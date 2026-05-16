@@ -21098,10 +21098,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return commit_fixup_requires_value_error();
                 };
-                fixup_commit = Some(value.to_string());
+                fixup_commit = Some(CommitFixup::parse(value)?);
             }
             value if value.starts_with("--fixup=") => {
-                fixup_commit = Some(value["--fixup=".len()..].to_string());
+                fixup_commit = Some(CommitFixup::parse(&value["--fixup=".len()..])?);
             }
             "--squash" => {
                 let Some(value) = iter.next() else {
@@ -21209,6 +21209,18 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '{option}' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if let Some(fixup) = &fixup_commit
+        && fixup.is_amend_style()
+        && !message_chunks.is_empty()
+    {
+        let option = if fixup.is_reword() {
+            "--fixup:reword"
+        } else {
+            "--fixup:amend"
+        };
+        eprintln!("fatal: options '-m' and '{option}' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if squash_commit.is_some() && fixup_commit.is_some() {
         eprintln!("fatal: options '--squash' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
@@ -21245,9 +21257,18 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         .map(|rev| read_reused_commit(&git_dir, format, rev))
         .transpose()?;
     let fixup_message = fixup_commit
-        .as_deref()
-        .map(|rev| read_fixup_commit_message(&git_dir, format, rev))
+        .as_ref()
+        .map(|fixup| read_fixup_commit_message(&git_dir, format, fixup))
         .transpose()?;
+    let fixup_reword_tree = if fixup_commit.as_ref().is_some_and(CommitFixup::is_reword) {
+        let Some(commit) = read_head_commit(&git_dir, format)? else {
+            eprintln!("fatal: You have nothing to amend.");
+            return Err(GitError::Exit(128));
+        };
+        Some(commit.tree)
+    } else {
+        None
+    };
     let squash_message = squash_commit
         .as_deref()
         .map(|rev| read_squash_commit_message(&git_dir, format, rev))
@@ -21308,7 +21329,11 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if all {
         commit_stage_tracked_changes(&git_dir, format)?;
     }
-    if !allow_empty && !amend && commit_index_matches_head(&git_dir, format)? {
+    if !allow_empty
+        && !amend
+        && fixup_reword_tree.is_none()
+        && commit_index_matches_head(&git_dir, format)?
+    {
         print_clean_commit_status(&git_dir, format)?;
         return Err(GitError::Exit(1));
     }
@@ -21325,6 +21350,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     };
     let result = if amend {
         git_sequencer::amend_index(&git_dir, format, options)
+    } else if let Some(tree) = fixup_reword_tree {
+        git_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
     } else {
         git_sequencer::commit_index(&git_dir, format, options)
     }?;
@@ -21332,6 +21359,50 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         println!("{}", result.oid);
     }
     Ok(())
+}
+
+enum CommitFixup {
+    Plain(String),
+    Amend { rev: String, reword: bool },
+}
+
+impl CommitFixup {
+    fn parse(value: &str) -> Result<Self> {
+        if let Some(rev) = value.strip_prefix("amend:") {
+            Ok(Self::Amend {
+                rev: rev.to_string(),
+                reword: false,
+            })
+        } else if let Some(rev) = value.strip_prefix("reword:") {
+            Ok(Self::Amend {
+                rev: rev.to_string(),
+                reword: true,
+            })
+        } else if value.contains(':')
+            && value
+                .split_once(':')
+                .is_some_and(|(mode, _)| !mode.is_empty())
+        {
+            eprintln!("fatal: unknown option: --fixup={value}");
+            Err(GitError::Exit(128))
+        } else {
+            Ok(Self::Plain(value.to_string()))
+        }
+    }
+
+    fn rev(&self) -> &str {
+        match self {
+            Self::Plain(rev) | Self::Amend { rev, .. } => rev,
+        }
+    }
+
+    fn is_amend_style(&self) -> bool {
+        matches!(self, Self::Amend { .. })
+    }
+
+    fn is_reword(&self) -> bool {
+        matches!(self, Self::Amend { reword: true, .. })
+    }
 }
 
 fn commit_message_requires_value_error() -> Result<()> {
@@ -21577,9 +21648,21 @@ fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result
     }
 }
 
-fn read_fixup_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<u8>> {
-    let commit = read_reused_commit(git_dir, format, rev)?;
-    Ok(format!("fixup! {}\n", commit_subject(&commit.message)).into_bytes())
+fn read_fixup_commit_message(
+    git_dir: &Path,
+    format: ObjectFormat,
+    fixup: &CommitFixup,
+) -> Result<Vec<u8>> {
+    let commit = read_reused_commit(git_dir, format, fixup.rev())?;
+    let subject = commit_subject(&commit.message);
+    match fixup {
+        CommitFixup::Plain(_) => Ok(format!("fixup! {subject}\n").into_bytes()),
+        CommitFixup::Amend { .. } => {
+            let mut message = format!("amend! {subject}\n\n").into_bytes();
+            message.extend_from_slice(&commit.message);
+            Ok(message)
+        }
+    }
 }
 
 fn read_squash_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<u8>> {
@@ -21640,14 +21723,23 @@ fn commit_message_body(message: &[u8]) -> Vec<u8> {
 }
 
 fn read_amended_commit(git_dir: &Path, format: ObjectFormat) -> Result<Commit> {
+    match read_head_commit(git_dir, format)? {
+        Some(commit) => Ok(commit),
+        None => {
+            eprintln!("fatal: You have nothing to amend.");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn read_head_commit(git_dir: &Path, format: ObjectFormat) -> Result<Option<Commit>> {
     let store = FileRefStore::new(git_dir, format);
     let head = match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
         direct => direct,
     };
     let Some(RefTarget::Direct(oid)) = head else {
-        eprintln!("fatal: You have nothing to amend.");
-        return Err(GitError::Exit(128));
+        return Ok(None);
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&oid)?;
@@ -21658,7 +21750,7 @@ fn read_amended_commit(git_dir: &Path, format: ObjectFormat) -> Result<Commit> {
             object.object_type.as_str()
         )));
     }
-    Commit::parse(format, &object.body)
+    Commit::parse(format, &object.body).map(Some)
 }
 
 fn build_reused_commit_author_identity(

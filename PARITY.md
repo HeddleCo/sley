@@ -860,7 +860,8 @@ Target: upstream Git 2.54.0.
   object parity and `--no-reset-author` reset/no-op parsing, covered `--amend`
   object parity including no-edit, reset-author, and author/date override cases,
   covered simple `--fixup <commit>` / `--fixup=<commit>` object parity
-  including appended `-m` body text and covered `-C` / `-c` / `-F` conflict errors,
+  including appended `-m` body text, `amend:` and `reword:` editor-noop object
+  parity, and covered `-C` / `-c` / `-F` conflict errors,
   covered simple `--squash <commit>` / `--squash=<commit>` object parity
   including editor-noop, `-m`, `-F`, and `-C` body reuse cases plus
   `--fixup` conflict errors,

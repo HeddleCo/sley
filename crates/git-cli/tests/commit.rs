@@ -236,6 +236,9 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-reedit-message=value", "-m", "subject"],
             vec!["commit", "--fixup"],
             vec!["commit", "--fixup=missing"],
+            vec!["commit", "--fixup=amend:missing"],
+            vec!["commit", "--fixup=reword:missing"],
+            vec!["commit", "--fixup=bad:HEAD"],
             vec!["commit", "-C", "HEAD", "--fixup", "HEAD"],
             vec!["commit", "-c", "HEAD", "--fixup", "HEAD"],
             vec!["commit", "--fixup", "HEAD", "-F", "message-lf.txt"],
@@ -854,6 +857,8 @@ fn commit_fixup_matches_upstream_git_objects() {
                 "fixup-message",
                 vec!["commit", "--fixup", "HEAD", "-m", "body"],
             ),
+            ("fixup-amend", vec!["commit", "--fixup=amend:HEAD"]),
+            ("fixup-reword", vec!["commit", "--fixup=reword:HEAD"]),
         ] {
             let expected_root = root.join(format!("{name}-expected"));
             let actual_root = root.join(format!("{name}-actual"));
@@ -882,14 +887,17 @@ fn commit_fixup_matches_upstream_git_objects() {
             run_success("git", &expected_root, &["add", "tracked.txt"]);
             run_success("git", &actual_root, &["add", "tracked.txt"]);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
+            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
             assert!(
                 expected.status.success(),
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            let actual = run_output_with_identity_and_editor(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &actual_root,
+                &args,
+            );
             assert!(
                 actual.status.success(),
                 "git-rs {args:?} failed: {}",

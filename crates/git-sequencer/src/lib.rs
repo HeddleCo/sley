@@ -115,7 +115,9 @@ pub fn commit_index(
     format: git_core::ObjectFormat,
     options: CommitIndexOptions,
 ) -> Result<CommitIndexResult> {
-    commit_index_with_amend(git_dir, format, options, false)
+    let git_dir = git_dir.as_ref();
+    let tree = git_worktree::write_tree_from_index(git_dir, format)?;
+    commit_tree_with_amend(git_dir, format, tree, options, false)
 }
 
 pub fn amend_index(
@@ -123,17 +125,28 @@ pub fn amend_index(
     format: git_core::ObjectFormat,
     options: CommitIndexOptions,
 ) -> Result<CommitIndexResult> {
-    commit_index_with_amend(git_dir, format, options, true)
+    let git_dir = git_dir.as_ref();
+    let tree = git_worktree::write_tree_from_index(git_dir, format)?;
+    commit_tree_with_amend(git_dir, format, tree, options, true)
 }
 
-fn commit_index_with_amend(
+pub fn commit_tree_at_head(
     git_dir: impl AsRef<Path>,
     format: git_core::ObjectFormat,
+    tree: ObjectId,
+    options: CommitIndexOptions,
+) -> Result<CommitIndexResult> {
+    commit_tree_with_amend(git_dir, format, tree, options, false)
+}
+
+fn commit_tree_with_amend(
+    git_dir: impl AsRef<Path>,
+    format: git_core::ObjectFormat,
+    tree: ObjectId,
     options: CommitIndexOptions,
     amend: bool,
 ) -> Result<CommitIndexResult> {
     let git_dir = git_dir.as_ref();
-    let tree = git_worktree::write_tree_from_index(git_dir, format)?;
     let refs = FileRefStore::new(git_dir, format);
     let (updated_ref, parent) = head_update_target(&refs)?;
     let commit_parents = if amend {
