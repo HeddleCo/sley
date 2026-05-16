@@ -5484,6 +5484,7 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
 struct StashListOptions {
     format: StashListFormat,
     max_count: Option<usize>,
+    abbrev_len: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -5498,6 +5499,8 @@ enum StashListFormat {
 
 #[derive(Debug)]
 enum StashListPlaceholder {
+    FullObjectName,
+    AbbreviatedObjectName,
     ReflogSelector,
     FullReflogSelector,
     ReflogSubject,
@@ -6129,7 +6132,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
             StashListFormat::Oneline => {
                 println!(
                     "{} refs/stash@{{{index}}}: {}",
-                    format_log_abbrev_oid(&entry.new_oid),
+                    format_log_oid(&entry.new_oid, options.abbrev_len),
                     String::from_utf8_lossy(&entry.message)
                 );
             }
@@ -6138,6 +6141,10 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                 final_newline,
             } => {
                 let value = match placeholder {
+                    StashListPlaceholder::FullObjectName => entry.new_oid.to_hex(),
+                    StashListPlaceholder::AbbreviatedObjectName => {
+                        format_log_oid(&entry.new_oid, options.abbrev_len)
+                    }
                     StashListPlaceholder::ReflogSelector => format!("stash@{{{index}}}"),
                     StashListPlaceholder::FullReflogSelector => format!("refs/stash@{{{index}}}"),
                     StashListPlaceholder::ReflogSubject => {
@@ -6158,6 +6165,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
 fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut format = StashListFormat::Default;
     let mut max_count = None;
+    let mut abbrev_len = Some(7);
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -6171,6 +6179,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 ));
             }
             "--oneline" => format = StashListFormat::Oneline,
+            "--abbrev" => abbrev_len = Some(7),
+            "--no-abbrev" => abbrev_len = None,
             "--format" | "--pretty" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6186,6 +6196,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value if let Some(count) = value.strip_prefix("--max-count=") => {
                 max_count = Some(parse_reflog_count(count)?);
+            }
+            value if let Some(value) = value.strip_prefix("--abbrev=") => {
+                abbrev_len = Some(parse_abbrev(value)?.max(4));
             }
             "--max-count" | "-n" => {
                 index += 1;
@@ -6216,12 +6229,24 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         }
         index += 1;
     }
-    Ok(StashListOptions { format, max_count })
+    Ok(StashListOptions {
+        format,
+        max_count,
+        abbrev_len,
+    })
 }
 
 fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
     match value {
         "oneline" => Ok(StashListFormat::Oneline),
+        "%H" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::FullObjectName,
+            final_newline: true,
+        }),
+        "%h" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::AbbreviatedObjectName,
+            final_newline: true,
+        }),
         "%gd" => Ok(StashListFormat::Placeholder {
             placeholder: StashListPlaceholder::ReflogSelector,
             final_newline: true,
@@ -6236,6 +6261,14 @@ fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
         }),
         "format:%gd" => Ok(StashListFormat::Placeholder {
             placeholder: StashListPlaceholder::ReflogSelector,
+            final_newline: false,
+        }),
+        "format:%H" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::FullObjectName,
+            final_newline: false,
+        }),
+        "format:%h" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::AbbreviatedObjectName,
             final_newline: false,
         }),
         "format:%gD" => Ok(StashListFormat::Placeholder {

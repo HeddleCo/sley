@@ -163,7 +163,7 @@ cargo run -p git-cli -- status --porcelain=v1
 cargo run -p git-cli -- status --porcelain=v1 [-z|--null]
 cargo run -p git-cli -- status --porcelain=v1 --branch
 cargo run -p git-cli -- status --porcelain=v1 [-u|-uall|-unormal|-uno|--untracked-files[=all|normal|no]]
-cargo run -p git-cli -- stash list [--oneline|--format=%gd|--format=%gD|--format=%gs] [-<n>|-n <n>|--max-count=<n>]
+cargo run -p git-cli -- stash list [--oneline|--format=%H|--format=%h|--format=%gd|--format=%gD|--format=%gs] [--abbrev[=<n>]|--no-abbrev] [-<n>|-n <n>|--max-count=<n>]
 cargo run -p git-cli -- stash clear
 cargo run -p git-cli -- stash drop [-q|--quiet|--no-quiet] [stash@{<n>}]
 cargo run -p git-cli -- stash show [-u|--include-untracked|--only-untracked] [--raw|--stat|--numstat|--shortstat|--summary|--name-only|--name-status|-p|--patch|--patch-with-raw|--patch-with-stat|--oneline|--quiet] [stash@{<n>}]

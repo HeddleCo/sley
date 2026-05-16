@@ -80,8 +80,9 @@ Target: upstream Git 2.54.0.
   `--all`, missing-ref, missing-value, unknown-option, and invalid-timestamp
   cases.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
-  display, `--oneline`, `%gd` / `%gD` / `%gs` formats, and `-<n>` / `-n` /
-  `--max-count` limiting for covered stash entries and empty repositories,
+  display, `--oneline`, `%H` / `%h` / `%gd` / `%gD` / `%gs` formats,
+  object-name abbreviation controls, and `-<n>` / `-n` / `--max-count`
+  limiting for covered stash entries and empty repositories,
   `stash clear` ref/reflog removal and covered empty/error cases, plus
   `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
   and covered invalid selector/error cases, plus `stash show` default stat,
@@ -883,7 +884,8 @@ Target: upstream Git 2.54.0.
   including covered `--dry-run` default/long/short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   `stash list` display over `refs/stash` reflogs including default,
-  `--oneline`, `%gd` / `%gD` / `%gs` formats, and count limiting, plus
+  `--oneline`, `%H` / `%h` / `%gd` / `%gD` / `%gs` formats, object-name
+  abbreviation controls, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/numstat/shortstat/summary/name/name-status/patch/untracked output, `stash store` ref/reflog writes,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
