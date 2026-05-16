@@ -20985,6 +20985,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut allow_empty_message = false;
     let mut author_override = None;
     let mut author_date = None;
+    let mut cleanup_mode = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21060,6 +21061,15 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--status" | "--no-status" => {}
             "-v" | "--verbose" | "--no-verbose" => {}
             "--no-edit" => {}
+            "--cleanup" => {
+                let Some(value) = iter.next() else {
+                    return commit_cleanup_requires_value_error();
+                };
+                cleanup_mode = Some(parse_commit_cleanup_mode(value)?);
+            }
+            value if value.starts_with("--cleanup=") => {
+                cleanup_mode = Some(parse_commit_cleanup_mode(&value["--cleanup=".len()..])?);
+            }
             value => {
                 return Err(GitError::Command(format!(
                     "unsupported commit argument {value}; currently supports -m and -F"
@@ -21078,8 +21088,11 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let author = build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?;
     let committer = commit_identity_from_env("COMMITTER")?;
-    let message =
+    let mut message =
         file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks));
+    if let Some(cleanup_mode) = cleanup_mode {
+        message = commit_cleanup_message(message, cleanup_mode);
+    }
     if !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
@@ -21121,6 +21134,11 @@ fn commit_author_requires_value_error() -> Result<()> {
 
 fn commit_date_requires_value_error() -> Result<()> {
     eprintln!("error: option `date' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_cleanup_requires_value_error() -> Result<()> {
+    eprintln!("error: option `cleanup' requires a value");
     Err(GitError::Exit(129))
 }
 
@@ -21259,6 +21277,33 @@ fn commit_message_chunk_is_empty(chunk: &[u8]) -> bool {
 
 fn commit_message_is_empty(message: &[u8]) -> bool {
     message.iter().all(u8::is_ascii_whitespace)
+}
+
+#[derive(Clone, Copy)]
+enum CommitCleanupMode {
+    Strip,
+    Whitespace,
+    Verbatim,
+}
+
+fn parse_commit_cleanup_mode(value: &str) -> Result<CommitCleanupMode> {
+    match value {
+        "strip" => Ok(CommitCleanupMode::Strip),
+        "whitespace" | "scissors" | "default" => Ok(CommitCleanupMode::Whitespace),
+        "verbatim" => Ok(CommitCleanupMode::Verbatim),
+        _ => {
+            eprintln!("fatal: Invalid cleanup mode {value}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn commit_cleanup_message(message: Vec<u8>, mode: CommitCleanupMode) -> Vec<u8> {
+    match mode {
+        CommitCleanupMode::Verbatim => message,
+        CommitCleanupMode::Strip => tag_stripspace_message(&message, true),
+        CommitCleanupMode::Whitespace => tag_stripspace_message(&message, false),
+    }
 }
 
 fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<bool> {

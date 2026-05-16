@@ -197,6 +197,10 @@ fn commit_message_option_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
+        let args = vec!["commit", "--cleanup=bad", "-m", "subject"];
+        let expected = run_output("git", &root, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+        assert_same_output(actual, expected, &args);
     })();
     let _ = fs::remove_dir_all(&root);
     result
@@ -282,6 +286,52 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "allow-empty-signoff",
                 vec!["commit", "-m", "", "-s", "--allow-empty-message"],
+            ),
+            (
+                "cleanup-strip",
+                vec![
+                    "commit",
+                    "--cleanup=strip",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "cleanup-whitespace",
+                vec![
+                    "commit",
+                    "--cleanup",
+                    "whitespace",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "cleanup-verbatim",
+                vec![
+                    "commit",
+                    "--cleanup=verbatim",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "cleanup-default",
+                vec![
+                    "commit",
+                    "--cleanup=default",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "cleanup-scissors",
+                vec![
+                    "commit",
+                    "--cleanup=scissors",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
             ),
         ] {
             let expected_root = root.join(format!("{name}-expected"));
