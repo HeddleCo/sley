@@ -5764,6 +5764,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut show_numstat = false;
     let mut show_shortstat = false;
     let mut show_summary = false;
+    let mut compact_summary = false;
     let mut show_patch = false;
     let mut raw_abbrev = Some(Some(7usize));
     let mut patch_abbrev = None;
@@ -5816,6 +5817,15 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 ) {
                     mode = StashShowMode::Stat;
                     show_summary = true;
+                }
+            }
+            "--compact-summary" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    compact_summary = true;
                 }
             }
             "--patch-with-raw" => {
@@ -6006,6 +6016,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 || show_numstat
                 || show_shortstat
                 || show_summary
+                || compact_summary
                 || show_patch;
             if !has_visual_mode {
                 show_stat = true;
@@ -6023,8 +6034,16 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 }
                 wrote_prefix_output = !entries.is_empty();
             }
-            if show_stat {
-                write_diff_stat(&mut stdout, &entries, &db, None, false, false, None)?;
+            if show_stat || compact_summary {
+                write_diff_stat(
+                    &mut stdout,
+                    &entries,
+                    &db,
+                    None,
+                    false,
+                    compact_summary,
+                    None,
+                )?;
                 wrote_prefix_output |= !entries.is_empty();
             }
             if show_shortstat {
