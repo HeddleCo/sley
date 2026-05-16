@@ -96,6 +96,7 @@ fn run(args: Vec<String>) -> Result<()> {
         "restore" => cmd_restore(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "show-ref" => cmd_show_ref(&args[1..]),
+        "stash" => cmd_stash(&args[1..]),
         "submodule" => cmd_submodule(&args[1..]),
         "symbolic-ref" => cmd_symbolic_ref(&args[1..]),
         "status" => cmd_status(&args[1..]),
@@ -5477,6 +5478,187 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
         return Ok(value.to_string());
     }
     branch_ref_name(value)
+}
+
+#[derive(Debug)]
+struct StashListOptions {
+    format: StashListFormat,
+    max_count: Option<usize>,
+}
+
+#[derive(Debug)]
+enum StashListFormat {
+    Default,
+    Oneline,
+    Placeholder {
+        placeholder: StashListPlaceholder,
+        final_newline: bool,
+    },
+}
+
+#[derive(Debug)]
+enum StashListPlaceholder {
+    ReflogSelector,
+    FullReflogSelector,
+    ReflogSubject,
+}
+
+fn cmd_stash(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("list") => cmd_stash_list(&args[1..]),
+        Some(other) => Err(GitError::Unsupported(format!(
+            "stash currently supports only list; unsupported subcommand {other}"
+        ))),
+        None => Err(GitError::Unsupported(
+            "stash currently supports only list".into(),
+        )),
+    }
+}
+
+fn cmd_stash_list(args: &[String]) -> Result<()> {
+    let options = parse_stash_list_options(args)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let mut entries = store.read_reflog("refs/stash")?;
+    entries.reverse();
+    let selected = options
+        .max_count
+        .map_or(entries.len(), |max_count| max_count.min(entries.len()));
+    for (index, entry) in entries.iter().take(selected).enumerate() {
+        match &options.format {
+            StashListFormat::Default => {
+                println!(
+                    "stash@{{{index}}}: {}",
+                    String::from_utf8_lossy(&entry.message)
+                );
+            }
+            StashListFormat::Oneline => {
+                println!(
+                    "{} refs/stash@{{{index}}}: {}",
+                    format_log_abbrev_oid(&entry.new_oid),
+                    String::from_utf8_lossy(&entry.message)
+                );
+            }
+            StashListFormat::Placeholder {
+                placeholder,
+                final_newline,
+            } => {
+                let value = match placeholder {
+                    StashListPlaceholder::ReflogSelector => format!("stash@{{{index}}}"),
+                    StashListPlaceholder::FullReflogSelector => format!("refs/stash@{{{index}}}"),
+                    StashListPlaceholder::ReflogSubject => {
+                        String::from_utf8_lossy(&entry.message).into_owned()
+                    }
+                };
+                if *final_newline || index + 1 < selected {
+                    println!("{value}");
+                } else {
+                    print!("{value}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
+    let mut format = StashListFormat::Default;
+    let mut max_count = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--" => {
+                if index + 1 == args.len() {
+                    break;
+                }
+                return Err(GitError::Unsupported(
+                    "stash list currently does not support revisions or pathspecs".into(),
+                ));
+            }
+            "--oneline" => format = StashListFormat::Oneline,
+            "--format" | "--pretty" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command(format!("{arg} requires a value")));
+                };
+                format = parse_stash_list_format(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--format=") => {
+                format = parse_stash_list_format(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--pretty=") => {
+                format = parse_stash_list_format(value)?;
+            }
+            value if let Some(count) = value.strip_prefix("--max-count=") => {
+                max_count = Some(parse_reflog_count(count)?);
+            }
+            "--max-count" | "-n" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command(format!("{arg} requires a value")));
+                };
+                max_count = Some(parse_reflog_count(value)?);
+            }
+            value if value.starts_with("-n") && value.len() > 2 => {
+                max_count = Some(parse_reflog_count(&value[2..])?);
+            }
+            value
+                if value.starts_with('-')
+                    && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                max_count = Some(parse_reflog_count(&value[1..])?);
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash list option {value}"
+                )));
+            }
+            _ => {
+                return Err(GitError::Unsupported(
+                    "stash list currently does not support revisions or pathspecs".into(),
+                ));
+            }
+        }
+        index += 1;
+    }
+    Ok(StashListOptions { format, max_count })
+}
+
+fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
+    match value {
+        "oneline" => Ok(StashListFormat::Oneline),
+        "%gd" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::ReflogSelector,
+            final_newline: true,
+        }),
+        "%gD" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::FullReflogSelector,
+            final_newline: true,
+        }),
+        "%gs" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::ReflogSubject,
+            final_newline: true,
+        }),
+        "format:%gd" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::ReflogSelector,
+            final_newline: false,
+        }),
+        "format:%gD" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::FullReflogSelector,
+            final_newline: false,
+        }),
+        "format:%gs" => Ok(StashListFormat::Placeholder {
+            placeholder: StashListPlaceholder::ReflogSubject,
+            final_newline: false,
+        }),
+        _ => Err(GitError::Unsupported(
+            "stash list currently supports only --oneline and %gd/%gD/%gs formats".into(),
+        )),
+    }
 }
 
 fn ancestor_depths(
@@ -40653,7 +40835,7 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
 
 fn print_usage() {
     eprintln!(
-        "usage: git-rs <init|add|branch|bundle|checkout|check-attr|check-ignore|clean|clone|config|count-objects|commit-graph|diff|fetch|for-each-ref|hash-object|cat-file|commit|commit-tree|ls-remote|ls-files|ls-tree|log|merge-base|mktree|multi-pack-index|mv|pack-refs|reflog|remote|reset|restore|rm|write-tree|worktree|update-index|update-ref|rev-parse|rev-list|show-ref|submodule|symbolic-ref|status|switch|tag|testkit|version> ..."
+        "usage: git-rs <init|add|branch|bundle|checkout|check-attr|check-ignore|clean|clone|config|count-objects|commit-graph|diff|fetch|for-each-ref|hash-object|cat-file|commit|commit-tree|ls-remote|ls-files|ls-tree|log|merge-base|mktree|multi-pack-index|mv|pack-refs|reflog|remote|reset|restore|rm|write-tree|worktree|update-index|update-ref|rev-parse|rev-list|show-ref|stash|submodule|symbolic-ref|status|switch|tag|testkit|version> ..."
     );
 }
 

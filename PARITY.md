@@ -79,6 +79,10 @@ Target: upstream Git 2.54.0.
   reachable/unreachable pruning, dry-run, verbose, `--rewrite`, `--updateref`,
   `--all`, missing-ref, missing-value, unknown-option, and invalid-timestamp
   cases.
+- Minimal read-only `stash list` support over `refs/stash` reflogs, including
+  default display, `--oneline`, `%gd` / `%gD` / `%gs` formats, and
+  `-<n>` / `-n` / `--max-count` limiting for covered stash entries and empty
+  repositories.
 - Minimal `mktree` support for `ls-tree`-style stdin records, including
   default object validation, `--missing`, `-z`, `--batch`, tree-entry sorting,
   submodule commit entries, and upstream-readable tree object writes.
@@ -873,6 +877,8 @@ Target: upstream Git 2.54.0.
   commit `--short` / `--porcelain` / `--long` / `-z` / `--null` status-preview output and reset/value-error parity,
   including covered `--dry-run` default/long/short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
+  read-only `stash list` display over `refs/stash` reflogs including
+  default, `--oneline`, `%gd` / `%gD` / `%gs` formats, and count limiting,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
   patch/interactive requirement errors,
   covered commit `--pathspec-from-file` and `--pathspec-file-nul` parser
