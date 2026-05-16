@@ -882,7 +882,7 @@ Target: upstream Git 2.54.0.
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`
   over unborn and committed tracked-change fixtures, normal long status output
-  for covered staged/unstaged/untracked fixtures, plus status quoting for
+  for covered unborn-clean/staged/unstaged/untracked fixtures, plus status quoting for
   space, quote, and tab paths in non-NUL short/porcelain output,
   status `-z`, status `--null`, status
   `--no-null`, status `--branch`, status `--no-branch`,

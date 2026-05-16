@@ -1066,6 +1066,29 @@ fn commit_status_preview_modes_match_upstream_git() {
                 );
             }
         }
+
+        for (name, args) in [
+            (
+                "dry-run-long-default-clean",
+                vec!["commit", "--dry-run", "-m", "subject"],
+            ),
+            (
+                "dry-run-long-clean",
+                vec!["commit", "--dry-run", "--long", "-m", "subject"],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            run_success("git", &expected_root, &["init", "-q"]);
+            run_success("git", &actual_root, &["init", "-q"]);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert_same_output(actual, expected, &args);
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

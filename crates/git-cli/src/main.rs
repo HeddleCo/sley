@@ -37103,7 +37103,12 @@ fn print_status_long(
     }
 
     if !has_staged && !has_unstaged && !has_untracked && !has_ignored {
-        println!("nothing to commit, working tree clean");
+        if head_initial {
+            println!();
+            println!("nothing to commit (create/copy files and use \"git add\" to track)");
+        } else {
+            println!("nothing to commit, working tree clean");
+        }
     } else if !has_staged && has_unstaged {
         println!();
         println!("no changes added to commit (use \"git add\" and/or \"git commit -a\")");

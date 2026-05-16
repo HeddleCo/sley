@@ -303,6 +303,29 @@ fn status_long_matches_upstream_git() {
 }
 
 #[test]
+fn status_long_unborn_clean_matches_upstream_git() {
+    let root = unique_temp_dir("status-long-unborn-clean");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        for args in [
+            vec!["status"],
+            vec!["status", "--long"],
+            vec!["status", "--short", "--long"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs unborn clean long status output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");
