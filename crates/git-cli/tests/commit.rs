@@ -234,6 +234,9 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--reedit-message=missing"],
             vec!["commit", "--no-reuse-message=value", "-m", "subject"],
             vec!["commit", "--no-reedit-message=value", "-m", "subject"],
+            vec!["commit", "--reset-author", "-m", "subject"],
+            vec!["commit", "--reset-author=value", "-m", "subject"],
+            vec!["commit", "--no-reset-author=value", "-m", "subject"],
         ] {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
@@ -284,6 +287,10 @@ fn commit_file_messages_match_upstream_git_objects() {
                     "-m",
                     "subject",
                 ],
+            ),
+            (
+                "no-reset-author-noop",
+                vec!["commit", "--no-reset-author", "-m", "subject"],
             ),
             (
                 "all-no-all",
@@ -544,6 +551,30 @@ fn commit_reuse_message_matches_upstream_git_objects() {
             (
                 "reuse-date-override",
                 vec!["commit", "-C", "HEAD", "--date=@456 +0230"],
+            ),
+            (
+                "reuse-reset-author",
+                vec!["commit", "-C", "HEAD", "--reset-author"],
+            ),
+            (
+                "reuse-reset-author-cancelled",
+                vec![
+                    "commit",
+                    "-C",
+                    "HEAD",
+                    "--reset-author",
+                    "--no-reset-author",
+                ],
+            ),
+            (
+                "reuse-reset-author-restored",
+                vec![
+                    "commit",
+                    "-C",
+                    "HEAD",
+                    "--no-reset-author",
+                    "--reset-author",
+                ],
             ),
         ] {
             let expected_root = root.join(format!("{name}-expected"));

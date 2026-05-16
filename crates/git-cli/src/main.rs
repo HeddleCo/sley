@@ -20988,6 +20988,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut author_date = None;
     let mut reuse_message = None;
     let mut reedit_message = false;
+    let mut reset_author = false;
     let mut cleanup_mode = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -21090,6 +21091,14 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-reedit-message=") => {
                 return commit_option_takes_no_value_error("no-reedit-message");
             }
+            "--reset-author" => reset_author = true,
+            "--no-reset-author" => reset_author = false,
+            value if value.starts_with("--reset-author=") => {
+                return commit_option_takes_no_value_error("reset-author");
+            }
+            value if value.starts_with("--no-reset-author=") => {
+                return commit_option_takes_no_value_error("no-reset-author");
+            }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
             "-q" | "--quiet" => quiet = true,
@@ -21166,6 +21175,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '{option}' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if reset_author && reuse_message.is_none() {
+        eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
+        return Err(GitError::Exit(128));
+    }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
@@ -21180,7 +21193,9 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         .as_deref()
         .map(|rev| read_reused_commit(&git_dir, format, rev))
         .transpose()?;
-    let author = if let Some(commit) = &reused_commit {
+    let author = if reset_author {
+        build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
+    } else if let Some(commit) = &reused_commit {
         build_reused_commit_author_identity(
             &commit.author,
             author_override.as_deref(),
