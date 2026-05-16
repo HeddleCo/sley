@@ -5505,13 +5505,39 @@ enum StashListPlaceholder {
 
 fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
+        Some("clear") => cmd_stash_clear(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only list; unsupported subcommand {other}"
+            "stash currently supports only clear and list; unsupported subcommand {other}"
         ))),
         None => Err(GitError::Unsupported(
-            "stash currently supports only list".into(),
+            "stash currently supports only clear and list".into(),
         )),
+    }
+}
+
+fn cmd_stash_clear(args: &[String]) -> Result<()> {
+    if let Some(arg) = args.first() {
+        if arg.starts_with('-') {
+            eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
+            eprintln!("usage: git stash clear");
+            eprintln!();
+            return Err(GitError::Exit(129));
+        }
+        eprintln!("error: git stash clear with arguments is unimplemented");
+        return Err(GitError::Exit(1));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    match store.delete_ref("refs/stash") {
+        Ok(_) | Err(GitError::NotFound(_)) => {
+            let _ = fs::remove_file(common_git_dir.join("logs").join("refs/stash"));
+            Ok(())
+        }
+        Err(err) => Err(err),
     }
 }
 

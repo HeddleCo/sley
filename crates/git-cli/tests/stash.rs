@@ -31,6 +31,22 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
+fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "status differed for {args:?}"
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "stdout differed for {args:?}"
+    );
+    assert_eq!(
+        actual.stderr, expected.stderr,
+        "stderr differed for {args:?}"
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run_success("git", cwd, args)
 }
@@ -51,6 +67,20 @@ fn prepare_stash_repo(root: &Path) {
     git(root, &["stash", "push", "-q", "-m", "one"]);
     fs::write(root.join("a.txt"), b"two\n").expect("write second stash fixture");
     git(root, &["stash", "push", "-q", "-m", "two"]);
+}
+
+fn copy_dir(source: &Path, target: &Path) {
+    fs::create_dir_all(target).expect("create copied directory");
+    for entry in fs::read_dir(source).expect("read source directory") {
+        let entry = entry.expect("read source entry");
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if entry.file_type().expect("entry file type").is_dir() {
+            copy_dir(&source_path, &target_path);
+        } else {
+            fs::copy(&source_path, &target_path).expect("copy fixture file");
+        }
+    }
 }
 
 #[test]
@@ -101,6 +131,57 @@ fn stash_list_empty_matches_upstream_git() {
                 actual, expected,
                 "git-rs empty stash output differed for {args:?}"
             );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_clear_matches_upstream_git() {
+    let root = unique_temp_dir("stash-clear");
+    let template = root.join("template");
+    let upstream = root.join("upstream");
+    let actual = root.join("actual");
+    let result = (|| {
+        prepare_stash_repo(&template);
+        copy_dir(&template, &upstream);
+        copy_dir(&template, &actual);
+
+        let args = ["stash", "clear"];
+        let expected = run_output("git", &upstream, &args);
+        let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+
+        for args in [
+            vec!["stash", "list"],
+            vec!["status", "--show-stash"],
+            vec!["show-ref", "--exists", "refs/stash"],
+        ] {
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_clear_empty_and_errors_match_upstream_git() {
+    let root = unique_temp_dir("stash-clear-empty-errors");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+
+        for args in [
+            vec!["stash", "clear"],
+            vec!["stash", "clear", "extra"],
+            vec!["stash", "clear", "--bogus"],
+        ] {
+            let expected = run_output("git", &root, &args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_same_output(actual, expected, &args);
         }
     })();
     let _ = fs::remove_dir_all(&root);
