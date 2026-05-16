@@ -918,7 +918,8 @@ Target: upstream Git 2.54.0.
   covered create, delete, list, and verify operands, upstream-style tag target
   resolution and too-many-argument errors for covered create paths,
   upstream-style malformed-object errors for covered tag filter revisions and
-  option-looking `--merged` / `--no-merged` operands, tag listing `--color` / `--no-color` /
+  empty/value-bearing tag filter spellings, option-looking `--merged` /
+  `--no-merged` operands, and covered malformed/unknown tag sort keys, tag listing `--color` / `--no-color` /
   `--color=always` / `--color=auto` / `--color=never` / `--no-column` /
   `--column` / `--column=always` / `--column=auto` / `--column=never` /
   `--column=plain` / `--column=column` / `--column=row` /

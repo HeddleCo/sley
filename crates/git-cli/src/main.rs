@@ -36097,56 +36097,36 @@ fn cmd_tag(args: &[String]) -> Result<()> {
                 let value = value
                     .strip_prefix("--points-at=")
                     .ok_or_else(|| GitError::Command("tag --points-at requires a value".into()))?;
-                if value.is_empty() {
-                    return Err(GitError::Command("tag --points-at requires a value".into()));
-                }
                 points_at = Some(value.to_string());
             }
             value if value.starts_with("--contains=") => {
                 let value = value
                     .strip_prefix("--contains=")
                     .ok_or_else(|| GitError::Command("tag --contains requires a value".into()))?;
-                if value.is_empty() {
-                    return Err(GitError::Command("tag --contains requires a value".into()));
-                }
                 contains = Some((value.to_string(), true));
             }
             value if value.starts_with("--no-contains=") => {
                 let value = value.strip_prefix("--no-contains=").ok_or_else(|| {
                     GitError::Command("tag --no-contains requires a value".into())
                 })?;
-                if value.is_empty() {
-                    return Err(GitError::Command(
-                        "tag --no-contains requires a value".into(),
-                    ));
-                }
                 contains = Some((value.to_string(), false));
             }
             value if value.starts_with("--merged=") => {
                 let value = value
                     .strip_prefix("--merged=")
                     .ok_or_else(|| GitError::Command("tag --merged requires a value".into()))?;
-                if value.is_empty() {
-                    return Err(GitError::Command("tag --merged requires a value".into()));
-                }
                 merged = Some((value.to_string(), true));
             }
             value if value.starts_with("--no-merged=") => {
                 let value = value
                     .strip_prefix("--no-merged=")
                     .ok_or_else(|| GitError::Command("tag --no-merged requires a value".into()))?;
-                if value.is_empty() {
-                    return Err(GitError::Command("tag --no-merged requires a value".into()));
-                }
                 merged = Some((value.to_string(), false));
             }
             value if value.starts_with("--sort=") => {
                 let value = value
                     .strip_prefix("--sort=")
                     .ok_or_else(|| GitError::Command("tag --sort requires a value".into()))?;
-                if value.is_empty() {
-                    return Err(GitError::Command("tag --sort requires a value".into()));
-                }
                 list = true;
                 sorts.push(parse_tag_list_sort(value)?);
             }
@@ -36518,7 +36498,7 @@ fn resolve_tag_points_at_filter(
 ) -> Result<ObjectId> {
     match resolve_revision(git_dir, format, rev) {
         Ok(oid) => Ok(oid),
-        Err(GitError::NotFound(_)) => {
+        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
             eprintln!("error: malformed object name '{rev}'");
             Err(GitError::Exit(129))
         }
@@ -36533,7 +36513,7 @@ fn resolve_tag_contains_filter(
 ) -> Result<ObjectId> {
     match resolve_revision(git_dir, format, rev) {
         Ok(oid) => Ok(oid),
-        Err(GitError::NotFound(_)) => {
+        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
             eprintln!("error: malformed object name {rev}");
             Err(GitError::Exit(129))
         }
@@ -36544,7 +36524,7 @@ fn resolve_tag_contains_filter(
 fn resolve_tag_merged_filter(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     match resolve_revision(git_dir, format, rev) {
         Ok(oid) => Ok(oid),
-        Err(GitError::NotFound(_)) => {
+        Err(GitError::NotFound(_) | GitError::InvalidFormat(_) | GitError::InvalidPath(_)) => {
             eprintln!("fatal: malformed object name {rev}");
             Err(GitError::Exit(128))
         }
@@ -37117,12 +37097,22 @@ fn parse_tag_list_sort(value: &str) -> Result<TagListSort> {
                     TagListSort::Identity(field)
                 })
             } else {
-                Err(GitError::Command(format!(
-                    "unsupported tag sort key {other}"
-                )))
+                tag_sort_key_error(other)
             }
         }
     }
+}
+
+fn tag_sort_key_error(key: &str) -> Result<TagListSort> {
+    if key.is_empty() {
+        eprintln!("fatal: malformed field name: ");
+    } else {
+        eprintln!(
+            "fatal: unknown field name: {}",
+            key.strip_prefix('-').unwrap_or(key)
+        );
+    }
+    Err(GitError::Exit(128))
 }
 
 fn parse_tag_list_annotation_lines(value: &str) -> Result<usize> {
