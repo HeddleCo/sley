@@ -255,6 +255,54 @@ fn status_porcelain_v2_tracked_changes_match_upstream_git() {
 }
 
 #[test]
+fn status_long_matches_upstream_git() {
+    let root = unique_temp_dir("status-long");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("a.txt"), b"base\n").expect("write modify fixture");
+        fs::write(root.join("d.txt"), b"delete\n").expect("write delete fixture");
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::write(root.join("a.txt"), b"staged\n").expect("write staged modify");
+        fs::write(root.join("n.txt"), b"new\n").expect("write staged add");
+        git(&root, &["add", "a.txt", "n.txt"]);
+        fs::write(root.join("a.txt"), b"worktree\n").expect("write worktree modify");
+        fs::remove_file(root.join("d.txt")).expect("remove tracked file");
+        fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+
+        for args in [
+            vec!["status"],
+            vec!["status", "--long"],
+            vec!["status", "--short", "--long"],
+            vec!["status", "--long", "--short"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs long status output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");

@@ -21774,16 +21774,35 @@ fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
         CommitStatusMode::Normal => {}
         CommitStatusMode::Short => args.push("--short".to_string()),
         CommitStatusMode::Porcelain => args.push("--porcelain".to_string()),
-        CommitStatusMode::Long => {
-            return Err(GitError::Unsupported(
-                "commit --long status preview is not implemented".into(),
-            ));
-        }
+        CommitStatusMode::Long => return cmd_commit_long_status_preview(),
     }
     if null {
         args.push("-z".to_string());
     }
     cmd_status(&args)
+}
+
+fn cmd_commit_long_status_preview() -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&git_dir)?;
+    let entries = git_worktree::short_status_with_options(
+        &worktree_root,
+        &git_dir,
+        format,
+        git_worktree::ShortStatusOptions {
+            include_ignored: false,
+            untracked_mode: git_worktree::StatusUntrackedMode::Normal,
+        },
+    )?;
+    let committable = status_entries_have_index_changes(&entries);
+    print_status_long(&git_dir, format, entries, true)?;
+    if committable {
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
 }
 
 impl CommitFixup {
@@ -36766,6 +36785,12 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 show_ignored = true;
             }
             "--ignored=no" | "--no-ignored" => show_ignored = false,
+            "--long" | "--no-long" => {
+                short = false;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                z = false;
+            }
             "--no-renames"
             | "--renames"
             | "--find-renames"
@@ -36789,9 +36814,15 @@ fn cmd_status(args: &[String]) -> Result<()> {
             "-M" => {}
             value if value.starts_with("-M") && value.len() > 2 => {}
             value if value.starts_with("--find-renames=") => {}
+            value if value.starts_with("--long=") => {
+                return status_option_takes_no_value_error("long");
+            }
+            value if value.starts_with("--no-long=") => {
+                return status_option_takes_no_value_error("no-long");
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(
-                    "status currently supports only --short, --porcelain, --porcelain=1, --porcelain=v1, --porcelain=v2, --branch, -z/--null, --untracked-files, --ignored=no, --no-renames, simple display toggles, and literal pathspecs"
+                    "status currently supports only --short, --porcelain, --porcelain=1, --porcelain=v1, --porcelain=v2, --long, --branch, -z/--null, --untracked-files, --ignored=no, --no-renames, simple display toggles, and literal pathspecs"
                         .into(),
                 ));
             }
@@ -36848,14 +36879,15 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 status_quote_path(&entry.path, true)
             );
         }
-    } else if entries.is_empty() {
-        println!("nothing to commit, working tree clean");
     } else {
-        for entry in entries {
-            println!("{}", entry.line());
-        }
+        print_status_long(&git_dir, format, entries, false)?;
     }
     Ok(())
+}
+
+fn status_option_takes_no_value_error(option: &str) -> Result<()> {
+    eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(129))
 }
 
 struct StatusPathspec {
@@ -36979,6 +37011,149 @@ fn print_status_porcelain_v2(
     }
     stdout.flush()?;
     Ok(())
+}
+
+fn print_status_long(
+    git_dir: &Path,
+    format: ObjectFormat,
+    entries: Vec<git_worktree::ShortStatusEntry>,
+    commit_preview: bool,
+) -> Result<()> {
+    let head_initial = print_status_long_branch(git_dir, format)?;
+    if head_initial {
+        println!();
+        if commit_preview {
+            println!("Initial commit");
+        } else {
+            println!("No commits yet");
+        }
+    }
+
+    let mut staged = Vec::new();
+    let mut unstaged = Vec::new();
+    let mut untracked = Vec::new();
+    let mut ignored = Vec::new();
+    for entry in entries {
+        if entry.index == b'?' && entry.worktree == b'?' {
+            untracked.push(entry.path);
+            continue;
+        }
+        if entry.index == b'!' && entry.worktree == b'!' {
+            ignored.push(entry.path);
+            continue;
+        }
+        if let Some(label) = status_long_change_label(entry.index) {
+            staged.push((label, entry.path.clone()));
+        }
+        if let Some(label) = status_long_change_label(entry.worktree) {
+            unstaged.push((label, entry.path));
+        }
+    }
+
+    let has_staged = !staged.is_empty();
+    let has_unstaged = !unstaged.is_empty();
+    let has_untracked = !untracked.is_empty();
+    let has_ignored = !ignored.is_empty();
+
+    if has_staged {
+        if head_initial {
+            println!();
+        }
+        println!("Changes to be committed:");
+        if head_initial {
+            println!("  (use \"git rm --cached <file>...\" to unstage)");
+        } else {
+            println!("  (use \"git restore --staged <file>...\" to unstage)");
+        }
+        for (label, path) in staged {
+            println!("\t{label:<12}{}", status_quote_path(&path, false));
+        }
+    }
+
+    if has_unstaged {
+        if head_initial || has_staged {
+            println!();
+        }
+        println!("Changes not staged for commit:");
+        println!("  (use \"git add/rm <file>...\" to update what will be committed)");
+        println!("  (use \"git restore <file>...\" to discard changes in working directory)");
+        for (label, path) in unstaged {
+            println!("\t{label:<12}{}", status_quote_path(&path, false));
+        }
+    }
+
+    if has_untracked {
+        if head_initial || has_staged || has_unstaged {
+            println!();
+        }
+        println!("Untracked files:");
+        println!("  (use \"git add <file>...\" to include in what will be committed)");
+        for path in untracked {
+            println!("\t{}", status_quote_path(&path, false));
+        }
+    }
+
+    if has_ignored {
+        if head_initial || has_staged || has_unstaged || has_untracked {
+            println!();
+        }
+        println!("Ignored files:");
+        println!("  (use \"git add -f <file>...\" to include in what will be committed)");
+        for path in ignored {
+            println!("\t{}", status_quote_path(&path, false));
+        }
+    }
+
+    if !has_staged && !has_unstaged && !has_untracked && !has_ignored {
+        println!("nothing to commit, working tree clean");
+    } else if !has_staged && has_unstaged {
+        println!();
+        println!("no changes added to commit (use \"git add\" and/or \"git commit -a\")");
+    } else if !has_staged && has_untracked {
+        println!();
+        println!("nothing added to commit but untracked files present (use \"git add\" to track)");
+    } else {
+        println!();
+    }
+    Ok(())
+}
+
+fn print_status_long_branch(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let store = FileRefStore::new(git_dir, format);
+    match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(target)) => {
+            if let Some(branch) = target.strip_prefix("refs/heads/") {
+                println!("On branch {branch}");
+                Ok(store.read_ref(&target)?.is_none())
+            } else {
+                println!("On branch {target}");
+                Ok(store.read_ref(&target)?.is_none())
+            }
+        }
+        Some(RefTarget::Direct(oid)) => {
+            println!("HEAD detached at {}", oid.to_hex());
+            Ok(false)
+        }
+        None => {
+            println!("On branch (unknown)");
+            Ok(true)
+        }
+    }
+}
+
+fn status_long_change_label(code: u8) -> Option<&'static str> {
+    match code {
+        b'A' => Some("new file:"),
+        b'M' => Some("modified:"),
+        b'D' => Some("deleted:"),
+        _ => None,
+    }
+}
+
+fn status_entries_have_index_changes(entries: &[git_worktree::ShortStatusEntry]) -> bool {
+    entries
+        .iter()
+        .any(|entry| status_long_change_label(entry.index).is_some())
 }
 
 fn status_quote_path(path: &[u8], quote_space: bool) -> String {

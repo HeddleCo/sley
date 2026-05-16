@@ -870,7 +870,7 @@ Target: upstream Git 2.54.0.
   creation, `--no-trailer` reset behavior, and signoff/trailer ordering,
   plus covered commit no-op/reset parsing and value rejection for quiet/verify/post-rewrite/status/verbose/untracked-files/include/only/edit/branch/template/file toggles, covered
   `-S` / `--gpg-sign[=<key>]` reset parsing with `--no-gpg-sign`, covered
-  commit `--short` / `--porcelain` / `-z` / `--null` status-preview output and reset/value-error parity,
+  commit `--short` / `--porcelain` / `--long` / `-z` / `--null` status-preview output and reset/value-error parity,
   including covered `--dry-run` short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
@@ -881,7 +881,8 @@ Target: upstream Git 2.54.0.
   `--cleanup` object parity including `--no-cleanup`, and `--template` value errors, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`
-  over unborn and committed tracked-change fixtures, plus status quoting for
+  over unborn and committed tracked-change fixtures, normal long status output
+  for covered staged/unstaged/untracked fixtures, plus status quoting for
   space, quote, and tab paths in non-NUL short/porcelain output,
   status `-z`, status `--null`, status
   `--no-null`, status `--branch`, status `--no-branch`,

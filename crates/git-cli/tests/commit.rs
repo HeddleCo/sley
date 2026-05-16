@@ -1005,6 +1005,7 @@ fn commit_status_preview_modes_match_upstream_git() {
         for (name, args) in [
             ("short-no-message", vec!["commit", "--short"]),
             ("short", vec!["commit", "--short", "-m", "subject"]),
+            ("long", vec!["commit", "--long", "-m", "subject"]),
             ("porcelain", vec!["commit", "--porcelain", "-m", "subject"]),
             (
                 "dry-run-short",
@@ -1027,6 +1028,10 @@ fn commit_status_preview_modes_match_upstream_git() {
             (
                 "null-reset-short",
                 vec!["commit", "--null", "--no-null", "--short", "-m", "subject"],
+            ),
+            (
+                "long-reset-short",
+                vec!["commit", "--long", "--no-long", "--short", "-m", "subject"],
             ),
         ] {
             let expected_root = root.join(format!("{name}-expected"));
