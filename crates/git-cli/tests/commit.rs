@@ -204,6 +204,8 @@ fn commit_message_option_errors_match_upstream_git() {
         for args in [
             vec!["commit", "--template"],
             vec!["commit", "--no-template=value", "-m", "subject"],
+            vec!["commit", "--all=value", "-m", "subject"],
+            vec!["commit", "--no-all=value", "-m", "subject"],
         ] {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
@@ -234,6 +236,10 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "message-no-gpg-sign",
                 vec!["commit", "--message=subject", "--no-gpg-sign"],
+            ),
+            (
+                "all-no-all",
+                vec!["commit", "--all", "--no-all", "-m", "subject"],
             ),
             ("signoff-short", vec!["commit", "-m", "subject", "-s"]),
             ("signoff-long", vec!["commit", "-m", "subject", "--signoff"]),
@@ -405,6 +411,64 @@ fn commit_file_messages_match_upstream_git_objects() {
         let expected = run_output_with_identity("git", &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
+    let root = unique_temp_dir("commit-all-tracked");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args, deleted) in [
+            ("all-modified", vec!["commit", "-a", "-m", "second"], false),
+            ("all-long", vec!["commit", "--all", "-m", "second"], false),
+            ("all-attached-message", vec!["commit", "-amsecond"], false),
+            ("all-deleted", vec!["commit", "-a", "-m", "second"], true),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            create_initial_commit("git", &expected_root);
+            create_initial_commit(env!("CARGO_BIN_EXE_git-rs"), &actual_root);
+            remove_message_fixtures(&expected_root);
+            remove_message_fixtures(&actual_root);
+            if deleted {
+                fs::remove_file(expected_root.join("tracked.txt"))
+                    .expect("delete expected tracked");
+                fs::remove_file(actual_root.join("tracked.txt")).expect("delete actual tracked");
+            } else {
+                fs::write(expected_root.join("tracked.txt"), b"changed\n")
+                    .expect("modify expected tracked");
+                fs::write(actual_root.join("tracked.txt"), b"changed\n")
+                    .expect("modify actual tracked");
+            }
+            fs::write(expected_root.join("untracked.txt"), b"untracked\n")
+                .expect("write expected untracked");
+            fs::write(actual_root.join("untracked.txt"), b"untracked\n")
+                .expect("write actual untracked");
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            assert!(
+                expected.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&expected.stderr)
+            );
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert!(
+                actual.status.success(),
+                "git-rs {args:?} failed: {}",
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            assert_eq!(
+                cat_head("git", &actual_root),
+                cat_head("git", &expected_root),
+                "committed object differed for {args:?}"
+            );
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

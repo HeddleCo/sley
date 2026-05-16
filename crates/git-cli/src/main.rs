@@ -20983,6 +20983,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut allow_empty = false;
     let mut allow_empty_message = false;
+    let mut all = false;
     let mut author_override = None;
     let mut author_date = None;
     let mut cleanup_mode = None;
@@ -20999,6 +21000,20 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("-m") && value.len() > 2 => {
                 let mut chunk = value.as_bytes()[2..].to_vec();
+                chunk.push(b'\n');
+                message_chunks.push(chunk);
+            }
+            value if value.starts_with("-am") => {
+                all = true;
+                let message = if value.len() > 3 {
+                    &value[3..]
+                } else {
+                    let Some(message) = iter.next() else {
+                        return commit_message_requires_value_error();
+                    };
+                    message
+                };
+                let mut chunk = message.as_bytes().to_vec();
                 chunk.push(b'\n');
                 message_chunks.push(chunk);
             }
@@ -21033,6 +21048,14 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-signoff" => signoff = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-a" | "--all" => all = true,
+            "--no-all" => all = false,
+            value if value.starts_with("--all=") => {
+                return commit_option_takes_no_value_error("all");
+            }
+            value if value.starts_with("--no-all=") => {
+                return commit_option_takes_no_value_error("no-all");
+            }
             "--allow-empty" => allow_empty = true,
             "--no-allow-empty" => allow_empty = false,
             "--allow-empty-message" => allow_empty_message = true,
@@ -21106,6 +21129,9 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
+    }
+    if all {
+        commit_stage_tracked_changes(&git_dir, format)?;
     }
     if !allow_empty && commit_index_matches_head(&git_dir, format)? {
         print_clean_commit_status(&git_dir, format)?;
@@ -21324,6 +21350,43 @@ fn commit_cleanup_message(message: Vec<u8>, mode: CommitCleanupMode) -> Vec<u8> 
         CommitCleanupMode::Strip => tag_stripspace_message(&message, true),
         CommitCleanupMode::Whitespace => tag_stripspace_message(&message, false),
     }
+}
+
+fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let actions = resolve_add_update_actions(
+        &cwd,
+        &worktree_root,
+        git_dir,
+        format,
+        Vec::new(),
+        false,
+        false,
+    )?;
+    let action_paths = actions
+        .iter()
+        .map(AddAction::path)
+        .cloned()
+        .collect::<Vec<_>>();
+    if action_paths.is_empty() {
+        return Ok(());
+    }
+    git_worktree::update_index_paths(
+        &worktree_root,
+        git_dir,
+        format,
+        &action_paths,
+        git_worktree::UpdateIndexOptions {
+            add: true,
+            remove: true,
+            force_remove: false,
+            chmod: None,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+        },
+    )?;
+    Ok(())
 }
 
 fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
