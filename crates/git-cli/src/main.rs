@@ -36734,6 +36734,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
     let mut untracked_mode = git_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
     let mut show_stash = false;
+    let mut ahead_behind = true;
     let mut path_args = Vec::new();
     let mut positional_only = false;
     for arg in args {
@@ -36830,8 +36831,6 @@ fn cmd_status(args: &[String]) -> Result<()> {
             "--no-renames"
             | "--renames"
             | "--find-renames"
-            | "--ahead-behind"
-            | "--no-ahead-behind"
             | "-v"
             | "--verbose"
             | "--no-verbose"
@@ -36852,6 +36851,8 @@ fn cmd_status(args: &[String]) -> Result<()> {
             | "--ignore-submodules=dirty"
             | "--ignore-submodules=all"
             | "--no-ignore-submodules" => {}
+            "--ahead-behind" => ahead_behind = true,
+            "--no-ahead-behind" => ahead_behind = false,
             "--show-stash" => show_stash = true,
             "--no-show-stash" => show_stash = false,
             "-M" => {}
@@ -36964,11 +36965,11 @@ fn cmd_status(args: &[String]) -> Result<()> {
         }
     }
     if porcelain_v2 {
-        print_status_porcelain_v2(&git_dir, format, entries, branch, z)?;
+        print_status_porcelain_v2(&git_dir, format, entries, branch, ahead_behind, z)?;
     } else if z {
         let mut stdout = io::stdout().lock();
         if branch {
-            stdout.write_all(status_branch_header(&git_dir, format)?.as_bytes())?;
+            stdout.write_all(status_branch_header(&git_dir, format, ahead_behind)?.as_bytes())?;
             stdout.write_all(&[0])?;
         }
         for entry in entries {
@@ -36978,7 +36979,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
         }
     } else if short {
         if branch {
-            println!("{}", status_branch_header(&git_dir, format)?);
+            println!("{}", status_branch_header(&git_dir, format, ahead_behind)?);
         }
         for entry in entries {
             println!(
@@ -37093,12 +37094,13 @@ fn print_status_porcelain_v2(
     format: ObjectFormat,
     entries: Vec<git_worktree::ShortStatusEntry>,
     branch: bool,
+    ahead_behind: bool,
     z: bool,
 ) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let separator = if z { b'\0' } else { b'\n' };
     if branch {
-        for header in status_porcelain_v2_branch_headers(git_dir, format)? {
+        for header in status_porcelain_v2_branch_headers(git_dir, format, ahead_behind)? {
             stdout.write_all(header.as_bytes())?;
             stdout.write_all(&[separator])?;
         }
@@ -37340,22 +37342,42 @@ fn status_porcelain_v2_code(code: u8) -> char {
     if code == b' ' { '.' } else { code as char }
 }
 
-fn status_porcelain_v2_branch_headers(git_dir: &Path, format: ObjectFormat) -> Result<Vec<String>> {
+fn status_porcelain_v2_branch_headers(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ahead_behind: bool,
+) -> Result<Vec<String>> {
     let store = FileRefStore::new(git_dir, format);
     match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(target)) => {
-            let oid = match store.read_ref(&target)? {
-                Some(RefTarget::Direct(oid)) => oid.to_hex(),
+            let target_oid = match store.read_ref(&target)? {
+                Some(RefTarget::Direct(oid)) => Some(oid),
+                _ => None,
+            };
+            let oid = match target_oid.as_ref() {
+                Some(oid) => oid.to_hex(),
                 _ => "(initial)".into(),
             };
             let head = target
                 .strip_prefix("refs/heads/")
                 .unwrap_or(target.as_str())
                 .to_string();
-            Ok(vec![
+            let mut headers = vec![
                 format!("# branch.oid {oid}"),
                 format!("# branch.head {head}"),
-            ])
+            ];
+            if let Some(oid) = target_oid.as_ref()
+                && let Some(tracking) =
+                    status_branch_tracking(git_dir, format, &store, &target, oid, ahead_behind)?
+            {
+                headers.push(format!("# branch.upstream {}", tracking.upstream));
+                headers.push(format!(
+                    "# branch.ab +{} -{}",
+                    status_branch_ab_count(tracking.track.map(|track| track.ahead)),
+                    status_branch_ab_count(tracking.track.map(|track| track.behind))
+                ));
+            }
+            Ok(headers)
         }
         Some(RefTarget::Direct(oid)) => Ok(vec![
             format!("# branch.oid {}", oid.to_hex()),
@@ -37368,13 +37390,39 @@ fn status_porcelain_v2_branch_headers(git_dir: &Path, format: ObjectFormat) -> R
     }
 }
 
-fn status_branch_header(git_dir: &Path, format: ObjectFormat) -> Result<String> {
+fn status_branch_header(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ahead_behind: bool,
+) -> Result<String> {
     let store = FileRefStore::new(git_dir, format);
     match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(target)) => {
             if let Some(branch) = target.strip_prefix("refs/heads/") {
-                if store.read_ref(&target)?.is_some() {
-                    Ok(format!("## {branch}"))
+                if let Some(RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                    let mut header = format!("## {branch}");
+                    if let Some(tracking) = status_branch_tracking(
+                        git_dir,
+                        format,
+                        &store,
+                        &target,
+                        &oid,
+                        ahead_behind,
+                    )? {
+                        header.push_str("...");
+                        header.push_str(&tracking.upstream);
+                        if let Some(track) = tracking.track {
+                            if track.ahead > 0 || track.behind > 0 {
+                                header.push(' ');
+                                let mut suffix = Vec::new();
+                                write_for_each_ref_track(&mut suffix, track, true)?;
+                                header.push_str(&String::from_utf8_lossy(&suffix));
+                            }
+                        } else {
+                            header.push_str(" [different]");
+                        }
+                    }
+                    Ok(header)
                 } else {
                     Ok(format!("## No commits yet on {branch}"))
                 }
@@ -37384,6 +37432,59 @@ fn status_branch_header(git_dir: &Path, format: ObjectFormat) -> Result<String> 
         }
         Some(RefTarget::Direct(_)) | None => Ok("## HEAD (no branch)".into()),
     }
+}
+
+struct StatusBranchTracking {
+    upstream: String,
+    track: Option<ForEachRefTrack>,
+}
+
+fn status_branch_tracking(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    branch_ref: &str,
+    oid: &ObjectId,
+    ahead_behind: bool,
+) -> Result<Option<StatusBranchTracking>> {
+    let config = read_repo_config(git_dir)?;
+    let Some(upstream) = for_each_ref_upstream(&config, branch_ref) else {
+        return Ok(None);
+    };
+    let db = FileObjectDatabase::new(repository_objects_dir(git_dir), format);
+    let track = if ahead_behind {
+        for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname)?
+    } else {
+        status_branch_tracking_without_ahead_behind(store, oid, &upstream.refname)?
+    };
+    Ok(Some(StatusBranchTracking {
+        upstream: for_each_ref_short_name(&upstream.refname).to_string(),
+        track,
+    }))
+}
+
+fn status_branch_tracking_without_ahead_behind(
+    store: &FileRefStore,
+    oid: &ObjectId,
+    upstream: &str,
+) -> Result<Option<ForEachRefTrack>> {
+    let Some(RefTarget::Direct(upstream_oid)) = store.read_ref(upstream)? else {
+        return Ok(None);
+    };
+    if oid == &upstream_oid {
+        Ok(Some(ForEachRefTrack {
+            ahead: 0,
+            behind: 0,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
+fn status_branch_ab_count(count: Option<usize>) -> String {
+    count
+        .map(|count| count.to_string())
+        .unwrap_or_else(|| "?".into())
 }
 
 fn cmd_tag(args: &[String]) -> Result<()> {

@@ -455,6 +455,86 @@ fn status_show_stash_matches_upstream_git() {
 }
 
 #[test]
+fn status_branch_ahead_behind_matches_upstream_git() {
+    let root = unique_temp_dir("status-branch-ahead-behind");
+    let remote = root.join("remote.git");
+    let work = root.join("work");
+    let peer = root.join("peer");
+    fs::create_dir_all(&root).expect("create temp root");
+    let remote_arg = remote.to_string_lossy().into_owned();
+    let work_arg = work.to_string_lossy().into_owned();
+    let peer_arg = peer.to_string_lossy().into_owned();
+    let result = (|| {
+        git(
+            &root,
+            &["init", "-q", "--bare", "--initial-branch=main", &remote_arg],
+        );
+        git(&root, &["clone", "-q", &remote_arg, &work_arg]);
+        git(&work, &["config", "user.name", "Example User"]);
+        git(&work, &["config", "user.email", "example@example.invalid"]);
+        fs::write(work.join("a.txt"), b"base\n").expect("write base fixture");
+        git(&work, &["add", "a.txt"]);
+        git(&work, &["commit", "-m", "base", "-q"]);
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+
+        for args in [
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--short", "--branch", "--no-ahead-behind"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
+        ] {
+            let expected = git(&work, &args);
+            let actual = git_rs(&work, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs clean tracking header differed for {args:?}"
+            );
+        }
+
+        fs::write(work.join("a.txt"), b"local\n").expect("write local fixture");
+        git(&work, &["commit", "-am", "local", "-q"]);
+        for args in [
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--short", "--branch", "--no-ahead-behind"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
+        ] {
+            let expected = git(&work, &args);
+            let actual = git_rs(&work, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs ahead tracking header differed for {args:?}"
+            );
+        }
+
+        git(&root, &["clone", "-q", &remote_arg, &peer_arg]);
+        git(&peer, &["config", "user.name", "Example User"]);
+        git(&peer, &["config", "user.email", "example@example.invalid"]);
+        fs::write(peer.join("b.txt"), b"remote\n").expect("write remote fixture");
+        git(&peer, &["add", "b.txt"]);
+        git(&peer, &["commit", "-m", "remote", "-q"]);
+        git(&peer, &["push", "-q"]);
+        git(&work, &["fetch", "-q"]);
+
+        for args in [
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--short", "--branch", "--no-ahead-behind"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
+        ] {
+            let expected = git(&work, &args);
+            let actual = git_rs(&work, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs divergent tracking header differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");
