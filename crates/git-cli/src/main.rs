@@ -20983,6 +20983,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut allow_empty = false;
     let mut allow_empty_message = false;
+    let mut author_override = None;
+    let mut author_date = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21034,6 +21036,24 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-allow-empty" => allow_empty = false,
             "--allow-empty-message" => allow_empty_message = true,
             "--no-allow-empty-message" => allow_empty_message = false,
+            "--author" => {
+                let Some(author) = iter.next() else {
+                    return commit_author_requires_value_error();
+                };
+                author_override = Some(author.to_string());
+            }
+            value if value.starts_with("--author=") => {
+                author_override = Some(value["--author=".len()..].to_string());
+            }
+            "--date" => {
+                let Some(date) = iter.next() else {
+                    return commit_date_requires_value_error();
+                };
+                author_date = Some(date.to_string());
+            }
+            value if value.starts_with("--date=") => {
+                author_date = Some(value["--date=".len()..].to_string());
+            }
             "-n" | "--no-verify" | "--verify" => {}
             "--no-gpg-sign" => {}
             value => {
@@ -21052,7 +21072,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let author = commit_identity_from_env("AUTHOR")?;
+    let author = build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let message =
         file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks));
@@ -21087,6 +21107,16 @@ fn cmd_commit(args: &[String]) -> Result<()> {
 
 fn commit_message_requires_value_error() -> Result<()> {
     eprintln!("error: switch `m' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_author_requires_value_error() -> Result<()> {
+    eprintln!("error: option `author' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_date_requires_value_error() -> Result<()> {
+    eprintln!("error: option `date' requires a value");
     Err(GitError::Exit(129))
 }
 
@@ -39075,6 +39105,40 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
         env::var(format!("GIT_{role}_EMAIL")).unwrap_or_else(|_| "git-rs@example.invalid".into());
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     git_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Result<Vec<u8>> {
+    let (name, email) = if let Some(author) = author {
+        parse_commit_author(author)?
+    } else {
+        (
+            env::var("GIT_AUTHOR_NAME").unwrap_or_else(|_| "Git Rs".into()),
+            env::var("GIT_AUTHOR_EMAIL").unwrap_or_else(|_| "git-rs@example.invalid".into()),
+        )
+    };
+    let date = date
+        .map(str::to_string)
+        .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
+    git_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+fn parse_commit_author(author: &str) -> Result<(String, String)> {
+    let Some((name, rest)) = author.rsplit_once('<') else {
+        return commit_invalid_author_error(author);
+    };
+    let Some(email) = rest.strip_suffix('>') else {
+        return commit_invalid_author_error(author);
+    };
+    let name = name.trim_end();
+    if name.is_empty() || email.is_empty() {
+        return commit_invalid_author_error(author);
+    }
+    Ok((name.to_string(), email.to_string()))
+}
+
+fn commit_invalid_author_error(author: &str) -> Result<(String, String)> {
+    eprintln!("fatal: --author '{author}' is not 'Name <email>' and matches no existing author");
+    Err(GitError::Exit(128))
 }
 
 fn commit_signoff_from_env() -> Result<Vec<u8>> {

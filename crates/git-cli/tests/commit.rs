@@ -369,6 +369,81 @@ fn commit_allow_empty_matches_upstream_git_objects() {
 }
 
 #[test]
+fn commit_author_and_date_options_match_upstream_git_objects() {
+    let root = unique_temp_dir("commit-author-date");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            (
+                "author-long",
+                vec![
+                    "commit",
+                    "--author",
+                    "Other User <other@example.invalid>",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "author-equals",
+                vec![
+                    "commit",
+                    "--author=Other User <other@example.invalid>",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "date-long",
+                vec!["commit", "--date", "@123 +0230", "-m", "subject"],
+            ),
+            (
+                "date-equals",
+                vec!["commit", "--date=@123456 -0700", "-m", "subject"],
+            ),
+            (
+                "author-and-date",
+                vec![
+                    "commit",
+                    "--author=Other User <other@example.invalid>",
+                    "--date=@123 +0230",
+                    "-m",
+                    "subject",
+                ],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            prepare_commit_repo(&expected_root);
+            prepare_commit_repo(&actual_root);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            assert!(
+                expected.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&expected.stderr)
+            );
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert!(
+                actual.status.success(),
+                "git-rs {args:?} failed: {}",
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            assert_eq!(
+                cat_head("git", &actual_root),
+                cat_head("git", &expected_root),
+                "committed object differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn commit_tree_argument_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-argument-errors");
     fs::create_dir_all(&root).expect("create temp repo");
