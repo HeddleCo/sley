@@ -6232,6 +6232,7 @@ fn print_stash_list_format(
     format: &str,
     abbrev_len: Option<usize>,
 ) -> Result<()> {
+    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
     let mut chars = format.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '%' {
@@ -6247,6 +6248,8 @@ fn print_stash_list_format(
             Some('g') => match chars.next() {
                 Some('d') => print!("stash@{{{index}}}"),
                 Some('D') => print!("refs/stash@{{{index}}}"),
+                Some('n' | 'N') => print!("{reflog_name}"),
+                Some('e' | 'E') => print!("{reflog_email}"),
                 Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
                 Some(other) => {
                     return Err(GitError::Unsupported(format!(

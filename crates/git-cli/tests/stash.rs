@@ -155,6 +155,7 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--format=%s"],
             vec!["stash", "list", "--format=literal %% %n%gs"],
             vec!["stash", "list", "--pretty=format:%h %gd %gs"],
+            vec!["stash", "list", "--format=%gn <%ge> %gN <%gE> %gs"],
             vec!["stash", "list", "--format=%gd"],
             vec!["stash", "list", "--format=%gD"],
             vec!["stash", "list", "--format=%gs"],
