@@ -35858,25 +35858,7 @@ fn cmd_tag(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
     if args.is_empty() {
-        print_tag_list(
-            &git_dir,
-            format,
-            &store,
-            TagListOptions {
-                patterns: &[],
-                ignore_case: false,
-                sorts: &[],
-                format_spec: None,
-                annotation_lines: None,
-                omit_empty: false,
-                color: false,
-                column: TagListColumn::None,
-                points_at: None,
-                contains: None,
-                merged: None,
-            },
-        )?;
-        return Ok(());
+        return print_default_tag_list(&git_dir, format, &store);
     }
 
     let mut annotated = false;
@@ -35901,6 +35883,7 @@ fn cmd_tag(args: &[String]) -> Result<()> {
     let mut trailers = Vec::new();
     let mut create_reflog = false;
     let mut cleanup_mode = TagCleanupMode::Strip;
+    let mut empty_file_noop = false;
     let mut positional = Vec::new();
     let mut iter = args.iter().peekable();
     while let Some(arg) = iter.next() {
@@ -36231,7 +36214,12 @@ fn cmd_tag(args: &[String]) -> Result<()> {
                 file_message = Some(read_commit_message_file(&value[2..])?);
             }
             value if value.starts_with("--file=") => {
-                file_message = Some(read_commit_message_file(&value["--file=".len()..])?);
+                let path = &value["--file=".len()..];
+                if path.is_empty() {
+                    empty_file_noop = true;
+                } else {
+                    file_message = Some(read_commit_message_file(path)?);
+                }
             }
             value if value.starts_with("--cleanup=") => {
                 cleanup_mode = parse_tag_cleanup_mode(&value["--cleanup=".len()..])?;
@@ -36259,6 +36247,32 @@ fn cmd_tag(args: &[String]) -> Result<()> {
     }
     if !messages.is_empty() || file_message.is_some() || !trailers.is_empty() {
         annotated = true;
+    }
+    if empty_file_noop
+        && positional.is_empty()
+        && !annotated
+        && !signed
+        && !force
+        && !delete
+        && !verify
+        && !list
+        && !explicit_list
+        && !ignore_case
+        && sorts.is_empty()
+        && format_spec.is_none()
+        && annotation_lines.is_none()
+        && !omit_empty
+        && !color
+        && column == TagListColumn::None
+        && points_at.is_none()
+        && contains.is_none()
+        && merged.is_none()
+        && messages.is_empty()
+        && file_message.is_none()
+        && trailers.is_empty()
+        && !create_reflog
+    {
+        return print_default_tag_list(&git_dir, format, &store);
     }
     if verify {
         if explicit_list {
@@ -36388,6 +36402,31 @@ fn cmd_tag(args: &[String]) -> Result<()> {
         })?;
     }
     Ok(())
+}
+
+fn print_default_tag_list(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+) -> Result<()> {
+    print_tag_list(
+        git_dir,
+        format,
+        store,
+        TagListOptions {
+            patterns: &[],
+            ignore_case: false,
+            sorts: &[],
+            format_spec: None,
+            annotation_lines: None,
+            omit_empty: false,
+            color: false,
+            column: TagListColumn::None,
+            points_at: None,
+            contains: None,
+            merged: None,
+        },
+    )
 }
 
 fn delete_tags(store: &FileRefStore, tags: &[String]) -> Result<()> {

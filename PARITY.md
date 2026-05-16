@@ -941,7 +941,8 @@ Target: upstream Git 2.54.0.
   `--cleanup=verbatim`, and `--no-cleanup`, tag `--no-edit` no-op parsing for
   covered non-editor creation paths, tag `--edit` / `-e` creation parsing for
   covered message-provided and no-message editor-noop paths, annotated tag
-  no-message fatal handling and trailer-only message creation,
+  no-message fatal handling and trailer-only message creation, empty
+  `--file=` no-op handling,
   `--no-local-user` no-op parsing plus
   missing-value errors for `-m` / `--message`, `-F` / `--file`, and
   `-u` / `--local-user`,

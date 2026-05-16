@@ -299,6 +299,7 @@ fn tag_create_errors_match_upstream_git() {
             vec!["tag", "--sort="],
             vec!["tag", "--sort=bogus"],
             vec!["tag", "--sort=-bogus"],
+            vec!["tag", "--file="],
             vec!["tag", "--delete", "--no-delete", "missing"],
             vec!["tag", "--verify", "--no-verify", "missing"],
             vec!["tag", "--list", "--no-list"],
@@ -335,6 +336,20 @@ fn tag_file_messages_match_upstream_git_objects() {
             (
                 "long-file-equals",
                 vec!["tag", "--file=message-no-lf.txt", "long-file-equals"],
+            ),
+            (
+                "empty-file-equals",
+                vec!["tag", "--file=", "empty-file-equals"],
+            ),
+            (
+                "empty-file-after-message",
+                vec![
+                    "tag",
+                    "--message",
+                    "inline",
+                    "--file=",
+                    "empty-file-after-message",
+                ],
             ),
             (
                 "long-file",
