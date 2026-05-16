@@ -1,0 +1,497 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("git-rs-{name}-{}-{nanos}", std::process::id()))
+}
+
+fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run(env!("CARGO_BIN_EXE_git-rs"), cwd, args)
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
+    run("git", cwd, args)
+}
+
+#[test]
+fn status_z_matches_upstream_git() {
+    let root = unique_temp_dir("status-z");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("hello.txt"), b"hello\n").expect("write staged fixture");
+        fs::write(root.join("extra.txt"), b"extra\n").expect("write untracked fixture");
+        fs::create_dir_all(root.join("dir/sub")).expect("create untracked directory fixture");
+        fs::write(root.join("dir/a.txt"), b"a\n").expect("write untracked directory file");
+        fs::write(root.join("dir/sub/b.txt"), b"b\n").expect("write nested untracked file");
+        fs::create_dir_all(root.join("empty-dir")).expect("create empty directory fixture");
+        fs::create_dir_all(root.join("tracked-dir")).expect("create tracked directory fixture");
+        fs::write(root.join("tracked-dir/base.txt"), b"base\n").expect("write tracked dir fixture");
+        fs::write(root.join("tracked-dir/extra.txt"), b"extra\n")
+            .expect("write untracked file under tracked dir");
+        git(&root, &["add", "hello.txt", "tracked-dir/base.txt"]);
+
+        for args in [
+            vec!["status", "-s", "-z"],
+            vec!["status", "--short", "-z"],
+            vec!["status", "--short", "--branch"],
+            vec!["status", "-s", "-b"],
+            vec!["status", "-b", "-s"],
+            vec!["status", "-sb"],
+            vec!["status", "-bs"],
+            vec!["status", "--short", "--branch", "--no-branch"],
+            vec!["status", "-sb", "--no-branch"],
+            vec!["status", "--short", "--no-branch", "--branch"],
+            vec!["status", "--short", "--branch", "-z"],
+            vec!["status", "-sb", "-z"],
+            vec!["status", "-bs", "--null"],
+            vec!["status", "--short", "--branch", "--null"],
+            vec!["status", "--short", "--null", "--no-null"],
+            vec!["status", "--short", "-u"],
+            vec!["status", "--short", "-uno"],
+            vec!["status", "--short", "--untracked-files"],
+            vec!["status", "--short", "--untracked-files=no"],
+            vec!["status", "--short", "--no-untracked-files"],
+            vec![
+                "status",
+                "--short",
+                "--untracked-files=no",
+                "--untracked-files",
+            ],
+            vec![
+                "status",
+                "--short",
+                "--no-untracked-files",
+                "--untracked-files",
+            ],
+            vec![
+                "status",
+                "--short",
+                "--untracked-files",
+                "--untracked-files=no",
+            ],
+            vec![
+                "status",
+                "--short",
+                "--untracked-files",
+                "--no-untracked-files",
+            ],
+            vec!["status", "--short", "--untracked-files=no", "-z"],
+            vec!["status", "--short", "--no-untracked-files", "-z"],
+            vec!["status", "--short", "--branch", "--untracked-files=no"],
+            vec!["status", "--short", "--branch", "--no-untracked-files"],
+            vec!["status", "--short", "-unormal"],
+            vec!["status", "--short", "-uall"],
+            vec!["status", "--short", "--untracked-files=normal"],
+            vec!["status", "--short", "--untracked-files=all"],
+            vec!["status", "--short", "-uall", "-z"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--porcelain=1"],
+            vec!["status", "--porcelain", "-z"],
+            vec!["status", "--porcelain", "--null"],
+            vec!["status", "--porcelain", "--null", "--no-null"],
+            vec!["status", "--porcelain", "--branch"],
+            vec!["status", "--porcelain=1", "--branch"],
+            vec!["status", "--porcelain", "--branch", "--no-branch"],
+            vec!["status", "--porcelain", "--branch", "-z"],
+            vec!["status", "--porcelain", "--untracked-files"],
+            vec!["status", "--porcelain", "--untracked-files=all"],
+            vec!["status", "--porcelain", "--untracked-files=all", "-z"],
+            vec!["status", "--porcelain", "--untracked-files=no"],
+            vec!["status", "--porcelain", "--no-untracked-files"],
+            vec!["status", "--porcelain=1", "--untracked-files=no"],
+            vec!["status", "--porcelain=1", "--no-untracked-files"],
+            vec!["status", "--porcelain=v1", "-z"],
+            vec!["status", "--porcelain=v1", "--null"],
+            vec!["status", "--porcelain=v1", "--untracked-files"],
+            vec!["status", "--porcelain=v1", "--untracked-files=all"],
+            vec!["status", "--porcelain=v1", "--branch"],
+            vec!["status", "--porcelain=v1", "--branch", "-z"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=2"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "-z"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-branch"],
+            vec!["status", "--porcelain=v2", "-z"],
+            vec!["status", "--porcelain=v2", "--untracked-files=no"],
+            vec!["status", "--porcelain=v2", "--no-untracked-files"],
+            vec!["status", "--porcelain=v2", "--untracked-files=all", "-z"],
+            vec!["status", "-z"],
+            vec!["status", "--null"],
+            vec!["status", "--short", "--ignored=no"],
+            vec!["status", "--short", "--ignored"],
+            vec!["status", "--short", "--ignored=traditional"],
+            vec!["status", "--short", "--ignored=matching"],
+            vec!["status", "--short", "--no-ignored"],
+            vec!["status", "--porcelain", "--ignored=no"],
+            vec!["status", "--porcelain", "--ignored"],
+            vec!["status", "--porcelain", "--ignored=traditional"],
+            vec!["status", "--porcelain", "--ignored=matching"],
+            vec!["status", "--porcelain=v1", "--no-ignored"],
+            vec!["status", "--short", "--no-renames"],
+            vec!["status", "--short", "--renames"],
+            vec!["status", "--short", "-M"],
+            vec!["status", "--short", "-M20%"],
+            vec!["status", "--short", "--find-renames"],
+            vec!["status", "--short", "--find-renames=20%"],
+            vec!["status", "--short", "--find-renames=50%"],
+            vec!["status", "--short", "--find-renames=abc"],
+            vec!["status", "--porcelain", "--no-renames"],
+            vec!["status", "--porcelain", "--renames"],
+            vec!["status", "--porcelain", "-M"],
+            vec!["status", "--porcelain", "-M100%"],
+            vec!["status", "--porcelain", "--find-renames"],
+            vec!["status", "--porcelain", "--find-renames=20%"],
+            vec!["status", "--porcelain", "--find-renames=50%"],
+            vec!["status", "--short", "--ahead-behind"],
+            vec!["status", "--short", "--no-ahead-behind"],
+            vec!["status", "--short", "-v"],
+            vec!["status", "--short", "--verbose"],
+            vec!["status", "--short", "--verbose", "--no-verbose"],
+            vec!["status", "--porcelain", "--show-stash"],
+            vec!["status", "--porcelain", "--no-show-stash"],
+            vec!["status", "--porcelain", "--verbose"],
+            vec!["status", "--porcelain", "--no-verbose"],
+            vec!["status", "--short", "--column"],
+            vec!["status", "--short", "--no-column"],
+            vec!["status", "--short", "--column=auto"],
+            vec!["status", "--short", "--column=never"],
+            vec!["status", "--short", "--column=plain"],
+            vec!["status", "--porcelain", "--column=auto"],
+            vec!["status", "--porcelain", "--column=never"],
+            vec!["status", "--porcelain", "--column=plain"],
+            vec!["status", "--short", "--ignore-submodules"],
+            vec!["status", "--short", "--ignore-submodules=none"],
+            vec!["status", "--short", "--ignore-submodules=untracked"],
+            vec!["status", "--short", "--ignore-submodules=dirty"],
+            vec!["status", "--short", "--ignore-submodules=all"],
+            vec!["status", "--porcelain", "--ignore-submodules"],
+            vec!["status", "--porcelain", "--ignore-submodules=all"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_porcelain_v2_tracked_changes_match_upstream_git() {
+    let root = unique_temp_dir("status-v2-tracked");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("staged-delete.txt"), b"delete\n").expect("write delete fixture");
+        fs::write(root.join("worktree-delete.txt"), b"delete\n").expect("write delete fixture");
+        fs::write(root.join("staged-modify.txt"), b"base\n").expect("write modify fixture");
+        fs::write(root.join("worktree-modify.txt"), b"base\n").expect("write modify fixture");
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::write(root.join("staged-add.txt"), b"add\n").expect("write add fixture");
+        fs::write(root.join("staged-modify.txt"), b"staged\n").expect("write staged modify");
+        fs::write(root.join("worktree-modify.txt"), b"worktree\n").expect("write worktree modify");
+        fs::write(root.join("untracked.txt"), b"untracked\n").expect("write untracked fixture");
+        fs::remove_file(root.join("worktree-delete.txt")).expect("remove worktree delete fixture");
+        git(&root, &["add", "staged-add.txt", "staged-modify.txt"]);
+        git(&root, &["rm", "-q", "staged-delete.txt"]);
+
+        for args in [
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=2"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "-z"],
+            vec!["status", "--porcelain=v2", "--untracked-files=no"],
+            vec![
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--untracked-files=no",
+            ],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_hides_root_gitignore_matches_like_upstream_git() {
+    let root = unique_temp_dir("status-gitignore");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(
+            root.join(".gitignore"),
+            b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\n*.log\n!important.log\nignored-dir/\n",
+        )
+        .expect("write gitignore");
+        fs::write(
+            root.join(".git/info/exclude"),
+            b"*.cache\n!important.cache\ninfo-dir/\n",
+        )
+        .expect("write exclude");
+        fs::write(
+            root.join("global-excludes"),
+            b"*.global\n!important.global\n",
+        )
+        .expect("write configured excludes");
+        git(&root, &["config", "core.excludesFile", "global-excludes"]);
+        fs::write(root.join("ignored.log"), b"ignored\n").expect("write ignored fixture");
+        fs::write(root.join("ignored.cache"), b"ignored\n").expect("write info ignored fixture");
+        fs::write(root.join("ignored.global"), b"ignored\n").expect("write global ignored fixture");
+        fs::write(root.join("#ignored.hash"), b"ignored\n").expect("write escaped hash fixture");
+        fs::write(root.join("!ignored.bang"), b"ignored\n").expect("write escaped bang fixture");
+        fs::write(root.join("*.literal"), b"ignored\n").expect("write escaped star fixture");
+        fs::write(root.join("wild.literal"), b"visible\n")
+            .expect("write escaped star visible fixture");
+        fs::write(root.join("literal-?.tmp"), b"ignored\n")
+            .expect("write escaped question fixture");
+        fs::write(root.join("literal-a.tmp"), b"visible\n")
+            .expect("write escaped question visible fixture");
+        fs::write(root.join("literal-[ab].tmp"), b"ignored\n")
+            .expect("write escaped class fixture");
+        fs::write(root.join("trailing.log"), b"ignored\n").expect("write trailing-space fixture");
+        fs::write(root.join("literal-space "), b"ignored\n").expect("write literal-space fixture");
+        fs::write(root.join("class-a.tmp"), b"ignored\n").expect("write class fixture");
+        fs::write(root.join("class-c.tmp"), b"visible\n").expect("write class visible fixture");
+        fs::write(root.join("range-1.tmp"), b"ignored\n").expect("write range fixture");
+        fs::write(root.join("range-9.tmp"), b"visible\n").expect("write range visible fixture");
+        fs::write(root.join("negclass-a.tmp"), b"ignored\n").expect("write negated class fixture");
+        fs::write(root.join("negclass-z.tmp"), b"visible\n")
+            .expect("write negated class visible fixture");
+        fs::write(root.join("important.log"), b"visible\n").expect("write negated fixture");
+        fs::write(root.join("important.cache"), b"visible\n").expect("write info negated fixture");
+        fs::write(root.join("important.global"), b"visible\n")
+            .expect("write global negated fixture");
+        fs::write(root.join("visible.tmp"), b"visible\n").expect("write visible fixture");
+        fs::create_dir_all(root.join("ignored-dir")).expect("create ignored dir");
+        fs::write(root.join("ignored-dir/file.txt"), b"ignored\n").expect("write ignored dir file");
+        fs::create_dir_all(root.join("info-dir")).expect("create info ignored dir");
+        fs::write(root.join("info-dir/file.txt"), b"ignored\n").expect("write info ignored file");
+        fs::create_dir_all(root.join("local")).expect("create local ignore dir");
+        fs::write(
+            root.join("local/.gitignore"),
+            b"*.local\n!important.local\n",
+        )
+        .expect("write local gitignore");
+        fs::write(root.join("local/hidden.local"), b"ignored\n").expect("write local ignored file");
+        fs::write(root.join("local/important.local"), b"visible\n")
+            .expect("write local negated file");
+        fs::write(root.join("local/tracked.txt"), b"tracked\n").expect("write local tracked file");
+        git(&root, &["add", "local/tracked.txt"]);
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--short", "-z"],
+            vec!["status", "--porcelain=v2", "-z"],
+            vec!["status", "--short", "--ignored"],
+            vec!["status", "--short", "--ignored=traditional"],
+            vec!["status", "--short", "--ignored=matching"],
+            vec!["status", "--short", "--ignored", "--no-ignored"],
+            vec!["status", "--short", "--ignored", "--ignored=no"],
+            vec!["status", "--porcelain", "--ignored"],
+            vec!["status", "--porcelain", "--ignored", "-z"],
+            vec!["status", "--porcelain=v2", "--ignored"],
+            vec!["status", "--porcelain=v2", "--ignored", "-z"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs ignored-file output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_pathspecs_match_upstream_git() {
+    let root = unique_temp_dir("status-pathspecs");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::create_dir_all(root.join("dir")).expect("create dir fixture");
+        fs::create_dir_all(root.join("other")).expect("create other fixture");
+        fs::write(root.join("a.txt"), b"base\n").expect("write root fixture");
+        fs::write(root.join("dir/b.txt"), b"base\n").expect("write dir fixture");
+        fs::write(root.join("other/c.txt"), b"base\n").expect("write other fixture");
+        git(&root, &["add", "a.txt", "dir/b.txt", "other/c.txt"]);
+        fs::write(root.join("a.txt"), b"modified\n").expect("modify root fixture");
+        fs::write(root.join("dir/b.txt"), b"modified\n").expect("modify dir fixture");
+        fs::write(root.join("dir/u.txt"), b"untracked\n").expect("write dir untracked fixture");
+        fs::write(root.join("v.txt"), b"untracked\n").expect("write root untracked fixture");
+
+        for args in [
+            vec!["status", "--short", "a.txt"],
+            vec!["status", "--short", "dir"],
+            vec!["status", "--short", "dir/"],
+            vec!["status", "--short", "missing"],
+            vec!["status", "--short", "--", "a.txt"],
+            vec!["status", "--short", "--", "dir", "--ignored"],
+            vec!["status", "--porcelain", "dir"],
+            vec!["status", "--porcelain=v2", "dir"],
+            vec!["status", "--short", "-z", "dir"],
+            vec!["status", "--porcelain=v2", "-z", "dir"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs pathspec output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_nested_cwd_paths_match_upstream_git() {
+    let root = unique_temp_dir("status-nested-cwd");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::create_dir_all(root.join("dir")).expect("create dir fixture");
+        fs::create_dir_all(root.join("other")).expect("create other fixture");
+        fs::write(root.join("dir/a.txt"), b"base\n").expect("write dir fixture");
+        fs::write(root.join("other/b.txt"), b"base\n").expect("write other fixture");
+        git(&root, &["add", "dir/a.txt", "other/b.txt"]);
+        fs::write(root.join("dir/a.txt"), b"modified\n").expect("modify dir fixture");
+        fs::write(root.join("other/b.txt"), b"modified\n").expect("modify other fixture");
+        fs::write(root.join("dir/u.txt"), b"untracked\n").expect("write dir untracked fixture");
+        fs::write(root.join("root.txt"), b"untracked\n").expect("write root untracked fixture");
+
+        let cwd = root.join("dir");
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--short", "."],
+            vec!["status", "--short", "a.txt"],
+            vec!["status", "--short", "../other"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--porcelain=v2", "."],
+            vec!["status", "--short", "-z"],
+            vec!["status", "--short", "-z", "../other"],
+            vec!["status", "--porcelain=v2", "-z"],
+        ] {
+            let expected = git(&cwd, &args);
+            let actual = git_rs(&cwd, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs nested-cwd output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_quoted_paths_match_upstream_git() {
+    let root = unique_temp_dir("status-quoted-paths");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (case, path) in [
+            ("space", "space name.txt"),
+            ("quote", "quote\"name.txt"),
+            ("tab", "tab\tname.txt"),
+        ] {
+            let repo = root.join(case);
+            fs::create_dir_all(&repo).expect("create case repo");
+            git(&repo, &["init", "-q"]);
+            fs::write(repo.join(path), b"initial\n").expect("write untracked fixture");
+
+            for args in [
+                vec!["status", "--short"],
+                vec!["status", "--porcelain"],
+                vec!["status", "--porcelain=v2"],
+                vec!["status", "--short", "-z"],
+                vec!["status", "--porcelain=v2", "-z"],
+            ] {
+                let expected = git(&repo, &args);
+                let actual = git_rs(&repo, &args);
+                assert_eq!(
+                    actual, expected,
+                    "git-rs untracked output differed for {args:?} path {path:?}"
+                );
+            }
+
+            git(&repo, &["add", path]);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "-m",
+                    "base",
+                    "-q",
+                ],
+            );
+            fs::write(repo.join(path), b"modified\n").expect("modify tracked fixture");
+
+            for args in [
+                vec!["status", "--short"],
+                vec!["status", "--porcelain"],
+                vec!["status", "--porcelain=v2"],
+                vec!["status", "--short", "-z"],
+                vec!["status", "--porcelain=v2", "-z"],
+            ] {
+                let expected = git(&repo, &args);
+                let actual = git_rs(&repo, &args);
+                assert_eq!(
+                    actual, expected,
+                    "git-rs tracked output differed for {args:?} path {path:?}"
+                );
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}

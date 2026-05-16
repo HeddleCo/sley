@@ -1,0 +1,30 @@
+[workspace]
+members = [
+    "crates/git-core",
+    "crates/git-formats",
+    "crates/git-odb",
+    "crates/git-refs",
+    "crates/git-rev",
+    "crates/git-worktree",
+    "crates/git-diff-merge",
+    "crates/git-sequencer",
+    "crates/git-pack",
+    "crates/git-transport",
+    "crates/git-cli",
+    "crates/git-testkit",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+

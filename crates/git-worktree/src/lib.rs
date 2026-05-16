@@ -1,0 +1,4206 @@
+use git_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use git_formats::{
+    Commit, EncodedObject, GitConfig, Index, IndexEntry, ObjectType, Tree, TreeEntry,
+    tree_entry_object_type,
+};
+use git_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
+use git_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+use std::{env, fs};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeStatus {
+    Clean,
+    Modified(RepoPath),
+    Added(RepoPath),
+    Deleted(RepoPath),
+    Untracked(RepoPath),
+}
+
+pub trait WorktreeScanner {
+    fn status(&self) -> Result<Vec<WorktreeStatus>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SparseCheckout {
+    pub patterns: Vec<Vec<u8>>,
+    pub sparse_index: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateIndexResult {
+    pub entries: usize,
+    pub updated: Vec<ObjectId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheInfoEntry {
+    pub mode: u32,
+    pub oid: ObjectId,
+    pub path: Vec<u8>,
+    pub stage: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexInfoRecord {
+    Add(CacheInfoEntry),
+    Remove { path: Vec<u8> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpdateIndexOptions {
+    pub add: bool,
+    pub remove: bool,
+    pub force_remove: bool,
+    pub chmod: Option<bool>,
+    pub info_only: bool,
+    pub ignore_skip_worktree_entries: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WriteTreeOptions {
+    pub missing_ok: bool,
+    pub prefix: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShortStatusEntry {
+    pub index: u8,
+    pub worktree: u8,
+    pub path: Vec<u8>,
+    pub head_mode: Option<u32>,
+    pub index_mode: Option<u32>,
+    pub worktree_mode: Option<u32>,
+    pub head_oid: Option<ObjectId>,
+    pub index_oid: Option<ObjectId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusUntrackedMode {
+    #[default]
+    All,
+    Normal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ShortStatusOptions {
+    pub include_ignored: bool,
+    pub untracked_mode: StatusUntrackedMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckoutResult {
+    pub branch: String,
+    pub oid: ObjectId,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreResult {
+    pub restored: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveResult {
+    pub removed: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveResult {
+    pub source: Vec<u8>,
+    pub destination: Vec<u8>,
+    pub skipped: bool,
+    pub fatal: Option<String>,
+    pub details: Vec<MoveDetail>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveDetail {
+    pub source: Vec<u8>,
+    pub destination: Vec<u8>,
+    pub skipped: bool,
+}
+
+pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
+    env::var_os("GIT_INDEX_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| git_dir.as_ref().join("index"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveOptions {
+    pub recursive: bool,
+    pub cached: bool,
+    pub force: bool,
+    pub dry_run: bool,
+    pub ignore_unmatch: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveOptions {
+    pub force: bool,
+    pub dry_run: bool,
+    pub skip_errors: bool,
+}
+
+impl ShortStatusEntry {
+    pub fn line(&self) -> String {
+        format!(
+            "{}{} {}",
+            self.index as char,
+            self.worktree as char,
+            String::from_utf8_lossy(&self.path)
+        )
+    }
+}
+
+pub fn add_paths_to_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<UpdateIndexResult> {
+    update_index_paths(
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        UpdateIndexOptions {
+            add: true,
+            remove: false,
+            force_remove: false,
+            chmod: None,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+        },
+    )
+}
+
+pub fn update_index_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut updated = Vec::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if options.force_remove {
+            index.entries.retain(|existing| existing.path != git_path);
+            continue;
+        }
+        if let Some(existing) = index
+            .entries
+            .iter()
+            .find(|existing| existing.path == git_path)
+            && index_entry_skip_worktree(existing)
+        {
+            if options.remove && !options.ignore_skip_worktree_entries {
+                index.entries.retain(|existing| existing.path != git_path);
+            }
+            continue;
+        }
+        if !absolute.exists() {
+            if options.remove {
+                index.entries.retain(|existing| existing.path != git_path);
+                continue;
+            }
+            print_update_index_path_error(&git_path, "does not exist and --remove not passed");
+            return Err(GitError::Exit(128));
+        }
+        if !options.add
+            && !index
+                .entries
+                .iter()
+                .any(|existing| existing.path == git_path)
+        {
+            print_update_index_path_error(
+                &git_path,
+                "cannot add to the index - missing --add option?",
+            );
+            return Err(GitError::Exit(128));
+        }
+        let body = fs::read(&absolute)?;
+        let object = EncodedObject::new(ObjectType::Blob, body);
+        let oid = if options.info_only {
+            object.object_id(format)?
+        } else {
+            odb.write_object(object)?
+        };
+        let metadata = fs::metadata(&absolute)?;
+        let mut entry = index_entry_from_metadata(git_path.clone(), oid.clone(), &metadata);
+        if let Some(executable) = options.chmod {
+            entry.mode = if executable { 0o100755 } else { 0o100644 };
+        }
+        index.entries.retain(|existing| existing.path != git_path);
+        index.entries.push(entry);
+        updated.push(oid);
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    normalize_index_version_for_extended_flags(&mut index);
+    index.extensions = index_extensions_without_cache_tree(&index.extensions);
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated,
+    })
+}
+
+pub fn refresh_index_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    quiet: bool,
+    ignore_missing: bool,
+    really_refresh: bool,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(UpdateIndexResult {
+            entries: 0,
+            updated: Vec::new(),
+        });
+    }
+    let mut index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let selected_paths = paths
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            git_path_bytes(relative)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected_paths = selected_paths.into_iter().collect::<BTreeSet<_>>();
+    let mut needs_update = false;
+    for entry in &mut index.entries {
+        if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        let selected_for_update =
+            !selected_paths.is_empty() && selected_paths.contains(&entry.path);
+        if entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0 {
+            if !really_refresh {
+                continue;
+            }
+            entry.flags &= !INDEX_FLAG_ASSUME_UNCHANGED;
+        }
+        let absolute = worktree_root.join(repo_path_to_os_path(&entry.path)?);
+        let Ok(metadata) = fs::metadata(&absolute) else {
+            if ignore_missing {
+                continue;
+            }
+            if !quiet {
+                print_update_index_needs_update(&entry.path);
+            }
+            needs_update = true;
+            continue;
+        };
+        if !metadata.is_file() {
+            if !quiet {
+                print_update_index_needs_update(&entry.path);
+            }
+            needs_update = true;
+            continue;
+        }
+        let body = fs::read(&absolute)?;
+        let object = EncodedObject::new(ObjectType::Blob, body);
+        let oid = object.object_id(format)?;
+        if oid != entry.oid || file_mode(&metadata) != entry.mode {
+            if !quiet {
+                print_update_index_needs_update(&entry.path);
+            }
+            needs_update = true;
+            if selected_for_update {
+                *entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+            }
+            continue;
+        }
+        *entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
+    }
+    fs::write(&index_path, index.write_sha1()?)?;
+    if needs_update && !quiet {
+        return Err(GitError::Exit(1));
+    }
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+pub fn update_index_again(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(UpdateIndexResult {
+            entries: 0,
+            updated: Vec::new(),
+        });
+    }
+    let index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_entries = head_tree_entries(git_dir, format, &db)?;
+    let selected_paths = selected_git_paths(worktree_root, paths)?;
+    let mut again_paths = Vec::new();
+    for entry in &index.entries {
+        if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        if !selected_paths.is_empty() && !git_path_selected(&entry.path, &selected_paths) {
+            continue;
+        }
+        let differs_from_head = match head_entries.get(&entry.path) {
+            Some(head_entry) => head_entry.oid != entry.oid || head_entry.mode != entry.mode,
+            None => true,
+        };
+        if differs_from_head {
+            again_paths.push(worktree_root.join(repo_path_to_os_path(&entry.path)?));
+        }
+    }
+    if again_paths.is_empty() {
+        return Ok(UpdateIndexResult {
+            entries: index.entries.len(),
+            updated: Vec::new(),
+        });
+    }
+    update_index_paths(worktree_root, git_dir, format, &again_paths, options)
+}
+
+pub fn set_index_assume_unchanged_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    assume_unchanged: bool,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let selected_paths = paths
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            git_path_bytes(relative)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for path in selected_paths {
+        if let Some(entry) = index.entries.iter_mut().find(|entry| entry.path == path) {
+            if assume_unchanged {
+                entry.flags |= INDEX_FLAG_ASSUME_UNCHANGED;
+            } else {
+                entry.flags &= !INDEX_FLAG_ASSUME_UNCHANGED;
+            }
+        }
+    }
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+fn selected_git_paths(worktree_root: &Path, paths: &[PathBuf]) -> Result<BTreeSet<Vec<u8>>> {
+    paths
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            git_path_bytes(relative)
+        })
+        .collect()
+}
+
+fn git_path_selected(path: &[u8], selected_paths: &BTreeSet<Vec<u8>>) -> bool {
+    selected_paths
+        .iter()
+        .any(|selected| path == selected || index_entry_is_under_path(path, selected))
+}
+
+pub fn set_index_skip_worktree_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    skip_worktree: bool,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let selected_paths = paths
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            git_path_bytes(relative)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for path in selected_paths {
+        if let Some(entry) = index.entries.iter_mut().find(|entry| entry.path == path) {
+            if skip_worktree {
+                entry.flags |= INDEX_FLAG_EXTENDED;
+                entry.flags_extended |= INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+            } else {
+                entry.flags_extended &= !INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+                if entry.flags_extended == 0 {
+                    entry.flags &= !INDEX_FLAG_EXTENDED;
+                }
+            }
+        }
+    }
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+pub fn set_index_fsmonitor_valid_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    _fsmonitor_valid: bool,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let selected_paths = paths
+        .iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                worktree_root.join(path)
+            };
+            let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            git_path_bytes(relative)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for path in selected_paths {
+        if !index.entries.iter().any(|entry| entry.path == path) {
+            eprintln!(
+                "fatal: Unable to mark file {}",
+                String::from_utf8_lossy(&path)
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+pub fn set_index_version(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    version: u32,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    if !matches!(version, 2..=4) {
+        return Err(GitError::Unsupported(format!(
+            "update-index currently supports --index-version 2, 3, or 4, got {version}"
+        )));
+    }
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    index.version = version;
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+pub fn force_write_index(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated: Vec::new(),
+    })
+}
+
+fn index_extensions_without_cache_tree(extensions: &[u8]) -> Vec<u8> {
+    let mut offset = 0;
+    let mut filtered = Vec::new();
+    while offset < extensions.len() {
+        if extensions.len().saturating_sub(offset) < 8 {
+            return Vec::new();
+        }
+        let signature = &extensions[offset..offset + 4];
+        let size = u32::from_be_bytes([
+            extensions[offset + 4],
+            extensions[offset + 5],
+            extensions[offset + 6],
+            extensions[offset + 7],
+        ]) as usize;
+        let end = offset + 8 + size;
+        if end > extensions.len() {
+            return Vec::new();
+        }
+        if signature != b"TREE" {
+            filtered.extend_from_slice(&extensions[offset..end]);
+        }
+        offset = end;
+    }
+    filtered
+}
+
+pub fn update_index_cacheinfo(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    entries: &[CacheInfoEntry],
+    add: bool,
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let mut updated = Vec::new();
+    for cacheinfo in entries {
+        if !add
+            && !index
+                .entries
+                .iter()
+                .any(|existing| existing.path == cacheinfo.path)
+        {
+            let path = String::from_utf8_lossy(&cacheinfo.path);
+            eprintln!("error: {path}: cannot add to the index - missing --add option?");
+            eprintln!("fatal: git update-index: --cacheinfo cannot add {path}");
+            return Err(GitError::Exit(128));
+        }
+        let flags = index_flags(cacheinfo.path.len(), cacheinfo.stage);
+        let entry = IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: cacheinfo.mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: cacheinfo.oid.clone(),
+            flags,
+            flags_extended: 0,
+            path: cacheinfo.path.clone(),
+        };
+        index.entries.retain(|existing| {
+            existing.path != cacheinfo.path || index_entry_stage(existing) != cacheinfo.stage
+        });
+        index.entries.push(entry);
+        updated.push(cacheinfo.oid.clone());
+    }
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated,
+    })
+}
+
+pub fn update_index_index_info(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    records: &[IndexInfoRecord],
+) -> Result<UpdateIndexResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "update-index currently writes sha1 index entries".into(),
+        ));
+    }
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let mut updated = Vec::new();
+    for record in records {
+        match record {
+            IndexInfoRecord::Remove { path } => {
+                index.entries.retain(|existing| existing.path != *path);
+            }
+            IndexInfoRecord::Add(cacheinfo) => {
+                let flags = index_flags(cacheinfo.path.len(), cacheinfo.stage);
+                let entry = IndexEntry {
+                    ctime_seconds: 0,
+                    ctime_nanoseconds: 0,
+                    mtime_seconds: 0,
+                    mtime_nanoseconds: 0,
+                    dev: 0,
+                    ino: 0,
+                    mode: cacheinfo.mode,
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    oid: cacheinfo.oid.clone(),
+                    flags,
+                    flags_extended: 0,
+                    path: cacheinfo.path.clone(),
+                };
+                if cacheinfo.stage == 0 {
+                    index
+                        .entries
+                        .retain(|existing| existing.path != cacheinfo.path);
+                } else {
+                    index.entries.retain(|existing| {
+                        existing.path != cacheinfo.path
+                            || index_entry_stage(existing) != cacheinfo.stage
+                    });
+                }
+                index.entries.push(entry);
+                updated.push(cacheinfo.oid.clone());
+            }
+        }
+    }
+    index.entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
+    });
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(UpdateIndexResult {
+        entries: index.entries.len(),
+        updated,
+    })
+}
+
+fn index_flags(path_len: usize, stage: u16) -> u16 {
+    ((stage & 0x3) << 12) | ((path_len.min(0xfff) as u16) & 0x0fff)
+}
+
+const INDEX_FLAG_ASSUME_UNCHANGED: u16 = 0x8000;
+const INDEX_FLAG_EXTENDED: u16 = 0x4000;
+const INDEX_EXTENDED_FLAG_SKIP_WORKTREE: u16 = 0x4000;
+
+fn normalize_index_version_for_extended_flags(index: &mut Index) {
+    let has_extended_flags = index
+        .entries
+        .iter()
+        .any(|entry| entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0);
+    if has_extended_flags && index.version < 3 {
+        index.version = 3;
+    } else if !has_extended_flags && index.version == 3 {
+        index.version = 2;
+    }
+}
+
+fn index_entry_stage(entry: &IndexEntry) -> u16 {
+    (entry.flags >> 12) & 0x3
+}
+
+fn index_entry_skip_worktree(entry: &IndexEntry) -> bool {
+    entry.flags & INDEX_FLAG_EXTENDED != 0
+        && entry.flags_extended & INDEX_EXTENDED_FLAG_SKIP_WORKTREE != 0
+}
+
+fn print_update_index_path_error(path: &[u8], message: &str) {
+    let path = String::from_utf8_lossy(path);
+    eprintln!("error: {path}: {message}");
+    eprintln!("fatal: Unable to process path {path}");
+}
+
+fn print_update_index_needs_update(path: &[u8]) {
+    let path = String::from_utf8_lossy(path);
+    println!("{path}: needs update");
+}
+
+pub fn write_tree_from_index(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Result<ObjectId> {
+    write_tree_from_index_with_options(git_dir, format, WriteTreeOptions::default())
+}
+
+pub fn write_tree_from_index_with_options(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: WriteTreeOptions,
+) -> Result<ObjectId> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "write-tree currently reads sha1 index entries".into(),
+        ));
+    }
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let entries = write_tree_entries_for_prefix(&index.entries, options.prefix.as_deref())?;
+    let mut root = TreeNode::default();
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    if !options.missing_ok {
+        let mut missing = false;
+        for entry in &entries {
+            if !odb.contains(&entry.oid)? {
+                eprintln!(
+                    "error: invalid object {:o} {} for '{}'",
+                    entry.mode,
+                    entry.oid,
+                    String::from_utf8_lossy(&entry.path)
+                );
+                missing = true;
+            }
+        }
+        if missing {
+            eprintln!("fatal: git-write-tree: error building trees");
+            return Err(GitError::Exit(128));
+        }
+    }
+    for entry in &entries {
+        root.insert(entry)?;
+    }
+    let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    write_tree_node(&root, &mut odb)
+}
+
+fn write_tree_entries_for_prefix(
+    entries: &[IndexEntry],
+    prefix: Option<&[u8]>,
+) -> Result<Vec<IndexEntry>> {
+    let Some(prefix) = prefix else {
+        return Ok(entries.to_vec());
+    };
+    let trimmed_len = prefix
+        .iter()
+        .rposition(|byte| *byte != b'/')
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    let trimmed = &prefix[..trimmed_len];
+    if trimmed.is_empty() {
+        return Ok(entries.to_vec());
+    }
+    let mut prefixed = Vec::new();
+    for entry in entries {
+        let Some(remainder) = entry.path.strip_prefix(trimmed) else {
+            continue;
+        };
+        let Some(stripped) = remainder.strip_prefix(b"/") else {
+            continue;
+        };
+        if stripped.is_empty() {
+            continue;
+        }
+        let mut entry = entry.clone();
+        entry.path = stripped.to_vec();
+        prefixed.push(entry);
+    }
+    if prefixed.is_empty() {
+        eprintln!(
+            "fatal: git-write-tree: prefix {} not found",
+            String::from_utf8_lossy(prefix)
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(prefixed)
+}
+
+pub fn short_status(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<ShortStatusEntry>> {
+    short_status_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        ShortStatusOptions::default(),
+    )
+}
+
+pub fn short_status_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: ShortStatusOptions,
+) -> Result<Vec<ShortStatusEntry>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "status currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head = head_tree_entries(git_dir, format, &db)?;
+    let index = read_index_entries(git_dir)?;
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let ignores = IgnoreMatcher::from_worktree_root(worktree_root)?;
+    let mut paths = BTreeSet::new();
+    paths.extend(head.keys().cloned());
+    paths.extend(index.keys().cloned());
+    paths.extend(
+        worktree
+            .keys()
+            .filter(|path| index.contains_key(*path))
+            .cloned(),
+    );
+
+    let mut entries = Vec::new();
+    for path in paths {
+        let head_entry = head.get(&path);
+        let index_entry = index.get(&path);
+        let worktree_entry = worktree.get(&path);
+        if head_entry.is_none()
+            && index_entry.is_none()
+            && worktree_entry.is_some()
+            && ignores.is_ignored(&path, false)
+        {
+            continue;
+        }
+        let (index_code, worktree_code) =
+            if head_entry.is_none() && index_entry.is_none() && worktree_entry.is_some() {
+                (b'?', b'?')
+            } else {
+                let index_code = match (head_entry, index_entry) {
+                    (None, Some(_)) => b'A',
+                    (Some(_), None) => b'D',
+                    (Some(left), Some(right)) if left != right => b'M',
+                    _ => b' ',
+                };
+                let worktree_code = match (index_entry, worktree_entry) {
+                    (None, Some(_)) => b'?',
+                    (Some(_), None) => b'D',
+                    (Some(left), Some(right)) if left != right => b'M',
+                    _ => b' ',
+                };
+                (index_code, worktree_code)
+            };
+        if index_code != b' ' || worktree_code != b' ' {
+            entries.push(ShortStatusEntry {
+                index: index_code,
+                worktree: worktree_code,
+                path,
+                head_mode: head_entry.map(|entry| entry.mode),
+                index_mode: index_entry.map(|entry| entry.mode),
+                worktree_mode: worktree_entry.map(|entry| entry.mode),
+                head_oid: head_entry.map(|entry| entry.oid.clone()),
+                index_oid: index_entry.map(|entry| entry.oid.clone()),
+            });
+        }
+    }
+    if options.include_ignored {
+        for path in ignored_untracked_paths(worktree_root, git_dir, &index, &ignores, true)? {
+            entries.push(ShortStatusEntry {
+                index: b'!',
+                worktree: b'!',
+                path,
+                head_mode: None,
+                index_mode: None,
+                worktree_mode: None,
+                head_oid: None,
+                index_oid: None,
+            });
+        }
+    }
+    let untracked_paths: Vec<Vec<u8>> = match options.untracked_mode {
+        StatusUntrackedMode::All => worktree
+            .keys()
+            .filter(|path| !index.contains_key(*path) && !ignores.is_ignored(path, false))
+            .cloned()
+            .collect(),
+        StatusUntrackedMode::Normal => {
+            let mut paths = BTreeSet::new();
+            collect_untracked_directory_paths(
+                worktree_root,
+                git_dir,
+                worktree_root,
+                &index,
+                &ignores,
+                &UntrackedPathOptions {
+                    directory: true,
+                    no_empty_directory: true,
+                    preserve_ignored_directories: false,
+                    exclude_standard: true,
+                    ignored_only: false,
+                    exclude_patterns: Vec::new(),
+                    exclude_per_directory: Vec::new(),
+                },
+                &mut paths,
+            )?;
+            paths.into_iter().collect()
+        }
+    };
+    for path in untracked_paths {
+        entries.push(ShortStatusEntry {
+            index: b'?',
+            worktree: b'?',
+            path,
+            head_mode: None,
+            index_mode: None,
+            worktree_mode: None,
+            head_oid: None,
+            index_oid: None,
+        });
+    }
+    entries.sort_by(|left, right| {
+        status_sort_category(left)
+            .cmp(&status_sort_category(right))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(entries)
+}
+
+fn status_sort_category(entry: &ShortStatusEntry) -> u8 {
+    match (entry.index, entry.worktree) {
+        (b'?', b'?') => 1,
+        (b'!', b'!') => 2,
+        _ => 0,
+    }
+}
+
+pub fn untracked_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<Vec<u8>>> {
+    untracked_paths_with_options(
+        worktree_root,
+        git_dir,
+        format,
+        UntrackedPathOptions::default(),
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UntrackedPathOptions {
+    pub directory: bool,
+    pub no_empty_directory: bool,
+    pub preserve_ignored_directories: bool,
+    pub exclude_standard: bool,
+    pub ignored_only: bool,
+    pub exclude_patterns: Vec<Vec<u8>>,
+    pub exclude_per_directory: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoreMatch {
+    pub source: Vec<u8>,
+    pub line_number: usize,
+    pub pattern: Vec<u8>,
+    pub ignored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttributeState {
+    Set,
+    Unset,
+    Value(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttributeCheck {
+    pub attribute: Vec<u8>,
+    pub state: Option<AttributeState>,
+}
+
+pub fn untracked_paths_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: UntrackedPathOptions,
+) -> Result<Vec<Vec<u8>>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "ls-files --others currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index = read_index_entries(git_dir)?;
+    let ignores = IgnoreMatcher::from_sources(
+        worktree_root,
+        options.exclude_standard,
+        &options.exclude_patterns,
+        &options.exclude_per_directory,
+    )?;
+    if options.ignored_only {
+        return ignored_untracked_paths(
+            worktree_root,
+            git_dir,
+            &index,
+            &ignores,
+            options.directory,
+        );
+    }
+    if options.directory {
+        let mut paths = BTreeSet::new();
+        collect_untracked_directory_paths(
+            worktree_root,
+            git_dir,
+            worktree_root,
+            &index,
+            &ignores,
+            &options,
+            &mut paths,
+        )?;
+        return Ok(paths.into_iter().collect());
+    }
+    let mut paths = Vec::new();
+    for path in worktree_entries(worktree_root, git_dir, format)?.into_keys() {
+        if !index.contains_key(&path) {
+            if ignores.is_ignored(&path, false) {
+                continue;
+            }
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+pub fn path_matches_standard_ignore(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    is_dir: bool,
+) -> Result<bool> {
+    path_matches_ignore(worktree_root, path, is_dir, true, &[])
+}
+
+pub fn standard_ignore_match(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    is_dir: bool,
+) -> Result<Option<IgnoreMatch>> {
+    let ignores = IgnoreMatcher::from_worktree_root(worktree_root.as_ref())?;
+    Ok(ignores.match_for(path, is_dir).map(IgnorePattern::to_match))
+}
+
+pub fn standard_attributes_for_path(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    requested: &[Vec<u8>],
+    all: bool,
+) -> Result<Vec<AttributeCheck>> {
+    let matcher = AttributeMatcher::from_worktree_root(worktree_root.as_ref())?;
+    Ok(matcher.attributes_for_path(path, requested, all))
+}
+
+pub fn standard_attributes_for_path_from_tree(
+    worktree_root: impl AsRef<Path>,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    path: &[u8],
+    requested: &[Vec<u8>],
+    all: bool,
+) -> Result<Vec<AttributeCheck>> {
+    let mut matcher = AttributeMatcher::default();
+    let worktree_root = worktree_root.as_ref();
+    if !matcher.read_configured_attributes(worktree_root) {
+        matcher.read_default_global_attributes();
+    }
+    collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
+    read_attribute_patterns(
+        worktree_root.join(".git").join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b".git/info/attributes",
+    );
+    Ok(matcher.attributes_for_path(path, requested, all))
+}
+
+pub fn standard_attributes_for_path_from_index(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    path: &[u8],
+    requested: &[Vec<u8>],
+    all: bool,
+) -> Result<Vec<AttributeCheck>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "check-attr --cached currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let mut matcher = AttributeMatcher::default();
+    if !matcher.read_configured_attributes(worktree_root) {
+        matcher.read_default_global_attributes();
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    collect_attribute_patterns_from_index(git_dir, &db, &mut matcher)?;
+    read_attribute_patterns(
+        worktree_root.join(".git").join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b".git/info/attributes",
+    );
+    Ok(matcher.attributes_for_path(path, requested, all))
+}
+
+pub fn path_matches_ignore(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    is_dir: bool,
+    exclude_standard: bool,
+    exclude_patterns: &[Vec<u8>],
+) -> Result<bool> {
+    path_matches_ignore_with_per_directory(
+        worktree_root,
+        path,
+        is_dir,
+        exclude_standard,
+        exclude_patterns,
+        &[],
+    )
+}
+
+pub fn path_matches_ignore_with_per_directory(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    is_dir: bool,
+    exclude_standard: bool,
+    exclude_patterns: &[Vec<u8>],
+    exclude_per_directory: &[String],
+) -> Result<bool> {
+    let ignores = IgnoreMatcher::from_sources(
+        worktree_root.as_ref(),
+        exclude_standard,
+        exclude_patterns,
+        exclude_per_directory,
+    )?;
+    Ok(ignores.is_ignored(path, is_dir))
+}
+
+pub fn ignored_index_entries<'a>(
+    worktree_root: impl AsRef<Path>,
+    entries: &'a [IndexEntry],
+    exclude_standard: bool,
+    exclude_patterns: &[Vec<u8>],
+    exclude_per_directory: &[String],
+) -> Result<Vec<&'a IndexEntry>> {
+    let ignores = IgnoreMatcher::from_sources(
+        worktree_root.as_ref(),
+        exclude_standard,
+        exclude_patterns,
+        exclude_per_directory,
+    )?;
+    Ok(entries
+        .iter()
+        .filter(|entry| ignores.is_ignored(&entry.path, false))
+        .collect())
+}
+
+fn collect_untracked_directory_paths(
+    root: &Path,
+    git_dir: &Path,
+    dir: &Path,
+    index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &IgnoreMatcher,
+    options: &UntrackedPathOptions,
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, git_dir) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if is_same_path(&path, git_dir) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if ignores.is_ignored(&git_path, metadata.is_dir()) {
+            continue;
+        }
+        if metadata.is_dir() {
+            if !index_has_path_under(index, &git_path) {
+                if options.preserve_ignored_directories
+                    && directory_has_ignored(&path, root, git_dir, ignores)?
+                {
+                    collect_untracked_directory_paths(
+                        root, git_dir, &path, index, ignores, options, paths,
+                    )?;
+                } else if !options.no_empty_directory
+                    || directory_has_file(&path, root, git_dir, ignores)?
+                {
+                    let mut directory = git_path;
+                    directory.push(b'/');
+                    paths.insert(directory);
+                }
+            } else {
+                collect_untracked_directory_paths(
+                    root, git_dir, &path, index, ignores, options, paths,
+                )?;
+            }
+        } else if metadata.is_file() && !index.contains_key(&git_path) {
+            paths.insert(git_path);
+        }
+    }
+    Ok(())
+}
+
+fn index_has_path_under(index: &BTreeMap<Vec<u8>, TrackedEntry>, directory: &[u8]) -> bool {
+    index.keys().any(|path| {
+        path.strip_prefix(directory)
+            .and_then(|rest| rest.strip_prefix(b"/"))
+            .is_some()
+    })
+}
+
+fn directory_has_file(
+    dir: &Path,
+    root: &Path,
+    git_dir: &Path,
+    ignores: &IgnoreMatcher,
+) -> Result<bool> {
+    if is_same_path(dir, git_dir) {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_same_path(&path, git_dir) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if ignores.is_ignored(&git_path, metadata.is_dir()) {
+            continue;
+        }
+        if metadata.is_file() {
+            return Ok(true);
+        }
+        if metadata.is_dir() && directory_has_file(&path, root, git_dir, ignores)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn directory_has_ignored(
+    dir: &Path,
+    root: &Path,
+    git_dir: &Path,
+    ignores: &IgnoreMatcher,
+) -> Result<bool> {
+    if is_same_path(dir, git_dir) {
+        return Ok(false);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_same_path(&path, git_dir) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if ignores.is_ignored(&git_path, metadata.is_dir()) {
+            return Ok(true);
+        }
+        if metadata.is_dir() && directory_has_ignored(&path, root, git_dir, ignores)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn ignored_untracked_paths(
+    root: &Path,
+    git_dir: &Path,
+    index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &IgnoreMatcher,
+    directory: bool,
+) -> Result<Vec<Vec<u8>>> {
+    let mut paths = BTreeSet::new();
+    let context = IgnoredUntrackedContext {
+        root,
+        git_dir,
+        index,
+        ignores,
+        directory,
+    };
+    collect_ignored_untracked_paths(&context, root, false, &mut paths)?;
+    Ok(paths.into_iter().collect())
+}
+
+struct IgnoredUntrackedContext<'a> {
+    root: &'a Path,
+    git_dir: &'a Path,
+    index: &'a BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &'a IgnoreMatcher,
+    directory: bool,
+}
+
+fn collect_ignored_untracked_paths(
+    context: &IgnoredUntrackedContext<'_>,
+    dir: &Path,
+    parent_ignored: bool,
+    paths: &mut BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    if is_same_path(dir, context.git_dir) {
+        return Ok(());
+    }
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if is_same_path(&path, context.git_dir) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        let relative = path.strip_prefix(context.root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if metadata.is_dir() {
+            let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
+            if ignored && !index_has_path_under(context.index, &git_path) {
+                if context.directory {
+                    let mut directory_path = git_path;
+                    directory_path.push(b'/');
+                    paths.insert(directory_path);
+                } else {
+                    collect_ignored_untracked_paths(context, &path, true, paths)?;
+                }
+            } else {
+                collect_ignored_untracked_paths(context, &path, ignored, paths)?;
+            }
+        } else if metadata.is_file()
+            && !context.index.contains_key(&git_path)
+            && (parent_ignored || context.ignores.is_ignored(&git_path, false))
+        {
+            paths.insert(git_path);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct IgnoreMatcher {
+    patterns: Vec<IgnorePattern>,
+}
+
+#[derive(Debug)]
+struct IgnorePattern {
+    base: Vec<u8>,
+    pattern: Vec<u8>,
+    original: Vec<u8>,
+    source: Vec<u8>,
+    line_number: usize,
+    negated: bool,
+    directory_only: bool,
+    anchored: bool,
+    has_slash: bool,
+}
+
+impl IgnoreMatcher {
+    fn from_sources(
+        root: &Path,
+        exclude_standard: bool,
+        patterns: &[Vec<u8>],
+        per_directory: &[String],
+    ) -> Result<Self> {
+        let mut matcher = if exclude_standard {
+            Self::from_worktree_root(root)?
+        } else {
+            Self::default()
+        };
+        matcher.extend_patterns(patterns);
+        matcher.extend_per_directory_patterns(root, per_directory)?;
+        Ok(matcher)
+    }
+
+    fn from_worktree_root(root: &Path) -> Result<Self> {
+        let mut patterns = Vec::new();
+        read_ignore_patterns(
+            root.join(".git").join("info").join("exclude"),
+            &mut patterns,
+            &[],
+            b".git/info/exclude",
+        );
+        if !read_core_excludes_file(root, &mut patterns) {
+            read_default_global_excludes_file(&mut patterns);
+        }
+        collect_per_directory_patterns(root, root, &[String::from(".gitignore")], &mut patterns)?;
+        Ok(Self { patterns })
+    }
+
+    fn extend_patterns(&mut self, patterns: &[Vec<u8>]) {
+        for pattern in patterns {
+            push_ignore_pattern(&mut self.patterns, pattern, &[], &[], 0);
+        }
+    }
+
+    fn extend_per_directory_patterns(&mut self, root: &Path, names: &[String]) -> Result<()> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        collect_per_directory_patterns(root, root, names, &mut self.patterns)
+    }
+
+    fn is_ignored(&self, path: &[u8], is_dir: bool) -> bool {
+        let mut ignored = false;
+        for pattern in &self.patterns {
+            if pattern.matches(path, is_dir) {
+                ignored = !pattern.negated;
+            }
+        }
+        ignored
+    }
+
+    fn match_for(&self, path: &[u8], is_dir: bool) -> Option<&IgnorePattern> {
+        let mut matched = None;
+        for pattern in &self.patterns {
+            if pattern.matches(path, is_dir) {
+                matched = Some(pattern);
+            }
+        }
+        matched
+    }
+}
+
+fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {
+    let Ok(config) = GitConfig::read(root.join(".git").join("config")) else {
+        return false;
+    };
+    let Some(value) = config.get("core", None, "excludesFile") else {
+        return false;
+    };
+    let path = expand_core_excludes_file(root, value);
+    read_ignore_patterns(path, patterns, &[], value.as_bytes());
+    true
+}
+
+fn expand_core_excludes_file(root: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    root.join(path)
+}
+
+fn read_default_global_excludes_file(patterns: &mut Vec<IgnorePattern>) {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
+        && !config_home.is_empty()
+    {
+        let path = PathBuf::from(config_home).join("git").join("ignore");
+        let source = path.to_string_lossy().into_owned();
+        read_ignore_patterns(path, patterns, &[], source.as_bytes());
+        return;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let path = PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("ignore");
+        let source = path.to_string_lossy().into_owned();
+        read_ignore_patterns(path, patterns, &[], source.as_bytes());
+    }
+}
+
+fn collect_per_directory_patterns(
+    root: &Path,
+    dir: &Path,
+    names: &[String],
+    patterns: &mut Vec<IgnorePattern>,
+) -> Result<()> {
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_per_directory_patterns(root, &path, names, patterns)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !names.iter().any(|name| name == file_name) {
+            continue;
+        }
+        let parent = path.parent().unwrap_or(root);
+        let relative = parent.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", parent.display()))
+        })?;
+        let base = git_path_bytes(relative)?;
+        let mut source = base.clone();
+        if !source.is_empty() {
+            source.push(b'/');
+        }
+        source.extend_from_slice(file_name.as_bytes());
+        read_ignore_patterns(&path, patterns, &base, &source);
+    }
+    Ok(())
+}
+
+fn read_ignore_patterns(
+    path: impl AsRef<Path>,
+    patterns: &mut Vec<IgnorePattern>,
+    base: &[u8],
+    source: &[u8],
+) {
+    let Ok(contents) = fs::read(path) else {
+        return;
+    };
+    for (line, raw) in contents.split(|byte| *byte == b'\n').enumerate() {
+        push_ignore_pattern(patterns, raw, base, source, line + 1);
+    }
+}
+
+fn push_ignore_pattern(
+    patterns: &mut Vec<IgnorePattern>,
+    raw: &[u8],
+    base: &[u8],
+    source: &[u8],
+    line_number: usize,
+) {
+    let mut line = raw.strip_suffix(b"\r").unwrap_or(raw).to_vec();
+    normalize_ignore_trailing_spaces(&mut line);
+    let original = line.clone();
+    let mut line = line.as_slice();
+    if line.is_empty() || line.starts_with(b"#") {
+        return;
+    }
+    let negated = if line.starts_with(b"\\#") || line.starts_with(b"\\!") {
+        line = &line[1..];
+        false
+    } else if let Some(pattern) = line.strip_prefix(b"!") {
+        line = pattern;
+        true
+    } else {
+        false
+    };
+    let directory_only = line.ends_with(b"/");
+    let pattern = if directory_only {
+        line.strip_suffix(b"/").unwrap_or(line)
+    } else {
+        line
+    };
+    let (anchored, pattern) = if let Some(pattern) = pattern.strip_prefix(b"/") {
+        (true, pattern)
+    } else {
+        (false, pattern)
+    };
+    if pattern.is_empty() {
+        return;
+    }
+    patterns.push(IgnorePattern {
+        base: base.to_vec(),
+        pattern: pattern.to_vec(),
+        original,
+        source: source.to_vec(),
+        line_number,
+        negated,
+        directory_only,
+        anchored,
+        has_slash: pattern.contains(&b'/'),
+    });
+}
+
+fn normalize_ignore_trailing_spaces(line: &mut Vec<u8>) {
+    while line.last() == Some(&b' ') {
+        let space_index = line.len() - 1;
+        let backslashes = line[..space_index]
+            .iter()
+            .rev()
+            .take_while(|byte| **byte == b'\\')
+            .count();
+        if backslashes % 2 == 1 {
+            line.remove(space_index - 1);
+            break;
+        }
+        line.pop();
+    }
+}
+
+impl IgnorePattern {
+    fn to_match(&self) -> IgnoreMatch {
+        IgnoreMatch {
+            source: self.source.clone(),
+            line_number: self.line_number,
+            pattern: self.original.clone(),
+            ignored: !self.negated,
+        }
+    }
+
+    fn matches(&self, path: &[u8], is_dir: bool) -> bool {
+        let path = if self.base.is_empty() {
+            path
+        } else {
+            let Some(rest) = path
+                .strip_prefix(self.base.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+            else {
+                return false;
+            };
+            rest
+        };
+        if self.directory_only {
+            return self.matches_directory(path, is_dir);
+        }
+        if self.anchored || self.has_slash {
+            return wildcard_path_matches(&self.pattern, path);
+        }
+        path.rsplit(|byte| *byte == b'/')
+            .next()
+            .is_some_and(|basename| wildcard_path_matches(&self.pattern, basename))
+    }
+
+    fn matches_directory(&self, path: &[u8], is_dir: bool) -> bool {
+        if self.anchored || self.has_slash {
+            return path == self.pattern
+                || path
+                    .strip_prefix(self.pattern.as_slice())
+                    .and_then(|rest| rest.strip_prefix(b"/"))
+                    .is_some();
+        }
+        path.split(|byte| *byte == b'/')
+            .enumerate()
+            .any(|(index, component)| {
+                wildcard_path_matches(&self.pattern, component)
+                    && (is_dir || index + 1 < path.split(|byte| *byte == b'/').count())
+            })
+    }
+}
+
+fn wildcard_path_matches(pattern: &[u8], value: &[u8]) -> bool {
+    let mut memo = vec![vec![None; value.len() + 1]; pattern.len() + 1];
+    wildcard_path_matches_from(pattern, value, 0, 0, &mut memo)
+}
+
+fn wildcard_path_matches_from(
+    pattern: &[u8],
+    value: &[u8],
+    pattern_index: usize,
+    value_index: usize,
+    memo: &mut [Vec<Option<bool>>],
+) -> bool {
+    if let Some(cached) = memo[pattern_index][value_index] {
+        return cached;
+    }
+    let matched = if pattern_index == pattern.len() {
+        value_index == value.len()
+    } else {
+        match pattern[pattern_index] {
+            b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => {
+                wildcard_double_star_matches(pattern, value, pattern_index, value_index, memo)
+            }
+            b'*' => {
+                if wildcard_path_matches_from(pattern, value, pattern_index + 1, value_index, memo)
+                {
+                    true
+                } else {
+                    let mut next = value_index;
+                    while next < value.len() && value[next] != b'/' {
+                        next += 1;
+                        if wildcard_path_matches_from(pattern, value, pattern_index + 1, next, memo)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+            b'?' => {
+                value_index < value.len()
+                    && value[value_index] != b'/'
+                    && wildcard_path_matches_from(
+                        pattern,
+                        value,
+                        pattern_index + 1,
+                        value_index + 1,
+                        memo,
+                    )
+            }
+            b'[' => {
+                if value_index < value.len() && value[value_index] != b'/' {
+                    if let Some((class_matches, next_pattern_index)) =
+                        wildcard_class_matches(pattern, pattern_index, value[value_index])
+                    {
+                        class_matches
+                            && wildcard_path_matches_from(
+                                pattern,
+                                value,
+                                next_pattern_index,
+                                value_index + 1,
+                                memo,
+                            )
+                    } else {
+                        value[value_index] == b'['
+                            && wildcard_path_matches_from(
+                                pattern,
+                                value,
+                                pattern_index + 1,
+                                value_index + 1,
+                                memo,
+                            )
+                    }
+                } else {
+                    false
+                }
+            }
+            b'\\' if pattern_index + 1 < pattern.len() => {
+                value_index < value.len()
+                    && pattern[pattern_index + 1] == value[value_index]
+                    && wildcard_path_matches_from(
+                        pattern,
+                        value,
+                        pattern_index + 2,
+                        value_index + 1,
+                        memo,
+                    )
+            }
+            literal => {
+                value_index < value.len()
+                    && literal == value[value_index]
+                    && wildcard_path_matches_from(
+                        pattern,
+                        value,
+                        pattern_index + 1,
+                        value_index + 1,
+                        memo,
+                    )
+            }
+        }
+    };
+    memo[pattern_index][value_index] = Some(matched);
+    matched
+}
+
+fn wildcard_double_star_matches(
+    pattern: &[u8],
+    value: &[u8],
+    pattern_index: usize,
+    value_index: usize,
+    memo: &mut [Vec<Option<bool>>],
+) -> bool {
+    let after_stars = pattern_index + 2;
+    if pattern.get(after_stars) == Some(&b'/') {
+        if wildcard_path_matches_from(pattern, value, after_stars + 1, value_index, memo) {
+            return true;
+        }
+        for next in value_index..value.len() {
+            if value[next] == b'/'
+                && wildcard_path_matches_from(pattern, value, after_stars + 1, next + 1, memo)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+    for next in value_index..=value.len() {
+        if wildcard_path_matches_from(pattern, value, after_stars, next, memo) {
+            return true;
+        }
+    }
+    false
+}
+
+fn wildcard_class_matches(pattern: &[u8], start: usize, value: u8) -> Option<(bool, usize)> {
+    let mut index = start + 1;
+    let negated = matches!(pattern.get(index), Some(b'!' | b'^'));
+    if negated {
+        index += 1;
+    }
+    let class_start = index;
+    let end = pattern[class_start..]
+        .iter()
+        .position(|byte| *byte == b']')
+        .map(|position| class_start + position)?;
+    if end == class_start {
+        return None;
+    }
+    let mut matched = false;
+    while index < end {
+        if index + 2 < end && pattern[index + 1] == b'-' {
+            let lower = pattern[index].min(pattern[index + 2]);
+            let upper = pattern[index].max(pattern[index + 2]);
+            matched |= lower <= value && value <= upper;
+            index += 3;
+        } else {
+            matched |= pattern[index] == value;
+            index += 1;
+        }
+    }
+    Some((if negated { !matched } else { matched }, end + 1))
+}
+
+#[derive(Debug, Default)]
+struct AttributeMatcher {
+    patterns: Vec<AttributePattern>,
+    attribute_order: BTreeMap<Vec<u8>, usize>,
+    macros: BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
+}
+
+#[derive(Debug)]
+struct AttributePattern {
+    base: Vec<u8>,
+    pattern: Vec<u8>,
+    anchored: bool,
+    has_slash: bool,
+    assignments: Vec<AttributeAssignment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttributeAssignment {
+    attribute: Vec<u8>,
+    state: Option<AttributeState>,
+}
+
+impl AttributeMatcher {
+    fn from_worktree_root(root: &Path) -> Result<Self> {
+        let mut matcher = Self::default();
+        if !matcher.read_configured_attributes(root) {
+            matcher.read_default_global_attributes();
+        }
+        collect_attribute_patterns(root, root, &mut matcher)?;
+        read_attribute_patterns(
+            root.join(".git").join("info").join("attributes"),
+            &mut matcher,
+            &[],
+            b".git/info/attributes",
+        );
+        Ok(matcher)
+    }
+
+    fn attributes_for_path(
+        &self,
+        path: &[u8],
+        requested: &[Vec<u8>],
+        all: bool,
+    ) -> Vec<AttributeCheck> {
+        let mut states = BTreeMap::<Vec<u8>, Option<AttributeState>>::new();
+        for pattern in &self.patterns {
+            if !pattern.matches(path) {
+                continue;
+            }
+            for assignment in &pattern.assignments {
+                states.insert(assignment.attribute.clone(), assignment.state.clone());
+            }
+        }
+        if all {
+            let mut checks = states
+                .into_iter()
+                .filter_map(|(attribute, state)| {
+                    state.map(|state| AttributeCheck {
+                        attribute,
+                        state: Some(state),
+                    })
+                })
+                .collect::<Vec<_>>();
+            checks.sort_by(|left, right| {
+                attribute_all_rank(&left.attribute, &self.attribute_order)
+                    .cmp(&attribute_all_rank(&right.attribute, &self.attribute_order))
+                    .then_with(|| left.attribute.cmp(&right.attribute))
+            });
+            return checks;
+        }
+        requested
+            .iter()
+            .map(|attribute| AttributeCheck {
+                attribute: attribute.clone(),
+                state: states.get(attribute).cloned().flatten(),
+            })
+            .collect()
+    }
+
+    fn push_attribute_order(&mut self, attribute: &[u8]) {
+        let next = self.attribute_order.len();
+        self.attribute_order
+            .entry(attribute.to_vec())
+            .or_insert(next);
+    }
+
+    fn read_configured_attributes(&mut self, root: &Path) -> bool {
+        let Ok(config) = GitConfig::read(root.join(".git").join("config")) else {
+            return false;
+        };
+        let Some(value) = config.get("core", None, "attributesFile") else {
+            return false;
+        };
+        let path = expand_core_excludes_file(root, value);
+        read_attribute_patterns(path, self, &[], value.as_bytes());
+        true
+    }
+
+    fn read_default_global_attributes(&mut self) {
+        if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME")
+            && !config_home.is_empty()
+        {
+            let path = PathBuf::from(config_home).join("git").join("attributes");
+            let source = path.to_string_lossy().into_owned();
+            read_attribute_patterns(path, self, &[], source.as_bytes());
+            return;
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let path = PathBuf::from(home)
+                .join(".config")
+                .join("git")
+                .join("attributes");
+            let source = path.to_string_lossy().into_owned();
+            read_attribute_patterns(path, self, &[], source.as_bytes());
+        }
+    }
+}
+
+fn collect_attribute_patterns(
+    root: &Path,
+    dir: &Path,
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    let relative = dir.strip_prefix(root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
+    })?;
+    let base = git_path_bytes(relative)?;
+    let mut source = base.clone();
+    if !source.is_empty() {
+        source.push(b'/');
+    }
+    source.extend_from_slice(b".gitattributes");
+    read_attribute_patterns(dir.join(".gitattributes"), matcher, &base, &source);
+
+    let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
+        if entry.metadata()?.is_dir() {
+            collect_attribute_patterns(root, &path, matcher)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_attribute_patterns(
+    path: impl AsRef<Path>,
+    matcher: &mut AttributeMatcher,
+    base: &[u8],
+    _source: &[u8],
+) {
+    let Ok(contents) = fs::read(path) else {
+        return;
+    };
+    read_attribute_patterns_from_bytes(&contents, matcher, base);
+}
+
+fn read_attribute_patterns_from_bytes(
+    contents: &[u8],
+    matcher: &mut AttributeMatcher,
+    base: &[u8],
+) {
+    for raw in contents.split(|byte| *byte == b'\n') {
+        push_attribute_pattern(matcher, raw, base);
+    }
+}
+
+fn collect_attribute_patterns_from_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    base: Vec<u8>,
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let mut entries = Tree::parse(format, &object.body)?.entries;
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    for entry in &entries {
+        if entry.name == b".gitattributes" && tree_entry_object_type(entry.mode) == ObjectType::Blob
+        {
+            let object = db.read_object(&entry.oid)?;
+            if object.object_type == ObjectType::Blob {
+                read_attribute_patterns_from_bytes(&object.body, matcher, &base);
+            }
+        }
+    }
+    for entry in entries {
+        if tree_entry_object_type(entry.mode) != ObjectType::Tree {
+            continue;
+        }
+        let mut child_base = base.clone();
+        if !child_base.is_empty() {
+            child_base.push(b'/');
+        }
+        child_base.extend_from_slice(&entry.name);
+        collect_attribute_patterns_from_tree(db, format, &entry.oid, child_base, matcher)?;
+    }
+    Ok(())
+}
+
+fn collect_attribute_patterns_from_index(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(());
+    }
+    let mut entries = Index::parse_v2_sha1(&fs::read(index_path)?)?.entries;
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    for entry in entries {
+        let is_attributes_file =
+            entry.path == b".gitattributes" || entry.path.ends_with(b"/.gitattributes");
+        if index_entry_stage(&entry) != 0
+            || tree_entry_object_type(entry.mode) != ObjectType::Blob
+            || !is_attributes_file
+        {
+            continue;
+        }
+        let base = match entry.path.strip_suffix(b".gitattributes") {
+            Some(b"") => Vec::new(),
+            Some(parent) => parent.strip_suffix(b"/").unwrap_or(parent).to_vec(),
+            None => continue,
+        };
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type == ObjectType::Blob {
+            read_attribute_patterns_from_bytes(&object.body, matcher, &base);
+        }
+    }
+    Ok(())
+}
+
+fn push_attribute_pattern(matcher: &mut AttributeMatcher, raw: &[u8], base: &[u8]) {
+    let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let line = trim_ascii_whitespace(line);
+    if line.is_empty() || line.starts_with(b"#") {
+        return;
+    }
+    let mut fields = line
+        .split(|byte| byte.is_ascii_whitespace())
+        .filter(|field| !field.is_empty());
+    let Some(raw_pattern) = fields.next() else {
+        return;
+    };
+    if let Some(macro_name) = raw_pattern.strip_prefix(b"[attr]") {
+        if macro_name.is_empty() {
+            return;
+        }
+        let mut assignments = vec![AttributeAssignment {
+            attribute: macro_name.to_vec(),
+            state: Some(AttributeState::Set),
+        }];
+        for field in fields {
+            push_attribute_assignments(&mut assignments, field, &matcher.macros);
+        }
+        for assignment in &assignments {
+            matcher.push_attribute_order(&assignment.attribute);
+        }
+        matcher.macros.insert(macro_name.to_vec(), assignments);
+        return;
+    }
+    let mut assignments = Vec::new();
+    for field in fields {
+        push_attribute_assignments(&mut assignments, field, &matcher.macros);
+    }
+    if assignments.is_empty() {
+        return;
+    }
+    for assignment in &assignments {
+        matcher.push_attribute_order(&assignment.attribute);
+    }
+    let (anchored, pattern) = if let Some(pattern) = raw_pattern.strip_prefix(b"/") {
+        (true, pattern)
+    } else {
+        (false, raw_pattern)
+    };
+    if pattern.is_empty() {
+        return;
+    }
+    matcher.patterns.push(AttributePattern {
+        base: base.to_vec(),
+        pattern: pattern.to_vec(),
+        anchored,
+        has_slash: pattern.contains(&b'/'),
+        assignments,
+    });
+}
+
+fn push_attribute_assignments(
+    assignments: &mut Vec<AttributeAssignment>,
+    field: &[u8],
+    macros: &BTreeMap<Vec<u8>, Vec<AttributeAssignment>>,
+) {
+    if let Some(macro_assignments) = macros.get(field) {
+        assignments.extend(macro_assignments.iter().cloned());
+        return;
+    }
+    if field == b"binary" {
+        assignments.push(AttributeAssignment {
+            attribute: b"binary".to_vec(),
+            state: Some(AttributeState::Set),
+        });
+        assignments.push(AttributeAssignment {
+            attribute: b"diff".to_vec(),
+            state: Some(AttributeState::Unset),
+        });
+        assignments.push(AttributeAssignment {
+            attribute: b"merge".to_vec(),
+            state: Some(AttributeState::Unset),
+        });
+        assignments.push(AttributeAssignment {
+            attribute: b"text".to_vec(),
+            state: Some(AttributeState::Unset),
+        });
+        return;
+    }
+    if let Some(attribute) = field.strip_prefix(b"-") {
+        if !attribute.is_empty() {
+            assignments.push(AttributeAssignment {
+                attribute: attribute.to_vec(),
+                state: Some(AttributeState::Unset),
+            });
+        }
+        return;
+    }
+    if let Some(attribute) = field.strip_prefix(b"!") {
+        if !attribute.is_empty() {
+            assignments.push(AttributeAssignment {
+                attribute: attribute.to_vec(),
+                state: None,
+            });
+        }
+        return;
+    }
+    if let Some(equal) = field.iter().position(|byte| *byte == b'=') {
+        let attribute = &field[..equal];
+        let value = &field[equal + 1..];
+        if !attribute.is_empty() {
+            assignments.push(AttributeAssignment {
+                attribute: attribute.to_vec(),
+                state: Some(AttributeState::Value(value.to_vec())),
+            });
+        }
+        return;
+    }
+    assignments.push(AttributeAssignment {
+        attribute: field.to_vec(),
+        state: Some(AttributeState::Set),
+    });
+}
+
+fn attribute_all_rank(
+    attribute: &[u8],
+    order: &BTreeMap<Vec<u8>, usize>,
+) -> (usize, usize, Vec<u8>) {
+    let rank = match attribute {
+        b"binary" => 0,
+        b"diff" => 1,
+        b"merge" => 2,
+        b"text" => 3,
+        b"eol" => 5,
+        _ => 4,
+    };
+    let order = order.get(attribute).copied().unwrap_or(usize::MAX);
+    (rank, order, attribute.to_vec())
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+impl AttributePattern {
+    fn matches(&self, path: &[u8]) -> bool {
+        let path = if self.base.is_empty() {
+            path
+        } else {
+            let Some(rest) = path
+                .strip_prefix(self.base.as_slice())
+                .and_then(|rest| rest.strip_prefix(b"/"))
+            else {
+                return false;
+            };
+            rest
+        };
+        if self.anchored || self.has_slash {
+            return wildcard_path_matches(&self.pattern, path);
+        }
+        path.rsplit(|byte| *byte == b'/')
+            .next()
+            .is_some_and(|basename| wildcard_path_matches(&self.pattern, basename))
+    }
+}
+
+pub fn deleted_index_entries(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<IndexEntry>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "ls-files --deleted currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let mut deleted = Vec::new();
+    for entry in index.entries {
+        if !worktree_path(worktree_root, &entry.path)?.exists() {
+            deleted.push(entry);
+        }
+    }
+    Ok(deleted)
+}
+
+pub fn modified_index_entries(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Vec<IndexEntry>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "ls-files --modified currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(Vec::new());
+    }
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let mut modified = Vec::new();
+    for entry in index.entries {
+        let Some(worktree_entry) = worktree.get(&entry.path) else {
+            modified.push(entry);
+            continue;
+        };
+        if worktree_entry.mode != entry.mode || worktree_entry.oid != entry.oid {
+            modified.push(entry);
+        }
+    }
+    Ok(modified)
+}
+
+pub fn checkout_branch(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    branch: &str,
+    committer: Vec<u8>,
+) -> Result<CheckoutResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "checkout currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let branch_ref = branch_ref_name(branch)?;
+    let refs = FileRefStore::new(git_dir, format);
+    let target = match refs.read_ref(&branch_ref)? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) => {
+            return Err(GitError::Unsupported(
+                "checkout target branch must be direct".into(),
+            ));
+        }
+        None => return Err(GitError::NotFound(format!("branch {branch}"))),
+    };
+    let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?;
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Symbolic(branch_ref),
+        reflog: Some(ReflogEntry {
+            old_oid: target.clone(),
+            new_oid: target.clone(),
+            committer,
+            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
+        }),
+    });
+    tx.commit()?;
+    Ok(CheckoutResult {
+        branch: branch.into(),
+        oid: target,
+        files,
+    })
+}
+
+pub fn checkout_detached(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target: &ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+) -> Result<CheckoutResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "checkout currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, target)?;
+    let refs = FileRefStore::new(git_dir, format);
+    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Direct(target.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid: zero,
+            new_oid: target.clone(),
+            committer,
+            message,
+        }),
+    });
+    tx.commit()?;
+    Ok(CheckoutResult {
+        branch: target.to_string(),
+        oid: target.clone(),
+        files,
+    })
+}
+
+fn checkout_commit_to_index_and_worktree(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+) -> Result<usize> {
+    let status = short_status(worktree_root, git_dir, format)?;
+    if !status.is_empty() {
+        return Err(GitError::Transaction(
+            "checkout requires a clean working tree".into(),
+        ));
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, target)?;
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+
+    for path in read_index_entries(git_dir)?.keys() {
+        if !target_entries.contains_key(path) {
+            remove_worktree_file(worktree_root, path)?;
+        }
+    }
+
+    let mut index_entries = Vec::new();
+    for (path, entry) in &target_entries {
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(format!(
+                "expected blob {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        let file_path = worktree_path(worktree_root, path)?;
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file_path, &object.body)?;
+        let metadata = fs::metadata(&file_path)?;
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        index_entry.mode = entry.mode;
+        index_entries.push(index_entry);
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(target_entries.len())
+}
+
+pub fn restore_worktree_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Err(GitError::Exit(1));
+    }
+    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut restored = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_has_entry_under(&index.entries, &git_path);
+        let mut matched = false;
+        for entry in &index.entries {
+            if entry.path == git_path
+                || (recursive && index_entry_is_under_path(&entry.path, &git_path))
+            {
+                restore_index_entry(worktree_root, &db, entry)?;
+                restored.insert(entry.path.clone());
+                matched = true;
+            }
+        }
+        if !matched {
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
+                path.display()
+            );
+            return Err(GitError::Exit(1));
+        }
+    }
+    Ok(RestoreResult {
+        restored: restored.len(),
+    })
+}
+
+pub fn restore_index_paths_from_head(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --staged currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_entries = head_tree_entries(git_dir, format, &db)?;
+    restore_index_paths_from_entries(worktree_root, git_dir, &db, index, &head_entries, paths)
+}
+
+pub fn restore_index_paths_from_tree(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --staged --source currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let source_entries = tree_entries(&db, format, tree_oid)?;
+    restore_index_paths_from_entries(worktree_root, git_dir, &db, index, &source_entries, paths)
+}
+
+fn restore_index_paths_from_entries(
+    worktree_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    index: Index,
+    source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    let mut index_entries = index
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut restored = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_entries
+                .keys()
+                .any(|entry| index_entry_is_under_path(entry, &git_path))
+            || source_entries
+                .keys()
+                .any(|entry| index_entry_is_under_path(entry, &git_path));
+        let mut matched_paths = BTreeSet::new();
+        for path in index_entries.keys().chain(source_entries.keys()) {
+            if path.as_slice() == git_path.as_slice()
+                || (recursive && index_entry_is_under_path(path, &git_path))
+            {
+                matched_paths.insert(path.clone());
+            }
+        }
+        if matched_paths.is_empty() {
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
+                path.display()
+            );
+            return Err(GitError::Exit(1));
+        }
+        for path in matched_paths {
+            if let Some(entry) = source_entries.get(&path) {
+                index_entries.insert(
+                    path.clone(),
+                    restored_head_index_entry(worktree_root, db, &path, entry)?,
+                );
+            } else {
+                index_entries.remove(&path);
+            }
+            restored.insert(path);
+        }
+    }
+    let mut entries = index_entries.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(RestoreResult {
+        restored: restored.len(),
+    })
+}
+
+pub fn restore_index_and_worktree_paths_from_head(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --staged --worktree currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_entries = head_tree_entries(git_dir, format, &db)?;
+    restore_index_and_worktree_paths_from_entries(
+        worktree_root,
+        git_dir,
+        &db,
+        index,
+        &head_entries,
+        paths,
+    )
+}
+
+pub fn restore_index_and_worktree_paths_from_tree(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --staged --worktree --source currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let source_entries = tree_entries(&db, format, tree_oid)?;
+    restore_index_and_worktree_paths_from_entries(
+        worktree_root,
+        git_dir,
+        &db,
+        index,
+        &source_entries,
+        paths,
+    )
+}
+
+fn restore_index_and_worktree_paths_from_entries(
+    worktree_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    index: Index,
+    source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    let mut index_entries = index
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut restored = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_entries
+                .keys()
+                .any(|entry| index_entry_is_under_path(entry, &git_path))
+            || source_entries
+                .keys()
+                .any(|entry| index_entry_is_under_path(entry, &git_path));
+        let mut matched_paths = BTreeSet::new();
+        for path in index_entries.keys().chain(source_entries.keys()) {
+            if path.as_slice() == git_path.as_slice()
+                || (recursive && index_entry_is_under_path(path, &git_path))
+            {
+                matched_paths.insert(path.clone());
+            }
+        }
+        if matched_paths.is_empty() {
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
+                path.display()
+            );
+            return Err(GitError::Exit(1));
+        }
+        for path in matched_paths {
+            if let Some(entry) = source_entries.get(&path) {
+                index_entries.insert(
+                    path.clone(),
+                    restore_head_entry_to_worktree_and_index(worktree_root, db, &path, entry)?,
+                );
+            } else {
+                index_entries.remove(&path);
+                remove_worktree_file(worktree_root, &path)?;
+            }
+            restored.insert(path);
+        }
+    }
+    let mut entries = index_entries.into_values().collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(RestoreResult {
+        restored: restored.len(),
+    })
+}
+
+pub fn reset_index_and_worktree_to_commit(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "reset --hard currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, commit_oid)?;
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+
+    for path in read_index_entries(git_dir)?.keys() {
+        if !target_entries.contains_key(path) {
+            remove_worktree_file(worktree_root, path)?;
+        }
+    }
+
+    let mut index_entries = Vec::new();
+    for (path, entry) in &target_entries {
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(format!(
+                "expected blob {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        let file_path = worktree_path(worktree_root, path)?;
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file_path, &object.body)?;
+        let metadata = fs::metadata(&file_path)?;
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        index_entry.mode = entry.mode;
+        index_entries.push(index_entry);
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(RestoreResult {
+        restored: target_entries.len(),
+    })
+}
+
+pub fn reset_index_to_commit(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    commit_oid: &ObjectId,
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "reset --mixed currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, commit_oid)?;
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+    let mut index_entries = Vec::new();
+    for (path, entry) in &target_entries {
+        index_entries.push(restored_head_index_entry(worktree_root, &db, path, entry)?);
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(RestoreResult {
+        restored: target_entries.len(),
+    })
+}
+
+pub fn restore_worktree_paths_from_head(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --source currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_entries = head_tree_entries(git_dir, format, &db)?;
+    restore_worktree_paths_from_entries(worktree_root, &db, index, &head_entries, paths)
+}
+
+pub fn restore_worktree_paths_from_tree(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "restore --source currently reads sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let source_entries = tree_entries(&db, format, tree_oid)?;
+    restore_worktree_paths_from_entries(worktree_root, &db, index, &source_entries, paths)
+}
+
+fn restore_worktree_paths_from_entries(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    index: Index,
+    source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    paths: &[PathBuf],
+) -> Result<RestoreResult> {
+    let index_entries = index
+        .entries
+        .into_iter()
+        .map(|entry| entry.path)
+        .collect::<BTreeSet<_>>();
+    let mut restored = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        let recursive = path == Path::new(".")
+            || path.to_string_lossy().ends_with('/')
+            || absolute.is_dir()
+            || index_entries
+                .iter()
+                .any(|entry| index_entry_is_under_path(entry, &git_path))
+            || source_entries
+                .keys()
+                .any(|entry| index_entry_is_under_path(entry, &git_path));
+        let mut matched_paths = BTreeSet::new();
+        for path in index_entries.iter().chain(source_entries.keys()) {
+            if path.as_slice() == git_path.as_slice()
+                || (recursive && index_entry_is_under_path(path, &git_path))
+            {
+                matched_paths.insert(path.clone());
+            }
+        }
+        if matched_paths.is_empty() {
+            eprintln!(
+                "error: pathspec '{}' did not match any file(s) known to git",
+                path.display()
+            );
+            return Err(GitError::Exit(1));
+        }
+        for path in matched_paths {
+            if let Some(entry) = source_entries.get(&path) {
+                restore_head_entry_to_worktree(worktree_root, db, &path, entry)?;
+            } else {
+                remove_worktree_file(worktree_root, &path)?;
+            }
+            restored.insert(path);
+        }
+    }
+    Ok(RestoreResult {
+        restored: restored.len(),
+    })
+}
+
+pub fn remove_index_and_worktree_paths(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: RemoveOptions,
+) -> Result<RemoveResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "rm currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head_entries = head_tree_entries(git_dir, format, &db)?;
+    let mut index_entries = index
+        .entries
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            worktree_root.join(path)
+        };
+        let relative = absolute.strip_prefix(worktree_root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if index_entries.contains_key(&git_path) {
+            selected.insert(git_path);
+            continue;
+        }
+        let matched = index_entries
+            .keys()
+            .filter(|entry| index_entry_is_under_path(entry, &git_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if matched.is_empty() {
+            if options.ignore_unmatch {
+                continue;
+            }
+            eprintln!(
+                "fatal: pathspec '{}' did not match any files",
+                String::from_utf8_lossy(&git_path)
+            );
+            return Err(GitError::Exit(128));
+        }
+        if !options.recursive {
+            eprintln!(
+                "fatal: not removing '{}' recursively without -r",
+                String::from_utf8_lossy(&git_path)
+            );
+            return Err(GitError::Exit(128));
+        }
+        selected.extend(matched);
+    }
+    if !options.cached && !options.force {
+        for path in &selected {
+            let Some(index_entry) = index_entries.get(path) else {
+                continue;
+            };
+            match head_entries.get(path) {
+                Some(head_entry)
+                    if head_entry.oid == index_entry.oid && head_entry.mode == index_entry.mode => {
+                }
+                _ => {
+                    eprintln!("error: the following file has changes staged in the index:");
+                    eprintln!("    {}", String::from_utf8_lossy(path));
+                    eprintln!("(use --cached to keep the file, or -f to force removal)");
+                    return Err(GitError::Exit(1));
+                }
+            }
+            let worktree_file = worktree_path(worktree_root, path)?;
+            if worktree_file.exists() {
+                let object = db.read_object(&index_entry.oid)?;
+                if object.object_type != ObjectType::Blob {
+                    return Err(GitError::InvalidObject(format!(
+                        "expected blob {}, found {}",
+                        index_entry.oid,
+                        object.object_type.as_str()
+                    )));
+                }
+                if fs::read(&worktree_file)? != object.body {
+                    eprintln!("error: the following file has local modifications:");
+                    eprintln!("    {}", String::from_utf8_lossy(path));
+                    eprintln!("(use --cached to keep the file, or -f to force removal)");
+                    return Err(GitError::Exit(1));
+                }
+            }
+        }
+    }
+    for path in &selected {
+        if options.dry_run {
+            continue;
+        }
+        if !options.cached {
+            remove_worktree_file(worktree_root, path)?;
+        }
+        index_entries.remove(path);
+    }
+    if options.dry_run {
+        return Ok(RemoveResult {
+            removed: selected.into_iter().collect(),
+        });
+    }
+    let entries = index_entries.into_values().collect::<Vec<_>>();
+    fs::write(
+        index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write_sha1()?,
+    )?;
+    Ok(RemoveResult {
+        removed: selected.into_iter().collect(),
+    })
+}
+
+pub fn move_index_and_worktree_path(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    source: &Path,
+    destination: &Path,
+    options: MoveOptions,
+) -> Result<MoveResult> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "mv currently writes sha1 index entries".into(),
+        ));
+    }
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let source_absolute = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        worktree_root.join(source)
+    };
+    let destination_absolute = if destination.is_absolute() {
+        destination.to_path_buf()
+    } else {
+        worktree_root.join(destination)
+    };
+    let destination_absolute = if destination_absolute.is_dir() {
+        let Some(file_name) = source_absolute.file_name() else {
+            return Err(GitError::InvalidPath(format!(
+                "invalid source path {}",
+                source.display()
+            )));
+        };
+        destination_absolute.join(file_name)
+    } else {
+        destination_absolute
+    };
+    let source_relative = source_absolute.strip_prefix(worktree_root).map_err(|_| {
+        GitError::InvalidPath(format!("path {} is outside worktree", source.display()))
+    })?;
+    let destination_relative = destination_absolute
+        .strip_prefix(worktree_root)
+        .map_err(|_| {
+            GitError::InvalidPath(format!(
+                "path {} is outside worktree",
+                destination.display()
+            ))
+        })?;
+    let source_path = git_path_bytes(source_relative)?;
+    let destination_path = git_path_bytes(destination_relative)?;
+    let destination_has_trailing_separator = path_has_trailing_separator(&destination_absolute);
+    if destination_has_trailing_separator && !destination_absolute.is_dir() {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        let mut destination = String::from_utf8_lossy(&destination_path).into_owned();
+        destination.push('/');
+        if options.dry_run {
+            let fatal = format!(
+                "fatal: destination directory does not exist, source={}, destination={destination}",
+                String::from_utf8_lossy(&source_path),
+            );
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination.clone().into_bytes(),
+                skipped: false,
+                fatal: Some(fatal),
+                details: Vec::new(),
+            });
+        }
+        eprintln!(
+            "fatal: destination directory does not exist, source={}, destination={destination}",
+            String::from_utf8_lossy(&source_path),
+        );
+        return Err(GitError::Exit(128));
+    }
+    if destination_absolute.exists() {
+        if !options.force {
+            if options.skip_errors {
+                return Ok(MoveResult {
+                    source: source_path,
+                    destination: destination_path,
+                    skipped: true,
+                    fatal: None,
+                    details: Vec::new(),
+                });
+            }
+            if options.dry_run {
+                let fatal = format!(
+                    "fatal: destination exists, source={}, destination={}",
+                    String::from_utf8_lossy(&source_path),
+                    String::from_utf8_lossy(&destination_path)
+                );
+                return Ok(MoveResult {
+                    source: source_path,
+                    destination: destination_path,
+                    skipped: false,
+                    fatal: Some(fatal),
+                    details: Vec::new(),
+                });
+            }
+            eprintln!(
+                "fatal: destination exists, source={}, destination={}",
+                String::from_utf8_lossy(&source_path),
+                String::from_utf8_lossy(&destination_path)
+            );
+            return Err(GitError::Exit(128));
+        }
+        if !options.dry_run && destination_absolute.is_dir() {
+            fs::remove_dir_all(&destination_absolute)?;
+        } else if !options.dry_run {
+            fs::remove_file(&destination_absolute)?;
+        }
+    }
+    let directory_prefix = {
+        let mut prefix = source_path.clone();
+        prefix.push(b'/');
+        prefix
+    };
+    let directory_entries: Vec<_> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.path.starts_with(&directory_prefix))
+        .cloned()
+        .collect();
+    if !directory_entries.is_empty() {
+        let details: Vec<_> = directory_entries
+            .iter()
+            .map(|entry| {
+                let suffix = &entry.path[source_path.len()..];
+                let mut destination = destination_path.clone();
+                destination.extend_from_slice(suffix);
+                MoveDetail {
+                    source: entry.path.clone(),
+                    destination,
+                    skipped: false,
+                }
+            })
+            .collect();
+        if options.dry_run {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: false,
+                fatal: None,
+                details,
+            });
+        }
+        fs::rename(&source_absolute, &destination_absolute)?;
+        let moved_paths: Vec<_> = details
+            .iter()
+            .map(|detail| detail.destination.clone())
+            .collect();
+        index.entries.retain(|entry| {
+            !entry.path.starts_with(&directory_prefix) && !moved_paths.contains(&entry.path)
+        });
+        for (source_entry, detail) in directory_entries.into_iter().zip(details.iter()) {
+            let relative_path = git_path_to_relative_path(&detail.destination)?;
+            let metadata = fs::metadata(worktree_root.join(relative_path))?;
+            let mut destination_entry =
+                index_entry_from_metadata(detail.destination.clone(), source_entry.oid, &metadata);
+            destination_entry.mode = source_entry.mode;
+            index.entries.push(destination_entry);
+        }
+        index
+            .entries
+            .sort_by(|left, right| left.path.cmp(&right.path));
+        index.extensions.clear();
+        fs::write(index_path, index.write_sha1()?)?;
+        return Ok(MoveResult {
+            source: source_path,
+            destination: destination_path,
+            skipped: false,
+            fatal: None,
+            details,
+        });
+    }
+
+    let Some(position) = index
+        .entries
+        .iter()
+        .position(|entry| entry.path == source_path)
+    else {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        let source_kind = if source_absolute.exists() {
+            "not under version control"
+        } else {
+            "bad source"
+        };
+        if options.dry_run {
+            let fatal = format!(
+                "fatal: {source_kind}, source={}, destination={}",
+                String::from_utf8_lossy(&source_path),
+                String::from_utf8_lossy(&destination_path)
+            );
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: false,
+                fatal: Some(fatal),
+                details: Vec::new(),
+            });
+        }
+        eprintln!(
+            "fatal: {source_kind}, source={}, destination={}",
+            String::from_utf8_lossy(&source_path),
+            String::from_utf8_lossy(&destination_path)
+        );
+        return Err(GitError::Exit(128));
+    };
+    if options.dry_run {
+        return Ok(MoveResult {
+            source: source_path,
+            destination: destination_path,
+            skipped: false,
+            fatal: None,
+            details: Vec::new(),
+        });
+    }
+    if let Some(parent) = destination_absolute.parent()
+        && !parent.exists()
+    {
+        if options.skip_errors {
+            return Ok(MoveResult {
+                source: source_path,
+                destination: destination_path,
+                skipped: true,
+                fatal: None,
+                details: Vec::new(),
+            });
+        }
+        eprintln!(
+            "fatal: renaming '{}' failed: No such file or directory",
+            String::from_utf8_lossy(&source_path)
+        );
+        return Err(GitError::Exit(128));
+    }
+    fs::rename(&source_absolute, &destination_absolute)?;
+    let metadata = fs::metadata(&destination_absolute)?;
+    let source_entry = index.entries.remove(position);
+    let mut destination_entry =
+        index_entry_from_metadata(destination_path.clone(), source_entry.oid, &metadata);
+    destination_entry.mode = source_entry.mode;
+    index.entries.retain(|entry| entry.path != destination_path);
+    index.entries.push(destination_entry);
+    index
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    index.extensions.clear();
+    fs::write(index_path, index.write_sha1()?)?;
+    Ok(MoveResult {
+        source: source_path,
+        destination: destination_path,
+        skipped: false,
+        fatal: None,
+        details: Vec::new(),
+    })
+}
+
+fn restore_index_entry(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    entry: &IndexEntry,
+) -> Result<()> {
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let file_path = worktree_path(worktree_root, &entry.path)?;
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(file_path, object.body)?;
+    Ok(())
+}
+
+fn restored_head_index_entry(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<IndexEntry> {
+    let file_path = worktree_path(worktree_root, path)?;
+    if let Ok(metadata) = fs::metadata(&file_path) {
+        let mut index_entry =
+            index_entry_from_metadata(path.to_vec(), entry.oid.clone(), &metadata);
+        index_entry.mode = entry.mode;
+        return Ok(index_entry);
+    }
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    Ok(IndexEntry {
+        ctime_seconds: 0,
+        ctime_nanoseconds: 0,
+        mtime_seconds: 0,
+        mtime_nanoseconds: 0,
+        dev: 0,
+        ino: 0,
+        mode: entry.mode,
+        uid: 0,
+        gid: 0,
+        size: object.body.len().min(u32::MAX as usize) as u32,
+        oid: entry.oid.clone(),
+        flags: path.len().min(0x0fff) as u16,
+        flags_extended: 0,
+        path: path.to_vec(),
+    })
+}
+
+fn restore_head_entry_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<()> {
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let file_path = worktree_path(worktree_root, path)?;
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(file_path, object.body)?;
+    Ok(())
+}
+
+fn restore_head_entry_to_worktree_and_index(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<IndexEntry> {
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let file_path = worktree_path(worktree_root, path)?;
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&file_path, object.body)?;
+    let metadata = fs::metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid.clone(), &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
+}
+
+fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
+    entries
+        .iter()
+        .any(|entry| index_entry_is_under_path(&entry.path, directory))
+}
+
+fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
+    if directory.is_empty() {
+        return true;
+    }
+    entry_path
+        .strip_prefix(directory)
+        .and_then(|rest| rest.strip_prefix(b"/"))
+        .is_some()
+}
+
+fn index_entry_from_metadata(path: Vec<u8>, oid: ObjectId, metadata: &fs::Metadata) -> IndexEntry {
+    let modified = metadata.modified().ok();
+    let duration = modified
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    let mode = file_mode(metadata);
+    let flags = path.len().min(0x0fff) as u16;
+    IndexEntry {
+        ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        ctime_nanoseconds: duration.subsec_nanos(),
+        mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        mtime_nanoseconds: duration.subsec_nanos(),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        size: metadata.len().min(u32::MAX as u64) as u32,
+        oid,
+        flags,
+        flags_extended: 0,
+        path,
+    }
+}
+
+fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Commit::parse(format, &object.body)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TrackedEntry {
+    mode: u32,
+    oid: ObjectId,
+}
+
+fn read_index_entries(git_dir: &Path) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.path,
+                TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                },
+            )
+        })
+        .collect())
+}
+
+fn head_tree_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    let refs = FileRefStore::new(git_dir, format);
+    let Some(head) = refs.read_ref("HEAD")? else {
+        return Ok(BTreeMap::new());
+    };
+    let commit_oid = match head {
+        RefTarget::Direct(oid) => Some(oid),
+        RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+    };
+    let Some(commit_oid) = commit_oid else {
+        return Ok(BTreeMap::new());
+    };
+    let object = db.read_object(&commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "HEAD {commit_oid} is not a commit"
+        )));
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    let mut entries = BTreeMap::new();
+    collect_tree_entries(db, format, &commit.tree, Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+fn tree_entries(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    let mut entries = BTreeMap::new();
+    collect_tree_entries(db, format, tree_oid, Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_tree_entries(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+    entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let tree = Tree::parse(format, &object.body)?;
+    for entry in tree.entries {
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        if entry.mode == 0o040000 {
+            collect_tree_entries(db, format, &entry.oid, path, entries)?;
+        } else {
+            entries.insert(
+                path,
+                TrackedEntry {
+                    mode: entry.mode,
+                    oid: entry.oid,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+fn worktree_entries(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    let mut entries = BTreeMap::new();
+    collect_worktree_entries(worktree_root, git_dir, worktree_root, format, &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_worktree_entries(
+    root: &Path,
+    git_dir: &Path,
+    dir: &Path,
+    format: ObjectFormat,
+    entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    if is_same_path(dir, git_dir) {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if is_same_path(&path, git_dir) {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_worktree_entries(root, git_dir, &path, format, entries)?;
+        } else if metadata.is_file() {
+            let relative = path.strip_prefix(root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            let git_path = git_path_bytes(relative)?;
+            let body = fs::read(&path)?;
+            let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
+            entries.insert(
+                git_path,
+                TrackedEntry {
+                    mode: file_mode(&metadata),
+                    oid,
+                },
+            );
+        } else if format == ObjectFormat::Sha1 {
+            continue;
+        }
+    }
+    Ok(())
+}
+
+fn is_same_path(left: &Path, right: &Path) -> bool {
+    left == right
+}
+
+fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
+    let text = std::str::from_utf8(path).map_err(|err| GitError::InvalidPath(err.to_string()))?;
+    let relative = PathBuf::from(text);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(GitError::InvalidPath(format!(
+            "invalid worktree path {text}"
+        )));
+    }
+    Ok(root.join(relative))
+}
+
+fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
+    let file = worktree_path(root, path)?;
+    if file.exists() {
+        fs::remove_file(&file)?;
+        prune_empty_parents(root, file.parent())?;
+    }
+    Ok(())
+}
+
+fn prune_empty_parents(root: &Path, mut dir: Option<&Path>) -> Result<()> {
+    while let Some(path) = dir {
+        if path == root {
+            break;
+        }
+        match fs::remove_dir(path) {
+            Ok(()) => dir = path.parent(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => dir = path.parent(),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default)]
+struct TreeNode {
+    files: Vec<TreeFile>,
+    directories: BTreeMap<Vec<u8>, TreeNode>,
+}
+
+#[derive(Debug)]
+struct TreeFile {
+    name: Vec<u8>,
+    mode: u32,
+    oid: ObjectId,
+}
+
+impl TreeNode {
+    fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
+        let components = entry.path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        if components.iter().any(|component| component.is_empty()) {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(&entry.path)
+            )));
+        }
+        self.insert_components(&components, entry)
+    }
+
+    fn insert_components(&mut self, components: &[&[u8]], entry: &IndexEntry) -> Result<()> {
+        match components {
+            [] => Err(GitError::InvalidPath("empty index path".into())),
+            [name] => {
+                self.files.push(TreeFile {
+                    name: name.to_vec(),
+                    mode: entry.mode,
+                    oid: entry.oid.clone(),
+                });
+                Ok(())
+            }
+            [directory, rest @ ..] => self
+                .directories
+                .entry(directory.to_vec())
+                .or_default()
+                .insert_components(rest, entry),
+        }
+    }
+}
+
+fn write_tree_node(node: &TreeNode, odb: &mut FileObjectDatabase) -> Result<ObjectId> {
+    let mut entries = Vec::with_capacity(node.files.len() + node.directories.len());
+    for file in &node.files {
+        entries.push(TreeEntry {
+            mode: file.mode,
+            name: file.name.clone(),
+            oid: file.oid.clone(),
+        });
+    }
+    for (name, child) in &node.directories {
+        let oid = write_tree_node(child, odb)?;
+        entries.push(TreeEntry {
+            mode: 0o040000,
+            name: name.clone(),
+            oid,
+        });
+    }
+    entries
+        .sort_by(|left, right| git_tree_entry_cmp(&left.name, left.mode, &right.name, right.mode));
+    odb.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree { entries }.write(),
+    ))
+}
+
+fn git_tree_entry_cmp(
+    left_name: &[u8],
+    left_mode: u32,
+    right_name: &[u8],
+    right_mode: u32,
+) -> Ordering {
+    let shared = left_name.len().min(right_name.len());
+    let name_order = left_name[..shared].cmp(&right_name[..shared]);
+    if name_order != Ordering::Equal {
+        return name_order;
+    }
+    let left_end = left_name.len() == shared;
+    let right_end = right_name.len() == shared;
+    match (left_end, right_end) {
+        (true, true) => Ordering::Equal,
+        (true, false) => tree_name_terminator(left_mode).cmp(&right_name[shared]),
+        (false, true) => left_name[shared].cmp(&tree_name_terminator(right_mode)),
+        (false, false) => Ordering::Equal,
+    }
+}
+
+fn tree_name_terminator(mode: u32) -> u8 {
+    if mode == 0o040000 { b'/' } else { 0 }
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o100644
+}
+
+fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err(GitError::InvalidPath(format!(
+            "invalid index path {}",
+            path.display()
+        )));
+    }
+    Ok(path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+        .into_bytes())
+}
+
+fn repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
+    let path = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidPath("index path is not utf8".into()))?;
+    Ok(path.split('/').collect())
+}
+
+fn git_path_to_relative_path(path: &[u8]) -> Result<PathBuf> {
+    let path = std::str::from_utf8(path)
+        .map_err(|err| GitError::InvalidPath(format!("invalid utf-8 index path: {err}")))?;
+    Ok(path.split('/').collect())
+}
+
+fn path_has_trailing_separator(path: &Path) -> bool {
+    path.as_os_str()
+        .to_string_lossy()
+        .ends_with(std::path::MAIN_SEPARATOR)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use git_odb::ObjectReader;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn update_index_adds_file_entry_and_blob() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+        let result = add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("hello.txt")],
+        )
+        .unwrap();
+        assert_eq!(result.entries, 1);
+        let index =
+            Index::parse_v2_sha1(&fs::read(repository_index_path(git_dir)).unwrap()).unwrap();
+        assert_eq!(index.entries[0].path, b"hello.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn write_tree_from_index_writes_nested_tree_objects() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("README.md"), b"readme\n").unwrap();
+        fs::write(root.join("src").join("lib.rs"), b"pub fn demo() {}\n").unwrap();
+        let result = add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("README.md"), PathBuf::from("src/lib.rs")],
+        )
+        .unwrap();
+        assert_eq!(result.entries, 2);
+        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha1).unwrap();
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = odb.read_object(&tree_oid).unwrap();
+        assert_eq!(tree.object_type, ObjectType::Tree);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_status_reports_added_and_untracked_paths() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+        fs::write(root.join("extra.txt"), b"extra\n").unwrap();
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("hello.txt")],
+        )
+        .unwrap();
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        assert_eq!(
+            status
+                .iter()
+                .map(ShortStatusEntry::line)
+                .collect::<Vec<_>>(),
+            vec!["A  hello.txt", "?? extra.txt"]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_root() -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "git-rs-worktree-{}-{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+}
