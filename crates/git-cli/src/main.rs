@@ -21614,9 +21614,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         return cmd_commit_status_preview(status_mode, status_null);
     }
     if dry_run {
-        return Err(GitError::Unsupported(
-            "commit --dry-run currently requires --short or --porcelain".into(),
-        ));
+        return cmd_commit_long_status_preview();
     }
     if gpg_sign {
         return Err(GitError::Unsupported(

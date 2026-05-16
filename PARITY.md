@@ -871,7 +871,7 @@ Target: upstream Git 2.54.0.
   plus covered commit no-op/reset parsing and value rejection for quiet/verify/post-rewrite/status/verbose/untracked-files/include/only/edit/branch/template/file toggles, covered
   `-S` / `--gpg-sign[=<key>]` reset parsing with `--no-gpg-sign`, covered
   commit `--short` / `--porcelain` / `--long` / `-z` / `--null` status-preview output and reset/value-error parity,
-  including covered `--dry-run` short/porcelain/null preview combinations,
+  including covered `--dry-run` default/long/short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
   patch/interactive requirement errors,

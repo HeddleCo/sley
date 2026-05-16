@@ -1008,8 +1008,16 @@ fn commit_status_preview_modes_match_upstream_git() {
             ("long", vec!["commit", "--long", "-m", "subject"]),
             ("porcelain", vec!["commit", "--porcelain", "-m", "subject"]),
             (
+                "dry-run-long-default",
+                vec!["commit", "--dry-run", "-m", "subject"],
+            ),
+            (
                 "dry-run-short",
                 vec!["commit", "--dry-run", "--short", "-m", "subject"],
+            ),
+            (
+                "dry-run-long",
+                vec!["commit", "--dry-run", "--long", "-m", "subject"],
             ),
             (
                 "dry-run-porcelain",
