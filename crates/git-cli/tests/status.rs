@@ -575,6 +575,40 @@ fn status_branch_ahead_behind_matches_upstream_git() {
 }
 
 #[test]
+fn status_detached_head_matches_upstream_git() {
+    let root = unique_temp_dir("status-detached-head");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "Example User"]);
+        git(&root, &["config", "user.email", "example@example.invalid"]);
+        fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-m", "base", "-q"]);
+        let base = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
+            .expect("rev-parse output is utf8");
+        fs::write(root.join("a.txt"), b"second\n").expect("write second fixture");
+        git(&root, &["commit", "-am", "second", "-q"]);
+        git(&root, &["checkout", "-q", base.trim()]);
+
+        for args in [
+            vec!["status"],
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs detached status output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");

@@ -905,7 +905,8 @@ Target: upstream Git 2.54.0.
   untracked, ignored, ignore-submodules, and column options, simple nested-cwd
   status path display, and simple
   literal status pathspec filtering for files, directories, missing paths, NUL
-  output, and `--` pathspec separation,
+  output, `--` pathspec separation, and detached-HEAD long/branch status
+  headers,
   Rust-created branch interop, `branch -r`/`-a`, `branch --list <pattern>...`,
   remote/all branch list patterns, `branch --points-at` including local/remote/all list-pattern forms, `branch --contains`,
   `branch --no-contains`, including default-`HEAD` contains/no-contains forms,

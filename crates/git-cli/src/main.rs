@@ -37303,7 +37303,7 @@ fn print_status_long_branch(
             }
         }
         Some(RefTarget::Direct(oid)) => {
-            println!("HEAD detached at {}", oid.to_hex());
+            println!("HEAD detached at {}", format_log_abbrev_oid(&oid));
             Ok(false)
         }
         None => {
