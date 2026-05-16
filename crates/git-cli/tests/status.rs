@@ -493,6 +493,31 @@ fn status_branch_ahead_behind_matches_upstream_git() {
             );
         }
 
+        git(&root, &["clone", "-q", &remote_arg, &peer_arg]);
+        git(&peer, &["config", "user.name", "Example User"]);
+        git(&peer, &["config", "user.email", "example@example.invalid"]);
+        fs::write(peer.join("b.txt"), b"remote\n").expect("write remote fixture");
+        git(&peer, &["add", "b.txt"]);
+        git(&peer, &["commit", "-m", "remote", "-q"]);
+        git(&peer, &["push", "-q"]);
+        git(&work, &["fetch", "-q"]);
+
+        for args in [
+            vec!["status"],
+            vec!["status", "--no-ahead-behind"],
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--short", "--branch", "--no-ahead-behind"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
+        ] {
+            let expected = git(&work, &args);
+            let actual = git_rs(&work, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs behind tracking header differed for {args:?}"
+            );
+        }
+
         fs::write(work.join("a.txt"), b"local\n").expect("write local fixture");
         git(&work, &["commit", "-am", "local", "-q"]);
         for args in [
@@ -510,15 +535,6 @@ fn status_branch_ahead_behind_matches_upstream_git() {
                 "git-rs ahead tracking header differed for {args:?}"
             );
         }
-
-        git(&root, &["clone", "-q", &remote_arg, &peer_arg]);
-        git(&peer, &["config", "user.name", "Example User"]);
-        git(&peer, &["config", "user.email", "example@example.invalid"]);
-        fs::write(peer.join("b.txt"), b"remote\n").expect("write remote fixture");
-        git(&peer, &["add", "b.txt"]);
-        git(&peer, &["commit", "-m", "remote", "-q"]);
-        git(&peer, &["push", "-q"]);
-        git(&work, &["fetch", "-q"]);
 
         for args in [
             vec!["status"],
