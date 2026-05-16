@@ -208,7 +208,11 @@ fn commit_message_option_errors_match_upstream_git() {
     let result = (|| {
         run_success("git", &root, &["init", "-q"]);
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
-        for args in [vec!["commit", "-m"], vec!["commit", "-m", "one", "-m"]] {
+        for args in [
+            vec!["commit", "-m"],
+            vec!["commit", "-m", "one", "-m"],
+            vec!["commit", "-t"],
+        ] {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
             assert_same_output(actual, expected, &args);
@@ -613,6 +617,14 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--template", "message-lf.txt", "-m", "subject"],
             ),
             (
+                "template-short",
+                vec!["commit", "-t", "message-lf.txt", "-m", "subject"],
+            ),
+            (
+                "template-short-attached",
+                vec!["commit", "-tmessage-lf.txt", "-m", "subject"],
+            ),
+            (
                 "template-equals",
                 vec!["commit", "--template=message-lf.txt", "-m", "subject"],
             ),
@@ -630,6 +642,7 @@ fn commit_file_messages_match_upstream_git_objects() {
                     "subject",
                 ],
             ),
+            ("terminator", vec!["commit", "-m", "subject", "--"]),
         ] {
             let expected_root = root.join(format!("{name}-expected"));
             let actual_root = root.join(format!("{name}-actual"));

@@ -21303,6 +21303,12 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-branch=") => {
                 return commit_option_takes_no_value_error("no-branch");
             }
+            "-t" => {
+                let Some(_template) = iter.next() else {
+                    return commit_template_short_requires_value_error();
+                };
+            }
+            value if value.starts_with("-t") && value.len() > 2 => {}
             "--template" => {
                 let Some(_template) = iter.next() else {
                     return commit_template_requires_value_error();
@@ -21325,6 +21331,13 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-cleanup" => cleanup_mode = Some(CommitCleanupMode::Whitespace),
             value if value.starts_with("--no-cleanup=") => {
                 return commit_option_takes_no_value_error("no-cleanup");
+            }
+            "--" => {
+                if let Some(value) = iter.as_slice().first() {
+                    return Err(GitError::Command(format!(
+                        "unsupported commit argument {value}; currently supports -m and -F"
+                    )));
+                }
             }
             value => {
                 return Err(GitError::Command(format!(
@@ -21573,6 +21586,11 @@ fn commit_cleanup_requires_value_error() -> Result<()> {
 
 fn commit_template_requires_value_error() -> Result<()> {
     eprintln!("error: option `template' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_template_short_requires_value_error() -> Result<()> {
+    eprintln!("error: switch `t' requires a value");
     Err(GitError::Exit(129))
 }
 
