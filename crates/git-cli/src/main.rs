@@ -21055,6 +21055,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                     &value["--file=".len()..],
                 )?);
             }
+            "--no-file" => {}
+            value if value.starts_with("--no-file=") => {
+                return commit_option_takes_no_value_error("no-file");
+            }
             "-C" | "--reuse-message" => {
                 let Some(value) = iter.next() else {
                     return commit_reuse_message_requires_value_error(arg == "-C", false);
@@ -21284,6 +21288,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--cleanup=") => {
                 cleanup_mode = Some(parse_commit_cleanup_mode(&value["--cleanup=".len()..])?);
+            }
+            "--no-cleanup" => cleanup_mode = Some(CommitCleanupMode::Whitespace),
+            value if value.starts_with("--no-cleanup=") => {
+                return commit_option_takes_no_value_error("no-cleanup");
             }
             value => {
                 return Err(GitError::Command(format!(

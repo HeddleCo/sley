@@ -220,6 +220,8 @@ fn commit_message_option_errors_match_upstream_git() {
         for args in [
             vec!["commit", "--template"],
             vec!["commit", "--no-template=value", "-m", "subject"],
+            vec!["commit", "--no-file=value", "-m", "subject"],
+            vec!["commit", "--no-cleanup=value", "-m", "subject"],
             vec!["commit", "--all=value", "-m", "subject"],
             vec!["commit", "--no-all=value", "-m", "subject"],
             vec!["commit", "-C"],
@@ -302,6 +304,11 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--file=message-no-lf.txt"],
             ),
             ("long-file", vec!["commit", "--file", "message-lf.txt"]),
+            ("no-file", vec!["commit", "--no-file", "-m", "subject"]),
+            (
+                "file-no-file",
+                vec!["commit", "--file", "message-no-lf.txt", "--no-file"],
+            ),
             (
                 "attached-and-long-message",
                 vec!["commit", "-mone", "--message", "two"],
@@ -530,6 +537,16 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec![
                     "commit",
                     "--cleanup=scissors",
+                    "-m",
+                    "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "cleanup-reset",
+                vec![
+                    "commit",
+                    "--cleanup=strip",
+                    "--no-cleanup",
                     "-m",
                     "subject\n\n# comment\n body  ",
                 ],
