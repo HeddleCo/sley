@@ -85,6 +85,28 @@ fn cat_head(program: &str, root: &Path) -> Vec<u8> {
     output.stdout
 }
 
+fn create_initial_commit(program: &str, root: &Path) {
+    prepare_commit_repo(root);
+    let output = run_output_with_identity(program, root, &["commit", "-m", "initial"]);
+    assert!(
+        output.status.success(),
+        "{program} initial commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn remove_message_fixtures(root: &Path) {
+    for name in [
+        "message-empty.txt",
+        "message-lf.txt",
+        "message-no-lf.txt",
+        "message-signed.txt",
+        "message-whitespace.txt",
+    ] {
+        fs::remove_file(root.join(name)).expect("remove message fixture");
+    }
+}
+
 #[test]
 fn commit_empty_message_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-empty-message-errors");
@@ -116,6 +138,43 @@ fn commit_empty_message_errors_match_upstream_git() {
             fs::create_dir_all(&actual_root).expect("create actual repo");
             prepare_commit_repo(&expected_root);
             prepare_commit_repo(&actual_root);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn commit_clean_index_requires_allow_empty_like_upstream_git() {
+    let root = unique_temp_dir("commit-clean-index");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            ("clean", vec!["commit", "-m", "second"]),
+            (
+                "allow-then-disallow",
+                vec![
+                    "commit",
+                    "--allow-empty",
+                    "--no-allow-empty",
+                    "-m",
+                    "second",
+                ],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            create_initial_commit("git", &expected_root);
+            create_initial_commit(env!("CARGO_BIN_EXE_git-rs"), &actual_root);
+            remove_message_fixtures(&expected_root);
+            remove_message_fixtures(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
             let actual =
@@ -250,6 +309,60 @@ fn commit_file_messages_match_upstream_git_objects() {
         let expected = run_output_with_identity("git", &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn commit_allow_empty_matches_upstream_git_objects() {
+    let root = unique_temp_dir("commit-allow-empty");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            (
+                "allow-empty",
+                vec!["commit", "--allow-empty", "-m", "second"],
+            ),
+            (
+                "disallow-then-allow-empty",
+                vec![
+                    "commit",
+                    "--no-allow-empty",
+                    "--allow-empty",
+                    "-m",
+                    "second",
+                ],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            create_initial_commit("git", &expected_root);
+            create_initial_commit(env!("CARGO_BIN_EXE_git-rs"), &actual_root);
+            remove_message_fixtures(&expected_root);
+            remove_message_fixtures(&actual_root);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            assert!(
+                expected.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&expected.stderr)
+            );
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert!(
+                actual.status.success(),
+                "git-rs {args:?} failed: {}",
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            assert_eq!(
+                cat_head("git", &actual_root),
+                cat_head("git", &expected_root),
+                "committed object differed for {args:?}"
+            );
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

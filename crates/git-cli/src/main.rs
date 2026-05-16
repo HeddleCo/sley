@@ -20981,6 +20981,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut file_message = None;
     let mut signoff = false;
     let mut quiet = false;
+    let mut allow_empty = false;
     let mut allow_empty_message = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -21029,6 +21030,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-signoff" => signoff = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "--allow-empty" => allow_empty = true,
+            "--no-allow-empty" => allow_empty = false,
             "--allow-empty-message" => allow_empty_message = true,
             "--no-allow-empty-message" => allow_empty_message = false,
             "-n" | "--no-verify" | "--verify" => {}
@@ -21055,6 +21058,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks));
     if !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
+    if !allow_empty && commit_index_matches_head(&git_dir, format)? {
+        print_clean_commit_status(&git_dir, format)?;
         return Err(GitError::Exit(1));
     }
     let message = if signoff {
@@ -21218,6 +21225,36 @@ fn commit_message_chunk_is_empty(chunk: &[u8]) -> bool {
 
 fn commit_message_is_empty(message: &[u8]) -> bool {
     message.iter().all(u8::is_ascii_whitespace)
+}
+
+fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let tree = git_worktree::write_tree_from_index(git_dir, format)?;
+    let store = FileRefStore::new(git_dir, format);
+    let head = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
+        direct => direct,
+    };
+    let Some(RefTarget::Direct(parent)) = head else {
+        return Ok(false);
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let object = db.read_object(&parent)?;
+    if object.object_type != ObjectType::Commit {
+        return Ok(false);
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(commit.tree == tree)
+}
+
+fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")?
+        && let Some(branch) = target.strip_prefix("refs/heads/")
+    {
+        println!("On branch {branch}");
+    }
+    println!("nothing to commit, working tree clean");
+    Ok(())
 }
 
 fn cmd_diff(args: &[String]) -> Result<()> {

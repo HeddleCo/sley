@@ -850,7 +850,8 @@ Target: upstream Git 2.54.0.
   minimal `commit -m` interop readable by upstream `git rev-parse` and
   `git log`, commit empty-message rejection and
   `--allow-empty-message` / `--no-allow-empty-message` toggle parity for
-  covered `-m` / `-F` messages, Rust add/status interop with upstream `git status --short`,
+  covered `-m` / `-F` messages, clean-index rejection and
+  `--allow-empty` / `--no-allow-empty` toggle parity, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`
   over unborn and committed tracked-change fixtures, plus status quoting for
