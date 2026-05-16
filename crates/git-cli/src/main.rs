@@ -5758,6 +5758,7 @@ fn validate_stash_like_commit(
 enum StashShowMode {
     Stat,
     NameOnly,
+    NameStatus,
     Patch,
     Quiet,
 }
@@ -5769,9 +5770,44 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut specs = Vec::new();
     for arg in args {
         match arg.as_str() {
-            "--stat" => mode = StashShowMode::Stat,
-            "--name-only" => mode = StashShowMode::NameOnly,
-            "-p" | "--patch" | "--oneline" => mode = StashShowMode::Patch,
+            "--stat" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                }
+            }
+            "--name-only" => {
+                if matches!(mode, StashShowMode::NameStatus) {
+                    eprintln!(
+                        "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                if !matches!(mode, StashShowMode::Quiet) {
+                    mode = StashShowMode::NameOnly;
+                }
+            }
+            "--name-status" => {
+                if matches!(mode, StashShowMode::NameOnly) {
+                    eprintln!(
+                        "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                if !matches!(mode, StashShowMode::Quiet) {
+                    mode = StashShowMode::NameStatus;
+                }
+            }
+            "-p" | "--patch" | "--oneline" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Patch;
+                }
+            }
             "--quiet" => mode = StashShowMode::Quiet,
             "-u" | "--include-untracked" => {
                 include_untracked = true;
@@ -5880,6 +5916,17 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         StashShowMode::NameOnly => {
             for entry in entries {
                 writeln!(stdout, "{}", status_quote_path(&entry.path, false))?;
+            }
+        }
+        StashShowMode::NameStatus => {
+            for entry in entries {
+                write!(stdout, "{}", entry.status.label())?;
+                if let Some(old_path) = &entry.old_path {
+                    let old_path = status_quote_path(old_path, false);
+                    write!(stdout, "\t{old_path}")?;
+                }
+                let path = status_quote_path(&entry.path, false);
+                writeln!(stdout, "\t{path}")?;
             }
         }
         StashShowMode::Patch => {

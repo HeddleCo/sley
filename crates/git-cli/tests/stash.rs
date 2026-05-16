@@ -454,6 +454,13 @@ fn stash_show_matches_upstream_git() {
             vec!["stash", "show"],
             vec!["stash", "show", "--stat"],
             vec!["stash", "show", "--name-only"],
+            vec!["stash", "show", "--name-status"],
+            vec!["stash", "show", "--name-status", "--stat"],
+            vec!["stash", "show", "--stat", "--name-status"],
+            vec!["stash", "show", "--name-status", "-p"],
+            vec!["stash", "show", "-p", "--name-status"],
+            vec!["stash", "show", "--name-only", "--stat"],
+            vec!["stash", "show", "--stat", "--name-only"],
             vec!["stash", "show", "-p"],
             vec!["stash", "show", "--patch"],
             vec!["stash", "show", "--oneline"],
@@ -489,6 +496,8 @@ fn stash_show_untracked_flags_match_upstream_git() {
             vec!["stash", "show", "--only-untracked"],
             vec!["stash", "show", "--name-only", "--include-untracked"],
             vec!["stash", "show", "--name-only", "--only-untracked"],
+            vec!["stash", "show", "--name-status", "--include-untracked"],
+            vec!["stash", "show", "--name-status", "--only-untracked"],
             vec!["stash", "show", "--name-only", "--no-include-untracked"],
             vec![
                 "stash",
@@ -526,6 +535,10 @@ fn stash_show_untracked_flags_match_upstream_git() {
         for args in [
             ["stash", "show", "--quiet", "--include-untracked"].as_slice(),
             ["stash", "show", "--quiet", "--only-untracked"].as_slice(),
+            ["stash", "show", "--quiet", "--name-status"].as_slice(),
+            ["stash", "show", "--name-status", "--quiet"].as_slice(),
+            ["stash", "show", "--name-only", "--name-status"].as_slice(),
+            ["stash", "show", "--name-status", "--name-only"].as_slice(),
             ["stash", "show", "--no-only-untracked"].as_slice(),
         ] {
             let expected = run_output("git", &untracked, args);
