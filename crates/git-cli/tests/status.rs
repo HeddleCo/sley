@@ -478,6 +478,8 @@ fn status_branch_ahead_behind_matches_upstream_git() {
         git(&work, &["push", "-q", "-u", "origin", "main"]);
 
         for args in [
+            vec!["status"],
+            vec!["status", "--no-ahead-behind"],
             vec!["status", "--short", "--branch"],
             vec!["status", "--short", "--branch", "--no-ahead-behind"],
             vec!["status", "--porcelain=v2", "--branch"],
@@ -494,6 +496,8 @@ fn status_branch_ahead_behind_matches_upstream_git() {
         fs::write(work.join("a.txt"), b"local\n").expect("write local fixture");
         git(&work, &["commit", "-am", "local", "-q"]);
         for args in [
+            vec!["status"],
+            vec!["status", "--no-ahead-behind"],
             vec!["status", "--short", "--branch"],
             vec!["status", "--short", "--branch", "--no-ahead-behind"],
             vec!["status", "--porcelain=v2", "--branch"],
@@ -517,6 +521,8 @@ fn status_branch_ahead_behind_matches_upstream_git() {
         git(&work, &["fetch", "-q"]);
 
         for args in [
+            vec!["status"],
+            vec!["status", "--no-ahead-behind"],
             vec!["status", "--short", "--branch"],
             vec!["status", "--short", "--branch", "--no-ahead-behind"],
             vec!["status", "--porcelain=v2", "--branch"],

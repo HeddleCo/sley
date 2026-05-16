@@ -21795,7 +21795,7 @@ fn cmd_commit_long_status_preview() -> Result<()> {
         },
     )?;
     let committable = status_entries_have_index_changes(&entries);
-    print_status_long(&git_dir, format, entries, true, false)?;
+    print_status_long(&git_dir, format, entries, true, false, true)?;
     if committable {
         Ok(())
     } else {
@@ -36990,7 +36990,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
             );
         }
     } else {
-        print_status_long(&git_dir, format, entries, false, show_stash)?;
+        print_status_long(&git_dir, format, entries, false, show_stash, ahead_behind)?;
     }
     Ok(())
 }
@@ -37155,8 +37155,9 @@ fn print_status_long(
     entries: Vec<git_worktree::ShortStatusEntry>,
     commit_preview: bool,
     show_stash: bool,
+    ahead_behind: bool,
 ) -> Result<()> {
-    let head_initial = print_status_long_branch(git_dir, format)?;
+    let head_initial = print_status_long_branch(git_dir, format, ahead_behind)?;
     if head_initial {
         println!();
         if commit_preview {
@@ -37273,13 +37274,29 @@ fn status_stash_count(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
     Ok(store.read_reflog("refs/stash")?.len())
 }
 
-fn print_status_long_branch(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+fn print_status_long_branch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    ahead_behind: bool,
+) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
     match store.read_ref("HEAD")? {
         Some(RefTarget::Symbolic(target)) => {
             if let Some(branch) = target.strip_prefix("refs/heads/") {
                 println!("On branch {branch}");
-                Ok(store.read_ref(&target)?.is_none())
+                if let Some(RefTarget::Direct(oid)) = store.read_ref(&target)? {
+                    print_status_long_tracking(
+                        git_dir,
+                        format,
+                        &store,
+                        &target,
+                        &oid,
+                        ahead_behind,
+                    )?;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
             } else {
                 println!("On branch {target}");
                 Ok(store.read_ref(&target)?.is_none())
@@ -37294,6 +37311,63 @@ fn print_status_long_branch(git_dir: &Path, format: ObjectFormat) -> Result<bool
             Ok(true)
         }
     }
+}
+
+fn print_status_long_tracking(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    branch_ref: &str,
+    oid: &ObjectId,
+    ahead_behind: bool,
+) -> Result<()> {
+    let Some(tracking) =
+        status_branch_tracking(git_dir, format, store, branch_ref, oid, ahead_behind)?
+    else {
+        return Ok(());
+    };
+    match tracking.track {
+        Some(ForEachRefTrack {
+            ahead: 0,
+            behind: 0,
+        }) => {
+            println!("Your branch is up to date with '{}'.", tracking.upstream);
+        }
+        Some(ForEachRefTrack { ahead, behind: 0 }) => {
+            println!(
+                "Your branch is ahead of '{}' by {ahead} {}.",
+                tracking.upstream,
+                status_commit_word(ahead)
+            );
+            println!("  (use \"git push\" to publish your local commits)");
+        }
+        Some(ForEachRefTrack { ahead: 0, behind }) => {
+            println!(
+                "Your branch is behind '{}' by {behind} {}, and can be fast-forwarded.",
+                tracking.upstream,
+                status_commit_word(behind)
+            );
+            println!("  (use \"git pull\" to update your local branch)");
+        }
+        Some(ForEachRefTrack { ahead, behind }) => {
+            println!("Your branch and '{}' have diverged,", tracking.upstream);
+            println!("and have {ahead} and {behind} different commits each, respectively.");
+            println!("  (use \"git pull\" if you want to integrate the remote branch with yours)");
+        }
+        None => {
+            println!(
+                "Your branch and '{}' refer to different commits.",
+                tracking.upstream
+            );
+            println!("  (use \"git status --ahead-behind\" for details)");
+        }
+    }
+    println!();
+    Ok(())
+}
+
+fn status_commit_word(count: usize) -> &'static str {
+    if count == 1 { "commit" } else { "commits" }
 }
 
 fn status_long_change_label(code: u8) -> Option<&'static str> {
