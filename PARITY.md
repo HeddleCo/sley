@@ -868,7 +868,7 @@ Target: upstream Git 2.54.0.
   message/author/date/fixup/squash values,
   covered `--trailer` insertion for token/value forms, trailer-only message
   creation, `--no-trailer` reset behavior, and signoff/trailer ordering,
-  plus covered commit no-op parsing for post-rewrite/status/verbose/edit/branch/template toggles, covered
+  plus covered commit no-op parsing and value rejection for post-rewrite/status/verbose/edit/branch/template toggles, covered
   `--cleanup` object parity, and `--template` value errors, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`

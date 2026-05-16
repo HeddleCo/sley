@@ -21156,8 +21156,20 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
+            value if value.starts_with("--signoff=") => {
+                return commit_option_takes_no_value_error("signoff");
+            }
+            value if value.starts_with("--no-signoff=") => {
+                return commit_option_takes_no_value_error("no-signoff");
+            }
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            value if value.starts_with("--quiet=") => {
+                return commit_option_takes_no_value_error("quiet");
+            }
+            value if value.starts_with("--no-quiet=") => {
+                return commit_option_takes_no_value_error("no-quiet");
+            }
             "-a" | "--all" => all = true,
             "--no-all" => all = false,
             value if value.starts_with("--all=") => {
@@ -21170,6 +21182,18 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-allow-empty" => allow_empty = false,
             "--allow-empty-message" => allow_empty_message = true,
             "--no-allow-empty-message" => allow_empty_message = false,
+            value if value.starts_with("--allow-empty=") => {
+                return commit_option_takes_no_value_error("allow-empty");
+            }
+            value if value.starts_with("--no-allow-empty=") => {
+                return commit_option_takes_no_value_error("no-allow-empty");
+            }
+            value if value.starts_with("--allow-empty-message=") => {
+                return commit_option_takes_no_value_error("allow-empty-message");
+            }
+            value if value.starts_with("--no-allow-empty-message=") => {
+                return commit_option_takes_no_value_error("no-allow-empty-message");
+            }
             "--author" => {
                 let Some(author) = iter.next() else {
                     return commit_author_requires_value_error();
@@ -21197,10 +21221,37 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 return commit_option_takes_no_value_error("no-date");
             }
             "-n" | "--no-verify" | "--verify" => {}
+            value if value.starts_with("--no-verify=") => {
+                return commit_option_takes_no_value_error("no-verify");
+            }
+            value if value.starts_with("--verify=") => {
+                return commit_option_takes_no_value_error("no-no-verify");
+            }
             "--no-gpg-sign" => {}
+            value if value.starts_with("--no-gpg-sign=") => {
+                return commit_option_takes_no_value_error("no-gpg-sign");
+            }
             "--post-rewrite" | "--no-post-rewrite" => {}
+            value if value.starts_with("--post-rewrite=") => {
+                return commit_option_takes_no_value_error("no-no-post-rewrite");
+            }
+            value if value.starts_with("--no-post-rewrite=") => {
+                return commit_option_takes_no_value_error("no-post-rewrite");
+            }
             "--status" | "--no-status" => {}
+            value if value.starts_with("--status=") => {
+                return commit_option_takes_no_value_error("status");
+            }
+            value if value.starts_with("--no-status=") => {
+                return commit_option_takes_no_value_error("no-status");
+            }
             "-v" | "--verbose" | "--no-verbose" => {}
+            value if value.starts_with("--verbose=") => {
+                return commit_option_takes_no_value_error("verbose");
+            }
+            value if value.starts_with("--no-verbose=") => {
+                return commit_option_takes_no_value_error("no-verbose");
+            }
             "-e" | "--edit" | "--no-edit" => {}
             value if value.starts_with("--edit=") => {
                 return commit_option_takes_no_value_error("edit");
