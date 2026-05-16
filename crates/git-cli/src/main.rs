@@ -36055,7 +36055,7 @@ fn cmd_tag(args: &[String]) -> Result<()> {
             }
             "--message" => {
                 let Some(message) = iter.next() else {
-                    return tag_message_requires_value_error();
+                    return tag_option_requires_value_error("message");
                 };
                 messages.push(message.as_bytes().to_vec());
             }
@@ -36068,7 +36068,11 @@ fn cmd_tag(args: &[String]) -> Result<()> {
             "--no-trailer" => trailers.clear(),
             "-F" | "--file" => {
                 let Some(path) = iter.next() else {
-                    return tag_file_requires_value_error();
+                    return if arg == "-F" {
+                        tag_file_requires_value_error()
+                    } else {
+                        tag_option_requires_value_error("file")
+                    };
                 };
                 file_message = Some(read_commit_message_file(path)?);
             }

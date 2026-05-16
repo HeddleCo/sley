@@ -943,7 +943,8 @@ Target: upstream Git 2.54.0.
   covered message-provided and no-message editor-noop paths, annotated tag
   no-message fatal handling and trailer-only message creation,
   `--no-local-user` no-op parsing plus
-  missing-value errors for `-u` / `--local-user`,
+  missing-value errors for `-m` / `--message`, `-F` / `--file`, and
+  `-u` / `--local-user`,
   takes-no-value errors for covered boolean tag option `=<value>` forms,
   unknown-option errors for covered non-existent tag mode negations and
   `=<value>` forms, unknown-switch errors for covered short boolean

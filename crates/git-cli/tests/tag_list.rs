@@ -215,7 +215,9 @@ fn tag_create_errors_match_upstream_git() {
             vec!["tag", "v1"],
             vec!["tag", "-a", "v1", "-m", "annotated"],
             vec!["tag", "-m"],
+            vec!["tag", "--message"],
             vec!["tag", "-F"],
+            vec!["tag", "--file"],
             vec![
                 "tag",
                 "-a",
