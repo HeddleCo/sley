@@ -82,6 +82,7 @@ Target: upstream Git 2.54.0.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
   display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
+  `--grep` filtering with case/fixed-string/all-match/invert toggles,
   `--reverse` rejection, and `-<n>` / `-n` / `--max-count` limiting for
   covered stash entries and empty repositories,
   `stash clear` ref/reflog removal and covered empty/error cases, plus
@@ -887,6 +888,7 @@ Target: upstream Git 2.54.0.
   `stash list` display over `refs/stash` reflogs including default,
   `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
+  `--grep` filtering with case/fixed-string/all-match/invert toggles,
   `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/numstat/shortstat/summary/name/name-status/patch/untracked output, `stash store` ref/reflog writes,

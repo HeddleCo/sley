@@ -5485,6 +5485,10 @@ struct StashListOptions {
     format: StashListFormat,
     max_count: Option<usize>,
     abbrev_len: Option<usize>,
+    grep_filters: Vec<SimpleLogRegex>,
+    grep_all_match: bool,
+    invert_grep: bool,
+    regexp_ignore_case: bool,
 }
 
 #[derive(Debug)]
@@ -6106,20 +6110,22 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     let store = FileRefStore::new(&common_git_dir, format);
     let mut entries = store.read_reflog("refs/stash")?;
     entries.reverse();
+    let mut entries = entries.into_iter().enumerate().collect::<Vec<_>>();
+    entries.retain(|(_, entry)| stash_list_grep_filters_match(entry, &options));
     let selected = options
         .max_count
         .map_or(entries.len(), |max_count| max_count.min(entries.len()));
-    for (index, entry) in entries.iter().take(selected).enumerate() {
+    for (position, (stash_index, entry)) in entries.iter().take(selected).enumerate() {
         match &options.format {
             StashListFormat::Default => {
                 println!(
-                    "stash@{{{index}}}: {}",
+                    "stash@{{{stash_index}}}: {}",
                     String::from_utf8_lossy(&entry.message)
                 );
             }
             StashListFormat::Oneline => {
                 println!(
-                    "{} refs/stash@{{{index}}}: {}",
+                    "{} refs/stash@{{{stash_index}}}: {}",
                     format_log_oid(&entry.new_oid, options.abbrev_len),
                     String::from_utf8_lossy(&entry.message)
                 );
@@ -6128,8 +6134,8 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                 format,
                 final_newline,
             } => {
-                print_stash_list_format(entry, index, format, options.abbrev_len)?;
-                if *final_newline || index + 1 < selected {
+                print_stash_list_format(entry, *stash_index, format, options.abbrev_len)?;
+                if *final_newline || position + 1 < selected {
                     println!();
                 }
             }
@@ -6142,6 +6148,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut format = StashListFormat::Default;
     let mut max_count = None;
     let mut abbrev_len = Some(7);
+    let mut grep_patterns = Vec::new();
+    let mut grep_all_match = false;
+    let mut invert_grep = false;
+    let mut regexp_ignore_case = false;
+    let mut regexp_mode = SimpleLogRegexMode::Basic;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -6163,6 +6174,23 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
+            "--grep" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(log_grep_requires_value_error());
+                };
+                grep_patterns.push(LogFilterPattern::new(value, "command line"));
+            }
+            value if let Some(value) = value.strip_prefix("--grep=") => {
+                grep_patterns.push(LogFilterPattern::new(value, "command line"));
+            }
+            "--all-match" => grep_all_match = true,
+            "--invert-grep" => invert_grep = true,
+            "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
+            "-F" | "--fixed-strings" => regexp_mode = SimpleLogRegexMode::Fixed,
+            "-E" | "--basic-regexp" | "--extended-regexp" => {
+                regexp_mode = SimpleLogRegexMode::Basic
+            }
             "--format" | "--pretty" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6211,10 +6239,15 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         }
         index += 1;
     }
+    let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
     Ok(StashListOptions {
         format,
         max_count,
         abbrev_len,
+        grep_filters,
+        grep_all_match,
+        invert_grep,
+        regexp_ignore_case,
     })
 }
 
@@ -6281,6 +6314,25 @@ fn print_stash_list_format(
         }
     }
     Ok(())
+}
+
+fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions) -> bool {
+    if options.grep_filters.is_empty() {
+        return true;
+    }
+    let message = String::from_utf8_lossy(&entry.message);
+    let matched = if options.grep_all_match {
+        options
+            .grep_filters
+            .iter()
+            .all(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    } else {
+        options
+            .grep_filters
+            .iter()
+            .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    };
+    matched != options.invert_grep
 }
 
 fn ancestor_depths(
