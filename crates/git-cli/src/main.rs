@@ -5491,19 +5491,7 @@ struct StashListOptions {
 enum StashListFormat {
     Default,
     Oneline,
-    Placeholder {
-        placeholder: StashListPlaceholder,
-        final_newline: bool,
-    },
-}
-
-#[derive(Debug)]
-enum StashListPlaceholder {
-    FullObjectName,
-    AbbreviatedObjectName,
-    ReflogSelector,
-    FullReflogSelector,
-    ReflogSubject,
+    Custom { format: String, final_newline: bool },
 }
 
 fn cmd_stash(args: &[String]) -> Result<()> {
@@ -6136,25 +6124,13 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                     String::from_utf8_lossy(&entry.message)
                 );
             }
-            StashListFormat::Placeholder {
-                placeholder,
+            StashListFormat::Custom {
+                format,
                 final_newline,
             } => {
-                let value = match placeholder {
-                    StashListPlaceholder::FullObjectName => entry.new_oid.to_hex(),
-                    StashListPlaceholder::AbbreviatedObjectName => {
-                        format_log_oid(&entry.new_oid, options.abbrev_len)
-                    }
-                    StashListPlaceholder::ReflogSelector => format!("stash@{{{index}}}"),
-                    StashListPlaceholder::FullReflogSelector => format!("refs/stash@{{{index}}}"),
-                    StashListPlaceholder::ReflogSubject => {
-                        String::from_utf8_lossy(&entry.message).into_owned()
-                    }
-                };
+                print_stash_list_format(entry, index, format, options.abbrev_len)?;
                 if *final_newline || index + 1 < selected {
-                    println!("{value}");
-                } else {
-                    print!("{value}");
+                    println!();
                 }
             }
         }
@@ -6239,50 +6215,63 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
 fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
     match value {
         "oneline" => Ok(StashListFormat::Oneline),
-        "%H" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::FullObjectName,
-            final_newline: true,
-        }),
-        "%h" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::AbbreviatedObjectName,
-            final_newline: true,
-        }),
-        "%gd" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::ReflogSelector,
-            final_newline: true,
-        }),
-        "%gD" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::FullReflogSelector,
-            final_newline: true,
-        }),
-        "%gs" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::ReflogSubject,
-            final_newline: true,
-        }),
-        "format:%gd" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::ReflogSelector,
+        value if let Some(format) = value.strip_prefix("format:") => Ok(StashListFormat::Custom {
+            format: format.to_string(),
             final_newline: false,
         }),
-        "format:%H" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::FullObjectName,
-            final_newline: false,
+        value => Ok(StashListFormat::Custom {
+            format: value.to_string(),
+            final_newline: true,
         }),
-        "format:%h" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::AbbreviatedObjectName,
-            final_newline: false,
-        }),
-        "format:%gD" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::FullReflogSelector,
-            final_newline: false,
-        }),
-        "format:%gs" => Ok(StashListFormat::Placeholder {
-            placeholder: StashListPlaceholder::ReflogSubject,
-            final_newline: false,
-        }),
-        _ => Err(GitError::Unsupported(
-            "stash list currently supports only --oneline and %gd/%gD/%gs formats".into(),
-        )),
     }
+}
+
+fn print_stash_list_format(
+    entry: &ReflogEntry,
+    index: usize,
+    format: &str,
+    abbrev_len: Option<usize>,
+) -> Result<()> {
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            print!("{ch}");
+            continue;
+        }
+        match chars.next() {
+            Some('%') => print!("%"),
+            Some('n') => println!(),
+            Some('H') => print!("{}", entry.new_oid),
+            Some('h') => print!("{}", format_log_oid(&entry.new_oid, abbrev_len)),
+            Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
+            Some('g') => match chars.next() {
+                Some('d') => print!("stash@{{{index}}}"),
+                Some('D') => print!("refs/stash@{{{index}}}"),
+                Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %g{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %g".into(),
+                    ));
+                }
+            },
+            Some(other) => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash list format placeholder %{other}"
+                )));
+            }
+            None => {
+                return Err(GitError::Unsupported(
+                    "unterminated stash list format placeholder %".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn ancestor_depths(
