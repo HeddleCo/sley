@@ -5765,10 +5765,14 @@ enum StashShowMode {
 fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut mode = StashShowMode::Stat;
     let mut show_stat = false;
+    let mut show_raw = false;
     let mut show_numstat = false;
     let mut show_shortstat = false;
     let mut show_summary = false;
     let mut show_patch = false;
+    let mut raw_abbrev = Some(Some(7usize));
+    let mut patch_abbrev = None;
+    let mut patch_full_index = false;
     let mut include_untracked = false;
     let mut only_untracked = false;
     let mut specs = Vec::new();
@@ -5781,6 +5785,15 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 ) {
                     mode = StashShowMode::Stat;
                     show_stat = true;
+                }
+            }
+            "--raw" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_raw = true;
                 }
             }
             "--numstat" => {
@@ -5810,6 +5823,34 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     show_summary = true;
                 }
             }
+            "--patch-with-raw" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_raw = true;
+                    show_patch = true;
+                }
+            }
+            "--patch-with-stat" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_stat = true;
+                    show_patch = true;
+                }
+            }
+            "--abbrev" => {
+                raw_abbrev = Some(Some(7));
+                patch_abbrev = Some(7);
+            }
+            "--no-abbrev" => {
+                raw_abbrev = Some(None);
+            }
+            "--full-index" => patch_full_index = true,
             "--name-only" => {
                 if matches!(mode, StashShowMode::NameStatus) {
                     eprintln!(
@@ -5857,6 +5898,14 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             "--no-only-untracked" => {
                 stash_show_usage();
                 return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--abbrev=") => {
+                let value = value
+                    .strip_prefix("--abbrev=")
+                    .ok_or_else(|| GitError::Command("--abbrev requires a value".into()))?;
+                let abbrev = parse_abbrev(value)?.max(4);
+                raw_abbrev = Some(Some(abbrev));
+                patch_abbrev = Some(abbrev);
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
@@ -5942,14 +5991,37 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         entries.sort_by(|left, right| left.path.cmp(&right.path));
     }
     let mut stdout = io::stdout();
+    let repository_abbrev = repository_abbrev(&common_git_dir, format)?;
+    let raw_abbrev = match raw_abbrev {
+        Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
+        None => repository_abbrev,
+    };
+    let patch_abbrev = if patch_full_index {
+        format.hex_len()
+    } else {
+        patch_abbrev
+            .or(repository_abbrev)
+            .unwrap_or(7)
+            .min(format.hex_len())
+    };
     match mode {
         StashShowMode::Stat => {
-            let has_visual_mode =
-                show_stat || show_numstat || show_shortstat || show_summary || show_patch;
+            let has_visual_mode = show_raw
+                || show_stat
+                || show_numstat
+                || show_shortstat
+                || show_summary
+                || show_patch;
             if !has_visual_mode {
                 show_stat = true;
             }
             let mut wrote_prefix_output = false;
+            if show_raw {
+                for entry in &entries {
+                    write_diff_raw_entry(&mut stdout, entry, false, false, raw_abbrev, format)?;
+                }
+                wrote_prefix_output = !entries.is_empty();
+            }
             if show_numstat {
                 for entry in &entries {
                     write_diff_numstat_entry(&mut stdout, entry, false, &db, None, false)?;
@@ -5974,16 +6046,13 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 if wrote_prefix_output {
                     writeln!(stdout)?;
                 }
-                let abbrev = repository_abbrev(&common_git_dir, format)?
-                    .unwrap_or(7)
-                    .min(format.hex_len());
                 for entry in &entries {
                     let options = DiffPatchOptions {
                         db: &db,
                         worktree_root: None,
                         use_worktree_new: false,
                         format,
-                        abbrev,
+                        abbrev: patch_abbrev,
                         src_prefix: "a/",
                         dst_prefix: "b/",
                     };
