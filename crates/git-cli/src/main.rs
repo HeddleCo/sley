@@ -37152,14 +37152,36 @@ fn tag_annotation_lines_range_error(value: &str) -> Result<usize> {
 }
 
 fn parse_tag_list_column(value: &str) -> Result<TagListColumn> {
-    match value {
-        "auto" | "never" | "plain" => Ok(TagListColumn::None),
-        "always" | "column" | "row" | "nodense" => Ok(TagListColumn::Aligned),
-        "dense" => Ok(TagListColumn::Dense),
-        _ => {
-            eprintln!("error: unsupported option '{value}'");
-            Err(GitError::Exit(129))
+    let mut enabled = true;
+    let mut column = TagListColumn::Aligned;
+    for (idx, token) in value.split(',').enumerate() {
+        match token {
+            "" => {}
+            "always" => enabled = true,
+            "auto" | "never" => enabled = false,
+            "plain" => column = TagListColumn::None,
+            "column" | "row" => column = TagListColumn::Aligned,
+            "dense" => {
+                if column != TagListColumn::None {
+                    column = TagListColumn::Dense;
+                }
+            }
+            "nodense" => {
+                if column != TagListColumn::None {
+                    column = TagListColumn::Aligned;
+                }
+            }
+            _ => {
+                let unsupported = if idx == 0 { value } else { token };
+                eprintln!("error: unsupported option '{unsupported}'");
+                return Err(GitError::Exit(129));
+            }
         }
+    }
+    if enabled {
+        Ok(column)
+    } else {
+        Ok(TagListColumn::None)
     }
 }
 

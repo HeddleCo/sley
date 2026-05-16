@@ -923,7 +923,8 @@ Target: upstream Git 2.54.0.
   `--color=always` / `--color=auto` / `--color=never` / `--no-column` /
   `--column` / `--column=always` / `--column=auto` / `--column=never` /
   `--column=plain` / `--column=column` / `--column=row` /
-  `--column=dense` / `--column=nodense` for covered non-wrapping output,
+  `--column=dense` / `--column=nodense` and covered comma-separated
+  `--column` style combinations for covered non-wrapping output,
   upstream-style value errors for covered tag listing options and bare
   `--points-at` default-`HEAD` behavior,
   tag listing `--omit-empty` / `--no-omit-empty`,
