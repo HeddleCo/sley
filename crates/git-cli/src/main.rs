@@ -21002,6 +21002,13 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut dry_run = false;
     let mut interactive = false;
     let mut patch = false;
+    let mut gpg_sign = false;
+    let mut unified_context = false;
+    let mut inter_hunk_context = false;
+    let mut pathspec_from_file = None;
+    let mut pathspec_from_file_active = false;
+    let mut pathspec_file_nul = false;
+    let mut pathspec_args = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21239,7 +21246,14 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--verify=") => {
                 return commit_option_takes_no_value_error("no-no-verify");
             }
-            "--no-gpg-sign" => {}
+            "-S" | "--gpg-sign" => gpg_sign = true,
+            value if value.starts_with("-S") && value.len() > 2 => {
+                gpg_sign = true;
+            }
+            value if value.starts_with("--gpg-sign=") => {
+                gpg_sign = true;
+            }
+            "--no-gpg-sign" => gpg_sign = false,
             value if value.starts_with("--no-gpg-sign=") => {
                 return commit_option_takes_no_value_error("no-gpg-sign");
             }
@@ -21356,6 +21370,45 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-patch=") => {
                 return commit_option_takes_no_value_error("no-patch");
             }
+            "-U" => {
+                let Some(value) = iter.next() else {
+                    return commit_unified_requires_value_error(true);
+                };
+                commit_validate_unified_context(value, true)?;
+                unified_context = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                commit_validate_unified_context(&value[2..], true)?;
+                unified_context = true;
+            }
+            "--unified" => {
+                let Some(value) = iter.next() else {
+                    return commit_unified_requires_value_error(false);
+                };
+                commit_validate_unified_context(value, false)?;
+                unified_context = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                unified_context = true;
+            }
+            "--inter-hunk-context" => {
+                let Some(value) = iter.next() else {
+                    return commit_inter_hunk_context_requires_value_error();
+                };
+                commit_validate_inter_hunk_context(value)?;
+                inter_hunk_context = true;
+            }
+            "--inter-hunk-context=" => {
+                return commit_inter_hunk_context_expects_numerical_value_error();
+            }
+            value if value.starts_with("--inter-hunk-context=") => {
+                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                inter_hunk_context = true;
+            }
             "-v" | "--verbose" | "--no-verbose" => {}
             value if value.starts_with("--verbose=") => {
                 return commit_option_takes_no_value_error("verbose");
@@ -21377,6 +21430,29 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-untracked-files" => {}
             value if value.starts_with("--no-untracked-files=") => {
                 return commit_option_takes_no_value_error("no-untracked-files");
+            }
+            "--pathspec-from-file" => {
+                let Some(value) = iter.next() else {
+                    return commit_pathspec_from_file_requires_value_error();
+                };
+                pathspec_from_file = Some(value.to_string());
+                pathspec_from_file_active = true;
+            }
+            value if value.starts_with("--pathspec-from-file=") => {
+                pathspec_from_file = Some(value["--pathspec-from-file=".len()..].to_string());
+                pathspec_from_file_active = true;
+            }
+            "--no-pathspec-from-file" => pathspec_from_file_active = false,
+            value if value.starts_with("--no-pathspec-from-file=") => {
+                return commit_option_takes_no_value_error("no-pathspec-from-file");
+            }
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            value if value.starts_with("--pathspec-file-nul=") => {
+                return commit_option_takes_no_value_error("pathspec-file-nul");
+            }
+            value if value.starts_with("--no-pathspec-file-nul=") => {
+                return commit_option_takes_no_value_error("no-pathspec-file-nul");
             }
             "-i" | "--include" => include_without_paths = true,
             "--no-include" => include_without_paths = false,
@@ -21438,16 +21514,24 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 return commit_option_takes_no_value_error("no-cleanup");
             }
             "--" => {
-                if let Some(value) = iter.as_slice().first() {
+                if pathspec_from_file_active && !iter.as_slice().is_empty() {
+                    return commit_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspec_args.extend(iter.by_ref().cloned());
+            }
+            value => {
+                if value.starts_with('-') {
+                    if pathspec_from_file_active {
+                        return commit_pathspec_from_file_with_inline_pathspec_error();
+                    }
                     return Err(GitError::Command(format!(
                         "unsupported commit argument {value}; currently supports -m and -F"
                     )));
                 }
-            }
-            value => {
-                return Err(GitError::Command(format!(
-                    "unsupported commit argument {value}; currently supports -m and -F"
-                )));
+                if pathspec_from_file_active {
+                    return commit_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspec_args.push(value.to_string());
             }
         }
     }
@@ -21498,12 +21582,45 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
     }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(pathspec_file) = pathspec_from_file.as_deref() {
+        let pathspecs =
+            read_commit_pathspecs_from_file(Path::new(pathspec_file), pathspec_file_nul)?;
+        if pathspec_from_file_active {
+            pathspec_args.extend(
+                pathspecs
+                    .into_iter()
+                    .map(|path| path.to_string_lossy().into_owned()),
+            );
+        }
+    }
+    if !pathspec_args.is_empty() {
+        return Err(GitError::Unsupported(
+            "commit pathspecs are not implemented".into(),
+        ));
+    }
+    if unified_context && !interactive && !patch {
+        eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
+        return Err(GitError::Exit(128));
+    }
+    if inter_hunk_context && !interactive && !patch {
+        eprintln!("fatal: the option '--inter-hunk-context' requires '--interactive/--patch'");
+        return Err(GitError::Exit(128));
+    }
     if status_mode != CommitStatusMode::Normal {
         return cmd_commit_status_preview(status_mode, status_null);
     }
     if dry_run {
         return Err(GitError::Unsupported(
             "commit --dry-run currently requires --short or --porcelain".into(),
+        ));
+    }
+    if gpg_sign {
+        return Err(GitError::Unsupported(
+            "commit gpg signing is not implemented".into(),
         ));
     }
     if interactive || patch {
@@ -21768,9 +21885,126 @@ fn commit_trailer_requires_value_error() -> Result<()> {
     Err(GitError::Exit(129))
 }
 
+fn commit_pathspec_from_file_requires_value_error() -> Result<()> {
+    eprintln!("error: option `pathspec-from-file' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_pathspec_from_file_with_inline_pathspec_error() -> Result<()> {
+    eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+    Err(GitError::Exit(128))
+}
+
+fn read_commit_pathspecs_from_file(path: &Path, nul: bool) -> Result<Vec<PathBuf>> {
+    let mut bytes = Vec::new();
+    if path == Path::new("-") {
+        io::stdin().read_to_end(&mut bytes)?;
+    } else {
+        bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let message = match err.kind() {
+                    io::ErrorKind::NotFound => "No such file or directory".to_string(),
+                    io::ErrorKind::PermissionDenied => "Permission denied".to_string(),
+                    _ => err.to_string(),
+                };
+                eprintln!(
+                    "fatal: could not open '{}' for reading: {message}",
+                    path.display()
+                );
+                return Err(GitError::Exit(128));
+            }
+        };
+    }
+    let separator = if nul { b'\0' } else { b'\n' };
+    Ok(bytes
+        .split(|byte| *byte == separator)
+        .filter_map(|entry| {
+            let entry = if !nul && entry.ends_with(b"\r") {
+                &entry[..entry.len() - 1]
+            } else {
+                entry
+            };
+            if entry.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(String::from_utf8_lossy(entry).into_owned()))
+            }
+        })
+        .collect())
+}
+
 fn commit_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
     Err(GitError::Exit(129))
+}
+
+fn commit_unified_requires_value_error(short: bool) -> Result<()> {
+    if short {
+        eprintln!("error: switch `U' requires a value");
+    } else {
+        eprintln!("error: option `unified' requires a value");
+    }
+    Err(GitError::Exit(129))
+}
+
+fn commit_inter_hunk_context_requires_value_error() -> Result<()> {
+    eprintln!("error: option `inter-hunk-context' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_validate_unified_context(value: &str, short: bool) -> Result<()> {
+    if value.is_empty() {
+        return commit_unified_expects_numerical_value_error(short);
+    }
+    if git_count_value_is_valid(value) {
+        return Ok(());
+    }
+    if short {
+        eprintln!("error: switch `U' expects an integer value with an optional k/m/g suffix");
+    } else {
+        eprintln!("error: option `unified' expects an integer value with an optional k/m/g suffix");
+    }
+    Err(GitError::Exit(129))
+}
+
+fn commit_unified_expects_numerical_value_error(short: bool) -> Result<()> {
+    if short {
+        eprintln!("error: switch `U' expects a numerical value");
+    } else {
+        eprintln!("error: option `unified' expects a numerical value");
+    }
+    Err(GitError::Exit(129))
+}
+
+fn commit_validate_inter_hunk_context(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return commit_inter_hunk_context_expects_numerical_value_error();
+    }
+    if git_count_value_is_valid(value) {
+        return Ok(());
+    }
+    eprintln!(
+        "error: option `inter-hunk-context' expects an integer value with an optional k/m/g suffix"
+    );
+    Err(GitError::Exit(129))
+}
+
+fn commit_inter_hunk_context_expects_numerical_value_error() -> Result<()> {
+    eprintln!("error: option `inter-hunk-context' expects a numerical value");
+    Err(GitError::Exit(129))
+}
+
+fn git_count_value_is_valid(value: &str) -> bool {
+    let number = match value.as_bytes().last() {
+        Some(b'k' | b'K' | b'm' | b'M' | b'g' | b'G') => &value[..value.len() - 1],
+        _ => value,
+    };
+    let digits = match number.as_bytes().first() {
+        Some(b'+' | b'-') if number.len() > 1 => &number[1..],
+        _ => number,
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn commit_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {

@@ -868,10 +868,15 @@ Target: upstream Git 2.54.0.
   message/author/date/fixup/squash values,
   covered `--trailer` insertion for token/value forms, trailer-only message
   creation, `--no-trailer` reset behavior, and signoff/trailer ordering,
-  plus covered commit no-op parsing and value rejection for post-rewrite/status/verbose/untracked-files/include/only/edit/branch/template/file toggles, covered
+  plus covered commit no-op/reset parsing and value rejection for quiet/verify/post-rewrite/status/verbose/untracked-files/include/only/edit/branch/template/file toggles, covered
+  `-S` / `--gpg-sign[=<key>]` reset parsing with `--no-gpg-sign`, covered
   commit `--short` / `--porcelain` / `-z` / `--null` status-preview output and reset/value-error parity,
   including covered `--dry-run` short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
+  covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
+  patch/interactive requirement errors,
+  covered commit `--pathspec-from-file` and `--pathspec-file-nul` parser
+  errors and reset parsing,
   `-t` template alias and bare option terminator parity, covered
   `--cleanup` object parity including `--no-cleanup`, and `--template` value errors, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,

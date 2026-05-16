@@ -294,11 +294,63 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-interactive=value", "-m", "subject"],
             vec!["commit", "--patch=value", "-m", "subject"],
             vec!["commit", "--no-patch=value", "-m", "subject"],
+            vec!["commit", "-U"],
+            vec!["commit", "-U", "", "-m", "subject"],
+            vec!["commit", "-Ubad", "-m", "subject"],
+            vec!["commit", "--unified"],
+            vec!["commit", "--unified=", "-m", "subject"],
+            vec!["commit", "--unified=bad", "-m", "subject"],
+            vec!["commit", "--unified", "bad", "-m", "subject"],
+            vec!["commit", "--inter-hunk-context"],
+            vec!["commit", "--inter-hunk-context=", "-m", "subject"],
+            vec!["commit", "--inter-hunk-context=bad", "-m", "subject"],
+            vec!["commit", "--inter-hunk-context", "bad", "-m", "subject"],
+            vec!["commit", "-U3", "-m", "subject"],
+            vec!["commit", "-U", "3", "-m", "subject"],
+            vec!["commit", "--unified=3", "-m", "subject"],
+            vec!["commit", "--unified", "3", "-m", "subject"],
+            vec!["commit", "--inter-hunk-context=2", "-m", "subject"],
+            vec!["commit", "--inter-hunk-context", "2", "-m", "subject"],
+            vec!["commit", "--dry-run", "-U3", "--short"],
             vec!["commit", "--verbose=value", "-m", "subject"],
             vec!["commit", "--no-verbose=value", "-m", "subject"],
             vec!["commit", "--untracked-files=bad", "-m", "subject"],
             vec!["commit", "-ubad", "-m", "subject"],
             vec!["commit", "--no-untracked-files=value", "-m", "subject"],
+            vec!["commit", "--pathspec-from-file"],
+            vec!["commit", "--no-pathspec-from-file=value", "-m", "subject"],
+            vec!["commit", "--pathspec-file-nul=value", "-m", "subject"],
+            vec!["commit", "--no-pathspec-file-nul=value", "-m", "subject"],
+            vec!["commit", "--pathspec-file-nul", "-m", "subject"],
+            vec![
+                "commit",
+                "--pathspec-file-nul",
+                "tracked.txt",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=pathspecs",
+                "tracked.txt",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=pathspecs",
+                "--",
+                "tracked.txt",
+                "-m",
+                "subject",
+            ],
+            vec![
+                "commit",
+                "--pathspec-from-file=missing",
+                "--no-pathspec-from-file",
+                "-m",
+                "subject",
+            ],
             vec!["commit", "--include", "-m", "subject"],
             vec!["commit", "--only", "-m", "subject"],
             vec!["commit", "-i", "-m", "subject"],
@@ -359,6 +411,80 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "message-no-gpg-sign",
                 vec!["commit", "--message=subject", "--no-gpg-sign"],
+            ),
+            (
+                "gpg-sign-reset",
+                vec!["commit", "--gpg-sign", "--no-gpg-sign", "-m", "subject"],
+            ),
+            (
+                "gpg-sign-key-reset",
+                vec!["commit", "--gpg-sign=key", "--no-gpg-sign", "-m", "subject"],
+            ),
+            (
+                "gpg-sign-empty-key-reset",
+                vec!["commit", "--gpg-sign=", "--no-gpg-sign", "-m", "subject"],
+            ),
+            (
+                "gpg-sign-short-reset",
+                vec!["commit", "-S", "--no-gpg-sign", "-m", "subject"],
+            ),
+            (
+                "gpg-sign-short-key-reset",
+                vec!["commit", "-Skey", "--no-gpg-sign", "-m", "subject"],
+            ),
+            (
+                "gpg-sign-restored-reset",
+                vec![
+                    "commit",
+                    "--no-gpg-sign",
+                    "--gpg-sign",
+                    "--no-gpg-sign",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "gpg-sign-key-restored-reset",
+                vec![
+                    "commit",
+                    "--no-gpg-sign",
+                    "--gpg-sign=key",
+                    "--no-gpg-sign",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "pathspec-file-nul-reset",
+                vec![
+                    "commit",
+                    "--pathspec-file-nul",
+                    "--no-pathspec-file-nul",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "pathspec-from-file-reset",
+                vec![
+                    "commit",
+                    "--pathspec-from-file=pathspecs",
+                    "--no-pathspec-from-file",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "pathspec-from-file-nul-reset",
+                vec![
+                    "commit",
+                    "--pathspec-file-nul",
+                    "--pathspec-from-file=pathspecs",
+                    "--no-pathspec-file-nul",
+                    "--no-pathspec-from-file",
+                    "-m",
+                    "subject",
+                ],
             ),
             (
                 "reuse-reset",
@@ -488,6 +614,14 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--quiet", "--verify", "-m", "subject"],
             ),
             (
+                "quiet-reset",
+                vec!["commit", "--quiet", "--no-quiet", "-m", "subject"],
+            ),
+            (
+                "verify-reset",
+                vec!["commit", "--no-verify", "--verify", "-m", "subject"],
+            ),
+            (
                 "dry-run-reset",
                 vec!["commit", "--dry-run", "--no-dry-run", "-m", "subject"],
             ),
@@ -546,12 +680,30 @@ fn commit_file_messages_match_upstream_git_objects() {
                 "no-post-rewrite",
                 vec!["commit", "--no-post-rewrite", "-m", "subject"],
             ),
+            (
+                "post-rewrite-reset",
+                vec![
+                    "commit",
+                    "--post-rewrite",
+                    "--no-post-rewrite",
+                    "-m",
+                    "subject",
+                ],
+            ),
             ("status", vec!["commit", "--status", "-m", "subject"]),
             ("no-status", vec!["commit", "--no-status", "-m", "subject"]),
+            (
+                "status-reset",
+                vec!["commit", "--status", "--no-status", "-m", "subject"],
+            ),
             ("verbose", vec!["commit", "--verbose", "-m", "subject"]),
             (
                 "no-verbose",
                 vec!["commit", "--no-verbose", "-m", "subject"],
+            ),
+            (
+                "verbose-reset",
+                vec!["commit", "--verbose", "--no-verbose", "-m", "subject"],
             ),
             (
                 "untracked-files",
@@ -587,6 +739,16 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--no-untracked-files", "-m", "subject"],
             ),
             (
+                "untracked-files-reset",
+                vec![
+                    "commit",
+                    "--untracked-files=all",
+                    "--no-untracked-files",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
                 "no-include",
                 vec!["commit", "--no-include", "-m", "subject"],
             ),
@@ -600,8 +762,16 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--only", "--no-only", "-m", "subject"],
             ),
             ("no-edit", vec!["commit", "--no-edit", "-m", "subject"]),
+            (
+                "edit-reset",
+                vec!["commit", "--edit", "--no-edit", "-m", "subject"],
+            ),
             ("branch", vec!["commit", "--branch", "-m", "subject"]),
             ("no-branch", vec!["commit", "--no-branch", "-m", "subject"]),
+            (
+                "branch-reset",
+                vec!["commit", "--branch", "--no-branch", "-m", "subject"],
+            ),
             (
                 "allow-empty-message",
                 vec!["commit", "-m", "", "--allow-empty-message"],
@@ -718,6 +888,10 @@ fn commit_file_messages_match_upstream_git_objects() {
             fs::create_dir_all(&actual_root).expect("create actual repo");
             prepare_commit_repo(&expected_root);
             prepare_commit_repo(&actual_root);
+            fs::write(expected_root.join("pathspecs"), b"tracked.txt\n")
+                .expect("write expected pathspec file");
+            fs::write(actual_root.join("pathspecs"), b"tracked.txt\n")
+                .expect("write actual pathspec file");
 
             let expected = run_output_with_identity("git", &expected_root, &args);
             assert!(
@@ -732,7 +906,12 @@ fn commit_file_messages_match_upstream_git_objects() {
                 "git-rs {args:?} failed: {}",
                 String::from_utf8_lossy(&actual.stderr)
             );
-            if args.iter().any(|arg| *arg == "-q" || *arg == "--quiet") {
+            let quiet = args.iter().fold(false, |quiet, arg| match *arg {
+                "-q" | "--quiet" => true,
+                "--no-quiet" => false,
+                _ => quiet,
+            });
+            if quiet {
                 assert_eq!(actual.stdout, expected.stdout, "quiet stdout differed");
                 assert_eq!(actual.stderr, expected.stderr, "quiet stderr differed");
             }
