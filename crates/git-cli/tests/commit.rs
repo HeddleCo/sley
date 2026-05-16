@@ -66,6 +66,8 @@ fn prepare_commit_repo(root: &Path) {
     run_success("git", root, &["add", "tracked.txt"]);
     fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
     fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
+    fs::write(root.join("message-empty.txt"), b"").expect("write empty message");
+    fs::write(root.join("message-whitespace.txt"), b"  \n\t\n").expect("write whitespace message");
     fs::write(
         root.join("message-signed.txt"),
         b"subject\n\nSigned-off-by: Example User <example@example.invalid>\n",
@@ -81,6 +83,48 @@ fn cat_head(program: &str, root: &Path) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+#[test]
+fn commit_empty_message_errors_match_upstream_git() {
+    let root = unique_temp_dir("commit-empty-message-errors");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            ("empty-inline", vec!["commit", "-m", ""]),
+            ("whitespace-inline", vec!["commit", "-m", "   "]),
+            ("empty-file", vec!["commit", "-F", "message-empty.txt"]),
+            (
+                "whitespace-file",
+                vec!["commit", "--file", "message-whitespace.txt"],
+            ),
+            ("empty-signoff", vec!["commit", "-m", "", "-s"]),
+            (
+                "allow-then-disallow",
+                vec![
+                    "commit",
+                    "-m",
+                    "",
+                    "--allow-empty-message",
+                    "--no-allow-empty-message",
+                ],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            prepare_commit_repo(&expected_root);
+            prepare_commit_repo(&actual_root);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
 }
 
 #[test]
@@ -141,6 +185,28 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "quiet-verify",
                 vec!["commit", "--quiet", "--verify", "-m", "subject"],
+            ),
+            (
+                "allow-empty-message",
+                vec!["commit", "-m", "", "--allow-empty-message"],
+            ),
+            (
+                "allow-empty-file",
+                vec!["commit", "-F", "message-empty.txt", "--allow-empty-message"],
+            ),
+            (
+                "disallow-then-allow-empty",
+                vec![
+                    "commit",
+                    "-m",
+                    "",
+                    "--no-allow-empty-message",
+                    "--allow-empty-message",
+                ],
+            ),
+            (
+                "allow-empty-signoff",
+                vec!["commit", "-m", "", "-s", "--allow-empty-message"],
             ),
         ] {
             let expected_root = root.join(format!("{name}-expected"));

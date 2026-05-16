@@ -20981,6 +20981,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut file_message = None;
     let mut signoff = false;
     let mut quiet = false;
+    let mut allow_empty_message = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21028,6 +21029,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--no-signoff" => signoff = false,
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "--allow-empty-message" => allow_empty_message = true,
+            "--no-allow-empty-message" => allow_empty_message = false,
             "-n" | "--no-verify" | "--verify" => {}
             "--no-gpg-sign" => {}
             value => {
@@ -21050,6 +21053,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let committer = commit_identity_from_env("COMMITTER")?;
     let message =
         file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks));
+    if !allow_empty_message && commit_message_is_empty(&message) {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
     let message = if signoff {
         commit_message_with_signoff(message, &commit_signoff_from_env()?)
     } else {
@@ -21193,13 +21200,24 @@ fn read_porcelain_commit_message_file(path: &str) -> Result<Vec<u8>> {
 
 fn commit_message_from_prepared_chunks(chunks: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
-    for (idx, chunk) in chunks.iter().enumerate() {
-        if idx != 0 {
+    for chunk in chunks
+        .iter()
+        .filter(|chunk| !commit_message_chunk_is_empty(chunk))
+    {
+        if !out.is_empty() {
             out.push(b'\n');
         }
         out.extend_from_slice(chunk);
     }
     out
+}
+
+fn commit_message_chunk_is_empty(chunk: &[u8]) -> bool {
+    chunk.is_empty() || chunk == b"\n"
+}
+
+fn commit_message_is_empty(message: &[u8]) -> bool {
+    message.iter().all(u8::is_ascii_whitespace)
 }
 
 fn cmd_diff(args: &[String]) -> Result<()> {
@@ -39035,6 +39053,11 @@ fn commit_message_with_signoff(mut message: Vec<u8>, signoff: &[u8]) -> Vec<u8> 
         .split(|byte| *byte == b'\n')
         .any(|line| line == signoff)
     {
+        return message;
+    }
+    if message.is_empty() {
+        message.extend_from_slice(signoff);
+        message.push(b'\n');
         return message;
     }
     if !message.is_empty() && !message.ends_with(b"\n") {

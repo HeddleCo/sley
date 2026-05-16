@@ -848,7 +848,9 @@ Target: upstream Git 2.54.0.
   loose and packed ref deletion observed by upstream `git show-ref`,
   deterministic `commit-tree` parity,
   minimal `commit -m` interop readable by upstream `git rev-parse` and
-  `git log`, Rust add/status interop with upstream `git status --short`,
+  `git log`, commit empty-message rejection and
+  `--allow-empty-message` / `--no-allow-empty-message` toggle parity for
+  covered `-m` / `-F` messages, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`
   over unborn and committed tracked-change fixtures, plus status quoting for
