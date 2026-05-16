@@ -245,6 +245,8 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--squash"],
             vec!["commit", "--squash=missing"],
             vec!["commit", "--squash", "HEAD", "--fixup", "HEAD"],
+            vec!["commit", "-m", "subject", "--trailer"],
+            vec!["commit", "-m", "subject", "--no-trailer=value"],
             vec!["commit", "--reset-author", "-m", "subject"],
             vec!["commit", "--reset-author=value", "-m", "subject"],
             vec!["commit", "--no-reset-author=value", "-m", "subject"],
@@ -309,6 +311,71 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "no-amend-reset",
                 vec!["commit", "--amend", "--no-amend", "-m", "subject"],
+            ),
+            (
+                "trailer-equals",
+                vec!["commit", "-m", "subject", "--trailer", "Acked-by=Alice"],
+            ),
+            (
+                "trailer-colon",
+                vec!["commit", "-m", "subject", "--trailer=Acked-by:Alice"],
+            ),
+            (
+                "trailer-multiple",
+                vec![
+                    "commit",
+                    "-m",
+                    "subject",
+                    "--trailer",
+                    "Acked-by=Alice",
+                    "--trailer",
+                    "Reviewed-by=Bob",
+                ],
+            ),
+            (
+                "trailer-body",
+                vec![
+                    "commit",
+                    "-m",
+                    "subject",
+                    "-m",
+                    "body",
+                    "--trailer",
+                    "Acked-by=Alice",
+                ],
+            ),
+            (
+                "trailer-clear",
+                vec![
+                    "commit",
+                    "-m",
+                    "subject",
+                    "--trailer",
+                    "Acked-by=Alice",
+                    "--no-trailer",
+                ],
+            ),
+            (
+                "trailer-clear-before",
+                vec![
+                    "commit",
+                    "-m",
+                    "subject",
+                    "--no-trailer",
+                    "--trailer",
+                    "Acked-by=Alice",
+                ],
+            ),
+            (
+                "signoff-trailer",
+                vec![
+                    "commit",
+                    "-m",
+                    "subject",
+                    "-s",
+                    "--trailer",
+                    "Acked-by=Alice",
+                ],
             ),
             (
                 "all-no-all",
@@ -484,6 +551,32 @@ fn commit_file_messages_match_upstream_git_objects() {
         let expected = run_output_with_identity("git", &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
+
+        let expected_root = root.join("trailer-only-expected");
+        let actual_root = root.join("trailer-only-actual");
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
+        let args = ["commit", "--trailer", "Acked-by=Alice"];
+        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "git-rs {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for trailer-only"
+        );
     })();
     let _ = fs::remove_dir_all(&root);
     result

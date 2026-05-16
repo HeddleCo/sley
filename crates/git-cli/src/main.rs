@@ -20990,6 +20990,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut reedit_message = false;
     let mut fixup_commit = None;
     let mut squash_commit = None;
+    let mut trailers = Vec::new();
     let mut reset_author = false;
     let mut amend = false;
     let mut cleanup_mode = None;
@@ -21111,6 +21112,19 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--squash=") => {
                 squash_commit = Some(value["--squash=".len()..].to_string());
+            }
+            "--trailer" => {
+                let Some(value) = iter.next() else {
+                    return commit_trailer_requires_value_error();
+                };
+                trailers.push(parse_tag_trailer(value));
+            }
+            value if value.starts_with("--trailer=") => {
+                trailers.push(parse_tag_trailer(&value["--trailer=".len()..]));
+            }
+            "--no-trailer" => trailers.clear(),
+            value if value.starts_with("--no-trailer=") => {
+                return commit_option_takes_no_value_error("no-trailer");
             }
             "--reset-author" => reset_author = true,
             "--no-reset-author" => reset_author = false,
@@ -21242,6 +21256,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         && reuse_message.is_none()
         && fixup_commit.is_none()
         && squash_commit.is_none()
+        && trailers.is_empty()
         && !amend
     {
         return Err(GitError::Command("commit requires -m <message>".into()));
@@ -21322,7 +21337,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if let Some(cleanup_mode) = cleanup_mode {
         message = commit_cleanup_message(message, cleanup_mode);
     }
-    if !allow_empty_message && commit_message_is_empty(&message) {
+    let message_with_trailers = tag_message_with_trailers(message.clone(), &trailers);
+    if !allow_empty_message && commit_message_is_empty(&message_with_trailers) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
@@ -21342,6 +21358,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     } else {
         message
     };
+    let message = tag_message_with_trailers(message, &trailers);
     let options = git_sequencer::CommitIndexOptions {
         author,
         committer,
@@ -21452,6 +21469,11 @@ fn commit_fixup_requires_value_error() -> Result<()> {
 
 fn commit_squash_requires_value_error() -> Result<()> {
     eprintln!("error: option `squash' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_trailer_requires_value_error() -> Result<()> {
+    eprintln!("error: option `trailer' requires a value");
     Err(GitError::Exit(129))
 }
 
