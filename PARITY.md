@@ -885,7 +885,8 @@ Target: upstream Git 2.54.0.
   for covered unborn-clean/staged/unstaged/untracked fixtures, plus status quoting for
   space, quote, and tab paths in non-NUL short/porcelain output,
   status `-z`, status `--null`, status
-  `--no-null`, status `--branch`, status `--no-branch`,
+  `--no-null`, status `--branch`, status `--no-branch`, status
+  `--no-short`, no-value display option errors, and `--long` / `-z` conflict errors,
   combined status `-sb` / `-bs`, status `-u` /
   `--untracked-files`, status `--untracked-files=no`, status
   `--ignored[=traditional|matching|no]` / `--no-ignored` no-op behavior in

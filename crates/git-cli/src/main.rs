@@ -36728,6 +36728,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
     let mut porcelain_v1 = false;
     let mut porcelain_v2 = false;
     let mut z = false;
+    let mut explicit_long = false;
     let mut branch = false;
     let mut show_untracked = true;
     let mut untracked_mode = git_worktree::StatusUntrackedMode::Normal;
@@ -36745,24 +36746,34 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 short = true;
                 porcelain_v1 = false;
                 porcelain_v2 = false;
+                explicit_long = false;
             }
             "--porcelain" | "--porcelain=1" | "--porcelain=v1" => {
                 short = true;
                 porcelain_v1 = true;
                 porcelain_v2 = false;
+                explicit_long = false;
             }
             "--porcelain=v2" | "--porcelain=2" => {
                 short = true;
                 porcelain_v1 = false;
                 porcelain_v2 = true;
+                explicit_long = false;
             }
             "--branch" | "-b" => {
                 short = true;
                 branch = true;
+                explicit_long = false;
             }
             "-sb" | "-bs" => {
                 short = true;
                 branch = true;
+                explicit_long = false;
+            }
+            "--no-short" => {
+                short = false;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
             }
             "--no-branch" => branch = false,
             "-uno" | "--untracked-files=no" => show_untracked = false,
@@ -36783,11 +36794,17 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 show_ignored = true;
             }
             "--ignored=no" | "--no-ignored" => show_ignored = false,
-            "--long" | "--no-long" => {
+            "--long" => {
                 short = false;
                 porcelain_v1 = false;
                 porcelain_v2 = false;
-                z = false;
+                explicit_long = true;
+            }
+            "--no-long" => {
+                short = false;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                explicit_long = false;
             }
             "--no-renames"
             | "--renames"
@@ -36812,11 +36829,47 @@ fn cmd_status(args: &[String]) -> Result<()> {
             "-M" => {}
             value if value.starts_with("-M") && value.len() > 2 => {}
             value if value.starts_with("--find-renames=") => {}
+            value if value.starts_with("--short=") => {
+                return status_option_takes_no_value_error("short");
+            }
+            value if value.starts_with("--no-short=") => {
+                return status_option_takes_no_value_error("no-short");
+            }
+            value if value.starts_with("--branch=") => {
+                return status_option_takes_no_value_error("branch");
+            }
+            value if value.starts_with("--no-branch=") => {
+                return status_option_takes_no_value_error("no-branch");
+            }
+            value if value.starts_with("--null=") => {
+                return status_option_takes_no_value_error("null");
+            }
+            value if value.starts_with("--no-null=") => {
+                return status_option_takes_no_value_error("no-null");
+            }
             value if value.starts_with("--long=") => {
                 return status_option_takes_no_value_error("long");
             }
             value if value.starts_with("--no-long=") => {
                 return status_option_takes_no_value_error("no-long");
+            }
+            value if value.starts_with("--ahead-behind=") => {
+                return status_option_takes_no_value_error("ahead-behind");
+            }
+            value if value.starts_with("--no-ahead-behind=") => {
+                return status_option_takes_no_value_error("no-ahead-behind");
+            }
+            value if value.starts_with("--verbose=") => {
+                return status_option_takes_no_value_error("verbose");
+            }
+            value if value.starts_with("--no-verbose=") => {
+                return status_option_takes_no_value_error("no-verbose");
+            }
+            value if value.starts_with("--show-stash=") => {
+                return status_option_takes_no_value_error("show-stash");
+            }
+            value if value.starts_with("--no-show-stash=") => {
+                return status_option_takes_no_value_error("no-show-stash");
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(
@@ -36826,6 +36879,10 @@ fn cmd_status(args: &[String]) -> Result<()> {
             }
             _ => path_args.push(arg.clone()),
         }
+    }
+    if explicit_long && z {
+        eprintln!("fatal: options '--long' and '-z' cannot be used together");
+        return Err(GitError::Exit(128));
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;

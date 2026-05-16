@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -25,6 +25,30 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
         String::from_utf8_lossy(&output.stderr)
     );
     output.stdout
+}
+
+fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "status differed for {args:?}"
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "stdout differed for {args:?}"
+    );
+    assert_eq!(
+        actual.stderr, expected.stderr,
+        "stderr differed for {args:?}"
+    );
 }
 
 fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -61,6 +85,8 @@ fn status_z_matches_upstream_git() {
             vec!["status", "-b", "-s"],
             vec!["status", "-sb"],
             vec!["status", "-bs"],
+            vec!["status", "--short", "--no-short"],
+            vec!["status", "--no-short", "--short"],
             vec!["status", "--short", "--branch", "--no-branch"],
             vec!["status", "-sb", "--no-branch"],
             vec!["status", "--short", "--no-branch", "--branch"],
@@ -140,6 +166,10 @@ fn status_z_matches_upstream_git() {
             vec!["status", "--porcelain=v2", "--untracked-files=all", "-z"],
             vec!["status", "-z"],
             vec!["status", "--null"],
+            vec!["status", "--null", "--no-short"],
+            vec!["status", "--no-short", "--null"],
+            vec!["status", "--null", "--no-long"],
+            vec!["status", "--no-long", "--null"],
             vec!["status", "--short", "--ignored=no"],
             vec!["status", "--short", "--ignored"],
             vec!["status", "--short", "--ignored=traditional"],
@@ -193,6 +223,41 @@ fn status_z_matches_upstream_git() {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn status_display_option_errors_match_upstream_git() {
+    let root = unique_temp_dir("status-display-option-errors");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+
+        for args in [
+            vec!["status", "--short=value"],
+            vec!["status", "--no-short=value"],
+            vec!["status", "--branch=value"],
+            vec!["status", "--no-branch=value"],
+            vec!["status", "--null=value"],
+            vec!["status", "--no-null=value"],
+            vec!["status", "--long=value"],
+            vec!["status", "--no-long=value"],
+            vec!["status", "--ahead-behind=value"],
+            vec!["status", "--no-ahead-behind=value"],
+            vec!["status", "--verbose=value"],
+            vec!["status", "--no-verbose=value"],
+            vec!["status", "--show-stash=value"],
+            vec!["status", "--no-show-stash=value"],
+            vec!["status", "--null", "--long"],
+            vec!["status", "--long", "--null"],
+        ] {
+            let expected = run_output("git", &root, &args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_same_output(actual, expected, &args);
         }
     })();
     let _ = fs::remove_dir_all(&root);
