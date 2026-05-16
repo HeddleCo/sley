@@ -21795,7 +21795,7 @@ fn cmd_commit_long_status_preview() -> Result<()> {
         },
     )?;
     let committable = status_entries_have_index_changes(&entries);
-    print_status_long(&git_dir, format, entries, true)?;
+    print_status_long(&git_dir, format, entries, true, false)?;
     if committable {
         Ok(())
     } else {
@@ -36733,6 +36733,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
     let mut show_untracked = true;
     let mut untracked_mode = git_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
+    let mut show_stash = false;
     let mut path_args = Vec::new();
     let mut positional_only = false;
     for arg in args {
@@ -36831,8 +36832,6 @@ fn cmd_status(args: &[String]) -> Result<()> {
             | "--find-renames"
             | "--ahead-behind"
             | "--no-ahead-behind"
-            | "--show-stash"
-            | "--no-show-stash"
             | "-v"
             | "--verbose"
             | "--no-verbose"
@@ -36853,6 +36852,8 @@ fn cmd_status(args: &[String]) -> Result<()> {
             | "--ignore-submodules=dirty"
             | "--ignore-submodules=all"
             | "--no-ignore-submodules" => {}
+            "--show-stash" => show_stash = true,
+            "--no-show-stash" => show_stash = false,
             "-M" => {}
             value if value.starts_with("-M") && value.len() > 2 => {}
             value if value.starts_with("--find-renames=") => {}
@@ -36988,7 +36989,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
             );
         }
     } else {
-        print_status_long(&git_dir, format, entries, false)?;
+        print_status_long(&git_dir, format, entries, false, show_stash)?;
     }
     Ok(())
 }
@@ -37151,6 +37152,7 @@ fn print_status_long(
     format: ObjectFormat,
     entries: Vec<git_worktree::ShortStatusEntry>,
     commit_preview: bool,
+    show_stash: bool,
 ) -> Result<()> {
     let head_initial = print_status_long_branch(git_dir, format)?;
     if head_initial {
@@ -37253,7 +37255,20 @@ fn print_status_long(
     } else {
         println!();
     }
+    if show_stash {
+        let stash_count = status_stash_count(git_dir, format)?;
+        if stash_count == 1 {
+            println!("Your stash currently has 1 entry");
+        } else if stash_count > 1 {
+            println!("Your stash currently has {stash_count} entries");
+        }
+    }
     Ok(())
+}
+
+fn status_stash_count(git_dir: &Path, format: ObjectFormat) -> Result<usize> {
+    let store = FileRefStore::new(git_dir, format);
+    Ok(store.read_reflog("refs/stash")?.len())
 }
 
 fn print_status_long_branch(git_dir: &Path, format: ObjectFormat) -> Result<bool> {

@@ -894,8 +894,9 @@ Target: upstream Git 2.54.0.
   non-ignored fixtures, status rename toggles
   `--no-renames` / `--renames` / `-M[<n>]` / `--find-renames[=<n>]`,
   including rename-toggle value errors, and simple status
-  display toggles for ahead/behind, verbosity, stash, and column output including
+  display toggles for ahead/behind, verbosity, and column output including
   `--column=auto` / `--column=never` / `--column=plain`, plus status
+  `--show-stash` / `--no-show-stash` long-output stash count display,
   `--ignore-submodules[=none|untracked|dirty|all]` no-op behavior in
   non-submodule fixtures, covered invalid status mode/value diagnostics for
   untracked, ignored, ignore-submodules, and column options, simple nested-cwd

@@ -419,6 +419,42 @@ fn status_long_unborn_clean_matches_upstream_git() {
 }
 
 #[test]
+fn status_show_stash_matches_upstream_git() {
+    let root = unique_temp_dir("status-show-stash");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.name", "Example User"]);
+        git(&root, &["config", "user.email", "example@example.invalid"]);
+        fs::write(root.join("a.txt"), b"base\n").expect("write tracked fixture");
+        git(&root, &["add", "a.txt"]);
+        git(&root, &["commit", "-m", "base", "-q"]);
+        fs::write(root.join("a.txt"), b"stash one\n").expect("write first stash fixture");
+        git(&root, &["stash", "push", "-q", "-m", "one"]);
+        fs::write(root.join("a.txt"), b"stash two\n").expect("write second stash fixture");
+        git(&root, &["stash", "push", "-q", "-m", "two"]);
+
+        for args in [
+            vec!["status", "--show-stash"],
+            vec!["status", "--show-stash", "--no-show-stash"],
+            vec!["status", "--no-show-stash", "--show-stash"],
+            vec!["status", "--short", "--show-stash"],
+            vec!["status", "--porcelain", "--show-stash"],
+            vec!["status", "--show-stash", "--short"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs show-stash output differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");
