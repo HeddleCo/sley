@@ -852,7 +852,8 @@ Target: upstream Git 2.54.0.
   `--allow-empty-message` / `--no-allow-empty-message` toggle parity for
   covered `-m` / `-F` messages, clean-index rejection and
   `--allow-empty` / `--no-allow-empty` toggle parity, covered raw
-  `--author` and `--date` object parity, Rust add/status interop with upstream `git status --short`,
+  `--author` and `--date` object parity, plus covered commit no-op parsing
+  for post-rewrite/status/verbose/no-edit toggles, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`
   over unborn and committed tracked-change fixtures, plus status quoting for

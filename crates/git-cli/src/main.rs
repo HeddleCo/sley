@@ -21056,6 +21056,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             "-n" | "--no-verify" | "--verify" => {}
             "--no-gpg-sign" => {}
+            "--post-rewrite" | "--no-post-rewrite" => {}
+            "--status" | "--no-status" => {}
+            "-v" | "--verbose" | "--no-verbose" => {}
+            "--no-edit" => {}
             value => {
                 return Err(GitError::Command(format!(
                     "unsupported commit argument {value}; currently supports -m and -F"

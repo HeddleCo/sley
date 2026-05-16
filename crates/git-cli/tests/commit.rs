@@ -246,6 +246,22 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--quiet", "--verify", "-m", "subject"],
             ),
             (
+                "post-rewrite",
+                vec!["commit", "--post-rewrite", "-m", "subject"],
+            ),
+            (
+                "no-post-rewrite",
+                vec!["commit", "--no-post-rewrite", "-m", "subject"],
+            ),
+            ("status", vec!["commit", "--status", "-m", "subject"]),
+            ("no-status", vec!["commit", "--no-status", "-m", "subject"]),
+            ("verbose", vec!["commit", "--verbose", "-m", "subject"]),
+            (
+                "no-verbose",
+                vec!["commit", "--no-verbose", "-m", "subject"],
+            ),
+            ("no-edit", vec!["commit", "--no-edit", "-m", "subject"]),
+            (
                 "allow-empty-message",
                 vec!["commit", "-m", "", "--allow-empty-message"],
             ),
