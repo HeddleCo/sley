@@ -857,8 +857,9 @@ Target: upstream Git 2.54.0.
   object parity including author/date overrides, covered `-c` /
   `--reedit-message` no-editor-change object parity, covered
   reuse/reedit negation reset parsing, covered `--reset-author` reuse-message
-  object parity and `--no-reset-author` reset/no-op parsing, plus covered commit no-op parsing
-  for post-rewrite/status/verbose/no-edit/template toggles, covered
+  object parity and `--no-reset-author` reset/no-op parsing, covered `--amend`
+  object parity including no-edit, reset-author, and author/date override cases,
+  plus covered commit no-op parsing for post-rewrite/status/verbose/no-edit/template toggles, covered
   `--cleanup` object parity, and `--template` value errors, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,
   `git status --porcelain=v1`, `git status --porcelain=v2`

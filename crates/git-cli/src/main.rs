@@ -20989,6 +20989,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut reuse_message = None;
     let mut reedit_message = false;
     let mut reset_author = false;
+    let mut amend = false;
     let mut cleanup_mode = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -21099,6 +21100,14 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-reset-author=") => {
                 return commit_option_takes_no_value_error("no-reset-author");
             }
+            "--amend" => amend = true,
+            "--no-amend" => amend = false,
+            value if value.starts_with("--amend=") => {
+                return commit_option_takes_no_value_error("amend");
+            }
+            value if value.starts_with("--no-amend=") => {
+                return commit_option_takes_no_value_error("no-amend");
+            }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
             "-q" | "--quiet" => quiet = true,
@@ -21175,7 +21184,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '{option}' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if reset_author && reuse_message.is_none() {
+    if reset_author && reuse_message.is_none() && !amend {
         eprintln!("fatal: --reset-author can be used only with -C, -c or --amend.");
         return Err(GitError::Exit(128));
     }
@@ -21183,12 +21192,15 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if file_message.is_none() && message_chunks.is_empty() && reuse_message.is_none() {
+    if file_message.is_none() && message_chunks.is_empty() && reuse_message.is_none() && !amend {
         return Err(GitError::Command("commit requires -m <message>".into()));
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let committer = commit_identity_from_env("COMMITTER")?;
+    let amended_commit = amend
+        .then(|| read_amended_commit(&git_dir, format))
+        .transpose()?;
     let reused_commit = reuse_message
         .as_deref()
         .map(|rev| read_reused_commit(&git_dir, format, rev))
@@ -21201,12 +21213,25 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             author_override.as_deref(),
             author_date.as_deref(),
         )?
+    } else if let Some(commit) = &amended_commit {
+        build_reused_commit_author_identity(
+            &commit.author,
+            author_override.as_deref(),
+            author_date.as_deref(),
+        )?
     } else {
         build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
     };
     let mut message = reused_commit
         .as_ref()
         .map(|commit| commit.message.clone())
+        .or_else(|| {
+            if amend && file_message.is_none() && message_chunks.is_empty() {
+                amended_commit.as_ref().map(|commit| commit.message.clone())
+            } else {
+                None
+            }
+        })
         .unwrap_or_else(|| {
             file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
         });
@@ -21220,7 +21245,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if all {
         commit_stage_tracked_changes(&git_dir, format)?;
     }
-    if !allow_empty && commit_index_matches_head(&git_dir, format)? {
+    if !allow_empty && !amend && commit_index_matches_head(&git_dir, format)? {
         print_clean_commit_status(&git_dir, format)?;
         return Err(GitError::Exit(1));
     }
@@ -21229,16 +21254,17 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     } else {
         message
     };
-    let result = git_sequencer::commit_index(
-        &git_dir,
-        format,
-        git_sequencer::CommitIndexOptions {
-            author,
-            committer,
-            reflog_message: commit_reflog_message(&message),
-            message,
-        },
-    )?;
+    let options = git_sequencer::CommitIndexOptions {
+        author,
+        committer,
+        reflog_message: commit_reflog_message(&message, amend),
+        message,
+    };
+    let result = if amend {
+        git_sequencer::amend_index(&git_dir, format, options)
+    } else {
+        git_sequencer::commit_index(&git_dir, format, options)
+    }?;
     if !quiet {
         println!("{}", result.oid);
     }
@@ -21476,6 +21502,28 @@ fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result
             Err(GitError::Exit(128))
         }
     }
+}
+
+fn read_amended_commit(git_dir: &Path, format: ObjectFormat) -> Result<Commit> {
+    let store = FileRefStore::new(git_dir, format);
+    let head = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
+        direct => direct,
+    };
+    let Some(RefTarget::Direct(oid)) = head else {
+        eprintln!("fatal: You have nothing to amend.");
+        return Err(GitError::Exit(128));
+    };
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            oid,
+            object.object_type.as_str()
+        )));
+    }
+    Commit::parse(format, &object.body)
 }
 
 fn build_reused_commit_author_identity(
@@ -39465,13 +39513,17 @@ fn commit_message_with_signoff(mut message: Vec<u8>, signoff: &[u8]) -> Vec<u8> 
     message
 }
 
-fn commit_reflog_message(message: &[u8]) -> Vec<u8> {
+fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
     let subject = String::from_utf8_lossy(message)
         .lines()
         .next()
         .unwrap_or("")
         .to_string();
-    format!("commit: {subject}").into_bytes()
+    if amend {
+        format!("commit (amend): {subject}").into_bytes()
+    } else {
+        format!("commit: {subject}").into_bytes()
+    }
 }
 
 fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {

@@ -1,6 +1,7 @@
 use git_core::{GitError, ObjectId, Result};
 use git_formats::{Commit, EncodedObject, ObjectType, Tag};
 use git_odb::FileObjectDatabase;
+use git_odb::ObjectReader;
 use git_odb::ObjectWriter;
 use git_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
 use std::path::Path;
@@ -114,16 +115,50 @@ pub fn commit_index(
     format: git_core::ObjectFormat,
     options: CommitIndexOptions,
 ) -> Result<CommitIndexResult> {
+    commit_index_with_amend(git_dir, format, options, false)
+}
+
+pub fn amend_index(
+    git_dir: impl AsRef<Path>,
+    format: git_core::ObjectFormat,
+    options: CommitIndexOptions,
+) -> Result<CommitIndexResult> {
+    commit_index_with_amend(git_dir, format, options, true)
+}
+
+fn commit_index_with_amend(
+    git_dir: impl AsRef<Path>,
+    format: git_core::ObjectFormat,
+    options: CommitIndexOptions,
+    amend: bool,
+) -> Result<CommitIndexResult> {
     let git_dir = git_dir.as_ref();
     let tree = git_worktree::write_tree_from_index(git_dir, format)?;
     let refs = FileRefStore::new(git_dir, format);
     let (updated_ref, parent) = head_update_target(&refs)?;
+    let commit_parents = if amend {
+        let Some(parent) = &parent else {
+            return Err(GitError::NotFound("commit to amend".into()));
+        };
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let object = db.read_object(parent)?;
+        if object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "expected commit {}, found {}",
+                parent,
+                object.object_type.as_str()
+            )));
+        }
+        Commit::parse(format, &object.body)?.parents
+    } else {
+        parent.iter().cloned().collect()
+    };
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let oid = create_commit(
         &mut db,
         CommitCreate {
             tree: tree.clone(),
-            parents: parent.iter().cloned().collect(),
+            parents: commit_parents,
             author: options.author,
             committer: options.committer.clone(),
             message: options.message,

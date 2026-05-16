@@ -237,6 +237,9 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--reset-author", "-m", "subject"],
             vec!["commit", "--reset-author=value", "-m", "subject"],
             vec!["commit", "--no-reset-author=value", "-m", "subject"],
+            vec!["commit", "--amend", "-m", "subject"],
+            vec!["commit", "--amend=value", "-m", "subject"],
+            vec!["commit", "--no-amend=value", "-m", "subject"],
         ] {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
@@ -291,6 +294,10 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "no-reset-author-noop",
                 vec!["commit", "--no-reset-author", "-m", "subject"],
+            ),
+            (
+                "no-amend-reset",
+                vec!["commit", "--amend", "--no-amend", "-m", "subject"],
             ),
             (
                 "all-no-all",
@@ -693,6 +700,110 @@ fn commit_reedit_message_matches_upstream_git_objects_when_editor_is_noop() {
                 .expect("modify expected tracked");
             fs::write(actual_root.join("tracked.txt"), b"changed\n")
                 .expect("modify actual tracked");
+            run_success("git", &expected_root, &["add", "tracked.txt"]);
+            run_success("git", &actual_root, &["add", "tracked.txt"]);
+
+            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+            assert!(
+                expected.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&expected.stderr)
+            );
+            let actual = run_output_with_identity_and_editor(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &actual_root,
+                &args,
+            );
+            assert!(
+                actual.status.success(),
+                "git-rs {args:?} failed: {}",
+                String::from_utf8_lossy(&actual.stderr)
+            );
+            assert_eq!(
+                cat_head("git", &actual_root),
+                cat_head("git", &expected_root),
+                "committed object differed for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn commit_amend_matches_upstream_git_objects() {
+    let root = unique_temp_dir("commit-amend");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            ("amend-message", vec!["commit", "--amend", "-m", "amended"]),
+            ("amend-no-edit", vec!["commit", "--amend", "--no-edit"]),
+            (
+                "amend-reset-author",
+                vec!["commit", "--amend", "--reset-author", "-m", "amended"],
+            ),
+            (
+                "amend-reset-author-cancelled",
+                vec![
+                    "commit",
+                    "--amend",
+                    "--reset-author",
+                    "--no-reset-author",
+                    "-m",
+                    "amended",
+                ],
+            ),
+            (
+                "amend-author-date-override",
+                vec![
+                    "commit",
+                    "--amend",
+                    "--author=Override User <override@example.invalid>",
+                    "--date=@456 +0230",
+                    "-m",
+                    "amended",
+                ],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            create_initial_commit("git", &expected_root);
+            create_initial_commit(env!("CARGO_BIN_EXE_git-rs"), &actual_root);
+            remove_message_fixtures(&expected_root);
+            remove_message_fixtures(&actual_root);
+
+            fs::write(expected_root.join("tracked.txt"), b"old\n").expect("modify expected old");
+            fs::write(actual_root.join("tracked.txt"), b"old\n").expect("modify actual old");
+            run_success("git", &expected_root, &["add", "tracked.txt"]);
+            run_success("git", &actual_root, &["add", "tracked.txt"]);
+            let old_args = [
+                "commit",
+                "--author=Reuse User <reuse@example.invalid>",
+                "--date=@123 +0000",
+                "-m",
+                "old subject",
+                "-m",
+                "old body",
+            ];
+            let expected_old = run_output_with_identity("git", &expected_root, &old_args);
+            assert!(
+                expected_old.status.success(),
+                "git old commit failed: {}",
+                String::from_utf8_lossy(&expected_old.stderr)
+            );
+            let actual_old =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &old_args);
+            assert!(
+                actual_old.status.success(),
+                "git-rs old commit failed: {}",
+                String::from_utf8_lossy(&actual_old.stderr)
+            );
+
+            fs::write(expected_root.join("tracked.txt"), b"amended\n")
+                .expect("modify expected amend");
+            fs::write(actual_root.join("tracked.txt"), b"amended\n").expect("modify actual amend");
             run_success("git", &expected_root, &["add", "tracked.txt"]);
             run_success("git", &actual_root, &["add", "tracked.txt"]);
 
