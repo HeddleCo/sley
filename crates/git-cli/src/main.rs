@@ -20989,6 +20989,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut reuse_message = None;
     let mut reedit_message = false;
     let mut fixup_commit = None;
+    let mut squash_commit = None;
     let mut reset_author = false;
     let mut amend = false;
     let mut cleanup_mode = None;
@@ -21102,6 +21103,15 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--fixup=") => {
                 fixup_commit = Some(value["--fixup=".len()..].to_string());
             }
+            "--squash" => {
+                let Some(value) = iter.next() else {
+                    return commit_squash_requires_value_error();
+                };
+                squash_commit = Some(value.to_string());
+            }
+            value if value.starts_with("--squash=") => {
+                squash_commit = Some(value["--squash=".len()..].to_string());
+            }
             "--reset-author" => reset_author = true,
             "--no-reset-author" => reset_author = false,
             value if value.starts_with("--reset-author=") => {
@@ -21199,6 +21209,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '{option}' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if squash_commit.is_some() && fixup_commit.is_some() {
+        eprintln!("fatal: options '--squash' and '--fixup' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if fixup_commit.is_some() && file_message.is_some() {
         eprintln!("fatal: options '-F' and '--fixup' cannot be used together");
         return Err(GitError::Exit(128));
@@ -21215,6 +21229,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         && message_chunks.is_empty()
         && reuse_message.is_none()
         && fixup_commit.is_none()
+        && squash_commit.is_none()
         && !amend
     {
         return Err(GitError::Command("commit requires -m <message>".into()));
@@ -21232,6 +21247,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let fixup_message = fixup_commit
         .as_deref()
         .map(|rev| read_fixup_commit_message(&git_dir, format, rev))
+        .transpose()?;
+    let squash_message = squash_commit
+        .as_deref()
+        .map(|rev| read_squash_commit_message(&git_dir, format, rev))
         .transpose()?;
     let author = if reset_author {
         build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
@@ -21252,7 +21271,18 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     };
     let mut message = reused_commit
         .as_ref()
-        .map(|commit| commit.message.clone())
+        .map(|commit| {
+            if let Some(squash_message) = &squash_message {
+                commit_squash_message(squash_message, Some(&commit.message), None, &[])
+            } else {
+                commit.message.clone()
+            }
+        })
+        .or_else(|| {
+            squash_message.as_ref().map(|message| {
+                commit_squash_message(message, None, file_message.as_deref(), &message_chunks)
+            })
+        })
         .or_else(|| {
             fixup_message.as_ref().map(|message| {
                 commit_fixup_message(message, file_message.as_deref(), &message_chunks)
@@ -21346,6 +21376,11 @@ fn commit_reuse_message_requires_value_error(short: bool, reedit: bool) -> Resul
 
 fn commit_fixup_requires_value_error() -> Result<()> {
     eprintln!("error: option `fixup' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_squash_requires_value_error() -> Result<()> {
+    eprintln!("error: option `squash' requires a value");
     Err(GitError::Exit(129))
 }
 
@@ -21547,6 +21582,11 @@ fn read_fixup_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) ->
     Ok(format!("fixup! {}\n", commit_subject(&commit.message)).into_bytes())
 }
 
+fn read_squash_commit_message(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Vec<u8>> {
+    let commit = read_reused_commit(git_dir, format, rev)?;
+    Ok(format!("squash! {}\n", commit_subject(&commit.message)).into_bytes())
+}
+
 fn commit_fixup_message(
     fixup_message: &[u8],
     file_message: Option<&[u8]>,
@@ -21564,6 +21604,39 @@ fn commit_fixup_message(
     }
     message.extend_from_slice(&body);
     message
+}
+
+fn commit_squash_message(
+    squash_message: &[u8],
+    reused_message: Option<&[u8]>,
+    file_message: Option<&[u8]>,
+    message_chunks: &[Vec<u8>],
+) -> Vec<u8> {
+    let body = reused_message
+        .map(commit_message_body)
+        .or_else(|| file_message.map(<[u8]>::to_vec))
+        .unwrap_or_else(|| commit_message_from_prepared_chunks(message_chunks));
+    if body.is_empty() {
+        return squash_message.to_vec();
+    }
+    let mut message = squash_message.to_vec();
+    if !message.ends_with(b"\n\n") {
+        message.push(b'\n');
+    }
+    message.extend_from_slice(&body);
+    message
+}
+
+fn commit_message_body(message: &[u8]) -> Vec<u8> {
+    let Some(first_lf) = message.iter().position(|byte| *byte == b'\n') else {
+        return Vec::new();
+    };
+    let body_start = if message.get(first_lf + 1) == Some(&b'\n') {
+        first_lf + 2
+    } else {
+        first_lf + 1
+    };
+    message[body_start..].to_vec()
 }
 
 fn read_amended_commit(git_dir: &Path, format: ObjectFormat) -> Result<Commit> {
