@@ -172,6 +172,14 @@ fn stash_list_matches_upstream_git() {
                 "git-rs stash output differed for {args:?}"
             );
         }
+        for args in [
+            ["stash", "list", "--reverse"].as_slice(),
+            ["stash", "list", "--oneline", "--reverse"].as_slice(),
+        ] {
+            let expected = run_output("git", &root, args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);
+            assert_same_output(actual, expected, args);
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

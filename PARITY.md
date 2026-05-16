@@ -82,7 +82,8 @@ Target: upstream Git 2.54.0.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
   display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
-  and `-<n>` / `-n` / `--max-count` limiting for covered stash entries and empty repositories,
+  `--reverse` rejection, and `-<n>` / `-n` / `--max-count` limiting for
+  covered stash entries and empty repositories,
   `stash clear` ref/reflog removal and covered empty/error cases, plus
   `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
   and covered invalid selector/error cases, plus `stash show` default stat,
@@ -885,7 +886,8 @@ Target: upstream Git 2.54.0.
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   `stash list` display over `refs/stash` reflogs including default,
   `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
-  `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls, and count limiting, plus
+  `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
+  `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/numstat/shortstat/summary/name/name-status/patch/untracked output, `stash store` ref/reflog writes,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and

@@ -6155,6 +6155,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 ));
             }
             "--oneline" => format = StashListFormat::Oneline,
+            "--reverse" => {
+                eprintln!(
+                    "fatal: options '--reverse' and '--walk-reflogs' cannot be used together"
+                );
+                return Err(GitError::Exit(1));
+            }
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
             "--format" | "--pretty" => {
