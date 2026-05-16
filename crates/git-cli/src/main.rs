@@ -20994,6 +20994,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut reset_author = false;
     let mut amend = false;
     let mut cleanup_mode = None;
+    let mut include_without_paths = false;
+    let mut only_without_paths = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21271,6 +21273,22 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-untracked-files=") => {
                 return commit_option_takes_no_value_error("no-untracked-files");
             }
+            "-i" | "--include" => include_without_paths = true,
+            "--no-include" => include_without_paths = false,
+            value if value.starts_with("--include=") => {
+                return commit_option_takes_no_value_error("include");
+            }
+            value if value.starts_with("--no-include=") => {
+                return commit_option_takes_no_value_error("no-include");
+            }
+            "-o" | "--only" => only_without_paths = true,
+            "--no-only" => only_without_paths = false,
+            value if value.starts_with("--only=") => {
+                return commit_option_takes_no_value_error("only");
+            }
+            value if value.starts_with("--no-only=") => {
+                return commit_option_takes_no_value_error("no-only");
+            }
             "-e" | "--edit" | "--no-edit" => {}
             value if value.starts_with("--edit=") => {
                 return commit_option_takes_no_value_error("edit");
@@ -21356,6 +21374,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if include_without_paths || only_without_paths {
+        eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
     }
     if file_message.is_none()
