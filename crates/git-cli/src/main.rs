@@ -21037,6 +21037,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 chunk.push(b'\n');
                 message_chunks.push(chunk);
             }
+            "--no-message" => message_chunks.clear(),
+            value if value.starts_with("--no-message=") => {
+                return commit_option_takes_no_value_error("no-message");
+            }
             "-F" | "--file" => {
                 let Some(path) = iter.next() else {
                     return commit_tree_file_requires_value_error();
@@ -21104,6 +21108,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--fixup=") => {
                 fixup_commit = Some(CommitFixup::parse(&value["--fixup=".len()..])?);
             }
+            "--no-fixup" => fixup_commit = None,
+            value if value.starts_with("--no-fixup=") => {
+                return commit_option_takes_no_value_error("no-fixup");
+            }
             "--squash" => {
                 let Some(value) = iter.next() else {
                     return commit_squash_requires_value_error();
@@ -21112,6 +21120,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--squash=") => {
                 squash_commit = Some(value["--squash=".len()..].to_string());
+            }
+            "--no-squash" => squash_commit = None,
+            value if value.starts_with("--no-squash=") => {
+                return commit_option_takes_no_value_error("no-squash");
             }
             "--trailer" => {
                 let Some(value) = iter.next() else {
@@ -21167,6 +21179,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--author=") => {
                 author_override = Some(value["--author=".len()..].to_string());
             }
+            "--no-author" => author_override = None,
+            value if value.starts_with("--no-author=") => {
+                return commit_option_takes_no_value_error("no-author");
+            }
             "--date" => {
                 let Some(date) = iter.next() else {
                     return commit_date_requires_value_error();
@@ -21175,6 +21191,10 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--date=") => {
                 author_date = Some(value["--date=".len()..].to_string());
+            }
+            "--no-date" => author_date = None,
+            value if value.starts_with("--no-date=") => {
+                return commit_option_takes_no_value_error("no-date");
             }
             "-n" | "--no-verify" | "--verify" => {}
             "--no-gpg-sign" => {}

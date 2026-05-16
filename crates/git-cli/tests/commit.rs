@@ -245,12 +245,17 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--squash"],
             vec!["commit", "--squash=missing"],
             vec!["commit", "--squash", "HEAD", "--fixup", "HEAD"],
+            vec!["commit", "--no-message=value", "-m", "subject"],
+            vec!["commit", "--no-fixup=value", "-m", "subject"],
+            vec!["commit", "--no-squash=value", "-m", "subject"],
             vec!["commit", "-m", "subject", "--trailer"],
             vec!["commit", "-m", "subject", "--no-trailer=value"],
             vec!["commit", "--edit=value", "-m", "subject"],
             vec!["commit", "--no-edit=value", "-m", "subject"],
             vec!["commit", "--branch=value", "-m", "subject"],
             vec!["commit", "--no-branch=value", "-m", "subject"],
+            vec!["commit", "--no-author=value", "-m", "subject"],
+            vec!["commit", "--no-date=value", "-m", "subject"],
             vec!["commit", "--reset-author", "-m", "subject"],
             vec!["commit", "--reset-author=value", "-m", "subject"],
             vec!["commit", "--no-reset-author=value", "-m", "subject"],
@@ -285,6 +290,17 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "-mone", "--message", "two"],
             ),
             (
+                "message-reset",
+                vec![
+                    "commit",
+                    "--message",
+                    "ignored",
+                    "--no-message",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
                 "message-no-gpg-sign",
                 vec!["commit", "--message=subject", "--no-gpg-sign"],
             ),
@@ -315,6 +331,14 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "no-amend-reset",
                 vec!["commit", "--amend", "--no-amend", "-m", "subject"],
+            ),
+            (
+                "fixup-reset",
+                vec!["commit", "--fixup", "HEAD", "--no-fixup", "-m", "subject"],
+            ),
+            (
+                "squash-reset",
+                vec!["commit", "--squash", "HEAD", "--no-squash", "-m", "subject"],
             ),
             (
                 "trailer-equals",
@@ -1221,6 +1245,20 @@ fn commit_author_and_date_options_match_upstream_git_objects() {
                     "-m",
                     "subject",
                 ],
+            ),
+            (
+                "author-reset",
+                vec![
+                    "commit",
+                    "--author=Other User <other@example.invalid>",
+                    "--no-author",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "date-reset",
+                vec!["commit", "--date=@123 +0230", "--no-date", "-m", "subject"],
             ),
         ] {
             let expected_root = root.join(format!("{name}-expected"));

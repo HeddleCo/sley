@@ -864,7 +864,8 @@ Target: upstream Git 2.54.0.
   parity, and covered `-C` / `-c` / `-F` conflict errors,
   covered simple `--squash <commit>` / `--squash=<commit>` object parity
   including editor-noop, `-m`, `-F`, and `-C` body reuse cases plus
-  `--fixup` conflict errors,
+  `--fixup` conflict errors, covered commit long-option reset parsing for
+  message/author/date/fixup/squash values,
   covered `--trailer` insertion for token/value forms, trailer-only message
   creation, `--no-trailer` reset behavior, and signoff/trailer ordering,
   plus covered commit no-op parsing for post-rewrite/status/verbose/edit/branch/template toggles, covered
