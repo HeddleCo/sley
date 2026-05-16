@@ -82,7 +82,9 @@ Target: upstream Git 2.54.0.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
   display, `--oneline`, `%gd` / `%gD` / `%gs` formats, and `-<n>` / `-n` /
   `--max-count` limiting for covered stash entries and empty repositories,
-  plus `stash clear` ref/reflog removal and covered empty/error cases.
+  `stash clear` ref/reflog removal and covered empty/error cases, plus
+  `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
+  and covered invalid selector/error cases.
 - Minimal `mktree` support for `ls-tree`-style stdin records, including
   default object validation, `--missing`, `-z`, `--batch`, tree-entry sorting,
   submodule commit entries, and upstream-readable tree object writes.
@@ -879,7 +881,7 @@ Target: upstream Git 2.54.0.
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   `stash list` display over `refs/stash` reflogs including default,
   `--oneline`, `%gd` / `%gD` / `%gs` formats, and count limiting, plus
-  `stash clear` ref/reflog removal,
+  `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
   patch/interactive requirement errors,
   covered commit `--pathspec-from-file` and `--pathspec-file-nul` parser

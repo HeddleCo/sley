@@ -69,6 +69,18 @@ fn prepare_stash_repo(root: &Path) {
     git(root, &["stash", "push", "-q", "-m", "two"]);
 }
 
+fn prepare_single_stash_repo(root: &Path) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("a.txt"), b"one\n").expect("write stash fixture");
+    git(root, &["stash", "push", "-q", "-m", "one"]);
+}
+
 fn copy_dir(source: &Path, target: &Path) {
     fs::create_dir_all(target).expect("create copied directory");
     for entry in fs::read_dir(source).expect("read source directory") {
@@ -182,6 +194,85 @@ fn stash_clear_empty_and_errors_match_upstream_git() {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
             assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_drop_matches_upstream_git() {
+    let root = unique_temp_dir("stash-drop");
+    let template = root.join("template");
+    let result = (|| {
+        prepare_stash_repo(&template);
+
+        for (name, args) in [
+            ("default", vec!["stash", "drop"]),
+            ("explicit", vec!["stash", "drop", "stash@{1}"]),
+            ("full-ref", vec!["stash", "drop", "refs/stash@{0}"]),
+            ("quiet", vec!["stash", "drop", "--quiet", "stash@{0}"]),
+            ("no-quiet", vec!["stash", "drop", "--no-quiet", "stash@{0}"]),
+        ] {
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+
+            for check_args in [
+                vec!["stash", "list"],
+                vec!["status", "--show-stash"],
+                vec!["show-ref", "--exists", "refs/stash"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_drop_last_and_errors_match_upstream_git() {
+    let root = unique_temp_dir("stash-drop-last-errors");
+    let template = root.join("template");
+    let result = (|| {
+        prepare_single_stash_repo(&template);
+
+        for (name, args) in [
+            ("last", vec!["stash", "drop"]),
+            ("empty", vec!["stash", "drop", "stash@{99}"]),
+            ("invalid", vec!["stash", "drop", "bad"]),
+            ("unknown-option", vec!["stash", "drop", "--bogus"]),
+            ("too-many", vec!["stash", "drop", "stash@{0}", "extra"]),
+        ] {
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+
+            if name == "last" {
+                for check_args in [
+                    vec!["stash", "list"],
+                    vec!["status", "--show-stash"],
+                    vec!["show-ref", "--exists", "refs/stash"],
+                ] {
+                    let expected = run_output("git", &upstream, &check_args);
+                    let actual_output =
+                        run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                    assert_same_output(actual_output, expected, &check_args);
+                }
+            }
         }
     })();
     let _ = fs::remove_dir_all(&root);

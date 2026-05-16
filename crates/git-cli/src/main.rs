@@ -5506,12 +5506,13 @@ enum StashListPlaceholder {
 fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("clear") => cmd_stash_clear(&args[1..]),
+        Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear and list; unsupported subcommand {other}"
+            "stash currently supports only clear, drop, and list; unsupported subcommand {other}"
         ))),
         None => Err(GitError::Unsupported(
-            "stash currently supports only clear and list".into(),
+            "stash currently supports only clear, drop, and list".into(),
         )),
     }
 }
@@ -5539,6 +5540,103 @@ fn cmd_stash_clear(args: &[String]) -> Result<()> {
         }
         Err(err) => Err(err),
     }
+}
+
+fn cmd_stash_drop(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut specs = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                stash_drop_usage();
+                return Err(GitError::Exit(129));
+            }
+            value => specs.push(value.to_string()),
+        }
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    let display = specs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let mut entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let dropped = entries.remove(entry_index);
+    if entries.is_empty() {
+        match store.delete_ref("refs/stash") {
+            Ok(_) | Err(GitError::NotFound(_)) => {
+                let _ = fs::remove_file(common_git_dir.join("logs").join("refs/stash"));
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        let new_top = entries
+            .last()
+            .map(|entry| entry.new_oid.clone())
+            .ok_or_else(|| GitError::InvalidFormat("stash reflog has no top entry".into()))?;
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/stash".to_string(),
+            expected: None,
+            new: RefTarget::Direct(new_top),
+            reflog: None,
+        });
+        tx.commit()?;
+        store.write_reflog("refs/stash", &entries)?;
+    }
+    if !quiet {
+        println!("Dropped {display} ({})", dropped.new_oid.to_hex());
+    }
+    Ok(())
+}
+
+fn parse_stash_drop_selector(spec: &str) -> Result<usize> {
+    let selector = spec
+        .strip_prefix("stash@{")
+        .or_else(|| spec.strip_prefix("refs/stash@{"))
+        .and_then(|rest| rest.strip_suffix('}'));
+    let Some(selector) = selector else {
+        eprintln!("error: {spec} is not a valid reference");
+        return Err(GitError::Exit(1));
+    };
+    selector.parse::<usize>().map_err(|_| {
+        eprintln!("error: {spec} is not a valid reference");
+        GitError::Exit(1)
+    })
+}
+
+fn stash_drop_usage() {
+    eprintln!("usage: git stash drop [-q | --quiet] [<stash>]");
+    eprintln!();
+    eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
+    eprintln!();
 }
 
 fn cmd_stash_list(args: &[String]) -> Result<()> {
