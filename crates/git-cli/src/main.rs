@@ -20987,6 +20987,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut author_override = None;
     let mut author_date = None;
     let mut reuse_message = None;
+    let mut reedit_message = false;
     let mut cleanup_mode = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -21047,15 +21048,33 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             "-C" | "--reuse-message" => {
                 let Some(value) = iter.next() else {
-                    return commit_reuse_message_requires_value_error(arg == "-C");
+                    return commit_reuse_message_requires_value_error(arg == "-C", false);
                 };
                 reuse_message = Some(value.to_string());
+                reedit_message = false;
             }
             value if value.starts_with("-C") && value.len() > 2 => {
                 reuse_message = Some(value[2..].to_string());
+                reedit_message = false;
             }
             value if value.starts_with("--reuse-message=") => {
                 reuse_message = Some(value["--reuse-message=".len()..].to_string());
+                reedit_message = false;
+            }
+            "-c" | "--reedit-message" => {
+                let Some(value) = iter.next() else {
+                    return commit_reuse_message_requires_value_error(arg == "-c", true);
+                };
+                reuse_message = Some(value.to_string());
+                reedit_message = true;
+            }
+            value if value.starts_with("-c") && value.len() > 2 => {
+                reuse_message = Some(value[2..].to_string());
+                reedit_message = true;
+            }
+            value if value.starts_with("--reedit-message=") => {
+                reuse_message = Some(value["--reedit-message=".len()..].to_string());
+                reedit_message = true;
             }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
@@ -21124,11 +21143,13 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         }
     }
     if reuse_message.is_some() && !message_chunks.is_empty() {
-        eprintln!("fatal: options '-m' and '-C' cannot be used together");
+        let option = if reedit_message { "-c" } else { "-C" };
+        eprintln!("fatal: options '-m' and '{option}' cannot be used together");
         return Err(GitError::Exit(128));
     }
     if reuse_message.is_some() && file_message.is_some() {
-        eprintln!("fatal: options '-C' and '-F' cannot be used together");
+        let option = if reedit_message { "-c" } else { "-C" };
+        eprintln!("fatal: options '{option}' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
     if file_message.is_some() && !message_chunks.is_empty() {
@@ -21220,11 +21241,17 @@ fn commit_template_requires_value_error() -> Result<()> {
     Err(GitError::Exit(129))
 }
 
-fn commit_reuse_message_requires_value_error(short: bool) -> Result<()> {
+fn commit_reuse_message_requires_value_error(short: bool, reedit: bool) -> Result<()> {
     if short {
-        eprintln!("error: switch `C' requires a value");
+        let switch = if reedit { "c" } else { "C" };
+        eprintln!("error: switch `{switch}' requires a value");
     } else {
-        eprintln!("error: option `reuse-message' requires a value");
+        let option = if reedit {
+            "reedit-message"
+        } else {
+            "reuse-message"
+        };
+        eprintln!("error: option `{option}' requires a value");
     }
     Err(GitError::Exit(129))
 }
