@@ -36776,7 +36776,7 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v2 = false;
             }
             "--no-branch" => branch = false,
-            "-uno" | "--untracked-files=no" => show_untracked = false,
+            "-uno" | "--untracked-files=no" | "--untracked-files=" => show_untracked = false,
             "-unormal" | "--no-untracked-files" | "--untracked-files=normal" => {
                 show_untracked = true;
                 untracked_mode = git_worktree::StatusUntrackedMode::Normal;
@@ -36784,6 +36784,14 @@ fn cmd_status(args: &[String]) -> Result<()> {
             "-u" | "-uall" | "--untracked-files" | "--untracked-files=all" => {
                 show_untracked = true;
                 untracked_mode = git_worktree::StatusUntrackedMode::All;
+            }
+            value if value.starts_with("-u") && value.len() > 2 => {
+                return status_invalid_untracked_files_mode_error(&value[2..]);
+            }
+            value if value.starts_with("--untracked-files=") => {
+                return status_invalid_untracked_files_mode_error(
+                    &value["--untracked-files=".len()..],
+                );
             }
             "-z" | "--null" => {
                 short = true;
@@ -36794,6 +36802,9 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 show_ignored = true;
             }
             "--ignored=no" | "--no-ignored" => show_ignored = false,
+            value if value.starts_with("--ignored=") => {
+                return status_invalid_ignored_mode_error(&value["--ignored=".len()..]);
+            }
             "--long" => {
                 short = false;
                 porcelain_v1 = false;
@@ -36818,14 +36829,21 @@ fn cmd_status(args: &[String]) -> Result<()> {
             | "--no-verbose"
             | "--column"
             | "--no-column"
+            | "--column="
             | "--column=auto"
+            | "--column=always"
             | "--column=never"
             | "--column=plain"
+            | "--column=column"
+            | "--column=row"
+            | "--column=dense"
+            | "--column=nodense"
             | "--ignore-submodules"
             | "--ignore-submodules=none"
             | "--ignore-submodules=untracked"
             | "--ignore-submodules=dirty"
-            | "--ignore-submodules=all" => {}
+            | "--ignore-submodules=all"
+            | "--no-ignore-submodules" => {}
             "-M" => {}
             value if value.starts_with("-M") && value.len() > 2 => {}
             value if value.starts_with("--find-renames=") => {}
@@ -36846,6 +36864,9 @@ fn cmd_status(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-null=") => {
                 return status_option_takes_no_value_error("no-null");
+            }
+            value if value.starts_with("--no-ignored=") => {
+                return status_option_takes_no_value_error("no-ignored");
             }
             value if value.starts_with("--long=") => {
                 return status_option_takes_no_value_error("long");
@@ -36870,6 +36891,20 @@ fn cmd_status(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-show-stash=") => {
                 return status_option_takes_no_value_error("no-show-stash");
+            }
+            value if value.starts_with("--column=") => {
+                return status_unsupported_column_option_error(&value["--column=".len()..]);
+            }
+            value if value.starts_with("--no-column=") => {
+                return status_option_takes_no_value_error("no-column");
+            }
+            value if value.starts_with("--ignore-submodules=") => {
+                return status_bad_ignore_submodules_argument_error(
+                    &value["--ignore-submodules=".len()..],
+                );
+            }
+            value if value.starts_with("--no-ignore-submodules=") => {
+                return status_option_takes_no_value_error("no-ignore-submodules");
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(
@@ -36942,6 +36977,26 @@ fn cmd_status(args: &[String]) -> Result<()> {
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(129))
+}
+
+fn status_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
+    eprintln!("fatal: Invalid untracked files mode '{mode}'");
+    Err(GitError::Exit(128))
+}
+
+fn status_invalid_ignored_mode_error(mode: &str) -> Result<()> {
+    eprintln!("fatal: Invalid ignored mode '{mode}'");
+    Err(GitError::Exit(128))
+}
+
+fn status_bad_ignore_submodules_argument_error(value: &str) -> Result<()> {
+    eprintln!("fatal: bad --ignore-submodules argument: {value}");
+    Err(GitError::Exit(128))
+}
+
+fn status_unsupported_column_option_error(value: &str) -> Result<()> {
+    eprintln!("error: unsupported option '{value}'");
     Err(GitError::Exit(129))
 }
 

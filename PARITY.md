@@ -895,7 +895,9 @@ Target: upstream Git 2.54.0.
   display toggles for ahead/behind, verbosity, stash, and column output including
   `--column=auto` / `--column=never` / `--column=plain`, plus status
   `--ignore-submodules[=none|untracked|dirty|all]` no-op behavior in
-  non-submodule fixtures, simple nested-cwd status path display, and simple
+  non-submodule fixtures, covered invalid status mode/value diagnostics for
+  untracked, ignored, ignore-submodules, and column options, simple nested-cwd
+  status path display, and simple
   literal status pathspec filtering for files, directories, missing paths, NUL
   output, and `--` pathspec separation,
   Rust-created branch interop, `branch -r`/`-a`, `branch --list <pattern>...`,
