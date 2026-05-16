@@ -21181,7 +21181,20 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--post-rewrite" | "--no-post-rewrite" => {}
             "--status" | "--no-status" => {}
             "-v" | "--verbose" | "--no-verbose" => {}
-            "--no-edit" => {}
+            "-e" | "--edit" | "--no-edit" => {}
+            value if value.starts_with("--edit=") => {
+                return commit_option_takes_no_value_error("edit");
+            }
+            value if value.starts_with("--no-edit=") => {
+                return commit_option_takes_no_value_error("no-edit");
+            }
+            "--branch" | "--no-branch" => {}
+            value if value.starts_with("--branch=") => {
+                return commit_option_takes_no_value_error("branch");
+            }
+            value if value.starts_with("--no-branch=") => {
+                return commit_option_takes_no_value_error("no-branch");
+            }
             "--template" => {
                 let Some(_template) = iter.next() else {
                     return commit_template_requires_value_error();
