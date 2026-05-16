@@ -290,6 +290,10 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-long=value", "-m", "subject"],
             vec!["commit", "--ahead-behind=value", "-m", "subject"],
             vec!["commit", "--no-ahead-behind=value", "-m", "subject"],
+            vec!["commit", "--interactive=value", "-m", "subject"],
+            vec!["commit", "--no-interactive=value", "-m", "subject"],
+            vec!["commit", "--patch=value", "-m", "subject"],
+            vec!["commit", "--no-patch=value", "-m", "subject"],
             vec!["commit", "--verbose=value", "-m", "subject"],
             vec!["commit", "--no-verbose=value", "-m", "subject"],
             vec!["commit", "--untracked-files=bad", "-m", "subject"],
@@ -515,6 +519,24 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "no-ahead-behind",
                 vec!["commit", "--no-ahead-behind", "-m", "subject"],
+            ),
+            (
+                "interactive-reset",
+                vec![
+                    "commit",
+                    "--interactive",
+                    "--no-interactive",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "patch-reset",
+                vec!["commit", "--patch", "--no-patch", "-m", "subject"],
+            ),
+            (
+                "patch-short-reset",
+                vec!["commit", "-p", "--no-patch", "-m", "subject"],
             ),
             (
                 "post-rewrite",

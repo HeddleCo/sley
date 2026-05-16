@@ -21000,6 +21000,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut status_null = false;
     let mut null_implied_status = false;
     let mut dry_run = false;
+    let mut interactive = false;
+    let mut patch = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21338,6 +21340,22 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-ahead-behind=") => {
                 return commit_option_takes_no_value_error("no-ahead-behind");
             }
+            "--interactive" => interactive = true,
+            "--no-interactive" => interactive = false,
+            value if value.starts_with("--interactive=") => {
+                return commit_option_takes_no_value_error("interactive");
+            }
+            value if value.starts_with("--no-interactive=") => {
+                return commit_option_takes_no_value_error("no-interactive");
+            }
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            value if value.starts_with("--patch=") => {
+                return commit_option_takes_no_value_error("patch");
+            }
+            value if value.starts_with("--no-patch=") => {
+                return commit_option_takes_no_value_error("no-patch");
+            }
             "-v" | "--verbose" | "--no-verbose" => {}
             value if value.starts_with("--verbose=") => {
                 return commit_option_takes_no_value_error("verbose");
@@ -21486,6 +21504,11 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if dry_run {
         return Err(GitError::Unsupported(
             "commit --dry-run currently requires --short or --porcelain".into(),
+        ));
+    }
+    if interactive || patch {
+        return Err(GitError::Unsupported(
+            "commit interactive patch selection is not implemented".into(),
         ));
     }
     if file_message.is_none()
