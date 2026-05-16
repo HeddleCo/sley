@@ -277,6 +277,13 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-post-rewrite=value", "-m", "subject"],
             vec!["commit", "--status=value", "-m", "subject"],
             vec!["commit", "--no-status=value", "-m", "subject"],
+            vec!["commit", "--short=value", "-m", "subject"],
+            vec!["commit", "--no-short=value", "-m", "subject"],
+            vec!["commit", "--porcelain=value", "-m", "subject"],
+            vec!["commit", "--porcelain=v1", "-m", "subject"],
+            vec!["commit", "--no-porcelain=value", "-m", "subject"],
+            vec!["commit", "--null=value", "-m", "subject"],
+            vec!["commit", "--no-null=value", "-m", "subject"],
             vec!["commit", "--verbose=value", "-m", "subject"],
             vec!["commit", "--no-verbose=value", "-m", "subject"],
             vec!["commit", "--untracked-files=bad", "-m", "subject"],
@@ -469,6 +476,18 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "quiet-verify",
                 vec!["commit", "--quiet", "--verify", "-m", "subject"],
+            ),
+            (
+                "short-reset",
+                vec!["commit", "--short", "--no-short", "-m", "subject"],
+            ),
+            (
+                "porcelain-reset",
+                vec!["commit", "--porcelain", "--no-porcelain", "-m", "subject"],
+            ),
+            (
+                "null-reset",
+                vec!["commit", "--null", "--no-null", "-m", "subject"],
             ),
             (
                 "post-rewrite",
@@ -744,6 +763,55 @@ fn commit_file_messages_match_upstream_git_objects() {
                 cat_head("git", &expected_root),
                 "committed object differed for {args:?}"
             );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn commit_status_preview_modes_match_upstream_git() {
+    let root = unique_temp_dir("commit-status-preview");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        for (name, args) in [
+            ("short-no-message", vec!["commit", "--short"]),
+            ("short", vec!["commit", "--short", "-m", "subject"]),
+            ("porcelain", vec!["commit", "--porcelain", "-m", "subject"]),
+            ("null-short", vec!["commit", "-z", "-m", "subject"]),
+            ("null-long", vec!["commit", "--null", "-m", "subject"]),
+            (
+                "short-null",
+                vec!["commit", "--short", "--null", "-m", "subject"],
+            ),
+            (
+                "null-reset-short",
+                vec!["commit", "--null", "--no-null", "--short", "-m", "subject"],
+            ),
+        ] {
+            let expected_root = root.join(format!("{name}-expected"));
+            let actual_root = root.join(format!("{name}-actual"));
+            fs::create_dir_all(&expected_root).expect("create expected repo");
+            fs::create_dir_all(&actual_root).expect("create actual repo");
+            prepare_commit_repo(&expected_root);
+            prepare_commit_repo(&actual_root);
+
+            let expected = run_output_with_identity("git", &expected_root, &args);
+            let actual =
+                run_output_with_identity(env!("CARGO_BIN_EXE_git-rs"), &actual_root, &args);
+            assert_same_output(actual, expected, &args);
+
+            for (program, repo) in [
+                ("git", expected_root.as_path()),
+                (env!("CARGO_BIN_EXE_git-rs"), actual_root.as_path()),
+            ] {
+                let head = run_output(program, repo, &["rev-parse", "--verify", "HEAD"]);
+                assert_eq!(
+                    head.status.code(),
+                    Some(128),
+                    "{program} unexpectedly created HEAD for {args:?}"
+                );
+            }
         }
     })();
     let _ = fs::remove_dir_all(&root);

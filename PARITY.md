@@ -869,6 +869,7 @@ Target: upstream Git 2.54.0.
   covered `--trailer` insertion for token/value forms, trailer-only message
   creation, `--no-trailer` reset behavior, and signoff/trailer ordering,
   plus covered commit no-op parsing and value rejection for post-rewrite/status/verbose/untracked-files/include/only/edit/branch/template/file toggles, covered
+  commit `--short` / `--porcelain` / `-z` / `--null` status-preview output and reset/value-error parity,
   `-t` template alias and bare option terminator parity, covered
   `--cleanup` object parity including `--no-cleanup`, and `--template` value errors, Rust add/status interop with upstream `git status --short`,
   `git status --porcelain`, `git status --porcelain=1`,

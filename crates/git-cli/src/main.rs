@@ -20996,6 +20996,9 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut cleanup_mode = None;
     let mut include_without_paths = false;
     let mut only_without_paths = false;
+    let mut status_mode = CommitStatusMode::Normal;
+    let mut status_null = false;
+    let mut null_implied_status = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21251,6 +21254,58 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-status=") => {
                 return commit_option_takes_no_value_error("no-status");
             }
+            "--short" => {
+                status_mode = CommitStatusMode::Short;
+                null_implied_status = false;
+            }
+            "--no-short" => {
+                if status_mode == CommitStatusMode::Short {
+                    status_mode = CommitStatusMode::Normal;
+                }
+                null_implied_status = false;
+            }
+            value if value.starts_with("--short=") => {
+                return commit_option_takes_no_value_error("short");
+            }
+            value if value.starts_with("--no-short=") => {
+                return commit_option_takes_no_value_error("no-short");
+            }
+            "--porcelain" => {
+                status_mode = CommitStatusMode::Porcelain;
+                null_implied_status = false;
+            }
+            "--no-porcelain" => {
+                if status_mode == CommitStatusMode::Porcelain {
+                    status_mode = CommitStatusMode::Normal;
+                }
+                null_implied_status = false;
+            }
+            value if value.starts_with("--porcelain=") => {
+                return commit_option_takes_no_value_error("porcelain");
+            }
+            value if value.starts_with("--no-porcelain=") => {
+                return commit_option_takes_no_value_error("no-porcelain");
+            }
+            "-z" | "--null" => {
+                if status_mode == CommitStatusMode::Normal {
+                    status_mode = CommitStatusMode::Short;
+                    null_implied_status = true;
+                }
+                status_null = true;
+            }
+            "--no-null" => {
+                status_null = false;
+                if null_implied_status {
+                    status_mode = CommitStatusMode::Normal;
+                    null_implied_status = false;
+                }
+            }
+            value if value.starts_with("--null=") => {
+                return commit_option_takes_no_value_error("null");
+            }
+            value if value.starts_with("--no-null=") => {
+                return commit_option_takes_no_value_error("no-null");
+            }
             "-v" | "--verbose" | "--no-verbose" => {}
             value if value.starts_with("--verbose=") => {
                 return commit_option_takes_no_value_error("verbose");
@@ -21393,6 +21448,9 @@ fn cmd_commit(args: &[String]) -> Result<()> {
         eprintln!("fatal: No paths with --include/--only does not make sense.");
         return Err(GitError::Exit(128));
     }
+    if status_mode != CommitStatusMode::Normal {
+        return cmd_commit_status_preview(status_mode, status_null);
+    }
     if file_message.is_none()
         && message_chunks.is_empty()
         && reuse_message.is_none()
@@ -21523,6 +21581,26 @@ fn cmd_commit(args: &[String]) -> Result<()> {
 enum CommitFixup {
     Plain(String),
     Amend { rev: String, reword: bool },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CommitStatusMode {
+    Normal,
+    Short,
+    Porcelain,
+}
+
+fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
+    let mut args = Vec::new();
+    match mode {
+        CommitStatusMode::Normal => {}
+        CommitStatusMode::Short => args.push("--short".to_string()),
+        CommitStatusMode::Porcelain => args.push("--porcelain".to_string()),
+    }
+    if null {
+        args.push("-z".to_string());
+    }
+    cmd_status(&args)
 }
 
 impl CommitFixup {
