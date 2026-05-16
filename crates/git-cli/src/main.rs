@@ -20986,6 +20986,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut all = false;
     let mut author_override = None;
     let mut author_date = None;
+    let mut reuse_message = None;
     let mut cleanup_mode = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -21043,6 +21044,18 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 file_message = Some(read_porcelain_commit_message_file(
                     &value["--file=".len()..],
                 )?);
+            }
+            "-C" | "--reuse-message" => {
+                let Some(value) = iter.next() else {
+                    return commit_reuse_message_requires_value_error(arg == "-C");
+                };
+                reuse_message = Some(value.to_string());
+            }
+            value if value.starts_with("-C") && value.len() > 2 => {
+                reuse_message = Some(value[2..].to_string());
+            }
+            value if value.starts_with("--reuse-message=") => {
+                reuse_message = Some(value["--reuse-message=".len()..].to_string());
             }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
@@ -21110,19 +21123,43 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
         }
     }
+    if reuse_message.is_some() && !message_chunks.is_empty() {
+        eprintln!("fatal: options '-m' and '-C' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if reuse_message.is_some() && file_message.is_some() {
+        eprintln!("fatal: options '-C' and '-F' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
     if file_message.is_some() && !message_chunks.is_empty() {
         eprintln!("fatal: options '-m' and '-F' cannot be used together");
         return Err(GitError::Exit(128));
     }
-    if file_message.is_none() && message_chunks.is_empty() {
+    if file_message.is_none() && message_chunks.is_empty() && reuse_message.is_none() {
         return Err(GitError::Command("commit requires -m <message>".into()));
     }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let author = build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?;
     let committer = commit_identity_from_env("COMMITTER")?;
-    let mut message =
-        file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks));
+    let reused_commit = reuse_message
+        .as_deref()
+        .map(|rev| read_reused_commit(&git_dir, format, rev))
+        .transpose()?;
+    let author = if let Some(commit) = &reused_commit {
+        build_reused_commit_author_identity(
+            &commit.author,
+            author_override.as_deref(),
+            author_date.as_deref(),
+        )?
+    } else {
+        build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
+    };
+    let mut message = reused_commit
+        .as_ref()
+        .map(|commit| commit.message.clone())
+        .unwrap_or_else(|| {
+            file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
+        });
     if let Some(cleanup_mode) = cleanup_mode {
         message = commit_cleanup_message(message, cleanup_mode);
     }
@@ -21180,6 +21217,15 @@ fn commit_cleanup_requires_value_error() -> Result<()> {
 
 fn commit_template_requires_value_error() -> Result<()> {
     eprintln!("error: option `template' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_reuse_message_requires_value_error(short: bool) -> Result<()> {
+    if short {
+        eprintln!("error: switch `C' requires a value");
+    } else {
+        eprintln!("error: option `reuse-message' requires a value");
+    }
     Err(GitError::Exit(129))
 }
 
@@ -21350,6 +21396,65 @@ fn commit_cleanup_message(message: Vec<u8>, mode: CommitCleanupMode) -> Vec<u8> 
         CommitCleanupMode::Strip => tag_stripspace_message(&message, true),
         CommitCleanupMode::Whitespace => tag_stripspace_message(&message, false),
     }
+}
+
+fn read_reused_commit(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<Commit> {
+    let result = (|| {
+        let oid = resolve_revision(git_dir, format, rev)?;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let commit_oid = git_rev::peel_to_commit(&db, format, &oid)?;
+        let object = db.read_object(&commit_oid)?;
+        if object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "expected commit {}, found {}",
+                commit_oid,
+                object.object_type.as_str()
+            )));
+        }
+        Commit::parse(format, &object.body)
+    })();
+    match result {
+        Ok(commit) => Ok(commit),
+        Err(_) => {
+            eprintln!("fatal: could not lookup commit '{rev}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn build_reused_commit_author_identity(
+    reused_author: &[u8],
+    author: Option<&str>,
+    date: Option<&str>,
+) -> Result<Vec<u8>> {
+    if author.is_none() && date.is_none() {
+        return Ok(reused_author.to_vec());
+    }
+    let (reused_name, reused_email, reused_date) = parse_commit_identity_parts(reused_author)?;
+    let (name, email) = if let Some(author) = author {
+        parse_commit_author(author)?
+    } else {
+        (reused_name, reused_email)
+    };
+    let date = date.unwrap_or(&reused_date);
+    git_sequencer::format_commit_identity(&name, &email, date)
+}
+
+fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, String)> {
+    let identity = std::str::from_utf8(identity)
+        .map_err(|err| GitError::InvalidObject(format!("invalid commit identity: {err}")))?;
+    let Some((left, timezone)) = identity.rsplit_once(' ') else {
+        return Err(GitError::InvalidObject(
+            "commit identity missing timezone".into(),
+        ));
+    };
+    let Some((author, timestamp)) = left.rsplit_once(' ') else {
+        return Err(GitError::InvalidObject(
+            "commit identity missing timestamp".into(),
+        ));
+    };
+    let (name, email) = parse_commit_author(author)?;
+    Ok((name, email, format!("{timestamp} {timezone}")))
 }
 
 fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<()> {
