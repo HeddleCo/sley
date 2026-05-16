@@ -277,6 +277,8 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-post-rewrite=value", "-m", "subject"],
             vec!["commit", "--status=value", "-m", "subject"],
             vec!["commit", "--no-status=value", "-m", "subject"],
+            vec!["commit", "--dry-run=value", "-m", "subject"],
+            vec!["commit", "--no-dry-run=value", "-m", "subject"],
             vec!["commit", "--short=value", "-m", "subject"],
             vec!["commit", "--no-short=value", "-m", "subject"],
             vec!["commit", "--porcelain=value", "-m", "subject"],
@@ -284,6 +286,10 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-porcelain=value", "-m", "subject"],
             vec!["commit", "--null=value", "-m", "subject"],
             vec!["commit", "--no-null=value", "-m", "subject"],
+            vec!["commit", "--long=value", "-m", "subject"],
+            vec!["commit", "--no-long=value", "-m", "subject"],
+            vec!["commit", "--ahead-behind=value", "-m", "subject"],
+            vec!["commit", "--no-ahead-behind=value", "-m", "subject"],
             vec!["commit", "--verbose=value", "-m", "subject"],
             vec!["commit", "--no-verbose=value", "-m", "subject"],
             vec!["commit", "--untracked-files=bad", "-m", "subject"],
@@ -478,6 +484,14 @@ fn commit_file_messages_match_upstream_git_objects() {
                 vec!["commit", "--quiet", "--verify", "-m", "subject"],
             ),
             (
+                "dry-run-reset",
+                vec!["commit", "--dry-run", "--no-dry-run", "-m", "subject"],
+            ),
+            (
+                "no-dry-run",
+                vec!["commit", "--no-dry-run", "-m", "subject"],
+            ),
+            (
                 "short-reset",
                 vec!["commit", "--short", "--no-short", "-m", "subject"],
             ),
@@ -488,6 +502,19 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "null-reset",
                 vec!["commit", "--null", "--no-null", "-m", "subject"],
+            ),
+            (
+                "long-reset",
+                vec!["commit", "--long", "--no-long", "-m", "subject"],
+            ),
+            ("no-long", vec!["commit", "--no-long", "-m", "subject"]),
+            (
+                "ahead-behind",
+                vec!["commit", "--ahead-behind", "-m", "subject"],
+            ),
+            (
+                "no-ahead-behind",
+                vec!["commit", "--no-ahead-behind", "-m", "subject"],
             ),
             (
                 "post-rewrite",

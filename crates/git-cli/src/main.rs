@@ -20999,6 +20999,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let mut status_mode = CommitStatusMode::Normal;
     let mut status_null = false;
     let mut null_implied_status = false;
+    let mut dry_run = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -21254,6 +21255,14 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-status=") => {
                 return commit_option_takes_no_value_error("no-status");
             }
+            "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            value if value.starts_with("--dry-run=") => {
+                return commit_option_takes_no_value_error("dry-run");
+            }
+            value if value.starts_with("--no-dry-run=") => {
+                return commit_option_takes_no_value_error("no-dry-run");
+            }
             "--short" => {
                 status_mode = CommitStatusMode::Short;
                 null_implied_status = false;
@@ -21305,6 +21314,29 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-null=") => {
                 return commit_option_takes_no_value_error("no-null");
+            }
+            "--long" => {
+                status_mode = CommitStatusMode::Long;
+                null_implied_status = false;
+            }
+            "--no-long" => {
+                if status_mode == CommitStatusMode::Long {
+                    status_mode = CommitStatusMode::Normal;
+                }
+                null_implied_status = false;
+            }
+            value if value.starts_with("--long=") => {
+                return commit_option_takes_no_value_error("long");
+            }
+            value if value.starts_with("--no-long=") => {
+                return commit_option_takes_no_value_error("no-long");
+            }
+            "--ahead-behind" | "--no-ahead-behind" => {}
+            value if value.starts_with("--ahead-behind=") => {
+                return commit_option_takes_no_value_error("ahead-behind");
+            }
+            value if value.starts_with("--no-ahead-behind=") => {
+                return commit_option_takes_no_value_error("no-ahead-behind");
             }
             "-v" | "--verbose" | "--no-verbose" => {}
             value if value.starts_with("--verbose=") => {
@@ -21451,6 +21483,11 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if status_mode != CommitStatusMode::Normal {
         return cmd_commit_status_preview(status_mode, status_null);
     }
+    if dry_run {
+        return Err(GitError::Unsupported(
+            "commit --dry-run currently requires --short or --porcelain".into(),
+        ));
+    }
     if file_message.is_none()
         && message_chunks.is_empty()
         && reuse_message.is_none()
@@ -21588,6 +21625,7 @@ enum CommitStatusMode {
     Normal,
     Short,
     Porcelain,
+    Long,
 }
 
 fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
@@ -21596,6 +21634,11 @@ fn cmd_commit_status_preview(mode: CommitStatusMode, null: bool) -> Result<()> {
         CommitStatusMode::Normal => {}
         CommitStatusMode::Short => args.push("--short".to_string()),
         CommitStatusMode::Porcelain => args.push("--porcelain".to_string()),
+        CommitStatusMode::Long => {
+            return Err(GitError::Unsupported(
+                "commit --long status preview is not implemented".into(),
+            ));
+        }
     }
     if null {
         args.push("-z".to_string());
