@@ -5759,12 +5759,16 @@ enum StashShowMode {
     Stat,
     NameOnly,
     NameStatus,
-    Patch,
     Quiet,
 }
 
 fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut mode = StashShowMode::Stat;
+    let mut show_stat = false;
+    let mut show_numstat = false;
+    let mut show_shortstat = false;
+    let mut show_summary = false;
+    let mut show_patch = false;
     let mut include_untracked = false;
     let mut only_untracked = false;
     let mut specs = Vec::new();
@@ -5776,6 +5780,34 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
                 ) {
                     mode = StashShowMode::Stat;
+                    show_stat = true;
+                }
+            }
+            "--numstat" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_numstat = true;
+                }
+            }
+            "--shortstat" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_shortstat = true;
+                }
+            }
+            "--summary" => {
+                if !matches!(
+                    mode,
+                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
+                ) {
+                    mode = StashShowMode::Stat;
+                    show_summary = true;
                 }
             }
             "--name-only" => {
@@ -5805,7 +5837,8 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     mode,
                     StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
                 ) {
-                    mode = StashShowMode::Patch;
+                    mode = StashShowMode::Stat;
+                    show_patch = true;
                 }
             }
             "--quiet" => mode = StashShowMode::Quiet,
@@ -5911,7 +5944,52 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout();
     match mode {
         StashShowMode::Stat => {
-            write_diff_stat(&mut stdout, &entries, &db, None, false, false, None)?;
+            let has_visual_mode =
+                show_stat || show_numstat || show_shortstat || show_summary || show_patch;
+            if !has_visual_mode {
+                show_stat = true;
+            }
+            let mut wrote_prefix_output = false;
+            if show_numstat {
+                for entry in &entries {
+                    write_diff_numstat_entry(&mut stdout, entry, false, &db, None, false)?;
+                }
+                wrote_prefix_output = !entries.is_empty();
+            }
+            if show_stat {
+                write_diff_stat(&mut stdout, &entries, &db, None, false, false, None)?;
+                wrote_prefix_output |= !entries.is_empty();
+            }
+            if show_shortstat {
+                write_diff_shortstat(&mut stdout, &entries, &db, None, false)?;
+                wrote_prefix_output |= !entries.is_empty();
+            }
+            if show_summary {
+                for entry in &entries {
+                    write_diff_summary_entry(&mut stdout, entry)?;
+                }
+                wrote_prefix_output |= entries.iter().any(stash_show_summary_outputs_entry);
+            }
+            if show_patch {
+                if wrote_prefix_output {
+                    writeln!(stdout)?;
+                }
+                let abbrev = repository_abbrev(&common_git_dir, format)?
+                    .unwrap_or(7)
+                    .min(format.hex_len());
+                for entry in &entries {
+                    let options = DiffPatchOptions {
+                        db: &db,
+                        worktree_root: None,
+                        use_worktree_new: false,
+                        format,
+                        abbrev,
+                        src_prefix: "a/",
+                        dst_prefix: "b/",
+                    };
+                    write_diff_patch_entry(&mut stdout, entry, options)?;
+                }
+            }
         }
         StashShowMode::NameOnly => {
             for entry in entries {
@@ -5929,23 +6007,6 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 writeln!(stdout, "\t{path}")?;
             }
         }
-        StashShowMode::Patch => {
-            let abbrev = repository_abbrev(&common_git_dir, format)?
-                .unwrap_or(7)
-                .min(format.hex_len());
-            for entry in &entries {
-                let options = DiffPatchOptions {
-                    db: &db,
-                    worktree_root: None,
-                    use_worktree_new: false,
-                    format,
-                    abbrev,
-                    src_prefix: "a/",
-                    dst_prefix: "b/",
-                };
-                write_diff_patch_entry(&mut stdout, entry, options)?;
-            }
-        }
         StashShowMode::Quiet => {
             if !entries.is_empty() {
                 return Err(GitError::Exit(1));
@@ -5953,6 +6014,16 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn stash_show_summary_outputs_entry(entry: &git_diff_merge::NameStatusEntry) -> bool {
+    match entry.status {
+        git_diff_merge::NameStatus::Added
+        | git_diff_merge::NameStatus::Deleted
+        | git_diff_merge::NameStatus::Renamed(_)
+        | git_diff_merge::NameStatus::Copied(_) => true,
+        git_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
+    }
 }
 
 fn stash_show_usage() {
