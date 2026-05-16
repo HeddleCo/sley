@@ -232,6 +232,8 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "-c", "HEAD", "-m", "subject"],
             vec!["commit", "-c", "HEAD", "-F", "message-lf.txt"],
             vec!["commit", "--reedit-message=missing"],
+            vec!["commit", "--no-reuse-message=value", "-m", "subject"],
+            vec!["commit", "--no-reedit-message=value", "-m", "subject"],
         ] {
             let expected = run_output("git", &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
@@ -262,6 +264,26 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "message-no-gpg-sign",
                 vec!["commit", "--message=subject", "--no-gpg-sign"],
+            ),
+            (
+                "reuse-reset",
+                vec![
+                    "commit",
+                    "--reuse-message=HEAD",
+                    "--no-reuse-message",
+                    "-m",
+                    "subject",
+                ],
+            ),
+            (
+                "reedit-reset",
+                vec![
+                    "commit",
+                    "--reedit-message=HEAD",
+                    "--no-reedit-message",
+                    "-m",
+                    "subject",
+                ],
             ),
             (
                 "all-no-all",

@@ -21061,6 +21061,13 @@ fn cmd_commit(args: &[String]) -> Result<()> {
                 reuse_message = Some(value["--reuse-message=".len()..].to_string());
                 reedit_message = false;
             }
+            "--no-reuse-message" => {
+                reuse_message = None;
+                reedit_message = false;
+            }
+            value if value.starts_with("--no-reuse-message=") => {
+                return commit_option_takes_no_value_error("no-reuse-message");
+            }
             "-c" | "--reedit-message" => {
                 let Some(value) = iter.next() else {
                     return commit_reuse_message_requires_value_error(arg == "-c", true);
@@ -21075,6 +21082,13 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--reedit-message=") => {
                 reuse_message = Some(value["--reedit-message=".len()..].to_string());
                 reedit_message = true;
+            }
+            "--no-reedit-message" => {
+                reuse_message = None;
+                reedit_message = false;
+            }
+            value if value.starts_with("--no-reedit-message=") => {
+                return commit_option_takes_no_value_error("no-reedit-message");
             }
             "-s" | "--signoff" => signoff = true,
             "--no-signoff" => signoff = false,
