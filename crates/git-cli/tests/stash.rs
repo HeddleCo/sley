@@ -81,6 +81,21 @@ fn prepare_single_stash_repo(root: &Path) {
     git(root, &["stash", "push", "-q", "-m", "one"]);
 }
 
+fn prepare_stash_store_repo(root: &Path) -> String {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("a.txt"), b"one\n").expect("write stash store fixture");
+    String::from_utf8(git(root, &["stash", "create", "store fixture"]))
+        .expect("stash create oid is utf8")
+        .trim()
+        .to_string()
+}
+
 fn copy_dir(source: &Path, target: &Path) {
     fs::create_dir_all(target).expect("create copied directory");
     for entry in fs::read_dir(source).expect("read source directory") {
@@ -118,6 +133,132 @@ fn stash_list_matches_upstream_git() {
                 actual, expected,
                 "git-rs stash output differed for {args:?}"
             );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_store_matches_upstream_git() {
+    let root = unique_temp_dir("stash-store");
+    let template = root.join("template");
+    let result = (|| {
+        let stash_oid = prepare_stash_store_repo(&template);
+
+        for (name, args) in [
+            ("default", vec!["stash", "store", stash_oid.as_str()]),
+            (
+                "message",
+                vec!["stash", "store", "-m", "saved", stash_oid.as_str()],
+            ),
+            (
+                "message-equals",
+                vec!["stash", "store", "--message=saved2", stash_oid.as_str()],
+            ),
+            (
+                "message-short",
+                vec!["stash", "store", "-msaved3", stash_oid.as_str()],
+            ),
+            (
+                "quiet",
+                vec!["stash", "store", "--quiet", stash_oid.as_str()],
+            ),
+            (
+                "no-quiet",
+                vec!["stash", "store", "--no-quiet", stash_oid.as_str()],
+            ),
+        ] {
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+
+            for check_args in [
+                vec!["stash", "list"],
+                vec!["show-ref", "--exists", "refs/stash"],
+                vec!["rev-parse", "refs/stash"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_store_appends_and_errors_match_upstream_git() {
+    let root = unique_temp_dir("stash-store-errors");
+    let template = root.join("template");
+    let result = (|| {
+        let stash_oid = prepare_stash_store_repo(&template);
+        let second_stash_oid =
+            String::from_utf8(git(&template, &["stash", "create", "second fixture"]))
+                .expect("second stash create oid is utf8")
+                .trim()
+                .to_string();
+        let head_oid = String::from_utf8(git(&template, &["rev-parse", "HEAD"]))
+            .expect("head oid is utf8")
+            .trim()
+            .to_string();
+        let blob_oid = String::from_utf8(git(&template, &["hash-object", "-w", "a.txt"]))
+            .expect("blob oid is utf8")
+            .trim()
+            .to_string();
+
+        for (name, args) in [
+            (
+                "append",
+                vec!["stash", "store", "-m", "first", second_stash_oid.as_str()],
+            ),
+            (
+                "same-oid-noop",
+                vec!["stash", "store", "-m", "first", stash_oid.as_str()],
+            ),
+            ("missing", vec!["stash", "store"]),
+            ("bad-revision", vec!["stash", "store", "bad"]),
+            (
+                "too-many",
+                vec!["stash", "store", stash_oid.as_str(), "extra"],
+            ),
+            ("missing-message", vec!["stash", "store", "-m"]),
+            ("missing-message-long", vec!["stash", "store", "--message"]),
+            (
+                "not-stash-commit",
+                vec!["stash", "store", head_oid.as_str()],
+            ),
+            (
+                "blob",
+                vec!["stash", "store", "-m", "blob", blob_oid.as_str()],
+            ),
+        ] {
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            if matches!(name, "append" | "same-oid-noop") {
+                git(&upstream, &["stash", "store", stash_oid.as_str()]);
+                git_rs(&actual, &["stash", "store", stash_oid.as_str()]);
+            }
+
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
+
+            if matches!(name, "append" | "same-oid-noop") {
+                let check_args = ["stash", "list"];
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
         }
     })();
     let _ = fs::remove_dir_all(&root);

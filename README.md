@@ -167,6 +167,7 @@ cargo run -p git-cli -- stash list [--oneline|--format=%gd|--format=%gD|--format
 cargo run -p git-cli -- stash clear
 cargo run -p git-cli -- stash drop [-q|--quiet|--no-quiet] [stash@{<n>}]
 cargo run -p git-cli -- stash show [--stat|--name-only|-p|--patch|--oneline|--quiet] [stash@{<n>}]
+cargo run -p git-cli -- stash store [-m <message>|--message=<message>] [-q|--quiet|--no-quiet] <commit>
 cargo run -p git-cli -- tag [<name> [<target>]]
 cargo run -p git-cli -- tag --list
 cargo run -p git-cli -- tag --list <pattern>...

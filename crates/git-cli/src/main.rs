@@ -5509,11 +5509,12 @@ fn cmd_stash(args: &[String]) -> Result<()> {
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
+        Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, drop, list, and show; unsupported subcommand {other}"
+            "stash currently supports only clear, drop, list, show, and store; unsupported subcommand {other}"
         ))),
         None => Err(GitError::Unsupported(
-            "stash currently supports only clear, drop, list, and show".into(),
+            "stash currently supports only clear, drop, list, show, and store".into(),
         )),
     }
 }
@@ -5638,6 +5639,119 @@ fn stash_drop_usage() {
     eprintln!();
     eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
     eprintln!();
+}
+
+fn cmd_stash_store(args: &[String]) -> Result<()> {
+    let mut message = b"Created via \"git stash store\".".to_vec();
+    let mut commits = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" | "--no-quiet" => {}
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                message = value.as_bytes().to_vec();
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                message = value.as_bytes().to_vec();
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                message = value.as_bytes()[2..].to_vec();
+            }
+            value => commits.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if commits.len() != 1 {
+        eprintln!("\"git stash store\" requires one <commit> argument");
+        return Err(GitError::Exit(1));
+    }
+    let commit = &commits[0];
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let stash_oid = match resolve_revision(&common_git_dir, format, commit) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("Cannot update refs/stash with {commit}");
+            return Err(GitError::Exit(1));
+        }
+    };
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+
+    let store = FileRefStore::new(&common_git_dir, format);
+    let old_oid = match store.read_ref("refs/stash")? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
+    };
+    if old_oid == stash_oid {
+        return Ok(());
+    }
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "refs/stash".to_string(),
+        expected: None,
+        new: RefTarget::Direct(stash_oid.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: stash_oid,
+            committer: default_committer(),
+            message,
+        }),
+    });
+    tx.commit()
+}
+
+fn validate_stash_like_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<()> {
+    let object = match db.read_object(oid) {
+        Ok(object) => object,
+        Err(GitError::NotFound(_)) => {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        }
+        Err(err) => return Err(err),
+    };
+    if object.object_type != ObjectType::Commit {
+        eprintln!(
+            "error: object {oid} is a {}, not a commit",
+            object.object_type.as_str()
+        );
+        eprintln!("fatal: '{oid}' is not a stash-like commit");
+        return Err(GitError::Exit(128));
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    if commit.parents.len() < 2 {
+        eprintln!("fatal: '{oid}' is not a stash-like commit");
+        return Err(GitError::Exit(128));
+    }
+    for parent in &commit.parents[..2] {
+        let Ok(parent_object) = db.read_object(parent) else {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        };
+        if parent_object.object_type != ObjectType::Commit {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
