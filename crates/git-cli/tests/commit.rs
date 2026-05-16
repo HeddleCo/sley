@@ -805,6 +805,18 @@ fn commit_status_preview_modes_match_upstream_git() {
             ("short-no-message", vec!["commit", "--short"]),
             ("short", vec!["commit", "--short", "-m", "subject"]),
             ("porcelain", vec!["commit", "--porcelain", "-m", "subject"]),
+            (
+                "dry-run-short",
+                vec!["commit", "--dry-run", "--short", "-m", "subject"],
+            ),
+            (
+                "dry-run-porcelain",
+                vec!["commit", "--dry-run", "--porcelain", "-m", "subject"],
+            ),
+            (
+                "dry-run-null",
+                vec!["commit", "--dry-run", "-z", "-m", "subject"],
+            ),
             ("null-short", vec!["commit", "-z", "-m", "subject"]),
             ("null-long", vec!["commit", "--null", "-m", "subject"]),
             (
