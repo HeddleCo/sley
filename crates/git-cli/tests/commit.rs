@@ -201,6 +201,14 @@ fn commit_message_option_errors_match_upstream_git() {
         let expected = run_output("git", &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
         assert_same_output(actual, expected, &args);
+        for args in [
+            vec!["commit", "--template"],
+            vec!["commit", "--no-template=value", "-m", "subject"],
+        ] {
+            let expected = run_output("git", &root, &args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_same_output(actual, expected, &args);
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result
@@ -331,6 +339,28 @@ fn commit_file_messages_match_upstream_git_objects() {
                     "--cleanup=scissors",
                     "-m",
                     "subject\n\n# comment\n body  ",
+                ],
+            ),
+            (
+                "template-long",
+                vec!["commit", "--template", "message-lf.txt", "-m", "subject"],
+            ),
+            (
+                "template-equals",
+                vec!["commit", "--template=message-lf.txt", "-m", "subject"],
+            ),
+            (
+                "template-empty-equals",
+                vec!["commit", "--template=", "-m", "subject"],
+            ),
+            (
+                "no-template",
+                vec![
+                    "commit",
+                    "--template=message-lf.txt",
+                    "--no-template",
+                    "-m",
+                    "subject",
                 ],
             ),
         ] {

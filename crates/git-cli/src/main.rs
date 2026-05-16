@@ -21061,6 +21061,16 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             "--status" | "--no-status" => {}
             "-v" | "--verbose" | "--no-verbose" => {}
             "--no-edit" => {}
+            "--template" => {
+                let Some(_template) = iter.next() else {
+                    return commit_template_requires_value_error();
+                };
+            }
+            value if value.starts_with("--template=") => {}
+            "--no-template" => {}
+            value if value.starts_with("--no-template=") => {
+                return commit_option_takes_no_value_error("no-template");
+            }
             "--cleanup" => {
                 let Some(value) = iter.next() else {
                     return commit_cleanup_requires_value_error();
@@ -21139,6 +21149,16 @@ fn commit_date_requires_value_error() -> Result<()> {
 
 fn commit_cleanup_requires_value_error() -> Result<()> {
     eprintln!("error: option `cleanup' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_template_requires_value_error() -> Result<()> {
+    eprintln!("error: option `template' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_option_takes_no_value_error(option: &str) -> Result<()> {
+    eprintln!("error: option `{option}' takes no value");
     Err(GitError::Exit(129))
 }
 
