@@ -36760,6 +36760,12 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v2 = true;
                 explicit_long = false;
             }
+            "--no-porcelain" => {
+                short = false;
+                porcelain_v1 = false;
+                porcelain_v2 = false;
+                explicit_long = false;
+            }
             "--branch" | "-b" => {
                 short = true;
                 branch = true;
@@ -36792,6 +36798,9 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 return status_invalid_untracked_files_mode_error(
                     &value["--untracked-files=".len()..],
                 );
+            }
+            value if value.starts_with("--porcelain=") => {
+                return status_unsupported_porcelain_version_error(&value["--porcelain=".len()..]);
             }
             "-z" | "--null" => {
                 short = true;
@@ -36853,6 +36862,9 @@ fn cmd_status(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-short=") => {
                 return status_option_takes_no_value_error("no-short");
             }
+            value if value.starts_with("--no-porcelain=") => {
+                return status_option_takes_no_value_error("no-porcelain");
+            }
             value if value.starts_with("--branch=") => {
                 return status_option_takes_no_value_error("branch");
             }
@@ -36891,6 +36903,12 @@ fn cmd_status(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-show-stash=") => {
                 return status_option_takes_no_value_error("no-show-stash");
+            }
+            value if value.starts_with("--renames=") => {
+                return status_option_takes_no_value_error("no-no-renames");
+            }
+            value if value.starts_with("--no-renames=") => {
+                return status_option_takes_no_value_error("no-renames");
             }
             value if value.starts_with("--column=") => {
                 return status_unsupported_column_option_error(&value["--column=".len()..]);
@@ -36987,6 +37005,11 @@ fn status_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
 
 fn status_invalid_ignored_mode_error(mode: &str) -> Result<()> {
     eprintln!("fatal: Invalid ignored mode '{mode}'");
+    Err(GitError::Exit(128))
+}
+
+fn status_unsupported_porcelain_version_error(version: &str) -> Result<()> {
+    eprintln!("fatal: unsupported porcelain version '{version}'");
     Err(GitError::Exit(128))
 }
 

@@ -143,6 +143,8 @@ fn status_z_matches_upstream_git() {
             vec!["status", "--porcelain=1", "--branch"],
             vec!["status", "--porcelain", "--branch", "--no-branch"],
             vec!["status", "--porcelain", "--branch", "-z"],
+            vec!["status", "--no-porcelain", "--short"],
+            vec!["status", "--porcelain", "--no-porcelain", "--short"],
             vec!["status", "--porcelain", "--untracked-files"],
             vec!["status", "--porcelain", "--untracked-files=all"],
             vec!["status", "--porcelain", "--untracked-files=all", "-z"],
@@ -260,6 +262,11 @@ fn status_display_option_errors_match_upstream_git() {
             vec!["status", "--no-verbose=value"],
             vec!["status", "--show-stash=value"],
             vec!["status", "--no-show-stash=value"],
+            vec!["status", "--porcelain=bad"],
+            vec!["status", "--porcelain="],
+            vec!["status", "--no-porcelain=value"],
+            vec!["status", "--renames=value"],
+            vec!["status", "--no-renames=value"],
             vec!["status", "--untracked-files=bad"],
             vec!["status", "-ubad"],
             vec!["status", "--ignored=bad"],
@@ -372,6 +379,9 @@ fn status_long_matches_upstream_git() {
             vec!["status", "--long"],
             vec!["status", "--short", "--long"],
             vec!["status", "--long", "--short"],
+            vec!["status", "--short", "--no-porcelain"],
+            vec!["status", "--porcelain", "--no-porcelain"],
+            vec!["status", "--porcelain=v2", "--no-porcelain"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);

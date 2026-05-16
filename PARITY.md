@@ -886,12 +886,14 @@ Target: upstream Git 2.54.0.
   space, quote, and tab paths in non-NUL short/porcelain output,
   status `-z`, status `--null`, status
   `--no-null`, status `--branch`, status `--no-branch`, status
-  `--no-short`, no-value display option errors, and `--long` / `-z` conflict errors,
+  `--no-short`, `--no-porcelain`, no-value display option errors,
+  unsupported porcelain-version errors, and `--long` / `-z` conflict errors,
   combined status `-sb` / `-bs`, status `-u` /
   `--untracked-files`, status `--untracked-files=no`, status
   `--ignored[=traditional|matching|no]` / `--no-ignored` no-op behavior in
   non-ignored fixtures, status rename toggles
-  `--no-renames` / `--renames` / `-M[<n>]` / `--find-renames[=<n>]`, and simple status
+  `--no-renames` / `--renames` / `-M[<n>]` / `--find-renames[=<n>]`,
+  including rename-toggle value errors, and simple status
   display toggles for ahead/behind, verbosity, stash, and column output including
   `--column=auto` / `--column=never` / `--column=plain`, plus status
   `--ignore-submodules[=none|untracked|dirty|all]` no-op behavior in
