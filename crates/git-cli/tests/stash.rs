@@ -69,6 +69,31 @@ fn prepare_stash_repo(root: &Path) {
     git(root, &["stash", "push", "-q", "-m", "two"]);
 }
 
+fn prepare_untracked_stash_repo(root: &Path) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("z.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "z.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("z.txt"), b"tracked\n").expect("write tracked fixture");
+    fs::write(root.join("a.txt"), b"untracked\n").expect("write untracked fixture");
+    git(root, &["stash", "push", "-q", "-u", "-m", "with untracked"]);
+}
+
+fn prepare_tracked_only_stash_repo(root: &Path) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("a.txt"), b"tracked\n").expect("write tracked fixture");
+    git(root, &["stash", "push", "-q", "-m", "tracked only"]);
+}
+
 fn prepare_single_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
     git(root, &["init", "-q"]);
@@ -445,6 +470,84 @@ fn stash_show_matches_upstream_git() {
         let args = ["stash", "show", "--quiet"];
         let expected = run_output("git", &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+        assert_same_output(actual, expected, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_show_untracked_flags_match_upstream_git() {
+    let root = unique_temp_dir("stash-show-untracked");
+    let untracked = root.join("untracked");
+    let tracked_only = root.join("tracked-only");
+    let result = (|| {
+        prepare_untracked_stash_repo(&untracked);
+        for args in [
+            vec!["stash", "show", "--include-untracked"],
+            vec!["stash", "show", "-u"],
+            vec!["stash", "show", "--only-untracked"],
+            vec!["stash", "show", "--name-only", "--include-untracked"],
+            vec!["stash", "show", "--name-only", "--only-untracked"],
+            vec!["stash", "show", "--name-only", "--no-include-untracked"],
+            vec![
+                "stash",
+                "show",
+                "--name-only",
+                "--include-untracked",
+                "--no-include-untracked",
+            ],
+            vec![
+                "stash",
+                "show",
+                "--name-only",
+                "--only-untracked",
+                "--include-untracked",
+            ],
+            vec![
+                "stash",
+                "show",
+                "--name-only",
+                "--include-untracked",
+                "--only-untracked",
+            ],
+            vec!["stash", "show", "--stat", "--include-untracked"],
+            vec!["stash", "show", "--stat", "--only-untracked"],
+            vec!["stash", "show", "-p", "--include-untracked"],
+            vec!["stash", "show", "-p", "--only-untracked"],
+        ] {
+            let expected = git(&untracked, &args);
+            let actual = git_rs(&untracked, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs stash show untracked output differed for {args:?}"
+            );
+        }
+        for args in [
+            ["stash", "show", "--quiet", "--include-untracked"].as_slice(),
+            ["stash", "show", "--quiet", "--only-untracked"].as_slice(),
+            ["stash", "show", "--no-only-untracked"].as_slice(),
+        ] {
+            let expected = run_output("git", &untracked, args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &untracked, args);
+            assert_same_output(actual, expected, args);
+        }
+
+        prepare_tracked_only_stash_repo(&tracked_only);
+        for args in [
+            vec!["stash", "show", "--only-untracked"],
+            vec!["stash", "show", "--name-only", "--only-untracked"],
+        ] {
+            let expected = git(&tracked_only, &args);
+            let actual = git_rs(&tracked_only, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs tracked-only stash output differed for {args:?}"
+            );
+        }
+        let args = ["stash", "show", "--quiet", "--only-untracked"];
+        let expected = run_output("git", &tracked_only, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &tracked_only, &args);
         assert_same_output(actual, expected, &args);
     })();
     let _ = fs::remove_dir_all(&root);

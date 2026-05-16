@@ -5764,6 +5764,8 @@ enum StashShowMode {
 
 fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut mode = StashShowMode::Stat;
+    let mut include_untracked = false;
+    let mut only_untracked = false;
     let mut specs = Vec::new();
     for arg in args {
         match arg.as_str() {
@@ -5771,6 +5773,22 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             "--name-only" => mode = StashShowMode::NameOnly,
             "-p" | "--patch" | "--oneline" => mode = StashShowMode::Patch,
             "--quiet" => mode = StashShowMode::Quiet,
+            "-u" | "--include-untracked" => {
+                include_untracked = true;
+                only_untracked = false;
+            }
+            "--no-include-untracked" => {
+                include_untracked = false;
+                only_untracked = false;
+            }
+            "--only-untracked" => {
+                include_untracked = true;
+                only_untracked = true;
+            }
+            "--no-only-untracked" => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
                     "unsupported stash show option {value}"
@@ -5826,13 +5844,34 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         )));
     }
     let base_commit = Commit::parse(format, &base_object.body)?;
-    let entries = git_diff_merge::diff_name_status_trees_with_options(
-        &db,
-        format,
-        &base_commit.tree,
-        &stash_commit.tree,
-        git_diff_merge::DiffNameStatusOptions::default(),
-    )?;
+    let diff_options = git_diff_merge::DiffNameStatusOptions::default();
+    let mut entries = if only_untracked {
+        Vec::new()
+    } else {
+        git_diff_merge::diff_name_status_trees_with_options(
+            &db,
+            format,
+            &base_commit.tree,
+            &stash_commit.tree,
+            diff_options,
+        )?
+    };
+    if include_untracked && let Some(untracked_oid) = stash_commit.parents.get(2) {
+        let untracked_object = db.read_object(untracked_oid)?;
+        if untracked_object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "stash untracked parent {untracked_oid} is not a commit"
+            )));
+        }
+        let untracked_commit = Commit::parse(format, &untracked_object.body)?;
+        entries.extend(git_diff_merge::diff_name_status_empty_tree_with_options(
+            &db,
+            format,
+            &untracked_commit.tree,
+            diff_options,
+        )?);
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+    }
     let mut stdout = io::stdout();
     match mode {
         StashShowMode::Stat => {
@@ -5867,6 +5906,17 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn stash_show_usage() {
+    eprintln!(
+        "usage: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]"
+    );
+    eprintln!();
+    eprintln!("    -u, --[no-]include-untracked");
+    eprintln!("                          include untracked files in the stash");
+    eprintln!("    --only-untracked      only show untracked files in the stash");
+    eprintln!();
 }
 
 fn cmd_stash_list(args: &[String]) -> Result<()> {

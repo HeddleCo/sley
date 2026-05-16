@@ -222,6 +222,23 @@ pub fn diff_name_status_trees_with_options(
     )
 }
 
+pub fn diff_name_status_empty_tree_with_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    right_tree: &ObjectId,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "tree diff currently reads sha1 repositories".into(),
+        ));
+    }
+    let left_entries = BTreeMap::new();
+    let mut right_entries = BTreeMap::new();
+    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    diff_name_status_maps(&left_entries, &right_entries, right_entries.keys(), options)
+}
+
 fn diff_name_status_maps<'a>(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
