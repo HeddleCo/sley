@@ -5771,8 +5771,12 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut patch_full_index = false;
     let mut include_untracked = false;
     let mut only_untracked = false;
+    let mut diff_filter = DiffFilter::default();
+    let mut diff_filter_seen = false;
     let mut specs = Vec::new();
-    for arg in args {
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
         match arg.as_str() {
             "--stat" => {
                 if !matches!(
@@ -5904,6 +5908,12 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 stash_show_usage();
                 return Err(GitError::Exit(129));
             }
+            "--diff-filter" => {
+                if idx + 1 == args.len() {
+                    eprintln!("error: option `diff-filter' requires a value");
+                    return Err(GitError::Exit(129));
+                }
+            }
             value if value.starts_with("--abbrev=") => {
                 let value = value
                     .strip_prefix("--abbrev=")
@@ -5912,6 +5922,13 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 raw_abbrev = Some(Some(abbrev));
                 patch_abbrev = Some(abbrev);
             }
+            value if value.starts_with("--diff-filter=") => {
+                let value = value
+                    .strip_prefix("--diff-filter=")
+                    .ok_or_else(|| GitError::Command("--diff-filter requires a value".into()))?;
+                diff_filter = parse_diff_filter(value)?;
+                diff_filter_seen = true;
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
                     "unsupported stash show option {value}"
@@ -5919,6 +5936,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             }
             value => specs.push(value.to_string()),
         }
+        idx += 1;
     }
     if specs.len() > 1 {
         eprintln!(
@@ -5926,6 +5944,18 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             specs[0], specs[1]
         );
         return Err(GitError::Exit(1));
+    }
+    if matches!(mode, StashShowMode::Stat)
+        && diff_filter_seen
+        && !(show_raw
+            || show_stat
+            || show_numstat
+            || show_shortstat
+            || show_summary
+            || compact_summary
+            || show_patch)
+    {
+        show_patch = true;
     }
     let selector = match specs.first() {
         Some(spec) => parse_stash_drop_selector(spec)?,
@@ -5995,6 +6025,22 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         )?);
         entries.sort_by(|left, right| left.path.cmp(&right.path));
     }
+    let entries: Vec<_> = if diff_filter.all_or_none {
+        if !diff_filter.includes.is_empty()
+            && entries
+                .iter()
+                .any(|entry| diff_filter.matches_status(entry.status.code()))
+        {
+            entries
+        } else {
+            Vec::new()
+        }
+    } else {
+        entries
+            .into_iter()
+            .filter(|entry| diff_filter.matches_status(entry.status.code()))
+            .collect()
+    };
     let mut stdout = io::stdout();
     let repository_abbrev = repository_abbrev(&common_git_dir, format)?;
     let raw_abbrev = match raw_abbrev {

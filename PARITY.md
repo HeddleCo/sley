@@ -89,7 +89,7 @@ Target: upstream Git 2.54.0.
   `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
   and covered invalid selector/error cases, plus `stash show` default stat,
   raw, compact-summary, numstat, shortstat, summary, name-only, name-status,
-  patch, quiet, explicit-stash, and untracked-display output, plus
+  patch, quiet, diff-filter, explicit-stash, and untracked-display output, plus
   `stash store` ref/reflog updates with message options and covered invalid
   commit cases.
 - Minimal `mktree` support for `ls-tree`-style stdin records, including
@@ -892,7 +892,7 @@ Target: upstream Git 2.54.0.
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
   `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
-  `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/untracked output, `stash store` ref/reflog writes,
+  `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/diff-filter/untracked output, `stash store` ref/reflog writes,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
   patch/interactive requirement errors,
   covered commit `--pathspec-from-file` and `--pathspec-file-nul` parser
