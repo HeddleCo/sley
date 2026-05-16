@@ -21256,6 +21256,21 @@ fn cmd_commit(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-verbose=") => {
                 return commit_option_takes_no_value_error("no-verbose");
             }
+            "-u" | "-uno" | "-unormal" | "-uall" | "--untracked-files" => {}
+            value if value.starts_with("-u") && value.len() > 2 => {
+                return commit_invalid_untracked_files_mode_error(&value[2..]);
+            }
+            value if value.starts_with("--untracked-files=") => {
+                let mode = &value["--untracked-files=".len()..];
+                match mode {
+                    "no" | "normal" | "all" => {}
+                    _ => return commit_invalid_untracked_files_mode_error(mode),
+                }
+            }
+            "--no-untracked-files" => {}
+            value if value.starts_with("--no-untracked-files=") => {
+                return commit_option_takes_no_value_error("no-untracked-files");
+            }
             "-e" | "--edit" | "--no-edit" => {}
             value if value.starts_with("--edit=") => {
                 return commit_option_takes_no_value_error("edit");
@@ -21572,6 +21587,11 @@ fn commit_trailer_requires_value_error() -> Result<()> {
 fn commit_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
     Err(GitError::Exit(129))
+}
+
+fn commit_invalid_untracked_files_mode_error(mode: &str) -> Result<()> {
+    eprintln!("fatal: Invalid untracked files mode '{mode}'");
+    Err(GitError::Exit(128))
 }
 
 fn cmd_commit_tree(args: &[String]) -> Result<()> {

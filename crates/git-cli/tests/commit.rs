@@ -275,6 +275,9 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--no-status=value", "-m", "subject"],
             vec!["commit", "--verbose=value", "-m", "subject"],
             vec!["commit", "--no-verbose=value", "-m", "subject"],
+            vec!["commit", "--untracked-files=bad", "-m", "subject"],
+            vec!["commit", "-ubad", "-m", "subject"],
+            vec!["commit", "--no-untracked-files=value", "-m", "subject"],
             vec!["commit", "--reset-author", "-m", "subject"],
             vec!["commit", "--reset-author=value", "-m", "subject"],
             vec!["commit", "--no-reset-author=value", "-m", "subject"],
@@ -469,6 +472,39 @@ fn commit_file_messages_match_upstream_git_objects() {
             (
                 "no-verbose",
                 vec!["commit", "--no-verbose", "-m", "subject"],
+            ),
+            (
+                "untracked-files",
+                vec!["commit", "--untracked-files", "-m", "subject"],
+            ),
+            (
+                "untracked-files-no",
+                vec!["commit", "--untracked-files=no", "-m", "subject"],
+            ),
+            (
+                "untracked-files-normal",
+                vec!["commit", "--untracked-files=normal", "-m", "subject"],
+            ),
+            (
+                "untracked-files-all",
+                vec!["commit", "--untracked-files=all", "-m", "subject"],
+            ),
+            ("untracked-short", vec!["commit", "-u", "-m", "subject"]),
+            (
+                "untracked-short-no",
+                vec!["commit", "-uno", "-m", "subject"],
+            ),
+            (
+                "untracked-short-normal",
+                vec!["commit", "-unormal", "-m", "subject"],
+            ),
+            (
+                "untracked-short-all",
+                vec!["commit", "-uall", "-m", "subject"],
+            ),
+            (
+                "no-untracked-files",
+                vec!["commit", "--no-untracked-files", "-m", "subject"],
             ),
             ("no-edit", vec!["commit", "--no-edit", "-m", "subject"]),
             ("branch", vec!["commit", "--branch", "-m", "subject"]),
