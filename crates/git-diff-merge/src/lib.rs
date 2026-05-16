@@ -198,6 +198,30 @@ pub fn diff_name_status_index_worktree_with_options(
     diff_name_status_maps(&index, &worktree, index.keys(), options)
 }
 
+pub fn diff_name_status_trees_with_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_tree: &ObjectId,
+    right_tree: &ObjectId,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(
+            "tree diff currently reads sha1 repositories".into(),
+        ));
+    }
+    let mut left_entries = BTreeMap::new();
+    collect_tree_entries(db, format, left_tree, Vec::new(), &mut left_entries)?;
+    let mut right_entries = BTreeMap::new();
+    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    diff_name_status_maps(
+        &left_entries,
+        &right_entries,
+        left_entries.keys().chain(right_entries.keys()),
+        options,
+    )
+}
+
 fn diff_name_status_maps<'a>(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,

@@ -5508,11 +5508,12 @@ fn cmd_stash(args: &[String]) -> Result<()> {
         Some("clear") => cmd_stash_clear(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
+        Some("show") => cmd_stash_show(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, drop, and list; unsupported subcommand {other}"
+            "stash currently supports only clear, drop, list, and show; unsupported subcommand {other}"
         ))),
         None => Err(GitError::Unsupported(
-            "stash currently supports only clear, drop, and list".into(),
+            "stash currently supports only clear, drop, list, and show".into(),
         )),
     }
 }
@@ -5637,6 +5638,121 @@ fn stash_drop_usage() {
     eprintln!();
     eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
     eprintln!();
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StashShowMode {
+    Stat,
+    NameOnly,
+    Patch,
+    Quiet,
+}
+
+fn cmd_stash_show(args: &[String]) -> Result<()> {
+    let mut mode = StashShowMode::Stat;
+    let mut specs = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--stat" => mode = StashShowMode::Stat,
+            "--name-only" => mode = StashShowMode::NameOnly,
+            "-p" | "--patch" | "--oneline" => mode = StashShowMode::Patch,
+            "--quiet" => mode = StashShowMode::Quiet,
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash show option {value}"
+                )));
+            }
+            value => specs.push(value.to_string()),
+        }
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let object = db.read_object(&stash_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash {stash_oid} is not a commit"
+        )));
+    }
+    let stash_commit = Commit::parse(format, &object.body)?;
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    let base_object = db.read_object(base_oid)?;
+    if base_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash parent {base_oid} is not a commit"
+        )));
+    }
+    let base_commit = Commit::parse(format, &base_object.body)?;
+    let entries = git_diff_merge::diff_name_status_trees_with_options(
+        &db,
+        format,
+        &base_commit.tree,
+        &stash_commit.tree,
+        git_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    let mut stdout = io::stdout();
+    match mode {
+        StashShowMode::Stat => {
+            write_diff_stat(&mut stdout, &entries, &db, None, false, false, None)?;
+        }
+        StashShowMode::NameOnly => {
+            for entry in entries {
+                writeln!(stdout, "{}", status_quote_path(&entry.path, false))?;
+            }
+        }
+        StashShowMode::Patch => {
+            let abbrev = repository_abbrev(&common_git_dir, format)?
+                .unwrap_or(7)
+                .min(format.hex_len());
+            for entry in &entries {
+                let options = DiffPatchOptions {
+                    db: &db,
+                    worktree_root: None,
+                    use_worktree_new: false,
+                    format,
+                    abbrev,
+                    src_prefix: "a/",
+                    dst_prefix: "b/",
+                };
+                write_diff_patch_entry(&mut stdout, entry, options)?;
+            }
+        }
+        StashShowMode::Quiet => {
+            if !entries.is_empty() {
+                return Err(GitError::Exit(1));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn cmd_stash_list(args: &[String]) -> Result<()> {

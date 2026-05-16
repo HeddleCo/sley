@@ -278,3 +278,68 @@ fn stash_drop_last_and_errors_match_upstream_git() {
     let _ = fs::remove_dir_all(&root);
     result
 }
+
+#[test]
+fn stash_show_matches_upstream_git() {
+    let root = unique_temp_dir("stash-show");
+    let result = (|| {
+        prepare_stash_repo(&root);
+        for args in [
+            vec!["stash", "show"],
+            vec!["stash", "show", "--stat"],
+            vec!["stash", "show", "--name-only"],
+            vec!["stash", "show", "-p"],
+            vec!["stash", "show", "--patch"],
+            vec!["stash", "show", "--oneline"],
+            vec!["stash", "show", "stash@{1}"],
+            vec!["stash", "show", "refs/stash@{0}"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs stash show output differed for {args:?}"
+            );
+        }
+        let args = ["stash", "show", "--quiet"];
+        let expected = run_output("git", &root, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+        assert_same_output(actual, expected, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_show_empty_and_errors_match_upstream_git() {
+    let root = unique_temp_dir("stash-show-empty-errors");
+    let template = root.join("template");
+    let result = (|| {
+        prepare_single_stash_repo(&template);
+
+        for (name, args) in [
+            ("empty", vec!["stash", "show", "stash@{99}"]),
+            ("invalid", vec!["stash", "show", "bad"]),
+            ("too-many", vec!["stash", "show", "stash@{0}", "extra"]),
+        ] {
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual, expected, &args);
+        }
+
+        let empty = root.join("empty-repo");
+        fs::create_dir_all(&empty).expect("create empty repo");
+        git(&empty, &["init", "-q"]);
+        let args = ["stash", "show"];
+        let expected = run_output("git", &empty, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &empty, &args);
+        assert_same_output(actual, expected, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
