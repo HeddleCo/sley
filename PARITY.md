@@ -894,9 +894,9 @@ Target: upstream Git 2.54.0.
   non-ignored fixtures, status rename toggles
   `--no-renames` / `--renames` / `-M[<n>]` / `--find-renames[=<n>]`,
   including rename-toggle value errors, status `--branch` upstream
-  ahead/behind headers for covered same/ahead/behind/divergent local-remote histories
-  including `--no-ahead-behind`, matching long-status tracking summaries for
-  the same histories, and simple status
+  ahead/behind headers for covered same/ahead/behind/divergent/gone
+  local-remote histories including `--no-ahead-behind`, matching long-status
+  tracking summaries for the same histories, and simple status
   display toggles for verbosity and column output including
   `--column=auto` / `--column=never` / `--column=plain`, plus status
   `--show-stash` / `--no-show-stash` long-output stash count display,

@@ -37326,14 +37326,14 @@ fn print_status_long_tracking(
     else {
         return Ok(());
     };
-    match tracking.track {
-        Some(ForEachRefTrack {
+    match tracking.state {
+        StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0,
             behind: 0,
         }) => {
             println!("Your branch is up to date with '{}'.", tracking.upstream);
         }
-        Some(ForEachRefTrack { ahead, behind: 0 }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind: 0 }) => {
             println!(
                 "Your branch is ahead of '{}' by {ahead} {}.",
                 tracking.upstream,
@@ -37341,7 +37341,7 @@ fn print_status_long_tracking(
             );
             println!("  (use \"git push\" to publish your local commits)");
         }
-        Some(ForEachRefTrack { ahead: 0, behind }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead: 0, behind }) => {
             println!(
                 "Your branch is behind '{}' by {behind} {}, and can be fast-forwarded.",
                 tracking.upstream,
@@ -37349,17 +37349,24 @@ fn print_status_long_tracking(
             );
             println!("  (use \"git pull\" to update your local branch)");
         }
-        Some(ForEachRefTrack { ahead, behind }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind }) => {
             println!("Your branch and '{}' have diverged,", tracking.upstream);
             println!("and have {ahead} and {behind} different commits each, respectively.");
             println!("  (use \"git pull\" if you want to integrate the remote branch with yours)");
         }
-        None => {
+        StatusBranchTrackingState::Different => {
             println!(
                 "Your branch and '{}' refer to different commits.",
                 tracking.upstream
             );
             println!("  (use \"git status --ahead-behind\" for details)");
+        }
+        StatusBranchTrackingState::Gone => {
+            println!(
+                "Your branch is based on '{}', but the upstream is gone.",
+                tracking.upstream
+            );
+            println!("  (use \"git branch --unset-upstream\" to fixup)");
         }
     }
     println!();
@@ -37445,11 +37452,15 @@ fn status_porcelain_v2_branch_headers(
                     status_branch_tracking(git_dir, format, &store, &target, oid, ahead_behind)?
             {
                 headers.push(format!("# branch.upstream {}", tracking.upstream));
-                headers.push(format!(
-                    "# branch.ab +{} -{}",
-                    status_branch_ab_count(tracking.track.map(|track| track.ahead)),
-                    status_branch_ab_count(tracking.track.map(|track| track.behind))
-                ));
+                match tracking.state {
+                    StatusBranchTrackingState::Counts(track) => {
+                        headers.push(format!("# branch.ab +{} -{}", track.ahead, track.behind));
+                    }
+                    StatusBranchTrackingState::Different => {
+                        headers.push("# branch.ab +? -?".into());
+                    }
+                    StatusBranchTrackingState::Gone => {}
+                }
             }
             Ok(headers)
         }
@@ -37485,13 +37496,15 @@ fn status_branch_header(
                     )? {
                         header.push_str("...");
                         header.push_str(&tracking.upstream);
-                        if let Some(track) = tracking.track {
+                        if let StatusBranchTrackingState::Counts(track) = tracking.state {
                             if track.ahead > 0 || track.behind > 0 {
                                 header.push(' ');
                                 let mut suffix = Vec::new();
                                 write_for_each_ref_track(&mut suffix, track, true)?;
                                 header.push_str(&String::from_utf8_lossy(&suffix));
                             }
+                        } else if matches!(tracking.state, StatusBranchTrackingState::Gone) {
+                            header.push_str(" [gone]");
                         } else {
                             header.push_str(" [different]");
                         }
@@ -37510,7 +37523,14 @@ fn status_branch_header(
 
 struct StatusBranchTracking {
     upstream: String,
-    track: Option<ForEachRefTrack>,
+    state: StatusBranchTrackingState,
+}
+
+#[derive(Clone, Copy)]
+enum StatusBranchTrackingState {
+    Counts(ForEachRefTrack),
+    Different,
+    Gone,
 }
 
 fn status_branch_tracking(
@@ -37527,13 +37547,18 @@ fn status_branch_tracking(
     };
     let db = FileObjectDatabase::new(repository_objects_dir(git_dir), format);
     let track = if ahead_behind {
-        for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname)?
+        match store.read_ref(&upstream.refname)? {
+            None => StatusBranchTrackingState::Gone,
+            Some(_) => for_each_ref_upstream_track(store, &db, format, oid, &upstream.refname)?
+                .map(StatusBranchTrackingState::Counts)
+                .unwrap_or(StatusBranchTrackingState::Different),
+        }
     } else {
         status_branch_tracking_without_ahead_behind(store, oid, &upstream.refname)?
     };
     Ok(Some(StatusBranchTracking {
         upstream: for_each_ref_short_name(&upstream.refname).to_string(),
-        track,
+        state: track,
     }))
 }
 
@@ -37541,24 +37566,18 @@ fn status_branch_tracking_without_ahead_behind(
     store: &FileRefStore,
     oid: &ObjectId,
     upstream: &str,
-) -> Result<Option<ForEachRefTrack>> {
+) -> Result<StatusBranchTrackingState> {
     let Some(RefTarget::Direct(upstream_oid)) = store.read_ref(upstream)? else {
-        return Ok(None);
+        return Ok(StatusBranchTrackingState::Gone);
     };
     if oid == &upstream_oid {
-        Ok(Some(ForEachRefTrack {
+        Ok(StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0,
             behind: 0,
         }))
     } else {
-        Ok(None)
+        Ok(StatusBranchTrackingState::Different)
     }
-}
-
-fn status_branch_ab_count(count: Option<usize>) -> String {
-    count
-        .map(|count| count.to_string())
-        .unwrap_or_else(|| "?".into())
 }
 
 fn cmd_tag(args: &[String]) -> Result<()> {

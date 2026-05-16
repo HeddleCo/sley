@@ -551,6 +551,24 @@ fn status_branch_ahead_behind_matches_upstream_git() {
                 "git-rs divergent tracking header differed for {args:?}"
             );
         }
+
+        git(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+
+        for args in [
+            vec!["status"],
+            vec!["status", "--no-ahead-behind"],
+            vec!["status", "--short", "--branch"],
+            vec!["status", "--short", "--branch", "--no-ahead-behind"],
+            vec!["status", "--porcelain=v2", "--branch"],
+            vec!["status", "--porcelain=v2", "--branch", "--no-ahead-behind"],
+        ] {
+            let expected = git(&work, &args);
+            let actual = git_rs(&work, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs gone tracking header differed for {args:?}"
+            );
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result
