@@ -784,6 +784,99 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
 }
 
 #[test]
+fn stash_branch_matches_upstream_git_for_clean_head() {
+    let root = unique_temp_dir("stash-branch");
+    let result = (|| {
+        for (name, setup, push_args, branch_args) in [
+            (
+                "unstaged",
+                "unstaged",
+                vec![vec!["stash", "push", "-q", "-m", "unstaged"]],
+                vec!["stash", "branch", "topic-unstaged"],
+            ),
+            (
+                "staged-and-unstaged",
+                "staged-and-unstaged",
+                vec![vec!["stash", "push", "-q", "-m", "mixed"]],
+                vec!["stash", "branch", "topic-mixed"],
+            ),
+            (
+                "untracked",
+                "tracked-and-untracked",
+                vec![vec!["stash", "push", "-q", "-u", "-m", "untracked"]],
+                vec!["stash", "branch", "topic-untracked"],
+            ),
+            (
+                "all",
+                "ignored",
+                vec![vec!["stash", "push", "-q", "-a", "-m", "all"]],
+                vec!["stash", "branch", "topic-all"],
+            ),
+            (
+                "selected",
+                "unstaged",
+                vec![
+                    vec!["stash", "push", "-q", "-m", "first"],
+                    vec!["stash", "push", "-q", "-m", "second"],
+                ],
+                vec!["stash", "branch", "topic-selected", "stash@{1}"],
+            ),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_create_repo(&template, setup);
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+            for (push_index, args) in push_args.iter().enumerate() {
+                if push_index > 0 {
+                    fs::write(upstream.join("a.txt"), format!("worktree {push_index}\n"))
+                        .expect("write upstream follow-up stash fixture");
+                    fs::write(actual.join("a.txt"), format!("worktree {push_index}\n"))
+                        .expect("write actual follow-up stash fixture");
+                }
+                run_output_with_fixed_identity("git", &upstream, args);
+                run_output_with_fixed_identity("git", &actual, args);
+            }
+
+            let expected = run_output("git", &upstream, &branch_args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &branch_args);
+            assert_eq!(
+                actual_output.status.code(),
+                expected.status.code(),
+                "status differed for stash branch case {name} {branch_args:?}\nactual stdout:\n{}\nactual stderr:\n{}\nexpected stdout:\n{}\nexpected stderr:\n{}",
+                String::from_utf8_lossy(&actual_output.stdout),
+                String::from_utf8_lossy(&actual_output.stderr),
+                String::from_utf8_lossy(&expected.stdout),
+                String::from_utf8_lossy(&expected.stderr),
+            );
+            assert_eq!(
+                actual_output.stdout, expected.stdout,
+                "stdout differed for stash branch case {name} {branch_args:?}"
+            );
+            assert_eq!(
+                actual_output.stderr, expected.stderr,
+                "stderr differed for stash branch case {name} {branch_args:?}"
+            );
+
+            let branch_name = branch_args[2];
+            for check_args in [
+                vec!["status", "--short"],
+                vec!["stash", "list", "--format=%gs"],
+                vec!["branch", "--show-current"],
+                vec!["show-ref", "--verify", &format!("refs/heads/{branch_name}")],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output("git", &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn stash_store_matches_upstream_git() {
     let root = unique_temp_dir("stash-store");
     let template = root.join("template");

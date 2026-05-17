@@ -5501,6 +5501,7 @@ enum StashListFormat {
 fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("apply") => cmd_stash_apply(&args[1..]),
+        Some("branch") => cmd_stash_branch(&args[1..]),
         Some("clear") => cmd_stash_clear(&args[1..]),
         Some("create") => cmd_stash_create(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
@@ -5511,7 +5512,7 @@ fn cmd_stash(args: &[String]) -> Result<()> {
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only apply, clear, create, drop, list, pop, push, save, show, and store; unsupported subcommand {other}"
+            "stash currently supports only apply, branch, clear, create, drop, list, pop, push, save, show, and store; unsupported subcommand {other}"
         ))),
         None => cmd_stash_push(&[]),
     }
@@ -5547,6 +5548,60 @@ fn cmd_stash_pop(args: &[String]) -> Result<()> {
         applied.selector,
         &applied.display,
         quiet,
+    )
+}
+
+fn cmd_stash_branch(args: &[String]) -> Result<()> {
+    if args.is_empty() || args.len() > 2 || args[0].starts_with('-') {
+        eprintln!("usage: git stash branch <branchname> [<stash>]");
+        return Err(GitError::Exit(129));
+    }
+    let branch = &args[0];
+    let display = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match args.get(1) {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+    let stash_object = db.read_object(&stash_oid)?;
+    let stash_commit = Commit::parse(format, &stash_object.body)?;
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    cmd_checkout(&["-b".to_string(), branch.clone(), base_oid.to_hex()])?;
+    let applied = apply_stash_entry(StashApplyOptions {
+        quiet: false,
+        reinstate_index: true,
+        selector,
+        display,
+    })?;
+    drop_stash_entry(
+        &applied.common_git_dir,
+        applied.format,
+        applied.selector,
+        &applied.display,
+        false,
     )
 }
 
