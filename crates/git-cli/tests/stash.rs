@@ -473,6 +473,139 @@ fn stash_push_matches_upstream_git() {
 }
 
 #[test]
+fn stash_save_matches_upstream_git() {
+    let root = unique_temp_dir("stash-save");
+    let result = (|| {
+        for (name, setup, args) in [
+            ("clean", "clean", vec!["stash", "save"]),
+            ("unstaged", "unstaged", vec!["stash", "save"]),
+            ("message", "unstaged", vec!["stash", "save", "saved"]),
+            (
+                "multi-message",
+                "unstaged",
+                vec!["stash", "save", "saved", "work"],
+            ),
+            (
+                "message-option",
+                "unstaged",
+                vec!["stash", "save", "-m", "saved"],
+            ),
+            (
+                "message-equals",
+                "unstaged",
+                vec!["stash", "save", "--message=saved2"],
+            ),
+            (
+                "message-short",
+                "unstaged",
+                vec!["stash", "save", "-msaved3"],
+            ),
+            (
+                "positional-overrides-message",
+                "unstaged",
+                vec!["stash", "save", "-m", "ignored", "saved"],
+            ),
+            (
+                "include-untracked",
+                "untracked",
+                vec!["stash", "save", "-u"],
+            ),
+            (
+                "include-untracked-after-message",
+                "tracked-and-untracked",
+                vec!["stash", "save", "saved", "-u"],
+            ),
+            ("all", "ignored", vec!["stash", "save", "-a"]),
+            ("all-long", "ignored", vec!["stash", "save", "--all"]),
+            (
+                "no-include-untracked",
+                "untracked",
+                vec!["stash", "save", "-u", "--no-include-untracked"],
+            ),
+            ("no-all", "ignored", vec!["stash", "save", "-a", "--no-all"]),
+            (
+                "literal-dashdash-message",
+                "unstaged",
+                vec!["stash", "save", "--", "-dash"],
+            ),
+            ("quiet", "unstaged", vec!["stash", "save", "-q", "quiet"]),
+            (
+                "no-quiet",
+                "unstaged",
+                vec!["stash", "save", "-q", "--no-quiet"],
+            ),
+            ("staged", "staged", vec!["stash", "save"]),
+            (
+                "staged-and-unstaged",
+                "staged-and-unstaged",
+                vec!["stash", "save"],
+            ),
+            ("deleted", "deleted", vec!["stash", "save"]),
+            ("detached", "detached", vec!["stash", "save"]),
+            ("unborn", "unborn", vec!["stash", "save"]),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_create_repo(&template, setup);
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output_with_fixed_identity("git", &upstream, &args);
+            let actual_output =
+                run_output_with_fixed_identity(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_eq!(
+                actual_output.status.code(),
+                expected.status.code(),
+                "status differed for stash save case {name} {args:?}\nactual stdout:\n{}\nactual stderr:\n{}\nexpected stdout:\n{}\nexpected stderr:\n{}",
+                String::from_utf8_lossy(&actual_output.stdout),
+                String::from_utf8_lossy(&actual_output.stderr),
+                String::from_utf8_lossy(&expected.stdout),
+                String::from_utf8_lossy(&expected.stderr),
+            );
+            assert_eq!(
+                actual_output.stdout, expected.stdout,
+                "stdout differed for stash save case {name} {args:?}"
+            );
+            assert_eq!(
+                actual_output.stderr, expected.stderr,
+                "stderr differed for stash save case {name} {args:?}"
+            );
+
+            for check_args in [
+                vec!["status", "--short"],
+                vec!["show-ref", "--exists", "refs/stash"],
+                vec!["stash", "list", "--format=%gs"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+            let stash_exists =
+                run_output("git", &upstream, &["show-ref", "--exists", "refs/stash"])
+                    .status
+                    .success();
+            if stash_exists {
+                for check_args in [
+                    vec!["rev-parse", "refs/stash"],
+                    vec!["cat-file", "-p", "refs/stash"],
+                    vec!["stash", "show", "--stat", "-p"],
+                    vec!["stash", "show", "--include-untracked", "--stat", "-p"],
+                    vec!["stash", "show", "--only-untracked", "--name-only"],
+                ] {
+                    let expected = run_output("git", &upstream, &check_args);
+                    let actual_output =
+                        run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                    assert_same_output(actual_output, expected, &check_args);
+                }
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn stash_store_matches_upstream_git() {
     let root = unique_temp_dir("stash-store");
     let template = root.join("template");

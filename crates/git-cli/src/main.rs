@@ -5505,10 +5505,11 @@ fn cmd_stash(args: &[String]) -> Result<()> {
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some("push") => cmd_stash_push(&args[1..]),
+        Some("save") => cmd_stash_save(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, create, drop, list, push, show, and store; unsupported subcommand {other}"
+            "stash currently supports only clear, create, drop, list, push, save, show, and store; unsupported subcommand {other}"
         ))),
         None => cmd_stash_push(&[]),
     }
@@ -5713,6 +5714,82 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         return Ok(());
     };
 
+    store_created_stash(created, quiet)
+}
+
+fn cmd_stash_save(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut include_untracked = false;
+    let mut include_ignored = false;
+    let mut explicit_message = Vec::new();
+    let mut positional_message = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "-u" | "--include-untracked" => include_untracked = true,
+            "--no-include-untracked" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-a" | "--all" => {
+                include_untracked = true;
+                include_ignored = true;
+            }
+            "--no-all" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                explicit_message = vec![value.clone()];
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                explicit_message = vec![value.to_string()];
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                explicit_message = vec![value[2..].to_string()];
+            }
+            "--" => {
+                positional_message.extend(args[index..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash save option {value}"
+                )));
+            }
+            value => positional_message.push(value.to_string()),
+        }
+        index += 1;
+    }
+    let message_args = if positional_message.is_empty() {
+        explicit_message
+    } else {
+        positional_message
+    };
+    let Some(created) = create_stash_commit(&message_args, include_untracked, include_ignored)?
+    else {
+        if !quiet {
+            println!("No local changes to save");
+        }
+        return Ok(());
+    };
+    store_created_stash(created, quiet)
+}
+
+fn store_created_stash(created: CreatedStash, quiet: bool) -> Result<()> {
     let store = FileRefStore::new(&created.common_git_dir, created.format);
     let old_oid = match store.read_ref("refs/stash")? {
         Some(RefTarget::Direct(oid)) => oid,
@@ -5725,8 +5802,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         new: RefTarget::Direct(created.oid.clone()),
         reflog: Some(ReflogEntry {
             old_oid,
-            new_oid: created.oid,
-            committer: created.committer,
+            new_oid: created.oid.clone(),
+            committer: created.committer.clone(),
             message: created.message.as_bytes().to_vec(),
         }),
     });
