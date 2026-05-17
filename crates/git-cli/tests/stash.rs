@@ -421,6 +421,27 @@ fn stash_push_matches_upstream_git() {
                 "staged",
                 vec!["stash", "push", "--keep-index", "--no-keep-index"],
             ),
+            ("staged-option", "staged", vec!["stash", "push", "--staged"]),
+            (
+                "no-staged-option",
+                "staged",
+                vec!["stash", "push", "--staged", "--no-staged"],
+            ),
+            (
+                "staged-option-no-staged-changes",
+                "unstaged",
+                vec!["stash", "push", "--staged"],
+            ),
+            (
+                "staged-option-untracked-only",
+                "untracked",
+                vec!["stash", "push", "--staged"],
+            ),
+            (
+                "staged-option-rejects-untracked",
+                "staged",
+                vec!["stash", "push", "--staged", "-u"],
+            ),
             ("staged", "staged", vec!["stash", "push"]),
             (
                 "staged-and-unstaged",
@@ -568,6 +589,22 @@ fn stash_save_matches_upstream_git() {
                 "no-keep-index",
                 "staged",
                 vec!["stash", "save", "--keep-index", "--no-keep-index"],
+            ),
+            ("staged-option", "staged", vec!["stash", "save", "--staged"]),
+            (
+                "no-staged-option",
+                "staged",
+                vec!["stash", "save", "--staged", "--no-staged"],
+            ),
+            (
+                "staged-option-no-staged-changes",
+                "unstaged",
+                vec!["stash", "save", "--staged"],
+            ),
+            (
+                "staged-option-rejects-untracked",
+                "staged",
+                vec!["stash", "save", "--staged", "-u"],
             ),
             ("staged", "staged", vec!["stash", "save"]),
             (

@@ -5929,10 +5929,16 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) = create_stash_commit(args, false, false)? {
+    if let Some(created) = create_stash_commit(args, false, false, StashCreateMode::Worktree)? {
         println!("{}", created.oid);
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StashCreateMode {
+    Worktree,
+    Staged,
 }
 
 fn cmd_stash_push(args: &[String]) -> Result<()> {
@@ -5940,6 +5946,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut include_untracked = false;
     let mut include_ignored = false;
     let mut keep_index = false;
+    let mut create_mode = StashCreateMode::Worktree;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut index = 0;
@@ -5963,6 +5970,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             }
             "--keep-index" => keep_index = true,
             "--no-keep-index" => keep_index = false,
+            "--staged" => create_mode = StashCreateMode::Staged,
+            "--no-staged" => create_mode = StashCreateMode::Worktree,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6000,7 +6009,16 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             "stash push pathspecs are not implemented".into(),
         ));
     }
-    let Some(created) = create_stash_commit(&message_args, include_untracked, include_ignored)?
+    if create_mode == StashCreateMode::Staged && include_untracked {
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Err(GitError::Exit(1));
+    }
+    let Some(created) = create_stash_commit(
+        &message_args,
+        include_untracked,
+        include_ignored,
+        create_mode,
+    )?
     else {
         if !quiet {
             println!("No local changes to save");
@@ -6016,6 +6034,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     let mut include_untracked = false;
     let mut include_ignored = false;
     let mut keep_index = false;
+    let mut create_mode = StashCreateMode::Worktree;
     let mut explicit_message = Vec::new();
     let mut positional_message = Vec::new();
     let mut index = 0;
@@ -6039,6 +6058,8 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             }
             "--keep-index" => keep_index = true,
             "--no-keep-index" => keep_index = false,
+            "--staged" => create_mode = StashCreateMode::Staged,
+            "--no-staged" => create_mode = StashCreateMode::Worktree,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6076,7 +6097,16 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     } else {
         positional_message
     };
-    let Some(created) = create_stash_commit(&message_args, include_untracked, include_ignored)?
+    if create_mode == StashCreateMode::Staged && include_untracked {
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Err(GitError::Exit(1));
+    }
+    let Some(created) = create_stash_commit(
+        &message_args,
+        include_untracked,
+        include_ignored,
+        create_mode,
+    )?
     else {
         if !quiet {
             println!("No local changes to save");
@@ -6146,6 +6176,7 @@ fn create_stash_commit(
     args: &[String],
     include_untracked: bool,
     include_ignored: bool,
+    mode: StashCreateMode,
 ) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -6203,6 +6234,20 @@ fn create_stash_commit(
     {
         return Ok(None);
     }
+    if mode == StashCreateMode::Staged {
+        if index_tree == head_commit.tree {
+            if worktree_tree != head_commit.tree {
+                eprintln!("No staged changes");
+                return Err(GitError::Exit(1));
+            }
+            return Ok(None);
+        }
+        if worktree_tree != index_tree {
+            return Err(GitError::Unsupported(
+                "stash push --staged currently requires no unstaged tracked changes".into(),
+            ));
+        }
+    }
 
     let branch = store
         .current_branch()?
@@ -6214,7 +6259,7 @@ fn create_stash_commit(
     let index_commit = git_sequencer::create_commit(
         &mut db,
         git_sequencer::CommitCreate {
-            tree: index_tree,
+            tree: index_tree.clone(),
             parents: vec![head_oid.clone()],
             author: author.clone(),
             committer: committer.clone(),
@@ -6248,7 +6293,11 @@ fn create_stash_commit(
     let stash_oid = git_sequencer::create_commit(
         &mut db,
         git_sequencer::CommitCreate {
-            tree: worktree_tree,
+            tree: if mode == StashCreateMode::Staged {
+                index_tree
+            } else {
+                worktree_tree
+            },
             parents,
             author,
             committer: committer.clone(),
