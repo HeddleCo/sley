@@ -1,8 +1,8 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
 use git_formats::{
     Bundle, BundlePrerequisite, BundleReference, Commit, CommitGraph, CommitGraphWriteEntry,
-    ConfigEntry, ConfigSection, EncodedObject, GitConfig, Index, ObjectType, RepositoryLayout, Tag,
-    Tree, TreeEntry, tree_entry_object_type,
+    ConfigEntry, ConfigSection, EncodedObject, GitConfig, Index, IndexEntry, ObjectType,
+    RepositoryLayout, Tag, Tree, TreeEntry, tree_entry_object_type,
 };
 use git_odb::{
     FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter, repository_objects_dir,
@@ -5501,15 +5501,16 @@ enum StashListFormat {
 fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
         Some("clear") => cmd_stash_clear(&args[1..]),
+        Some("create") => cmd_stash_create(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, drop, list, show, and store; unsupported subcommand {other}"
+            "stash currently supports only clear, create, drop, list, show, and store; unsupported subcommand {other}"
         ))),
         None => Err(GitError::Unsupported(
-            "stash currently supports only clear, drop, list, show, and store".into(),
+            "stash currently supports only clear, create, drop, list, show, and store".into(),
         )),
     }
 }
@@ -5634,6 +5635,238 @@ fn stash_drop_usage() {
     eprintln!();
     eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
     eprintln!();
+}
+
+fn cmd_stash_create(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let store = FileRefStore::new(&git_dir, format);
+    let Some((head_oid, head_commit)) = stash_head_commit(&store, &db, format)? else {
+        eprintln!("You do not have the initial commit yet");
+        return Err(GitError::Exit(1));
+    };
+    let index = read_repository_index(&git_dir)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+    let index_entries = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
+    let worktree_entries = stash_worktree_entries(&worktree_root, &mut db, &index_entries)?;
+    let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
+    if index_tree == head_commit.tree && worktree_tree == head_commit.tree {
+        return Ok(());
+    }
+
+    let branch = store
+        .current_branch()?
+        .unwrap_or_else(|| "(no branch)".to_string());
+    let head_name = format_log_oid(&head_oid, Some(7));
+    let head_subject = commit_subject(&head_commit.message);
+    let author = commit_identity_from_env("AUTHOR")?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let index_commit = git_sequencer::create_commit(
+        &mut db,
+        git_sequencer::CommitCreate {
+            tree: index_tree,
+            parents: vec![head_oid.clone()],
+            author: author.clone(),
+            committer: committer.clone(),
+            message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
+        },
+    )?;
+    let message = if args.is_empty() {
+        format!("WIP on {branch}: {head_name} {head_subject}")
+    } else {
+        format!("On {branch}: {}", args.join(" "))
+    };
+    let stash_oid = git_sequencer::create_commit(
+        &mut db,
+        git_sequencer::CommitCreate {
+            tree: worktree_tree,
+            parents: vec![head_oid, index_commit],
+            author,
+            committer,
+            message: message.into_bytes(),
+        },
+    )?;
+    println!("{stash_oid}");
+    Ok(())
+}
+
+fn stash_head_commit(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Option<(ObjectId, Commit)>> {
+    let target = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
+        direct => direct,
+    };
+    let Some(RefTarget::Direct(oid)) = target else {
+        return Ok(None);
+    };
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            oid,
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Some((oid, Commit::parse(format, &object.body)?)))
+}
+
+#[derive(Default)]
+struct StashTreeNode {
+    files: Vec<TreeEntry>,
+    directories: BTreeMap<Vec<u8>, StashTreeNode>,
+}
+
+impl StashTreeNode {
+    fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
+        let components = entry.path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        if components.iter().any(|component| component.is_empty()) {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(&entry.path)
+            )));
+        }
+        self.insert_components(&components, entry)
+    }
+
+    fn insert_components(&mut self, components: &[&[u8]], entry: &IndexEntry) -> Result<()> {
+        match components {
+            [] => Err(GitError::InvalidPath("empty index path".into())),
+            [name] => {
+                self.files.push(TreeEntry {
+                    mode: entry.mode,
+                    name: name.to_vec(),
+                    oid: entry.oid.clone(),
+                });
+                Ok(())
+            }
+            [directory, rest @ ..] => self
+                .directories
+                .entry(directory.to_vec())
+                .or_default()
+                .insert_components(rest, entry),
+        }
+    }
+}
+
+fn stash_write_tree_from_entries(
+    db: &mut FileObjectDatabase,
+    entries: &[IndexEntry],
+) -> Result<ObjectId> {
+    let mut root = StashTreeNode::default();
+    for entry in entries {
+        root.insert(entry)?;
+    }
+    stash_write_tree_node(db, &root)
+}
+
+fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> Result<ObjectId> {
+    let mut entries = Vec::with_capacity(node.files.len() + node.directories.len());
+    entries.extend(node.files.iter().cloned());
+    for (name, child) in &node.directories {
+        entries.push(TreeEntry {
+            mode: 0o040000,
+            name: name.clone(),
+            oid: stash_write_tree_node(db, child)?,
+        });
+    }
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree { entries }.write(),
+    ))
+}
+
+fn stash_worktree_entries(
+    worktree_root: &Path,
+    db: &mut FileObjectDatabase,
+    index_entries: &[IndexEntry],
+) -> Result<Vec<IndexEntry>> {
+    let mut entries = Vec::new();
+    for entry in index_entries {
+        let path = stash_repo_path_to_os_path(&entry.path)?;
+        let absolute = worktree_root.join(path);
+        let Ok(metadata) = fs::metadata(&absolute) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            entries.push(entry.clone());
+            continue;
+        }
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
+        entries.push(stash_index_entry_from_metadata(
+            entry.path.clone(),
+            oid,
+            &metadata,
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
+    let path = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidPath("index path is not utf8".into()))?;
+    Ok(path.split('/').collect())
+}
+
+fn stash_index_entry_from_metadata(
+    path: Vec<u8>,
+    oid: ObjectId,
+    metadata: &fs::Metadata,
+) -> IndexEntry {
+    let modified = metadata.modified().ok();
+    let duration = modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    let flags = path.len().min(0x0fff) as u16;
+    IndexEntry {
+        ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        ctime_nanoseconds: duration.subsec_nanos(),
+        mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        mtime_nanoseconds: duration.subsec_nanos(),
+        dev: 0,
+        ino: 0,
+        mode: stash_file_mode(metadata),
+        uid: 0,
+        gid: 0,
+        size: metadata.len().min(u32::MAX as u64) as u32,
+        oid,
+        flags,
+        flags_extended: 0,
+        path,
+    }
+}
+
+#[cfg(unix)]
+fn stash_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn stash_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o100644
 }
 
 fn cmd_stash_store(args: &[String]) -> Result<()> {

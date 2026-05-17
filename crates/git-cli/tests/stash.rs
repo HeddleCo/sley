@@ -31,6 +31,20 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
+fn run_output_with_fixed_identity(program: &str, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Example User")
+        .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+        .env("GIT_AUTHOR_DATE", "@0 +0000")
+        .env("GIT_COMMITTER_NAME", "Example User")
+        .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+        .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     assert_eq!(
         actual.status.code(),
@@ -193,6 +207,139 @@ fn stash_list_matches_upstream_git() {
     })();
     let _ = fs::remove_dir_all(&root);
     result
+}
+
+#[test]
+fn stash_create_matches_upstream_git() {
+    let root = unique_temp_dir("stash-create");
+    let result = (|| {
+        let clean_upstream = root.join("clean-upstream");
+        let clean_actual = root.join("clean-actual");
+        prepare_stash_create_repo(&clean_upstream, "clean");
+        prepare_stash_create_repo(&clean_actual, "clean");
+        let clean_args = ["stash", "create"];
+        let expected = run_output_with_fixed_identity("git", &clean_upstream, &clean_args);
+        let actual_output = run_output_with_fixed_identity(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &clean_actual,
+            &clean_args,
+        );
+        assert_same_output(actual_output, expected, &clean_args);
+
+        for (name, setup, args) in [
+            ("unstaged", "unstaged", vec!["stash", "create"]),
+            ("message", "unstaged", vec!["stash", "create", "saved work"]),
+            (
+                "multi-message",
+                "unstaged",
+                vec!["stash", "create", "one", "two"],
+            ),
+            ("staged", "staged", vec!["stash", "create"]),
+            (
+                "staged-and-unstaged",
+                "staged-and-unstaged",
+                vec!["stash", "create"],
+            ),
+            ("deleted", "deleted", vec!["stash", "create"]),
+            ("detached", "detached", vec!["stash", "create"]),
+            ("unborn", "unborn", vec!["stash", "create"]),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_create_repo(&template, setup);
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output_with_fixed_identity("git", &upstream, &args);
+            let actual_output =
+                run_output_with_fixed_identity(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_eq!(
+                actual_output.status.code(),
+                expected.status.code(),
+                "status differed for stash create case {name} {args:?}\nactual stdout:\n{}\nactual stderr:\n{}\nexpected stdout:\n{}\nexpected stderr:\n{}",
+                String::from_utf8_lossy(&actual_output.stdout),
+                String::from_utf8_lossy(&actual_output.stderr),
+                String::from_utf8_lossy(&expected.stdout),
+                String::from_utf8_lossy(&expected.stderr),
+            );
+            assert_eq!(
+                actual_output.stdout, expected.stdout,
+                "stdout differed for stash create case {name} {args:?}"
+            );
+            assert_eq!(
+                actual_output.stderr, expected.stderr,
+                "stderr differed for stash create case {name} {args:?}"
+            );
+
+            for check_args in [
+                vec!["status", "--short"],
+                vec!["show-ref", "--exists", "refs/stash"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+
+            let oid =
+                String::from_utf8(run_output_with_fixed_identity("git", &upstream, &args).stdout)
+                    .expect("stash create oid is utf8")
+                    .trim()
+                    .to_string();
+            if oid.is_empty() {
+                continue;
+            }
+            for check_args in [
+                vec!["cat-file", "-p", oid.as_str()],
+                vec!["stash", "store", "-m", "created", oid.as_str()],
+                vec!["stash", "show", "--stat", "-p"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+fn prepare_stash_create_repo(root: &Path, setup: &str) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    if setup == "unborn" {
+        fs::write(root.join("a.txt"), b"unborn\n").expect("write unborn fixture");
+        git(root, &["add", "a.txt"]);
+        return;
+    }
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    match setup {
+        "clean" => {}
+        "unstaged" => {
+            fs::write(root.join("a.txt"), b"worktree\n").expect("write unstaged fixture");
+        }
+        "staged" => {
+            fs::write(root.join("a.txt"), b"staged\n").expect("write staged fixture");
+            git(root, &["add", "a.txt"]);
+        }
+        "staged-and-unstaged" => {
+            fs::write(root.join("a.txt"), b"staged\n").expect("write staged fixture");
+            git(root, &["add", "a.txt"]);
+            fs::write(root.join("a.txt"), b"worktree\n").expect("write worktree fixture");
+        }
+        "deleted" => {
+            fs::remove_file(root.join("a.txt")).expect("remove tracked fixture");
+        }
+        "detached" => {
+            git(root, &["checkout", "-q", "--detach", "HEAD"]);
+            fs::write(root.join("a.txt"), b"detached\n").expect("write detached fixture");
+        }
+        other => panic!("unknown stash create setup {other}"),
+    }
 }
 
 #[test]
