@@ -37,10 +37,10 @@ fn run_output_with_fixed_identity(program: &str, cwd: &Path, args: &[&str]) -> O
         .args(args)
         .env("GIT_AUTHOR_NAME", "Example User")
         .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
-        .env("GIT_AUTHOR_DATE", "@0 +0000")
+        .env("GIT_AUTHOR_DATE", "@1 +0000")
         .env("GIT_COMMITTER_NAME", "Example User")
         .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
-        .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .env("GIT_COMMITTER_DATE", "@1 +0000")
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -340,6 +340,104 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
         }
         other => panic!("unknown stash create setup {other}"),
     }
+}
+
+#[test]
+fn stash_push_matches_upstream_git() {
+    let root = unique_temp_dir("stash-push");
+    let result = (|| {
+        for (name, setup, args) in [
+            ("default-subcommand", "unstaged", vec!["stash"]),
+            ("clean", "clean", vec!["stash", "push"]),
+            ("unstaged", "unstaged", vec!["stash", "push"]),
+            ("message", "unstaged", vec!["stash", "push", "-m", "saved"]),
+            (
+                "message-equals",
+                "unstaged",
+                vec!["stash", "push", "--message=saved2"],
+            ),
+            (
+                "message-short",
+                "unstaged",
+                vec!["stash", "push", "-msaved3"],
+            ),
+            (
+                "quiet",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+            ),
+            (
+                "no-quiet",
+                "unstaged",
+                vec!["stash", "push", "-q", "--no-quiet"],
+            ),
+            ("staged", "staged", vec!["stash", "push"]),
+            (
+                "staged-and-unstaged",
+                "staged-and-unstaged",
+                vec!["stash", "push"],
+            ),
+            ("deleted", "deleted", vec!["stash", "push"]),
+            ("detached", "detached", vec!["stash", "push"]),
+            ("unborn", "unborn", vec!["stash", "push"]),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_create_repo(&template, setup);
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output_with_fixed_identity("git", &upstream, &args);
+            let actual_output =
+                run_output_with_fixed_identity(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_eq!(
+                actual_output.status.code(),
+                expected.status.code(),
+                "status differed for stash push case {name} {args:?}\nactual stdout:\n{}\nactual stderr:\n{}\nexpected stdout:\n{}\nexpected stderr:\n{}",
+                String::from_utf8_lossy(&actual_output.stdout),
+                String::from_utf8_lossy(&actual_output.stderr),
+                String::from_utf8_lossy(&expected.stdout),
+                String::from_utf8_lossy(&expected.stderr),
+            );
+            assert_eq!(
+                actual_output.stdout, expected.stdout,
+                "stdout differed for stash push case {name} {args:?}"
+            );
+            assert_eq!(
+                actual_output.stderr, expected.stderr,
+                "stderr differed for stash push case {name} {args:?}"
+            );
+
+            for check_args in [
+                vec!["status", "--short"],
+                vec!["show-ref", "--exists", "refs/stash"],
+                vec!["stash", "list", "--format=%gs"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+            let stash_exists =
+                run_output("git", &upstream, &["show-ref", "--exists", "refs/stash"])
+                    .status
+                    .success();
+            if stash_exists {
+                for check_args in [
+                    vec!["rev-parse", "refs/stash"],
+                    vec!["cat-file", "-p", "refs/stash"],
+                    vec!["stash", "show", "--stat", "-p"],
+                ] {
+                    let expected = run_output("git", &upstream, &check_args);
+                    let actual_output =
+                        run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                    assert_same_output(actual_output, expected, &check_args);
+                }
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
 }
 
 #[test]

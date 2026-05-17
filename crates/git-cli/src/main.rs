@@ -5504,14 +5504,13 @@ fn cmd_stash(args: &[String]) -> Result<()> {
         Some("create") => cmd_stash_create(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
+        Some("push") => cmd_stash_push(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, create, drop, list, show, and store; unsupported subcommand {other}"
+            "stash currently supports only clear, create, drop, list, push, show, and store; unsupported subcommand {other}"
         ))),
-        None => Err(GitError::Unsupported(
-            "stash currently supports only clear, create, drop, list, show, and store".into(),
-        )),
+        None => cmd_stash_push(&[]),
     }
 }
 
@@ -5638,6 +5637,112 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
+    if let Some(created) = create_stash_commit(args)? {
+        println!("{}", created.oid);
+    }
+    Ok(())
+}
+
+fn cmd_stash_push(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut message_args = Vec::new();
+    let mut pathspecs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                message_args = vec![value.clone()];
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                message_args = vec![value.to_string()];
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                message_args = vec![value[2..].to_string()];
+            }
+            "--" => {
+                pathspecs.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash push option {value}"
+                )));
+            }
+            value => pathspecs.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if !pathspecs.is_empty() {
+        return Err(GitError::Unsupported(
+            "stash push pathspecs are not implemented".into(),
+        ));
+    }
+    let Some(created) = create_stash_commit(&message_args)? else {
+        if !quiet {
+            println!("No local changes to save");
+        }
+        return Ok(());
+    };
+
+    let store = FileRefStore::new(&created.common_git_dir, created.format);
+    let old_oid = match store.read_ref("refs/stash")? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) | None => zero_oid(created.format)?,
+    };
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "refs/stash".to_string(),
+        expected: None,
+        new: RefTarget::Direct(created.oid.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: created.oid,
+            committer: created.committer,
+            message: created.message.as_bytes().to_vec(),
+        }),
+    });
+    tx.commit()?;
+
+    git_worktree::reset_index_and_worktree_to_commit(
+        &created.worktree_root,
+        &created.git_dir,
+        created.format,
+        &created.head_oid,
+    )?;
+    if !quiet {
+        println!(
+            "Saved working directory and index state {}",
+            created.message
+        );
+    }
+    Ok(())
+}
+
+struct CreatedStash {
+    oid: ObjectId,
+    message: String,
+    committer: Vec<u8>,
+    head_oid: ObjectId,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    worktree_root: PathBuf,
+    format: ObjectFormat,
+}
+
+fn create_stash_commit(args: &[String]) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -5665,7 +5770,7 @@ fn cmd_stash_create(args: &[String]) -> Result<()> {
     let worktree_entries = stash_worktree_entries(&worktree_root, &mut db, &index_entries)?;
     let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
     if index_tree == head_commit.tree && worktree_tree == head_commit.tree {
-        return Ok(());
+        return Ok(None);
     }
 
     let branch = store
@@ -5694,14 +5799,22 @@ fn cmd_stash_create(args: &[String]) -> Result<()> {
         &mut db,
         git_sequencer::CommitCreate {
             tree: worktree_tree,
-            parents: vec![head_oid, index_commit],
+            parents: vec![head_oid.clone(), index_commit],
             author,
-            committer,
-            message: message.into_bytes(),
+            committer: committer.clone(),
+            message: message.as_bytes().to_vec(),
         },
     )?;
-    println!("{stash_oid}");
-    Ok(())
+    Ok(Some(CreatedStash {
+        oid: stash_oid,
+        message,
+        committer,
+        head_oid,
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        format,
+    }))
 }
 
 fn stash_head_commit(
