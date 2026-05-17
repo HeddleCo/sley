@@ -5637,7 +5637,7 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) = create_stash_commit(args)? {
+    if let Some(created) = create_stash_commit(args, false)? {
         println!("{}", created.oid);
     }
     Ok(())
@@ -5645,6 +5645,7 @@ fn cmd_stash_create(args: &[String]) -> Result<()> {
 
 fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut quiet = false;
+    let mut include_untracked = false;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut index = 0;
@@ -5653,6 +5654,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-u" | "--include-untracked" => include_untracked = true,
+            "--no-include-untracked" => include_untracked = false,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -5690,7 +5693,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             "stash push pathspecs are not implemented".into(),
         ));
     }
-    let Some(created) = create_stash_commit(&message_args)? else {
+    let Some(created) = create_stash_commit(&message_args, include_untracked)? else {
         if !quiet {
             println!("No local changes to save");
         }
@@ -5722,6 +5725,9 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         created.format,
         &created.head_oid,
     )?;
+    for path in &created.untracked_paths {
+        remove_stashed_untracked_path(&created.worktree_root, path)?;
+    }
     if !quiet {
         println!(
             "Saved working directory and index state {}",
@@ -5739,10 +5745,11 @@ struct CreatedStash {
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
+    untracked_paths: Vec<Vec<u8>>,
     format: ObjectFormat,
 }
 
-fn create_stash_commit(args: &[String]) -> Result<Option<CreatedStash>> {
+fn create_stash_commit(args: &[String], include_untracked: bool) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -5769,7 +5776,34 @@ fn create_stash_commit(args: &[String]) -> Result<Option<CreatedStash>> {
     let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
     let worktree_entries = stash_worktree_entries(&worktree_root, &mut db, &index_entries)?;
     let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
-    if index_tree == head_commit.tree && worktree_tree == head_commit.tree {
+    let untracked_paths = if include_untracked {
+        git_worktree::untracked_paths_with_options(
+            &worktree_root,
+            &git_dir,
+            format,
+            git_worktree::UntrackedPathOptions {
+                directory: false,
+                no_empty_directory: false,
+                preserve_ignored_directories: false,
+                exclude_standard: true,
+                ignored_only: false,
+                exclude_patterns: Vec::new(),
+                exclude_per_directory: Vec::new(),
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+    let untracked_entries = stash_untracked_entries(&worktree_root, &mut db, &untracked_paths)?;
+    let untracked_tree = if untracked_entries.is_empty() {
+        None
+    } else {
+        Some(stash_write_tree_from_entries(&mut db, &untracked_entries)?)
+    };
+    if index_tree == head_commit.tree
+        && worktree_tree == head_commit.tree
+        && untracked_tree.is_none()
+    {
         return Ok(None);
     }
 
@@ -5790,16 +5824,35 @@ fn create_stash_commit(args: &[String]) -> Result<Option<CreatedStash>> {
             message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
         },
     )?;
+    let untracked_commit = if let Some(tree) = untracked_tree {
+        Some(git_sequencer::create_commit(
+            &mut db,
+            git_sequencer::CommitCreate {
+                tree,
+                parents: Vec::new(),
+                author: author.clone(),
+                committer: committer.clone(),
+                message: format!("untracked files on {branch}: {head_name} {head_subject}\n")
+                    .into_bytes(),
+            },
+        )?)
+    } else {
+        None
+    };
     let message = if args.is_empty() {
         format!("WIP on {branch}: {head_name} {head_subject}")
     } else {
         format!("On {branch}: {}", args.join(" "))
     };
+    let mut parents = vec![head_oid.clone(), index_commit];
+    if let Some(untracked_commit) = untracked_commit {
+        parents.push(untracked_commit);
+    }
     let stash_oid = git_sequencer::create_commit(
         &mut db,
         git_sequencer::CommitCreate {
             tree: worktree_tree,
-            parents: vec![head_oid.clone(), index_commit],
+            parents,
             author,
             committer: committer.clone(),
             message: message.as_bytes().to_vec(),
@@ -5813,6 +5866,7 @@ fn create_stash_commit(args: &[String]) -> Result<Option<CreatedStash>> {
         git_dir,
         common_git_dir,
         worktree_root,
+        untracked_paths,
         format,
     }))
 }
@@ -5930,6 +5984,57 @@ fn stash_worktree_entries(
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(entries)
+}
+
+fn stash_untracked_entries(
+    worktree_root: &Path,
+    db: &mut FileObjectDatabase,
+    paths: &[Vec<u8>],
+) -> Result<Vec<IndexEntry>> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = worktree_root.join(stash_repo_path_to_os_path(path)?);
+        let metadata = fs::metadata(&absolute)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
+        entries.push(stash_index_entry_from_metadata(
+            path.clone(),
+            oid,
+            &metadata,
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
+    let path = worktree_root.join(stash_repo_path_to_os_path(path)?);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if directory == worktree_root || directory.join(".git").exists() {
+            break;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => parent = directory.parent(),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
 }
 
 fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {

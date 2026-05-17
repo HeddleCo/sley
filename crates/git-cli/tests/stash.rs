@@ -322,6 +322,13 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
         "unstaged" => {
             fs::write(root.join("a.txt"), b"worktree\n").expect("write unstaged fixture");
         }
+        "untracked" => {
+            fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+        }
+        "tracked-and-untracked" => {
+            fs::write(root.join("a.txt"), b"worktree\n").expect("write unstaged fixture");
+            fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+        }
         "staged" => {
             fs::write(root.join("a.txt"), b"staged\n").expect("write staged fixture");
             git(root, &["add", "a.txt"]);
@@ -351,6 +358,21 @@ fn stash_push_matches_upstream_git() {
             ("clean", "clean", vec!["stash", "push"]),
             ("unstaged", "unstaged", vec!["stash", "push"]),
             ("message", "unstaged", vec!["stash", "push", "-m", "saved"]),
+            (
+                "include-untracked",
+                "untracked",
+                vec!["stash", "push", "-u"],
+            ),
+            (
+                "include-untracked-long",
+                "tracked-and-untracked",
+                vec!["stash", "push", "--include-untracked"],
+            ),
+            (
+                "no-include-untracked",
+                "untracked",
+                vec!["stash", "push", "-u", "--no-include-untracked"],
+            ),
             (
                 "message-equals",
                 "unstaged",
@@ -427,6 +449,8 @@ fn stash_push_matches_upstream_git() {
                     vec!["rev-parse", "refs/stash"],
                     vec!["cat-file", "-p", "refs/stash"],
                     vec!["stash", "show", "--stat", "-p"],
+                    vec!["stash", "show", "--include-untracked", "--stat", "-p"],
+                    vec!["stash", "show", "--only-untracked", "--name-only"],
                 ] {
                     let expected = run_output("git", &upstream, &check_args);
                     let actual_output =
