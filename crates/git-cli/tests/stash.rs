@@ -401,6 +401,26 @@ fn stash_push_matches_upstream_git() {
                 "unstaged",
                 vec!["stash", "push", "-q", "--no-quiet"],
             ),
+            (
+                "keep-index-staged",
+                "staged",
+                vec!["stash", "push", "--keep-index"],
+            ),
+            (
+                "keep-index-mixed",
+                "staged-and-unstaged",
+                vec!["stash", "push", "--keep-index"],
+            ),
+            (
+                "keep-index-untracked",
+                "tracked-and-untracked",
+                vec!["stash", "push", "--keep-index", "-u"],
+            ),
+            (
+                "no-keep-index",
+                "staged",
+                vec!["stash", "push", "--keep-index", "--no-keep-index"],
+            ),
             ("staged", "staged", vec!["stash", "push"]),
             (
                 "staged-and-unstaged",
@@ -533,6 +553,21 @@ fn stash_save_matches_upstream_git() {
                 "no-quiet",
                 "unstaged",
                 vec!["stash", "save", "-q", "--no-quiet"],
+            ),
+            (
+                "keep-index-staged",
+                "staged",
+                vec!["stash", "save", "--keep-index"],
+            ),
+            (
+                "keep-index-mixed",
+                "staged-and-unstaged",
+                vec!["stash", "save", "--keep-index"],
+            ),
+            (
+                "no-keep-index",
+                "staged",
+                vec!["stash", "save", "--keep-index", "--no-keep-index"],
             ),
             ("staged", "staged", vec!["stash", "save"]),
             (

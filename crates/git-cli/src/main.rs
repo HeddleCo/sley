@@ -5939,6 +5939,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
     let mut include_ignored = false;
+    let mut keep_index = false;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut index = 0;
@@ -5960,6 +5961,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 include_untracked = false;
                 include_ignored = false;
             }
+            "--keep-index" => keep_index = true,
+            "--no-keep-index" => keep_index = false,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6005,13 +6008,14 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         return Ok(());
     };
 
-    store_created_stash(created, quiet)
+    store_created_stash(created, quiet, keep_index)
 }
 
 fn cmd_stash_save(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
     let mut include_ignored = false;
+    let mut keep_index = false;
     let mut explicit_message = Vec::new();
     let mut positional_message = Vec::new();
     let mut index = 0;
@@ -6033,6 +6037,8 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 include_untracked = false;
                 include_ignored = false;
             }
+            "--keep-index" => keep_index = true,
+            "--no-keep-index" => keep_index = false,
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6077,10 +6083,10 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         }
         return Ok(());
     };
-    store_created_stash(created, quiet)
+    store_created_stash(created, quiet, keep_index)
 }
 
-fn store_created_stash(created: CreatedStash, quiet: bool) -> Result<()> {
+fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
     let store = FileRefStore::new(&created.common_git_dir, created.format);
     let old_oid = match store.read_ref("refs/stash")? {
         Some(RefTarget::Direct(oid)) => oid,
@@ -6100,11 +6106,16 @@ fn store_created_stash(created: CreatedStash, quiet: bool) -> Result<()> {
     });
     tx.commit()?;
 
+    let reset_oid = if keep_index {
+        &created.index_oid
+    } else {
+        &created.head_oid
+    };
     git_worktree::reset_index_and_worktree_to_commit(
         &created.worktree_root,
         &created.git_dir,
         created.format,
-        &created.head_oid,
+        reset_oid,
     )?;
     for path in &created.untracked_paths {
         remove_stashed_untracked_path(&created.worktree_root, path)?;
@@ -6123,6 +6134,7 @@ struct CreatedStash {
     message: String,
     committer: Vec<u8>,
     head_oid: ObjectId,
+    index_oid: ObjectId,
     git_dir: PathBuf,
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
@@ -6229,7 +6241,7 @@ fn create_stash_commit(
     } else {
         format!("On {branch}: {}", args.join(" "))
     };
-    let mut parents = vec![head_oid.clone(), index_commit];
+    let mut parents = vec![head_oid.clone(), index_commit.clone()];
     if let Some(untracked_commit) = untracked_commit {
         parents.push(untracked_commit);
     }
@@ -6248,6 +6260,7 @@ fn create_stash_commit(
         message,
         committer,
         head_oid,
+        index_oid: index_commit,
         git_dir,
         common_git_dir,
         worktree_root,
