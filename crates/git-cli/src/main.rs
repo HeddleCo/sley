@@ -5637,7 +5637,7 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) = create_stash_commit(args, false)? {
+    if let Some(created) = create_stash_commit(args, false, false)? {
         println!("{}", created.oid);
     }
     Ok(())
@@ -5646,6 +5646,7 @@ fn cmd_stash_create(args: &[String]) -> Result<()> {
 fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
+    let mut include_ignored = false;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut index = 0;
@@ -5655,7 +5656,18 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "-u" | "--include-untracked" => include_untracked = true,
-            "--no-include-untracked" => include_untracked = false,
+            "--no-include-untracked" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-a" | "--all" => {
+                include_untracked = true;
+                include_ignored = true;
+            }
+            "--no-all" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -5693,7 +5705,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             "stash push pathspecs are not implemented".into(),
         ));
     }
-    let Some(created) = create_stash_commit(&message_args, include_untracked)? else {
+    let Some(created) = create_stash_commit(&message_args, include_untracked, include_ignored)?
+    else {
         if !quiet {
             println!("No local changes to save");
         }
@@ -5749,7 +5762,11 @@ struct CreatedStash {
     format: ObjectFormat,
 }
 
-fn create_stash_commit(args: &[String], include_untracked: bool) -> Result<Option<CreatedStash>> {
+fn create_stash_commit(
+    args: &[String],
+    include_untracked: bool,
+    include_ignored: bool,
+) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -5785,7 +5802,7 @@ fn create_stash_commit(args: &[String], include_untracked: bool) -> Result<Optio
                 directory: false,
                 no_empty_directory: false,
                 preserve_ignored_directories: false,
-                exclude_standard: true,
+                exclude_standard: !include_ignored,
                 ignored_only: false,
                 exclude_patterns: Vec::new(),
                 exclude_per_directory: Vec::new(),

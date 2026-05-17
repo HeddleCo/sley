@@ -325,6 +325,11 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
         "untracked" => {
             fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
         }
+        "ignored" => {
+            fs::write(root.join(".gitignore"), b"*.log\n").expect("write gitignore fixture");
+            fs::write(root.join("ignored.log"), b"ignored\n").expect("write ignored fixture");
+            fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+        }
         "tracked-and-untracked" => {
             fs::write(root.join("a.txt"), b"worktree\n").expect("write unstaged fixture");
             fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
@@ -368,11 +373,14 @@ fn stash_push_matches_upstream_git() {
                 "tracked-and-untracked",
                 vec!["stash", "push", "--include-untracked"],
             ),
+            ("all", "ignored", vec!["stash", "push", "-a"]),
+            ("all-long", "ignored", vec!["stash", "push", "--all"]),
             (
                 "no-include-untracked",
                 "untracked",
                 vec!["stash", "push", "-u", "--no-include-untracked"],
             ),
+            ("no-all", "ignored", vec!["stash", "push", "-a", "--no-all"]),
             (
                 "message-equals",
                 "unstaged",
