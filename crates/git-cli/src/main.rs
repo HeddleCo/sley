@@ -5500,19 +5500,245 @@ enum StashListFormat {
 
 fn cmd_stash(args: &[String]) -> Result<()> {
     match args.first().map(String::as_str) {
+        Some("apply") => cmd_stash_apply(&args[1..]),
         Some("clear") => cmd_stash_clear(&args[1..]),
         Some("create") => cmd_stash_create(&args[1..]),
         Some("drop") => cmd_stash_drop(&args[1..]),
         Some("list") => cmd_stash_list(&args[1..]),
+        Some("pop") => cmd_stash_pop(&args[1..]),
         Some("push") => cmd_stash_push(&args[1..]),
         Some("save") => cmd_stash_save(&args[1..]),
         Some("show") => cmd_stash_show(&args[1..]),
         Some("store") => cmd_stash_store(&args[1..]),
         Some(other) => Err(GitError::Unsupported(format!(
-            "stash currently supports only clear, create, drop, list, push, save, show, and store; unsupported subcommand {other}"
+            "stash currently supports only apply, clear, create, drop, list, pop, push, save, show, and store; unsupported subcommand {other}"
         ))),
         None => cmd_stash_push(&[]),
     }
+}
+
+struct StashApplyOptions {
+    quiet: bool,
+    reinstate_index: bool,
+    selector: usize,
+    display: String,
+}
+
+struct AppliedStash {
+    common_git_dir: PathBuf,
+    format: ObjectFormat,
+    selector: usize,
+    display: String,
+}
+
+fn cmd_stash_apply(args: &[String]) -> Result<()> {
+    let options = parse_stash_apply_options(args, "apply")?;
+    apply_stash_entry(options)?;
+    Ok(())
+}
+
+fn cmd_stash_pop(args: &[String]) -> Result<()> {
+    let options = parse_stash_apply_options(args, "pop")?;
+    let quiet = options.quiet;
+    let applied = apply_stash_entry(options)?;
+    drop_stash_entry(
+        &applied.common_git_dir,
+        applied.format,
+        applied.selector,
+        &applied.display,
+        quiet,
+    )
+}
+
+fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashApplyOptions> {
+    let mut quiet = false;
+    let mut reinstate_index = false;
+    let mut specs = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "--index" => reinstate_index = true,
+            "--no-index" => reinstate_index = false,
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash {command} option {value}"
+                )));
+            }
+            value => specs.push(value.to_string()),
+        }
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    let display = specs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+    Ok(StashApplyOptions {
+        quiet,
+        reinstate_index,
+        selector,
+        display,
+    })
+}
+
+fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if options.selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    if !git_worktree::short_status(&worktree_root, &git_dir, format)?.is_empty() {
+        return Err(GitError::Unsupported(
+            "stash apply currently requires a clean working tree and index".into(),
+        ));
+    }
+    let entry_index = entries.len() - 1 - options.selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+    let stash_object = db.read_object(&stash_oid)?;
+    let stash_commit = Commit::parse(format, &stash_object.body)?;
+    let head_store = FileRefStore::new(&git_dir, format);
+    let Some((head_oid, _)) = stash_head_commit(&head_store, &db, format)? else {
+        eprintln!("You do not have the initial commit yet");
+        return Err(GitError::Exit(1));
+    };
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    if base_oid != &head_oid {
+        return Err(GitError::Unsupported(
+            "stash apply currently requires the stash base to match HEAD".into(),
+        ));
+    }
+    let base_object = db.read_object(base_oid)?;
+    if base_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash parent {base_oid} is not a commit"
+        )));
+    }
+    let base_commit = Commit::parse(format, &base_object.body)?;
+    let tracked_tree_unchanged = base_commit.tree == stash_commit.tree;
+    let index_oid = stash_commit
+        .parents
+        .get(1)
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no index parent")))?;
+    git_worktree::reset_index_and_worktree_to_commit(&worktree_root, &git_dir, format, &stash_oid)?;
+    if options.reinstate_index {
+        git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, index_oid)?;
+    } else {
+        git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)?;
+    }
+    if let Some(untracked_oid) = stash_commit.parents.get(2) {
+        let untracked_object = db.read_object(untracked_oid)?;
+        if untracked_object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "stash untracked parent {untracked_oid} is not a commit"
+            )));
+        }
+        let untracked_commit = Commit::parse(format, &untracked_object.body)?;
+        restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
+    }
+    if !options.quiet {
+        if tracked_tree_unchanged {
+            println!("Already up to date.");
+        }
+        cmd_status(&[])?;
+    }
+    Ok(AppliedStash {
+        common_git_dir,
+        format,
+        selector: options.selector,
+        display: options.display,
+    })
+}
+
+fn restore_stash_tree_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<()> {
+    restore_stash_tree_entries_to_worktree(worktree_root, db, format, tree_oid, Vec::new())
+}
+
+fn restore_stash_tree_entries_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let tree = Tree::parse(format, &object.body)?;
+    for entry in tree.entries {
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        if entry.mode == 0o040000 {
+            restore_stash_tree_entries_to_worktree(worktree_root, db, format, &entry.oid, path)?;
+            continue;
+        }
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(format!(
+                "expected blob {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        let path = worktree_root.join(stash_repo_path_to_os_path(&path)?);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, &object.body)?;
+        set_stash_restored_file_mode(&path, entry.mode)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_stash_restored_file_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_stash_restored_file_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
 }
 
 fn cmd_stash_clear(args: &[String]) -> Result<()> {
@@ -5575,7 +5801,17 @@ fn cmd_stash_drop(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    drop_stash_entry(&common_git_dir, format, selector, &display, quiet)
+}
+
+fn drop_stash_entry(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    selector: usize,
+    display: &str,
+    quiet: bool,
+) -> Result<()> {
+    let store = FileRefStore::new(common_git_dir, format);
     let mut entries = store.read_reflog("refs/stash")?;
     if entries.is_empty() {
         eprintln!("No stash entries found.");
@@ -38693,7 +38929,11 @@ fn print_status_long(
             println!();
         }
         println!("Changes not staged for commit:");
-        println!("  (use \"git add/rm <file>...\" to update what will be committed)");
+        if unstaged.iter().any(|(label, _)| *label == "deleted:") {
+            println!("  (use \"git add/rm <file>...\" to update what will be committed)");
+        } else {
+            println!("  (use \"git add <file>...\" to update what will be committed)");
+        }
         println!("  (use \"git restore <file>...\" to discard changes in working directory)");
         for (label, path) in unstaged {
             println!("\t{label:<12}{}", status_quote_path(&path, false));
