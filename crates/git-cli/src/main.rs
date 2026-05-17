@@ -5754,6 +5754,7 @@ enum StashShowMode {
     Stat,
     NameOnly,
     NameStatus,
+    NoPatch,
     Quiet,
 }
 
@@ -5861,7 +5862,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             }
             "--full-index" => patch_full_index = true,
             "--name-only" => {
-                if matches!(mode, StashShowMode::NameStatus) {
+                if matches!(mode, StashShowMode::NameStatus | StashShowMode::NoPatch) {
                     eprintln!(
                         "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
                     );
@@ -5872,7 +5873,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 }
             }
             "--name-status" => {
-                if matches!(mode, StashShowMode::NameOnly) {
+                if matches!(mode, StashShowMode::NameOnly | StashShowMode::NoPatch) {
                     eprintln!(
                         "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
                     );
@@ -5889,6 +5890,18 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 ) {
                     mode = StashShowMode::Stat;
                     show_patch = true;
+                }
+            }
+            "-s" | "--no-patch" => {
+                show_stat = false;
+                show_raw = false;
+                show_numstat = false;
+                show_shortstat = false;
+                show_summary = false;
+                compact_summary = false;
+                show_patch = false;
+                if !matches!(mode, StashShowMode::Quiet) {
+                    mode = StashShowMode::NoPatch;
                 }
             }
             "--quiet" => mode = StashShowMode::Quiet,
@@ -6136,6 +6149,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 writeln!(stdout, "\t{path}")?;
             }
         }
+        StashShowMode::NoPatch => {}
         StashShowMode::Quiet => {
             if !entries.is_empty() {
                 return Err(GitError::Exit(1));
