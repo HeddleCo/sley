@@ -83,9 +83,9 @@ Target: upstream Git 2.54.0.
   display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
-  accepted decoration and no-walk toggles, `--reverse` rejection, and `-<n>` /
-  `-n` / `--max-count` limiting for covered stash entries and empty
-  repositories,
+  accepted decoration, no-walk, and simple history walk toggles, covered
+  history-limiting rejections, `--reverse` rejection, and `-<n>` / `-n` /
+  `--max-count` limiting for covered stash entries and empty repositories,
   `stash clear` ref/reflog removal and covered empty/error cases, plus
   `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
   and covered invalid selector/error cases, plus `stash show` default stat,
@@ -896,8 +896,8 @@ Target: upstream Git 2.54.0.
   `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
-  accepted decoration and no-walk toggles, `--reverse` rejection, and count
-  limiting, plus
+  accepted decoration, no-walk, and simple history walk toggles, covered
+  history-limiting rejections, `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/quiet/exit-code/diff-filter/untracked output plus covered visual/untracked-toggle no-value errors, `stash store` ref/reflog writes,
   `stash push` / `stash save --staged` creation and same-path unstaged cleanup

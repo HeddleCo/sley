@@ -202,6 +202,11 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--first-parent"],
             vec!["stash", "list", "--parents"],
             vec!["stash", "list", "--no-min-parents"],
+            vec!["stash", "list", "--full-history"],
+            vec!["stash", "list", "--dense"],
+            vec!["stash", "list", "--sparse"],
+            vec!["stash", "list", "--remove-empty"],
+            vec!["stash", "list", "--left-right"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
@@ -215,6 +220,11 @@ fn stash_list_matches_upstream_git() {
             ["stash", "list", "--oneline", "--reverse"].as_slice(),
             ["stash", "list", "--decorate=bad"].as_slice(),
             ["stash", "list", "--no-decorate=false"].as_slice(),
+            ["stash", "list", "--children"].as_slice(),
+            ["stash", "list", "--cherry-pick"].as_slice(),
+            ["stash", "list", "--ancestry-path"].as_slice(),
+            ["stash", "list", "--simplify-by-decoration"].as_slice(),
+            ["stash", "list", "--simplify-merges"].as_slice(),
         ] {
             let expected = run_output("git", &root, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);

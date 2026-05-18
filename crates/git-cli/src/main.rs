@@ -7855,7 +7855,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 return Err(GitError::Exit(1));
             }
             "--no-decorate" | "--walk-reflogs" | "--no-walk" | "--do-walk" | "--first-parent"
-            | "--parents" | "--no-min-parents" => {}
+            | "--parents" | "--no-min-parents" | "--full-history" | "--dense" | "--sparse"
+            | "--remove-empty" | "--left-right" => {}
+            "--children"
+            | "--cherry-pick"
+            | "--ancestry-path"
+            | "--simplify-by-decoration"
+            | "--simplify-merges" => {
+                eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
+                return Err(GitError::Exit(1));
+            }
             value if value.starts_with("--no-decorate=") => {
                 eprintln!("error: option `no-decorate' takes no value");
                 return Err(GitError::Exit(1));
