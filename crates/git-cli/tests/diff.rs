@@ -127,6 +127,16 @@ fn diff_name_only_matches_upstream_git() {
             ],
             vec!["diff", "--name-status", "--ignore-submodules", "HEAD"],
             vec!["diff", "--name-status", "--ignore-submodules=dirty", "HEAD"],
+            vec!["diff", "--name-status", "--minimal", "HEAD"],
+            vec!["diff", "--name-status", "--patience", "HEAD"],
+            vec!["diff", "--name-status", "--histogram", "HEAD"],
+            vec!["diff", "--name-status", "--diff-algorithm", "myers", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--diff-algorithm=histogram",
+                "HEAD",
+            ],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);

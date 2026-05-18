@@ -25976,6 +25976,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
     let mut color_always = false;
+    let mut diff_algorithm_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26068,6 +26069,19 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
+            "--diff-algorithm" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("diff-algorithm"))?;
+                log_validate_diff_algorithm(value)?;
+                diff_algorithm_control = true;
+            }
+            value if let Some(value) = value.strip_prefix("--diff-algorithm=") => {
+                log_validate_diff_algorithm(value)?;
+                diff_algorithm_control = true;
+            }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
             "--color-moved" | "--no-color-moved" => {}
@@ -26204,6 +26218,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if color_always && !name_status && !name_only && !stat && !compact_summary && !shortstat {
         return Err(GitError::Unsupported(
             "diff colored output is not supported for this output mode".into(),
+        ));
+    }
+    if diff_algorithm_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff algorithm controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;
