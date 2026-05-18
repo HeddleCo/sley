@@ -87,7 +87,8 @@ Target: upstream Git 2.54.0.
   `%cI` / `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` /
   `%gs`, `%d` / `%D` decoration, `%m` mark, `%N` no-notes, unsigned-signature,
   source-literal, `%xNN`, and no-op color formats with `--date` mode support for
-  default date placeholders and reflog selectors, object-name abbreviation controls,
+  default date placeholders and reflog selectors, object-name abbreviation controls
+  including covered permissive `--abbrev=<value>` parsing,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration
@@ -913,7 +914,8 @@ Target: upstream Git 2.54.0.
   `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` / `%gs`,
   `%d` / `%D` decoration, `%m` mark, `%N` no-notes, unsigned-signature,
   source-literal, `%xNN`, and no-op color formats with `--date` mode support for default date placeholders and reflog selectors,
-  object-name abbreviation controls,
+  object-name abbreviation controls including covered permissive
+  `--abbrev=<value>` parsing,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration

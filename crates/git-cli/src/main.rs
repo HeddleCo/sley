@@ -8213,7 +8213,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 max_parents = Some(parse_reflog_max_parent_count(count)?);
             }
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
-                abbrev_len = Some(parse_abbrev(value)?.max(4));
+                abbrev_len = parse_stash_list_abbrev(value);
             }
             "--max-count" | "-n" => {
                 index += 1;
@@ -8328,6 +8328,14 @@ fn stash_list_validate_ignore_submodules(value: &str) -> Result<()> {
         GitError::Exit(128) => GitError::Exit(1),
         err => err,
     })
+}
+
+fn parse_stash_list_abbrev(value: &str) -> Option<usize> {
+    match value.parse::<isize>() {
+        Ok(width) if width < 0 => None,
+        Ok(width) => Some((width as usize).max(4)),
+        Err(_) => Some(4),
+    }
 }
 
 fn parse_stash_list_age(value: &str) -> Result<i64> {
