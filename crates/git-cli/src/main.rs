@@ -25979,6 +25979,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_algorithm_control = false;
     let mut diff_driver_control = false;
     let mut diff_hunk_control = false;
+    let mut diff_whitespace_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26105,6 +26106,18 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             value if let Some(value) = value.strip_prefix("--inter-hunk-context=") => {
                 log_validate_inter_hunk_context(value)?;
                 diff_hunk_control = true;
+            }
+            "--ws-error-highlight" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("ws-error-highlight"))?;
+                log_validate_ws_error_highlight(value)?;
+                diff_whitespace_control = true;
+            }
+            value if let Some(value) = value.strip_prefix("--ws-error-highlight=") => {
+                log_validate_ws_error_highlight(value)?;
+                diff_whitespace_control = true;
             }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
@@ -26260,6 +26273,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_hunk_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff hunk context controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_whitespace_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff whitespace controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;
