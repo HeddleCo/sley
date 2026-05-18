@@ -8083,6 +8083,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--no-color-moved=") => {
                 stash_list_option_takes_no_value_error("no-color-moved")?;
             }
+            value if value.starts_with("--no-color=") => {
+                stash_list_option_takes_no_value_error("no-color")?;
+            }
             value
                 if value.starts_with("--no-graph=")
                     || value.starts_with("--oneline=")
@@ -8093,6 +8096,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     || value.starts_with("--no-notes=")
                     || value.starts_with("--standard-notes=")
                     || value.starts_with("--no-standard-notes=")
+                    || value.starts_with("--no-diff-merges=")
                     || value.starts_with("--perl-regexp=")
                     || value.starts_with("--basic-regexp=")
                     || value.starts_with("--extended-regexp=")
@@ -8297,13 +8301,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             "--diff-merges" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(log_diff_merges_requires_value_error());
-                };
-                log_validate_diff_merges(value)?;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                stash_list_validate_diff_merges(value)?;
             }
             value if let Some(value) = value.strip_prefix("--diff-merges=") => {
-                log_validate_diff_merges(value)?;
+                stash_list_validate_diff_merges(value)?;
             }
             value if let Some(value) = value.strip_prefix("--color=") => {
                 stash_list_validate_color(value)?;
@@ -8313,9 +8315,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             "--color-moved-ws" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(log_option_requires_value_error("color-moved-ws"));
-                };
+                let value = args.get(index).map_or("refs/stash", String::as_str);
                 stash_list_validate_color_moved_ws(value)?;
             }
             value if let Some(value) = value.strip_prefix("--color-moved-ws=") => {
@@ -8333,11 +8333,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--dst-prefix=") => {}
             "--output-indicator-new" | "--output-indicator-old" | "--output-indicator-context" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(log_option_requires_value_error(
-                        arg.trim_start_matches("--"),
-                    ));
-                };
+                let value = args.get(index).map_or("refs/stash", String::as_str);
                 stash_list_validate_output_indicator(arg.trim_start_matches("--"), value)?;
             }
             value if let Some(value) = value.strip_prefix("--output-indicator-new=") => {
@@ -8578,6 +8574,13 @@ fn stash_list_validate_color_moved(value: &str) -> Result<()> {
 fn stash_list_validate_color_moved_ws(value: &str) -> Result<()> {
     log_validate_color_moved_ws(value).map_err(|err| match err {
         GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_diff_merges(value: &str) -> Result<()> {
+    log_validate_diff_merges(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
         err => err,
     })
 }
