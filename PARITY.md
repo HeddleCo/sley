@@ -100,7 +100,7 @@ Target: upstream Git 2.54.0.
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting/ordering value, filter/date/encoding reset, diff/whitespace display option value,
-  regexp short/long reset/value, notes/source/signature value rejections,
+  regexp short/long reset/value, notes value warnings, source/signature value rejections,
   `--reverse` rejection, `--skip` skipping, and `-<n>` / `-n` /
   `--max-count` limiting including negative
   count reset behavior and quiet toggles for covered stash entries and empty repositories,
@@ -931,7 +931,7 @@ Target: upstream Git 2.54.0.
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting/ordering value, filter/date/encoding reset, diff/whitespace display option value,
-  regexp short/long reset/value, notes/source/signature value rejections,
+  regexp short/long reset/value, notes value warnings, source/signature value rejections,
   `--reverse` rejection, `--skip` skipping, quiet toggles, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/quiet/exit-code/diff-filter/untracked output plus covered visual/untracked-toggle no-value errors, `stash store` ref/reflog writes,

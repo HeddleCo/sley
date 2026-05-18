@@ -5536,6 +5536,7 @@ struct StashListOptions {
     grep_all_match: bool,
     invert_grep: bool,
     regexp_ignore_case: bool,
+    note_refs: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -7837,6 +7838,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
+    stash_list_warn_invalid_note_refs(&store, &options.note_refs);
     let db = FileObjectDatabase::new(repository_objects_dir(&common_git_dir), format);
     let mut entries = store.read_reflog("refs/stash")?;
     entries.reverse();
@@ -7914,6 +7916,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut invert_grep = false;
     let mut regexp_ignore_case = false;
     let mut regexp_mode = SimpleLogRegexMode::Basic;
+    let mut note_refs = Vec::new();
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -8079,6 +8082,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value if value.starts_with("--no-source=") => {
                 stash_list_option_takes_no_value_error("no-source")?;
+            }
+            value if let Some(value) = value.strip_prefix("--notes=") => {
+                note_refs.push(stash_list_note_ref(value));
+            }
+            value if let Some(value) = value.strip_prefix("--show-notes=") => {
+                note_refs.push(stash_list_note_ref(value));
             }
             value if value.starts_with("--no-color-moved=") => {
                 stash_list_option_takes_no_value_error("no-color-moved")?;
@@ -8504,12 +8513,29 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         grep_all_match,
         invert_grep,
         regexp_ignore_case,
+        note_refs,
     })
 }
 
 fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
     Err(GitError::Exit(1))
+}
+
+fn stash_list_note_ref(value: &str) -> String {
+    if value.starts_with("refs/notes/") {
+        value.to_string()
+    } else {
+        format!("refs/notes/{value}")
+    }
+}
+
+fn stash_list_warn_invalid_note_refs(store: &FileRefStore, note_refs: &[String]) {
+    for note_ref in note_refs {
+        if !matches!(store.read_ref(note_ref), Ok(Some(_))) {
+            eprintln!("warning: notes ref {note_ref} is invalid");
+        }
+    }
 }
 
 fn stash_list_diff_option_with_value(value: &str) -> Option<&'static str> {
