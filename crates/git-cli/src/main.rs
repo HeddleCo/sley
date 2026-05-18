@@ -5465,9 +5465,30 @@ fn parse_reflog_show_options(args: &[String]) -> Result<ReflogShowOptions> {
 }
 
 fn parse_reflog_count(value: &str) -> Result<usize> {
+    let count = parse_reflog_integer(value)?;
+    if count < 0 {
+        return Ok(usize::MAX);
+    }
+    usize::try_from(count).map_err(|_| reflog_invalid_integer_error(value))
+}
+
+fn parse_reflog_skip_count(value: &str) -> Result<usize> {
+    let count = parse_reflog_integer(value)?;
+    if count < 0 {
+        return Ok(0);
+    }
+    usize::try_from(count).map_err(|_| reflog_invalid_integer_error(value))
+}
+
+fn parse_reflog_integer(value: &str) -> Result<i128> {
     value
-        .parse::<usize>()
-        .map_err(|err| GitError::InvalidFormat(err.to_string()))
+        .parse::<i128>()
+        .map_err(|_| reflog_invalid_integer_error(value))
+}
+
+fn reflog_invalid_integer_error(value: &str) -> GitError {
+    eprintln!("fatal: '{value}': not an integer");
+    GitError::Exit(1)
 }
 
 fn reflog_reference_name(value: Option<&str>) -> Result<String> {
@@ -5484,6 +5505,7 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
 struct StashListOptions {
     format: StashListFormat,
     max_count: Option<usize>,
+    skip_count: usize,
     abbrev_len: Option<usize>,
     grep_filters: Vec<SimpleLogRegex>,
     grep_all_match: bool,
@@ -7794,10 +7816,14 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     entries.reverse();
     let mut entries = entries.into_iter().enumerate().collect::<Vec<_>>();
     entries.retain(|(_, entry)| stash_list_grep_filters_match(entry, &options));
+    let skipped = options.skip_count.min(entries.len());
     let selected = options
         .max_count
-        .map_or(entries.len(), |max_count| max_count.min(entries.len()));
-    for (position, (stash_index, entry)) in entries.iter().take(selected).enumerate() {
+        .map_or(entries.len() - skipped, |max_count| {
+            max_count.min(entries.len() - skipped)
+        });
+    for (position, (stash_index, entry)) in entries.iter().skip(skipped).take(selected).enumerate()
+    {
         match &options.format {
             StashListFormat::Default => {
                 println!(
@@ -7829,6 +7855,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
 fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut format = StashListFormat::Default;
     let mut max_count = None;
+    let mut skip_count = 0;
     let mut abbrev_len = Some(7);
     let mut grep_patterns = Vec::new();
     let mut grep_all_match = false;
@@ -7860,6 +7887,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "--children"
             | "--cherry-pick"
             | "--ancestry-path"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
             | "--simplify-by-decoration"
             | "--simplify-merges" => {
                 eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
@@ -7917,15 +7947,21 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(count) = value.strip_prefix("--max-count=") => {
                 max_count = Some(parse_reflog_count(count)?);
             }
+            value if let Some(count) = value.strip_prefix("--skip=") => {
+                skip_count = parse_reflog_skip_count(count)?;
+            }
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
                 abbrev_len = Some(parse_abbrev(value)?.max(4));
             }
             "--max-count" | "-n" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(GitError::Command(format!("{arg} requires a value")));
-                };
+                let value = args.get(index).map_or("refs/stash", String::as_str);
                 max_count = Some(parse_reflog_count(value)?);
+            }
+            "--skip" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                skip_count = parse_reflog_skip_count(value)?;
             }
             value if value.starts_with("-n") && value.len() > 2 => {
                 max_count = Some(parse_reflog_count(&value[2..])?);
@@ -7953,6 +7989,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     Ok(StashListOptions {
         format,
         max_count,
+        skip_count,
         abbrev_len,
         grep_filters,
         grep_all_match,

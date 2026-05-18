@@ -84,8 +84,9 @@ Target: upstream Git 2.54.0.
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
   accepted decoration, no-walk, and simple history walk toggles, covered
-  history-limiting rejections, `--reverse` rejection, and `-<n>` / `-n` /
-  `--max-count` limiting for covered stash entries and empty repositories,
+  history-limiting and ordering rejections, `--reverse` rejection, `--skip`
+  skipping, and `-<n>` / `-n` / `--max-count` limiting including negative
+  count reset behavior for covered stash entries and empty repositories,
   `stash clear` ref/reflog removal and covered empty/error cases, plus
   `stash drop` top/explicit-entry removal, quiet toggles, ref update/removal,
   and covered invalid selector/error cases, plus `stash show` default stat,
@@ -897,7 +898,8 @@ Target: upstream Git 2.54.0.
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
   accepted decoration, no-walk, and simple history walk toggles, covered
-  history-limiting rejections, `--reverse` rejection, and count limiting, plus
+  history-limiting and ordering rejections, `--reverse` rejection, `--skip`
+  skipping, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/quiet/exit-code/diff-filter/untracked output plus covered visual/untracked-toggle no-value errors, `stash store` ref/reflog writes,
   `stash push` / `stash save --staged` creation and same-path unstaged cleanup
