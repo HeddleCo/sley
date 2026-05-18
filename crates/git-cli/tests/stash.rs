@@ -188,6 +188,20 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "-1"],
             vec!["stash", "list", "-n", "1"],
             vec!["stash", "list", "-n1"],
+            vec!["stash", "list", "--no-decorate"],
+            vec!["stash", "list", "--decorate"],
+            vec!["stash", "list", "--decorate=no"],
+            vec!["stash", "list", "--decorate=short"],
+            vec!["stash", "list", "--decorate=full"],
+            vec!["stash", "list", "--decorate=auto"],
+            vec!["stash", "list", "--walk-reflogs"],
+            vec!["stash", "list", "--no-walk"],
+            vec!["stash", "list", "--no-walk=sorted"],
+            vec!["stash", "list", "--no-walk=unsorted"],
+            vec!["stash", "list", "--do-walk"],
+            vec!["stash", "list", "--first-parent"],
+            vec!["stash", "list", "--parents"],
+            vec!["stash", "list", "--no-min-parents"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
@@ -199,6 +213,8 @@ fn stash_list_matches_upstream_git() {
         for args in [
             ["stash", "list", "--reverse"].as_slice(),
             ["stash", "list", "--oneline", "--reverse"].as_slice(),
+            ["stash", "list", "--decorate=bad"].as_slice(),
+            ["stash", "list", "--no-decorate=false"].as_slice(),
         ] {
             let expected = run_output("git", &root, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);

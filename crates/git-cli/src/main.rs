@@ -7854,6 +7854,25 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 );
                 return Err(GitError::Exit(1));
             }
+            "--no-decorate" | "--walk-reflogs" | "--no-walk" | "--do-walk" | "--first-parent"
+            | "--parents" | "--no-min-parents" => {}
+            value if value.starts_with("--no-decorate=") => {
+                eprintln!("error: option `no-decorate' takes no value");
+                return Err(GitError::Exit(1));
+            }
+            "--decorate" => {}
+            value if let Some(value) = value.strip_prefix("--decorate=") => {
+                if matches!(
+                    value,
+                    "no" | "auto" | "short" | "full" | "" | "false" | "0" | "off"
+                ) {
+                    // Decorations are not shown in the covered stash-list formats.
+                } else {
+                    eprintln!("fatal: invalid --decorate option: {value}");
+                    return Err(GitError::Exit(1));
+                }
+            }
+            "--no-walk=sorted" | "--no-walk=unsorted" => {}
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
             "--grep" => {
