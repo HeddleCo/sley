@@ -7952,6 +7952,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             | "--source"
             | "--no-source"
             | "--no-patch"
+            | "--color"
+            | "--no-color"
+            | "--clear-decorations"
+            | "--no-decorate-refs"
+            | "--no-decorate-refs-exclude"
             | "--no-diff-merges"
             | "--full-diff"
             | "--relative"
@@ -7992,6 +7997,15 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 eprintln!("error: option `no-decorate' takes no value");
                 return Err(GitError::Exit(1));
             }
+            value if value.starts_with("--clear-decorations=") => {
+                stash_list_option_takes_no_value_error("clear-decorations")?;
+            }
+            value if value.starts_with("--no-decorate-refs=") => {
+                stash_list_option_takes_no_value_error("no-decorate-refs")?;
+            }
+            value if value.starts_with("--no-decorate-refs-exclude=") => {
+                stash_list_option_takes_no_value_error("no-decorate-refs-exclude")?;
+            }
             "--decorate" => {}
             value if let Some(value) = value.strip_prefix("--decorate=") => {
                 if matches!(
@@ -8004,6 +8018,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     return Err(GitError::Exit(1));
                 }
             }
+            "--decorate-refs" | "--decorate-refs-exclude" => {
+                index += 1;
+                if args.get(index).is_none() {
+                    return Err(log_option_requires_value_error(
+                        arg.trim_start_matches("--"),
+                    ));
+                }
+            }
+            value if value.starts_with("--decorate-refs=") => {}
+            value if value.starts_with("--decorate-refs-exclude=") => {}
             "--no-walk=sorted" | "--no-walk=unsorted" => {}
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
@@ -8062,6 +8086,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value if let Some(value) = value.strip_prefix("--diff-merges=") => {
                 log_validate_diff_merges(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--color=") => {
+                stash_list_validate_color(value)?;
             }
             "--format" | "--pretty" => {
                 index += 1;
@@ -8193,6 +8220,18 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         grep_all_match,
         invert_grep,
         regexp_ignore_case,
+    })
+}
+
+fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
+    eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(1))
+}
+
+fn stash_list_validate_color(value: &str) -> Result<()> {
+    log_validate_color(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
     })
 }
 
