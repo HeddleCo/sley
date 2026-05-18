@@ -85,7 +85,8 @@ Target: upstream Git 2.54.0.
   `%aN` / `%aE` / `%aL` / `%at` / `%ad` / `%ai` / `%aI` / `%as` / `%aD` /
   `%cn` / `%ce` / `%cl` / `%cN` / `%cE` / `%cL` / `%ct` / `%cd` / `%ci` /
   `%cI` / `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` /
-  `%gs`, `%xNN`, and no-op color formats with `--date` mode support for
+  `%gs`, `%d` / `%D` decoration, `%m` mark, `%N` no-notes, unsigned-signature,
+  source-literal, `%xNN`, and no-op color formats with `--date` mode support for
   default date placeholders and reflog selectors, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,
@@ -906,7 +907,8 @@ Target: upstream Git 2.54.0.
   `%aE` / `%aL` / `%at` / `%ad` / `%ai` / `%aI` / `%as` / `%aD` / `%cn` /
   `%ce` / `%cl` / `%cN` / `%cE` / `%cL` / `%ct` / `%cd` / `%ci` / `%cI` /
   `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` / `%gs`,
-  `%xNN`, and no-op color formats with `--date` mode support for default date placeholders and reflog selectors,
+  `%d` / `%D` decoration, `%m` mark, `%N` no-notes, unsigned-signature,
+  source-literal, `%xNN`, and no-op color formats with `--date` mode support for default date placeholders and reflog selectors,
   object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,

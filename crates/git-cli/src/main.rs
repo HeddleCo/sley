@@ -8206,11 +8206,33 @@ fn print_stash_list_format(
             Some('t') => print!("{}", format_log_oid(&commit.tree, abbrev_len)),
             Some('P') => print!("{}", format_commit_parent_oids(&commit.parents, None)),
             Some('p') => print!("{}", format_commit_parent_oids(&commit.parents, abbrev_len)),
+            Some('m') => print!(">"),
             Some('s') => print!("{}", commit_subject(&commit.message)),
             Some('f') => print!("{}", log_sanitized_subject(&commit.message)),
             Some('e') => print!("{}", commit_encoding(commit)),
             Some('b') => io::stdout().write_all(commit_body(&commit.message))?,
             Some('B') => io::stdout().write_all(&commit.message)?,
+            Some('d') if index == 0 => print!(" (refs/stash)"),
+            Some('d') => {}
+            Some('D') if index == 0 => print!("refs/stash"),
+            Some('D') => {}
+            Some('N') => {}
+            Some('S') => print!("%S"),
+            Some('G') => match chars.next() {
+                Some('?') => print!("N"),
+                Some('T') => print!("undefined"),
+                Some('G' | 'S' | 'K' | 'F' | 'P') => {}
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %G{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %G".into(),
+                    ));
+                }
+            },
             Some('a') => match chars.next() {
                 Some('n' | 'N') => print!("{author_name}"),
                 Some('e' | 'E') => print!("{author_email}"),
