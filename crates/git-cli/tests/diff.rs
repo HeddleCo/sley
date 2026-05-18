@@ -825,6 +825,14 @@ fn diff_renames_match_upstream_git() {
         for args in [
             vec!["diff", "--cached", "-M", "-l", "HEAD", "--name-status"],
             vec!["diff", "--cached", "-M", "-lfoo", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-Mfoo", "--name-status", "HEAD"],
+            vec![
+                "diff",
+                "--cached",
+                "--find-renames=foo",
+                "--name-status",
+                "HEAD",
+            ],
         ] {
             let expected = run_status("git", &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
@@ -1099,6 +1107,14 @@ fn diff_copies_match_upstream_git() {
         }
 
         for args in [
+            vec!["diff", "--cached", "-Cfoo", "--name-status", "HEAD"],
+            vec![
+                "diff",
+                "--cached",
+                "--find-copies=foo",
+                "--name-status",
+                "HEAD",
+            ],
             vec![
                 "diff",
                 "--cached",

@@ -26363,10 +26363,22 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             "--rename-empty" => rename_empty = true,
             "--no-rename-empty" => rename_empty = false,
-            value if value.starts_with("-M") && value.len() > 2 => detect_renames = true,
-            value if value.starts_with("--find-renames=") => detect_renames = true,
-            value if value.starts_with("-C") && value.len() > 2 => detect_copies = true,
-            value if value.starts_with("--find-copies=") => detect_copies = true,
+            value if value.starts_with("-M") && value.len() > 2 => {
+                log_validate_similarity_option(&value[2..], "find-renames")?;
+                detect_renames = true;
+            }
+            value if let Some(value) = value.strip_prefix("--find-renames=") => {
+                log_validate_similarity_option(value, "find-renames")?;
+                detect_renames = true;
+            }
+            value if value.starts_with("-C") && value.len() > 2 => {
+                log_validate_similarity_option(&value[2..], "find-copies")?;
+                detect_copies = true;
+            }
+            value if let Some(value) = value.strip_prefix("--find-copies=") => {
+                log_validate_similarity_option(value, "find-copies")?;
+                detect_copies = true;
+            }
             value if value.starts_with("--find-copies-harder=") => {
                 return log_option_takes_no_value_error("find-copies-harder");
             }
