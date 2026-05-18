@@ -26121,6 +26121,28 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_ws_error_highlight(value)?;
                 diff_whitespace_control = true;
             }
+            "-b"
+            | "-w"
+            | "--ignore-space-at-eol"
+            | "--ignore-cr-at-eol"
+            | "--ignore-space-change"
+            | "--ignore-all-space"
+            | "--ignore-blank-lines" => diff_whitespace_control = true,
+            value if value.starts_with("--ignore-space-at-eol=") => {
+                return log_option_takes_no_value_error("ignore-space-at-eol");
+            }
+            value if value.starts_with("--ignore-cr-at-eol=") => {
+                return log_option_takes_no_value_error("ignore-cr-at-eol");
+            }
+            value if value.starts_with("--ignore-space-change=") => {
+                return log_option_takes_no_value_error("ignore-space-change");
+            }
+            value if value.starts_with("--ignore-all-space=") => {
+                return log_option_takes_no_value_error("ignore-all-space");
+            }
+            value if value.starts_with("--ignore-blank-lines=") => {
+                return log_option_takes_no_value_error("ignore-blank-lines");
+            }
             "--output-indicator-new" => {
                 idx += 1;
                 let value = args

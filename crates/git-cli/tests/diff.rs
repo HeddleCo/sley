@@ -150,6 +150,13 @@ fn diff_name_only_matches_upstream_git() {
                 "HEAD",
             ],
             vec!["diff", "--name-status", "--ws-error-highlight=all", "HEAD"],
+            vec!["diff", "--name-status", "-b", "HEAD"],
+            vec!["diff", "--name-status", "-w", "HEAD"],
+            vec!["diff", "--name-status", "--ignore-space-at-eol", "HEAD"],
+            vec!["diff", "--name-status", "--ignore-cr-at-eol", "HEAD"],
+            vec!["diff", "--name-status", "--ignore-space-change", "HEAD"],
+            vec!["diff", "--name-status", "--ignore-all-space", "HEAD"],
+            vec!["diff", "--name-status", "--ignore-blank-lines", "HEAD"],
             vec![
                 "diff",
                 "--name-status",

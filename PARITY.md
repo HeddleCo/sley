@@ -540,7 +540,8 @@ Target: upstream Git 2.54.0.
   non-coloring name output with `--color[=always]`, general `--no-color` /
   `--color=never|auto`, no-op `--color-moved` / `--color-moved-ws`
   / `--no-color-moved-ws` controls, name-output no-op diff algorithm
-  controls, `--inter-hunk-context`, `--ws-error-highlight`, and
+  controls, `--inter-hunk-context`, whitespace ignore controls,
+  `--ws-error-highlight`, and
   output-indicator and patch context controls, non-submodule `--ignore-submodules`,
   and cached/staged variants
   support for added, modified, and deleted paths known to the index/HEAD,
