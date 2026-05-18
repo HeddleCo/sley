@@ -7935,6 +7935,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             | "--quiet"
             | "--no-quiet"
             | "--no-graph"
+            | "--expand-tabs"
+            | "--no-expand-tabs"
             | "--no-decorate"
             | "--walk-reflogs"
             | "--no-walk"
@@ -8037,6 +8039,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 eprintln!("error: option `no-decorate' takes no value");
                 return Err(GitError::Exit(1));
             }
+            value if let Some(value) = value.strip_prefix("--expand-tabs=") => {
+                stash_list_validate_non_negative_integer(value)?;
+            }
             value if value.starts_with("--quiet=") => {
                 stash_list_option_takes_no_value_error("quiet")?;
             }
@@ -8072,6 +8077,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value
                 if value.starts_with("--no-graph=")
+                    || value.starts_with("--no-expand-tabs=")
                     || value.starts_with("--show-signature=")
                     || value.starts_with("--no-show-signature=")
                     || value.starts_with("--no-notes=")
@@ -8376,6 +8382,13 @@ fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
 fn stash_list_no_walk_invalid_argument(value: &str) -> Result<()> {
     eprintln!("error: invalid argument to --no-walk");
     stash_list_fatal_unrecognized_argument(value)
+}
+
+fn stash_list_validate_non_negative_integer(value: &str) -> Result<()> {
+    value.parse::<usize>().map(|_| ()).map_err(|_| {
+        eprintln!("fatal: '{value}': not a non-negative integer");
+        GitError::Exit(1)
+    })
 }
 
 fn stash_list_validate_color(value: &str) -> Result<()> {

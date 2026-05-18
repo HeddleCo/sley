@@ -93,8 +93,8 @@ Target: upstream Git 2.54.0.
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration
   and color-mode controls, mailmap toggles, notes, encoding, source, signature,
-  patch-suppression, no-graph toggle, ext-diff/textconv, full-diff,
-  rename/copy detection, relative path,
+  patch-suppression, no-graph and tab-expansion toggles, ext-diff/textconv,
+  full-diff, rename/copy detection, relative path,
   merge-diff suppression, diff-algorithm, whitespace, context, prefix,
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
@@ -922,8 +922,8 @@ Target: upstream Git 2.54.0.
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration
   and color-mode controls, mailmap toggles, notes, encoding, source, signature,
-  patch-suppression, no-graph toggle, ext-diff/textconv, full-diff,
-  rename/copy detection, relative path,
+  patch-suppression, no-graph and tab-expansion toggles, ext-diff/textconv,
+  full-diff, rename/copy detection, relative path,
   merge-diff suppression, diff-algorithm, whitespace, context, prefix,
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
