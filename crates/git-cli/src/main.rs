@@ -25972,6 +25972,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut raw_abbrev = None;
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
+    let mut color_output_requested = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26064,6 +26065,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "--color" | "--color=always" => color_output_requested = true,
             "--no-color" | "--color=never" | "--color=auto" => {}
             "--ignore-submodules"
             | "--ignore-submodules=none"
@@ -26180,6 +26182,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if name_status && name_only {
         return Err(GitError::Command(
             "diff currently supports: diff [--cached] [-z] [-M|-C] [--diff-filter=<filter>] [--exit-code|--quiet] [--abbrev[=<n>]|--no-abbrev] [--src-prefix=<prefix>|--dst-prefix=<prefix>|--no-prefix|--default-prefix] [--raw|--stat|--compact-summary|--numstat|--shortstat|--summary|--name-status|--name-only|-p|-u|--patch|--patch-with-raw|--patch-with-stat|-s|--no-patch] [HEAD] [-- <path>...] and diff [--cached] [-z] --quiet [HEAD]".into(),
+        ));
+    }
+    if color_output_requested && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff colored output is not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;

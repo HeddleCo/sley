@@ -102,6 +102,8 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--staged", "--name-only", "HEAD"],
             vec!["diff", "--name-status", "--no-ext-diff", "HEAD"],
             vec!["diff", "--name-status", "--no-textconv", "HEAD"],
+            vec!["diff", "--name-status", "--color", "HEAD"],
+            vec!["diff", "--name-status", "--color=always", "HEAD"],
             vec!["diff", "--name-status", "--no-color", "HEAD"],
             vec!["diff", "--name-status", "--color=never", "HEAD"],
             vec!["diff", "--name-status", "--color=auto", "HEAD"],
