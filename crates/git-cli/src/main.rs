@@ -25983,6 +25983,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_output_indicator_control = false;
     let mut diff_patch_context_control = false;
     let mut diff_submodule_output_control = false;
+    let mut diff_word_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26149,6 +26150,20 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_submodule_format(value)?;
                 diff_submodule_output_control = true;
             }
+            "--word-diff" => diff_word_control = true,
+            value if let Some(value) = value.strip_prefix("--word-diff=") => {
+                log_validate_word_diff(value)?;
+                diff_word_control = true;
+            }
+            "--word-diff-regex" => {
+                idx += 1;
+                args.get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("word-diff-regex"))?;
+                diff_word_control = true;
+            }
+            value if value.starts_with("--word-diff-regex=") => diff_word_control = true,
+            "--color-words" => diff_word_control = true,
+            value if value.starts_with("--color-words=") => diff_word_control = true,
             "--output-indicator-new" => {
                 idx += 1;
                 let value = args
@@ -26371,6 +26386,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_submodule_output_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff submodule output controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_word_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff word controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;
@@ -32883,6 +32903,16 @@ fn log_validate_submodule_format(value: &str) -> Result<()> {
         "short" | "log" | "diff" => Ok(()),
         _ => {
             eprintln!("error: failed to parse --submodule option parameter: '{value}'");
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+fn log_validate_word_diff(value: &str) -> Result<()> {
+    match value {
+        "plain" | "color" | "porcelain" | "none" => Ok(()),
+        _ => {
+            eprintln!("error: bad --word-diff argument: {value}");
             Err(GitError::Exit(129))
         }
     }
