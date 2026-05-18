@@ -341,6 +341,22 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
             fs::write(root.join("a.txt"), b"worktree a\n").expect("write first worktree fixture");
             fs::write(root.join("b.txt"), b"worktree b\n").expect("write second worktree fixture");
         }
+        "two-tracked-pathspec-file" => {
+            fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"worktree a\n").expect("write first worktree fixture");
+            fs::write(root.join("b.txt"), b"worktree b\n").expect("write second worktree fixture");
+            fs::write(root.join("pathspecs"), b"a.txt\n").expect("write pathspec fixture");
+        }
+        "two-tracked-pathspec-nul" => {
+            fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"worktree a\n").expect("write first worktree fixture");
+            fs::write(root.join("b.txt"), b"worktree b\n").expect("write second worktree fixture");
+            fs::write(root.join("pathspecs"), b"a.txt\0").expect("write pathspec fixture");
+        }
         "two-tracked-staged" => {
             fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
             git(root, &["add", "b.txt"]);
@@ -472,6 +488,42 @@ fn stash_push_matches_upstream_git() {
                 vec!["stash", "push", "--", "a.txt"],
             ),
             (
+                "pathspec-from-file",
+                "two-tracked-pathspec-file",
+                vec!["stash", "push", "--pathspec-from-file=pathspecs"],
+            ),
+            (
+                "pathspec-file-nul",
+                "two-tracked-pathspec-nul",
+                vec![
+                    "stash",
+                    "push",
+                    "--pathspec-file-nul",
+                    "--pathspec-from-file",
+                    "pathspecs",
+                ],
+            ),
+            (
+                "pathspec-from-file-mixed",
+                "two-tracked-pathspec-file",
+                vec!["stash", "push", "--pathspec-from-file=pathspecs", "a.txt"],
+            ),
+            (
+                "pathspec-file-nul-without-file",
+                "two-tracked",
+                vec!["stash", "push", "--pathspec-file-nul", "a.txt"],
+            ),
+            (
+                "pathspec-from-file-reset",
+                "two-tracked-pathspec-file",
+                vec![
+                    "stash",
+                    "push",
+                    "--pathspec-from-file=pathspecs",
+                    "--no-pathspec-from-file",
+                ],
+            ),
+            (
                 "pathspec-untracked",
                 "two-tracked-and-untracked",
                 vec!["stash", "push", "-u", "--", "a.txt", "u.txt"],
@@ -526,7 +578,19 @@ fn stash_push_matches_upstream_git() {
             ] {
                 let expected = run_output("git", &upstream, &check_args);
                 let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
-                assert_same_output(actual_output, expected, &check_args);
+                assert_eq!(
+                    actual_output.status.code(),
+                    expected.status.code(),
+                    "post-state status differed for stash push case {name} {args:?} check {check_args:?}"
+                );
+                assert_eq!(
+                    actual_output.stdout, expected.stdout,
+                    "post-state stdout differed for stash push case {name} {args:?} check {check_args:?}"
+                );
+                assert_eq!(
+                    actual_output.stderr, expected.stderr,
+                    "post-state stderr differed for stash push case {name} {args:?} check {check_args:?}"
+                );
             }
             let stash_exists =
                 run_output("git", &upstream, &["show-ref", "--exists", "refs/stash"])

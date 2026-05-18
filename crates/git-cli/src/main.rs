@@ -5950,6 +5950,8 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut create_mode = StashCreateMode::Worktree;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
+    let mut pathspec_from_file = None;
+    let mut pathspec_file_nul = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -5993,17 +5995,64 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 message_args = vec![value[2..].to_string()];
             }
             "--" => {
+                if pathspec_from_file.is_some() && index + 1 < args.len() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
                 pathspecs.extend(args[index + 1..].iter().cloned());
                 break;
+            }
+            "--pathspec-from-file" => {
+                if !pathspecs.is_empty() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return stash_pathspec_from_file_requires_value_error();
+                };
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            value if let Some(value) = value.strip_prefix("--pathspec-from-file=") => {
+                if !pathspecs.is_empty() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => {}
+            value if value.starts_with("--no-pathspec-from-file=") => {
+                return stash_option_takes_no_value_error("no-pathspec-from-file");
+            }
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            value if value.starts_with("--pathspec-file-nul=") => {
+                return stash_option_takes_no_value_error("pathspec-file-nul");
+            }
+            value if value.starts_with("--no-pathspec-file-nul=") => {
+                return stash_option_takes_no_value_error("no-pathspec-file-nul");
             }
             value if value.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
                     "unsupported stash push option {value}"
                 )));
             }
-            value => pathspecs.push(value.to_string()),
+            value => {
+                if pathspec_from_file.is_some() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspecs.push(value.to_string());
+            }
         }
         index += 1;
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(pathspec_file) = pathspec_from_file.as_deref() {
+        pathspecs.extend(
+            read_commit_pathspecs_from_file(pathspec_file, pathspec_file_nul)?
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
     }
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
@@ -6024,6 +6073,21 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     };
 
     store_created_stash(created, quiet, keep_index)
+}
+
+fn stash_pathspec_from_file_requires_value_error<T>() -> Result<T> {
+    eprintln!("error: option `pathspec-from-file' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn stash_pathspec_from_file_with_inline_pathspec_error<T>() -> Result<T> {
+    eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+    Err(GitError::Exit(128))
+}
+
+fn stash_option_takes_no_value_error<T>(option: &str) -> Result<T> {
+    eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(129))
 }
 
 fn cmd_stash_save(args: &[String]) -> Result<()> {
