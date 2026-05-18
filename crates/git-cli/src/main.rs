@@ -6521,6 +6521,17 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
     });
     tx.commit()?;
 
+    if !quiet {
+        println!(
+            "Saved working directory and index state {}",
+            created.message
+        );
+    }
+    if !created.staged_worktree_conflicts.is_empty() {
+        report_stash_staged_worktree_conflicts(&created.staged_worktree_conflicts, quiet);
+        return Err(GitError::Exit(1));
+    }
+
     if created.pathspec_paths.is_empty() {
         let reset_oid = if keep_index {
             &created.index_oid
@@ -6551,13 +6562,18 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
     for path in &created.untracked_paths {
         remove_stashed_untracked_path(&created.worktree_root, path)?;
     }
-    if !quiet {
-        println!(
-            "Saved working directory and index state {}",
-            created.message
-        );
-    }
     Ok(())
+}
+
+fn report_stash_staged_worktree_conflicts(paths: &[Vec<u8>], quiet: bool) {
+    for path in paths {
+        let path = String::from_utf8_lossy(path);
+        eprintln!("error: patch failed: {path}:1");
+        eprintln!("error: {path}: patch does not apply");
+    }
+    if !quiet {
+        eprintln!("Cannot remove worktree changes");
+    }
 }
 
 struct CreatedStash {
@@ -6571,6 +6587,7 @@ struct CreatedStash {
     worktree_root: PathBuf,
     untracked_paths: Vec<Vec<u8>>,
     pathspec_paths: Vec<PathBuf>,
+    staged_worktree_conflicts: Vec<Vec<u8>>,
     format: ObjectFormat,
 }
 
@@ -6641,6 +6658,7 @@ fn create_stash_commit(
         Some(stash_write_tree_from_entries(&mut db, &untracked_entries)?)
     };
     let mut pathspec_paths = Vec::new();
+    let mut staged_worktree_conflicts = Vec::new();
     if let Some(pathspec) = pathspec.as_ref() {
         let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
         let index_entry_map = stash_index_entry_map(&index_entries);
@@ -6676,14 +6694,11 @@ fn create_stash_commit(
         let worktree_entry_map = stash_index_entry_map(&worktree_entries);
         let staged_change_paths = stash_tree_changed_paths(&head_entries, &index_entry_map);
         let unstaged_change_paths = stash_tree_changed_paths(&index_entry_map, &worktree_entry_map);
-        if staged_change_paths
+        staged_worktree_conflicts = staged_change_paths
             .iter()
-            .any(|path| unstaged_change_paths.contains(path))
-        {
-            return Err(GitError::Unsupported(
-                "stash push --staged currently requires no unstaged changes on staged paths".into(),
-            ));
-        }
+            .filter(|path| unstaged_change_paths.contains(*path))
+            .cloned()
+            .collect();
         pathspec_paths = stash_changed_pathbufs(&staged_change_paths)?;
     }
 
@@ -6753,6 +6768,7 @@ fn create_stash_commit(
         worktree_root,
         untracked_paths,
         pathspec_paths,
+        staged_worktree_conflicts,
         format,
     }))
 }

@@ -91,7 +91,9 @@ Target: upstream Git 2.54.0.
   raw, compact-summary, numstat, shortstat, summary, name-only, name-status,
   patch, quiet, diff-filter, explicit-stash, and untracked-display output, plus
   `stash store` ref/reflog updates with message options and covered invalid
-  commit cases.
+  commit cases, plus covered `stash push` / `stash save --staged` behavior
+  for staged-only changes, disjoint unstaged changes, and same-path unstaged
+  cleanup failures after stash creation.
 - Minimal `mktree` support for `ls-tree`-style stdin records, including
   default object validation, `--missing`, `-z`, `--batch`, tree-entry sorting,
   submodule commit entries, and upstream-readable tree object writes.
@@ -893,6 +895,8 @@ Target: upstream Git 2.54.0.
   `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
   `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/diff-filter/untracked output, `stash store` ref/reflog writes,
+  `stash push` / `stash save --staged` creation and same-path unstaged cleanup
+  failure parity,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and
   patch/interactive requirement errors,
   covered commit `--pathspec-from-file` and `--pathspec-file-nul` parser

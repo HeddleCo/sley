@@ -547,6 +547,11 @@ fn stash_push_matches_upstream_git() {
                 vec!["stash", "push", "--staged"],
             ),
             (
+                "staged-option-with-same-path-unstaged",
+                "staged-and-unstaged",
+                vec!["stash", "push", "--staged"],
+            ),
+            (
                 "no-staged-option",
                 "staged",
                 vec!["stash", "push", "--staged", "--no-staged"],
@@ -852,6 +857,11 @@ fn stash_save_matches_upstream_git() {
             (
                 "staged-option-with-separate-unstaged",
                 "staged-and-unstaged-separate",
+                vec!["stash", "save", "--staged"],
+            ),
+            (
+                "staged-option-with-same-path-unstaged",
+                "staged-and-unstaged",
                 vec!["stash", "save", "--staged"],
             ),
             (
