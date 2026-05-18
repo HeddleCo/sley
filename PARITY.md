@@ -84,8 +84,8 @@ Target: upstream Git 2.54.0.
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,
-  numeric age filters, accepted decoration, no-walk, simple history walk
-  toggles, and parent-count filters, covered
+  numeric age filters plus covered explicit date cutoffs, accepted decoration,
+  no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and `-<n>` / `-n` / `--max-count` limiting including negative
   count reset behavior for covered stash entries and empty repositories,
@@ -900,8 +900,8 @@ Target: upstream Git 2.54.0.
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,
-  numeric age filters, accepted decoration, no-walk, simple history walk
-  toggles, and parent-count filters, covered
+  numeric age filters plus covered explicit date cutoffs, accepted decoration,
+  no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,

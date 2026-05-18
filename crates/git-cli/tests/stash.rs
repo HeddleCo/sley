@@ -414,6 +414,16 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--max-age=1500", "--min-age=1500"],
             vec!["stash", "list", "--max-age=1500", "--max-count=1"],
             vec!["stash", "list", "--min-age=1500", "--skip=1"],
+            vec!["stash", "list", "--since=@1500 +0000"],
+            vec!["stash", "list", "--after=@1500 +0000"],
+            vec!["stash", "list", "--until=@1500 +0000"],
+            vec!["stash", "list", "--before=@1500 +0000"],
+            vec!["stash", "list", "--since", "@1500 +0000"],
+            vec!["stash", "list", "--until", "@1500 +0000"],
+            vec!["stash", "list", "--since=1970-01-01 00:25:00 +0000"],
+            vec!["stash", "list", "--until=1970-01-01T00:25:00 +0000"],
+            vec!["stash", "list", "--since=@1500 +0000", "--max-count=1"],
+            vec!["stash", "list", "--until=@1500 +0000", "--skip=1"],
         ] {
             let expected = git(&ages, &args);
             let actual = git_rs(&ages, &args);

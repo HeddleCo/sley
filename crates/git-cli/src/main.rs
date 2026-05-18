@@ -8012,6 +8012,18 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(age) = value.strip_prefix("--min-age=") => {
                 min_age = Some(parse_stash_list_min_age(age)?);
             }
+            value if let Some(date) = value.strip_prefix("--since=") => {
+                max_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--after=") => {
+                max_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--until=") => {
+                min_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--before=") => {
+                min_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
             value if let Some(count) = value.strip_prefix("--min-parents=") => {
                 min_parents = Some(parse_reflog_min_parent_count(count)?);
             }
@@ -8040,6 +8052,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 index += 1;
                 let value = args.get(index).map_or("refs/stash", String::as_str);
                 min_age = Some(parse_stash_list_min_age(value)?);
+            }
+            "--since" | "--after" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                max_age = Some(parse_stash_list_date_cutoff(value)?);
+            }
+            "--until" | "--before" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                min_age = Some(parse_stash_list_date_cutoff(value)?);
             }
             value if value.starts_with("-n") && value.len() > 2 => {
                 max_count = Some(parse_reflog_count(&value[2..])?);
@@ -8094,6 +8116,13 @@ fn parse_stash_list_age(value: &str) -> Result<i64> {
 fn parse_stash_list_min_age(value: &str) -> Result<i64> {
     let age = parse_stash_list_age(value)?;
     if age < 0 { Ok(i64::MAX) } else { Ok(age) }
+}
+
+fn parse_stash_list_date_cutoff(value: &str) -> Result<i64> {
+    log_parse_date_cutoff(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
 }
 
 fn parse_stash_list_filter_patterns(
