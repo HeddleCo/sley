@@ -191,6 +191,11 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--function-context", "HEAD"],
             vec!["diff", "--name-status", "--indent-heuristic", "HEAD"],
             vec!["diff", "--name-status", "--no-indent-heuristic", "HEAD"],
+            vec!["diff", "--name-status", "--full-diff", "HEAD"],
+            vec!["diff", "--name-status", "-D", "HEAD"],
+            vec!["diff", "--name-status", "--irreversible-delete", "HEAD"],
+            vec!["diff", "--name-status", "--ita-visible-in-index", "HEAD"],
+            vec!["diff", "--name-status", "--ita-invisible-in-index", "HEAD"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);

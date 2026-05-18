@@ -25982,6 +25982,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_whitespace_control = false;
     let mut diff_output_indicator_control = false;
     let mut diff_patch_context_control = false;
+    let mut diff_patch_output_control = false;
     let mut diff_submodule_output_control = false;
     let mut diff_word_control = false;
     let mut src_prefix = "a/".to_string();
@@ -26210,6 +26211,13 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "-W" | "--function-context" | "--indent-heuristic" | "--no-indent-heuristic" => {
                 diff_patch_context_control = true;
             }
+            "--full-diff"
+            | "-D"
+            | "--irreversible-delete"
+            | "--ita-visible-in-index"
+            | "--ita-invisible-in-index" => {
+                diff_patch_output_control = true;
+            }
             value if value.starts_with("--function-context=") => {
                 return log_option_takes_no_value_error("function-context");
             }
@@ -26218,6 +26226,18 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-indent-heuristic=") => {
                 return log_option_takes_no_value_error("no-indent-heuristic");
+            }
+            value if value.starts_with("--full-diff=") => {
+                return log_option_takes_no_value_error("full-diff");
+            }
+            value if value.starts_with("--irreversible-delete=") => {
+                return log_option_takes_no_value_error("irreversible-delete");
+            }
+            value if value.starts_with("--ita-visible-in-index=") => {
+                return log_option_takes_no_value_error("ita-visible-in-index");
+            }
+            value if value.starts_with("--ita-invisible-in-index=") => {
+                return log_option_takes_no_value_error("ita-invisible-in-index");
             }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
@@ -26388,6 +26408,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_patch_context_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff patch context controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_patch_output_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff patch output controls are not supported for this output mode".into(),
         ));
     }
     if diff_submodule_output_control && !name_status && !name_only {
