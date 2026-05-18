@@ -133,6 +133,8 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--minimal", "HEAD"],
             vec!["diff", "--name-status", "--patience", "HEAD"],
             vec!["diff", "--name-status", "--histogram", "HEAD"],
+            vec!["diff", "--name-status", "--anchored", "before", "HEAD"],
+            vec!["diff", "--name-status", "--anchored=before", "HEAD"],
             vec!["diff", "--name-status", "--diff-algorithm", "myers", "HEAD"],
             vec![
                 "diff",

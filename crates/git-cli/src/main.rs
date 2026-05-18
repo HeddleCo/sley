@@ -26078,6 +26078,13 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             "--ext-diff" | "--textconv" => diff_driver_control = true,
             "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
+            "--anchored" => {
+                idx += 1;
+                args.get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("anchored"))?;
+                diff_algorithm_control = true;
+            }
+            value if value.starts_with("--anchored=") => diff_algorithm_control = true,
             "--diff-algorithm" => {
                 idx += 1;
                 let value = args
