@@ -750,6 +750,10 @@ fn diff_renames_match_upstream_git() {
             vec!["diff", "--cached", "-M", "--name-status", "HEAD"],
             vec!["diff", "--cached", "-R", "-M", "--name-status", "HEAD"],
             vec!["diff", "--cached", "-M100%", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-M", "-l0", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-M", "-l", "1", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-M", "-l-1", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-M", "-l1k", "--name-status", "HEAD"],
             vec![
                 "diff",
                 "--cached",
@@ -799,6 +803,15 @@ fn diff_renames_match_upstream_git() {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        for args in [
+            vec!["diff", "--cached", "-M", "-l", "HEAD", "--name-status"],
+            vec!["diff", "--cached", "-M", "-lfoo", "--name-status", "HEAD"],
+        ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
         }
 
         for args in [
@@ -941,6 +954,7 @@ fn diff_copies_match_upstream_git() {
         git(&root, &["add", "copy.txt"]);
         for args in [
             vec!["diff", "--cached", "-C", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-C", "-l1", "--name-status", "HEAD"],
             vec!["diff", "--cached", "-R", "-C", "--name-status", "HEAD"],
             vec!["diff", "--cached", "--find-copies", "--name-status", "HEAD"],
             vec![

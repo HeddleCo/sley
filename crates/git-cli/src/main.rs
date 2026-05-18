@@ -26351,6 +26351,16 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--find-renames=") => detect_renames = true,
             value if value.starts_with("-C") && value.len() > 2 => detect_copies = true,
             value if value.starts_with("--find-copies=") => detect_copies = true,
+            "-l" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(diff_rename_limit_requires_integer_error)?;
+                validate_diff_rename_limit(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("-l") => {
+                validate_diff_rename_limit(value)?;
+            }
             "--diff-filter" => {
                 idx += 1;
                 let value = args
@@ -27616,6 +27626,29 @@ fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
         "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
     );
     Err(GitError::Exit(128))
+}
+
+fn validate_diff_rename_limit(value: &str) -> Result<()> {
+    let value = value
+        .strip_prefix('+')
+        .or_else(|| value.strip_prefix('-'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(value);
+    let value = value
+        .strip_suffix('k')
+        .or_else(|| value.strip_suffix('m'))
+        .or_else(|| value.strip_suffix('g'))
+        .unwrap_or(value);
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        Ok(())
+    } else {
+        Err(diff_rename_limit_requires_integer_error())
+    }
+}
+
+fn diff_rename_limit_requires_integer_error() -> GitError {
+    eprintln!("error: switch `l' expects an integer value with an optional k/m/g suffix");
+    GitError::Exit(129)
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
