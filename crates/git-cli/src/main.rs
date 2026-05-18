@@ -8021,6 +8021,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 }
             }
             value if value.starts_with("--encoding=") => {}
+            value if value.starts_with("--no-encoding") => {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             "--merges" => min_parents = Some(2),
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
@@ -8139,6 +8142,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
+            value if value.starts_with("--no-abbrev=") => {
+                stash_list_option_takes_no_value_error("no-abbrev")?;
+            }
             "--grep" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -8292,15 +8298,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             "--date" => {
                 index += 1;
-                let Some(value) = args.get(index) else {
-                    return Err(GitError::Command("--date requires a value".into()));
-                };
-                date_mode = log_date_mode(value)?;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                date_mode = stash_list_date_mode(value)?;
                 date_explicit = true;
             }
             value if let Some(value) = value.strip_prefix("--date=") => {
-                date_mode = log_date_mode(value)?;
+                date_mode = stash_list_date_mode(value)?;
                 date_explicit = true;
+            }
+            value if value.starts_with("--no-date") => {
+                stash_list_fatal_unrecognized_argument(value)?;
             }
             value if let Some(count) = value.strip_prefix("--max-count=") => {
                 max_count = Some(parse_reflog_count(count)?);
@@ -8513,6 +8520,13 @@ fn parse_stash_list_age(value: &str) -> Result<i64> {
 fn parse_stash_list_min_age(value: &str) -> Result<i64> {
     let age = parse_stash_list_age(value)?;
     if age < 0 { Ok(i64::MAX) } else { Ok(age) }
+}
+
+fn stash_list_date_mode(value: &str) -> Result<ForEachRefDateMode> {
+    log_date_mode(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
 }
 
 fn parse_stash_list_date_cutoff(value: &str) -> Result<i64> {
