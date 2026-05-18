@@ -8082,7 +8082,22 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     || value.starts_with("--no-show-signature=")
                     || value.starts_with("--no-notes=")
                     || value.starts_with("--standard-notes=")
-                    || value.starts_with("--no-standard-notes=") =>
+                    || value.starts_with("--no-standard-notes=")
+                    || value.starts_with("--perl-regexp=")
+                    || value.starts_with("--basic-regexp=")
+                    || value.starts_with("--extended-regexp=")
+                    || value.starts_with("--fixed-strings=")
+                    || value.starts_with("--regexp-ignore-case=")
+                    || value.starts_with("--all-match=")
+                    || value.starts_with("--invert-grep=")
+                    || value.starts_with("--no-perl-regexp")
+                    || value.starts_with("--no-basic-regexp")
+                    || value.starts_with("--no-extended-regexp")
+                    || value.starts_with("--no-fixed-strings")
+                    || value.starts_with("--no-regexp-ignore-case")
+                    || value.starts_with("--no-all-match")
+                    || value.starts_with("--no-invert-grep")
+                    || value.starts_with("--no-grep") =>
             {
                 stash_list_fatal_unrecognized_argument(value)?;
             }
