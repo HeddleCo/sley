@@ -981,6 +981,54 @@ fn stash_apply_matches_upstream_git_for_clean_head() {
                 vec!["stash", "push", "-q", "-m", "quiet"],
                 vec!["stash", "apply", "-q"],
             ),
+            (
+                "no-quiet",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "apply", "-q", "--no-quiet"],
+            ),
+            (
+                "separator-default",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "separator"],
+                vec!["stash", "apply", "--"],
+            ),
+            (
+                "separator-explicit",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "separator"],
+                vec!["stash", "apply", "--", "stash@{0}"],
+            ),
+            (
+                "no-index-overrides-index",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "apply", "--index", "--no-index"],
+            ),
+            (
+                "quiet-value",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "apply", "--quiet=false"],
+            ),
+            (
+                "no-quiet-value",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "apply", "--no-quiet=false"],
+            ),
+            (
+                "index-value",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "apply", "--index=false"],
+            ),
+            (
+                "no-index-value",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "apply", "--no-index=false"],
+            ),
         ] {
             let template = root.join(format!("{name}-template"));
             prepare_stash_create_repo(&template, setup);
@@ -1054,6 +1102,48 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
                 "unstaged",
                 vec!["stash", "push", "-q", "-m", "quiet"],
                 vec!["stash", "pop", "-q"],
+            ),
+            (
+                "no-quiet",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "pop", "-q", "--no-quiet"],
+            ),
+            (
+                "separator-default",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "separator"],
+                vec!["stash", "pop", "--"],
+            ),
+            (
+                "separator-explicit",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "separator"],
+                vec!["stash", "pop", "--", "stash@{0}"],
+            ),
+            (
+                "no-index-overrides-index",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "pop", "--index", "--no-index"],
+            ),
+            (
+                "quiet-value",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "pop", "--quiet=false"],
+            ),
+            (
+                "index-value",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "pop", "--index=false"],
+            ),
+            (
+                "no-index-value",
+                "staged",
+                vec!["stash", "push", "-q", "-m", "staged"],
+                vec!["stash", "pop", "--no-index=false"],
             ),
         ] {
             let template = root.join(format!("{name}-template"));

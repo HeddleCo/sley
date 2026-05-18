@@ -5609,12 +5609,30 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
     let mut quiet = false;
     let mut reinstate_index = false;
     let mut specs = Vec::new();
-    for arg in args {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
             "--index" => reinstate_index = true,
             "--no-index" => reinstate_index = false,
+            value if value.starts_with("--quiet=") => {
+                return stash_option_takes_no_value_error("quiet");
+            }
+            value if value.starts_with("--no-quiet=") => {
+                return stash_option_takes_no_value_error("no-quiet");
+            }
+            value if value.starts_with("--index=") => {
+                return stash_option_takes_no_value_error("index");
+            }
+            value if value.starts_with("--no-index=") => {
+                return stash_option_takes_no_value_error("no-index");
+            }
+            "--" => {
+                specs.extend(args[index + 1..].iter().cloned());
+                break;
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Unsupported(format!(
                     "unsupported stash {command} option {value}"
@@ -5622,6 +5640,7 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
             }
             value => specs.push(value.to_string()),
         }
+        index += 1;
     }
     if specs.len() > 1 {
         eprintln!(
