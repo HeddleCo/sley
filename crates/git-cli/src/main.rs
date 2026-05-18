@@ -25977,6 +25977,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut patch_full_index = false;
     let mut color_always = false;
     let mut diff_algorithm_control = false;
+    let mut diff_driver_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26069,6 +26070,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "--ext-diff" | "--textconv" => diff_driver_control = true,
             "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
             "--diff-algorithm" => {
                 idx += 1;
@@ -26081,6 +26083,12 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             value if let Some(value) = value.strip_prefix("--diff-algorithm=") => {
                 log_validate_diff_algorithm(value)?;
                 diff_algorithm_control = true;
+            }
+            value if value.starts_with("--ext-diff=") => {
+                return log_option_takes_no_value_error("ext-diff");
+            }
+            value if value.starts_with("--textconv=") => {
+                return log_option_takes_no_value_error("textconv");
             }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
@@ -26226,6 +26234,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_algorithm_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff algorithm controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_driver_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff driver controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;
