@@ -263,6 +263,8 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--format=%h", "--no-abbrev"],
             vec!["stash", "list", "--pretty=format:%H"],
             vec!["stash", "list", "--pretty=format:%h"],
+            vec!["stash", "list", "--format=%T|%t|%P|%p|%f|%e|%b|%B"],
+            vec!["stash", "list", "--abbrev=12", "--format=%T|%t|%P|%p|%f"],
             vec!["stash", "list", "--format=%H %h %gd %gD %gs"],
             vec!["stash", "list", "--format=%s"],
             vec!["stash", "list", "--format=literal %% %n%gs"],

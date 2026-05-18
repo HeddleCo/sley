@@ -8202,7 +8202,15 @@ fn print_stash_list_format(
             Some('n') => println!(),
             Some('H') => print!("{}", entry.new_oid),
             Some('h') => print!("{}", format_log_oid(&entry.new_oid, abbrev_len)),
+            Some('T') => print!("{}", commit.tree),
+            Some('t') => print!("{}", format_log_oid(&commit.tree, abbrev_len)),
+            Some('P') => print!("{}", format_commit_parent_oids(&commit.parents, None)),
+            Some('p') => print!("{}", format_commit_parent_oids(&commit.parents, abbrev_len)),
             Some('s') => print!("{}", commit_subject(&commit.message)),
+            Some('f') => print!("{}", log_sanitized_subject(&commit.message)),
+            Some('e') => print!("{}", commit_encoding(commit)),
+            Some('b') => io::stdout().write_all(commit_body(&commit.message))?,
+            Some('B') => io::stdout().write_all(&commit.message)?,
             Some('a') => match chars.next() {
                 Some('n' | 'N') => print!("{author_name}"),
                 Some('e' | 'E') => print!("{author_email}"),
@@ -8324,6 +8332,17 @@ fn print_stash_list_format(
     }
     io::stdout().flush()?;
     Ok(())
+}
+
+fn format_commit_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
+    parents
+        .iter()
+        .map(|oid| match abbrev_len {
+            Some(_) => format_log_oid(oid, abbrev_len),
+            None => oid.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn stash_list_reflog_selector(

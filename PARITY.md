@@ -80,7 +80,8 @@ Target: upstream Git 2.54.0.
   `--all`, missing-ref, missing-value, unknown-option, and invalid-timestamp
   cases.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
-  display, `--oneline`, custom `%H` / `%h` / `%s` / `%an` / `%ae` / `%al` /
+  display, `--oneline`, custom `%H` / `%h` / `%T` / `%t` / `%P` / `%p` /
+  `%s` / `%f` / `%e` / `%b` / `%B` / `%an` / `%ae` / `%al` /
   `%aN` / `%aE` / `%aL` / `%at` / `%ad` / `%ai` / `%aI` / `%as` / `%aD` /
   `%cn` / `%ce` / `%cl` / `%cN` / `%cE` / `%cL` / `%ct` / `%cd` / `%ci` /
   `%cI` / `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` /
@@ -900,7 +901,8 @@ Target: upstream Git 2.54.0.
   including covered `--dry-run` default/long/short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   `stash list` display over `refs/stash` reflogs including default,
-  `--oneline`, custom `%H` / `%h` / `%s` / `%an` / `%ae` / `%al` / `%aN` /
+  `--oneline`, custom `%H` / `%h` / `%T` / `%t` / `%P` / `%p` / `%s` /
+  `%f` / `%e` / `%b` / `%B` / `%an` / `%ae` / `%al` / `%aN` /
   `%aE` / `%aL` / `%at` / `%ad` / `%ai` / `%aI` / `%as` / `%aD` / `%cn` /
   `%ce` / `%cl` / `%cN` / `%cE` / `%cL` / `%ct` / `%cd` / `%ci` / `%cI` /
   `%cs` / `%cD` / `%gd` / `%gD` / `%gn` / `%gN` / `%ge` / `%gE` / `%gs`,
