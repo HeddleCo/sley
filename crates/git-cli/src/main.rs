@@ -5528,6 +5528,7 @@ struct StashListOptions {
     max_parents: Option<usize>,
     abbrev_len: Option<usize>,
     date_mode: ForEachRefDateMode,
+    date_explicit: bool,
     author_filters: Vec<SimpleLogRegex>,
     committer_filters: Vec<SimpleLogRegex>,
     grep_filters: Vec<SimpleLogRegex>,
@@ -7882,6 +7883,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                     list_format,
                     options.abbrev_len,
                     options.date_mode,
+                    options.date_explicit,
                 )?;
                 if *final_newline || position + 1 < selected {
                     println!();
@@ -7902,6 +7904,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut max_parents = None;
     let mut abbrev_len = Some(7);
     let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_explicit = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
@@ -8017,9 +8020,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     return Err(GitError::Command("--date requires a value".into()));
                 };
                 date_mode = log_date_mode(value)?;
+                date_explicit = true;
             }
             value if let Some(value) = value.strip_prefix("--date=") => {
                 date_mode = log_date_mode(value)?;
+                date_explicit = true;
             }
             value if let Some(count) = value.strip_prefix("--max-count=") => {
                 max_count = Some(parse_reflog_count(count)?);
@@ -8119,6 +8124,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         max_parents,
         abbrev_len,
         date_mode,
+        date_explicit,
         author_filters,
         committer_filters,
         grep_filters,
@@ -8178,6 +8184,7 @@ fn print_stash_list_format(
     format: &str,
     abbrev_len: Option<usize>,
     date_mode: ForEachRefDateMode,
+    date_explicit: bool,
 ) -> Result<()> {
     let (author_name, author_email) = commit_identity_name_email(&commit.author);
     let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
@@ -8263,8 +8270,20 @@ fn print_stash_list_format(
                 }
             },
             Some('g') => match chars.next() {
-                Some('d') => print!("stash@{{{index}}}"),
-                Some('D') => print!("refs/stash@{{{index}}}"),
+                Some('d') => print!(
+                    "{}",
+                    stash_list_reflog_selector("stash", index, entry, date_mode, date_explicit)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    stash_list_reflog_selector(
+                        "refs/stash",
+                        index,
+                        entry,
+                        date_mode,
+                        date_explicit
+                    )
+                ),
                 Some('n' | 'N') => print!("{reflog_name}"),
                 Some('e' | 'E') => print!("{reflog_email}"),
                 Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
@@ -8305,6 +8324,20 @@ fn print_stash_list_format(
     }
     io::stdout().flush()?;
     Ok(())
+}
+
+fn stash_list_reflog_selector(
+    reference: &str,
+    index: usize,
+    entry: &ReflogEntry,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+) -> String {
+    if date_explicit {
+        let date = commit_identity_date(&entry.committer, date_mode);
+        return format!("{reference}@{{{date}}}");
+    }
+    format!("{reference}@{{{index}}}")
 }
 
 fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions) -> bool {
@@ -29502,7 +29535,7 @@ fn format_for_each_ref_date(parts: ForEachRefDateParts<'_>, mode: ForEachRefDate
     ];
     match mode {
         ForEachRefDateMode::Default => format!(
-            "{} {} {:02} {:02}:{:02}:{:02} {} {}",
+            "{} {} {} {:02}:{:02}:{:02} {} {}",
             parts.weekday,
             MONTHS[(parts.month - 1) as usize],
             parts.day,
