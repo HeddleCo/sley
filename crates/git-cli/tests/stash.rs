@@ -1203,6 +1203,66 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
 }
 
 #[test]
+fn stash_apply_pop_matches_upstream_git_for_moved_head_unchanged_paths() {
+    let root = unique_temp_dir("stash-apply-moved-head");
+    let result = (|| {
+        for (name, setup, apply_args) in [
+            ("apply", "unstaged", vec!["stash", "apply"]),
+            ("apply-index", "staged", vec!["stash", "apply", "--index"]),
+            ("pop", "unstaged", vec!["stash", "pop"]),
+            ("pop-index", "staged", vec!["stash", "pop", "--index"]),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_moved_head_repo(&template, setup);
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &apply_args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &apply_args);
+            assert_same_output(actual_output, expected, &apply_args);
+
+            for check_args in [
+                vec!["status", "--short"],
+                vec!["stash", "list", "--format=%gs"],
+                vec!["show-ref", "--exists", "refs/stash"],
+            ] {
+                let expected = run_output("git", &upstream, &check_args);
+                let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+                assert_same_output(actual_output, expected, &check_args);
+            }
+            assert_eq!(
+                fs::read(upstream.join("b.txt")).expect("read upstream moved-head file"),
+                fs::read(actual.join("b.txt")).expect("read actual moved-head file"),
+                "moved HEAD file differed for stash apply case {name}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+fn prepare_stash_moved_head_repo(root: &Path, setup: &str) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base a\n").expect("write first base fixture");
+    fs::write(root.join("b.txt"), b"base b\n").expect("write second base fixture");
+    git(root, &["add", "a.txt", "b.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("a.txt"), b"stashed a\n").expect("write stash fixture");
+    if setup == "staged" {
+        git(root, &["add", "a.txt"]);
+    }
+    git(root, &["stash", "push", "-q", "-m", "moved"]);
+    fs::write(root.join("b.txt"), b"new head b\n").expect("write moved head fixture");
+    git(root, &["add", "b.txt"]);
+    git(root, &["commit", "-m", "new head", "-q"]);
+}
+
+#[test]
 fn stash_apply_pop_empty_and_errors_match_upstream_git() {
     let root = unique_temp_dir("stash-apply-pop-errors");
     let result = (|| {

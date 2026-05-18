@@ -5731,7 +5731,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let stash_object = db.read_object(&stash_oid)?;
     let stash_commit = Commit::parse(format, &stash_object.body)?;
     let head_store = FileRefStore::new(&git_dir, format);
-    let Some((head_oid, _)) = stash_head_commit(&head_store, &db, format)? else {
+    let Some((head_oid, head_commit)) = stash_head_commit(&head_store, &db, format)? else {
         eprintln!("You do not have the initial commit yet");
         return Err(GitError::Exit(1));
     };
@@ -5739,11 +5739,6 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         .parents
         .first()
         .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
-    if base_oid != &head_oid {
-        return Err(GitError::Unsupported(
-            "stash apply currently requires the stash base to match HEAD".into(),
-        ));
-    }
     let base_object = db.read_object(base_oid)?;
     if base_object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
@@ -5756,11 +5751,39 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         .parents
         .get(1)
         .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no index parent")))?;
-    git_worktree::reset_index_and_worktree_to_commit(&worktree_root, &git_dir, format, &stash_oid)?;
-    if options.reinstate_index {
-        git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, index_oid)?;
+    let index_object = db.read_object(index_oid)?;
+    if index_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash index parent {index_oid} is not a commit"
+        )));
+    }
+    let index_commit = Commit::parse(format, &index_object.body)?;
+    if base_oid == &head_oid {
+        git_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            &stash_oid,
+        )?;
+        if options.reinstate_index {
+            git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, index_oid)?;
+        } else {
+            git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)?;
+        }
     } else {
-        git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)?;
+        apply_stash_tracked_paths_to_moved_head(
+            &worktree_root,
+            &git_dir,
+            &db,
+            format,
+            StashMovedHeadApply {
+                base_tree: &base_commit.tree,
+                head_tree: &head_commit.tree,
+                stash_tree: &stash_commit.tree,
+                index_tree: &index_commit.tree,
+                reinstate_index: options.reinstate_index,
+            },
+        )?;
     }
     if let Some(untracked_oid) = stash_commit.parents.get(2) {
         let untracked_object = db.read_object(untracked_oid)?;
@@ -5784,6 +5807,84 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         selector: options.selector,
         display: options.display,
     })
+}
+
+struct StashMovedHeadApply<'a> {
+    base_tree: &'a ObjectId,
+    head_tree: &'a ObjectId,
+    stash_tree: &'a ObjectId,
+    index_tree: &'a ObjectId,
+    reinstate_index: bool,
+}
+
+fn apply_stash_tracked_paths_to_moved_head(
+    worktree_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: StashMovedHeadApply<'_>,
+) -> Result<()> {
+    let base_entries = stash_tree_entry_map(db, format, options.base_tree)?;
+    let head_entries = stash_tree_entry_map(db, format, options.head_tree)?;
+    let stash_entries = stash_tree_entry_map(db, format, options.stash_tree)?;
+    let index_entries = stash_tree_entry_map(db, format, options.index_tree)?;
+    let worktree_paths = stash_tree_changed_paths(&base_entries, &stash_entries);
+    let index_paths = if options.reinstate_index {
+        stash_tree_changed_paths(&base_entries, &index_entries)
+    } else {
+        BTreeSet::new()
+    };
+    let mut affected_paths = worktree_paths.clone();
+    affected_paths.extend(index_paths.iter().cloned());
+    for path in &affected_paths {
+        if head_entries.get(path) != base_entries.get(path) {
+            return Err(GitError::Unsupported(
+                "stash apply currently requires stashed paths to be unchanged since the stash base"
+                    .into(),
+            ));
+        }
+    }
+    let worktree_paths = stash_changed_pathbufs(&worktree_paths)?;
+    if !worktree_paths.is_empty() {
+        git_worktree::restore_worktree_paths_from_tree(
+            worktree_root,
+            git_dir,
+            format,
+            options.stash_tree,
+            &worktree_paths,
+        )?;
+    }
+    let index_paths = stash_changed_pathbufs(&index_paths)?;
+    if !index_paths.is_empty() {
+        git_worktree::restore_index_paths_from_tree(
+            worktree_root,
+            git_dir,
+            format,
+            options.index_tree,
+            &index_paths,
+        )?;
+    }
+    Ok(())
+}
+
+fn stash_tree_changed_paths(
+    left: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    right: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> BTreeSet<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    paths.extend(left.keys().cloned());
+    paths.extend(right.keys().cloned());
+    paths
+        .into_iter()
+        .filter(|path| left.get(path) != right.get(path))
+        .collect()
+}
+
+fn stash_changed_pathbufs(paths: &BTreeSet<Vec<u8>>) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| stash_repo_path_to_os_path(path))
+        .collect()
 }
 
 fn restore_stash_tree_to_worktree(
