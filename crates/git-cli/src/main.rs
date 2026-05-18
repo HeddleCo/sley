@@ -8158,6 +8158,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                         | "true"
                         | "1"
                         | "on"
+                        | "yes"
                 ) {
                     // Decorations are not shown in the covered stash-list formats.
                 } else {
@@ -31568,7 +31569,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
             | "-wb"
             | "-W" => {}
             "--decorate" | "--decorate=short" | "--decorate=true" | "--decorate=1"
-            | "--decorate=on" => decoration = LogDecorationMode::Short,
+            | "--decorate=on" | "--decorate=yes" => decoration = LogDecorationMode::Short,
             "--decorate=full" => decoration = LogDecorationMode::Full,
             value if value.starts_with("--decorate=") => {
                 return Err(GitError::Command(format!(

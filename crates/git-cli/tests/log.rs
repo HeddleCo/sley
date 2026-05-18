@@ -644,6 +644,7 @@ fn log_oneline_matches_upstream_git() {
             vec!["log", "--decorate=true", "--oneline", "HEAD"],
             vec!["log", "--decorate=1", "--oneline", "HEAD"],
             vec!["log", "--decorate=on", "--oneline", "HEAD"],
+            vec!["log", "--decorate=yes", "--oneline", "HEAD"],
             vec!["log", "--decorate=full", "--oneline", "HEAD"],
             vec!["log", "--decorate", "--pretty=oneline", "-1", "HEAD"],
             vec!["log", "--decorate", "--format=%H", "-1", "HEAD"],
