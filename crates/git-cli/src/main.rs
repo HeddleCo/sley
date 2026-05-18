@@ -7214,17 +7214,45 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     show_stat = true;
                 }
             }
+            value if value.starts_with("--stat=") => {
+                eprintln!(
+                    "error: invalid --stat value: {}",
+                    value.trim_start_matches("--stat=")
+                );
+                return Err(GitError::Exit(129));
+            }
+            "--no-stat" | "--no-raw" | "--no-name-only" | "--no-name-status" | "--no-numstat"
+            | "--no-shortstat" | "--no-summary" => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            value
+                if value.starts_with("--no-stat=")
+                    || value.starts_with("--no-raw=")
+                    || value.starts_with("--no-name-only=")
+                    || value.starts_with("--no-name-status=")
+                    || value.starts_with("--no-numstat=")
+                    || value.starts_with("--no-shortstat=")
+                    || value.starts_with("--no-summary=") =>
+            {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
             "--raw" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_raw = true;
                 }
             }
+            value if value.starts_with("--raw=") => stash_option_takes_no_value_error("raw")?,
             "--numstat" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_numstat = true;
                 }
+            }
+            value if value.starts_with("--numstat=") => {
+                stash_option_takes_no_value_error("numstat")?
             }
             "--shortstat" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
@@ -7232,17 +7260,46 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     show_shortstat = true;
                 }
             }
+            value if value.starts_with("--shortstat=") => {
+                stash_option_takes_no_value_error("shortstat")?
+            }
             "--summary" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_summary = true;
                 }
             }
+            value if value.starts_with("--summary=") => {
+                stash_option_takes_no_value_error("summary")?
+            }
             "--compact-summary" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     compact_summary = true;
                 }
+            }
+            "--no-compact-summary" => {
+                compact_summary = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--compact-summary=") => {
+                stash_option_takes_no_value_error("compact-summary")?
+            }
+            value if value.starts_with("--no-compact-summary=") => {
+                stash_option_takes_no_value_error("no-compact-summary")?
             }
             "--patch-with-raw" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
@@ -7258,6 +7315,12 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     show_patch = true;
                 }
             }
+            value if value.starts_with("--patch-with-raw=") => {
+                stash_option_takes_no_value_error("patch-with-raw")?
+            }
+            value if value.starts_with("--patch-with-stat=") => {
+                stash_option_takes_no_value_error("patch-with-stat")?
+            }
             "--abbrev" => {
                 raw_abbrev = Some(Some(7));
                 patch_abbrev = Some(7);
@@ -7266,6 +7329,29 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 raw_abbrev = Some(None);
             }
             "--full-index" => patch_full_index = true,
+            "--no-full-index" => {
+                patch_full_index = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--full-index=") => {
+                stash_option_takes_no_value_error("full-index")?
+            }
+            value if value.starts_with("--no-full-index=") => {
+                stash_option_takes_no_value_error("no-full-index")?
+            }
             "--name-only" => {
                 if matches!(mode, StashShowMode::NameStatus | StashShowMode::NoPatch) {
                     eprintln!(
@@ -7274,6 +7360,9 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     return Err(GitError::Exit(128));
                 }
                 mode = StashShowMode::NameOnly;
+            }
+            value if value.starts_with("--name-only=") => {
+                stash_option_takes_no_value_error("name-only")?
             }
             "--name-status" => {
                 if matches!(mode, StashShowMode::NameOnly | StashShowMode::NoPatch) {
@@ -7284,12 +7373,16 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 }
                 mode = StashShowMode::NameStatus;
             }
+            value if value.starts_with("--name-status=") => {
+                stash_option_takes_no_value_error("name-status")?
+            }
             "-p" | "--patch" | "--oneline" => {
                 if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_patch = true;
                 }
             }
+            value if value.starts_with("--patch=") => stash_option_takes_no_value_error("patch")?,
             "-s" | "--no-patch" => {
                 show_stat = false;
                 show_raw = false;
@@ -7300,61 +7393,98 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 show_patch = false;
                 mode = StashShowMode::NoPatch;
             }
+            value if value.starts_with("--no-patch=") => {
+                stash_option_takes_no_value_error("no-patch")?
+            }
             "--quiet" => quiet = true,
+            value if value.starts_with("--quiet=") => stash_option_takes_no_value_error("quiet")?,
             "--no-quiet" => {
                 quiet = false;
-                if matches!(mode, StashShowMode::Stat)
-                    && !(show_raw
-                        || show_stat
-                        || show_numstat
-                        || show_shortstat
-                        || show_summary
-                        || compact_summary
-                        || show_patch)
-                {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
                     show_patch = true;
                 }
+            }
+            value if value.starts_with("--no-quiet=") => {
+                stash_option_takes_no_value_error("no-quiet")?
             }
             "--exit-code" => {
                 exit_code = true;
-                if matches!(mode, StashShowMode::Stat)
-                    && !(show_raw
-                        || show_stat
-                        || show_numstat
-                        || show_shortstat
-                        || show_summary
-                        || compact_summary
-                        || show_patch)
-                {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
                     show_patch = true;
                 }
+            }
+            value if value.starts_with("--exit-code=") => {
+                stash_option_takes_no_value_error("exit-code")?
             }
             "--no-exit-code" => {
                 exit_code = false;
-                if matches!(mode, StashShowMode::Stat)
-                    && !(show_raw
-                        || show_stat
-                        || show_numstat
-                        || show_shortstat
-                        || show_summary
-                        || compact_summary
-                        || show_patch)
-                {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
                     show_patch = true;
                 }
             }
+            value if value.starts_with("--no-exit-code=") => {
+                stash_option_takes_no_value_error("no-exit-code")?
+            }
             "--ext-diff" | "--no-ext-diff" | "--textconv" | "--no-textconv" => {
-                if matches!(mode, StashShowMode::Stat)
-                    && !(show_raw
-                        || show_stat
-                        || show_numstat
-                        || show_shortstat
-                        || show_summary
-                        || compact_summary
-                        || show_patch)
-                {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
                     show_patch = true;
                 }
+            }
+            value if value.starts_with("--ext-diff=") => {
+                stash_option_takes_no_value_error("ext-diff")?
+            }
+            value if value.starts_with("--no-ext-diff=") => {
+                stash_option_takes_no_value_error("no-ext-diff")?
+            }
+            value if value.starts_with("--textconv=") => {
+                stash_option_takes_no_value_error("textconv")?
+            }
+            value if value.starts_with("--no-textconv=") => {
+                stash_option_takes_no_value_error("no-textconv")?
             }
             "-u" | "--include-untracked" => {
                 include_untracked = true;
@@ -7623,6 +7753,10 @@ fn stash_show_summary_outputs_entry(entry: &git_diff_merge::NameStatusEntry) -> 
         | git_diff_merge::NameStatus::Copied(_) => true,
         git_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
     }
+}
+
+fn stash_show_should_enable_default_patch(mode: StashShowMode, visual_modes: [bool; 7]) -> bool {
+    matches!(mode, StashShowMode::Stat) && !visual_modes.into_iter().any(|enabled| enabled)
 }
 
 fn stash_show_usage() {

@@ -1801,9 +1801,11 @@ fn stash_show_matches_upstream_git() {
             vec!["stash", "show", "-p", "--stat"],
             vec!["stash", "show", "-p", "--abbrev=12"],
             vec!["stash", "show", "-p", "--full-index"],
+            vec!["stash", "show", "--no-full-index"],
             vec!["stash", "show", "-p"],
             vec!["stash", "show", "--patch"],
             vec!["stash", "show", "--oneline"],
+            vec!["stash", "show", "--no-compact-summary"],
             vec!["stash", "show", "--quiet", "--no-quiet"],
             vec!["stash", "show", "--name-only", "--quiet", "--no-quiet"],
             vec!["stash", "show", "--quiet", "--no-quiet", "--name-only"],
@@ -1830,6 +1832,42 @@ fn stash_show_matches_upstream_git() {
         let expected = run_output("git", &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
         assert_same_output(actual, expected, &args);
+        for args in [
+            ["stash", "show", "--quiet=false"].as_slice(),
+            ["stash", "show", "--no-quiet=false"].as_slice(),
+            ["stash", "show", "--exit-code=false"].as_slice(),
+            ["stash", "show", "--no-exit-code=false"].as_slice(),
+            ["stash", "show", "--stat=false"].as_slice(),
+            ["stash", "show", "--no-stat"].as_slice(),
+            ["stash", "show", "--no-stat=false"].as_slice(),
+            ["stash", "show", "--raw=false"].as_slice(),
+            ["stash", "show", "--no-raw"].as_slice(),
+            ["stash", "show", "--no-raw=false"].as_slice(),
+            ["stash", "show", "--name-only=false"].as_slice(),
+            ["stash", "show", "--no-name-only"].as_slice(),
+            ["stash", "show", "--name-status=false"].as_slice(),
+            ["stash", "show", "--no-name-status"].as_slice(),
+            ["stash", "show", "--numstat=false"].as_slice(),
+            ["stash", "show", "--no-numstat"].as_slice(),
+            ["stash", "show", "--shortstat=false"].as_slice(),
+            ["stash", "show", "--no-shortstat"].as_slice(),
+            ["stash", "show", "--summary=false"].as_slice(),
+            ["stash", "show", "--no-summary"].as_slice(),
+            ["stash", "show", "--compact-summary=false"].as_slice(),
+            ["stash", "show", "--no-compact-summary=false"].as_slice(),
+            ["stash", "show", "--patch=false"].as_slice(),
+            ["stash", "show", "--no-patch=false"].as_slice(),
+            ["stash", "show", "--full-index=false"].as_slice(),
+            ["stash", "show", "--no-full-index=false"].as_slice(),
+            ["stash", "show", "--ext-diff=false"].as_slice(),
+            ["stash", "show", "--no-ext-diff=false"].as_slice(),
+            ["stash", "show", "--textconv=false"].as_slice(),
+            ["stash", "show", "--no-textconv=false"].as_slice(),
+        ] {
+            let expected = run_output("git", &root, args);
+            let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);
+            assert_same_output(actual, expected, args);
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result
