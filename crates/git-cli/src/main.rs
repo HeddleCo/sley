@@ -25985,6 +25985,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_patch_output_control = false;
     let mut diff_submodule_output_control = false;
     let mut diff_word_control = false;
+    let mut diff_relative = DiffRelativeMode::Off;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26239,6 +26240,14 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--ita-invisible-in-index=") => {
                 return log_option_takes_no_value_error("ita-invisible-in-index");
             }
+            "--relative" => diff_relative = DiffRelativeMode::Cwd,
+            value if let Some(value) = value.strip_prefix("--relative=") => {
+                diff_relative = DiffRelativeMode::Prefix(value.to_string());
+            }
+            "--no-relative" => diff_relative = DiffRelativeMode::Off,
+            value if value.starts_with("--no-relative=") => {
+                return log_option_takes_no_value_error("no-relative");
+            }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
             "--color-moved" | "--no-color-moved" | "--no-color-moved-ws" => {}
@@ -26425,6 +26434,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "diff word controls are not supported for this output mode".into(),
         ));
     }
+    if !matches!(diff_relative, DiffRelativeMode::Off) && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff relative output is not supported for this output mode".into(),
+        ));
+    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -26483,6 +26497,12 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         )?
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = if matches!(diff_relative, DiffRelativeMode::Off) {
+        entries
+    } else {
+        let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        apply_diff_relative(entries, &prefix)
+    };
     let entries: Vec<_> = if diff_filter.all_or_none {
         if !diff_filter.includes.is_empty()
             && entries.iter().any(|entry| {
@@ -27530,6 +27550,115 @@ fn apply_diff_pathspec(
         }
     }
     filtered
+}
+
+enum DiffRelativeMode {
+    Off,
+    Cwd,
+    Prefix(String),
+}
+
+fn diff_relative_prefix(mode: &DiffRelativeMode, cwd: &Path, git_dir: &Path) -> Result<Vec<u8>> {
+    match mode {
+        DiffRelativeMode::Off => Ok(Vec::new()),
+        DiffRelativeMode::Cwd => Ok(worktree_prefix(cwd, git_dir)?
+            .trim_end_matches('/')
+            .as_bytes()
+            .to_vec()),
+        DiffRelativeMode::Prefix(prefix) => Ok(diff_relative_prefix_arg(prefix).into_bytes()),
+    }
+}
+
+fn diff_relative_prefix_arg(prefix: &str) -> String {
+    if prefix.starts_with('/') {
+        prefix.to_string()
+    } else {
+        prefix.trim_end_matches('/').to_string()
+    }
+}
+
+fn apply_diff_relative(
+    entries: Vec<git_diff_merge::NameStatusEntry>,
+    prefix: &[u8],
+) -> Vec<git_diff_merge::NameStatusEntry> {
+    let mut filtered = Vec::new();
+    for entry in entries {
+        if let Some(old_path) = &entry.old_path {
+            let old_display = diff_relative_display_path(old_path, prefix);
+            let new_display = diff_relative_display_path(&entry.path, prefix);
+            if matches!(entry.status, git_diff_merge::NameStatus::Copied(_)) {
+                match (old_display, new_display) {
+                    (Some(old_path), Some(path)) => {
+                        filtered.push(git_diff_merge::NameStatusEntry {
+                            path,
+                            old_path: Some(old_path),
+                            ..entry
+                        })
+                    }
+                    (None, Some(path)) => filtered.push(git_diff_merge::NameStatusEntry {
+                        status: git_diff_merge::NameStatus::Added,
+                        path,
+                        old_path: None,
+                        old_mode: None,
+                        new_mode: entry.new_mode,
+                        old_oid: None,
+                        new_oid: entry.new_oid,
+                    }),
+                    (Some(_), None) | (None, None) => {}
+                }
+            } else {
+                match (old_display, new_display) {
+                    (Some(old_path), Some(path)) => {
+                        filtered.push(git_diff_merge::NameStatusEntry {
+                            path,
+                            old_path: Some(old_path),
+                            ..entry
+                        });
+                    }
+                    (Some(path), None) => filtered.push(git_diff_merge::NameStatusEntry {
+                        status: git_diff_merge::NameStatus::Deleted,
+                        path,
+                        old_path: None,
+                        old_mode: entry.old_mode,
+                        new_mode: None,
+                        old_oid: entry.old_oid,
+                        new_oid: None,
+                    }),
+                    (None, Some(path)) => filtered.push(git_diff_merge::NameStatusEntry {
+                        status: git_diff_merge::NameStatus::Added,
+                        path,
+                        old_path: None,
+                        old_mode: None,
+                        new_mode: entry.new_mode,
+                        old_oid: None,
+                        new_oid: entry.new_oid,
+                    }),
+                    (None, None) => {}
+                }
+            }
+        } else if let Some(path) = diff_relative_display_path(&entry.path, prefix) {
+            filtered.push(git_diff_merge::NameStatusEntry { path, ..entry });
+        }
+    }
+    filtered.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+            .then_with(|| left.status.code().cmp(&right.status.code()))
+    });
+    filtered
+}
+
+fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
+    if prefix.is_empty() {
+        return Some(path.to_vec());
+    }
+    if path == prefix {
+        return Some(Vec::new());
+    }
+    path.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix(b"/"))
+        .map(|rest| rest.to_vec())
 }
 
 #[derive(Default)]

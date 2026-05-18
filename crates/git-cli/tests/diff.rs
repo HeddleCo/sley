@@ -427,6 +427,17 @@ fn diff_pathspecs_match_upstream_git() {
             vec!["diff", "--name-status", "HEAD", "--", "missing"],
             vec!["diff", "--cached", "--name-status", "HEAD", "--", "dir"],
             vec!["diff", "--cached", "--name-only", "-z", "HEAD", "--", "dir"],
+            vec!["diff", "--name-status", "--relative", "HEAD"],
+            vec!["diff", "--name-status", "--relative=dir", "HEAD"],
+            vec!["diff", "--name-only", "-z", "--relative=dir/", "HEAD"],
+            vec!["diff", "--name-status", "--relative=missing", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--relative",
+                "--no-relative",
+                "HEAD",
+            ],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
@@ -441,6 +452,16 @@ fn diff_pathspecs_match_upstream_git() {
             vec!["diff", "--name-status", "HEAD", "--", "."],
             vec!["diff", "--name-only", "-z", "HEAD", "--", "."],
             vec!["diff", "--cached", "--name-status", "HEAD", "--", "."],
+            vec!["diff", "--name-status", "--relative", "HEAD"],
+            vec!["diff", "--name-only", "-z", "--relative", "HEAD"],
+            vec!["diff", "--name-status", "--relative=dir", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--relative",
+                "--no-relative",
+                "HEAD",
+            ],
         ] {
             let expected = git(&nested, &args);
             let actual = git_rs(&nested, &args);
@@ -546,6 +567,62 @@ fn diff_renames_match_upstream_git() {
                 "--",
                 "old.txt",
                 "new.txt",
+            ],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn diff_relative_renames_match_upstream_git() {
+    let root = unique_temp_dir("diff-relative-renames");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::create_dir_all(root.join("dir")).expect("create dir");
+        fs::create_dir_all(root.join("other")).expect("create other dir");
+        fs::write(root.join("dir/old.txt"), b"one\n").expect("write old fixture");
+        fs::write(root.join("other/old.txt"), b"two\n").expect("write other fixture");
+        git(&root, &["add", "dir/old.txt", "other/old.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        git(&root, &["mv", "dir/old.txt", "dir/new.txt"]);
+        git(&root, &["mv", "other/old.txt", "dir/from-other.txt"]);
+
+        for args in [
+            vec![
+                "diff",
+                "--cached",
+                "-M",
+                "--name-status",
+                "--relative=dir",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-M",
+                "--name-only",
+                "-z",
+                "--relative=dir",
+                "HEAD",
             ],
         ] {
             let expected = git(&root, &args);
