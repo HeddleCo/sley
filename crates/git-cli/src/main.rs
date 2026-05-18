@@ -7951,6 +7951,10 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             | "--no-show-signature"
             | "--source"
             | "--no-source"
+            | "--use-mailmap"
+            | "--no-use-mailmap"
+            | "--mailmap"
+            | "--no-mailmap"
             | "--no-patch"
             | "--color"
             | "--no-color"
@@ -8036,6 +8040,18 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value if value.starts_with("--no-decorate-refs-exclude=") => {
                 stash_list_option_takes_no_value_error("no-decorate-refs-exclude")?;
+            }
+            value if value.starts_with("--use-mailmap=") => {
+                stash_list_option_takes_no_value_error("use-mailmap")?;
+            }
+            value if value.starts_with("--no-use-mailmap=") => {
+                stash_list_option_takes_no_value_error("no-use-mailmap")?;
+            }
+            value if value.starts_with("--mailmap=") => {
+                stash_list_option_takes_no_value_error("mailmap")?;
+            }
+            value if value.starts_with("--no-mailmap=") => {
+                stash_list_option_takes_no_value_error("no-mailmap")?;
             }
             "--decorate" => {}
             value if let Some(value) = value.strip_prefix("--decorate=") => {
