@@ -356,6 +356,13 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--no-color-moved", "--format=%gd|%s"],
             vec!["stash", "list", "--color-moved=plain", "--format=%gd|%s"],
             vec!["stash", "list", "--color-moved=no", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=true", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=1", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=on", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=yes", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=false", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=0", "--format=%gd|%s"],
+            vec!["stash", "list", "--color-moved=off", "--format=%gd|%s"],
             vec![
                 "stash",
                 "list",

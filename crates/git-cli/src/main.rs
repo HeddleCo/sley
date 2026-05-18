@@ -32671,7 +32671,8 @@ fn log_validate_ignore_submodules(value: &str) -> Result<()> {
 
 fn log_validate_color_moved(value: &str) -> Result<()> {
     match value {
-        "" | "no" | "default" | "blocks" | "zebra" | "dimmed-zebra" | "plain" => Ok(()),
+        "" | "no" | "default" | "blocks" | "zebra" | "dimmed-zebra" | "plain" | "true" | "1"
+        | "on" | "yes" | "false" | "0" | "off" => Ok(()),
         _ => {
             eprintln!(
                 "error: color moved setting must be one of 'no', 'default', 'blocks', 'zebra', 'dimmed-zebra', 'plain'"
