@@ -5522,6 +5522,8 @@ struct StashListOptions {
     format: StashListFormat,
     max_count: Option<usize>,
     skip_count: usize,
+    max_age: Option<i64>,
+    min_age: Option<i64>,
     min_parents: Option<usize>,
     max_parents: Option<usize>,
     abbrev_len: Option<usize>,
@@ -7884,6 +7886,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut format = StashListFormat::Default;
     let mut max_count = None;
     let mut skip_count = 0;
+    let mut max_age = None;
+    let mut min_age = None;
     let mut min_parents = None;
     let mut max_parents = None;
     let mut abbrev_len = Some(7);
@@ -8002,6 +8006,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(count) = value.strip_prefix("--skip=") => {
                 skip_count = parse_reflog_skip_count(count)?;
             }
+            value if let Some(age) = value.strip_prefix("--max-age=") => {
+                max_age = Some(parse_stash_list_age(age)?);
+            }
+            value if let Some(age) = value.strip_prefix("--min-age=") => {
+                min_age = Some(parse_stash_list_min_age(age)?);
+            }
             value if let Some(count) = value.strip_prefix("--min-parents=") => {
                 min_parents = Some(parse_reflog_min_parent_count(count)?);
             }
@@ -8020,6 +8030,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 index += 1;
                 let value = args.get(index).map_or("refs/stash", String::as_str);
                 skip_count = parse_reflog_skip_count(value)?;
+            }
+            "--max-age" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                max_age = Some(parse_stash_list_age(value)?);
+            }
+            "--min-age" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                min_age = Some(parse_stash_list_min_age(value)?);
             }
             value if value.starts_with("-n") && value.len() > 2 => {
                 max_count = Some(parse_reflog_count(&value[2..])?);
@@ -8050,6 +8070,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         format,
         max_count,
         skip_count,
+        max_age,
+        min_age,
         min_parents,
         max_parents,
         abbrev_len,
@@ -8060,6 +8082,18 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         invert_grep,
         regexp_ignore_case,
     })
+}
+
+fn parse_stash_list_age(value: &str) -> Result<i64> {
+    log_parse_age(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_min_age(value: &str) -> Result<i64> {
+    let age = parse_stash_list_age(value)?;
+    if age < 0 { Ok(i64::MAX) } else { Ok(age) }
 }
 
 fn parse_stash_list_filter_patterns(
@@ -8164,6 +8198,8 @@ fn stash_list_commit_filters_match(
 ) -> Result<bool> {
     if options.min_parents.is_none()
         && options.max_parents.is_none()
+        && options.max_age.is_none()
+        && options.min_age.is_none()
         && options.author_filters.is_empty()
         && options.committer_filters.is_empty()
     {
@@ -8179,9 +8215,10 @@ fn stash_list_commit_filters_match(
         &commit.committer,
         &options.committer_filters,
         options.regexp_ignore_case,
-    ) && options
-        .min_parents
-        .is_none_or(|min| commit.parents.len() >= min)
+    ) && stash_list_age_filters_match(&commit, options)?
+        && options
+            .min_parents
+            .is_none_or(|min| commit.parents.len() >= min)
         && options
             .max_parents
             .is_none_or(|max| commit.parents.len() <= max))
@@ -8199,6 +8236,15 @@ fn stash_list_identity_filters_match(
     filters
         .iter()
         .any(|filter| filter.is_match(&identity, ignore_case))
+}
+
+fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> Result<bool> {
+    if options.max_age.is_none() && options.min_age.is_none() {
+        return Ok(true);
+    }
+    let timestamp = commit_identity_timestamp_i64(&commit.committer)?;
+    Ok(options.max_age.is_none_or(|age| timestamp >= age)
+        && options.min_age.is_none_or(|age| timestamp <= age))
 }
 
 fn ancestor_depths(

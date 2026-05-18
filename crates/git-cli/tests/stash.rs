@@ -95,6 +95,23 @@ fn git_stash_push_with_identity(
     );
 }
 
+fn git_stash_push_with_dates(cwd: &Path, message: &str, author_date: &str, committer_date: &str) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["stash", "push", "-q", "-m", message])
+        .env("GIT_AUTHOR_DATE", author_date)
+        .env("GIT_COMMITTER_DATE", committer_date)
+        .output()
+        .expect("run git stash with dates");
+    assert!(
+        output.status.success(),
+        "git stash push failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn prepare_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
     git(root, &["init", "-q"]);
@@ -135,6 +152,33 @@ fn prepare_stash_identity_repo(root: &Path) {
         "Committer Two",
         "committer2@example.invalid",
     );
+}
+
+fn prepare_stash_age_repo(root: &Path) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["commit", "-m", "base", "-q"])
+        .env("GIT_AUTHOR_DATE", "@100 +0000")
+        .env("GIT_COMMITTER_DATE", "@100 +0000")
+        .output()
+        .expect("run git commit with dates");
+    assert!(
+        output.status.success(),
+        "git commit failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::write(root.join("a.txt"), b"old\n").expect("write old stash fixture");
+    git_stash_push_with_dates(root, "old", "@1000 +0000", "@1000 +0000");
+    fs::write(root.join("a.txt"), b"new\n").expect("write new stash fixture");
+    git_stash_push_with_dates(root, "new", "@2000 +0000", "@2000 +0000");
 }
 
 fn prepare_untracked_stash_repo(root: &Path) {
@@ -242,6 +286,8 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--committer=Example"],
             vec!["stash", "list", "--author"],
             vec!["stash", "list", "--committer"],
+            vec!["stash", "list", "--max-age=0"],
+            vec!["stash", "list", "--min-age=0"],
             vec!["stash", "list", "--skip=1"],
             vec!["stash", "list", "--skip", "1"],
             vec!["stash", "list", "--skip=-1"],
@@ -311,6 +357,10 @@ fn stash_list_matches_upstream_git() {
             ["stash", "list", "--max-parents=bad"].as_slice(),
             ["stash", "list", "--author=["].as_slice(),
             ["stash", "list", "--committer=["].as_slice(),
+            ["stash", "list", "--max-age=bad"].as_slice(),
+            ["stash", "list", "--min-age=bad"].as_slice(),
+            ["stash", "list", "--max-age"].as_slice(),
+            ["stash", "list", "--min-age"].as_slice(),
         ] {
             let expected = run_output("git", &root, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);
@@ -347,6 +397,29 @@ fn stash_list_matches_upstream_git() {
             assert_eq!(
                 actual, expected,
                 "git-rs stash identity filter output differed for {args:?}"
+            );
+        }
+
+        let ages = root.join("ages");
+        prepare_stash_age_repo(&ages);
+        for args in [
+            vec!["stash", "list", "--max-age=1500"],
+            vec!["stash", "list", "--max-age", "1500"],
+            vec!["stash", "list", "--min-age=1500"],
+            vec!["stash", "list", "--min-age", "1500"],
+            vec!["stash", "list", "--max-age=-1"],
+            vec!["stash", "list", "--min-age=-1"],
+            vec!["stash", "list", "--max-age=0"],
+            vec!["stash", "list", "--min-age=0"],
+            vec!["stash", "list", "--max-age=1500", "--min-age=1500"],
+            vec!["stash", "list", "--max-age=1500", "--max-count=1"],
+            vec!["stash", "list", "--min-age=1500", "--skip=1"],
+        ] {
+            let expected = git(&ages, &args);
+            let actual = git_rs(&ages, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs stash age filter output differed for {args:?}"
             );
         }
     })();
