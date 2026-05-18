@@ -8148,7 +8148,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(value) = value.strip_prefix("--decorate=") => {
                 if matches!(
                     value,
-                    "no" | "auto" | "short" | "full" | "" | "false" | "0" | "off"
+                    "no" | "auto"
+                        | "short"
+                        | "full"
+                        | ""
+                        | "false"
+                        | "0"
+                        | "off"
+                        | "true"
+                        | "1"
+                        | "on"
                 ) {
                     // Decorations are not shown in the covered stash-list formats.
                 } else {
