@@ -7951,7 +7951,22 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             | "--no-show-signature"
             | "--source"
             | "--no-source"
-            | "--no-patch" => {}
+            | "--no-patch"
+            | "--no-diff-merges"
+            | "--full-diff"
+            | "--relative"
+            | "--no-relative"
+            | "--ext-diff"
+            | "--no-ext-diff"
+            | "--no-renames"
+            | "--find-renames"
+            | "--find-copies"
+            | "--find-copies-harder"
+            | "--no-find-copies-harder"
+            | "--textconv"
+            | "--no-textconv"
+            | "-M"
+            | "-C" => {}
             "--encoding" => {
                 if index + 1 < args.len() {
                     index += 1;
@@ -8024,6 +8039,29 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "-F" | "--fixed-strings" => regexp_mode = SimpleLogRegexMode::Fixed,
             "-E" | "-P" | "--basic-regexp" | "--extended-regexp" | "--perl-regexp" => {
                 regexp_mode = SimpleLogRegexMode::Basic
+            }
+            value if value.starts_with("-M") => {
+                log_validate_similarity_option(&value[2..], "find-renames")?;
+            }
+            value if value.starts_with("-C") => {
+                log_validate_similarity_option(&value[2..], "find-copies")?;
+            }
+            value if value.starts_with("--relative=") => {}
+            value if let Some(value) = value.strip_prefix("--find-renames=") => {
+                log_validate_similarity_option(value, "find-renames")?;
+            }
+            value if let Some(value) = value.strip_prefix("--find-copies=") => {
+                log_validate_similarity_option(value, "find-copies")?;
+            }
+            "--diff-merges" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(log_diff_merges_requires_value_error());
+                };
+                log_validate_diff_merges(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--diff-merges=") => {
+                log_validate_diff_merges(value)?;
             }
             "--format" | "--pretty" => {
                 index += 1;

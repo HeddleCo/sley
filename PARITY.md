@@ -91,8 +91,9 @@ Target: upstream Git 2.54.0.
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,
-  notes, encoding, source, signature, patch-suppression, no-walk, simple history
-  walk toggles, and parent-count filters, covered
+  notes, encoding, source, signature, patch-suppression, ext-diff/textconv,
+  full-diff, rename/copy detection, relative path, merge-diff suppression,
+  no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and `-<n>` / `-n` / `--max-count` limiting including negative
   count reset behavior for covered stash entries and empty repositories,
@@ -914,8 +915,9 @@ Target: upstream Git 2.54.0.
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,
-  notes, encoding, source, signature, patch-suppression, no-walk, simple history
-  walk toggles, and parent-count filters, covered
+  notes, encoding, source, signature, patch-suppression, ext-diff/textconv,
+  full-diff, rename/copy detection, relative path, merge-diff suppression,
+  no-walk, simple history walk toggles, and parent-count filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
