@@ -150,6 +150,21 @@ fn diff_name_only_matches_upstream_git() {
                 "HEAD",
             ],
             vec!["diff", "--name-status", "--ws-error-highlight=all", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--output-indicator-new",
+                "@",
+                "HEAD",
+            ],
+            vec!["diff", "--name-status", "--output-indicator-old=_", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--output-indicator-context",
+                ".",
+                "HEAD",
+            ],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
