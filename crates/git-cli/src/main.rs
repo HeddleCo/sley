@@ -7869,10 +7869,18 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                 );
             }
             StashListFormat::Custom {
-                format,
+                format: list_format,
                 final_newline,
             } => {
-                print_stash_list_format(entry, *stash_index, format, options.abbrev_len)?;
+                let object = db.read_object(&entry.new_oid)?;
+                let commit = Commit::parse(format, &object.body)?;
+                print_stash_list_format(
+                    entry,
+                    *stash_index,
+                    &commit,
+                    list_format,
+                    options.abbrev_len,
+                )?;
                 if *final_newline || position + 1 < selected {
                     println!();
                 }
@@ -8152,9 +8160,14 @@ fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
 fn print_stash_list_format(
     entry: &ReflogEntry,
     index: usize,
+    commit: &Commit,
     format: &str,
     abbrev_len: Option<usize>,
 ) -> Result<()> {
+    let (author_name, author_email) = commit_identity_name_email(&commit.author);
+    let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
+    let author_timestamp = commit_identity_timestamp(&commit.author);
+    let committer_timestamp = commit_identity_timestamp(&commit.committer);
     let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
     let mut chars = format.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -8167,7 +8180,37 @@ fn print_stash_list_format(
             Some('n') => println!(),
             Some('H') => print!("{}", entry.new_oid),
             Some('h') => print!("{}", format_log_oid(&entry.new_oid, abbrev_len)),
-            Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
+            Some('s') => print!("{}", commit_subject(&commit.message)),
+            Some('a') => match chars.next() {
+                Some('n' | 'N') => print!("{author_name}"),
+                Some('e' | 'E') => print!("{author_email}"),
+                Some('t') => print!("{author_timestamp}"),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %a{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %a".into(),
+                    ));
+                }
+            },
+            Some('c') => match chars.next() {
+                Some('n' | 'N') => print!("{committer_name}"),
+                Some('e' | 'E') => print!("{committer_email}"),
+                Some('t') => print!("{committer_timestamp}"),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %c{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %c".into(),
+                    ));
+                }
+            },
             Some('g') => match chars.next() {
                 Some('d') => print!("stash@{{{index}}}"),
                 Some('D') => print!("refs/stash@{{{index}}}"),

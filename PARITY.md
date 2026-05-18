@@ -80,8 +80,9 @@ Target: upstream Git 2.54.0.
   `--all`, missing-ref, missing-value, unknown-option, and invalid-timestamp
   cases.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
-  display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
-  `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
+  display, `--oneline`, custom `%H` / `%h` / `%s` / `%an` / `%ae` / `%aN` /
+  `%aE` / `%at` / `%cn` / `%ce` / `%cN` / `%cE` / `%ct` / `%gd` / `%gD` /
+  `%gn` / `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,
@@ -896,8 +897,9 @@ Target: upstream Git 2.54.0.
   including covered `--dry-run` default/long/short/porcelain/null preview combinations,
   reset/no-op parsing and value rejection for dry-run/long/ahead-behind/interactive/patch display toggles,
   `stash list` display over `refs/stash` reflogs including default,
-  `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
-  `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
+  `--oneline`, custom `%H` / `%h` / `%s` / `%an` / `%ae` / `%aN` /
+  `%aE` / `%at` / `%cn` / `%ce` / `%cN` / `%cE` / `%ct` / `%gd` / `%gD` /
+  `%gn` / `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
   case/fixed-string/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,

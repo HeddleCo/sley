@@ -380,6 +380,11 @@ fn stash_list_matches_upstream_git() {
             vec![
                 "stash",
                 "list",
+                "--format=%gd|%an|%ae|%aN|%aE|%cn|%ce|%cN|%cE|%at|%ct|%s",
+            ],
+            vec![
+                "stash",
+                "list",
                 "--author=Author One",
                 "--committer=Committer One",
             ],
