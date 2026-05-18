@@ -31567,7 +31567,8 @@ fn cmd_log(args: &[String]) -> Result<()> {
             | "-bw"
             | "-wb"
             | "-W" => {}
-            "--decorate" | "--decorate=short" => decoration = LogDecorationMode::Short,
+            "--decorate" | "--decorate=short" | "--decorate=true" | "--decorate=1"
+            | "--decorate=on" => decoration = LogDecorationMode::Short,
             "--decorate=full" => decoration = LogDecorationMode::Full,
             value if value.starts_with("--decorate=") => {
                 return Err(GitError::Command(format!(

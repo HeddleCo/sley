@@ -41,8 +41,8 @@ Target: upstream Git 2.54.0.
   `A..B` / `A...B` ranges for covered log walks,
   `--parents` commit-header output for covered default/oneline modes,
   `--children` oneline header output, plus
-  no-op parser compatibility for quiet, source, mailmap, encoding, and decoration
-  disabling flags, and
+  no-op parser compatibility for quiet, source, mailmap, encoding, decoration
+  disabling flags, and boolean decoration aliases, plus
   commit-ish peeling from annotated tags.
 - Annotated tag object parse/write support and minimal `tag -a -m` /
   `tag -F` creation.
@@ -1125,7 +1125,8 @@ Target: upstream Git 2.54.0.
   over commits and annotated tags, `log --reverse`, log quiet/source/mailmap/
   decoration auto/empty/false, clearing/filtering/disabling no-op flags for covered no-mailmap cases,
   encoding output selection no-op behavior for covered UTF-8 commits,
-  and short/full `--decorate` labels for covered oneline/pretty-oneline modes,
+  and short/full plus boolean-alias `--decorate` labels for covered
+  oneline/pretty-oneline modes,
   walk-mode (`--no-walk` and `--first-parent` for covered single-revision cases), default date-ready walk ordering, explicit ordering (`--topo-order`, `--date-order`, and `--author-date-order`) for covered single-revision walks, no-op history simplification flags (`--sparse`, `--dense`, `--remove-empty`, `--unpacked`, `--full-history`, `--simplify-merges`, and `--show-pulls`) for covered path-free walks, ref selectors (`--all`, `--branches[=<glob>]`, `--tags[=<glob>]`, `--remotes[=<glob>]`, and `--glob[=<glob>]` with scoped `--exclude` plus `--exclude-hidden[=<section>]` configured hidden-ref filtering for covered `--all` / `--glob` modes) for covered local ref walks, `--default <rev>` fallback when no explicit start revision is supplied, `--stdin` revision input for covered LF-delimited revision and `--not` toggle cases, multiple positive revisions, `^rev` / `--not` exclusions, and simple `A..B` / `A...B` ranges for covered log walks, identity filters (`--author[=<pattern>]` and `--committer[=<pattern>]`), message filters (`--grep[=<pattern>]`, `--all-match`, and `--invert-grep`), filter case folding (`-i` / `--regexp-ignore-case`), regexp mode flags (`-F` / `--fixed-strings`, `-E`, `--basic-regexp`, and `--extended-regexp`) for covered literal and simple regex cases, and timestamp filters (`--max-age[=<epoch>]`, `--min-age[=<epoch>]`, plus `--since` / `--after` / `--until` / `--before` for covered `@<epoch> <tz>` and explicit `YYYY-MM-DD[ T]HH:MM:SS <tz>` forms), parent-count filters (`--merges`, `--no-merges`, and min/max parent forms), abbreviation control (`--abbrev-commit`, `--no-abbrev-commit`, `--abbrev[=<n>]`, and `--no-abbrev`) for covered commit-header/oneline/custom placeholder modes, `--parents` commit-header output for covered default/oneline modes, `--children` oneline header output, plus date-display/notes-signature-disabling/unsigned-signature-display/color-mode/no-op color-placeholder/patch-suppression/merge-diff-disabling/diff-display/rename/copy-detection/rewrite-detection/diff-algorithm/anchored-diff/whitespace-diff/context-control/prefix-control/index-abbrev/submodule/textconv/color-moved/ws-error-highlight/pickaxe-mode no-op flags for covered no-patch cases, single-object SHA-1/SHA-256
   pack-read, SHA-1/SHA-256 deltified pack-read, SHA-1 thin pack-read with
   external base lookup, and single-object
