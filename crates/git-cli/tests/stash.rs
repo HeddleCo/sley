@@ -383,6 +383,14 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
             git(root, &["add", "a.txt"]);
             fs::write(root.join("a.txt"), b"worktree\n").expect("write worktree fixture");
         }
+        "staged-and-unstaged-separate" => {
+            fs::write(root.join("b.txt"), b"base b\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"staged\n").expect("write staged fixture");
+            git(root, &["add", "a.txt"]);
+            fs::write(root.join("b.txt"), b"worktree\n").expect("write worktree fixture");
+        }
         "deleted" => {
             fs::remove_file(root.join("a.txt")).expect("remove tracked fixture");
         }
@@ -533,6 +541,11 @@ fn stash_push_matches_upstream_git() {
             ),
             ("staged-option", "staged", vec!["stash", "push", "--staged"]),
             ("staged-option-short", "staged", vec!["stash", "push", "-S"]),
+            (
+                "staged-option-with-separate-unstaged",
+                "staged-and-unstaged-separate",
+                vec!["stash", "push", "--staged"],
+            ),
             (
                 "no-staged-option",
                 "staged",
@@ -836,6 +849,11 @@ fn stash_save_matches_upstream_git() {
             ),
             ("staged-option", "staged", vec!["stash", "save", "--staged"]),
             ("staged-option-short", "staged", vec!["stash", "save", "-S"]),
+            (
+                "staged-option-with-separate-unstaged",
+                "staged-and-unstaged-separate",
+                vec!["stash", "save", "--staged"],
+            ),
             (
                 "no-staged-option",
                 "staged",

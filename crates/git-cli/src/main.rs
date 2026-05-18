@@ -6671,11 +6671,20 @@ fn create_stash_commit(
             }
             return Ok(None);
         }
-        if worktree_tree != index_tree {
+        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
+        let index_entry_map = stash_index_entry_map(&index_entries);
+        let worktree_entry_map = stash_index_entry_map(&worktree_entries);
+        let staged_change_paths = stash_tree_changed_paths(&head_entries, &index_entry_map);
+        let unstaged_change_paths = stash_tree_changed_paths(&index_entry_map, &worktree_entry_map);
+        if staged_change_paths
+            .iter()
+            .any(|path| unstaged_change_paths.contains(path))
+        {
             return Err(GitError::Unsupported(
-                "stash push --staged currently requires no unstaged tracked changes".into(),
+                "stash push --staged currently requires no unstaged changes on staged paths".into(),
             ));
         }
+        pathspec_paths = stash_changed_pathbufs(&staged_change_paths)?;
     }
 
     let branch = store
