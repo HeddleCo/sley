@@ -7970,8 +7970,31 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             | "--no-find-copies-harder"
             | "--textconv"
             | "--no-textconv"
+            | "--minimal"
+            | "--patience"
+            | "--histogram"
+            | "--indent-heuristic"
+            | "--no-indent-heuristic"
+            | "--ignore-space-at-eol"
+            | "--ignore-cr-at-eol"
+            | "--ignore-space-change"
+            | "--ignore-all-space"
+            | "--ignore-blank-lines"
+            | "--function-context"
+            | "--no-prefix"
+            | "--default-prefix"
+            | "--full-index"
+            | "--break-rewrites"
+            | "--irreversible-delete"
             | "-M"
-            | "-C" => {}
+            | "-C"
+            | "-B"
+            | "-D"
+            | "-m"
+            | "-s"
+            | "-b"
+            | "-w"
+            | "-W" => {}
             "--encoding" => {
                 if index + 1 < args.len() {
                     index += 1;
