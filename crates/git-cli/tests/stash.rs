@@ -982,6 +982,12 @@ fn stash_apply_matches_upstream_git_for_clean_head() {
                 vec!["stash", "apply", "-q"],
             ),
             (
+                "quiet-combined",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "apply", "-qq"],
+            ),
+            (
                 "no-quiet",
                 "unstaged",
                 vec!["stash", "push", "-q", "-m", "quiet"],
@@ -1104,6 +1110,12 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
                 vec!["stash", "pop", "-q"],
             ),
             (
+                "quiet-combined",
+                "unstaged",
+                vec!["stash", "push", "-q", "-m", "quiet"],
+                vec!["stash", "pop", "-qq"],
+            ),
+            (
                 "no-quiet",
                 "unstaged",
                 vec!["stash", "push", "-q", "-m", "quiet"],
@@ -1184,6 +1196,85 @@ fn stash_pop_matches_upstream_git_for_clean_head() {
                 let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
                 assert_same_output(actual_output, expected, &check_args);
             }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn stash_apply_pop_empty_and_errors_match_upstream_git() {
+    let root = unique_temp_dir("stash-apply-pop-errors");
+    let result = (|| {
+        for (name, setup, args) in [
+            ("apply-empty", "clean", vec!["stash", "apply"]),
+            ("pop-empty", "clean", vec!["stash", "pop"]),
+            (
+                "apply-empty-explicit",
+                "clean",
+                vec!["stash", "apply", "stash@{99}"],
+            ),
+            (
+                "pop-empty-explicit",
+                "clean",
+                vec!["stash", "pop", "stash@{99}"],
+            ),
+            ("apply-empty-bad", "clean", vec!["stash", "apply", "bad"]),
+            ("pop-empty-bad", "clean", vec!["stash", "pop", "bad"]),
+            (
+                "apply-out-of-range",
+                "unstaged",
+                vec!["stash", "apply", "stash@{99}"],
+            ),
+            (
+                "pop-out-of-range",
+                "unstaged",
+                vec!["stash", "pop", "stash@{99}"],
+            ),
+            (
+                "apply-too-many",
+                "clean",
+                vec!["stash", "apply", "stash@{0}", "extra"],
+            ),
+            (
+                "pop-too-many",
+                "clean",
+                vec!["stash", "pop", "stash@{0}", "extra"],
+            ),
+            (
+                "apply-unknown-option",
+                "clean",
+                vec!["stash", "apply", "--bogus"],
+            ),
+            (
+                "pop-unknown-option",
+                "clean",
+                vec!["stash", "pop", "--bogus"],
+            ),
+            (
+                "apply-unknown-switch",
+                "clean",
+                vec!["stash", "apply", "-q=false"],
+            ),
+            (
+                "apply-combined-quiet-empty",
+                "clean",
+                vec!["stash", "apply", "-qq"],
+            ),
+        ] {
+            let template = root.join(format!("{name}-template"));
+            prepare_stash_create_repo(&template, setup);
+            if setup != "clean" {
+                run_output_with_fixed_identity("git", &template, &["stash", "push", "-q"]);
+            }
+            let upstream = root.join(format!("{name}-upstream"));
+            let actual = root.join(format!("{name}-actual"));
+            copy_dir(&template, &upstream);
+            copy_dir(&template, &actual);
+
+            let expected = run_output("git", &upstream, &args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected, &args);
         }
     })();
     let _ = fs::remove_dir_all(&root);

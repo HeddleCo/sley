@@ -5521,6 +5521,7 @@ fn cmd_stash(args: &[String]) -> Result<()> {
 struct StashApplyOptions {
     quiet: bool,
     reinstate_index: bool,
+    explicit_selector: bool,
     selector: usize,
     display: String,
 }
@@ -5593,6 +5594,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
     let applied = apply_stash_entry(StashApplyOptions {
         quiet: false,
         reinstate_index: true,
+        explicit_selector: true,
         selector,
         display,
     })?;
@@ -5615,6 +5617,10 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            value if value.starts_with("-q") && value.len() > 2 => {
+                stash_apply_parse_combined_quiet(value, command)?;
+                quiet = true;
+            }
             "--index" => reinstate_index = true,
             "--no-index" => reinstate_index = false,
             value if value.starts_with("--quiet=") => {
@@ -5634,9 +5640,7 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
                 break;
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported stash {command} option {value}"
-                )));
+                return stash_apply_unknown_option_error(command, value);
             }
             value => specs.push(value.to_string()),
         }
@@ -5660,9 +5664,39 @@ fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashAppl
     Ok(StashApplyOptions {
         quiet,
         reinstate_index,
+        explicit_selector: !specs.is_empty(),
         selector,
         display,
     })
+}
+
+fn stash_apply_parse_combined_quiet(value: &str, command: &str) -> Result<()> {
+    for byte in value.as_bytes()[2..].iter().copied() {
+        if byte != b'q' {
+            return stash_apply_unknown_switch_error(command, byte as char);
+        }
+    }
+    Ok(())
+}
+
+fn stash_apply_unknown_option_error<T>(command: &str, value: &str) -> Result<T> {
+    eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+    stash_apply_usage(command);
+    Err(GitError::Exit(129))
+}
+
+fn stash_apply_unknown_switch_error<T>(command: &str, switch: char) -> Result<T> {
+    eprintln!("error: unknown switch `{switch}'");
+    stash_apply_usage(command);
+    Err(GitError::Exit(129))
+}
+
+fn stash_apply_usage(command: &str) {
+    eprintln!("usage: git stash {command} [--index] [-q | --quiet] [<stash>]");
+    eprintln!();
+    eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
+    eprintln!("    --[no-]index          attempt to recreate the index");
+    eprintln!();
 }
 
 fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
@@ -5674,6 +5708,10 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
     let store = FileRefStore::new(&common_git_dir, format);
     let entries = store.read_reflog("refs/stash")?;
     if entries.is_empty() {
+        if options.explicit_selector {
+            eprintln!("error: {} is not a valid reference", options.display);
+            return Err(GitError::Exit(1));
+        }
         eprintln!("No stash entries found.");
         return Err(GitError::Exit(1));
     }
