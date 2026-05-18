@@ -7183,11 +7183,12 @@ enum StashShowMode {
     NameOnly,
     NameStatus,
     NoPatch,
-    Quiet,
 }
 
 fn cmd_stash_show(args: &[String]) -> Result<()> {
     let mut mode = StashShowMode::Stat;
+    let mut quiet = false;
+    let mut exit_code = false;
     let mut show_stat = false;
     let mut show_raw = false;
     let mut show_numstat = false;
@@ -7208,74 +7209,50 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         let arg = &args[idx];
         match arg.as_str() {
             "--stat" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_stat = true;
                 }
             }
             "--raw" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_raw = true;
                 }
             }
             "--numstat" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_numstat = true;
                 }
             }
             "--shortstat" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_shortstat = true;
                 }
             }
             "--summary" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_summary = true;
                 }
             }
             "--compact-summary" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     compact_summary = true;
                 }
             }
             "--patch-with-raw" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_raw = true;
                     show_patch = true;
                 }
             }
             "--patch-with-stat" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_stat = true;
                     show_patch = true;
@@ -7296,9 +7273,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     );
                     return Err(GitError::Exit(128));
                 }
-                if !matches!(mode, StashShowMode::Quiet) {
-                    mode = StashShowMode::NameOnly;
-                }
+                mode = StashShowMode::NameOnly;
             }
             "--name-status" => {
                 if matches!(mode, StashShowMode::NameOnly | StashShowMode::NoPatch) {
@@ -7307,15 +7282,10 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     );
                     return Err(GitError::Exit(128));
                 }
-                if !matches!(mode, StashShowMode::Quiet) {
-                    mode = StashShowMode::NameStatus;
-                }
+                mode = StashShowMode::NameStatus;
             }
             "-p" | "--patch" | "--oneline" => {
-                if !matches!(
-                    mode,
-                    StashShowMode::NameOnly | StashShowMode::NameStatus | StashShowMode::Quiet
-                ) {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
                     mode = StashShowMode::Stat;
                     show_patch = true;
                 }
@@ -7328,11 +7298,64 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 show_summary = false;
                 compact_summary = false;
                 show_patch = false;
-                if !matches!(mode, StashShowMode::Quiet) {
-                    mode = StashShowMode::NoPatch;
+                mode = StashShowMode::NoPatch;
+            }
+            "--quiet" => quiet = true,
+            "--no-quiet" => {
+                quiet = false;
+                if matches!(mode, StashShowMode::Stat)
+                    && !(show_raw
+                        || show_stat
+                        || show_numstat
+                        || show_shortstat
+                        || show_summary
+                        || compact_summary
+                        || show_patch)
+                {
+                    show_patch = true;
                 }
             }
-            "--quiet" => mode = StashShowMode::Quiet,
+            "--exit-code" => {
+                exit_code = true;
+                if matches!(mode, StashShowMode::Stat)
+                    && !(show_raw
+                        || show_stat
+                        || show_numstat
+                        || show_shortstat
+                        || show_summary
+                        || compact_summary
+                        || show_patch)
+                {
+                    show_patch = true;
+                }
+            }
+            "--no-exit-code" => {
+                exit_code = false;
+                if matches!(mode, StashShowMode::Stat)
+                    && !(show_raw
+                        || show_stat
+                        || show_numstat
+                        || show_shortstat
+                        || show_summary
+                        || compact_summary
+                        || show_patch)
+                {
+                    show_patch = true;
+                }
+            }
+            "--ext-diff" | "--no-ext-diff" | "--textconv" | "--no-textconv" => {
+                if matches!(mode, StashShowMode::Stat)
+                    && !(show_raw
+                        || show_stat
+                        || show_numstat
+                        || show_shortstat
+                        || show_summary
+                        || compact_summary
+                        || show_patch)
+                {
+                    show_patch = true;
+                }
+            }
             "-u" | "--include-untracked" => {
                 include_untracked = true;
                 only_untracked = false;
@@ -7496,6 +7519,13 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             .unwrap_or(7)
             .min(format.hex_len())
     };
+    let has_entries = !entries.is_empty();
+    if quiet {
+        if has_entries {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     match mode {
         StashShowMode::Stat => {
             let has_visual_mode = show_raw
@@ -7578,11 +7608,9 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
             }
         }
         StashShowMode::NoPatch => {}
-        StashShowMode::Quiet => {
-            if !entries.is_empty() {
-                return Err(GitError::Exit(1));
-            }
-        }
+    }
+    if exit_code && has_entries {
+        return Err(GitError::Exit(1));
     }
     Ok(())
 }

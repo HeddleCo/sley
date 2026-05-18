@@ -1804,6 +1804,14 @@ fn stash_show_matches_upstream_git() {
             vec!["stash", "show", "-p"],
             vec!["stash", "show", "--patch"],
             vec!["stash", "show", "--oneline"],
+            vec!["stash", "show", "--quiet", "--no-quiet"],
+            vec!["stash", "show", "--name-only", "--quiet", "--no-quiet"],
+            vec!["stash", "show", "--quiet", "--no-quiet", "--name-only"],
+            vec!["stash", "show", "--exit-code", "--no-exit-code"],
+            vec!["stash", "show", "--ext-diff"],
+            vec!["stash", "show", "--no-ext-diff"],
+            vec!["stash", "show", "--textconv"],
+            vec!["stash", "show", "--no-textconv"],
             vec!["stash", "show", "stash@{1}"],
             vec!["stash", "show", "refs/stash@{0}"],
         ] {
@@ -1815,6 +1823,10 @@ fn stash_show_matches_upstream_git() {
             );
         }
         let args = ["stash", "show", "--quiet"];
+        let expected = run_output("git", &root, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+        assert_same_output(actual, expected, &args);
+        let args = ["stash", "show", "--exit-code"];
         let expected = run_output("git", &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
         assert_same_output(actual, expected, &args);
