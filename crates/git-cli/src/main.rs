@@ -26084,7 +26084,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
-            "--color-moved" | "--no-color-moved" => {}
+            "--color-moved" | "--no-color-moved" | "--no-color-moved-ws" => {}
             value if let Some(value) = value.strip_prefix("--color-moved=") => {
                 log_validate_color_moved(value)?;
             }
@@ -26097,6 +26097,9 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             value if let Some(value) = value.strip_prefix("--color-moved-ws=") => {
                 log_validate_color_moved_ws(value)?;
+            }
+            value if value.starts_with("--no-color-moved-ws=") => {
+                return log_option_takes_no_value_error("no-color-moved-ws");
             }
             "--ignore-submodules"
             | "--ignore-submodules=none"

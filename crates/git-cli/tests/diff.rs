@@ -125,6 +125,7 @@ fn diff_name_only_matches_upstream_git() {
                 "ignore-all-space",
                 "HEAD",
             ],
+            vec!["diff", "--name-status", "--no-color-moved-ws", "HEAD"],
             vec!["diff", "--name-status", "--ignore-submodules", "HEAD"],
             vec!["diff", "--name-status", "--ignore-submodules=dirty", "HEAD"],
             vec!["diff", "--name-status", "--minimal", "HEAD"],
