@@ -69,6 +69,32 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run_success(env!("CARGO_BIN_EXE_git-rs"), cwd, args)
 }
 
+fn git_stash_push_with_identity(
+    cwd: &Path,
+    message: &str,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+) {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(["stash", "push", "-q", "-m", message])
+        .env("GIT_AUTHOR_NAME", author_name)
+        .env("GIT_AUTHOR_EMAIL", author_email)
+        .env("GIT_COMMITTER_NAME", committer_name)
+        .env("GIT_COMMITTER_EMAIL", committer_email)
+        .output()
+        .expect("run git stash with identity");
+    assert!(
+        output.status.success(),
+        "git stash push failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn prepare_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
     git(root, &["init", "-q"]);
@@ -81,6 +107,34 @@ fn prepare_stash_repo(root: &Path) {
     git(root, &["stash", "push", "-q", "-m", "one"]);
     fs::write(root.join("a.txt"), b"two\n").expect("write second stash fixture");
     git(root, &["stash", "push", "-q", "-m", "two"]);
+}
+
+fn prepare_stash_identity_repo(root: &Path) {
+    fs::create_dir_all(root).expect("create temp repo");
+    git(root, &["init", "-q"]);
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
+    fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
+    git(root, &["add", "a.txt"]);
+    git(root, &["commit", "-m", "base", "-q"]);
+    fs::write(root.join("a.txt"), b"one\n").expect("write first stash fixture");
+    git_stash_push_with_identity(
+        root,
+        "one",
+        "Author One",
+        "author1@example.invalid",
+        "Committer One",
+        "committer1@example.invalid",
+    );
+    fs::write(root.join("a.txt"), b"two\n").expect("write second stash fixture");
+    git_stash_push_with_identity(
+        root,
+        "two",
+        "Author Two",
+        "author2@example.invalid",
+        "Committer Two",
+        "committer2@example.invalid",
+    );
 }
 
 fn prepare_untracked_stash_repo(root: &Path) {
@@ -184,6 +238,10 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--grep=one", "--grep=two", "--all-match"],
             vec!["stash", "list", "--grep=.", "-F"],
             vec!["stash", "list", "--grep=.", "--basic-regexp"],
+            vec!["stash", "list", "--author=Example"],
+            vec!["stash", "list", "--committer=Example"],
+            vec!["stash", "list", "--author"],
+            vec!["stash", "list", "--committer"],
             vec!["stash", "list", "--skip=1"],
             vec!["stash", "list", "--skip", "1"],
             vec!["stash", "list", "--skip=-1"],
@@ -251,10 +309,45 @@ fn stash_list_matches_upstream_git() {
             ["stash", "list", "--max-count"].as_slice(),
             ["stash", "list", "--min-parents=bad"].as_slice(),
             ["stash", "list", "--max-parents=bad"].as_slice(),
+            ["stash", "list", "--author=["].as_slice(),
+            ["stash", "list", "--committer=["].as_slice(),
         ] {
             let expected = run_output("git", &root, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);
             assert_same_output(actual, expected, args);
+        }
+
+        let identity = root.join("identity");
+        prepare_stash_identity_repo(&identity);
+        for args in [
+            vec!["stash", "list", "--author=Author One"],
+            vec!["stash", "list", "--author", "Author Two"],
+            vec!["stash", "list", "--author=author1@example"],
+            vec!["stash", "list", "--author=AUTHOR TWO", "-i"],
+            vec!["stash", "list", "--committer=Committer One"],
+            vec!["stash", "list", "--committer", "committer2@example"],
+            vec!["stash", "list", "--committer=COMMITTER TWO", "-i"],
+            vec![
+                "stash",
+                "list",
+                "--author=Author One",
+                "--committer=Committer One",
+            ],
+            vec![
+                "stash",
+                "list",
+                "--author=Author One",
+                "--committer=Committer Two",
+            ],
+            vec!["stash", "list", "--author=Missing"],
+            vec!["stash", "list", "--committer=Missing"],
+        ] {
+            let expected = git(&identity, &args);
+            let actual = git_rs(&identity, &args);
+            assert_eq!(
+                actual, expected,
+                "git-rs stash identity filter output differed for {args:?}"
+            );
         }
     })();
     let _ = fs::remove_dir_all(&root);

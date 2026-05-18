@@ -5525,6 +5525,8 @@ struct StashListOptions {
     min_parents: Option<usize>,
     max_parents: Option<usize>,
     abbrev_len: Option<usize>,
+    author_filters: Vec<SimpleLogRegex>,
+    committer_filters: Vec<SimpleLogRegex>,
     grep_filters: Vec<SimpleLogRegex>,
     grep_all_match: bool,
     invert_grep: bool,
@@ -7837,7 +7839,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     entries.retain(|(_, entry)| stash_list_grep_filters_match(entry, &options));
     let mut parent_filtered_entries = Vec::new();
     for (stash_index, entry) in entries {
-        if stash_list_parent_filters_match(&db, format, &entry, &options)? {
+        if stash_list_commit_filters_match(&db, format, &entry, &options)? {
             parent_filtered_entries.push((stash_index, entry));
         }
     }
@@ -7885,6 +7887,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut min_parents = None;
     let mut max_parents = None;
     let mut abbrev_len = Some(7);
+    let mut author_patterns = Vec::new();
+    let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
     let mut grep_all_match = false;
     let mut invert_grep = false;
@@ -7956,6 +7960,22 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(value) = value.strip_prefix("--grep=") => {
                 grep_patterns.push(LogFilterPattern::new(value, "command line"));
             }
+            "--author" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                author_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--author=") => {
+                author_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            "--committer" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                committer_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--committer=") => {
+                committer_patterns.push(LogFilterPattern::new(value, "header"));
+            }
             "--all-match" => grep_all_match = true,
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
@@ -8023,7 +8043,9 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         }
         index += 1;
     }
-    let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
+    let author_filters = parse_stash_list_filter_patterns(&author_patterns, regexp_mode)?;
+    let committer_filters = parse_stash_list_filter_patterns(&committer_patterns, regexp_mode)?;
+    let grep_filters = parse_stash_list_filter_patterns(&grep_patterns, regexp_mode)?;
     Ok(StashListOptions {
         format,
         max_count,
@@ -8031,10 +8053,22 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         min_parents,
         max_parents,
         abbrev_len,
+        author_filters,
+        committer_filters,
         grep_filters,
         grep_all_match,
         invert_grep,
         regexp_ignore_case,
+    })
+}
+
+fn parse_stash_list_filter_patterns(
+    patterns: &[LogFilterPattern],
+    mode: SimpleLogRegexMode,
+) -> Result<Vec<SimpleLogRegex>> {
+    parse_log_filter_patterns(patterns, mode).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
     })
 }
 
@@ -8122,23 +8156,49 @@ fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions
     matched != options.invert_grep
 }
 
-fn stash_list_parent_filters_match(
+fn stash_list_commit_filters_match(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     entry: &ReflogEntry,
     options: &StashListOptions,
 ) -> Result<bool> {
-    if options.min_parents.is_none() && options.max_parents.is_none() {
+    if options.min_parents.is_none()
+        && options.max_parents.is_none()
+        && options.author_filters.is_empty()
+        && options.committer_filters.is_empty()
+    {
         return Ok(true);
     }
     let object = db.read_object(&entry.new_oid)?;
     let commit = Commit::parse(format, &object.body)?;
-    Ok(options
+    Ok(stash_list_identity_filters_match(
+        &commit.author,
+        &options.author_filters,
+        options.regexp_ignore_case,
+    ) && stash_list_identity_filters_match(
+        &commit.committer,
+        &options.committer_filters,
+        options.regexp_ignore_case,
+    ) && options
         .min_parents
         .is_none_or(|min| commit.parents.len() >= min)
         && options
             .max_parents
             .is_none_or(|max| commit.parents.len() <= max))
+}
+
+fn stash_list_identity_filters_match(
+    identity: &[u8],
+    filters: &[SimpleLogRegex],
+    ignore_case: bool,
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let identity = String::from_utf8_lossy(identity);
+    filters
+        .iter()
+        .any(|filter| filter.is_match(&identity, ignore_case))
 }
 
 fn ancestor_depths(

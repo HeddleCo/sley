@@ -82,7 +82,8 @@ Target: upstream Git 2.54.0.
 - Minimal `stash list` support over `refs/stash` reflogs, including default
   display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
-  `--grep` filtering with case/fixed-string/all-match/invert toggles,
+  `--author` / `--committer` identity filtering, `--grep` filtering with
+  case/fixed-string/all-match/invert toggles,
   accepted decoration, no-walk, simple history walk toggles, and parent-count
   filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
@@ -897,7 +898,8 @@ Target: upstream Git 2.54.0.
   `stash list` display over `refs/stash` reflogs including default,
   `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
-  `--grep` filtering with case/fixed-string/all-match/invert toggles,
+  `--author` / `--committer` identity filtering, `--grep` filtering with
+  case/fixed-string/all-match/invert toggles,
   accepted decoration, no-walk, simple history walk toggles, and parent-count
   filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
