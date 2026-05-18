@@ -211,10 +211,27 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--irreversible-delete", "HEAD"],
             vec!["diff", "--name-status", "--ita-visible-in-index", "HEAD"],
             vec!["diff", "--name-status", "--ita-invisible-in-index", "HEAD"],
+            vec!["diff", "--name-status", "-B", "HEAD"],
+            vec!["diff", "--name-status", "-B50%", "HEAD"],
+            vec!["diff", "--name-status", "-B20%/70%", "HEAD"],
+            vec!["diff", "--name-status", "--break-rewrites", "HEAD"],
+            vec!["diff", "--name-status", "--break-rewrites=50%", "HEAD"],
+            vec!["diff", "--name-status", "--break-rewrites=20%/70%", "HEAD"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        for args in [
+            vec!["diff", "--name-status", "-Bfoo", "HEAD"],
+            vec!["diff", "--name-status", "-B1/2/3", "HEAD"],
+            vec!["diff", "--name-status", "--break-rewrites=foo", "HEAD"],
+            vec!["diff", "--name-status", "--break-rewrites=1/2/3", "HEAD"],
+        ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
         }
     })();
     let _ = fs::remove_dir_all(&root);

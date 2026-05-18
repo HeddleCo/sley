@@ -25988,6 +25988,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_output_indicator_control = false;
     let mut diff_patch_context_control = false;
     let mut diff_patch_output_control = false;
+    let mut diff_rewrite_control = false;
     let mut diff_submodule_output_control = false;
     let mut diff_word_control = false;
     let mut diff_relative = DiffRelativeMode::Off;
@@ -26257,6 +26258,15 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             | "--ita-invisible-in-index" => {
                 diff_patch_output_control = true;
             }
+            "-B" | "--break-rewrites" => diff_rewrite_control = true,
+            value if let Some(value) = value.strip_prefix("-B") => {
+                log_validate_break_rewrites_option(value)?;
+                diff_rewrite_control = true;
+            }
+            value if let Some(value) = value.strip_prefix("--break-rewrites=") => {
+                log_validate_break_rewrites_option(value)?;
+                diff_rewrite_control = true;
+            }
             value if value.starts_with("--function-context=") => {
                 return log_option_takes_no_value_error("function-context");
             }
@@ -26478,6 +26488,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_patch_output_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff patch output controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_rewrite_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff rewrite controls are not supported for this output mode".into(),
         ));
     }
     if diff_submodule_output_control && !name_status && !name_only {
