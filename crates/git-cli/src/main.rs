@@ -25981,6 +25981,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_hunk_control = false;
     let mut diff_whitespace_control = false;
     let mut diff_output_indicator_control = false;
+    let mut diff_patch_context_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26156,6 +26157,18 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_output_indicator("output-indicator-context", value)?;
                 diff_output_indicator_control = true;
             }
+            "-W" | "--function-context" | "--indent-heuristic" | "--no-indent-heuristic" => {
+                diff_patch_context_control = true;
+            }
+            value if value.starts_with("--function-context=") => {
+                return log_option_takes_no_value_error("function-context");
+            }
+            value if value.starts_with("--indent-heuristic=") => {
+                return log_option_takes_no_value_error("indent-heuristic");
+            }
+            value if value.starts_with("--no-indent-heuristic=") => {
+                return log_option_takes_no_value_error("no-indent-heuristic");
+            }
             "--color" | "--color=always" => color_always = true,
             "--no-color" | "--color=never" | "--color=auto" => color_always = false,
             "--color-moved" | "--no-color-moved" | "--no-color-moved-ws" => {}
@@ -26320,6 +26333,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_output_indicator_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff output indicator controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_patch_context_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff patch context controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;

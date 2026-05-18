@@ -165,6 +165,10 @@ fn diff_name_only_matches_upstream_git() {
                 ".",
                 "HEAD",
             ],
+            vec!["diff", "--name-status", "-W", "HEAD"],
+            vec!["diff", "--name-status", "--function-context", "HEAD"],
+            vec!["diff", "--name-status", "--indent-heuristic", "HEAD"],
+            vec!["diff", "--name-status", "--no-indent-heuristic", "HEAD"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
