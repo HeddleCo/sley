@@ -5948,6 +5948,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut include_ignored = false;
     let mut keep_index = false;
     let mut create_mode = StashCreateMode::Worktree;
+    let mut patch = false;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut pathspec_from_file = None;
@@ -5975,6 +5976,14 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             "--no-keep-index" => keep_index = false,
             "-S" | "--staged" => create_mode = StashCreateMode::Staged,
             "--no-staged" => create_mode = StashCreateMode::Worktree,
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            value if value.starts_with("--patch=") => {
+                return stash_option_takes_no_value_error("patch");
+            }
+            value if value.starts_with("--no-patch=") => {
+                return stash_option_takes_no_value_error("no-patch");
+            }
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -5993,6 +6002,10 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("-m") && value.len() > 2 => {
                 message_args = vec![value[2..].to_string()];
+            }
+            "--no-message" => message_args.clear(),
+            value if value.starts_with("--no-message=") => {
+                return stash_option_takes_no_value_error("no-message");
             }
             "--" => {
                 if pathspec_from_file.is_some() && index + 1 < args.len() {
@@ -6058,6 +6071,11 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Err(GitError::Exit(1));
     }
+    if patch {
+        return Err(GitError::Unsupported(
+            "stash push --patch is not implemented".into(),
+        ));
+    }
     let Some(created) = create_stash_commit(
         &message_args,
         include_untracked,
@@ -6096,6 +6114,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     let mut include_ignored = false;
     let mut keep_index = false;
     let mut create_mode = StashCreateMode::Worktree;
+    let mut patch = false;
     let mut explicit_message = Vec::new();
     let mut positional_message = Vec::new();
     let mut index = 0;
@@ -6121,6 +6140,14 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             "--no-keep-index" => keep_index = false,
             "-S" | "--staged" => create_mode = StashCreateMode::Staged,
             "--no-staged" => create_mode = StashCreateMode::Worktree,
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            value if value.starts_with("--patch=") => {
+                return stash_option_takes_no_value_error("patch");
+            }
+            value if value.starts_with("--no-patch=") => {
+                return stash_option_takes_no_value_error("no-patch");
+            }
             "-m" | "--message" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
@@ -6139,6 +6166,10 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("-m") && value.len() > 2 => {
                 explicit_message = vec![value[2..].to_string()];
+            }
+            "--no-message" => explicit_message.clear(),
+            value if value.starts_with("--no-message=") => {
+                return stash_option_takes_no_value_error("no-message");
             }
             "--" => {
                 positional_message.extend(args[index..].iter().cloned());
@@ -6161,6 +6192,11 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Err(GitError::Exit(1));
+    }
+    if patch {
+        return Err(GitError::Unsupported(
+            "stash save --patch is not implemented".into(),
+        ));
     }
     let Some(created) = create_stash_commit(
         &message_args,

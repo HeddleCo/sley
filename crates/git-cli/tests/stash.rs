@@ -441,6 +441,22 @@ fn stash_push_matches_upstream_git() {
                 "unstaged",
                 vec!["stash", "push", "-q", "--no-quiet"],
             ),
+            ("no-patch", "unstaged", vec!["stash", "push", "--no-patch"]),
+            (
+                "patch-no-patch",
+                "unstaged",
+                vec!["stash", "push", "--patch", "--no-patch"],
+            ),
+            (
+                "no-message",
+                "unstaged",
+                vec!["stash", "push", "-m", "ignored", "--no-message"],
+            ),
+            (
+                "no-message-value",
+                "unstaged",
+                vec!["stash", "push", "--no-message=value"],
+            ),
             (
                 "keep-index-staged",
                 "staged",
@@ -679,6 +695,22 @@ fn stash_save_matches_upstream_git() {
                 "no-quiet",
                 "unstaged",
                 vec!["stash", "save", "-q", "--no-quiet"],
+            ),
+            ("no-patch", "unstaged", vec!["stash", "save", "--no-patch"]),
+            (
+                "patch-no-patch",
+                "unstaged",
+                vec!["stash", "save", "--patch", "--no-patch"],
+            ),
+            (
+                "no-message",
+                "unstaged",
+                vec!["stash", "save", "-m", "ignored", "--no-message"],
+            ),
+            (
+                "no-message-value",
+                "unstaged",
+                vec!["stash", "save", "--no-message=value"],
             ),
             (
                 "keep-index-staged",
