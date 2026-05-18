@@ -7490,15 +7490,28 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                 include_untracked = true;
                 only_untracked = false;
             }
+            value if value.starts_with("--include-untracked=") => {
+                stash_option_takes_no_value_error("include-untracked")?
+            }
             "--no-include-untracked" => {
                 include_untracked = false;
                 only_untracked = false;
+            }
+            value if value.starts_with("--no-include-untracked=") => {
+                stash_option_takes_no_value_error("no-include-untracked")?
             }
             "--only-untracked" => {
                 include_untracked = true;
                 only_untracked = true;
             }
+            value if value.starts_with("--only-untracked=") => {
+                stash_option_takes_no_value_error("only-untracked")?
+            }
             "--no-only-untracked" => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--no-only-untracked=") => {
                 stash_show_usage();
                 return Err(GitError::Exit(129));
             }

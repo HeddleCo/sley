@@ -91,8 +91,8 @@ Target: upstream Git 2.54.0.
   raw, compact-summary, numstat, shortstat, summary, name-only, name-status,
   patch, quiet/no-quiet, exit-code, accepted ext-diff/textconv toggles,
   `--no-full-index` / `--no-compact-summary` reset behavior, covered
-  no-value errors for visual toggles, diff-filter, explicit-stash, and
-  untracked-display output, plus
+  no-value errors for visual and untracked-display toggles, diff-filter,
+  explicit-stash, and untracked-display output, plus
   `stash store` ref/reflog updates with message options and covered invalid
   commit cases, plus covered `stash push` / `stash save --staged` behavior
   for staged-only changes, disjoint unstaged changes, and same-path unstaged
@@ -897,7 +897,7 @@ Target: upstream Git 2.54.0.
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
   `--reverse` rejection, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
-  `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/quiet/exit-code/diff-filter/untracked output plus covered visual-toggle no-value errors, `stash store` ref/reflog writes,
+  `stash show` default raw/stat/compact-summary/numstat/shortstat/summary/name/name-status/patch/quiet/exit-code/diff-filter/untracked output plus covered visual/untracked-toggle no-value errors, `stash store` ref/reflog writes,
   `stash push` / `stash save --staged` creation and same-path unstaged cleanup
   failure parity,
   covered `-U` / `--unified` and `--inter-hunk-context` value parsing and

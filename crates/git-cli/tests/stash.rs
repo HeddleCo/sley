@@ -1903,6 +1903,18 @@ fn stash_show_untracked_flags_match_upstream_git() {
             vec![
                 "stash",
                 "show",
+                "--only-untracked",
+                "--no-include-untracked",
+            ],
+            vec![
+                "stash",
+                "show",
+                "--include-untracked",
+                "--no-include-untracked",
+            ],
+            vec![
+                "stash",
+                "show",
                 "--name-status",
                 "--diff-filter=A",
                 "--include-untracked",
@@ -1973,6 +1985,18 @@ fn stash_show_untracked_flags_match_upstream_git() {
             ["stash", "show", "--name-only", "--name-status"].as_slice(),
             ["stash", "show", "--name-status", "--name-only"].as_slice(),
             ["stash", "show", "--no-only-untracked"].as_slice(),
+            ["stash", "show", "--include-untracked=false"].as_slice(),
+            ["stash", "show", "--no-include-untracked=false"].as_slice(),
+            ["stash", "show", "--only-untracked=false"].as_slice(),
+            ["stash", "show", "--no-only-untracked=false"].as_slice(),
+            [
+                "stash",
+                "show",
+                "--include-untracked",
+                "--only-untracked",
+                "--no-only-untracked",
+            ]
+            .as_slice(),
         ] {
             let expected = run_output("git", &untracked, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &untracked, args);
