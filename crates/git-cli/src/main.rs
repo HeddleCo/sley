@@ -7931,7 +7931,10 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 );
                 return Err(GitError::Exit(1));
             }
-            "--no-decorate"
+            "-q"
+            | "--quiet"
+            | "--no-quiet"
+            | "--no-decorate"
             | "--walk-reflogs"
             | "--no-walk"
             | "--do-walk"
@@ -8031,6 +8034,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--no-decorate=") => {
                 eprintln!("error: option `no-decorate' takes no value");
                 return Err(GitError::Exit(1));
+            }
+            value if value.starts_with("--quiet=") => {
+                stash_list_option_takes_no_value_error("quiet")?;
+            }
+            value if value.starts_with("--no-quiet=") => {
+                stash_list_option_takes_no_value_error("no-quiet")?;
             }
             value if value.starts_with("--clear-decorations=") => {
                 stash_list_option_takes_no_value_error("clear-decorations")?;
