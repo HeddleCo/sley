@@ -5971,9 +5971,9 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
                 include_untracked = false;
                 include_ignored = false;
             }
-            "--keep-index" => keep_index = true,
+            "-k" | "--keep-index" => keep_index = true,
             "--no-keep-index" => keep_index = false,
-            "--staged" => create_mode = StashCreateMode::Staged,
+            "-S" | "--staged" => create_mode = StashCreateMode::Staged,
             "--no-staged" => create_mode = StashCreateMode::Worktree,
             "-m" | "--message" => {
                 index += 1;
@@ -6117,9 +6117,9 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
                 include_untracked = false;
                 include_ignored = false;
             }
-            "--keep-index" => keep_index = true,
+            "-k" | "--keep-index" => keep_index = true,
             "--no-keep-index" => keep_index = false,
-            "--staged" => create_mode = StashCreateMode::Staged,
+            "-S" | "--staged" => create_mode = StashCreateMode::Staged,
             "--no-staged" => create_mode = StashCreateMode::Worktree,
             "-m" | "--message" => {
                 index += 1;

@@ -446,6 +446,7 @@ fn stash_push_matches_upstream_git() {
                 "staged",
                 vec!["stash", "push", "--keep-index"],
             ),
+            ("keep-index-short", "staged", vec!["stash", "push", "-k"]),
             (
                 "keep-index-mixed",
                 "staged-and-unstaged",
@@ -462,6 +463,7 @@ fn stash_push_matches_upstream_git() {
                 vec!["stash", "push", "--keep-index", "--no-keep-index"],
             ),
             ("staged-option", "staged", vec!["stash", "push", "--staged"]),
+            ("staged-option-short", "staged", vec!["stash", "push", "-S"]),
             (
                 "no-staged-option",
                 "staged",
@@ -683,6 +685,7 @@ fn stash_save_matches_upstream_git() {
                 "staged",
                 vec!["stash", "save", "--keep-index"],
             ),
+            ("keep-index-short", "staged", vec!["stash", "save", "-k"]),
             (
                 "keep-index-mixed",
                 "staged-and-unstaged",
@@ -694,6 +697,7 @@ fn stash_save_matches_upstream_git() {
                 vec!["stash", "save", "--keep-index", "--no-keep-index"],
             ),
             ("staged-option", "staged", vec!["stash", "save", "--staged"]),
+            ("staged-option-short", "staged", vec!["stash", "save", "-S"]),
             (
                 "no-staged-option",
                 "staged",
