@@ -539,8 +539,9 @@ Target: upstream Git 2.54.0.
   colored `--stat` / `--compact-summary` graph output with `--color[=always]`,
   non-coloring name output with `--color[=always]`, general `--no-color` /
   `--color=never|auto`, no-op `--color-moved` / `--color-moved-ws`
-  / `--no-color-moved-ws` controls, name-output no-op diff algorithm controls, and non-submodule
-  `--ignore-submodules`, and cached/staged variants
+  / `--no-color-moved-ws` controls, name-output no-op diff algorithm
+  controls and `--inter-hunk-context`, non-submodule `--ignore-submodules`,
+  and cached/staged variants
   support for added, modified, and deleted paths known to the index/HEAD,
   exact rename detection for name output including `-M` / `--find-renames` /
   `--no-renames`, exact copy detection for name output including `-C` /

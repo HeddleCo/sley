@@ -140,6 +140,8 @@ fn diff_name_only_matches_upstream_git() {
                 "--diff-algorithm=histogram",
                 "HEAD",
             ],
+            vec!["diff", "--name-status", "--inter-hunk-context", "3", "HEAD"],
+            vec!["diff", "--name-status", "--inter-hunk-context=3", "HEAD"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
