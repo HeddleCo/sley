@@ -536,7 +536,8 @@ Target: upstream Git 2.54.0.
   headers, including Git-style path quoting for patch headers,
   no-op parsing for `-a` / `--text`, `--no-ext-diff`, `--no-textconv`,
   non-coloring name output with `--color[=always]`, general `--no-color` /
-  `--color=never|auto`, and non-submodule
+  `--color=never|auto`, no-op `--color-moved` / `--color-moved-ws`
+  controls, and non-submodule
   `--ignore-submodules`, and cached/staged variants
   support for added, modified, and deleted paths known to the index/HEAD,
   exact rename detection for name output including `-M` / `--find-renames` /

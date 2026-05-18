@@ -26067,6 +26067,20 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             "--color" | "--color=always" => color_output_requested = true,
             "--no-color" | "--color=never" | "--color=auto" => {}
+            "--color-moved" | "--no-color-moved" => {}
+            value if let Some(value) = value.strip_prefix("--color-moved=") => {
+                log_validate_color_moved(value)?;
+            }
+            "--color-moved-ws" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("color-moved-ws"))?;
+                log_validate_color_moved_ws(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--color-moved-ws=") => {
+                log_validate_color_moved_ws(value)?;
+            }
             "--ignore-submodules"
             | "--ignore-submodules=none"
             | "--ignore-submodules=untracked"
