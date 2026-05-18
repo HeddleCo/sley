@@ -5531,6 +5531,7 @@ struct StashListOptions {
     date_explicit: bool,
     author_filters: Vec<SimpleLogRegex>,
     committer_filters: Vec<SimpleLogRegex>,
+    reflog_filters: Vec<SimpleLogRegex>,
     grep_filters: Vec<SimpleLogRegex>,
     grep_all_match: bool,
     invert_grep: bool,
@@ -7907,6 +7908,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut date_explicit = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
+    let mut reflog_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
     let mut grep_all_match = false;
     let mut invert_grep = false;
@@ -8147,6 +8149,14 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(value) = value.strip_prefix("--grep=") => {
                 grep_patterns.push(LogFilterPattern::new(value, "command line"));
             }
+            "--grep-reflog" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                reflog_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--grep-reflog=") => {
+                reflog_patterns.push(LogFilterPattern::new(value, "header"));
+            }
             "--author" => {
                 index += 1;
                 let value = args.get(index).map_or("refs/stash", String::as_str);
@@ -8363,6 +8373,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     }
     let author_filters = parse_stash_list_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_stash_list_filter_patterns(&committer_patterns, regexp_mode)?;
+    let reflog_filters = parse_stash_list_filter_patterns(&reflog_patterns, regexp_mode)?;
     let grep_filters = parse_stash_list_filter_patterns(&grep_patterns, regexp_mode)?;
     Ok(StashListOptions {
         format,
@@ -8377,6 +8388,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         date_explicit,
         author_filters,
         committer_filters,
+        reflog_filters,
         grep_filters,
         grep_all_match,
         invert_grep,
@@ -8711,11 +8723,19 @@ fn stash_list_reflog_selector(
 }
 
 fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions) -> bool {
+    let message = String::from_utf8_lossy(&entry.message);
+    if !options.reflog_filters.is_empty()
+        && !options
+            .reflog_filters
+            .iter()
+            .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    {
+        return false;
+    }
     if options.grep_filters.is_empty() {
         return true;
     }
-    let message = String::from_utf8_lossy(&entry.message);
-    let matched = if options.grep_all_match {
+    let grep_matched = if options.grep_all_match {
         options
             .grep_filters
             .iter()
@@ -8726,7 +8746,7 @@ fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions
             .iter()
             .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
     };
-    matched != options.invert_grep
+    grep_matched != options.invert_grep
 }
 
 fn stash_list_commit_filters_match(

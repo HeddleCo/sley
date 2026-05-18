@@ -90,7 +90,8 @@ Target: upstream Git 2.54.0.
   default date placeholders and reflog selectors, object-name abbreviation controls
   including covered permissive `--abbrev=<value>` parsing,
   `--author` / `--committer` identity filtering, `--grep` filtering with
-  case/fixed-string/extended/perl/all-match/invert toggles,
+  case/fixed-string/extended/perl/all-match/invert toggles, reflog-grep
+  filtering,
   numeric age filters plus covered explicit date cutoffs, accepted decoration
   and color-mode controls, mailmap toggles, notes, encoding, source, signature,
   patch-suppression, no-graph and tab-expansion toggles, ext-diff/textconv,
@@ -920,7 +921,8 @@ Target: upstream Git 2.54.0.
   object-name abbreviation controls including covered permissive
   `--abbrev=<value>` parsing,
   `--author` / `--committer` identity filtering, `--grep` filtering with
-  case/fixed-string/extended/perl/all-match/invert toggles,
+  case/fixed-string/extended/perl/all-match/invert toggles, reflog-grep
+  filtering,
   numeric age filters plus covered explicit date cutoffs, accepted decoration
   and color-mode controls, mailmap toggles, notes, encoding, source, signature,
   patch-suppression, no-graph and tab-expansion toggles, ext-diff/textconv,
