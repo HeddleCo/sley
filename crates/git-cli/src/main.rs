@@ -25973,6 +25973,9 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut patch = false;
     let mut no_patch = false;
     let mut reverse = false;
+    let mut pickaxe = None;
+    let mut pickaxe_all = false;
+    let mut pickaxe_regex = false;
     let mut raw_abbrev = None;
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
@@ -26080,6 +26083,27 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             "-R" => reverse = true,
+            "-S" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(diff_pickaxe_requires_value_error)?;
+                if value.is_empty() {
+                    return Err(diff_pickaxe_requires_non_empty_error());
+                }
+                pickaxe = Some(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("-S") => {
+                pickaxe = Some(value.to_string());
+            }
+            "--pickaxe-all" => pickaxe_all = true,
+            "--pickaxe-regex" => pickaxe_regex = true,
+            value if value.starts_with("--pickaxe-all=") => {
+                return log_option_takes_no_value_error("pickaxe-all");
+            }
+            value if value.starts_with("--pickaxe-regex=") => {
+                return log_option_takes_no_value_error("pickaxe-regex");
+            }
             "--ext-diff" | "--textconv" => diff_driver_control = true,
             "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
             "--anchored" => {
@@ -26446,6 +26470,16 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "diff reverse output is not supported for this output mode".into(),
         ));
     }
+    if (pickaxe.is_some() || pickaxe_all || pickaxe_regex) && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff pickaxe controls are not supported for this output mode".into(),
+        ));
+    }
+    if pickaxe.is_some() && pickaxe_regex {
+        return Err(GitError::Unsupported(
+            "diff pickaxe regex matching is not supported".into(),
+        ));
+    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -26504,6 +26538,20 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         )?
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = if let Some(needle) = pickaxe.as_deref() {
+        apply_diff_pickaxe(
+            entries,
+            needle.as_bytes(),
+            pickaxe_all,
+            &db,
+            worktree_root.as_deref(),
+            !cached,
+        )?
+    } else if pickaxe_all || pickaxe_regex {
+        sort_diff_entries_by_path(entries)
+    } else {
+        entries
+    };
     let entries = if reverse {
         reverse_diff_entries(entries)
     } else {
@@ -27411,6 +27459,91 @@ fn diff_entry_new_content(
         .as_ref()
         .map(|oid| read_blob(db, oid))
         .transpose()
+}
+
+fn apply_diff_pickaxe(
+    entries: Vec<git_diff_merge::NameStatusEntry>,
+    needle: &[u8],
+    pickaxe_all: bool,
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+) -> Result<Vec<git_diff_merge::NameStatusEntry>> {
+    if needle.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut matches = Vec::new();
+    for entry in &entries {
+        if diff_entry_matches_pickaxe(entry, needle, db, worktree_root, use_worktree_new)? {
+            matches.push(entry.clone());
+        }
+    }
+    if pickaxe_all {
+        if matches.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Ok(sort_diff_entries_by_path(entries))
+        }
+    } else {
+        Ok(sort_diff_entries_by_path(matches))
+    }
+}
+
+fn diff_entry_matches_pickaxe(
+    entry: &git_diff_merge::NameStatusEntry,
+    needle: &[u8],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+) -> Result<bool> {
+    let old_content = diff_entry_old_content(entry, db)?;
+    let new_content = diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+    Ok(
+        count_non_overlapping_occurrences(old_content.as_deref().unwrap_or_default(), needle)
+            != count_non_overlapping_occurrences(
+                new_content.as_deref().unwrap_or_default(),
+                needle,
+            ),
+    )
+}
+
+fn count_non_overlapping_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() {
+        return 0;
+    }
+    let mut count = 0;
+    let mut offset = 0;
+    while offset + needle.len() <= haystack.len() {
+        if &haystack[offset..offset + needle.len()] == needle {
+            count += 1;
+            offset += needle.len();
+        } else {
+            offset += 1;
+        }
+    }
+    count
+}
+
+fn sort_diff_entries_by_path(
+    mut entries: Vec<git_diff_merge::NameStatusEntry>,
+) -> Vec<git_diff_merge::NameStatusEntry> {
+    entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+            .then_with(|| left.status.code().cmp(&right.status.code()))
+    });
+    entries
+}
+
+fn diff_pickaxe_requires_value_error() -> GitError {
+    eprintln!("error: switch `S' requires a value");
+    GitError::Exit(129)
+}
+
+fn diff_pickaxe_requires_non_empty_error() -> GitError {
+    eprintln!("error: -S requires a non-empty argument");
+    GitError::Exit(129)
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {

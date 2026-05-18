@@ -391,6 +391,92 @@ fn diff_filter_matches_upstream_git() {
 }
 
 #[test]
+fn diff_pickaxe_matches_upstream_git() {
+    let root = unique_temp_dir("diff-pickaxe");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::create_dir_all(root.join("dir")).expect("create nested directory");
+        fs::write(root.join("change.txt"), b"needle\nkeep\n").expect("write change fixture");
+        fs::write(root.join("delete.txt"), b"needle\n").expect("write delete fixture");
+        fs::write(root.join("dir/nested.txt"), b"base\n").expect("write nested fixture");
+        fs::write(root.join("other.txt"), b"plain\n").expect("write other fixture");
+        fs::write(root.join("same-count.txt"), b"needle old\n").expect("write same fixture");
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::write(root.join("change.txt"), b"needle\nneedle\nkeep\n")
+            .expect("modify change fixture");
+        fs::write(root.join("dir/nested.txt"), b"base needle\n").expect("modify nested fixture");
+        fs::write(root.join("other.txt"), b"changed\n").expect("modify other fixture");
+        fs::write(root.join("same-count.txt"), b"needle changed\n").expect("modify same fixture");
+        fs::remove_file(root.join("delete.txt")).expect("remove delete fixture");
+        fs::write(root.join("add.txt"), b"needle\n").expect("write add fixture");
+        git(&root, &["add", "add.txt"]);
+
+        for args in [
+            vec!["diff", "--name-status", "-Sneedle", "HEAD"],
+            vec!["diff", "--name-status", "-S", "needle", "HEAD"],
+            vec!["diff", "--name-only", "-Sneedle", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "-Sneedle",
+                "--diff-filter=M",
+                "HEAD",
+            ],
+            vec!["diff", "--name-status", "--pickaxe-all", "-Sneedle", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--pickaxe-all",
+                "-Sneedle",
+                "--diff-filter=R",
+                "HEAD",
+            ],
+            vec!["diff", "--name-status", "--pickaxe-regex", "HEAD"],
+            vec!["diff", "-R", "--name-status", "-Sneedle", "HEAD"],
+            vec![
+                "diff",
+                "--name-status",
+                "--relative=dir",
+                "-Sneedle",
+                "HEAD",
+            ],
+            vec!["diff", "--cached", "--name-status", "-Sneedle", "HEAD"],
+            vec!["diff", "--name-status", "-Smissing", "HEAD"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        for args in [
+            vec!["diff", "--name-status", "-S"],
+            vec!["diff", "--name-status", "-S", "", "HEAD"],
+        ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn diff_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("diff-pathspecs");
     fs::create_dir_all(&root).expect("create temp repo");
