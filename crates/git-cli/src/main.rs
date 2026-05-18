@@ -8085,6 +8085,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     || value.starts_with("--no-expand-tabs=")
                     || value.starts_with("--show-signature=")
                     || value.starts_with("--no-show-signature=")
+                    || value.starts_with("--full-diff=")
                     || value.starts_with("--no-notes=")
                     || value.starts_with("--standard-notes=")
                     || value.starts_with("--no-standard-notes=")
@@ -8203,17 +8204,56 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 stash_list_fatal_unrecognized_argument(value)?;
             }
             value if value.starts_with("-M") => {
-                log_validate_similarity_option(&value[2..], "find-renames")?;
+                stash_list_validate_similarity_option(&value[2..], "find-renames")?;
             }
             value if value.starts_with("-C") => {
-                log_validate_similarity_option(&value[2..], "find-copies")?;
+                stash_list_validate_similarity_option(&value[2..], "find-copies")?;
+            }
+            value if value.starts_with("-B") => {
+                stash_list_validate_break_rewrites_option(&value[2..])?;
+            }
+            value if value.starts_with("--no-relative=") => {
+                stash_list_option_takes_no_value_error("no-relative")?;
             }
             value if value.starts_with("--relative=") => {}
             value if let Some(value) = value.strip_prefix("--find-renames=") => {
-                log_validate_similarity_option(value, "find-renames")?;
+                stash_list_validate_similarity_option(value, "find-renames")?;
             }
             value if let Some(value) = value.strip_prefix("--find-copies=") => {
-                log_validate_similarity_option(value, "find-copies")?;
+                stash_list_validate_similarity_option(value, "find-copies")?;
+            }
+            value if value.starts_with("--find-copies-harder=") => {
+                stash_list_option_takes_no_value_error("find-copies-harder")?;
+            }
+            value if value.starts_with("--no-find-copies-harder=") => {
+                stash_list_option_takes_no_value_error("no-find-copies-harder")?;
+            }
+            value if let Some(value) = value.strip_prefix("--break-rewrites=") => {
+                stash_list_validate_break_rewrites_option(value)?;
+            }
+            value if value.starts_with("--no-patch=") => {
+                stash_list_option_takes_no_value_error("no-patch")?;
+            }
+            value if value.starts_with("--ext-diff=") => {
+                stash_list_option_takes_no_value_error("ext-diff")?;
+            }
+            value if value.starts_with("--no-ext-diff=") => {
+                stash_list_option_takes_no_value_error("no-ext-diff")?;
+            }
+            value if value.starts_with("--textconv=") => {
+                stash_list_option_takes_no_value_error("textconv")?;
+            }
+            value if value.starts_with("--no-textconv=") => {
+                stash_list_option_takes_no_value_error("no-textconv")?;
+            }
+            value if value.starts_with("--no-renames=") => {
+                stash_list_option_takes_no_value_error("no-renames")?;
+            }
+            value if value.starts_with("--full-index=") => {
+                stash_list_option_takes_no_value_error("full-index")?;
+            }
+            value if value.starts_with("--irreversible-delete=") => {
+                stash_list_option_takes_no_value_error("irreversible-delete")?;
             }
             "--diff-merges" => {
                 index += 1;
@@ -8498,6 +8538,20 @@ fn stash_list_validate_submodule_format(value: &str) -> Result<()> {
 fn stash_list_validate_ignore_submodules(value: &str) -> Result<()> {
     log_validate_ignore_submodules(value).map_err(|err| match err {
         GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_similarity_option(value: &str, option: &str) -> Result<()> {
+    log_validate_similarity_option(value, option).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_break_rewrites_option(value: &str) -> Result<()> {
+    log_validate_break_rewrites_option(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
         err => err,
     })
 }
