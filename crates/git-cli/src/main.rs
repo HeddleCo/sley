@@ -8157,6 +8157,13 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(value) = value.strip_prefix("--grep-reflog=") => {
                 reflog_patterns.push(LogFilterPattern::new(value, "header"));
             }
+            value
+                if value.starts_with("--no-grep-reflog")
+                    || value.starts_with("--no-author")
+                    || value.starts_with("--no-committer") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             "--author" => {
                 index += 1;
                 let value = args.get(index).map_or("refs/stash", String::as_str);
@@ -8309,6 +8316,18 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             }
             value if let Some(date) = value.strip_prefix("--before=") => {
                 min_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value
+                if value.starts_with("--no-max-count")
+                    || value.starts_with("--no-skip")
+                    || value.starts_with("--no-max-age")
+                    || value.starts_with("--no-min-age")
+                    || value.starts_with("--no-since")
+                    || value.starts_with("--no-after")
+                    || value.starts_with("--no-until")
+                    || value.starts_with("--no-before") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
             }
             value if let Some(count) = value.strip_prefix("--min-parents=") => {
                 min_parents = Some(parse_reflog_min_parent_count(count)?);
