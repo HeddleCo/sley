@@ -25976,6 +25976,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut pickaxe = None;
     let mut pickaxe_all = false;
     let mut pickaxe_regex = false;
+    let mut find_object_values = Vec::new();
     let mut raw_abbrev = None;
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
@@ -26103,6 +26104,16 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--pickaxe-regex=") => {
                 return log_option_takes_no_value_error("pickaxe-regex");
+            }
+            "--find-object" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("find-object"))?;
+                find_object_values.push(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("--find-object=") => {
+                find_object_values.push(value.to_string());
             }
             "--ext-diff" | "--textconv" => diff_driver_control = true,
             "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
@@ -26475,6 +26486,14 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "diff pickaxe controls are not supported for this output mode".into(),
         ));
     }
+    if !find_object_values.is_empty() && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff find-object output is not supported for this output mode".into(),
+        ));
+    }
+    if pickaxe_all && !find_object_values.is_empty() {
+        return diff_find_object_pickaxe_all_conflict_error();
+    }
     if pickaxe.is_some() && pickaxe_regex {
         return Err(GitError::Unsupported(
             "diff pickaxe regex matching is not supported".into(),
@@ -26484,6 +26503,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
     let repository_abbrev = repository_abbrev(&git_dir, format)?;
     let raw_abbrev = match raw_abbrev {
         Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
@@ -26552,6 +26572,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    let entries = apply_diff_find_objects(entries, &find_objects);
     let entries = if reverse {
         reverse_diff_entries(entries)
     } else {
@@ -27507,6 +27528,45 @@ fn diff_entry_matches_pickaxe(
     )
 }
 
+fn resolve_diff_find_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    values: &[String],
+) -> Result<Vec<ObjectId>> {
+    values
+        .iter()
+        .map(|value| resolve_diff_find_object(git_dir, format, value))
+        .collect()
+}
+
+fn resolve_diff_find_object(git_dir: &Path, format: ObjectFormat, value: &str) -> Result<ObjectId> {
+    if value.len() == format.hex_len() && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return ObjectId::from_hex(format, value)
+            .map_err(|_| diff_find_object_unable_to_resolve_error(value));
+    }
+    resolve_revision(git_dir, format, value)
+        .map_err(|_| diff_find_object_unable_to_resolve_error(value))
+}
+
+fn apply_diff_find_objects(
+    entries: Vec<git_diff_merge::NameStatusEntry>,
+    targets: &[ObjectId],
+) -> Vec<git_diff_merge::NameStatusEntry> {
+    if targets.is_empty() {
+        return entries;
+    }
+    sort_diff_entries_by_path(
+        entries
+            .into_iter()
+            .filter(|entry| {
+                targets.iter().any(|target| {
+                    entry.old_oid.as_ref() == Some(target) || entry.new_oid.as_ref() == Some(target)
+                })
+            })
+            .collect(),
+    )
+}
+
 fn count_non_overlapping_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
     if needle.is_empty() {
         return 0;
@@ -27544,6 +27604,18 @@ fn diff_pickaxe_requires_value_error() -> GitError {
 fn diff_pickaxe_requires_non_empty_error() -> GitError {
     eprintln!("error: -S requires a non-empty argument");
     GitError::Exit(129)
+}
+
+fn diff_find_object_unable_to_resolve_error(value: &str) -> GitError {
+    eprintln!("error: unable to resolve '{value}'");
+    GitError::Exit(129)
+}
+
+fn diff_find_object_pickaxe_all_conflict_error() -> Result<()> {
+    eprintln!(
+        "fatal: options '--pickaxe-all' and '--find-object' cannot be used together, use '--pickaxe-all' with '-G' and '-S'"
+    );
+    Err(GitError::Exit(128))
 }
 
 fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {

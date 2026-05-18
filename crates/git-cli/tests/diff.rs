@@ -48,6 +48,13 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run("git", cwd, args)
 }
 
+fn utf8_trimmed(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .expect("git output is utf8")
+        .trim()
+        .to_string()
+}
+
 #[test]
 fn diff_name_only_matches_upstream_git() {
     let root = unique_temp_dir("diff-name-only");
@@ -467,6 +474,155 @@ fn diff_pickaxe_matches_upstream_git() {
             vec!["diff", "--name-status", "-S"],
             vec!["diff", "--name-status", "-S", "", "HEAD"],
         ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn diff_find_object_matches_upstream_git() {
+    let root = unique_temp_dir("diff-find-object");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::create_dir_all(root.join("dir")).expect("create nested directory");
+        fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
+        fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested fixture");
+        fs::write(root.join("replace.txt"), b"old\n").expect("write replace fixture");
+        fs::write(root.join("unrelated.txt"), b"plain\n").expect("write unrelated fixture");
+        git(&root, &["add", "."]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        let old_replace = utf8_trimmed(git(&root, &["rev-parse", "HEAD:replace.txt"]));
+        let delete_oid = utf8_trimmed(git(&root, &["rev-parse", "HEAD:delete.txt"]));
+        let nested_oid = utf8_trimmed(git(&root, &["rev-parse", "HEAD:dir/nested.txt"]));
+
+        fs::write(root.join("replace.txt"), b"new\n").expect("modify replace fixture");
+        fs::write(root.join("dir/nested.txt"), b"nested changed\n").expect("modify nested fixture");
+        fs::write(root.join("unrelated.txt"), b"changed\n").expect("modify unrelated fixture");
+        fs::remove_file(root.join("delete.txt")).expect("remove delete fixture");
+        fs::write(root.join("add.txt"), b"add\n").expect("write add fixture");
+        git(&root, &["add", "add.txt"]);
+        let add_oid = utf8_trimmed(git(&root, &["hash-object", "add.txt"]));
+
+        let output_cases = [
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={old_replace}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--find-object".to_string(),
+                old_replace.clone(),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-only".to_string(),
+                format!("--find-object={old_replace}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={delete_oid}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={add_oid}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--cached".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={add_oid}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={old_replace}"),
+                format!("--find-object={delete_oid}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "-R".to_string(),
+                "--name-status".to_string(),
+                format!("--find-object={old_replace}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--relative=dir".to_string(),
+                format!("--find-object={nested_oid}"),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--find-object=HEAD".to_string(),
+                "HEAD".to_string(),
+            ],
+        ];
+        for args in output_cases {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        let status_cases = [
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--find-object".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--find-object=".to_string(),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--find-object=1234".to_string(),
+                "HEAD".to_string(),
+            ],
+            vec![
+                "diff".to_string(),
+                "--name-status".to_string(),
+                "--pickaxe-all".to_string(),
+                format!("--find-object={old_replace}"),
+                "HEAD".to_string(),
+            ],
+        ];
+        for args in status_cases {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
             let expected = run_status("git", &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
             assert_eq!(actual, expected, "git-rs result differed for {args:?}");
