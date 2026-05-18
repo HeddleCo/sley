@@ -26355,6 +26355,9 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 detect_copies = true;
                 find_copies_harder = true;
             }
+            "--no-find-copies-harder" => {
+                find_copies_harder = false;
+            }
             "--no-renames" => {
                 detect_renames = false;
             }
@@ -26364,6 +26367,12 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--find-renames=") => detect_renames = true,
             value if value.starts_with("-C") && value.len() > 2 => detect_copies = true,
             value if value.starts_with("--find-copies=") => detect_copies = true,
+            value if value.starts_with("--find-copies-harder=") => {
+                return log_option_takes_no_value_error("find-copies-harder");
+            }
+            value if value.starts_with("--no-find-copies-harder=") => {
+                return log_option_takes_no_value_error("no-find-copies-harder");
+            }
             value if value.starts_with("--rename-empty=") => {
                 return log_option_takes_no_value_error("rename-empty");
             }

@@ -979,6 +979,24 @@ fn diff_copies_match_upstream_git() {
                 "--cached",
                 "-C",
                 "--find-copies-harder",
+                "--no-find-copies-harder",
+                "--name-status",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-C",
+                "--no-find-copies-harder",
+                "--find-copies-harder",
+                "--name-status",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "--find-copies-harder",
+                "--no-find-copies-harder",
                 "--name-status",
                 "HEAD",
             ],
@@ -1078,6 +1096,27 @@ fn diff_copies_match_upstream_git() {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        for args in [
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--find-copies-harder=1",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--no-find-copies-harder=1",
+                "HEAD",
+            ],
+        ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
         }
 
         fs::write(root.join("old.txt"), b"changed\n").expect("modify source fixture");
