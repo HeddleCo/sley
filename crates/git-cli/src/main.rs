@@ -8022,7 +8022,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "--invert-grep" => invert_grep = true,
             "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
             "-F" | "--fixed-strings" => regexp_mode = SimpleLogRegexMode::Fixed,
-            "-E" | "--basic-regexp" | "--extended-regexp" => {
+            "-E" | "-P" | "--basic-regexp" | "--extended-regexp" | "--perl-regexp" => {
                 regexp_mode = SimpleLogRegexMode::Basic
             }
             "--format" | "--pretty" => {

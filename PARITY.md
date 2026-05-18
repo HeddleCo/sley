@@ -89,7 +89,7 @@ Target: upstream Git 2.54.0.
   source-literal, `%xNN`, and no-op color formats with `--date` mode support for
   default date placeholders and reflog selectors, object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
-  case/fixed-string/all-match/invert toggles,
+  case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,
   notes, encoding, source, signature, patch-suppression, no-walk, simple history
   walk toggles, and parent-count filters, covered
@@ -912,7 +912,7 @@ Target: upstream Git 2.54.0.
   source-literal, `%xNN`, and no-op color formats with `--date` mode support for default date placeholders and reflog selectors,
   object-name abbreviation controls,
   `--author` / `--committer` identity filtering, `--grep` filtering with
-  case/fixed-string/all-match/invert toggles,
+  case/fixed-string/extended/perl/all-match/invert toggles,
   numeric age filters plus covered explicit date cutoffs, accepted decoration,
   notes, encoding, source, signature, patch-suppression, no-walk, simple history
   walk toggles, and parent-count filters, covered
