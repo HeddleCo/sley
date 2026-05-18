@@ -7934,6 +7934,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "-q"
             | "--quiet"
             | "--no-quiet"
+            | "--no-graph"
             | "--no-decorate"
             | "--walk-reflogs"
             | "--no-walk"
@@ -8020,7 +8021,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
             "--no-max-parents" => max_parents = None,
-            "--children"
+            "--graph"
+            | "--children"
             | "--cherry-pick"
             | "--ancestry-path"
             | "--topo-order"
@@ -8069,7 +8071,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 stash_list_option_takes_no_value_error("no-source")?;
             }
             value
-                if value.starts_with("--show-signature=")
+                if value.starts_with("--no-graph=")
+                    || value.starts_with("--show-signature=")
                     || value.starts_with("--no-show-signature=")
                     || value.starts_with("--no-notes=")
                     || value.starts_with("--standard-notes=")
@@ -8100,6 +8103,17 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--decorate-refs=") => {}
             value if value.starts_with("--decorate-refs-exclude=") => {}
             "--no-walk=sorted" | "--no-walk=unsorted" => {}
+            value if value.starts_with("--no-walk=") => {
+                stash_list_no_walk_invalid_argument(value)?;
+            }
+            value
+                if value.starts_with("--walk-reflogs=")
+                    || value.starts_with("--do-walk=")
+                    || value.starts_with("--first-parent=")
+                    || value.starts_with("--parents=") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             "--abbrev" => abbrev_len = Some(7),
             "--no-abbrev" => abbrev_len = None,
             "--grep" => {
@@ -8357,6 +8371,11 @@ fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
 fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
     eprintln!("fatal: unrecognized argument: {value}");
     Err(GitError::Exit(1))
+}
+
+fn stash_list_no_walk_invalid_argument(value: &str) -> Result<()> {
+    eprintln!("error: invalid argument to --no-walk");
+    stash_list_fatal_unrecognized_argument(value)
 }
 
 fn stash_list_validate_color(value: &str) -> Result<()> {
