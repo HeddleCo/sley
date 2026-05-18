@@ -8062,6 +8062,21 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--no-mailmap=") => {
                 stash_list_option_takes_no_value_error("no-mailmap")?;
             }
+            value if value.starts_with("--source=") => {
+                stash_list_option_takes_no_value_error("source")?;
+            }
+            value if value.starts_with("--no-source=") => {
+                stash_list_option_takes_no_value_error("no-source")?;
+            }
+            value
+                if value.starts_with("--show-signature=")
+                    || value.starts_with("--no-show-signature=")
+                    || value.starts_with("--no-notes=")
+                    || value.starts_with("--standard-notes=")
+                    || value.starts_with("--no-standard-notes=") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             "--decorate" => {}
             value if let Some(value) = value.strip_prefix("--decorate=") => {
                 if matches!(
@@ -8336,6 +8351,11 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
 
 fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(1))
+}
+
+fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
+    eprintln!("fatal: unrecognized argument: {value}");
     Err(GitError::Exit(1))
 }
 
