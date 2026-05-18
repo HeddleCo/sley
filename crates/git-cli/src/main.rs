@@ -8212,6 +8212,22 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("-B") => {
                 stash_list_validate_break_rewrites_option(&value[2..])?;
             }
+            value if let Some(option) = stash_list_diff_option_with_value(value) => {
+                stash_list_option_takes_no_value_error(option)?;
+            }
+            value
+                if value.len() > 2
+                    && (value.starts_with("-D")
+                        || value.starts_with("-s")
+                        || value.starts_with("-b")
+                        || value.starts_with("-w")
+                        || value.starts_with("-W")) =>
+            {
+                stash_list_fatal_unrecognized_argument(&format!("-{}", &value[2..]))?;
+            }
+            value if value.len() > 2 && value.starts_with("-m") => {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             value if value.starts_with("--no-relative=") => {
                 stash_list_option_takes_no_value_error("no-relative")?;
             }
@@ -8474,6 +8490,34 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
 fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
     eprintln!("error: option `{option}' takes no value");
     Err(GitError::Exit(1))
+}
+
+fn stash_list_diff_option_with_value(value: &str) -> Option<&'static str> {
+    const OPTIONS: &[&str] = &[
+        "minimal",
+        "patience",
+        "histogram",
+        "indent-heuristic",
+        "no-indent-heuristic",
+        "ignore-space-at-eol",
+        "ignore-cr-at-eol",
+        "ignore-space-change",
+        "ignore-all-space",
+        "ignore-blank-lines",
+        "function-context",
+        "no-prefix",
+        "default-prefix",
+        "ita-visible-in-index",
+        "ita-invisible-in-index",
+        "pickaxe-all",
+        "pickaxe-regex",
+    ];
+    let value = value.strip_prefix("--")?;
+    OPTIONS.iter().copied().find(|option| {
+        value
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('='))
+    })
 }
 
 fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
