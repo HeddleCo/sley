@@ -7931,9 +7931,33 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 );
                 return Err(GitError::Exit(1));
             }
-            "--no-decorate" | "--walk-reflogs" | "--no-walk" | "--do-walk" | "--first-parent"
-            | "--parents" | "--full-history" | "--dense" | "--sparse" | "--remove-empty"
-            | "--left-right" => {}
+            "--no-decorate"
+            | "--walk-reflogs"
+            | "--no-walk"
+            | "--do-walk"
+            | "--first-parent"
+            | "--parents"
+            | "--full-history"
+            | "--dense"
+            | "--sparse"
+            | "--remove-empty"
+            | "--left-right"
+            | "--no-notes"
+            | "--notes"
+            | "--show-notes"
+            | "--standard-notes"
+            | "--no-standard-notes"
+            | "--show-signature"
+            | "--no-show-signature"
+            | "--source"
+            | "--no-source"
+            | "--no-patch" => {}
+            "--encoding" => {
+                if index + 1 < args.len() {
+                    index += 1;
+                }
+            }
+            value if value.starts_with("--encoding=") => {}
             "--merges" => min_parents = Some(2),
             "--no-merges" => max_parents = Some(1),
             "--no-min-parents" => min_parents = None,
