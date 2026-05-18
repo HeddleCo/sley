@@ -80,8 +80,12 @@ fn diff_name_only_matches_upstream_git() {
         for args in [
             vec!["diff", "--name-status"],
             vec!["diff", "--name-only"],
+            vec!["diff", "-R", "--name-status"],
+            vec!["diff", "-R", "--name-only"],
             vec!["diff", "--name-status", "HEAD"],
             vec!["diff", "--name-only", "HEAD"],
+            vec!["diff", "-R", "--name-status", "HEAD"],
+            vec!["diff", "-R", "--name-only", "HEAD"],
             vec!["diff", "--raw", "--name-status", "HEAD"],
             vec!["diff", "--name-status", "--raw", "HEAD"],
             vec!["diff", "--raw", "--name-only", "HEAD"],
@@ -96,8 +100,12 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--no-patch", "--stat", "HEAD"],
             vec!["diff", "--cached", "--name-status"],
             vec!["diff", "--cached", "--name-only"],
+            vec!["diff", "--cached", "-R", "--name-status"],
+            vec!["diff", "--cached", "-R", "--name-only"],
             vec!["diff", "--cached", "--name-status", "HEAD"],
             vec!["diff", "--cached", "--name-only", "HEAD"],
+            vec!["diff", "--cached", "-R", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-R", "--name-only", "HEAD"],
             vec!["diff", "--staged", "--name-status", "HEAD"],
             vec!["diff", "--staged", "--name-only", "HEAD"],
             vec!["diff", "--name-status", "--ext-diff", "HEAD"],
@@ -498,6 +506,7 @@ fn diff_renames_match_upstream_git() {
         for args in [
             vec!["diff", "--cached", "--name-status", "HEAD"],
             vec!["diff", "--cached", "-M", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-R", "-M", "--name-status", "HEAD"],
             vec!["diff", "--cached", "-M100%", "--name-status", "HEAD"],
             vec![
                 "diff",
@@ -514,8 +523,19 @@ fn diff_renames_match_upstream_git() {
                 "HEAD",
             ],
             vec!["diff", "--cached", "-M", "--name-only", "HEAD"],
+            vec!["diff", "--cached", "-R", "-M", "--name-only", "HEAD"],
             vec!["diff", "--cached", "-M", "--name-status", "-z", "HEAD"],
+            vec![
+                "diff",
+                "--cached",
+                "-R",
+                "-M",
+                "--name-status",
+                "-z",
+                "HEAD",
+            ],
             vec!["diff", "--cached", "-M", "--name-only", "-z", "HEAD"],
+            vec!["diff", "--cached", "-R", "-M", "--name-only", "-z", "HEAD"],
             vec![
                 "diff",
                 "--cached",
@@ -618,6 +638,25 @@ fn diff_relative_renames_match_upstream_git() {
             vec![
                 "diff",
                 "--cached",
+                "-R",
+                "-M",
+                "--name-status",
+                "--relative=dir",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-M",
+                "--name-only",
+                "-z",
+                "--relative=dir",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-R",
                 "-M",
                 "--name-only",
                 "-z",
@@ -660,6 +699,7 @@ fn diff_copies_match_upstream_git() {
         git(&root, &["add", "copy.txt"]);
         for args in [
             vec!["diff", "--cached", "-C", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "-R", "-C", "--name-status", "HEAD"],
             vec!["diff", "--cached", "--find-copies", "--name-status", "HEAD"],
             vec![
                 "diff",

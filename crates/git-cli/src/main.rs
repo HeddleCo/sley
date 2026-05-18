@@ -25972,6 +25972,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut shortstat = false;
     let mut patch = false;
     let mut no_patch = false;
+    let mut reverse = false;
     let mut raw_abbrev = None;
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
@@ -26078,6 +26079,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "-R" => reverse = true,
             "--ext-diff" | "--textconv" => diff_driver_control = true,
             "--minimal" | "--patience" | "--histogram" => diff_algorithm_control = true,
             "--anchored" => {
@@ -26439,6 +26441,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "diff relative output is not supported for this output mode".into(),
         ));
     }
+    if reverse && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff reverse output is not supported for this output mode".into(),
+        ));
+    }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
@@ -26497,6 +26504,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         )?
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
+    let entries = if reverse {
+        reverse_diff_entries(entries)
+    } else {
+        entries
+    };
     let entries = if matches!(diff_relative, DiffRelativeMode::Off) {
         entries
     } else {
@@ -27550,6 +27562,74 @@ fn apply_diff_pathspec(
         }
     }
     filtered
+}
+
+fn reverse_diff_entries(
+    entries: Vec<git_diff_merge::NameStatusEntry>,
+) -> Vec<git_diff_merge::NameStatusEntry> {
+    let mut reversed = entries
+        .into_iter()
+        .map(reverse_diff_entry)
+        .collect::<Vec<_>>();
+    reversed.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.old_path.cmp(&right.old_path))
+            .then_with(|| left.status.code().cmp(&right.status.code()))
+    });
+    reversed
+}
+
+fn reverse_diff_entry(entry: git_diff_merge::NameStatusEntry) -> git_diff_merge::NameStatusEntry {
+    match entry.status {
+        git_diff_merge::NameStatus::Added => git_diff_merge::NameStatusEntry {
+            status: git_diff_merge::NameStatus::Deleted,
+            old_mode: entry.new_mode,
+            new_mode: None,
+            old_oid: entry.new_oid,
+            new_oid: None,
+            ..entry
+        },
+        git_diff_merge::NameStatus::Deleted => git_diff_merge::NameStatusEntry {
+            status: git_diff_merge::NameStatus::Added,
+            old_mode: None,
+            new_mode: entry.old_mode,
+            old_oid: None,
+            new_oid: entry.old_oid,
+            ..entry
+        },
+        git_diff_merge::NameStatus::Modified => git_diff_merge::NameStatusEntry {
+            old_mode: entry.new_mode,
+            new_mode: entry.old_mode,
+            old_oid: entry.new_oid,
+            new_oid: entry.old_oid,
+            ..entry
+        },
+        git_diff_merge::NameStatus::Renamed(score) => {
+            let new_path = entry
+                .old_path
+                .clone()
+                .expect("rename entries include old_path");
+            git_diff_merge::NameStatusEntry {
+                status: git_diff_merge::NameStatus::Renamed(score),
+                path: new_path,
+                old_path: Some(entry.path),
+                old_mode: entry.new_mode,
+                new_mode: entry.old_mode,
+                old_oid: entry.new_oid,
+                new_oid: entry.old_oid,
+            }
+        }
+        git_diff_merge::NameStatus::Copied(_) => git_diff_merge::NameStatusEntry {
+            status: git_diff_merge::NameStatus::Deleted,
+            old_path: None,
+            old_mode: entry.new_mode,
+            new_mode: None,
+            old_oid: entry.new_oid,
+            new_oid: None,
+            ..entry
+        },
+    }
 }
 
 enum DiffRelativeMode {

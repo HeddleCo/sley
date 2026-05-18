@@ -543,7 +543,7 @@ Target: upstream Git 2.54.0.
   and anchored controls, `--inter-hunk-context`, whitespace ignore controls,
   `--ws-error-highlight`, and
   output-indicator, patch context/output, submodule output, and word-diff controls,
-  `--relative` / `--no-relative` name output,
+  `--relative` / `--no-relative` and `-R` name output,
   non-submodule `--ignore-submodules`,
   and cached/staged variants
   support for added, modified, and deleted paths known to the index/HEAD,
