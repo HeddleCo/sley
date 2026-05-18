@@ -334,6 +334,30 @@ fn prepare_stash_create_repo(root: &Path, setup: &str) {
             fs::write(root.join("a.txt"), b"worktree\n").expect("write unstaged fixture");
             fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
         }
+        "two-tracked" => {
+            fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"worktree a\n").expect("write first worktree fixture");
+            fs::write(root.join("b.txt"), b"worktree b\n").expect("write second worktree fixture");
+        }
+        "two-tracked-staged" => {
+            fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"staged a\n").expect("write first staged fixture");
+            git(root, &["add", "a.txt"]);
+            fs::write(root.join("b.txt"), b"staged b\n").expect("write second staged fixture");
+            git(root, &["add", "b.txt"]);
+        }
+        "two-tracked-and-untracked" => {
+            fs::write(root.join("b.txt"), b"base\n").expect("write second base fixture");
+            git(root, &["add", "b.txt"]);
+            git(root, &["commit", "-m", "second", "-q"]);
+            fs::write(root.join("a.txt"), b"worktree a\n").expect("write first worktree fixture");
+            fs::write(root.join("b.txt"), b"worktree b\n").expect("write second worktree fixture");
+            fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
+        }
         "staged" => {
             fs::write(root.join("a.txt"), b"staged\n").expect("write staged fixture");
             git(root, &["add", "a.txt"]);
@@ -441,6 +465,21 @@ fn stash_push_matches_upstream_git() {
                 "staged-option-rejects-untracked",
                 "staged",
                 vec!["stash", "push", "--staged", "-u"],
+            ),
+            (
+                "pathspec-tracked",
+                "two-tracked",
+                vec!["stash", "push", "--", "a.txt"],
+            ),
+            (
+                "pathspec-untracked",
+                "two-tracked-and-untracked",
+                vec!["stash", "push", "-u", "--", "a.txt", "u.txt"],
+            ),
+            (
+                "pathspec-preserves-unselected-staged",
+                "two-tracked-staged",
+                vec!["stash", "push", "--", "a.txt"],
             ),
             ("staged", "staged", vec!["stash", "push"]),
             (

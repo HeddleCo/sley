@@ -5929,7 +5929,8 @@ fn stash_drop_usage() {
 }
 
 fn cmd_stash_create(args: &[String]) -> Result<()> {
-    if let Some(created) = create_stash_commit(args, false, false, StashCreateMode::Worktree)? {
+    if let Some(created) = create_stash_commit(args, false, false, StashCreateMode::Worktree, &[])?
+    {
         println!("{}", created.oid);
     }
     Ok(())
@@ -6004,11 +6005,6 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         }
         index += 1;
     }
-    if !pathspecs.is_empty() {
-        return Err(GitError::Unsupported(
-            "stash push pathspecs are not implemented".into(),
-        ));
-    }
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Err(GitError::Exit(1));
@@ -6018,6 +6014,7 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         include_untracked,
         include_ignored,
         create_mode,
+        &pathspecs,
     )?
     else {
         if !quiet {
@@ -6106,6 +6103,7 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
         include_untracked,
         include_ignored,
         create_mode,
+        &[],
     )?
     else {
         if !quiet {
@@ -6136,17 +6134,33 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
     });
     tx.commit()?;
 
-    let reset_oid = if keep_index {
-        &created.index_oid
+    if created.pathspec_paths.is_empty() {
+        let reset_oid = if keep_index {
+            &created.index_oid
+        } else {
+            &created.head_oid
+        };
+        git_worktree::reset_index_and_worktree_to_commit(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            reset_oid,
+        )?;
+    } else if keep_index {
+        git_worktree::restore_worktree_paths(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            &created.pathspec_paths,
+        )?;
     } else {
-        &created.head_oid
-    };
-    git_worktree::reset_index_and_worktree_to_commit(
-        &created.worktree_root,
-        &created.git_dir,
-        created.format,
-        reset_oid,
-    )?;
+        git_worktree::restore_index_and_worktree_paths_from_head(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            &created.pathspec_paths,
+        )?;
+    }
     for path in &created.untracked_paths {
         remove_stashed_untracked_path(&created.worktree_root, path)?;
     }
@@ -6169,6 +6183,7 @@ struct CreatedStash {
     common_git_dir: PathBuf,
     worktree_root: PathBuf,
     untracked_paths: Vec<Vec<u8>>,
+    pathspec_paths: Vec<PathBuf>,
     format: ObjectFormat,
 }
 
@@ -6177,6 +6192,7 @@ fn create_stash_commit(
     include_untracked: bool,
     include_ignored: bool,
     mode: StashCreateMode,
+    pathspecs: &[String],
 ) -> Result<Option<CreatedStash>> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
@@ -6201,10 +6217,16 @@ fn create_stash_commit(
         .filter(|entry| index_entry_stage(entry) == 0)
         .cloned()
         .collect::<Vec<_>>();
+    let pathspec = if pathspecs.is_empty() {
+        None
+    } else {
+        Some(LsFilesPathspec::new(&cwd, &worktree_root, true, pathspecs)?)
+    };
     let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
-    let worktree_entries = stash_worktree_entries(&worktree_root, &mut db, &index_entries)?;
+    let worktree_entries =
+        stash_worktree_entries(&worktree_root, &mut db, &index_entries, pathspec.as_ref())?;
     let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
-    let untracked_paths = if include_untracked {
+    let mut untracked_paths = if include_untracked {
         git_worktree::untracked_paths_with_options(
             &worktree_root,
             &git_dir,
@@ -6222,12 +6244,32 @@ fn create_stash_commit(
     } else {
         Vec::new()
     };
+    if let Some(pathspec) = pathspec.as_ref() {
+        untracked_paths.retain(|path| pathspec.matches(path));
+    }
     let untracked_entries = stash_untracked_entries(&worktree_root, &mut db, &untracked_paths)?;
     let untracked_tree = if untracked_entries.is_empty() {
         None
     } else {
         Some(stash_write_tree_from_entries(&mut db, &untracked_entries)?)
     };
+    let mut pathspec_paths = Vec::new();
+    if let Some(pathspec) = pathspec.as_ref() {
+        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
+        let index_entry_map = stash_index_entry_map(&index_entries);
+        let worktree_entry_map = stash_index_entry_map(&worktree_entries);
+        let tracked_change_paths = stash_pathspec_tracked_change_paths(
+            pathspec,
+            &head_entries,
+            &index_entry_map,
+            &worktree_entry_map,
+        )?;
+        pathspec.exit_if_unmatched()?;
+        if tracked_change_paths.is_empty() && untracked_tree.is_none() {
+            return Ok(None);
+        }
+        pathspec_paths = tracked_change_paths;
+    }
     if index_tree == head_commit.tree
         && worktree_tree == head_commit.tree
         && untracked_tree.is_none()
@@ -6314,6 +6356,7 @@ fn create_stash_commit(
         common_git_dir,
         worktree_root,
         untracked_paths,
+        pathspec_paths,
         format,
     }))
 }
@@ -6406,13 +6449,88 @@ fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> R
     ))
 }
 
+fn stash_tree_entry_map(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
+    let mut entries = BTreeMap::new();
+    collect_stash_tree_entry_map(db, format, tree_oid, Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_stash_tree_entry_map(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+    entries: &mut BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {}, found {}",
+            tree_oid,
+            object.object_type.as_str()
+        )));
+    }
+    let tree = Tree::parse(format, &object.body)?;
+    for entry in tree.entries {
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        if entry.mode == 0o040000 {
+            collect_stash_tree_entry_map(db, format, &entry.oid, path, entries)?;
+        } else {
+            entries.insert(path, (entry.mode, entry.oid));
+        }
+    }
+    Ok(())
+}
+
+fn stash_index_entry_map(entries: &[IndexEntry]) -> BTreeMap<Vec<u8>, (u32, ObjectId)> {
+    entries
+        .iter()
+        .map(|entry| (entry.path.clone(), (entry.mode, entry.oid.clone())))
+        .collect()
+}
+
+fn stash_pathspec_tracked_change_paths(
+    pathspec: &LsFilesPathspec,
+    head_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    index_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    worktree_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    paths.extend(head_entries.keys().cloned());
+    paths.extend(index_entries.keys().cloned());
+    paths.extend(worktree_entries.keys().cloned());
+    let mut changed = Vec::new();
+    for path in paths {
+        if pathspec.matches(&path)
+            && (head_entries.get(&path) != index_entries.get(&path)
+                || index_entries.get(&path) != worktree_entries.get(&path))
+        {
+            changed.push(stash_repo_path_to_os_path(&path)?);
+        }
+    }
+    Ok(changed)
+}
+
 fn stash_worktree_entries(
     worktree_root: &Path,
     db: &mut FileObjectDatabase,
     index_entries: &[IndexEntry],
+    pathspec: Option<&LsFilesPathspec>,
 ) -> Result<Vec<IndexEntry>> {
     let mut entries = Vec::new();
     for entry in index_entries {
+        if pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path)) {
+            entries.push(entry.clone());
+            continue;
+        }
         let path = stash_repo_path_to_os_path(&entry.path)?;
         let absolute = worktree_root.join(path);
         let Ok(metadata) = fs::metadata(&absolute) else {
