@@ -5949,6 +5949,9 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
     let mut keep_index = false;
     let mut create_mode = StashCreateMode::Worktree;
     let mut patch = false;
+    let mut no_auto_advance = false;
+    let mut unified_context = false;
+    let mut inter_hunk_context = false;
     let mut message_args = Vec::new();
     let mut pathspecs = Vec::new();
     let mut pathspec_from_file = None;
@@ -5983,6 +5986,56 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-patch=") => {
                 return stash_option_takes_no_value_error("no-patch");
+            }
+            "--auto-advance" => {}
+            "--no-auto-advance" => no_auto_advance = true,
+            value if value.starts_with("--auto-advance=") => {
+                return stash_option_takes_no_value_error("auto-advance");
+            }
+            value if value.starts_with("--no-auto-advance=") => {
+                return stash_option_takes_no_value_error("no-auto-advance");
+            }
+            "-U" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(true);
+                };
+                commit_validate_unified_context(value, true)?;
+                unified_context = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                commit_validate_unified_context(&value[2..], true)?;
+                unified_context = true;
+            }
+            "--unified" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(false);
+                };
+                commit_validate_unified_context(value, false)?;
+                unified_context = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                unified_context = true;
+            }
+            "--inter-hunk-context" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_inter_hunk_context_requires_value_error();
+                };
+                commit_validate_inter_hunk_context(value)?;
+                inter_hunk_context = true;
+            }
+            "--inter-hunk-context=" => {
+                return commit_inter_hunk_context_expects_numerical_value_error();
+            }
+            value if value.starts_with("--inter-hunk-context=") => {
+                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                inter_hunk_context = true;
             }
             "-m" | "--message" => {
                 index += 1;
@@ -6071,6 +6124,15 @@ fn cmd_stash_push(args: &[String]) -> Result<()> {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Err(GitError::Exit(1));
     }
+    if no_auto_advance && !patch {
+        return stash_patch_option_requires_patch_error("no-auto-advance");
+    }
+    if unified_context && !patch {
+        return stash_patch_option_requires_patch_error("unified");
+    }
+    if inter_hunk_context && !patch {
+        return stash_patch_option_requires_patch_error("inter-hunk-context");
+    }
     if patch {
         return Err(GitError::Unsupported(
             "stash push --patch is not implemented".into(),
@@ -6108,6 +6170,11 @@ fn stash_option_takes_no_value_error<T>(option: &str) -> Result<T> {
     Err(GitError::Exit(129))
 }
 
+fn stash_patch_option_requires_patch_error<T>(option: &str) -> Result<T> {
+    eprintln!("fatal: the option '--{option}' requires '--patch'");
+    Err(GitError::Exit(128))
+}
+
 fn cmd_stash_save(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut include_untracked = false;
@@ -6115,6 +6182,9 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     let mut keep_index = false;
     let mut create_mode = StashCreateMode::Worktree;
     let mut patch = false;
+    let mut no_auto_advance = false;
+    let mut unified_context = false;
+    let mut inter_hunk_context = false;
     let mut explicit_message = Vec::new();
     let mut positional_message = Vec::new();
     let mut index = 0;
@@ -6147,6 +6217,56 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--no-patch=") => {
                 return stash_option_takes_no_value_error("no-patch");
+            }
+            "--auto-advance" => {}
+            "--no-auto-advance" => no_auto_advance = true,
+            value if value.starts_with("--auto-advance=") => {
+                return stash_option_takes_no_value_error("auto-advance");
+            }
+            value if value.starts_with("--no-auto-advance=") => {
+                return stash_option_takes_no_value_error("no-auto-advance");
+            }
+            "-U" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(true);
+                };
+                commit_validate_unified_context(value, true)?;
+                unified_context = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                commit_validate_unified_context(&value[2..], true)?;
+                unified_context = true;
+            }
+            "--unified" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(false);
+                };
+                commit_validate_unified_context(value, false)?;
+                unified_context = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                unified_context = true;
+            }
+            "--inter-hunk-context" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_inter_hunk_context_requires_value_error();
+                };
+                commit_validate_inter_hunk_context(value)?;
+                inter_hunk_context = true;
+            }
+            "--inter-hunk-context=" => {
+                return commit_inter_hunk_context_expects_numerical_value_error();
+            }
+            value if value.starts_with("--inter-hunk-context=") => {
+                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                inter_hunk_context = true;
             }
             "-m" | "--message" => {
                 index += 1;
@@ -6192,6 +6312,15 @@ fn cmd_stash_save(args: &[String]) -> Result<()> {
     if create_mode == StashCreateMode::Staged && include_untracked {
         eprintln!("Can't use --staged and --include-untracked or --all at the same time");
         return Err(GitError::Exit(1));
+    }
+    if no_auto_advance && !patch {
+        return stash_patch_option_requires_patch_error("no-auto-advance");
+    }
+    if unified_context && !patch {
+        return stash_patch_option_requires_patch_error("unified");
+    }
+    if inter_hunk_context && !patch {
+        return stash_patch_option_requires_patch_error("inter-hunk-context");
     }
     if patch {
         return Err(GitError::Unsupported(

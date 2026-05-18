@@ -458,6 +458,59 @@ fn stash_push_matches_upstream_git() {
                 vec!["stash", "push", "--no-message=value"],
             ),
             (
+                "auto-advance",
+                "unstaged",
+                vec!["stash", "push", "--auto-advance"],
+            ),
+            (
+                "auto-advance-value",
+                "unstaged",
+                vec!["stash", "push", "--auto-advance=false"],
+            ),
+            (
+                "no-auto-advance",
+                "unstaged",
+                vec!["stash", "push", "--no-auto-advance"],
+            ),
+            (
+                "no-auto-advance-no-patch",
+                "unstaged",
+                vec![
+                    "stash",
+                    "push",
+                    "--patch",
+                    "--no-auto-advance",
+                    "--no-patch",
+                ],
+            ),
+            ("unified", "unstaged", vec!["stash", "push", "--unified=1"]),
+            ("unified-short", "unstaged", vec!["stash", "push", "-U1"]),
+            (
+                "unified-missing",
+                "unstaged",
+                vec!["stash", "push", "--unified"],
+            ),
+            (
+                "unified-invalid",
+                "unstaged",
+                vec!["stash", "push", "--unified=bad"],
+            ),
+            (
+                "inter-hunk-context",
+                "unstaged",
+                vec!["stash", "push", "--inter-hunk-context=1"],
+            ),
+            (
+                "inter-hunk-context-missing",
+                "unstaged",
+                vec!["stash", "push", "--inter-hunk-context"],
+            ),
+            (
+                "inter-hunk-context-invalid",
+                "unstaged",
+                vec!["stash", "push", "--inter-hunk-context=bad"],
+            ),
+            (
                 "keep-index-staged",
                 "staged",
                 vec!["stash", "push", "--keep-index"],
@@ -711,6 +764,59 @@ fn stash_save_matches_upstream_git() {
                 "no-message-value",
                 "unstaged",
                 vec!["stash", "save", "--no-message=value"],
+            ),
+            (
+                "auto-advance",
+                "unstaged",
+                vec!["stash", "save", "--auto-advance"],
+            ),
+            (
+                "auto-advance-value",
+                "unstaged",
+                vec!["stash", "save", "--auto-advance=false"],
+            ),
+            (
+                "no-auto-advance",
+                "unstaged",
+                vec!["stash", "save", "--no-auto-advance"],
+            ),
+            (
+                "no-auto-advance-no-patch",
+                "unstaged",
+                vec![
+                    "stash",
+                    "save",
+                    "--patch",
+                    "--no-auto-advance",
+                    "--no-patch",
+                ],
+            ),
+            ("unified", "unstaged", vec!["stash", "save", "--unified=1"]),
+            ("unified-short", "unstaged", vec!["stash", "save", "-U1"]),
+            (
+                "unified-missing",
+                "unstaged",
+                vec!["stash", "save", "--unified"],
+            ),
+            (
+                "unified-invalid",
+                "unstaged",
+                vec!["stash", "save", "--unified=bad"],
+            ),
+            (
+                "inter-hunk-context",
+                "unstaged",
+                vec!["stash", "save", "--inter-hunk-context=1"],
+            ),
+            (
+                "inter-hunk-context-missing",
+                "unstaged",
+                vec!["stash", "save", "--inter-hunk-context"],
+            ),
+            (
+                "inter-hunk-context-invalid",
+                "unstaged",
+                vec!["stash", "save", "--inter-hunk-context=bad"],
             ),
             (
                 "keep-index-staged",
