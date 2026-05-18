@@ -1086,6 +1086,155 @@ fn diff_copies_match_upstream_git() {
 }
 
 #[test]
+fn diff_empty_rename_controls_match_upstream_git() {
+    let root = unique_temp_dir("diff-empty-renames");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("old-empty.txt"), b"").expect("write empty fixture");
+        git(&root, &["add", "old-empty.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        git(&root, &["mv", "old-empty.txt", "new-empty.txt"]);
+        for args in [
+            vec!["diff", "--cached", "--name-status", "HEAD"],
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--rename-empty",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--no-rename-empty",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-M",
+                "--name-only",
+                "--no-rename-empty",
+                "HEAD",
+            ],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+
+        for args in [
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--rename-empty=1",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "--name-status",
+                "--no-rename-empty=1",
+                "HEAD",
+            ],
+        ] {
+            let expected = run_status("git", &root, &args);
+            let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_eq!(actual, expected, "git-rs result differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn diff_empty_copy_controls_match_upstream_git() {
+    let root = unique_temp_dir("diff-empty-copies");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("source-empty.txt"), b"").expect("write empty fixture");
+        git(&root, &["add", "source-empty.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::copy(root.join("source-empty.txt"), root.join("copy-empty.txt"))
+            .expect("copy empty fixture");
+        git(&root, &["add", "copy-empty.txt"]);
+        for args in [
+            vec![
+                "diff",
+                "--cached",
+                "-C",
+                "--find-copies-harder",
+                "--name-status",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-C",
+                "--find-copies-harder",
+                "--name-status",
+                "--rename-empty",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-C",
+                "--find-copies-harder",
+                "--name-status",
+                "--no-rename-empty",
+                "HEAD",
+            ],
+            vec![
+                "diff",
+                "--cached",
+                "-C",
+                "--find-copies-harder",
+                "--name-only",
+                "--no-rename-empty",
+                "HEAD",
+            ],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn diff_summary_matches_upstream_git() {
     let root = unique_temp_dir("diff-summary");
     fs::create_dir_all(&root).expect("create temp repo");

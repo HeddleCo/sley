@@ -4136,6 +4136,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
                 detect_renames: true,
                 detect_copies: true,
                 find_copies_harder: true,
+                rename_empty: true,
             },
         )?;
         let rename_copy_rust = rename_copy_entries

@@ -25998,6 +25998,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut detect_renames = true;
     let mut detect_copies = false;
     let mut find_copies_harder = false;
+    let mut rename_empty = true;
     let mut diff_filter = DiffFilter::default();
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -26347,10 +26348,18 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "--no-renames" => {
                 detect_renames = false;
             }
+            "--rename-empty" => rename_empty = true,
+            "--no-rename-empty" => rename_empty = false,
             value if value.starts_with("-M") && value.len() > 2 => detect_renames = true,
             value if value.starts_with("--find-renames=") => detect_renames = true,
             value if value.starts_with("-C") && value.len() > 2 => detect_copies = true,
             value if value.starts_with("--find-copies=") => detect_copies = true,
+            value if value.starts_with("--rename-empty=") => {
+                return log_option_takes_no_value_error("rename-empty");
+            }
+            value if value.starts_with("--no-rename-empty=") => {
+                return log_option_takes_no_value_error("no-rename-empty");
+            }
             "-l" => {
                 idx += 1;
                 let value = args
@@ -26542,6 +26551,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         detect_renames,
         detect_copies,
         find_copies_harder,
+        rename_empty,
     };
     let zero_worktree_oids = !cached && !head;
     let entries = if cached {

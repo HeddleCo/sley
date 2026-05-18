@@ -1,4 +1,4 @@
-use git_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use git_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 use git_formats::{Commit, EncodedObject, Index, ObjectType, Tree};
 use git_odb::{FileObjectDatabase, ObjectReader};
 use git_refs::{FileRefStore, RefTarget};
@@ -94,6 +94,7 @@ pub struct DiffNameStatusOptions {
     pub detect_renames: bool,
     pub detect_copies: bool,
     pub find_copies_harder: bool,
+    pub rename_empty: bool,
 }
 
 impl Default for DiffNameStatusOptions {
@@ -102,6 +103,7 @@ impl Default for DiffNameStatusOptions {
             detect_renames: true,
             detect_copies: false,
             find_copies_harder: false,
+            rename_empty: true,
         }
     }
 }
@@ -271,7 +273,7 @@ fn diff_name_status_maps<'a>(
         }
     }
     if options.detect_renames {
-        changes = detect_exact_renames(changes, left_entries, right_entries);
+        changes = detect_exact_renames(changes, left_entries, right_entries, options.rename_empty);
     }
     if options.detect_copies {
         changes = detect_exact_copies(
@@ -279,6 +281,7 @@ fn diff_name_status_maps<'a>(
             left_entries,
             right_entries,
             options.find_copies_harder,
+            options.rename_empty,
         );
     }
     Ok(changes)
@@ -288,6 +291,7 @@ fn detect_exact_renames(
     changes: Vec<NameStatusEntry>,
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    rename_empty: bool,
 ) -> Vec<NameStatusEntry> {
     let added = changes
         .iter()
@@ -310,9 +314,9 @@ fn detect_exact_renames(
         };
         if let Some((idx, new_path)) = added.iter().find(|(idx, new_path)| {
             !consumed.contains(idx)
-                && right_entries
-                    .get(new_path)
-                    .is_some_and(|right| right.oid == left.oid)
+                && right_entries.get(new_path).is_some_and(|right| {
+                    right.oid == left.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
+                })
         }) {
             consumed.insert(*idx);
             renamed_old_paths.insert(old_path.clone());
@@ -347,6 +351,7 @@ fn detect_exact_copies(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     find_copies_harder: bool,
+    rename_empty: bool,
 ) -> Vec<NameStatusEntry> {
     let changed_sources = changes
         .iter()
@@ -371,9 +376,9 @@ fn detect_exact_copies(
         };
         if let Some(old_path) = source_paths.iter().find(|old_path| {
             old_path.as_slice() != entry.path.as_slice()
-                && left_entries
-                    .get(*old_path)
-                    .is_some_and(|left| left.oid == right.oid)
+                && left_entries.get(*old_path).is_some_and(|left| {
+                    left.oid == right.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
+                })
         }) {
             result.push(NameStatusEntry {
                 status: NameStatus::Copied(100),
@@ -390,6 +395,10 @@ fn detect_exact_copies(
     }
     result.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
     result
+}
+
+fn is_empty_blob_oid(oid: &ObjectId) -> bool {
+    object_id_for_bytes(oid.format(), "blob", b"").is_ok_and(|empty| empty == *oid)
 }
 
 fn diff_entry_sort_path(entry: &NameStatusEntry) -> &[u8] {

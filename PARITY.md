@@ -551,6 +551,7 @@ Target: upstream Git 2.54.0.
   exact rename detection for name output including `-M` / `--find-renames` /
   `--no-renames`, exact copy detection for name output including `-C` /
   `--find-copies` / `--find-copies-harder`, no-op `-l<n>` rename-limit parsing
+  and `--rename-empty` / `--no-rename-empty` controls
   for exact rename/copy name output, with simple literal pathspec
   filtering, excluding untracked files like upstream Git.
 - Minimal `rev-parse` support for full object IDs, `HEAD`, direct ref names,
