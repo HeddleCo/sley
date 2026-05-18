@@ -5527,6 +5527,7 @@ struct StashListOptions {
     min_parents: Option<usize>,
     max_parents: Option<usize>,
     abbrev_len: Option<usize>,
+    date_mode: ForEachRefDateMode,
     author_filters: Vec<SimpleLogRegex>,
     committer_filters: Vec<SimpleLogRegex>,
     grep_filters: Vec<SimpleLogRegex>,
@@ -7880,6 +7881,7 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                     &commit,
                     list_format,
                     options.abbrev_len,
+                    options.date_mode,
                 )?;
                 if *final_newline || position + 1 < selected {
                     println!();
@@ -7899,6 +7901,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut min_parents = None;
     let mut max_parents = None;
     let mut abbrev_len = Some(7);
+    let mut date_mode = ForEachRefDateMode::Default;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
     let mut grep_patterns = Vec::new();
@@ -8008,6 +8011,16 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(value) = value.strip_prefix("--pretty=") => {
                 format = parse_stash_list_format(value)?;
             }
+            "--date" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command("--date requires a value".into()));
+                };
+                date_mode = log_date_mode(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--date=") => {
+                date_mode = log_date_mode(value)?;
+            }
             value if let Some(count) = value.strip_prefix("--max-count=") => {
                 max_count = Some(parse_reflog_count(count)?);
             }
@@ -8105,6 +8118,7 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         min_parents,
         max_parents,
         abbrev_len,
+        date_mode,
         author_filters,
         committer_filters,
         grep_filters,
@@ -8163,6 +8177,7 @@ fn print_stash_list_format(
     commit: &Commit,
     format: &str,
     abbrev_len: Option<usize>,
+    date_mode: ForEachRefDateMode,
 ) -> Result<()> {
     let (author_name, author_email) = commit_identity_name_email(&commit.author);
     let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
@@ -8184,7 +8199,25 @@ fn print_stash_list_format(
             Some('a') => match chars.next() {
                 Some('n' | 'N') => print!("{author_name}"),
                 Some('e' | 'E') => print!("{author_email}"),
+                Some('l' | 'L') => print!("{}", log_email_local_part(&author_email)),
                 Some('t') => print!("{author_timestamp}"),
+                Some('d') => print!("{}", commit_identity_date(&commit.author, date_mode)),
+                Some('i') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Iso)
+                ),
+                Some('I') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::IsoStrict)
+                ),
+                Some('s') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Short)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822)
+                ),
                 Some(other) => {
                     return Err(GitError::Unsupported(format!(
                         "unsupported stash list format placeholder %a{other}"
@@ -8199,7 +8232,25 @@ fn print_stash_list_format(
             Some('c') => match chars.next() {
                 Some('n' | 'N') => print!("{committer_name}"),
                 Some('e' | 'E') => print!("{committer_email}"),
+                Some('l' | 'L') => print!("{}", log_email_local_part(&committer_email)),
                 Some('t') => print!("{committer_timestamp}"),
+                Some('d') => print!("{}", commit_identity_date(&commit.committer, date_mode)),
+                Some('i') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Iso)
+                ),
+                Some('I') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::IsoStrict)
+                ),
+                Some('s') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Short)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Rfc2822)
+                ),
                 Some(other) => {
                     return Err(GitError::Unsupported(format!(
                         "unsupported stash list format placeholder %c{other}"
@@ -8228,6 +8279,18 @@ fn print_stash_list_format(
                     ));
                 }
             },
+            Some('C') => consume_log_format_color(&mut chars)?,
+            Some('x') => {
+                let mut lookahead = chars.clone();
+                if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
+                    && let (Some(high), Some(low)) = (high.to_digit(16), low.to_digit(16))
+                {
+                    chars = lookahead;
+                    io::stdout().write_all(&[((high << 4) | low) as u8])?;
+                } else {
+                    print!("%x");
+                }
+            }
             Some(other) => {
                 return Err(GitError::Unsupported(format!(
                     "unsupported stash list format placeholder %{other}"
@@ -8240,6 +8303,7 @@ fn print_stash_list_format(
             }
         }
     }
+    io::stdout().flush()?;
     Ok(())
 }
 
@@ -29360,7 +29424,7 @@ fn for_each_ref_identity_date_raw(identity: &[u8]) -> Option<&[u8]> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 enum ForEachRefDateMode {
     Default,
     Raw,

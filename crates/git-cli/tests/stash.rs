@@ -380,8 +380,16 @@ fn stash_list_matches_upstream_git() {
             vec![
                 "stash",
                 "list",
-                "--format=%gd|%an|%ae|%aN|%aE|%cn|%ce|%cN|%cE|%at|%ct|%s",
+                "--format=%gd|%an|%ae|%al|%aN|%aE|%aL|%cn|%ce|%cl|%cN|%cE|%cL|%at|%ct|%s",
             ],
+            vec![
+                "stash",
+                "list",
+                "--format=%gd|%ad|%ai|%aI|%as|%aD|%cd|%ci|%cI|%cs|%cD",
+            ],
+            vec!["stash", "list", "--date=iso", "--format=%ad|%cd"],
+            vec!["stash", "list", "--date", "short", "--format=%ad|%cd"],
+            vec!["stash", "list", "--format=%gd%x09%C(red)%s%Creset"],
             vec![
                 "stash",
                 "list",
