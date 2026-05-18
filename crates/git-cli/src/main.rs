@@ -7749,8 +7749,11 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                     &db,
                     None,
                     false,
-                    compact_summary,
-                    None,
+                    DiffStatOptions {
+                        compact_summary,
+                        stat_count: None,
+                        color: false,
+                    },
                 )?;
                 wrote_prefix_output |= !entries.is_empty();
             }
@@ -25972,7 +25975,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut raw_abbrev = None;
     let mut patch_abbrev = None;
     let mut patch_full_index = false;
-    let mut color_output_requested = false;
+    let mut color_always = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26065,8 +26068,8 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
-            "--color" | "--color=always" => color_output_requested = true,
-            "--no-color" | "--color=never" | "--color=auto" => {}
+            "--color" | "--color=always" => color_always = true,
+            "--no-color" | "--color=never" | "--color=auto" => color_always = false,
             "--color-moved" | "--no-color-moved" => {}
             value if let Some(value) = value.strip_prefix("--color-moved=") => {
                 log_validate_color_moved(value)?;
@@ -26198,7 +26201,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             "diff currently supports: diff [--cached] [-z] [-M|-C] [--diff-filter=<filter>] [--exit-code|--quiet] [--abbrev[=<n>]|--no-abbrev] [--src-prefix=<prefix>|--dst-prefix=<prefix>|--no-prefix|--default-prefix] [--raw|--stat|--compact-summary|--numstat|--shortstat|--summary|--name-status|--name-only|-p|-u|--patch|--patch-with-raw|--patch-with-stat|-s|--no-patch] [HEAD] [-- <path>...] and diff [--cached] [-z] --quiet [HEAD]".into(),
         ));
     }
-    if color_output_requested && !name_status && !name_only {
+    if color_always && !name_status && !name_only && !stat && !compact_summary && !shortstat {
         return Err(GitError::Unsupported(
             "diff colored output is not supported for this output mode".into(),
         ));
@@ -26325,8 +26328,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 &db,
                 worktree_root.as_deref(),
                 !cached,
-                compact_summary,
-                stat_count,
+                DiffStatOptions {
+                    compact_summary,
+                    stat_count,
+                    color: color_always,
+                },
             )?;
         }
         if show_shortstat {
@@ -26911,12 +26917,16 @@ fn write_diff_stat(
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
     use_worktree_new: bool,
-    compact_summary: bool,
-    stat_count: Option<usize>,
+    options: DiffStatOptions,
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
+    let DiffStatOptions {
+        compact_summary,
+        stat_count,
+        color,
+    } = options;
     let rows = diff_stat_rows(
         entries,
         db,
@@ -26957,6 +26967,8 @@ fn write_diff_stat(
     for row in rows.iter().take(displayed_rows) {
         match row.stats {
             DiffStatStats::Binary { old_size, new_size } => {
+                let old_size = color_stat_deleted(&old_size.to_string(), color);
+                let new_size = color_stat_inserted(&new_size.to_string(), color);
                 writeln!(
                     stdout,
                     " {:path_width$} | Bin {old_size} -> {new_size} bytes",
@@ -26968,7 +26980,7 @@ fn write_diff_stat(
                 if count == 0 {
                     writeln!(stdout, " {:path_width$} | {count:>count_width$}", row.path)?;
                 } else {
-                    let graph = diff_stat_graph(inserted, deleted);
+                    let graph = diff_stat_graph(inserted, deleted, color);
                     writeln!(
                         stdout,
                         " {:path_width$} | {count:>count_width$} {graph}",
@@ -26982,6 +26994,13 @@ fn write_diff_stat(
         writeln!(stdout, " ...")?;
     }
     write_diff_shortstat(stdout, entries, db, worktree_root, use_worktree_new)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiffStatOptions {
+    compact_summary: bool,
+    stat_count: Option<usize>,
+    color: bool,
 }
 
 fn diff_stat_rows(
@@ -27056,11 +27075,33 @@ fn diff_compact_summary_label(entry: &git_diff_merge::NameStatusEntry) -> Option
     }
 }
 
-fn diff_stat_graph(inserted: usize, deleted: usize) -> String {
+fn diff_stat_graph(inserted: usize, deleted: usize, color: bool) -> String {
     let mut graph = String::with_capacity(inserted + deleted);
-    graph.extend(std::iter::repeat_n('+', inserted));
-    graph.extend(std::iter::repeat_n('-', deleted));
+    if inserted > 0 {
+        let pluses = std::iter::repeat_n('+', inserted).collect::<String>();
+        graph.push_str(&color_stat_inserted(&pluses, color));
+    }
+    if deleted > 0 {
+        let minuses = std::iter::repeat_n('-', deleted).collect::<String>();
+        graph.push_str(&color_stat_deleted(&minuses, color));
+    }
     graph
+}
+
+fn color_stat_inserted(value: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[32m{value}\x1b[m")
+    } else {
+        value.to_string()
+    }
+}
+
+fn color_stat_deleted(value: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[31m{value}\x1b[m")
+    } else {
+        value.to_string()
+    }
 }
 
 fn diff_stat_count_option(value: &str) -> Result<Option<Option<usize>>> {

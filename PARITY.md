@@ -535,6 +535,7 @@ Target: upstream Git 2.54.0.
   add/delete/modify and mode-only cases, and exact rename/copy similarity
   headers, including Git-style path quoting for patch headers,
   no-op parsing for `-a` / `--text`, `--no-ext-diff`, `--no-textconv`,
+  colored `--stat` / `--compact-summary` graph output with `--color[=always]`,
   non-coloring name output with `--color[=always]`, general `--no-color` /
   `--color=never|auto`, no-op `--color-moved` / `--color-moved-ws`
   controls, and non-submodule
