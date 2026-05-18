@@ -8080,8 +8080,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if value.starts_with("--no-source=") => {
                 stash_list_option_takes_no_value_error("no-source")?;
             }
+            value if value.starts_with("--no-color-moved=") => {
+                stash_list_option_takes_no_value_error("no-color-moved")?;
+            }
             value
                 if value.starts_with("--no-graph=")
+                    || value.starts_with("--oneline=")
                     || value.starts_with("--no-expand-tabs=")
                     || value.starts_with("--show-signature=")
                     || value.starts_with("--no-show-signature=")
@@ -8103,9 +8107,29 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                     || value.starts_with("--no-regexp-ignore-case")
                     || value.starts_with("--no-all-match")
                     || value.starts_with("--no-invert-grep")
-                    || value.starts_with("--no-grep") =>
+                    || value.starts_with("--no-grep")
+                    || value.starts_with("--full-history=")
+                    || value.starts_with("--dense=")
+                    || value.starts_with("--sparse=")
+                    || value.starts_with("--remove-empty=")
+                    || value.starts_with("--left-right=")
+                    || value.starts_with("--merges=")
+                    || value.starts_with("--no-merges=")
+                    || value.starts_with("--no-min-parents=")
+                    || value.starts_with("--no-max-parents=")
+                    || value.starts_with("--children=")
+                    || value.starts_with("--cherry-pick=")
+                    || value.starts_with("--topo-order=")
+                    || value.starts_with("--date-order=")
+                    || value.starts_with("--author-date-order=")
+                    || value.starts_with("--simplify-by-decoration=")
+                    || value.starts_with("--simplify-merges=") =>
             {
                 stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--ancestry-path=") => {
+                eprintln!("error: could not get commit for --ancestry-path argument {value}");
+                return Err(GitError::Exit(1));
             }
             "--decorate" => {}
             value if let Some(value) = value.strip_prefix("--decorate=") => {
