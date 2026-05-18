@@ -99,7 +99,7 @@ Target: upstream Git 2.54.0.
   merge-diff suppression, diff-algorithm, whitespace, context, prefix,
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
-  history-limiting, ordering, filter reset, regexp reset/value,
+  history-limiting, ordering, filter reset, regexp short/long reset/value,
   notes/source/signature value rejections,
   `--reverse` rejection, `--skip` skipping, and `-<n>` / `-n` /
   `--max-count` limiting including negative
@@ -930,7 +930,7 @@ Target: upstream Git 2.54.0.
   merge-diff suppression, diff-algorithm, whitespace, context, prefix,
   output-indicator, submodule, color-moved, pickaxe, ita, and rewrite no-op
   flags, no-walk, simple history walk toggles, and parent-count filters, covered
-  history-limiting, ordering, filter reset, regexp reset/value,
+  history-limiting, ordering, filter reset, regexp short/long reset/value,
   notes/source/signature value rejections,
   `--reverse` rejection, `--skip` skipping, quiet toggles, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,

@@ -8187,6 +8187,15 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             "-E" | "-P" | "--basic-regexp" | "--extended-regexp" | "--perl-regexp" => {
                 regexp_mode = SimpleLogRegexMode::Basic
             }
+            value
+                if (value.starts_with("-F")
+                    || value.starts_with("-E")
+                    || value.starts_with("-P")
+                    || value.starts_with("-i"))
+                    && value.len() > 2 =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
             value if value.starts_with("-M") => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
             }
