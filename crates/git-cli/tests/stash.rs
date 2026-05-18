@@ -207,7 +207,18 @@ fn stash_list_matches_upstream_git() {
             vec!["stash", "list", "--do-walk"],
             vec!["stash", "list", "--first-parent"],
             vec!["stash", "list", "--parents"],
+            vec!["stash", "list", "--merges"],
+            vec!["stash", "list", "--no-merges"],
+            vec!["stash", "list", "--min-parents=0"],
+            vec!["stash", "list", "--min-parents=2"],
+            vec!["stash", "list", "--min-parents=3"],
+            vec!["stash", "list", "--min-parents=-1"],
+            vec!["stash", "list", "--max-parents=1"],
+            vec!["stash", "list", "--max-parents=2"],
+            vec!["stash", "list", "--max-parents=-1"],
             vec!["stash", "list", "--no-min-parents"],
+            vec!["stash", "list", "--no-max-parents"],
+            vec!["stash", "list", "--max-parents=1", "--no-max-parents"],
             vec!["stash", "list", "--full-history"],
             vec!["stash", "list", "--dense"],
             vec!["stash", "list", "--sparse"],
@@ -238,6 +249,8 @@ fn stash_list_matches_upstream_git() {
             ["stash", "list", "--skip"].as_slice(),
             ["stash", "list", "--max-count=bad"].as_slice(),
             ["stash", "list", "--max-count"].as_slice(),
+            ["stash", "list", "--min-parents=bad"].as_slice(),
+            ["stash", "list", "--max-parents=bad"].as_slice(),
         ] {
             let expected = run_output("git", &root, args);
             let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &root, args);

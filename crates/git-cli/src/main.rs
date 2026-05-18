@@ -5480,6 +5480,22 @@ fn parse_reflog_skip_count(value: &str) -> Result<usize> {
     usize::try_from(count).map_err(|_| reflog_invalid_integer_error(value))
 }
 
+fn parse_reflog_min_parent_count(value: &str) -> Result<usize> {
+    let count = parse_reflog_integer(value)?;
+    if count < 0 {
+        return Ok(0);
+    }
+    usize::try_from(count).map_err(|_| reflog_invalid_integer_error(value))
+}
+
+fn parse_reflog_max_parent_count(value: &str) -> Result<usize> {
+    let count = parse_reflog_integer(value)?;
+    if count < 0 {
+        return Ok(usize::MAX);
+    }
+    usize::try_from(count).map_err(|_| reflog_invalid_integer_error(value))
+}
+
 fn parse_reflog_integer(value: &str) -> Result<i128> {
     value
         .parse::<i128>()
@@ -5506,6 +5522,8 @@ struct StashListOptions {
     format: StashListFormat,
     max_count: Option<usize>,
     skip_count: usize,
+    min_parents: Option<usize>,
+    max_parents: Option<usize>,
     abbrev_len: Option<usize>,
     grep_filters: Vec<SimpleLogRegex>,
     grep_all_match: bool,
@@ -7812,10 +7830,18 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
     let store = FileRefStore::new(&common_git_dir, format);
+    let db = FileObjectDatabase::new(repository_objects_dir(&common_git_dir), format);
     let mut entries = store.read_reflog("refs/stash")?;
     entries.reverse();
     let mut entries = entries.into_iter().enumerate().collect::<Vec<_>>();
     entries.retain(|(_, entry)| stash_list_grep_filters_match(entry, &options));
+    let mut parent_filtered_entries = Vec::new();
+    for (stash_index, entry) in entries {
+        if stash_list_parent_filters_match(&db, format, &entry, &options)? {
+            parent_filtered_entries.push((stash_index, entry));
+        }
+    }
+    let entries = parent_filtered_entries;
     let skipped = options.skip_count.min(entries.len());
     let selected = options
         .max_count
@@ -7856,6 +7882,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
     let mut format = StashListFormat::Default;
     let mut max_count = None;
     let mut skip_count = 0;
+    let mut min_parents = None;
+    let mut max_parents = None;
     let mut abbrev_len = Some(7);
     let mut grep_patterns = Vec::new();
     let mut grep_all_match = false;
@@ -7882,8 +7910,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
                 return Err(GitError::Exit(1));
             }
             "--no-decorate" | "--walk-reflogs" | "--no-walk" | "--do-walk" | "--first-parent"
-            | "--parents" | "--no-min-parents" | "--full-history" | "--dense" | "--sparse"
-            | "--remove-empty" | "--left-right" => {}
+            | "--parents" | "--full-history" | "--dense" | "--sparse" | "--remove-empty"
+            | "--left-right" => {}
+            "--merges" => min_parents = Some(2),
+            "--no-merges" => max_parents = Some(1),
+            "--no-min-parents" => min_parents = None,
+            "--no-max-parents" => max_parents = None,
             "--children"
             | "--cherry-pick"
             | "--ancestry-path"
@@ -7950,6 +7982,12 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
             value if let Some(count) = value.strip_prefix("--skip=") => {
                 skip_count = parse_reflog_skip_count(count)?;
             }
+            value if let Some(count) = value.strip_prefix("--min-parents=") => {
+                min_parents = Some(parse_reflog_min_parent_count(count)?);
+            }
+            value if let Some(count) = value.strip_prefix("--max-parents=") => {
+                max_parents = Some(parse_reflog_max_parent_count(count)?);
+            }
             value if let Some(value) = value.strip_prefix("--abbrev=") => {
                 abbrev_len = Some(parse_abbrev(value)?.max(4));
             }
@@ -7990,6 +8028,8 @@ fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
         format,
         max_count,
         skip_count,
+        min_parents,
+        max_parents,
         abbrev_len,
         grep_filters,
         grep_all_match,
@@ -8080,6 +8120,25 @@ fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions
             .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
     };
     matched != options.invert_grep
+}
+
+fn stash_list_parent_filters_match(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+    options: &StashListOptions,
+) -> Result<bool> {
+    if options.min_parents.is_none() && options.max_parents.is_none() {
+        return Ok(true);
+    }
+    let object = db.read_object(&entry.new_oid)?;
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(options
+        .min_parents
+        .is_none_or(|min| commit.parents.len() >= min)
+        && options
+            .max_parents
+            .is_none_or(|max| commit.parents.len() <= max))
 }
 
 fn ancestor_depths(

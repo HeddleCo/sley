@@ -83,7 +83,8 @@ Target: upstream Git 2.54.0.
   display, `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` /
   `%gN` / `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
-  accepted decoration, no-walk, and simple history walk toggles, covered
+  accepted decoration, no-walk, simple history walk toggles, and parent-count
+  filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and `-<n>` / `-n` / `--max-count` limiting including negative
   count reset behavior for covered stash entries and empty repositories,
@@ -897,7 +898,8 @@ Target: upstream Git 2.54.0.
   `--oneline`, custom `%H` / `%h` / `%s` / `%gd` / `%gD` / `%gn` / `%gN` /
   `%ge` / `%gE` / `%gs` formats, object-name abbreviation controls,
   `--grep` filtering with case/fixed-string/all-match/invert toggles,
-  accepted decoration, no-walk, and simple history walk toggles, covered
+  accepted decoration, no-walk, simple history walk toggles, and parent-count
+  filters, covered
   history-limiting and ordering rejections, `--reverse` rejection, `--skip`
   skipping, and count limiting, plus
   `stash clear` ref/reflog removal and `stash drop` top/explicit-entry removal,
