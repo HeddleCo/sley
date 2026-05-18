@@ -25982,6 +25982,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_whitespace_control = false;
     let mut diff_output_indicator_control = false;
     let mut diff_patch_context_control = false;
+    let mut diff_submodule_output_control = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -26142,6 +26143,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--ignore-blank-lines=") => {
                 return log_option_takes_no_value_error("ignore-blank-lines");
+            }
+            "--submodule" => diff_submodule_output_control = true,
+            value if let Some(value) = value.strip_prefix("--submodule=") => {
+                log_validate_submodule_format(value)?;
+                diff_submodule_output_control = true;
             }
             "--output-indicator-new" => {
                 idx += 1;
@@ -26360,6 +26366,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     if diff_patch_context_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff patch context controls are not supported for this output mode".into(),
+        ));
+    }
+    if diff_submodule_output_control && !name_status && !name_only {
+        return Err(GitError::Unsupported(
+            "diff submodule output controls are not supported for this output mode".into(),
         ));
     }
     let cwd = env::current_dir()?;

@@ -542,7 +542,8 @@ Target: upstream Git 2.54.0.
   / `--no-color-moved-ws` controls, name-output no-op diff algorithm
   controls, `--inter-hunk-context`, whitespace ignore controls,
   `--ws-error-highlight`, and
-  output-indicator and patch context controls, non-submodule `--ignore-submodules`,
+  output-indicator, patch context, and submodule output controls,
+  non-submodule `--ignore-submodules`,
   and cached/staged variants
   support for added, modified, and deleted paths known to the index/HEAD,
   exact rename detection for name output including `-M` / `--find-renames` /

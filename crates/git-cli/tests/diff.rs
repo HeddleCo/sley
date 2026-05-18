@@ -157,6 +157,10 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--ignore-space-change", "HEAD"],
             vec!["diff", "--name-status", "--ignore-all-space", "HEAD"],
             vec!["diff", "--name-status", "--ignore-blank-lines", "HEAD"],
+            vec!["diff", "--name-status", "--submodule", "HEAD"],
+            vec!["diff", "--name-status", "--submodule=short", "HEAD"],
+            vec!["diff", "--name-status", "--submodule=log", "HEAD"],
+            vec!["diff", "--name-status", "--submodule=diff", "HEAD"],
             vec![
                 "diff",
                 "--name-status",
