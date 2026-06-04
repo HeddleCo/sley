@@ -1,0 +1,3462 @@
+//! `git stash` and its subcommands
+//! (push/save/pop/apply/branch/clear/drop/create/store/show/list).
+
+// Command modules pull their shared plumbing from the crate root. A glob import
+// works because a submodule can access its ancestor module's items (including
+// private ones), so every helper, type, and re-export visible at the crate root
+// is in scope here without re-listing it.
+use crate::*;
+#[derive(Debug)]
+struct StashListOptions {
+    format: StashListFormat,
+    max_count: Option<usize>,
+    skip_count: usize,
+    max_age: Option<i64>,
+    min_age: Option<i64>,
+    min_parents: Option<usize>,
+    max_parents: Option<usize>,
+    abbrev_len: Option<usize>,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+    author_filters: Vec<SimpleLogRegex>,
+    committer_filters: Vec<SimpleLogRegex>,
+    reflog_filters: Vec<SimpleLogRegex>,
+    grep_filters: Vec<SimpleLogRegex>,
+    grep_all_match: bool,
+    invert_grep: bool,
+    regexp_ignore_case: bool,
+    note_refs: Vec<String>,
+}
+
+#[derive(Debug)]
+enum StashListFormat {
+    Default,
+    Oneline,
+    Custom { format: String, final_newline: bool },
+}
+
+pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
+    match args.first().map(String::as_str) {
+        Some("apply") => cmd_stash_apply(&args[1..]),
+        Some("branch") => cmd_stash_branch(&args[1..]),
+        Some("clear") => cmd_stash_clear(&args[1..]),
+        Some("create") => cmd_stash_create(&args[1..]),
+        Some("drop") => cmd_stash_drop(&args[1..]),
+        Some("list") => cmd_stash_list(&args[1..]),
+        Some("pop") => cmd_stash_pop(&args[1..]),
+        Some("push") => cmd_stash_push(&args[1..]),
+        Some("save") => cmd_stash_save(&args[1..]),
+        Some("show") => cmd_stash_show(&args[1..]),
+        Some("store") => cmd_stash_store(&args[1..]),
+        Some(other) => Err(GitError::Unsupported(format!(
+            "stash currently supports only apply, branch, clear, create, drop, list, pop, push, save, show, and store; unsupported subcommand {other}"
+        ))),
+        None => cmd_stash_push(&[]),
+    }
+}
+
+struct StashApplyOptions {
+    quiet: bool,
+    reinstate_index: bool,
+    explicit_selector: bool,
+    selector: usize,
+    display: String,
+}
+
+struct AppliedStash {
+    common_git_dir: PathBuf,
+    format: ObjectFormat,
+    selector: usize,
+    display: String,
+}
+
+fn cmd_stash_apply(args: &[String]) -> Result<()> {
+    let options = parse_stash_apply_options(args, "apply")?;
+    apply_stash_entry(options)?;
+    Ok(())
+}
+
+fn cmd_stash_pop(args: &[String]) -> Result<()> {
+    let options = parse_stash_apply_options(args, "pop")?;
+    let quiet = options.quiet;
+    let applied = apply_stash_entry(options)?;
+    drop_stash_entry(
+        &applied.common_git_dir,
+        applied.format,
+        applied.selector,
+        &applied.display,
+        quiet,
+    )
+}
+
+fn cmd_stash_branch(args: &[String]) -> Result<()> {
+    if args.is_empty() || args.len() > 2 || args[0].starts_with('-') {
+        eprintln!("usage: git stash branch <branchname> [<stash>]");
+        return Err(GitError::Exit(129));
+    }
+    let branch = &args[0];
+    let display = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match args.get(1) {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+    let stash_object = db.read_object(&stash_oid)?;
+    let stash_commit = Commit::parse(format, &stash_object.body)?;
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    cmd_checkout(&["-b".to_string(), branch.clone(), base_oid.to_hex()])?;
+    let applied = apply_stash_entry(StashApplyOptions {
+        quiet: false,
+        reinstate_index: true,
+        explicit_selector: true,
+        selector,
+        display,
+    })?;
+    drop_stash_entry(
+        &applied.common_git_dir,
+        applied.format,
+        applied.selector,
+        &applied.display,
+        false,
+    )
+}
+
+fn parse_stash_apply_options(args: &[String], command: &str) -> Result<StashApplyOptions> {
+    let mut quiet = false;
+    let mut reinstate_index = false;
+    let mut specs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            value if value.starts_with("-q") && value.len() > 2 => {
+                stash_apply_parse_combined_quiet(value, command)?;
+                quiet = true;
+            }
+            "--index" => reinstate_index = true,
+            "--no-index" => reinstate_index = false,
+            value if value.starts_with("--quiet=") => {
+                return stash_option_takes_no_value_error("quiet");
+            }
+            value if value.starts_with("--no-quiet=") => {
+                return stash_option_takes_no_value_error("no-quiet");
+            }
+            value if value.starts_with("--index=") => {
+                return stash_option_takes_no_value_error("index");
+            }
+            value if value.starts_with("--no-index=") => {
+                return stash_option_takes_no_value_error("no-index");
+            }
+            "--" => {
+                specs.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return stash_apply_unknown_option_error(command, value);
+            }
+            value => specs.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    let display = specs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+    Ok(StashApplyOptions {
+        quiet,
+        reinstate_index,
+        explicit_selector: !specs.is_empty(),
+        selector,
+        display,
+    })
+}
+
+fn stash_apply_parse_combined_quiet(value: &str, command: &str) -> Result<()> {
+    for byte in value.as_bytes()[2..].iter().copied() {
+        if byte != b'q' {
+            return stash_apply_unknown_switch_error(command, byte as char);
+        }
+    }
+    Ok(())
+}
+
+fn stash_apply_unknown_option_error<T>(command: &str, value: &str) -> Result<T> {
+    eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+    stash_apply_usage(command);
+    Err(GitError::Exit(129))
+}
+
+fn stash_apply_unknown_switch_error<T>(command: &str, switch: char) -> Result<T> {
+    eprintln!("error: unknown switch `{switch}'");
+    stash_apply_usage(command);
+    Err(GitError::Exit(129))
+}
+
+fn stash_apply_usage(command: &str) {
+    eprintln!("usage: git stash {command} [--index] [-q | --quiet] [<stash>]");
+    eprintln!();
+    eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
+    eprintln!("    --[no-]index          attempt to recreate the index");
+    eprintln!();
+}
+
+fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        if options.explicit_selector {
+            eprintln!("error: {} is not a valid reference", options.display);
+            return Err(GitError::Exit(1));
+        }
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if options.selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    if !git_worktree::short_status(&worktree_root, &git_dir, format)?.is_empty() {
+        return Err(GitError::Unsupported(
+            "stash apply currently requires a clean working tree and index".into(),
+        ));
+    }
+    let entry_index = entries.len() - 1 - options.selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+    let stash_object = db.read_object(&stash_oid)?;
+    let stash_commit = Commit::parse(format, &stash_object.body)?;
+    let head_store = FileRefStore::new(&git_dir, format);
+    let Some((head_oid, head_commit)) = stash_head_commit(&head_store, &db, format)? else {
+        eprintln!("You do not have the initial commit yet");
+        return Err(GitError::Exit(1));
+    };
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    let base_object = db.read_object(base_oid)?;
+    if base_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash parent {base_oid} is not a commit"
+        )));
+    }
+    let base_commit = Commit::parse(format, &base_object.body)?;
+    let tracked_tree_unchanged = base_commit.tree == stash_commit.tree;
+    let index_oid = stash_commit
+        .parents
+        .get(1)
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no index parent")))?;
+    let index_object = db.read_object(index_oid)?;
+    if index_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash index parent {index_oid} is not a commit"
+        )));
+    }
+    let index_commit = Commit::parse(format, &index_object.body)?;
+    if base_oid == &head_oid {
+        git_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            &stash_oid,
+        )?;
+        if options.reinstate_index {
+            git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, index_oid)?;
+        } else {
+            git_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)?;
+        }
+    } else {
+        apply_stash_tracked_paths_to_moved_head(
+            &worktree_root,
+            &git_dir,
+            &db,
+            format,
+            StashMovedHeadApply {
+                base_tree: &base_commit.tree,
+                head_tree: &head_commit.tree,
+                stash_tree: &stash_commit.tree,
+                index_tree: &index_commit.tree,
+                reinstate_index: options.reinstate_index,
+            },
+        )?;
+    }
+    if let Some(untracked_oid) = stash_commit.parents.get(2) {
+        let untracked_object = db.read_object(untracked_oid)?;
+        if untracked_object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "stash untracked parent {untracked_oid} is not a commit"
+            )));
+        }
+        let untracked_commit = Commit::parse(format, &untracked_object.body)?;
+        restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
+    }
+    if !options.quiet {
+        if tracked_tree_unchanged {
+            println!("Already up to date.");
+        }
+        cmd_status(&[])?;
+    }
+    Ok(AppliedStash {
+        common_git_dir,
+        format,
+        selector: options.selector,
+        display: options.display,
+    })
+}
+
+struct StashMovedHeadApply<'a> {
+    base_tree: &'a ObjectId,
+    head_tree: &'a ObjectId,
+    stash_tree: &'a ObjectId,
+    index_tree: &'a ObjectId,
+    reinstate_index: bool,
+}
+
+fn apply_stash_tracked_paths_to_moved_head(
+    worktree_root: &Path,
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    options: StashMovedHeadApply<'_>,
+) -> Result<()> {
+    let base_entries = stash_tree_entry_map(db, format, options.base_tree)?;
+    let head_entries = stash_tree_entry_map(db, format, options.head_tree)?;
+    let stash_entries = stash_tree_entry_map(db, format, options.stash_tree)?;
+    let index_entries = stash_tree_entry_map(db, format, options.index_tree)?;
+    let worktree_paths = stash_tree_changed_paths(&base_entries, &stash_entries);
+    let index_paths = if options.reinstate_index {
+        stash_tree_changed_paths(&base_entries, &index_entries)
+    } else {
+        BTreeSet::new()
+    };
+    let mut affected_paths = worktree_paths.clone();
+    affected_paths.extend(index_paths.iter().cloned());
+    for path in &affected_paths {
+        if head_entries.get(path) != base_entries.get(path) {
+            return Err(GitError::Unsupported(
+                "stash apply currently requires stashed paths to be unchanged since the stash base"
+                    .into(),
+            ));
+        }
+    }
+    let worktree_paths = stash_changed_pathbufs(&worktree_paths)?;
+    if !worktree_paths.is_empty() {
+        git_worktree::restore_worktree_paths_from_tree(
+            worktree_root,
+            git_dir,
+            format,
+            options.stash_tree,
+            &worktree_paths,
+        )?;
+    }
+    let index_paths = stash_changed_pathbufs(&index_paths)?;
+    if !index_paths.is_empty() {
+        git_worktree::restore_index_paths_from_tree(
+            worktree_root,
+            git_dir,
+            format,
+            options.index_tree,
+            &index_paths,
+        )?;
+    }
+    Ok(())
+}
+
+fn stash_tree_changed_paths(
+    left: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    right: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> BTreeSet<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    paths.extend(left.keys().cloned());
+    paths.extend(right.keys().cloned());
+    paths
+        .into_iter()
+        .filter(|path| left.get(path) != right.get(path))
+        .collect()
+}
+
+fn stash_changed_pathbufs(paths: &BTreeSet<Vec<u8>>) -> Result<Vec<PathBuf>> {
+    paths
+        .iter()
+        .map(|path| stash_repo_path_to_os_path(path))
+        .collect()
+}
+
+fn restore_stash_tree_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<()> {
+    restore_stash_tree_entries_to_worktree(worktree_root, db, format, tree_oid, Vec::new())
+}
+
+fn restore_stash_tree_entries_to_worktree(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+) -> Result<()> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let tree = Tree::parse(format, &object.body)?;
+    for entry in tree.entries {
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        if entry.mode == 0o040000 {
+            restore_stash_tree_entries_to_worktree(worktree_root, db, format, &entry.oid, path)?;
+            continue;
+        }
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(format!(
+                "expected blob {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        let path = worktree_root.join(stash_repo_path_to_os_path(&path)?);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&path, &object.body)?;
+        set_stash_restored_file_mode(&path, entry.mode)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_stash_restored_file_mode(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(if mode == 0o100755 { 0o755 } else { 0o644 });
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_stash_restored_file_mode(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+fn cmd_stash_clear(args: &[String]) -> Result<()> {
+    if let Some(arg) = args.first() {
+        if arg.starts_with('-') {
+            eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
+            eprintln!("usage: git stash clear");
+            eprintln!();
+            return Err(GitError::Exit(129));
+        }
+        eprintln!("error: git stash clear with arguments is unimplemented");
+        return Err(GitError::Exit(1));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    match store.delete_ref("refs/stash") {
+        Ok(_) | Err(GitError::NotFound(_)) => {
+            let _ = fs::remove_file(common_git_dir.join("logs").join("refs/stash"));
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn cmd_stash_drop(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut specs = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                stash_drop_usage();
+                return Err(GitError::Exit(129));
+            }
+            value => specs.push(value.to_string()),
+        }
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    let display = specs
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "refs/stash@{0}".to_string());
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    drop_stash_entry(&common_git_dir, format, selector, &display, quiet)
+}
+
+fn drop_stash_entry(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    selector: usize,
+    display: &str,
+    quiet: bool,
+) -> Result<()> {
+    let store = FileRefStore::new(common_git_dir, format);
+    let mut entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let dropped = entries.remove(entry_index);
+    if entries.is_empty() {
+        match store.delete_ref("refs/stash") {
+            Ok(_) | Err(GitError::NotFound(_)) => {
+                let _ = fs::remove_file(common_git_dir.join("logs").join("refs/stash"));
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        let new_top = entries
+            .last()
+            .map(|entry| entry.new_oid.clone())
+            .ok_or_else(|| GitError::InvalidFormat("stash reflog has no top entry".into()))?;
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/stash".to_string(),
+            expected: None,
+            new: RefTarget::Direct(new_top),
+            reflog: None,
+        });
+        tx.commit()?;
+        store.write_reflog("refs/stash", &entries)?;
+    }
+    if !quiet {
+        println!("Dropped {display} ({})", dropped.new_oid.to_hex());
+    }
+    Ok(())
+}
+
+fn parse_stash_drop_selector(spec: &str) -> Result<usize> {
+    let selector = spec
+        .strip_prefix("stash@{")
+        .or_else(|| spec.strip_prefix("refs/stash@{"))
+        .and_then(|rest| rest.strip_suffix('}'));
+    let Some(selector) = selector else {
+        eprintln!("error: {spec} is not a valid reference");
+        return Err(GitError::Exit(1));
+    };
+    selector.parse::<usize>().map_err(|_| {
+        eprintln!("error: {spec} is not a valid reference");
+        GitError::Exit(1)
+    })
+}
+
+fn stash_drop_usage() {
+    eprintln!("usage: git stash drop [-q | --quiet] [<stash>]");
+    eprintln!();
+    eprintln!("    -q, --[no-]quiet      be quiet, only report errors");
+    eprintln!();
+}
+
+fn cmd_stash_create(args: &[String]) -> Result<()> {
+    if let Some(created) = create_stash_commit(args, false, false, StashCreateMode::Worktree, &[])?
+    {
+        println!("{}", created.oid);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StashCreateMode {
+    Worktree,
+    Staged,
+}
+
+fn cmd_stash_push(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut include_untracked = false;
+    let mut include_ignored = false;
+    let mut keep_index = false;
+    let mut create_mode = StashCreateMode::Worktree;
+    let mut patch = false;
+    let mut no_auto_advance = false;
+    let mut unified_context = false;
+    let mut inter_hunk_context = false;
+    let mut message_args = Vec::new();
+    let mut pathspecs = Vec::new();
+    let mut pathspec_from_file = None;
+    let mut pathspec_file_nul = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "-u" | "--include-untracked" => include_untracked = true,
+            "--no-include-untracked" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-a" | "--all" => {
+                include_untracked = true;
+                include_ignored = true;
+            }
+            "--no-all" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-k" | "--keep-index" => keep_index = true,
+            "--no-keep-index" => keep_index = false,
+            "-S" | "--staged" => create_mode = StashCreateMode::Staged,
+            "--no-staged" => create_mode = StashCreateMode::Worktree,
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            value if value.starts_with("--patch=") => {
+                return stash_option_takes_no_value_error("patch");
+            }
+            value if value.starts_with("--no-patch=") => {
+                return stash_option_takes_no_value_error("no-patch");
+            }
+            "--auto-advance" => {}
+            "--no-auto-advance" => no_auto_advance = true,
+            value if value.starts_with("--auto-advance=") => {
+                return stash_option_takes_no_value_error("auto-advance");
+            }
+            value if value.starts_with("--no-auto-advance=") => {
+                return stash_option_takes_no_value_error("no-auto-advance");
+            }
+            "-U" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(true);
+                };
+                commit_validate_unified_context(value, true)?;
+                unified_context = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                commit_validate_unified_context(&value[2..], true)?;
+                unified_context = true;
+            }
+            "--unified" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(false);
+                };
+                commit_validate_unified_context(value, false)?;
+                unified_context = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                unified_context = true;
+            }
+            "--inter-hunk-context" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_inter_hunk_context_requires_value_error();
+                };
+                commit_validate_inter_hunk_context(value)?;
+                inter_hunk_context = true;
+            }
+            "--inter-hunk-context=" => {
+                return commit_inter_hunk_context_expects_numerical_value_error();
+            }
+            value if value.starts_with("--inter-hunk-context=") => {
+                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                inter_hunk_context = true;
+            }
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                message_args = vec![value.clone()];
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                message_args = vec![value.to_string()];
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                message_args = vec![value[2..].to_string()];
+            }
+            "--no-message" => message_args.clear(),
+            value if value.starts_with("--no-message=") => {
+                return stash_option_takes_no_value_error("no-message");
+            }
+            "--" => {
+                if pathspec_from_file.is_some() && index + 1 < args.len() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspecs.extend(args[index + 1..].iter().cloned());
+                break;
+            }
+            "--pathspec-from-file" => {
+                if !pathspecs.is_empty() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return stash_pathspec_from_file_requires_value_error();
+                };
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            value if let Some(value) = value.strip_prefix("--pathspec-from-file=") => {
+                if !pathspecs.is_empty() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => {}
+            value if value.starts_with("--no-pathspec-from-file=") => {
+                return stash_option_takes_no_value_error("no-pathspec-from-file");
+            }
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            value if value.starts_with("--pathspec-file-nul=") => {
+                return stash_option_takes_no_value_error("pathspec-file-nul");
+            }
+            value if value.starts_with("--no-pathspec-file-nul=") => {
+                return stash_option_takes_no_value_error("no-pathspec-file-nul");
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash push option {value}"
+                )));
+            }
+            value => {
+                if pathspec_from_file.is_some() {
+                    return stash_pathspec_from_file_with_inline_pathspec_error();
+                }
+                pathspecs.push(value.to_string());
+            }
+        }
+        index += 1;
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(pathspec_file) = pathspec_from_file.as_deref() {
+        pathspecs.extend(
+            read_commit_pathspecs_from_file(pathspec_file, pathspec_file_nul)?
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        );
+    }
+    if create_mode == StashCreateMode::Staged && include_untracked {
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Err(GitError::Exit(1));
+    }
+    if no_auto_advance && !patch {
+        return stash_patch_option_requires_patch_error("no-auto-advance");
+    }
+    if unified_context && !patch {
+        return stash_patch_option_requires_patch_error("unified");
+    }
+    if inter_hunk_context && !patch {
+        return stash_patch_option_requires_patch_error("inter-hunk-context");
+    }
+    if patch {
+        return Err(GitError::Unsupported(
+            "stash push --patch is not implemented".into(),
+        ));
+    }
+    let Some(created) = create_stash_commit(
+        &message_args,
+        include_untracked,
+        include_ignored,
+        create_mode,
+        &pathspecs,
+    )?
+    else {
+        if !quiet {
+            println!("No local changes to save");
+        }
+        return Ok(());
+    };
+
+    store_created_stash(created, quiet, keep_index)
+}
+
+fn stash_pathspec_from_file_requires_value_error<T>() -> Result<T> {
+    eprintln!("error: option `pathspec-from-file' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn stash_pathspec_from_file_with_inline_pathspec_error<T>() -> Result<T> {
+    eprintln!("fatal: '--pathspec-from-file' and pathspec arguments cannot be used together");
+    Err(GitError::Exit(128))
+}
+
+fn stash_option_takes_no_value_error<T>(option: &str) -> Result<T> {
+    eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(129))
+}
+
+fn stash_patch_option_requires_patch_error<T>(option: &str) -> Result<T> {
+    eprintln!("fatal: the option '--{option}' requires '--patch'");
+    Err(GitError::Exit(128))
+}
+
+fn cmd_stash_save(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut include_untracked = false;
+    let mut include_ignored = false;
+    let mut keep_index = false;
+    let mut create_mode = StashCreateMode::Worktree;
+    let mut patch = false;
+    let mut no_auto_advance = false;
+    let mut unified_context = false;
+    let mut inter_hunk_context = false;
+    let mut explicit_message = Vec::new();
+    let mut positional_message = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "-u" | "--include-untracked" => include_untracked = true,
+            "--no-include-untracked" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-a" | "--all" => {
+                include_untracked = true;
+                include_ignored = true;
+            }
+            "--no-all" => {
+                include_untracked = false;
+                include_ignored = false;
+            }
+            "-k" | "--keep-index" => keep_index = true,
+            "--no-keep-index" => keep_index = false,
+            "-S" | "--staged" => create_mode = StashCreateMode::Staged,
+            "--no-staged" => create_mode = StashCreateMode::Worktree,
+            "-p" | "--patch" => patch = true,
+            "--no-patch" => patch = false,
+            value if value.starts_with("--patch=") => {
+                return stash_option_takes_no_value_error("patch");
+            }
+            value if value.starts_with("--no-patch=") => {
+                return stash_option_takes_no_value_error("no-patch");
+            }
+            "--auto-advance" => {}
+            "--no-auto-advance" => no_auto_advance = true,
+            value if value.starts_with("--auto-advance=") => {
+                return stash_option_takes_no_value_error("auto-advance");
+            }
+            value if value.starts_with("--no-auto-advance=") => {
+                return stash_option_takes_no_value_error("no-auto-advance");
+            }
+            "-U" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(true);
+                };
+                commit_validate_unified_context(value, true)?;
+                unified_context = true;
+            }
+            value if value.starts_with("-U") && value.len() > 2 => {
+                commit_validate_unified_context(&value[2..], true)?;
+                unified_context = true;
+            }
+            "--unified" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_unified_requires_value_error(false);
+                };
+                commit_validate_unified_context(value, false)?;
+                unified_context = true;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value if value.starts_with("--unified=") => {
+                commit_validate_unified_context(&value["--unified=".len()..], false)?;
+                unified_context = true;
+            }
+            "--inter-hunk-context" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return commit_inter_hunk_context_requires_value_error();
+                };
+                commit_validate_inter_hunk_context(value)?;
+                inter_hunk_context = true;
+            }
+            "--inter-hunk-context=" => {
+                return commit_inter_hunk_context_expects_numerical_value_error();
+            }
+            value if value.starts_with("--inter-hunk-context=") => {
+                commit_validate_inter_hunk_context(&value["--inter-hunk-context=".len()..])?;
+                inter_hunk_context = true;
+            }
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                explicit_message = vec![value.clone()];
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                explicit_message = vec![value.to_string()];
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                explicit_message = vec![value[2..].to_string()];
+            }
+            "--no-message" => explicit_message.clear(),
+            value if value.starts_with("--no-message=") => {
+                return stash_option_takes_no_value_error("no-message");
+            }
+            "--" => {
+                positional_message.extend(args[index..].iter().cloned());
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash save option {value}"
+                )));
+            }
+            value => positional_message.push(value.to_string()),
+        }
+        index += 1;
+    }
+    let message_args = if positional_message.is_empty() {
+        explicit_message
+    } else {
+        positional_message
+    };
+    if create_mode == StashCreateMode::Staged && include_untracked {
+        eprintln!("Can't use --staged and --include-untracked or --all at the same time");
+        return Err(GitError::Exit(1));
+    }
+    if no_auto_advance && !patch {
+        return stash_patch_option_requires_patch_error("no-auto-advance");
+    }
+    if unified_context && !patch {
+        return stash_patch_option_requires_patch_error("unified");
+    }
+    if inter_hunk_context && !patch {
+        return stash_patch_option_requires_patch_error("inter-hunk-context");
+    }
+    if patch {
+        return Err(GitError::Unsupported(
+            "stash save --patch is not implemented".into(),
+        ));
+    }
+    let Some(created) = create_stash_commit(
+        &message_args,
+        include_untracked,
+        include_ignored,
+        create_mode,
+        &[],
+    )?
+    else {
+        if !quiet {
+            println!("No local changes to save");
+        }
+        return Ok(());
+    };
+    store_created_stash(created, quiet, keep_index)
+}
+
+fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> Result<()> {
+    let store = FileRefStore::new(&created.common_git_dir, created.format);
+    let old_oid = match store.read_ref("refs/stash")? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) | None => zero_oid(created.format)?,
+    };
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "refs/stash".to_string(),
+        expected: None,
+        new: RefTarget::Direct(created.oid.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: created.oid.clone(),
+            committer: created.committer.clone(),
+            message: created.message.as_bytes().to_vec(),
+        }),
+    });
+    tx.commit()?;
+
+    if !quiet {
+        println!(
+            "Saved working directory and index state {}",
+            created.message
+        );
+    }
+    if !created.staged_worktree_conflicts.is_empty() {
+        report_stash_staged_worktree_conflicts(&created.staged_worktree_conflicts, quiet);
+        return Err(GitError::Exit(1));
+    }
+
+    if created.pathspec_paths.is_empty() {
+        let reset_oid = if keep_index {
+            &created.index_oid
+        } else {
+            &created.head_oid
+        };
+        git_worktree::reset_index_and_worktree_to_commit(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            reset_oid,
+        )?;
+    } else if keep_index {
+        git_worktree::restore_worktree_paths(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            &created.pathspec_paths,
+        )?;
+    } else {
+        git_worktree::restore_index_and_worktree_paths_from_head(
+            &created.worktree_root,
+            &created.git_dir,
+            created.format,
+            &created.pathspec_paths,
+        )?;
+    }
+    for path in &created.untracked_paths {
+        remove_stashed_untracked_path(&created.worktree_root, path)?;
+    }
+    Ok(())
+}
+
+fn report_stash_staged_worktree_conflicts(paths: &[Vec<u8>], quiet: bool) {
+    for path in paths {
+        let path = String::from_utf8_lossy(path);
+        eprintln!("error: patch failed: {path}:1");
+        eprintln!("error: {path}: patch does not apply");
+    }
+    if !quiet {
+        eprintln!("Cannot remove worktree changes");
+    }
+}
+
+struct CreatedStash {
+    oid: ObjectId,
+    message: String,
+    committer: Vec<u8>,
+    head_oid: ObjectId,
+    index_oid: ObjectId,
+    git_dir: PathBuf,
+    common_git_dir: PathBuf,
+    worktree_root: PathBuf,
+    untracked_paths: Vec<Vec<u8>>,
+    pathspec_paths: Vec<PathBuf>,
+    staged_worktree_conflicts: Vec<Vec<u8>>,
+    format: ObjectFormat,
+}
+
+fn create_stash_commit(
+    args: &[String],
+    include_untracked: bool,
+    include_ignored: bool,
+    mode: StashCreateMode,
+    pathspecs: &[String],
+) -> Result<Option<CreatedStash>> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let mut db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let store = FileRefStore::new(&git_dir, format);
+    let Some((head_oid, head_commit)) = stash_head_commit(&store, &db, format)? else {
+        eprintln!("You do not have the initial commit yet");
+        return Err(GitError::Exit(1));
+    };
+    let index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
+    let index_entries = index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .cloned()
+        .collect::<Vec<_>>();
+    let pathspec = if pathspecs.is_empty() {
+        None
+    } else {
+        Some(LsFilesPathspec::new(&cwd, &worktree_root, true, pathspecs)?)
+    };
+    let index_tree = stash_write_tree_from_entries(&mut db, &index_entries)?;
+    let worktree_entries =
+        stash_worktree_entries(&worktree_root, &mut db, &index_entries, pathspec.as_ref())?;
+    let worktree_tree = stash_write_tree_from_entries(&mut db, &worktree_entries)?;
+    let mut untracked_paths = if include_untracked {
+        git_worktree::untracked_paths_with_options(
+            &worktree_root,
+            &git_dir,
+            format,
+            git_worktree::UntrackedPathOptions {
+                directory: false,
+                no_empty_directory: false,
+                preserve_ignored_directories: false,
+                exclude_standard: !include_ignored,
+                ignored_only: false,
+                exclude_patterns: Vec::new(),
+                exclude_per_directory: Vec::new(),
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+    if let Some(pathspec) = pathspec.as_ref() {
+        untracked_paths.retain(|path| pathspec.matches(path));
+    }
+    let untracked_entries = stash_untracked_entries(&worktree_root, &mut db, &untracked_paths)?;
+    let untracked_tree = if untracked_entries.is_empty() {
+        None
+    } else {
+        Some(stash_write_tree_from_entries(&mut db, &untracked_entries)?)
+    };
+    let mut pathspec_paths = Vec::new();
+    let mut staged_worktree_conflicts = Vec::new();
+    if let Some(pathspec) = pathspec.as_ref() {
+        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
+        let index_entry_map = stash_index_entry_map(&index_entries);
+        let worktree_entry_map = stash_index_entry_map(&worktree_entries);
+        let tracked_change_paths = stash_pathspec_tracked_change_paths(
+            pathspec,
+            &head_entries,
+            &index_entry_map,
+            &worktree_entry_map,
+        )?;
+        pathspec.exit_if_unmatched()?;
+        if tracked_change_paths.is_empty() && untracked_tree.is_none() {
+            return Ok(None);
+        }
+        pathspec_paths = tracked_change_paths;
+    }
+    if index_tree == head_commit.tree
+        && worktree_tree == head_commit.tree
+        && untracked_tree.is_none()
+    {
+        return Ok(None);
+    }
+    if mode == StashCreateMode::Staged {
+        if index_tree == head_commit.tree {
+            if worktree_tree != head_commit.tree {
+                eprintln!("No staged changes");
+                return Err(GitError::Exit(1));
+            }
+            return Ok(None);
+        }
+        let head_entries = stash_tree_entry_map(&db, format, &head_commit.tree)?;
+        let index_entry_map = stash_index_entry_map(&index_entries);
+        let worktree_entry_map = stash_index_entry_map(&worktree_entries);
+        let staged_change_paths = stash_tree_changed_paths(&head_entries, &index_entry_map);
+        let unstaged_change_paths = stash_tree_changed_paths(&index_entry_map, &worktree_entry_map);
+        staged_worktree_conflicts = staged_change_paths
+            .iter()
+            .filter(|path| unstaged_change_paths.contains(*path))
+            .cloned()
+            .collect();
+        pathspec_paths = stash_changed_pathbufs(&staged_change_paths)?;
+    }
+
+    let branch = store
+        .current_branch()?
+        .unwrap_or_else(|| "(no branch)".to_string());
+    let head_name = format_log_oid(&head_oid, Some(7));
+    let head_subject = commit_subject(&head_commit.message);
+    let author = commit_identity_from_env("AUTHOR")?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let index_commit = git_sequencer::create_commit(
+        &mut db,
+        git_sequencer::CommitCreate {
+            tree: index_tree.clone(),
+            parents: vec![head_oid.clone()],
+            author: author.clone(),
+            committer: committer.clone(),
+            message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
+        },
+    )?;
+    let untracked_commit = if let Some(tree) = untracked_tree {
+        Some(git_sequencer::create_commit(
+            &mut db,
+            git_sequencer::CommitCreate {
+                tree,
+                parents: Vec::new(),
+                author: author.clone(),
+                committer: committer.clone(),
+                message: format!("untracked files on {branch}: {head_name} {head_subject}\n")
+                    .into_bytes(),
+            },
+        )?)
+    } else {
+        None
+    };
+    let message = if args.is_empty() {
+        format!("WIP on {branch}: {head_name} {head_subject}")
+    } else {
+        format!("On {branch}: {}", args.join(" "))
+    };
+    let mut parents = vec![head_oid.clone(), index_commit.clone()];
+    if let Some(untracked_commit) = untracked_commit {
+        parents.push(untracked_commit);
+    }
+    let stash_oid = git_sequencer::create_commit(
+        &mut db,
+        git_sequencer::CommitCreate {
+            tree: if mode == StashCreateMode::Staged {
+                index_tree
+            } else {
+                worktree_tree
+            },
+            parents,
+            author,
+            committer: committer.clone(),
+            message: message.as_bytes().to_vec(),
+        },
+    )?;
+    Ok(Some(CreatedStash {
+        oid: stash_oid,
+        message,
+        committer,
+        head_oid,
+        index_oid: index_commit,
+        git_dir,
+        common_git_dir,
+        worktree_root,
+        untracked_paths,
+        pathspec_paths,
+        staged_worktree_conflicts,
+        format,
+    }))
+}
+
+fn stash_head_commit(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Option<(ObjectId, Commit)>> {
+    let target = match store.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(name)) => store.read_ref(&name)?,
+        direct => direct,
+    };
+    let Some(RefTarget::Direct(oid)) = target else {
+        return Ok(None);
+    };
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {}, found {}",
+            oid,
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Some((oid, Commit::parse(format, &object.body)?)))
+}
+
+#[derive(Default)]
+struct StashTreeNode {
+    files: Vec<TreeEntry>,
+    directories: BTreeMap<Vec<u8>, StashTreeNode>,
+}
+
+impl StashTreeNode {
+    fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
+        let components = entry.path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        if components.iter().any(|component| component.is_empty()) {
+            return Err(GitError::InvalidPath(format!(
+                "invalid index path {}",
+                String::from_utf8_lossy(&entry.path)
+            )));
+        }
+        self.insert_components(&components, entry)
+    }
+
+    fn insert_components(&mut self, components: &[&[u8]], entry: &IndexEntry) -> Result<()> {
+        match components {
+            [] => Err(GitError::InvalidPath("empty index path".into())),
+            [name] => {
+                self.files.push(TreeEntry {
+                    mode: entry.mode,
+                    name: name.to_vec(),
+                    oid: entry.oid.clone(),
+                });
+                Ok(())
+            }
+            [directory, rest @ ..] => self
+                .directories
+                .entry(directory.to_vec())
+                .or_default()
+                .insert_components(rest, entry),
+        }
+    }
+}
+
+fn stash_write_tree_from_entries(
+    db: &mut FileObjectDatabase,
+    entries: &[IndexEntry],
+) -> Result<ObjectId> {
+    let mut root = StashTreeNode::default();
+    for entry in entries {
+        root.insert(entry)?;
+    }
+    stash_write_tree_node(db, &root)
+}
+
+fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> Result<ObjectId> {
+    let mut entries = Vec::with_capacity(node.files.len() + node.directories.len());
+    entries.extend(node.files.iter().cloned());
+    for (name, child) in &node.directories {
+        entries.push(TreeEntry {
+            mode: 0o040000,
+            name: name.clone(),
+            oid: stash_write_tree_node(db, child)?,
+        });
+    }
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        Tree { entries }.write(),
+    ))
+}
+
+fn stash_index_entry_map(entries: &[IndexEntry]) -> BTreeMap<Vec<u8>, (u32, ObjectId)> {
+    entries
+        .iter()
+        .map(|entry| (entry.path.clone(), (entry.mode, entry.oid.clone())))
+        .collect()
+}
+
+fn stash_pathspec_tracked_change_paths(
+    pathspec: &LsFilesPathspec,
+    head_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    index_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    worktree_entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = BTreeSet::new();
+    paths.extend(head_entries.keys().cloned());
+    paths.extend(index_entries.keys().cloned());
+    paths.extend(worktree_entries.keys().cloned());
+    let mut changed = Vec::new();
+    for path in paths {
+        if pathspec.matches(&path)
+            && (head_entries.get(&path) != index_entries.get(&path)
+                || index_entries.get(&path) != worktree_entries.get(&path))
+        {
+            changed.push(stash_repo_path_to_os_path(&path)?);
+        }
+    }
+    Ok(changed)
+}
+
+fn stash_worktree_entries(
+    worktree_root: &Path,
+    db: &mut FileObjectDatabase,
+    index_entries: &[IndexEntry],
+    pathspec: Option<&LsFilesPathspec>,
+) -> Result<Vec<IndexEntry>> {
+    let mut entries = Vec::new();
+    for entry in index_entries {
+        if pathspec.is_some_and(|pathspec| !pathspec.matches(&entry.path)) {
+            entries.push(entry.clone());
+            continue;
+        }
+        let path = stash_repo_path_to_os_path(&entry.path)?;
+        let absolute = worktree_root.join(path);
+        let Ok(metadata) = fs::metadata(&absolute) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            entries.push(entry.clone());
+            continue;
+        }
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
+        entries.push(stash_index_entry_from_metadata(
+            entry.path.clone(),
+            oid,
+            &metadata,
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn stash_untracked_entries(
+    worktree_root: &Path,
+    db: &mut FileObjectDatabase,
+    paths: &[Vec<u8>],
+) -> Result<Vec<IndexEntry>> {
+    let mut entries = Vec::new();
+    for path in paths {
+        let absolute = worktree_root.join(stash_repo_path_to_os_path(path)?);
+        let metadata = fs::metadata(&absolute)?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let oid = db.write_object(EncodedObject::new(ObjectType::Blob, fs::read(&absolute)?))?;
+        entries.push(stash_index_entry_from_metadata(
+            path.clone(),
+            oid,
+            &metadata,
+        ));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(entries)
+}
+
+fn remove_stashed_untracked_path(worktree_root: &Path, path: &[u8]) -> Result<()> {
+    let path = worktree_root.join(stash_repo_path_to_os_path(path)?);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    }
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        if directory == worktree_root || directory.join(".git").exists() {
+            break;
+        }
+        match fs::remove_dir(directory) {
+            Ok(()) => parent = directory.parent(),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) =>
+            {
+                break;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
+    let path = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidPath("index path is not utf8".into()))?;
+    Ok(path.split('/').collect())
+}
+
+fn stash_index_entry_from_metadata(
+    path: Vec<u8>,
+    oid: ObjectId,
+    metadata: &fs::Metadata,
+) -> IndexEntry {
+    let modified = metadata.modified().ok();
+    let duration = modified
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .unwrap_or_default();
+    let flags = path.len().min(0x0fff) as u16;
+    IndexEntry {
+        ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        ctime_nanoseconds: duration.subsec_nanos(),
+        mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
+        mtime_nanoseconds: duration.subsec_nanos(),
+        dev: 0,
+        ino: 0,
+        mode: stash_file_mode(metadata),
+        uid: 0,
+        gid: 0,
+        size: metadata.len().min(u32::MAX as u64) as u32,
+        oid,
+        flags,
+        flags_extended: 0,
+        path,
+    }
+}
+
+#[cfg(unix)]
+fn stash_file_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    if metadata.permissions().mode() & 0o111 != 0 {
+        0o100755
+    } else {
+        0o100644
+    }
+}
+
+#[cfg(not(unix))]
+fn stash_file_mode(_metadata: &fs::Metadata) -> u32 {
+    0o100644
+}
+
+fn cmd_stash_store(args: &[String]) -> Result<()> {
+    let mut message = b"Created via \"git stash store\".".to_vec();
+    let mut commits = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" | "--no-quiet" => {}
+            "-m" | "--message" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    let option = arg.trim_start_matches('-');
+                    if arg.starts_with("--") {
+                        eprintln!("error: option `{option}' requires a value");
+                    } else {
+                        eprintln!("error: switch `{option}' requires a value");
+                    }
+                    return Err(GitError::Exit(129));
+                };
+                message = value.as_bytes().to_vec();
+            }
+            value if let Some(value) = value.strip_prefix("--message=") => {
+                message = value.as_bytes().to_vec();
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                message = value.as_bytes()[2..].to_vec();
+            }
+            value => commits.push(value.to_string()),
+        }
+        index += 1;
+    }
+    if commits.len() != 1 {
+        eprintln!("\"git stash store\" requires one <commit> argument");
+        return Err(GitError::Exit(1));
+    }
+    let commit = &commits[0];
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let stash_oid = match resolve_revision(&common_git_dir, format, commit) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("Cannot update refs/stash with {commit}");
+            return Err(GitError::Exit(1));
+        }
+    };
+    validate_stash_like_commit(&db, format, &stash_oid)?;
+
+    let store = FileRefStore::new(&common_git_dir, format);
+    let old_oid = match store.read_ref("refs/stash")? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
+    };
+    if old_oid == stash_oid {
+        return Ok(());
+    }
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "refs/stash".to_string(),
+        expected: None,
+        new: RefTarget::Direct(stash_oid.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: stash_oid,
+            committer: default_committer(),
+            message,
+        }),
+    });
+    tx.commit()
+}
+
+fn validate_stash_like_commit(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<()> {
+    let object = match db.read_object(oid) {
+        Ok(object) => object,
+        Err(GitError::NotFound(_)) => {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        }
+        Err(err) => return Err(err),
+    };
+    if object.object_type != ObjectType::Commit {
+        eprintln!(
+            "error: object {oid} is a {}, not a commit",
+            object.object_type.as_str()
+        );
+        eprintln!("fatal: '{oid}' is not a stash-like commit");
+        return Err(GitError::Exit(128));
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    if commit.parents.len() < 2 {
+        eprintln!("fatal: '{oid}' is not a stash-like commit");
+        return Err(GitError::Exit(128));
+    }
+    for parent in &commit.parents[..2] {
+        let Ok(parent_object) = db.read_object(parent) else {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        };
+        if parent_object.object_type != ObjectType::Commit {
+            eprintln!("fatal: '{oid}' is not a stash-like commit");
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StashShowMode {
+    Stat,
+    NameOnly,
+    NameStatus,
+    NoPatch,
+}
+
+fn cmd_stash_show(args: &[String]) -> Result<()> {
+    let mut mode = StashShowMode::Stat;
+    let mut quiet = false;
+    let mut exit_code = false;
+    let mut show_stat = false;
+    let mut show_raw = false;
+    let mut show_numstat = false;
+    let mut show_shortstat = false;
+    let mut show_summary = false;
+    let mut compact_summary = false;
+    let mut show_patch = false;
+    let mut raw_abbrev = Some(Some(7usize));
+    let mut patch_abbrev = None;
+    let mut patch_full_index = false;
+    let mut include_untracked = false;
+    let mut only_untracked = false;
+    let mut diff_filter = DiffFilter::default();
+    let mut diff_filter_seen = false;
+    let mut specs = Vec::new();
+    let mut idx = 0;
+    while idx < args.len() {
+        let arg = &args[idx];
+        match arg.as_str() {
+            "--stat" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_stat = true;
+                }
+            }
+            value if value.starts_with("--stat=") => {
+                eprintln!(
+                    "error: invalid --stat value: {}",
+                    value.trim_start_matches("--stat=")
+                );
+                return Err(GitError::Exit(129));
+            }
+            "--no-stat" | "--no-raw" | "--no-name-only" | "--no-name-status" | "--no-numstat"
+            | "--no-shortstat" | "--no-summary" => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            value
+                if value.starts_with("--no-stat=")
+                    || value.starts_with("--no-raw=")
+                    || value.starts_with("--no-name-only=")
+                    || value.starts_with("--no-name-status=")
+                    || value.starts_with("--no-numstat=")
+                    || value.starts_with("--no-shortstat=")
+                    || value.starts_with("--no-summary=") =>
+            {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            "--raw" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_raw = true;
+                }
+            }
+            value if value.starts_with("--raw=") => stash_option_takes_no_value_error("raw")?,
+            "--numstat" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_numstat = true;
+                }
+            }
+            value if value.starts_with("--numstat=") => {
+                stash_option_takes_no_value_error("numstat")?
+            }
+            "--shortstat" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_shortstat = true;
+                }
+            }
+            value if value.starts_with("--shortstat=") => {
+                stash_option_takes_no_value_error("shortstat")?
+            }
+            "--summary" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_summary = true;
+                }
+            }
+            value if value.starts_with("--summary=") => {
+                stash_option_takes_no_value_error("summary")?
+            }
+            "--compact-summary" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    compact_summary = true;
+                }
+            }
+            "--no-compact-summary" => {
+                compact_summary = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--compact-summary=") => {
+                stash_option_takes_no_value_error("compact-summary")?
+            }
+            value if value.starts_with("--no-compact-summary=") => {
+                stash_option_takes_no_value_error("no-compact-summary")?
+            }
+            "--patch-with-raw" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_raw = true;
+                    show_patch = true;
+                }
+            }
+            "--patch-with-stat" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_stat = true;
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--patch-with-raw=") => {
+                stash_option_takes_no_value_error("patch-with-raw")?
+            }
+            value if value.starts_with("--patch-with-stat=") => {
+                stash_option_takes_no_value_error("patch-with-stat")?
+            }
+            "--abbrev" => {
+                raw_abbrev = Some(Some(7));
+                patch_abbrev = Some(7);
+            }
+            "--no-abbrev" => {
+                raw_abbrev = Some(None);
+            }
+            "--full-index" => patch_full_index = true,
+            "--no-full-index" => {
+                patch_full_index = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--full-index=") => {
+                stash_option_takes_no_value_error("full-index")?
+            }
+            value if value.starts_with("--no-full-index=") => {
+                stash_option_takes_no_value_error("no-full-index")?
+            }
+            "--name-only" => {
+                if matches!(mode, StashShowMode::NameStatus | StashShowMode::NoPatch) {
+                    eprintln!(
+                        "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                mode = StashShowMode::NameOnly;
+            }
+            value if value.starts_with("--name-only=") => {
+                stash_option_takes_no_value_error("name-only")?
+            }
+            "--name-status" => {
+                if matches!(mode, StashShowMode::NameOnly | StashShowMode::NoPatch) {
+                    eprintln!(
+                        "fatal: options '--name-only', '--name-status', '--check', and '-s' cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                mode = StashShowMode::NameStatus;
+            }
+            value if value.starts_with("--name-status=") => {
+                stash_option_takes_no_value_error("name-status")?
+            }
+            "-p" | "--patch" | "--oneline" => {
+                if !matches!(mode, StashShowMode::NameOnly | StashShowMode::NameStatus) {
+                    mode = StashShowMode::Stat;
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--patch=") => stash_option_takes_no_value_error("patch")?,
+            "-s" | "--no-patch" => {
+                show_stat = false;
+                show_raw = false;
+                show_numstat = false;
+                show_shortstat = false;
+                show_summary = false;
+                compact_summary = false;
+                show_patch = false;
+                mode = StashShowMode::NoPatch;
+            }
+            value if value.starts_with("--no-patch=") => {
+                stash_option_takes_no_value_error("no-patch")?
+            }
+            "--quiet" => quiet = true,
+            value if value.starts_with("--quiet=") => stash_option_takes_no_value_error("quiet")?,
+            "--no-quiet" => {
+                quiet = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--no-quiet=") => {
+                stash_option_takes_no_value_error("no-quiet")?
+            }
+            "--exit-code" => {
+                exit_code = true;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--exit-code=") => {
+                stash_option_takes_no_value_error("exit-code")?
+            }
+            "--no-exit-code" => {
+                exit_code = false;
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--no-exit-code=") => {
+                stash_option_takes_no_value_error("no-exit-code")?
+            }
+            "--ext-diff" | "--no-ext-diff" | "--textconv" | "--no-textconv" => {
+                if stash_show_should_enable_default_patch(
+                    mode,
+                    [
+                        show_raw,
+                        show_stat,
+                        show_numstat,
+                        show_shortstat,
+                        show_summary,
+                        compact_summary,
+                        show_patch,
+                    ],
+                ) {
+                    show_patch = true;
+                }
+            }
+            value if value.starts_with("--ext-diff=") => {
+                stash_option_takes_no_value_error("ext-diff")?
+            }
+            value if value.starts_with("--no-ext-diff=") => {
+                stash_option_takes_no_value_error("no-ext-diff")?
+            }
+            value if value.starts_with("--textconv=") => {
+                stash_option_takes_no_value_error("textconv")?
+            }
+            value if value.starts_with("--no-textconv=") => {
+                stash_option_takes_no_value_error("no-textconv")?
+            }
+            "-u" | "--include-untracked" => {
+                include_untracked = true;
+                only_untracked = false;
+            }
+            value if value.starts_with("--include-untracked=") => {
+                stash_option_takes_no_value_error("include-untracked")?
+            }
+            "--no-include-untracked" => {
+                include_untracked = false;
+                only_untracked = false;
+            }
+            value if value.starts_with("--no-include-untracked=") => {
+                stash_option_takes_no_value_error("no-include-untracked")?
+            }
+            "--only-untracked" => {
+                include_untracked = true;
+                only_untracked = true;
+            }
+            value if value.starts_with("--only-untracked=") => {
+                stash_option_takes_no_value_error("only-untracked")?
+            }
+            "--no-only-untracked" => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--no-only-untracked=") => {
+                stash_show_usage();
+                return Err(GitError::Exit(129));
+            }
+            "--diff-filter" => {
+                if idx + 1 == args.len() {
+                    eprintln!("error: option `diff-filter' requires a value");
+                    return Err(GitError::Exit(129));
+                }
+            }
+            value if value.starts_with("--abbrev=") => {
+                let value = value
+                    .strip_prefix("--abbrev=")
+                    .ok_or_else(|| GitError::Command("--abbrev requires a value".into()))?;
+                let abbrev = parse_abbrev(value)?.max(4);
+                raw_abbrev = Some(Some(abbrev));
+                patch_abbrev = Some(abbrev);
+            }
+            value if value.starts_with("--diff-filter=") => {
+                let value = value
+                    .strip_prefix("--diff-filter=")
+                    .ok_or_else(|| GitError::Command("--diff-filter requires a value".into()))?;
+                diff_filter = parse_diff_filter(value)?;
+                diff_filter_seen = true;
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash show option {value}"
+                )));
+            }
+            value => specs.push(value.to_string()),
+        }
+        idx += 1;
+    }
+    if specs.len() > 1 {
+        eprintln!(
+            "Too many revisions specified: '{}' '{}'",
+            specs[0], specs[1]
+        );
+        return Err(GitError::Exit(1));
+    }
+    if matches!(mode, StashShowMode::Stat)
+        && diff_filter_seen
+        && !(show_raw
+            || show_stat
+            || show_numstat
+            || show_shortstat
+            || show_summary
+            || compact_summary
+            || show_patch)
+    {
+        show_patch = true;
+    }
+    let selector = match specs.first() {
+        Some(spec) => parse_stash_drop_selector(spec)?,
+        None => 0,
+    };
+
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let entries = store.read_reflog("refs/stash")?;
+    if entries.is_empty() {
+        eprintln!("No stash entries found.");
+        return Err(GitError::Exit(1));
+    }
+    if selector >= entries.len() {
+        eprintln!("fatal: log for 'stash' only has {} entries", entries.len());
+        return Err(GitError::Exit(128));
+    }
+    let entry_index = entries.len() - 1 - selector;
+    let stash_oid = entries[entry_index].new_oid.clone();
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let object = db.read_object(&stash_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash {stash_oid} is not a commit"
+        )));
+    }
+    let stash_commit = Commit::parse(format, &object.body)?;
+    let base_oid = stash_commit
+        .parents
+        .first()
+        .ok_or_else(|| GitError::InvalidObject(format!("stash {stash_oid} has no parent")))?;
+    let base_object = db.read_object(base_oid)?;
+    if base_object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "stash parent {base_oid} is not a commit"
+        )));
+    }
+    let base_commit = Commit::parse(format, &base_object.body)?;
+    let diff_options = git_diff_merge::DiffNameStatusOptions::default();
+    let mut entries = if only_untracked {
+        Vec::new()
+    } else {
+        git_diff_merge::diff_name_status_trees_with_options(
+            &db,
+            format,
+            &base_commit.tree,
+            &stash_commit.tree,
+            diff_options,
+        )?
+    };
+    if include_untracked && let Some(untracked_oid) = stash_commit.parents.get(2) {
+        let untracked_object = db.read_object(untracked_oid)?;
+        if untracked_object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "stash untracked parent {untracked_oid} is not a commit"
+            )));
+        }
+        let untracked_commit = Commit::parse(format, &untracked_object.body)?;
+        entries.extend(git_diff_merge::diff_name_status_empty_tree_with_options(
+            &db,
+            format,
+            &untracked_commit.tree,
+            diff_options,
+        )?);
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    let entries: Vec<_> = if diff_filter.all_or_none {
+        if !diff_filter.includes.is_empty()
+            && entries
+                .iter()
+                .any(|entry| diff_filter.matches_status(entry.status.code()))
+        {
+            entries
+        } else {
+            Vec::new()
+        }
+    } else {
+        entries
+            .into_iter()
+            .filter(|entry| diff_filter.matches_status(entry.status.code()))
+            .collect()
+    };
+    let mut stdout = io::stdout();
+    let repository_abbrev = repository_abbrev(&common_git_dir, format)?;
+    let raw_abbrev = match raw_abbrev {
+        Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
+        None => repository_abbrev,
+    };
+    let patch_abbrev = if patch_full_index {
+        format.hex_len()
+    } else {
+        patch_abbrev
+            .or(repository_abbrev)
+            .unwrap_or(7)
+            .min(format.hex_len())
+    };
+    let has_entries = !entries.is_empty();
+    if quiet {
+        if has_entries {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
+    match mode {
+        StashShowMode::Stat => {
+            let has_visual_mode = show_raw
+                || show_stat
+                || show_numstat
+                || show_shortstat
+                || show_summary
+                || compact_summary
+                || show_patch;
+            if !has_visual_mode {
+                show_stat = true;
+            }
+            let mut wrote_prefix_output = false;
+            if show_raw {
+                for entry in &entries {
+                    write_diff_raw_entry(&mut stdout, entry, false, false, raw_abbrev, format)?;
+                }
+                wrote_prefix_output = !entries.is_empty();
+            }
+            if show_numstat {
+                for entry in &entries {
+                    write_diff_numstat_entry(&mut stdout, entry, false, &db, None, false)?;
+                }
+                wrote_prefix_output = !entries.is_empty();
+            }
+            if show_stat || compact_summary {
+                write_diff_stat(
+                    &mut stdout,
+                    &entries,
+                    &db,
+                    None,
+                    false,
+                    DiffStatOptions {
+                        compact_summary,
+                        stat_count: None,
+                        color: false,
+                    },
+                )?;
+                wrote_prefix_output |= !entries.is_empty();
+            }
+            if show_shortstat {
+                write_diff_shortstat(&mut stdout, &entries, &db, None, false)?;
+                wrote_prefix_output |= !entries.is_empty();
+            }
+            if show_summary {
+                for entry in &entries {
+                    write_diff_summary_entry(&mut stdout, entry)?;
+                }
+                wrote_prefix_output |= entries.iter().any(stash_show_summary_outputs_entry);
+            }
+            if show_patch {
+                if wrote_prefix_output {
+                    writeln!(stdout)?;
+                }
+                for entry in &entries {
+                    let options = DiffPatchOptions {
+                        db: &db,
+                        worktree_root: None,
+                        use_worktree_new: false,
+                        format,
+                        abbrev: patch_abbrev,
+                        src_prefix: "a/",
+                        dst_prefix: "b/",
+                    };
+                    write_diff_patch_entry(&mut stdout, entry, options)?;
+                }
+            }
+        }
+        StashShowMode::NameOnly => {
+            for entry in entries {
+                writeln!(stdout, "{}", status_quote_path(&entry.path, false))?;
+            }
+        }
+        StashShowMode::NameStatus => {
+            for entry in entries {
+                write!(stdout, "{}", entry.status.label())?;
+                if let Some(old_path) = &entry.old_path {
+                    let old_path = status_quote_path(old_path, false);
+                    write!(stdout, "\t{old_path}")?;
+                }
+                let path = status_quote_path(&entry.path, false);
+                writeln!(stdout, "\t{path}")?;
+            }
+        }
+        StashShowMode::NoPatch => {}
+    }
+    if exit_code && has_entries {
+        return Err(GitError::Exit(1));
+    }
+    Ok(())
+}
+
+fn stash_show_summary_outputs_entry(entry: &git_diff_merge::NameStatusEntry) -> bool {
+    match entry.status {
+        git_diff_merge::NameStatus::Added
+        | git_diff_merge::NameStatus::Deleted
+        | git_diff_merge::NameStatus::Renamed(_)
+        | git_diff_merge::NameStatus::Copied(_) => true,
+        git_diff_merge::NameStatus::Modified => entry.old_mode != entry.new_mode,
+    }
+}
+
+fn stash_show_should_enable_default_patch(mode: StashShowMode, visual_modes: [bool; 7]) -> bool {
+    matches!(mode, StashShowMode::Stat) && !visual_modes.into_iter().any(|enabled| enabled)
+}
+
+fn stash_show_usage() {
+    eprintln!(
+        "usage: git stash show [-u | --include-untracked | --only-untracked] [<diff-options>] [<stash>]"
+    );
+    eprintln!();
+    eprintln!("    -u, --[no-]include-untracked");
+    eprintln!("                          include untracked files in the stash");
+    eprintln!("    --only-untracked      only show untracked files in the stash");
+    eprintln!();
+}
+
+fn cmd_stash_list(args: &[String]) -> Result<()> {
+    let options = parse_stash_list_options(args)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    stash_list_warn_invalid_note_refs(&store, &options.note_refs);
+    let db = FileObjectDatabase::new(repository_objects_dir(&common_git_dir), format);
+    let mut entries = store.read_reflog("refs/stash")?;
+    entries.reverse();
+    let mut entries = entries.into_iter().enumerate().collect::<Vec<_>>();
+    entries.retain(|(_, entry)| stash_list_grep_filters_match(entry, &options));
+    let mut parent_filtered_entries = Vec::new();
+    for (stash_index, entry) in entries {
+        if stash_list_commit_filters_match(&db, format, &entry, &options)? {
+            parent_filtered_entries.push((stash_index, entry));
+        }
+    }
+    let entries = parent_filtered_entries;
+    let skipped = options.skip_count.min(entries.len());
+    let selected = options
+        .max_count
+        .map_or(entries.len() - skipped, |max_count| {
+            max_count.min(entries.len() - skipped)
+        });
+    for (position, (stash_index, entry)) in entries.iter().skip(skipped).take(selected).enumerate()
+    {
+        match &options.format {
+            StashListFormat::Default => {
+                println!(
+                    "stash@{{{stash_index}}}: {}",
+                    String::from_utf8_lossy(&entry.message)
+                );
+            }
+            StashListFormat::Oneline => {
+                println!(
+                    "{} refs/stash@{{{stash_index}}}: {}",
+                    format_log_oid(&entry.new_oid, options.abbrev_len),
+                    String::from_utf8_lossy(&entry.message)
+                );
+            }
+            StashListFormat::Custom {
+                format: list_format,
+                final_newline,
+            } => {
+                let object = db.read_object(&entry.new_oid)?;
+                let commit = Commit::parse(format, &object.body)?;
+                print_stash_list_format(
+                    entry,
+                    *stash_index,
+                    &commit,
+                    list_format,
+                    options.abbrev_len,
+                    options.date_mode,
+                    options.date_explicit,
+                )?;
+                if *final_newline || position + 1 < selected {
+                    println!();
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_stash_list_options(args: &[String]) -> Result<StashListOptions> {
+    let mut format = StashListFormat::Default;
+    let mut max_count = None;
+    let mut skip_count = 0;
+    let mut max_age = None;
+    let mut min_age = None;
+    let mut min_parents = None;
+    let mut max_parents = None;
+    let mut abbrev_len = Some(7);
+    let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_explicit = false;
+    let mut author_patterns = Vec::new();
+    let mut committer_patterns = Vec::new();
+    let mut reflog_patterns = Vec::new();
+    let mut grep_patterns = Vec::new();
+    let mut grep_all_match = false;
+    let mut invert_grep = false;
+    let mut regexp_ignore_case = false;
+    let mut regexp_mode = SimpleLogRegexMode::Basic;
+    let mut note_refs = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "--" => {
+                if index + 1 == args.len() {
+                    break;
+                }
+                return Err(GitError::Unsupported(
+                    "stash list currently does not support revisions or pathspecs".into(),
+                ));
+            }
+            "--oneline" => format = StashListFormat::Oneline,
+            "--reverse" => {
+                eprintln!(
+                    "fatal: options '--reverse' and '--walk-reflogs' cannot be used together"
+                );
+                return Err(GitError::Exit(1));
+            }
+            "-q"
+            | "--quiet"
+            | "--no-quiet"
+            | "--no-graph"
+            | "--expand-tabs"
+            | "--no-expand-tabs"
+            | "--no-decorate"
+            | "--walk-reflogs"
+            | "--no-walk"
+            | "--do-walk"
+            | "--first-parent"
+            | "--parents"
+            | "--full-history"
+            | "--dense"
+            | "--sparse"
+            | "--remove-empty"
+            | "--left-right"
+            | "--no-notes"
+            | "--notes"
+            | "--show-notes"
+            | "--standard-notes"
+            | "--no-standard-notes"
+            | "--show-signature"
+            | "--no-show-signature"
+            | "--source"
+            | "--no-source"
+            | "--use-mailmap"
+            | "--no-use-mailmap"
+            | "--mailmap"
+            | "--no-mailmap"
+            | "--no-patch"
+            | "--color"
+            | "--no-color"
+            | "--color-moved"
+            | "--no-color-moved"
+            | "--clear-decorations"
+            | "--no-decorate-refs"
+            | "--no-decorate-refs-exclude"
+            | "--no-diff-merges"
+            | "--full-diff"
+            | "--relative"
+            | "--no-relative"
+            | "--ext-diff"
+            | "--no-ext-diff"
+            | "--no-renames"
+            | "--find-renames"
+            | "--find-copies"
+            | "--find-copies-harder"
+            | "--no-find-copies-harder"
+            | "--textconv"
+            | "--no-textconv"
+            | "--minimal"
+            | "--patience"
+            | "--histogram"
+            | "--indent-heuristic"
+            | "--no-indent-heuristic"
+            | "--ignore-space-at-eol"
+            | "--ignore-cr-at-eol"
+            | "--ignore-space-change"
+            | "--ignore-all-space"
+            | "--ignore-blank-lines"
+            | "--function-context"
+            | "--no-prefix"
+            | "--default-prefix"
+            | "--full-index"
+            | "--break-rewrites"
+            | "--irreversible-delete"
+            | "--submodule"
+            | "--ignore-submodules"
+            | "--ita-visible-in-index"
+            | "--ita-invisible-in-index"
+            | "--pickaxe-all"
+            | "--pickaxe-regex"
+            | "-M"
+            | "-C"
+            | "-B"
+            | "-D"
+            | "-m"
+            | "-s"
+            | "-b"
+            | "-w"
+            | "-W" => {}
+            "--encoding" => {
+                if index + 1 < args.len() {
+                    index += 1;
+                }
+            }
+            value if value.starts_with("--encoding=") => {}
+            value if value.starts_with("--no-encoding") => {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            "--merges" => min_parents = Some(2),
+            "--no-merges" => max_parents = Some(1),
+            "--no-min-parents" => min_parents = None,
+            "--no-max-parents" => max_parents = None,
+            "--graph"
+            | "--children"
+            | "--cherry-pick"
+            | "--ancestry-path"
+            | "--topo-order"
+            | "--date-order"
+            | "--author-date-order"
+            | "--simplify-by-decoration"
+            | "--simplify-merges" => {
+                eprintln!("fatal: cannot combine --walk-reflogs with history-limiting options");
+                return Err(GitError::Exit(1));
+            }
+            value if value.starts_with("--no-decorate=") => {
+                eprintln!("error: option `no-decorate' takes no value");
+                return Err(GitError::Exit(1));
+            }
+            value if let Some(value) = value.strip_prefix("--expand-tabs=") => {
+                stash_list_validate_non_negative_integer(value)?;
+            }
+            value if value.starts_with("--quiet=") => {
+                stash_list_option_takes_no_value_error("quiet")?;
+            }
+            value if value.starts_with("--no-quiet=") => {
+                stash_list_option_takes_no_value_error("no-quiet")?;
+            }
+            value if value.starts_with("--clear-decorations=") => {
+                stash_list_option_takes_no_value_error("clear-decorations")?;
+            }
+            value if value.starts_with("--no-decorate-refs=") => {
+                stash_list_option_takes_no_value_error("no-decorate-refs")?;
+            }
+            value if value.starts_with("--no-decorate-refs-exclude=") => {
+                stash_list_option_takes_no_value_error("no-decorate-refs-exclude")?;
+            }
+            value if value.starts_with("--use-mailmap=") => {
+                stash_list_option_takes_no_value_error("use-mailmap")?;
+            }
+            value if value.starts_with("--no-use-mailmap=") => {
+                stash_list_option_takes_no_value_error("no-use-mailmap")?;
+            }
+            value if value.starts_with("--mailmap=") => {
+                stash_list_option_takes_no_value_error("mailmap")?;
+            }
+            value if value.starts_with("--no-mailmap=") => {
+                stash_list_option_takes_no_value_error("no-mailmap")?;
+            }
+            value if value.starts_with("--source=") => {
+                stash_list_option_takes_no_value_error("source")?;
+            }
+            value if value.starts_with("--no-source=") => {
+                stash_list_option_takes_no_value_error("no-source")?;
+            }
+            value if let Some(value) = value.strip_prefix("--notes=") => {
+                note_refs.push(stash_list_note_ref(value));
+            }
+            value if let Some(value) = value.strip_prefix("--show-notes=") => {
+                note_refs.push(stash_list_note_ref(value));
+            }
+            value if value.starts_with("--no-color-moved=") => {
+                stash_list_option_takes_no_value_error("no-color-moved")?;
+            }
+            value if value.starts_with("--no-color=") => {
+                stash_list_option_takes_no_value_error("no-color")?;
+            }
+            value
+                if value.starts_with("--no-graph=")
+                    || value.starts_with("--oneline=")
+                    || value.starts_with("--no-expand-tabs=")
+                    || value.starts_with("--show-signature=")
+                    || value.starts_with("--no-show-signature=")
+                    || value.starts_with("--full-diff=")
+                    || value.starts_with("--no-notes=")
+                    || value.starts_with("--standard-notes=")
+                    || value.starts_with("--no-standard-notes=")
+                    || value.starts_with("--no-diff-merges=")
+                    || value.starts_with("--perl-regexp=")
+                    || value.starts_with("--basic-regexp=")
+                    || value.starts_with("--extended-regexp=")
+                    || value.starts_with("--fixed-strings=")
+                    || value.starts_with("--regexp-ignore-case=")
+                    || value.starts_with("--all-match=")
+                    || value.starts_with("--invert-grep=")
+                    || value.starts_with("--no-perl-regexp")
+                    || value.starts_with("--no-basic-regexp")
+                    || value.starts_with("--no-extended-regexp")
+                    || value.starts_with("--no-fixed-strings")
+                    || value.starts_with("--no-regexp-ignore-case")
+                    || value.starts_with("--no-all-match")
+                    || value.starts_with("--no-invert-grep")
+                    || value.starts_with("--no-grep")
+                    || value.starts_with("--full-history=")
+                    || value.starts_with("--dense=")
+                    || value.starts_with("--sparse=")
+                    || value.starts_with("--remove-empty=")
+                    || value.starts_with("--left-right=")
+                    || value.starts_with("--merges=")
+                    || value.starts_with("--no-merges=")
+                    || value.starts_with("--no-min-parents=")
+                    || value.starts_with("--no-max-parents=")
+                    || value.starts_with("--children=")
+                    || value.starts_with("--cherry-pick=")
+                    || value.starts_with("--topo-order=")
+                    || value.starts_with("--date-order=")
+                    || value.starts_with("--author-date-order=")
+                    || value.starts_with("--simplify-by-decoration=")
+                    || value.starts_with("--simplify-merges=") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--ancestry-path=") => {
+                eprintln!("error: could not get commit for --ancestry-path argument {value}");
+                return Err(GitError::Exit(1));
+            }
+            "--decorate" => {}
+            value if let Some(value) = value.strip_prefix("--decorate=") => {
+                if matches!(
+                    value,
+                    "no" | "auto"
+                        | "short"
+                        | "full"
+                        | ""
+                        | "false"
+                        | "0"
+                        | "off"
+                        | "true"
+                        | "1"
+                        | "on"
+                        | "yes"
+                ) {
+                    // Decorations are not shown in the covered stash-list formats.
+                } else {
+                    eprintln!("fatal: invalid --decorate option: {value}");
+                    return Err(GitError::Exit(1));
+                }
+            }
+            "--decorate-refs" | "--decorate-refs-exclude" => {
+                index += 1;
+                if args.get(index).is_none() {
+                    return Err(log_option_requires_value_error(
+                        arg.trim_start_matches("--"),
+                    ));
+                }
+            }
+            value if value.starts_with("--decorate-refs=") => {}
+            value if value.starts_with("--decorate-refs-exclude=") => {}
+            "--no-walk=sorted" | "--no-walk=unsorted" => {}
+            value if value.starts_with("--no-walk=") => {
+                stash_list_no_walk_invalid_argument(value)?;
+            }
+            value
+                if value.starts_with("--walk-reflogs=")
+                    || value.starts_with("--do-walk=")
+                    || value.starts_with("--first-parent=")
+                    || value.starts_with("--parents=") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            "--abbrev" => abbrev_len = Some(7),
+            "--no-abbrev" => abbrev_len = None,
+            value if value.starts_with("--no-abbrev=") => {
+                stash_list_option_takes_no_value_error("no-abbrev")?;
+            }
+            "--grep" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(log_grep_requires_value_error());
+                };
+                grep_patterns.push(LogFilterPattern::new(value, "command line"));
+            }
+            value if let Some(value) = value.strip_prefix("--grep=") => {
+                grep_patterns.push(LogFilterPattern::new(value, "command line"));
+            }
+            "--grep-reflog" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                reflog_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--grep-reflog=") => {
+                reflog_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value
+                if value.starts_with("--no-grep-reflog")
+                    || value.starts_with("--no-author")
+                    || value.starts_with("--no-committer") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            "--author" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                author_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--author=") => {
+                author_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            "--committer" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                committer_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            value if let Some(value) = value.strip_prefix("--committer=") => {
+                committer_patterns.push(LogFilterPattern::new(value, "header"));
+            }
+            "--all-match" => grep_all_match = true,
+            "--invert-grep" => invert_grep = true,
+            "-i" | "--regexp-ignore-case" => regexp_ignore_case = true,
+            "-F" | "--fixed-strings" => regexp_mode = SimpleLogRegexMode::Fixed,
+            "-E" | "-P" | "--basic-regexp" | "--extended-regexp" | "--perl-regexp" => {
+                regexp_mode = SimpleLogRegexMode::Basic
+            }
+            value
+                if (value.starts_with("-F")
+                    || value.starts_with("-E")
+                    || value.starts_with("-P")
+                    || value.starts_with("-i"))
+                    && value.len() > 2 =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if value.starts_with("-M") => {
+                stash_list_validate_similarity_option(&value[2..], "find-renames")?;
+            }
+            value if value.starts_with("-C") => {
+                stash_list_validate_similarity_option(&value[2..], "find-copies")?;
+            }
+            value if value.starts_with("-B") => {
+                stash_list_validate_break_rewrites_option(&value[2..])?;
+            }
+            value if let Some(option) = stash_list_diff_option_with_value(value) => {
+                stash_list_option_takes_no_value_error(option)?;
+            }
+            value
+                if value.len() > 2
+                    && (value.starts_with("-D")
+                        || value.starts_with("-s")
+                        || value.starts_with("-b")
+                        || value.starts_with("-w")
+                        || value.starts_with("-W")) =>
+            {
+                stash_list_fatal_unrecognized_argument(&format!("-{}", &value[2..]))?;
+            }
+            value if value.len() > 2 && value.starts_with("-m") => {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if value.starts_with("--no-relative=") => {
+                stash_list_option_takes_no_value_error("no-relative")?;
+            }
+            value if value.starts_with("--relative=") => {}
+            value if let Some(value) = value.strip_prefix("--find-renames=") => {
+                stash_list_validate_similarity_option(value, "find-renames")?;
+            }
+            value if let Some(value) = value.strip_prefix("--find-copies=") => {
+                stash_list_validate_similarity_option(value, "find-copies")?;
+            }
+            value if value.starts_with("--find-copies-harder=") => {
+                stash_list_option_takes_no_value_error("find-copies-harder")?;
+            }
+            value if value.starts_with("--no-find-copies-harder=") => {
+                stash_list_option_takes_no_value_error("no-find-copies-harder")?;
+            }
+            value if let Some(value) = value.strip_prefix("--break-rewrites=") => {
+                stash_list_validate_break_rewrites_option(value)?;
+            }
+            value if value.starts_with("--no-patch=") => {
+                stash_list_option_takes_no_value_error("no-patch")?;
+            }
+            value if value.starts_with("--ext-diff=") => {
+                stash_list_option_takes_no_value_error("ext-diff")?;
+            }
+            value if value.starts_with("--no-ext-diff=") => {
+                stash_list_option_takes_no_value_error("no-ext-diff")?;
+            }
+            value if value.starts_with("--textconv=") => {
+                stash_list_option_takes_no_value_error("textconv")?;
+            }
+            value if value.starts_with("--no-textconv=") => {
+                stash_list_option_takes_no_value_error("no-textconv")?;
+            }
+            value if value.starts_with("--no-renames=") => {
+                stash_list_option_takes_no_value_error("no-renames")?;
+            }
+            value if value.starts_with("--full-index=") => {
+                stash_list_option_takes_no_value_error("full-index")?;
+            }
+            value if value.starts_with("--irreversible-delete=") => {
+                stash_list_option_takes_no_value_error("irreversible-delete")?;
+            }
+            "--diff-merges" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                stash_list_validate_diff_merges(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--diff-merges=") => {
+                stash_list_validate_diff_merges(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--color=") => {
+                stash_list_validate_color(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--color-moved=") => {
+                stash_list_validate_color_moved(value)?;
+            }
+            "--color-moved-ws" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                stash_list_validate_color_moved_ws(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--color-moved-ws=") => {
+                stash_list_validate_color_moved_ws(value)?;
+            }
+            "--src-prefix" | "--dst-prefix" => {
+                index += 1;
+                if args.get(index).is_none() {
+                    return Err(log_option_requires_value_error(
+                        arg.trim_start_matches("--"),
+                    ));
+                }
+            }
+            value if value.starts_with("--src-prefix=") => {}
+            value if value.starts_with("--dst-prefix=") => {}
+            "--output-indicator-new" | "--output-indicator-old" | "--output-indicator-context" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                stash_list_validate_output_indicator(arg.trim_start_matches("--"), value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--output-indicator-new=") => {
+                stash_list_validate_output_indicator("output-indicator-new", value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--output-indicator-old=") => {
+                stash_list_validate_output_indicator("output-indicator-old", value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--output-indicator-context=") => {
+                stash_list_validate_output_indicator("output-indicator-context", value)?;
+            }
+            "--ws-error-highlight" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                stash_list_validate_ws_error_highlight(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--ws-error-highlight=") => {
+                stash_list_validate_ws_error_highlight(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--submodule=") => {
+                stash_list_validate_submodule_format(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
+                stash_list_validate_ignore_submodules(value)?;
+            }
+            "--format" | "--pretty" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Command(format!("{arg} requires a value")));
+                };
+                format = parse_stash_list_format(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--format=") => {
+                format = parse_stash_list_format(value)?;
+            }
+            value if let Some(value) = value.strip_prefix("--pretty=") => {
+                format = parse_stash_list_format(value)?;
+            }
+            "--date" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                date_mode = stash_list_date_mode(value)?;
+                date_explicit = true;
+            }
+            value if let Some(value) = value.strip_prefix("--date=") => {
+                date_mode = stash_list_date_mode(value)?;
+                date_explicit = true;
+            }
+            value if value.starts_with("--no-date") => {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if let Some(count) = value.strip_prefix("--max-count=") => {
+                max_count = Some(parse_reflog_count(count)?);
+            }
+            value if let Some(count) = value.strip_prefix("--skip=") => {
+                skip_count = parse_reflog_skip_count(count)?;
+            }
+            value if let Some(age) = value.strip_prefix("--max-age=") => {
+                max_age = Some(parse_stash_list_age(age)?);
+            }
+            value if let Some(age) = value.strip_prefix("--min-age=") => {
+                min_age = Some(parse_stash_list_min_age(age)?);
+            }
+            value if let Some(date) = value.strip_prefix("--since=") => {
+                max_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--after=") => {
+                max_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--until=") => {
+                min_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value if let Some(date) = value.strip_prefix("--before=") => {
+                min_age = Some(parse_stash_list_date_cutoff(date)?);
+            }
+            value
+                if value.starts_with("--no-max-count")
+                    || value.starts_with("--no-skip")
+                    || value.starts_with("--no-max-age")
+                    || value.starts_with("--no-min-age")
+                    || value.starts_with("--no-since")
+                    || value.starts_with("--no-after")
+                    || value.starts_with("--no-until")
+                    || value.starts_with("--no-before") =>
+            {
+                stash_list_fatal_unrecognized_argument(value)?;
+            }
+            value if let Some(count) = value.strip_prefix("--min-parents=") => {
+                min_parents = Some(parse_reflog_min_parent_count(count)?);
+            }
+            value if let Some(count) = value.strip_prefix("--max-parents=") => {
+                max_parents = Some(parse_reflog_max_parent_count(count)?);
+            }
+            value if let Some(value) = value.strip_prefix("--abbrev=") => {
+                abbrev_len = parse_stash_list_abbrev(value);
+            }
+            "--max-count" | "-n" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                max_count = Some(parse_reflog_count(value)?);
+            }
+            "--skip" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                skip_count = parse_reflog_skip_count(value)?;
+            }
+            "--max-age" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                max_age = Some(parse_stash_list_age(value)?);
+            }
+            "--min-age" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                min_age = Some(parse_stash_list_min_age(value)?);
+            }
+            "--since" | "--after" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                max_age = Some(parse_stash_list_date_cutoff(value)?);
+            }
+            "--until" | "--before" => {
+                index += 1;
+                let value = args.get(index).map_or("refs/stash", String::as_str);
+                min_age = Some(parse_stash_list_date_cutoff(value)?);
+            }
+            value if value.starts_with("-n") && value.len() > 2 => {
+                max_count = Some(parse_reflog_count(&value[2..])?);
+            }
+            value
+                if value.starts_with('-')
+                    && value[1..].bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                max_count = Some(parse_reflog_count(&value[1..])?);
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash list option {value}"
+                )));
+            }
+            _ => {
+                return Err(GitError::Unsupported(
+                    "stash list currently does not support revisions or pathspecs".into(),
+                ));
+            }
+        }
+        index += 1;
+    }
+    let author_filters = parse_stash_list_filter_patterns(&author_patterns, regexp_mode)?;
+    let committer_filters = parse_stash_list_filter_patterns(&committer_patterns, regexp_mode)?;
+    let reflog_filters = parse_stash_list_filter_patterns(&reflog_patterns, regexp_mode)?;
+    let grep_filters = parse_stash_list_filter_patterns(&grep_patterns, regexp_mode)?;
+    Ok(StashListOptions {
+        format,
+        max_count,
+        skip_count,
+        max_age,
+        min_age,
+        min_parents,
+        max_parents,
+        abbrev_len,
+        date_mode,
+        date_explicit,
+        author_filters,
+        committer_filters,
+        reflog_filters,
+        grep_filters,
+        grep_all_match,
+        invert_grep,
+        regexp_ignore_case,
+        note_refs,
+    })
+}
+
+fn stash_list_option_takes_no_value_error(option: &str) -> Result<()> {
+    eprintln!("error: option `{option}' takes no value");
+    Err(GitError::Exit(1))
+}
+
+fn stash_list_note_ref(value: &str) -> String {
+    if value.starts_with("refs/notes/") {
+        value.to_string()
+    } else {
+        format!("refs/notes/{value}")
+    }
+}
+
+fn stash_list_warn_invalid_note_refs(store: &FileRefStore, note_refs: &[String]) {
+    for note_ref in note_refs {
+        if !matches!(store.read_ref(note_ref), Ok(Some(_))) {
+            eprintln!("warning: notes ref {note_ref} is invalid");
+        }
+    }
+}
+
+fn stash_list_diff_option_with_value(value: &str) -> Option<&'static str> {
+    const OPTIONS: &[&str] = &[
+        "minimal",
+        "patience",
+        "histogram",
+        "indent-heuristic",
+        "no-indent-heuristic",
+        "ignore-space-at-eol",
+        "ignore-cr-at-eol",
+        "ignore-space-change",
+        "ignore-all-space",
+        "ignore-blank-lines",
+        "function-context",
+        "no-prefix",
+        "default-prefix",
+        "ita-visible-in-index",
+        "ita-invisible-in-index",
+        "pickaxe-all",
+        "pickaxe-regex",
+    ];
+    let value = value.strip_prefix("--")?;
+    OPTIONS.iter().copied().find(|option| {
+        value
+            .strip_prefix(option)
+            .is_some_and(|suffix| suffix.starts_with('='))
+    })
+}
+
+fn stash_list_fatal_unrecognized_argument(value: &str) -> Result<()> {
+    eprintln!("fatal: unrecognized argument: {value}");
+    Err(GitError::Exit(1))
+}
+
+fn stash_list_no_walk_invalid_argument(value: &str) -> Result<()> {
+    eprintln!("error: invalid argument to --no-walk");
+    stash_list_fatal_unrecognized_argument(value)
+}
+
+fn stash_list_validate_non_negative_integer(value: &str) -> Result<()> {
+    value.parse::<usize>().map(|_| ()).map_err(|_| {
+        eprintln!("fatal: '{value}': not a non-negative integer");
+        GitError::Exit(1)
+    })
+}
+
+fn stash_list_validate_color(value: &str) -> Result<()> {
+    log_validate_color(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_color_moved(value: &str) -> Result<()> {
+    log_validate_color_moved(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_color_moved_ws(value: &str) -> Result<()> {
+    log_validate_color_moved_ws(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_diff_merges(value: &str) -> Result<()> {
+    log_validate_diff_merges(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_output_indicator(option: &str, value: &str) -> Result<()> {
+    log_validate_output_indicator(option, value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_ws_error_highlight(value: &str) -> Result<()> {
+    log_validate_ws_error_highlight(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_submodule_format(value: &str) -> Result<()> {
+    log_validate_submodule_format(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_ignore_submodules(value: &str) -> Result<()> {
+    log_validate_ignore_submodules(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_similarity_option(value: &str, option: &str) -> Result<()> {
+    log_validate_similarity_option(value, option).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn stash_list_validate_break_rewrites_option(value: &str) -> Result<()> {
+    log_validate_break_rewrites_option(value).map_err(|err| match err {
+        GitError::Exit(129) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_abbrev(value: &str) -> Option<usize> {
+    match value.parse::<isize>() {
+        Ok(width) if width < 0 => None,
+        Ok(width) => Some((width as usize).max(4)),
+        Err(_) => Some(4),
+    }
+}
+
+fn parse_stash_list_age(value: &str) -> Result<i64> {
+    log_parse_age(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_min_age(value: &str) -> Result<i64> {
+    let age = parse_stash_list_age(value)?;
+    if age < 0 { Ok(i64::MAX) } else { Ok(age) }
+}
+
+fn stash_list_date_mode(value: &str) -> Result<ForEachRefDateMode> {
+    log_date_mode(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_date_cutoff(value: &str) -> Result<i64> {
+    log_parse_date_cutoff(value).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_filter_patterns(
+    patterns: &[LogFilterPattern],
+    mode: SimpleLogRegexMode,
+) -> Result<Vec<SimpleLogRegex>> {
+    parse_log_filter_patterns(patterns, mode).map_err(|err| match err {
+        GitError::Exit(128) => GitError::Exit(1),
+        err => err,
+    })
+}
+
+fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
+    match value {
+        "oneline" => Ok(StashListFormat::Oneline),
+        value if let Some(format) = value.strip_prefix("format:") => Ok(StashListFormat::Custom {
+            format: format.to_string(),
+            final_newline: false,
+        }),
+        value => Ok(StashListFormat::Custom {
+            format: value.to_string(),
+            final_newline: true,
+        }),
+    }
+}
+
+fn print_stash_list_format(
+    entry: &ReflogEntry,
+    index: usize,
+    commit: &Commit,
+    format: &str,
+    abbrev_len: Option<usize>,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+) -> Result<()> {
+    let (author_name, author_email) = commit_identity_name_email(&commit.author);
+    let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
+    let author_timestamp = commit_identity_timestamp(&commit.author);
+    let committer_timestamp = commit_identity_timestamp(&commit.committer);
+    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
+    let mut chars = format.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            print!("{ch}");
+            continue;
+        }
+        match chars.next() {
+            Some('%') => print!("%"),
+            Some('n') => println!(),
+            Some('H') => print!("{}", entry.new_oid),
+            Some('h') => print!("{}", format_log_oid(&entry.new_oid, abbrev_len)),
+            Some('T') => print!("{}", commit.tree),
+            Some('t') => print!("{}", format_log_oid(&commit.tree, abbrev_len)),
+            Some('P') => print!("{}", format_commit_parent_oids(&commit.parents, None)),
+            Some('p') => print!("{}", format_commit_parent_oids(&commit.parents, abbrev_len)),
+            Some('m') => print!(">"),
+            Some('s') => print!("{}", commit_subject(&commit.message)),
+            Some('f') => print!("{}", log_sanitized_subject(&commit.message)),
+            Some('e') => print!("{}", commit_encoding(commit)),
+            Some('b') => io::stdout().write_all(commit_body(&commit.message))?,
+            Some('B') => io::stdout().write_all(&commit.message)?,
+            Some('d') if index == 0 => print!(" (refs/stash)"),
+            Some('d') => {}
+            Some('D') if index == 0 => print!("refs/stash"),
+            Some('D') => {}
+            Some('N') => {}
+            Some('S') => print!("%S"),
+            Some('G') => match chars.next() {
+                Some('?') => print!("N"),
+                Some('T') => print!("undefined"),
+                Some('G' | 'S' | 'K' | 'F' | 'P') => {}
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %G{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %G".into(),
+                    ));
+                }
+            },
+            Some('a') => match chars.next() {
+                Some('n' | 'N') => print!("{author_name}"),
+                Some('e' | 'E') => print!("{author_email}"),
+                Some('l' | 'L') => print!("{}", log_email_local_part(&author_email)),
+                Some('t') => print!("{author_timestamp}"),
+                Some('d') => print!("{}", commit_identity_date(&commit.author, date_mode)),
+                Some('i') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Iso)
+                ),
+                Some('I') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::IsoStrict)
+                ),
+                Some('s') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Short)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822)
+                ),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %a{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %a".into(),
+                    ));
+                }
+            },
+            Some('c') => match chars.next() {
+                Some('n' | 'N') => print!("{committer_name}"),
+                Some('e' | 'E') => print!("{committer_email}"),
+                Some('l' | 'L') => print!("{}", log_email_local_part(&committer_email)),
+                Some('t') => print!("{committer_timestamp}"),
+                Some('d') => print!("{}", commit_identity_date(&commit.committer, date_mode)),
+                Some('i') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Iso)
+                ),
+                Some('I') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::IsoStrict)
+                ),
+                Some('s') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Short)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Rfc2822)
+                ),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %c{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %c".into(),
+                    ));
+                }
+            },
+            Some('g') => match chars.next() {
+                Some('d') => print!(
+                    "{}",
+                    stash_list_reflog_selector("stash", index, entry, date_mode, date_explicit)
+                ),
+                Some('D') => print!(
+                    "{}",
+                    stash_list_reflog_selector(
+                        "refs/stash",
+                        index,
+                        entry,
+                        date_mode,
+                        date_explicit
+                    )
+                ),
+                Some('n' | 'N') => print!("{reflog_name}"),
+                Some('e' | 'E') => print!("{reflog_email}"),
+                Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
+                Some(other) => {
+                    return Err(GitError::Unsupported(format!(
+                        "unsupported stash list format placeholder %g{other}"
+                    )));
+                }
+                None => {
+                    return Err(GitError::Unsupported(
+                        "unterminated stash list format placeholder %g".into(),
+                    ));
+                }
+            },
+            Some('C') => consume_log_format_color(&mut chars)?,
+            Some('x') => {
+                let mut lookahead = chars.clone();
+                if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
+                    && let (Some(high), Some(low)) = (high.to_digit(16), low.to_digit(16))
+                {
+                    chars = lookahead;
+                    io::stdout().write_all(&[((high << 4) | low) as u8])?;
+                } else {
+                    print!("%x");
+                }
+            }
+            Some(other) => {
+                return Err(GitError::Unsupported(format!(
+                    "unsupported stash list format placeholder %{other}"
+                )));
+            }
+            None => {
+                return Err(GitError::Unsupported(
+                    "unterminated stash list format placeholder %".into(),
+                ));
+            }
+        }
+    }
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn format_commit_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
+    parents
+        .iter()
+        .map(|oid| match abbrev_len {
+            Some(_) => format_log_oid(oid, abbrev_len),
+            None => oid.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn stash_list_reflog_selector(
+    reference: &str,
+    index: usize,
+    entry: &ReflogEntry,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+) -> String {
+    if date_explicit {
+        let date = commit_identity_date(&entry.committer, date_mode);
+        return format!("{reference}@{{{date}}}");
+    }
+    format!("{reference}@{{{index}}}")
+}
+
+fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions) -> bool {
+    let message = String::from_utf8_lossy(&entry.message);
+    if !options.reflog_filters.is_empty()
+        && !options
+            .reflog_filters
+            .iter()
+            .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    {
+        return false;
+    }
+    if options.grep_filters.is_empty() {
+        return true;
+    }
+    let grep_matched = if options.grep_all_match {
+        options
+            .grep_filters
+            .iter()
+            .all(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    } else {
+        options
+            .grep_filters
+            .iter()
+            .any(|filter| filter.is_match(&message, options.regexp_ignore_case))
+    };
+    grep_matched != options.invert_grep
+}
+
+fn stash_list_commit_filters_match(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entry: &ReflogEntry,
+    options: &StashListOptions,
+) -> Result<bool> {
+    if options.min_parents.is_none()
+        && options.max_parents.is_none()
+        && options.max_age.is_none()
+        && options.min_age.is_none()
+        && options.author_filters.is_empty()
+        && options.committer_filters.is_empty()
+    {
+        return Ok(true);
+    }
+    let object = db.read_object(&entry.new_oid)?;
+    let commit = Commit::parse(format, &object.body)?;
+    Ok(stash_list_identity_filters_match(
+        &commit.author,
+        &options.author_filters,
+        options.regexp_ignore_case,
+    ) && stash_list_identity_filters_match(
+        &commit.committer,
+        &options.committer_filters,
+        options.regexp_ignore_case,
+    ) && stash_list_age_filters_match(&commit, options)?
+        && options
+            .min_parents
+            .is_none_or(|min| commit.parents.len() >= min)
+        && options
+            .max_parents
+            .is_none_or(|max| commit.parents.len() <= max))
+}
+
+fn stash_list_identity_filters_match(
+    identity: &[u8],
+    filters: &[SimpleLogRegex],
+    ignore_case: bool,
+) -> bool {
+    if filters.is_empty() {
+        return true;
+    }
+    let identity = String::from_utf8_lossy(identity);
+    filters
+        .iter()
+        .any(|filter| filter.is_match(&identity, ignore_case))
+}
+
+fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> Result<bool> {
+    if options.max_age.is_none() && options.min_age.is_none() {
+        return Ok(true);
+    }
+    let timestamp = commit_identity_timestamp_i64(&commit.committer)?;
+    Ok(options.max_age.is_none_or(|age| timestamp >= age)
+        && options.min_age.is_none_or(|age| timestamp <= age))
+}
+
