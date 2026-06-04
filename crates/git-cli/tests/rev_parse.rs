@@ -824,3 +824,81 @@ fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
     let _ = fs::remove_dir_all(&root);
     result
 }
+
+fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-rs"))
+        .current_dir(cwd)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn git-rs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            let mut out = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
+            }
+            assert!(status.success(), "git-rs {args:?} exited with {:?}", status.code());
+            return out.trim().to_string();
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("git-rs {args:?} did not terminate within 10s (rev-parse infinite-loop regression)");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn setup_rev_parse_repo(dir: &Path, sha256: bool) {
+    fs::create_dir_all(dir).expect("create repo dir");
+    if sha256 {
+        run("git", dir, &["init", "-q", "--object-format=sha256"]);
+    } else {
+        run("git", dir, &["init", "-q"]);
+    }
+    run(
+        "git",
+        dir,
+        &[
+            "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "c1",
+            "-q",
+        ],
+    );
+}
+
+// Regression: `rev-parse --short=N` / `--abbrev-ref` / `--symbolic-full-name` used
+// to spin forever (a `continue` in the arg loop never advanced the index).
+// `--short=N` with N >= the hash hex length must print the full hash, like git.
+#[test]
+fn rev_parse_short_and_ref_flags_terminate_and_match_git() {
+    let root = unique_temp_dir("rev-parse-short");
+    let sha1 = root.join("sha1");
+    setup_rev_parse_repo(&sha1, false);
+    for args in [
+        ["rev-parse", "--short=7", "HEAD"],
+        ["rev-parse", "--short=40", "HEAD"],
+        ["rev-parse", "--short=100", "HEAD"],
+        ["rev-parse", "--abbrev-ref", "HEAD"],
+        ["rev-parse", "--symbolic-full-name", "HEAD"],
+    ] {
+        let actual = rev_parse_terminates(&sha1, &args);
+        let expected = String::from_utf8(git(&sha1, &args)).expect("utf8");
+        assert_eq!(actual, expected.trim(), "rev-parse {args:?} mismatch");
+    }
+
+    let sha256 = root.join("sha256");
+    setup_rev_parse_repo(&sha256, true);
+    for args in [
+        ["rev-parse", "--short=64", "HEAD"],
+        ["rev-parse", "--short=100", "HEAD"],
+    ] {
+        let actual = rev_parse_terminates(&sha256, &args);
+        let expected = String::from_utf8(git(&sha256, &args)).expect("utf8");
+        assert_eq!(actual, expected.trim(), "rev-parse {args:?} mismatch (sha256)");
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

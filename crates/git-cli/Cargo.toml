@@ -5,6 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[lib]
+name = "git_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "git-rs"
 path = "src/main.rs"
@@ -22,7 +26,7 @@ git-refs = { path = "../git-refs" }
 git-rev = { path = "../git-rev" }
 git-sequencer = { path = "../git-sequencer" }
 git-testkit = { path = "../git-testkit" }
-git-transport = { path = "../git-transport" }
+git-transport = { path = "../git-transport", features = ["http-client"] }
 git-worktree = { path = "../git-worktree" }
 
 [lints]
