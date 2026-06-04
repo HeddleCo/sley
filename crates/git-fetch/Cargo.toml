@@ -1,0 +1,18 @@
+[package]
+name = "git-fetch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+git-core = { path = "../git-core" }
+git-odb = { path = "../git-odb" }
+git-transport = { path = "../git-transport" }
+
+[dev-dependencies]
+git-formats = { path = "../git-formats" }
+git-pack = { path = "../git-pack" }
+
+[lints]
+workspace = true
