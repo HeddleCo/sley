@@ -5007,12 +5007,19 @@ fn worktree_entries(
     // as `git add` would store them. With no filter configured this is an exact
     // passthrough, so unfiltered repositories see identical OIDs.
     let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    // Build the attribute matcher (the .gitattributes chain) ONCE for the whole
+    // walk and reuse it for every file. Resolving attributes per file rebuilt the
+    // entire matcher on each call, which made status/diff O(n^2) in the file count.
+    let attr_matcher = AttributeMatcher::from_worktree_root(worktree_root)?;
+    let attr_requested = filter_attribute_names();
     collect_worktree_entries(
         worktree_root,
         git_dir,
         worktree_root,
         format,
         &config,
+        &attr_matcher,
+        &attr_requested,
         &mut entries,
     )?;
     Ok(entries)
@@ -5024,6 +5031,8 @@ fn collect_worktree_entries(
     dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
+    matcher: &AttributeMatcher,
+    requested: &[Vec<u8>],
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     if is_same_path(dir, git_dir) {
@@ -5040,14 +5049,19 @@ fn collect_worktree_entries(
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_worktree_entries(root, git_dir, &path, format, config, entries)?;
+            collect_worktree_entries(root, git_dir, &path, format, config, matcher, requested, entries)?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
             let git_path = git_path_bytes(relative)?;
             let body = fs::read(&path)?;
-            let body = apply_clean_filter(root, git_dir, config, &git_path, &body)?;
+            // Resolve this path's attributes against the prebuilt matcher (a cheap
+            // pattern match) and apply the clean filter -- no per-file matcher
+            // rebuild. With no attributes/autocrlf configured this is an exact
+            // passthrough, so the stored OID is unchanged.
+            let checks = matcher.attributes_for_path(&git_path, requested, false);
+            let body = apply_clean_filter_with_attributes(config, &checks, &git_path, &body)?;
             let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
             entries.insert(
                 git_path,
