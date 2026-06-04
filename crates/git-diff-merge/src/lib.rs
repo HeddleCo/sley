@@ -272,6 +272,447 @@ fn coalesce_ops(ops: Vec<DiffOp>) -> Vec<DiffOp> {
     out
 }
 
+// ===========================================================================
+// Alternative diff algorithms: patience and histogram.
+//
+// Both share the recursive "anchor and recurse" shape used by git's xdiff
+// implementations of `--patience` and `--histogram`:
+//
+//   1. trim the common prefix and suffix of the current line range,
+//   2. pick one or more common lines that are confidently aligned (the
+//      "anchors") according to the algorithm's rule,
+//   3. recurse on the gaps to the left of, between, and to the right of the
+//      anchors,
+//   4. when no anchor can be found, fall back to the Myers shortest-edit-script
+//      search for that range so the result is still a valid LCS-correct diff.
+//
+// They operate purely on slices of [`DiffLine`]s and emit the same coalesced
+// [`DiffOp`] run sequence as [`myers_diff_lines`], so any caller can swap
+// algorithms freely. The two functions differ only in the anchor-selection
+// rule in steps 2/3.
+// ===========================================================================
+
+/// A hashable key for a line, used to bucket equal lines when finding anchors.
+///
+/// Mirrors [`DiffLine`]'s `PartialEq`: two lines are the same iff their bytes
+/// and their trailing-newline flag match. Keying on this tuple lets us hash
+/// lines without changing the public [`DiffLine`] type.
+type LineKey<'a> = (&'a [u8], bool);
+
+#[inline]
+fn line_key<'a>(line: &DiffLine<'a>) -> LineKey<'a> {
+    (line.content, line.has_newline)
+}
+
+/// Compute a line-level edit script transforming `old` into `new` using the
+/// patience diff algorithm (Bram Cohen's algorithm, as in `git diff
+/// --patience`).
+///
+/// Patience diff anchors on lines that occur *exactly once* in both `old` and
+/// `new`; it aligns those unique lines via a longest-increasing-subsequence
+/// ("patience sorting") pass and recurses into the gaps, falling back to Myers
+/// when a gap has no unique common line. The result is a valid LCS-correct edit
+/// script with the same shape as [`myers_diff_lines`]: walking it reconstructs
+/// `new` from `old`, and every [`DiffOp::Equal`] run covers genuinely equal
+/// lines. Patience tends to produce more human-readable hunks than Myers when
+/// blocks of lines are moved or repeated, though it is not guaranteed to be a
+/// shortest edit script.
+pub fn patience_diff_lines(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    patience_recurse(old, new, 0, old.len(), 0, new.len(), &mut ops);
+    coalesce_ops(ops)
+}
+
+/// Compute a line-level edit script transforming `old` into `new` using the
+/// histogram diff algorithm (as in `git diff --histogram`, derived from JGit).
+///
+/// Histogram diff is a patience-style unique-anchor algorithm with a fallback:
+/// it builds an occurrence histogram of `old` and, scanning `new`, picks the
+/// longest run of matching lines whose `old` line has the *fewest* occurrences
+/// (preferring truly unique lines, like patience, but still able to anchor on
+/// low-frequency lines when no globally-unique line exists). It then recurses
+/// on the regions on either side of that run, falling back to Myers only when
+/// no common line exists in a region. The result is a valid LCS-correct edit
+/// script with the same shape as [`myers_diff_lines`].
+pub fn histogram_diff_lines(old: &[DiffLine<'_>], new: &[DiffLine<'_>]) -> Vec<DiffOp> {
+    let mut ops: Vec<DiffOp> = Vec::new();
+    histogram_recurse(old, new, 0, old.len(), 0, new.len(), &mut ops);
+    coalesce_ops(ops)
+}
+
+/// Dispatch to the line-diff implementation selected by `algorithm`.
+///
+/// All variants return the same coalesced [`DiffOp`] run sequence as
+/// [`myers_diff_lines`], so callers can switch algorithms without changing how
+/// they consume the result.
+///
+/// - [`DiffAlgorithm::Myers`] and [`DiffAlgorithm::Minimal`] use the Myers
+///   O(ND) shortest-edit-script search ([`myers_diff_lines`]); that search is
+///   already minimal in deletions + insertions, so `Minimal` is an alias for
+///   it here rather than a distinct slower mode.
+/// - [`DiffAlgorithm::Patience`] uses [`patience_diff_lines`].
+/// - [`DiffAlgorithm::Histogram`] uses [`histogram_diff_lines`].
+pub fn diff_lines_with_algorithm(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    algorithm: DiffAlgorithm,
+) -> Vec<DiffOp> {
+    match algorithm {
+        DiffAlgorithm::Myers | DiffAlgorithm::Minimal => myers_diff_lines(old, new),
+        DiffAlgorithm::Patience => patience_diff_lines(old, new),
+        DiffAlgorithm::Histogram => histogram_diff_lines(old, new),
+    }
+}
+
+/// Emit ops for an empty-on-one-side range; returns `true` if it handled it.
+///
+/// Covers the recursion base cases where one side of `old[a0..a1]` /
+/// `new[b0..b1]` is empty: a pure deletion, a pure insertion, or nothing at
+/// all. Used by both the patience and histogram recursions before they look
+/// for an anchor.
+fn emit_trivial_range(
+    a0: usize,
+    a1: usize,
+    b0: usize,
+    b1: usize,
+    out: &mut Vec<DiffOp>,
+) -> bool {
+    let old_len = a1 - a0;
+    let new_len = b1 - b0;
+    if old_len == 0 && new_len == 0 {
+        return true;
+    }
+    if old_len == 0 {
+        out.push(DiffOp::Insert(new_len));
+        return true;
+    }
+    if new_len == 0 {
+        out.push(DiffOp::Delete(old_len));
+        return true;
+    }
+    false
+}
+
+/// Trim the common prefix/suffix of `old[a0..a1]` vs `new[b0..b1]`.
+///
+/// Emits an `Equal` for the matched prefix immediately, returns the inner
+/// (still-differing) range, and reports the matched-suffix length so the caller
+/// can emit its `Equal` *after* it has processed the inner range. This keeps
+/// the per-range work proportional to the actual edit, mirroring the prefix /
+/// suffix trim in [`myers_diff_lines`].
+fn trim_common(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    mut a0: usize,
+    mut a1: usize,
+    mut b0: usize,
+    mut b1: usize,
+    out: &mut Vec<DiffOp>,
+) -> (usize, usize, usize, usize, usize) {
+    let mut prefix = 0usize;
+    while a0 < a1 && b0 < b1 && old[a0] == new[b0] {
+        a0 += 1;
+        b0 += 1;
+        prefix += 1;
+    }
+    if prefix > 0 {
+        out.push(DiffOp::Equal(prefix));
+    }
+    let mut suffix = 0usize;
+    while a1 > a0 && b1 > b0 && old[a1 - 1] == new[b1 - 1] {
+        a1 -= 1;
+        b1 -= 1;
+        suffix += 1;
+    }
+    (a0, a1, b0, b1, suffix)
+}
+
+/// Recursive patience-diff worker over `old[a0..a1]` vs `new[b0..b1]`.
+fn patience_recurse(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    a0: usize,
+    a1: usize,
+    b0: usize,
+    b1: usize,
+    out: &mut Vec<DiffOp>,
+) {
+    if emit_trivial_range(a0, a1, b0, b1, out) {
+        return;
+    }
+    let (a0, a1, b0, b1, suffix) = trim_common(old, new, a0, a1, b0, b1, out);
+    if !emit_trivial_range(a0, a1, b0, b1, out) {
+        match patience_anchors(old, new, a0, a1, b0, b1) {
+            Some(anchors) => {
+                // Walk the aligned anchors in order, recursing into each gap
+                // before emitting the anchor line as Equal.
+                let mut cur_a = a0;
+                let mut cur_b = b0;
+                for (ai, bi) in anchors {
+                    patience_recurse(old, new, cur_a, ai, cur_b, bi, out);
+                    out.push(DiffOp::Equal(1));
+                    cur_a = ai + 1;
+                    cur_b = bi + 1;
+                }
+                // Tail after the last anchor.
+                patience_recurse(old, new, cur_a, a1, cur_b, b1, out);
+            }
+            // No unique common line in this range: defer to Myers, which always
+            // yields a valid (and minimal) script for the leftover block.
+            None => myers_core(&old[a0..a1], &new[b0..b1], out),
+        }
+    }
+    if suffix > 0 {
+        out.push(DiffOp::Equal(suffix));
+    }
+}
+
+/// Find the patience anchors for `old[a0..a1]` vs `new[b0..b1]`.
+///
+/// An anchor is a line that occurs exactly once in `old[a0..a1]` and exactly
+/// once in `new[b0..b1]`. The matched (old_index, new_index) pairs are reduced
+/// to their longest increasing subsequence by new-index (the patience-sort LCS)
+/// so the returned anchors are strictly increasing in *both* indices and can be
+/// used as split points. Returns `None` when there are no such unique common
+/// lines (the caller then falls back to Myers).
+fn patience_anchors(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    a0: usize,
+    a1: usize,
+    b0: usize,
+    b1: usize,
+) -> Option<Vec<(usize, usize)>> {
+    // Count occurrences and remember the (single) position of each line in each
+    // side's range. `count > 1` poisons the position so we can ignore it.
+    struct Occ {
+        count: usize,
+        pos: usize,
+    }
+    let mut in_old: HashMap<LineKey<'_>, Occ> = HashMap::new();
+    for (i, line) in old.iter().enumerate().take(a1).skip(a0) {
+        in_old
+            .entry(line_key(line))
+            .and_modify(|o| o.count += 1)
+            .or_insert(Occ { count: 1, pos: i });
+    }
+    let mut in_new: HashMap<LineKey<'_>, Occ> = HashMap::new();
+    for (j, line) in new.iter().enumerate().take(b1).skip(b0) {
+        in_new
+            .entry(line_key(line))
+            .and_modify(|o| o.count += 1)
+            .or_insert(Occ { count: 1, pos: j });
+    }
+
+    // Collect lines unique in both, ordered by their position in `old`.
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    for (i, line) in old.iter().enumerate().take(a1).skip(a0) {
+        let key = line_key(line);
+        let Some(o) = in_old.get(&key) else { continue };
+        if o.count != 1 || o.pos != i {
+            continue;
+        }
+        // A line unique in both ranges is a candidate anchor.
+        if let Some(n) = in_new.get(&key)
+            && n.count == 1
+        {
+            pairs.push((i, n.pos));
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+
+    // Patience sort: longest increasing subsequence of new-indices. `pairs` is
+    // already sorted by old-index, so an LIS by new-index yields a set of
+    // anchors increasing in both coordinates.
+    let lis = longest_increasing_by_new(&pairs);
+    if lis.is_empty() {
+        None
+    } else {
+        Some(lis)
+    }
+}
+
+/// Longest increasing subsequence of `pairs` (sorted by old-index) keyed on the
+/// new-index, returned as the chosen (old_index, new_index) pairs in order.
+///
+/// This is the patience-sorting core: standard O(k log k) LIS with predecessor
+/// links so the actual subsequence (not just its length) is recovered. Because
+/// the input is pre-sorted by old-index and the new-indices are distinct, the
+/// result is strictly increasing in both coordinates.
+fn longest_increasing_by_new(pairs: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    if pairs.is_empty() {
+        return Vec::new();
+    }
+    // tails[len-1] = index into `pairs` of the smallest possible tail value of
+    // an increasing subsequence of length `len`.
+    let mut tails: Vec<usize> = Vec::new();
+    // prev[i] = index into `pairs` of the predecessor of pairs[i] in its LIS.
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+
+    for i in 0..pairs.len() {
+        let val = pairs[i].1;
+        // Binary search for the first tail whose new-index is >= val.
+        let mut lo = 0usize;
+        let mut hi = tails.len();
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pairs[tails[mid]].1 < val {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo > 0 {
+            prev[i] = Some(tails[lo - 1]);
+        }
+        if lo == tails.len() {
+            tails.push(i);
+        } else {
+            tails[lo] = i;
+        }
+    }
+
+    // Reconstruct by following predecessor links from the last tail.
+    let mut result: Vec<(usize, usize)> = Vec::with_capacity(tails.len());
+    let mut cur = tails.last().copied();
+    while let Some(i) = cur {
+        result.push(pairs[i]);
+        cur = prev[i];
+    }
+    result.reverse();
+    result
+}
+
+/// Recursive histogram-diff worker over `old[a0..a1]` vs `new[b0..b1]`.
+fn histogram_recurse(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    a0: usize,
+    a1: usize,
+    b0: usize,
+    b1: usize,
+    out: &mut Vec<DiffOp>,
+) {
+    if emit_trivial_range(a0, a1, b0, b1, out) {
+        return;
+    }
+    let (a0, a1, b0, b1, suffix) = trim_common(old, new, a0, a1, b0, b1, out);
+    if !emit_trivial_range(a0, a1, b0, b1, out) {
+        match histogram_region(old, new, a0, a1, b0, b1) {
+            Some(region) => {
+                // Recurse left of the matched run, emit the run as Equal, then
+                // recurse right of it.
+                histogram_recurse(old, new, a0, region.old_start, b0, region.new_start, out);
+                out.push(DiffOp::Equal(region.len));
+                histogram_recurse(
+                    old,
+                    new,
+                    region.old_start + region.len,
+                    a1,
+                    region.new_start + region.len,
+                    b1,
+                    out,
+                );
+            }
+            // No common line at all in this range: hand it to Myers.
+            None => myers_core(&old[a0..a1], &new[b0..b1], out),
+        }
+    }
+    if suffix > 0 {
+        out.push(DiffOp::Equal(suffix));
+    }
+}
+
+/// The longest common run chosen by the histogram heuristic for one range.
+struct HistogramRegion {
+    old_start: usize,
+    new_start: usize,
+    len: usize,
+}
+
+/// Choose the histogram anchor run for `old[a0..a1]` vs `new[b0..b1]`.
+///
+/// Builds an occurrence histogram of the `old` range, then scans the `new`
+/// range. For each `new` line that also appears in `old`, it extends a matching
+/// run backward and forward and scores candidate alignments, preferring the run
+/// whose anchoring `old` line has the *fewest* occurrences (ties broken by run
+/// length, then by earliest position). This is the JGit/`git --histogram`
+/// heuristic: rare lines make the most reliable anchors. Returns `None` if no
+/// `new` line appears in the `old` range.
+fn histogram_region(
+    old: &[DiffLine<'_>],
+    new: &[DiffLine<'_>],
+    a0: usize,
+    a1: usize,
+    b0: usize,
+    b1: usize,
+) -> Option<HistogramRegion> {
+    // Occurrence count and the list of positions of each line within old[a0..a1].
+    let mut buckets: HashMap<LineKey<'_>, Vec<usize>> = HashMap::new();
+    for (i, line) in old.iter().enumerate().take(a1).skip(a0) {
+        buckets.entry(line_key(line)).or_default().push(i);
+    }
+
+    let mut best: Option<HistogramRegion> = None;
+    // Lower occurrence count is better; among equal counts, longer run wins.
+    let mut best_count = usize::MAX;
+    let mut best_len = 0usize;
+
+    let mut bj = b0;
+    while bj < b1 {
+        let key = line_key(&new[bj]);
+        let Some(positions) = buckets.get(&key) else {
+            bj += 1;
+            continue;
+        };
+        let occ = positions.len();
+        // For every place this line sits in `old`, measure the maximal matching
+        // run that passes through (positions[*], bj).
+        let mut next_bj = bj + 1;
+        for &ai in positions {
+            // Extend backward while lines keep matching and we stay in range.
+            let mut start_a = ai;
+            let mut start_b = bj;
+            while start_a > a0 && start_b > b0 && old[start_a - 1] == new[start_b - 1] {
+                start_a -= 1;
+                start_b -= 1;
+            }
+            // Extend forward from the run start.
+            let mut len = 0usize;
+            while start_a + len < a1
+                && start_b + len < b1
+                && old[start_a + len] == new[start_b + len]
+            {
+                len += 1;
+            }
+            // Score this run by the rarest occurrence count along it; using the
+            // anchor line's own count is the standard, cheaper approximation.
+            let run_count = occ;
+            let better = run_count < best_count
+                || (run_count == best_count && len > best_len);
+            if better && len > 0 {
+                best_count = run_count;
+                best_len = len;
+                best = Some(HistogramRegion {
+                    old_start: start_a,
+                    new_start: start_b,
+                    len,
+                });
+                // Skip past this matched run in `new` so we do not re-evaluate
+                // every interior line of the same run from scratch.
+                if start_b + len > next_bj {
+                    next_bj = start_b + len;
+                }
+            }
+        }
+        bj = next_bj.max(bj + 1);
+    }
+
+    best
+}
+
 /// Which conflict-marker style [`merge_blobs`] emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ConflictStyle {
@@ -850,6 +1291,129 @@ pub fn diff_name_status_head_index_with_rename_options(
         options,
         |oid| read_blob_bytes(&db, oid),
     )
+}
+
+/// Read an arbitrary tree object's flattened blob entries (recursively) keyed by
+/// repository-relative path. This is the tree-side counterpart used by
+/// `git diff-index <tree-ish>`: unlike [`head_tree_entries`] it does not consult
+/// `HEAD`, so any commit/tag (peeled to a tree) or tree oid can be compared.
+///
+/// The canonical empty tree (`git hash-object -t tree /dev/null`) is treated as
+/// always present and yields no entries, even when the object was never written
+/// to the database. git makes the same guarantee, which keeps the common idiom
+/// `git diff-index --cached <empty-tree-sha>` working in a fresh repository.
+fn tree_entries(
+    tree_oid: &ObjectId,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    let mut entries = BTreeMap::new();
+    if *tree_oid == empty_tree_oid(format)? {
+        return Ok(entries);
+    }
+    collect_tree_entries(db, format, tree_oid, Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+/// The well-known oid of the empty tree for `format` (the hash of a zero-length
+/// tree object). git hard-codes this value and treats it as always existing.
+fn empty_tree_oid(format: ObjectFormat) -> Result<ObjectId> {
+    object_id_for_bytes(format, "tree", b"")
+}
+
+/// Name-status diff of an arbitrary tree against the index, the engine behind
+/// `git diff-index --cached <tree-ish>`. Exact rename/copy detection follows
+/// `options`; all blob content comes from the object database.
+pub fn diff_name_status_tree_index_with_options(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tree = tree_entries(tree_oid, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    diff_name_status_maps(&tree, &index, tree.keys().chain(index.keys()), options)
+}
+
+/// Tree-vs-index name-status with full rename/copy options, including inexact
+/// (similarity) detection when enabled. Both sides read blob content from the
+/// object database. Counterpart of
+/// [`diff_name_status_head_index_with_rename_options`] for an arbitrary tree.
+pub fn diff_name_status_tree_index_with_rename_options(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tree = tree_entries(tree_oid, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    diff_name_status_maps_with_renames(
+        &tree,
+        &index,
+        tree.keys().chain(index.keys()),
+        options,
+        |oid| read_blob_bytes(&db, oid),
+    )
+}
+
+/// Name-status diff of an arbitrary tree against the working tree, the engine
+/// behind plain `git diff-index <tree-ish>` (no `--cached`). New-side oids for
+/// paths whose worktree contents differ from the index are cleared (rendered as
+/// zeros), matching git, which only reports the worktree blob oid when it is
+/// known-clean against the index.
+pub fn diff_name_status_tree_worktree_with_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tree = tree_entries(tree_oid, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let changes =
+        diff_name_status_maps(&tree, &worktree, tree.keys().chain(index.keys()), options)?;
+    Ok(mark_unstaged_worktree_oids_unresolved(
+        changes, &index, &worktree,
+    ))
+}
+
+/// Tree-vs-worktree name-status with full rename/copy options, including inexact
+/// (similarity) detection when enabled. Worktree blob content is read directly
+/// from the working tree (via an oid-keyed cache); tree-side blobs come from the
+/// object database. As with [`diff_name_status_tree_worktree_with_options`],
+/// new-side oids for paths that differ from the index are cleared.
+pub fn diff_name_status_tree_worktree_with_rename_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let tree = tree_entries(tree_oid, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let cache = worktree_blob_cache(worktree_root, git_dir, format)?;
+    let changes = diff_name_status_maps_with_renames(
+        &tree,
+        &worktree,
+        tree.keys().chain(index.keys()),
+        options,
+        |oid| cache_or_odb_blob(&cache, &db, oid),
+    )?;
+    Ok(mark_unstaged_worktree_oids_unresolved(
+        changes, &index, &worktree,
+    ))
 }
 
 pub fn diff_name_status_index_worktree(
@@ -3605,5 +4169,422 @@ new mode 100755
         assert!(statuses.contains(&NameStatus::Deleted));
         assert!(!statuses.iter().any(|s| matches!(s, NameStatus::Renamed(_))));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- patience / histogram diff tests ------------------------------------
+
+    /// Apply an edit script to `old` and return the reconstructed `new` bytes.
+    ///
+    /// Panics (test-only) if the script ever references a line out of range or
+    /// claims a line is `Equal` when the corresponding `old`/`new` lines differ
+    /// — that is exactly the invariant a correct LCS diff must uphold.
+    fn apply_ops(old: &[DiffLine<'_>], new: &[DiffLine<'_>], ops: &[DiffOp]) -> Vec<u8> {
+        let mut oi = 0usize;
+        let mut ni = 0usize;
+        let mut rebuilt: Vec<u8> = Vec::new();
+        for op in ops {
+            match *op {
+                DiffOp::Equal(n) => {
+                    for _ in 0..n {
+                        // Equal must mean genuinely-equal lines (LCS-correct).
+                        assert_eq!(old[oi], new[ni], "Equal op covered unequal lines");
+                        rebuilt.extend_from_slice(old[oi].content);
+                        oi += 1;
+                        ni += 1;
+                    }
+                }
+                DiffOp::Delete(n) => oi += n,
+                DiffOp::Insert(n) => {
+                    for _ in 0..n {
+                        rebuilt.extend_from_slice(new[ni].content);
+                        ni += 1;
+                    }
+                }
+            }
+        }
+        // The script must consume every line of both sides exactly once.
+        assert_eq!(oi, old.len(), "script did not consume all of old");
+        assert_eq!(ni, new.len(), "script did not consume all of new");
+        rebuilt
+    }
+
+    /// Assert that `ops` is a valid LCS-correct script: it reconstructs `new`
+    /// from `old`, and consecutive ops are coalesced (no two same-kind in a row).
+    fn assert_valid_script(old_bytes: &[u8], new_bytes: &[u8], ops: &[DiffOp]) {
+        let old = split_lines(old_bytes);
+        let new = split_lines(new_bytes);
+        let rebuilt = apply_ops(&old, &new, ops);
+        assert_eq!(rebuilt, new_bytes, "script did not rebuild new");
+        for pair in ops.windows(2) {
+            let same_kind = matches!(
+                (pair[0], pair[1]),
+                (DiffOp::Equal(_), DiffOp::Equal(_))
+                    | (DiffOp::Delete(_), DiffOp::Delete(_))
+                    | (DiffOp::Insert(_), DiffOp::Insert(_))
+            );
+            assert!(!same_kind, "ops not coalesced: {:?}", ops);
+        }
+    }
+
+    /// Run all three real algorithms over a byte pair and assert each produces a
+    /// valid, coalesced, LCS-correct script.
+    fn check_all_algorithms(old_bytes: &[u8], new_bytes: &[u8]) {
+        let old = split_lines(old_bytes);
+        let new = split_lines(new_bytes);
+        for algo in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Minimal,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Histogram,
+        ] {
+            let ops = diff_lines_with_algorithm(&old, &new, algo);
+            assert_valid_script(old_bytes, new_bytes, &ops);
+        }
+    }
+
+    #[test]
+    fn patience_and_histogram_match_myers_on_simple_cases() {
+        // For localized single-line edits with no repeated lines, all three
+        // algorithms agree with the canonical Myers script.
+        let cases: &[(&[u8], &[u8], Vec<DiffOp>)] = &[
+            (
+                b"a\nb\nc\n",
+                b"a\nx\nc\n",
+                vec![
+                    DiffOp::Equal(1),
+                    DiffOp::Delete(1),
+                    DiffOp::Insert(1),
+                    DiffOp::Equal(1),
+                ],
+            ),
+            (b"a\nb\nc\n", b"a\nb\nc\n", vec![DiffOp::Equal(3)]),
+            (b"", b"a\nb\n", vec![DiffOp::Insert(2)]),
+            (b"a\nb\n", b"", vec![DiffOp::Delete(2)]),
+            (
+                b"a\nb\nc\nd\n",
+                b"a\nc\nd\n",
+                vec![DiffOp::Equal(1), DiffOp::Delete(1), DiffOp::Equal(2)],
+            ),
+        ];
+        for (old_bytes, new_bytes, expected) in cases {
+            let old = split_lines(old_bytes);
+            let new = split_lines(new_bytes);
+            assert_eq!(&patience_diff_lines(&old, &new), expected);
+            assert_eq!(&histogram_diff_lines(&old, &new), expected);
+            assert_eq!(&myers_diff_lines(&old, &new), expected);
+        }
+    }
+
+    #[test]
+    fn patience_handles_both_empty() {
+        let empty = split_lines(b"");
+        assert!(patience_diff_lines(&empty, &empty).is_empty());
+        assert!(histogram_diff_lines(&empty, &empty).is_empty());
+    }
+
+    #[test]
+    fn patience_aligns_unique_anchors_across_moved_block() {
+        // Reordering two unique blocks: patience anchors on the unique lines and
+        // produces a delete-then-insert (or insert-then-delete) that still
+        // reconstructs `new`. Validity is the contract; exact shape may differ
+        // from Myers, so we only assert reconstruction here.
+        check_all_algorithms(b"alpha\nbeta\ngamma\ndelta\n", b"gamma\ndelta\nalpha\nbeta\n");
+    }
+
+    #[test]
+    fn histogram_differs_from_myers_keeping_block_contiguous() {
+        // A case where histogram diverges from Myers. With old = "b a" and a new
+        // that surrounds an intact "b a" with inserted "b" lines, Myers splits
+        // the common run into two single-line Equals (matching the leading and
+        // trailing `b`/`a` separately), while histogram anchors on the rare line
+        // and keeps the original two lines together as one Equal(2) block.
+        let old = b"b\na\n";
+        let new = b"a\nb\nb\na\nb\n";
+        let old_l = split_lines(old);
+        let new_l = split_lines(new);
+
+        let myers = myers_diff_lines(&old_l, &new_l);
+        let histogram = histogram_diff_lines(&old_l, &new_l);
+
+        // All variants must reconstruct `new`.
+        assert_valid_script(old, new, &myers);
+        assert_valid_script(old, new, &histogram);
+
+        // Exact, pinned shapes: Myers interleaves single-line equals; histogram
+        // keeps "b\na\n" contiguous.
+        assert_eq!(
+            myers,
+            vec![
+                DiffOp::Insert(1),
+                DiffOp::Equal(1),
+                DiffOp::Insert(1),
+                DiffOp::Equal(1),
+                DiffOp::Insert(1),
+            ]
+        );
+        assert_eq!(
+            histogram,
+            vec![DiffOp::Insert(2), DiffOp::Equal(2), DiffOp::Insert(1)]
+        );
+        // The contract the task calls out: histogram differs from Myers here.
+        assert_ne!(myers, histogram);
+    }
+
+    #[test]
+    fn patience_differs_from_myers_on_repeated_lines() {
+        // A case where patience diverges from Myers. old = "b a", new = "a a b".
+        // Myers deletes the leading `b` and appends; patience anchors on the
+        // single unique-in-both line `a`... but `a` occurs twice in `new`, so it
+        // is NOT unique there; patience instead falls through to its recursive
+        // structure and produces the mirror script. Both reconstruct `new`.
+        let old = b"b\na\n";
+        let new = b"a\na\nb\n";
+        let old_l = split_lines(old);
+        let new_l = split_lines(new);
+
+        let myers = myers_diff_lines(&old_l, &new_l);
+        let patience = patience_diff_lines(&old_l, &new_l);
+
+        assert_valid_script(old, new, &myers);
+        assert_valid_script(old, new, &patience);
+
+        assert_eq!(
+            myers,
+            vec![DiffOp::Delete(1), DiffOp::Equal(1), DiffOp::Insert(2)]
+        );
+        assert_eq!(
+            patience,
+            vec![DiffOp::Insert(2), DiffOp::Equal(1), DiffOp::Delete(1)]
+        );
+        assert_ne!(myers, patience);
+    }
+
+    #[test]
+    fn realistic_function_insertion_all_valid() {
+        // A more lifelike example: a new function is inserted ahead of an
+        // existing one that shares structural lines ("}", blank line). We don't
+        // pin exact shapes (they depend on trim interactions) but every
+        // algorithm must produce a valid LCS-correct script.
+        let old = b"int f() {\n    return 1;\n}\n";
+        let new = b"int g() {\n    return 2;\n}\n\nint f() {\n    return 1;\n}\n";
+        check_all_algorithms(old, new);
+    }
+
+    #[test]
+    fn histogram_anchors_on_rare_line_when_no_unique_line_exists() {
+        // No line is globally unique on both sides (every distinct line repeats
+        // on at least one side), so plain patience would fall straight to Myers.
+        // Histogram still anchors on the least-frequent shared line. We assert
+        // both produce valid, reconstructing scripts.
+        check_all_algorithms(b"x\nx\nmid\nx\nx\n", b"x\nmid\nx\nx\nx\n");
+        check_all_algorithms(
+            b"dup\ndup\nrare\ndup\ndup\n",
+            b"dup\nrare\ndup\ndup\ndup\ndup\n",
+        );
+    }
+
+    #[test]
+    fn all_algorithms_treat_missing_final_newline_as_change() {
+        // "b" (no newline) vs "b\n" is a real change for every algorithm.
+        let old = split_lines(b"a\nb");
+        let new = split_lines(b"a\nb\n");
+        for algo in [
+            DiffAlgorithm::Myers,
+            DiffAlgorithm::Minimal,
+            DiffAlgorithm::Patience,
+            DiffAlgorithm::Histogram,
+        ] {
+            let ops = diff_lines_with_algorithm(&old, &new, algo);
+            assert_eq!(
+                ops,
+                vec![DiffOp::Equal(1), DiffOp::Delete(1), DiffOp::Insert(1)],
+                "algorithm {:?} mishandled missing final newline",
+                algo
+            );
+        }
+    }
+
+    #[test]
+    fn dispatcher_routes_each_variant() {
+        let old = split_lines(b"a\nb\nc\n");
+        let new = split_lines(b"a\nx\nc\n");
+        assert_eq!(
+            diff_lines_with_algorithm(&old, &new, DiffAlgorithm::Myers),
+            myers_diff_lines(&old, &new)
+        );
+        // Minimal aliases Myers (the Myers search is already a minimal SES).
+        assert_eq!(
+            diff_lines_with_algorithm(&old, &new, DiffAlgorithm::Minimal),
+            myers_diff_lines(&old, &new)
+        );
+        assert_eq!(
+            diff_lines_with_algorithm(&old, &new, DiffAlgorithm::Patience),
+            patience_diff_lines(&old, &new)
+        );
+        assert_eq!(
+            diff_lines_with_algorithm(&old, &new, DiffAlgorithm::Histogram),
+            histogram_diff_lines(&old, &new)
+        );
+    }
+
+    #[test]
+    fn patience_recurses_into_gaps_between_anchors() {
+        // Unique anchors `head`/`tail` bracket an inner edit; patience must
+        // recurse into the middle gap and diff `mid1`->`MID` there.
+        let old = b"head\nmid1\nmid2\ntail\n";
+        let new = b"head\nMID\nmid2\ntail\n";
+        let old_l = split_lines(old);
+        let new_l = split_lines(new);
+        let ops = patience_diff_lines(&old_l, &new_l);
+        assert_eq!(
+            ops,
+            vec![
+                DiffOp::Equal(1),
+                DiffOp::Delete(1),
+                DiffOp::Insert(1),
+                DiffOp::Equal(2),
+            ]
+        );
+        assert_valid_script(old, new, &ops);
+    }
+
+    #[test]
+    fn patience_falls_back_to_myers_with_no_unique_lines() {
+        // Every line is duplicated within its own side, so there are no
+        // unique-in-both anchors; patience must defer to Myers but still return
+        // a valid script.
+        let old = b"a\na\nb\nb\n";
+        let new = b"a\na\na\nb\n";
+        let old_l = split_lines(old);
+        let new_l = split_lines(new);
+        let ops = patience_diff_lines(&old_l, &new_l);
+        // The contract for the fallback path is validity, not minimality: after
+        // the greedy prefix/suffix trim (which git's patience does too) the
+        // leftover block is handed to Myers, and the whole script must still
+        // reconstruct `new`.
+        assert_valid_script(old, new, &ops);
+    }
+
+    #[test]
+    fn algorithms_agree_with_myers_when_all_lines_distinct() {
+        // When every line is globally unique, patience's anchor set is the full
+        // LCS, so patience and histogram must produce exactly the Myers script.
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"a\nb\nc\nd\ne\n", b"a\nc\nd\nf\ne\n"),
+            (b"1\n2\n3\n4\n5\n6\n", b"1\n3\n2\n4\n6\n5\n"),
+            (b"q\nw\ne\nr\nt\ny\n", b"q\nw\nx\nr\nt\nz\n"),
+        ];
+        for (old_bytes, new_bytes) in cases {
+            let old = split_lines(old_bytes);
+            let new = split_lines(new_bytes);
+            let myers = myers_diff_lines(&old, &new);
+            assert_eq!(
+                patience_diff_lines(&old, &new),
+                myers,
+                "patience must equal Myers when all lines are distinct: {:?}",
+                old_bytes
+            );
+            assert_eq!(
+                histogram_diff_lines(&old, &new),
+                myers,
+                "histogram must equal Myers when all lines are distinct: {:?}",
+                old_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn fuzz_all_algorithms_reconstruct_new() {
+        // A small deterministic LCG drives many random small inputs over a tiny
+        // alphabet (so lines repeat and exercise the anchor/fallback paths).
+        // Every algorithm must produce a valid LCS-correct script for each pair.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let alphabet = [b"a\n", b"b\n", b"c\n", b"d\n"];
+        let build = |rng: &mut dyn FnMut() -> u32| -> Vec<u8> {
+            let len = (rng() % 9) as usize; // 0..=8 lines
+            let mut buf = Vec::new();
+            for _ in 0..len {
+                let pick = (rng() % alphabet.len() as u32) as usize;
+                buf.extend_from_slice(alphabet[pick]);
+            }
+            // Occasionally drop the trailing newline to exercise that path.
+            if !buf.is_empty() && rng() % 4 == 0 {
+                buf.pop();
+            }
+            buf
+        };
+        for _ in 0..400 {
+            let old_bytes = build(&mut next);
+            let new_bytes = build(&mut next);
+            check_all_algorithms(&old_bytes, &new_bytes);
+        }
+    }
+
+    #[test]
+    fn exhaustive_small_inputs_all_algorithms_reconstruct() {
+        // Brute force over a 3-symbol alphabet up to 5 lines per side: every
+        // algorithm must produce a valid LCS-correct script for *every* pair.
+        // This is the strongest correctness net for the recursion/fallback
+        // paths; apply_ops asserts both reconstruction and Equal-correctness.
+        let syms = [b"a\n".to_vec(), b"b\n".to_vec(), b"c\n".to_vec()];
+        let make = |n: usize, mut code: usize| -> Vec<u8> {
+            let mut v = Vec::new();
+            for _ in 0..n {
+                v.extend_from_slice(&syms[code % 3]);
+                code /= 3;
+            }
+            v
+        };
+        for la in 0..=5usize {
+            for lb in 0..=5usize {
+                for ca in 0..3usize.pow(la as u32) {
+                    for cb in 0..3usize.pow(lb as u32) {
+                        let ob = make(la, ca);
+                        let nb = make(lb, cb);
+                        let ol = split_lines(&ob);
+                        let nl = split_lines(&nb);
+                        assert_eq!(apply_ops(&ol, &nl, &myers_diff_lines(&ol, &nl)), nb);
+                        assert_eq!(apply_ops(&ol, &nl, &patience_diff_lines(&ol, &nl)), nb);
+                        assert_eq!(apply_ops(&ol, &nl, &histogram_diff_lines(&ol, &nl)), nb);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fuzz_distinct_lines_patience_histogram_equal_myers() {
+        // When inputs are permutations/subsequences of globally-unique lines,
+        // patience and histogram must match Myers exactly. We generate sequences
+        // of distinct tokens to guarantee global uniqueness on both sides.
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        for _ in 0..200 {
+            // Random subset+order of tokens "0\n".."9\n" for each side; tokens
+            // are globally unique, so any common line is unique in both.
+            let pick_subseq = |rng: &mut dyn FnMut() -> u32| -> Vec<u8> {
+                let mut buf = Vec::new();
+                for t in 0..10u32 {
+                    if rng() % 2 == 0 {
+                        buf.extend_from_slice(format!("{t}\n").as_bytes());
+                    }
+                }
+                buf
+            };
+            let old_bytes = pick_subseq(&mut next);
+            let new_bytes = pick_subseq(&mut next);
+            let old = split_lines(&old_bytes);
+            let new = split_lines(&new_bytes);
+            let myers = myers_diff_lines(&old, &new);
+            assert_eq!(patience_diff_lines(&old, &new), myers);
+            assert_eq!(histogram_diff_lines(&old, &new), myers);
+        }
     }
 }

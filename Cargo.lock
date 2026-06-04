@@ -76,7 +76,14 @@ dependencies = [
 name = "git"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
+ "git-formats",
+ "git-object",
+ "git-odb",
+ "git-refs",
+ "git-rev",
+ "git-worktree",
 ]
 
 [[package]]

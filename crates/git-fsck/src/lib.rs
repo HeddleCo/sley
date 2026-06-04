@@ -3,6 +3,13 @@ use git_object::{Commit, EncodedObject, ObjectType, Tag, Tree};
 use git_odb::ObjectReader;
 use std::collections::{HashSet, VecDeque};
 
+mod connectivity;
+
+pub use connectivity::{
+    check_connectivity, check_refs, ConnectivityOptions, FsckFinding, FsckFindings, FsckRef,
+    FsckRefTarget, FsckSeverity,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsckIssue {
     pub message: String,

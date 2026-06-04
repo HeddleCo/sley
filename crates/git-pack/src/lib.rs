@@ -2801,6 +2801,593 @@ fn hash_function_id(format: ObjectFormat) -> u32 {
     }
 }
 
+/// Maximum number of clean (run) words that a single EWAH running-length word
+/// can describe. The field is 32 bits wide (bits 1..=32 of the RLW).
+const EWAH_MAX_RUNNING_LEN: u64 = 0xffff_ffff;
+
+/// Maximum number of literal (dirty) words that can trail a single EWAH
+/// running-length word. The field is 31 bits wide (bits 33..=63 of the RLW).
+const EWAH_MAX_LITERAL_LEN: u64 = 0x7fff_ffff;
+
+/// All-ones 64-bit word, used to recognise a "clean" run of set bits.
+const EWAH_ALL_ONES: u64 = u64::MAX;
+
+impl EwahBitmap {
+    /// Constructs an [`EwahBitmap`] in git's canonical EWAH compressed form
+    /// from a slice of raw uncompressed 64-bit words.
+    ///
+    /// Within each word bit `i` corresponds to position `word_index * 64 + i`,
+    /// matching git's on-disk convention. `bit_size` records the number of
+    /// logical bits the bitmap spans; it must not exceed `words.len() * 64`.
+    ///
+    /// This mirrors libgit's `ewah_add`/`ewah_add_empty_words` incremental
+    /// encoder: consecutive all-zero or all-one words collapse into a run, and
+    /// any other word is stored verbatim as a literal. Only the first
+    /// `bit_size.div_ceil(64)` words back the declared bits; any extra trailing
+    /// words supplied by the caller are ignored, just as git encodes a bitmap
+    /// sized to its highest set bit.
+    pub fn from_words(bit_size: u32, words: &[u64]) -> Result<Self> {
+        let required_words = bit_size.div_ceil(64) as usize;
+        if required_words > words.len() {
+            return Err(GitError::InvalidFormat(format!(
+                "EWAH bit_size {bit_size} requires {required_words} words but only {} supplied",
+                words.len()
+            )));
+        }
+        // Only the words that actually back the declared bits matter; libgit
+        // never emits clean trailing zero words for the unused tail.
+        let significant = &words[..required_words];
+        let mut builder = EwahBuilder::new(bit_size);
+        for &word in significant {
+            if word == 0 {
+                builder.add_empty_words(false, 1);
+            } else if word == EWAH_ALL_ONES {
+                builder.add_empty_words(true, 1);
+            } else {
+                builder.add_literal(word);
+            }
+        }
+        builder.finish()
+    }
+
+    /// Constructs an [`EwahBitmap`] from a set of bit positions.
+    ///
+    /// `bit_size` is the number of logical bits (typically the pack object
+    /// count). Every position in `positions` must be strictly less than
+    /// `bit_size`. Positions may be given in any order and may repeat.
+    pub fn from_positions(bit_size: u32, positions: &[u32]) -> Result<Self> {
+        let word_count = bit_size.div_ceil(64) as usize;
+        let mut words = vec![0u64; word_count];
+        for &position in positions {
+            if position >= bit_size {
+                return Err(GitError::InvalidFormat(format!(
+                    "EWAH bit position {position} out of range for bit_size {bit_size}"
+                )));
+            }
+            let word_index = (position / 64) as usize;
+            let bit_index = position % 64;
+            words[word_index] |= 1u64 << bit_index;
+        }
+        Self::from_words(bit_size, &words)
+    }
+
+    /// An empty EWAH bitmap (no bits, no words). This is what git writes for an
+    /// all-zero type bitmap (e.g. when a pack has no tags).
+    pub fn empty() -> Self {
+        Self {
+            bit_size: 0,
+            words: Vec::new(),
+            rlw_position: 0,
+        }
+    }
+
+    /// Decodes the compressed EWAH back into raw 64-bit words, LSB-first within
+    /// each word. The returned vector has `bit_size.div_ceil(64)` entries.
+    ///
+    /// This is the inverse of [`EwahBitmap::from_words`] for the bits the
+    /// bitmap actually covers and is primarily used to validate roundtrips.
+    pub fn to_words(&self) -> Result<Vec<u64>> {
+        let mut out = Vec::new();
+        let mut word_idx = 0usize;
+        while word_idx < self.words.len() {
+            let rlw = self.words[word_idx];
+            let run_bit = rlw & 1;
+            let run_words = (rlw >> 1) & EWAH_MAX_RUNNING_LEN;
+            let literal_words = (rlw >> 33) as usize;
+            word_idx += 1;
+            let fill = if run_bit == 1 { EWAH_ALL_ONES } else { 0 };
+            for _ in 0..run_words {
+                out.push(fill);
+            }
+            let literal_end = word_idx
+                .checked_add(literal_words)
+                .filter(|end| *end <= self.words.len())
+                .ok_or_else(|| {
+                    GitError::InvalidFormat("EWAH literal words extend past word table".into())
+                })?;
+            out.extend_from_slice(&self.words[word_idx..literal_end]);
+            word_idx = literal_end;
+        }
+        let required_words = (self.bit_size as usize).div_ceil(64);
+        if out.len() < required_words {
+            out.resize(required_words, 0);
+        }
+        out.truncate(required_words);
+        Ok(out)
+    }
+
+    /// Returns the sorted set bit positions covered by this bitmap.
+    pub fn to_positions(&self) -> Result<Vec<u32>> {
+        let words = self.to_words()?;
+        let mut positions = Vec::new();
+        for (word_index, word) in words.iter().enumerate() {
+            let mut remaining = *word;
+            while remaining != 0 {
+                let bit = remaining.trailing_zeros();
+                let position = (word_index as u64) * 64 + u64::from(bit);
+                if position < u64::from(self.bit_size) {
+                    // position always fits in u32 because bit_size is u32.
+                    positions.push(position as u32);
+                }
+                remaining &= remaining - 1;
+            }
+        }
+        Ok(positions)
+    }
+
+    /// Serialises the bitmap to git's on-disk EWAH byte layout: `bit_size`
+    /// (u32 BE), word count (u32 BE), each compressed word (u64 BE), then the
+    /// running-length-word position (u32 BE).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.words.len() * 8);
+        self.append_bytes(&mut out);
+        out
+    }
+
+    fn append_bytes(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.bit_size.to_be_bytes());
+        out.extend_from_slice(&(self.words.len() as u32).to_be_bytes());
+        for word in &self.words {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out.extend_from_slice(&self.rlw_position.to_be_bytes());
+    }
+}
+
+/// Incremental EWAH compressed-buffer builder mirroring libgit's `ewah_add`.
+///
+/// The buffer is a sequence of blocks. Each block begins with a running-length
+/// word (RLW) and is followed by zero or more literal words:
+///   * bit 0      => value of the clean run words (0 or 1)
+///   * bits 1..=32 => number of clean run words (32-bit field)
+///   * bits 33..=63 => number of trailing literal words (31-bit field)
+struct EwahBuilder {
+    bit_size: u32,
+    words: Vec<u64>,
+    rlw_position: usize,
+}
+
+impl EwahBuilder {
+    fn new(bit_size: u32) -> Self {
+        // Every EWAH buffer begins with an RLW, even an empty one.
+        Self {
+            bit_size,
+            words: vec![0u64],
+            rlw_position: 0,
+        }
+    }
+
+    fn rlw(&self) -> u64 {
+        self.words[self.rlw_position]
+    }
+
+    fn set_rlw(&mut self, value: u64) {
+        self.words[self.rlw_position] = value;
+    }
+
+    fn rlw_running_len(&self) -> u64 {
+        (self.rlw() >> 1) & EWAH_MAX_RUNNING_LEN
+    }
+
+    fn rlw_running_bit(&self) -> bool {
+        self.rlw() & 1 == 1
+    }
+
+    fn rlw_literal_len(&self) -> u64 {
+        self.rlw() >> 33
+    }
+
+    fn set_running_bit(&mut self, bit: bool) {
+        let mut value = self.rlw();
+        value &= !1;
+        value |= u64::from(bit);
+        self.set_rlw(value);
+    }
+
+    fn set_running_len(&mut self, len: u64) {
+        let mut value = self.rlw();
+        value &= !(EWAH_MAX_RUNNING_LEN << 1);
+        value |= (len & EWAH_MAX_RUNNING_LEN) << 1;
+        self.set_rlw(value);
+    }
+
+    fn set_literal_len(&mut self, len: u64) {
+        let mut value = self.rlw();
+        value &= (1u64 << 33) - 1;
+        value |= (len & EWAH_MAX_LITERAL_LEN) << 33;
+        self.set_rlw(value);
+    }
+
+    /// Begins a fresh RLW block at the end of the buffer.
+    fn push_rlw(&mut self) {
+        self.rlw_position = self.words.len();
+        self.words.push(0);
+    }
+
+    /// Appends `number` clean words whose bits are all `value`, mirroring
+    /// libgit's `ewah_add_empty_words`.
+    ///
+    /// A run can only be merged into the current RLW when that RLW has not yet
+    /// emitted any literal words and its run either is empty or already carries
+    /// the same fill value. Otherwise a fresh RLW block must be started, because
+    /// every block stores its run strictly before its literals.
+    fn add_empty_words(&mut self, value: bool, mut number: u64) {
+        while number > 0 {
+            // The current RLW can absorb more run words only when it has no
+            // literals yet, its run is either empty or already the right fill
+            // value, and the 32-bit run-length field is not already saturated.
+            let can_extend = self.rlw_literal_len() == 0
+                && (self.rlw_running_len() == 0 || self.rlw_running_bit() == value)
+                && self.rlw_running_len() < EWAH_MAX_RUNNING_LEN;
+            if !can_extend {
+                self.push_rlw();
+            }
+            if self.rlw_running_len() == 0 {
+                self.set_running_bit(value);
+            }
+            let available = EWAH_MAX_RUNNING_LEN - self.rlw_running_len();
+            let take = available.min(number);
+            self.set_running_len(self.rlw_running_len() + take);
+            number -= take;
+        }
+    }
+
+    /// Appends a single literal (dirty) word verbatim, mirroring libgit's
+    /// `ewah_add_dirty_words` for a count of one.
+    fn add_literal(&mut self, word: u64) {
+        if self.rlw_literal_len() >= EWAH_MAX_LITERAL_LEN {
+            self.push_rlw();
+        }
+        let literal_len = self.rlw_literal_len();
+        self.set_literal_len(literal_len + 1);
+        self.words.push(word);
+    }
+
+    fn finish(self) -> Result<EwahBitmap> {
+        let rlw_position = u32::try_from(self.rlw_position)
+            .map_err(|_| GitError::InvalidFormat("EWAH RLW position overflow".into()))?;
+        if self.words.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat("EWAH word table overflow".into()));
+        }
+        Ok(EwahBitmap {
+            bit_size: self.bit_size,
+            words: self.words,
+            rlw_position,
+        })
+    }
+}
+
+/// Builder that assembles a reachability bitmap (`.bitmap`) for a pack.
+///
+/// The writer is constructed from the object layout of a pack (one
+/// [`ObjectType`] per object, in pack order) and the pack's trailing checksum.
+/// Callers then register one selected commit per [`add_commit`] call, supplying
+/// the set of pack positions reachable from that commit. [`build`]/[`write`]
+/// produce a [`PackBitmapIndex`] / serialised `.bitmap` bytes matching git's
+/// on-disk format (signature `BITM`, version 1).
+///
+/// [`add_commit`]: PackBitmapWriter::add_commit
+/// [`build`]: PackBitmapWriter::build
+/// [`write`]: PackBitmapWriter::write
+#[derive(Debug, Clone)]
+pub struct PackBitmapWriter {
+    format: ObjectFormat,
+    pack_checksum: ObjectId,
+    object_count: u32,
+    commit_positions: Vec<u32>,
+    tree_positions: Vec<u32>,
+    blob_positions: Vec<u32>,
+    tag_positions: Vec<u32>,
+    name_hash_cache: Option<Vec<u32>>,
+    selected: Vec<SelectedCommit>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedCommit {
+    commit_position: u32,
+    flags: u8,
+    reachable: Vec<u32>,
+}
+
+impl PackBitmapWriter {
+    /// `OBJ_NONE` selection flag: this commit's bitmap is stored in full (no XOR
+    /// compression against a previously selected commit). This is the only flag
+    /// value this writer emits.
+    pub const FLAG_NONE: u8 = 0;
+
+    /// Creates a writer for a pack whose objects (in pack order) have the given
+    /// [`ObjectType`]s and whose trailing checksum is `pack_checksum`.
+    ///
+    /// Returns an error if the pack contains more than `u32::MAX` objects, if
+    /// `pack_checksum`'s format does not match `format`, or if any object type
+    /// is not one of the four reachable git object kinds.
+    pub fn new(
+        format: ObjectFormat,
+        pack_checksum: ObjectId,
+        object_types: &[ObjectType],
+    ) -> Result<Self> {
+        if object_types.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat(
+                "too many objects for a pack bitmap".into(),
+            ));
+        }
+        if pack_checksum.format() != format {
+            return Err(GitError::InvalidObjectId(
+                "pack checksum format does not match bitmap format".into(),
+            ));
+        }
+        let object_count = object_types.len() as u32;
+        let mut commit_positions = Vec::new();
+        let mut tree_positions = Vec::new();
+        let mut blob_positions = Vec::new();
+        let mut tag_positions = Vec::new();
+        for (index, object_type) in object_types.iter().enumerate() {
+            let position = index as u32;
+            match object_type {
+                ObjectType::Commit => commit_positions.push(position),
+                ObjectType::Tree => tree_positions.push(position),
+                ObjectType::Blob => blob_positions.push(position),
+                ObjectType::Tag => tag_positions.push(position),
+            }
+        }
+        Ok(Self {
+            format,
+            pack_checksum,
+            object_count,
+            commit_positions,
+            tree_positions,
+            blob_positions,
+            tag_positions,
+            name_hash_cache: None,
+            selected: Vec::new(),
+        })
+    }
+
+    /// Attaches a name-hash cache (one `u32` per object, in pack order). When
+    /// set, the written bitmap advertises [`PackBitmapIndex::OPTION_HASH_CACHE`]
+    /// and appends the cache after the bitmap entries, exactly as git does.
+    ///
+    /// Returns an error if the cache length does not equal the object count.
+    pub fn with_name_hash_cache(mut self, cache: Vec<u32>) -> Result<Self> {
+        if cache.len() != self.object_count as usize {
+            return Err(GitError::InvalidFormat(format!(
+                "name hash cache has {} entries but pack has {} objects",
+                cache.len(),
+                self.object_count
+            )));
+        }
+        self.name_hash_cache = Some(cache);
+        Ok(self)
+    }
+
+    /// Registers a selected commit and the pack positions reachable from it.
+    ///
+    /// `commit_position` is the pack position of the commit itself; it must
+    /// reference a commit object and is implicitly part of the reachable set.
+    /// `reachable` lists the pack positions of every object reachable from the
+    /// commit (it may include or omit `commit_position`; duplicates are fine).
+    /// All positions must be in range. The commit's full (non-XORed) bitmap is
+    /// stored.
+    pub fn add_commit(&mut self, commit_position: u32, reachable: &[u32]) -> Result<()> {
+        if commit_position >= self.object_count {
+            return Err(GitError::InvalidFormat(format!(
+                "commit position {commit_position} out of range for {} objects",
+                self.object_count
+            )));
+        }
+        if !self.commit_positions.contains(&commit_position) {
+            return Err(GitError::InvalidFormat(format!(
+                "bitmap commit position {commit_position} is not a commit object"
+            )));
+        }
+        for &position in reachable {
+            if position >= self.object_count {
+                return Err(GitError::InvalidFormat(format!(
+                    "reachable position {position} out of range for {} objects",
+                    self.object_count
+                )));
+            }
+        }
+        let mut reachable = reachable.to_vec();
+        reachable.push(commit_position);
+        self.selected.push(SelectedCommit {
+            commit_position,
+            flags: Self::FLAG_NONE,
+            reachable,
+        });
+        Ok(())
+    }
+
+    /// Builds the in-memory [`PackBitmapIndex`] without serialising it.
+    ///
+    /// The resulting index always advertises
+    /// [`PackBitmapIndex::OPTION_FULL_DAG`] (the four type bitmaps fully cover
+    /// the pack) and, when a name-hash cache was attached,
+    /// [`PackBitmapIndex::OPTION_HASH_CACHE`].
+    pub fn build(&self) -> Result<PackBitmapIndex> {
+        let commits = EwahBitmap::from_positions(self.object_count, &self.commit_positions)?;
+        let trees = EwahBitmap::from_positions(self.object_count, &self.tree_positions)?;
+        let blobs = EwahBitmap::from_positions(self.object_count, &self.blob_positions)?;
+        let tags = EwahBitmap::from_positions(self.object_count, &self.tag_positions)?;
+
+        let mut entries = Vec::with_capacity(self.selected.len());
+        for selected in &self.selected {
+            let bitmap = EwahBitmap::from_positions(self.object_count, &selected.reachable)?;
+            entries.push(PackBitmapEntry {
+                object_position: selected.commit_position,
+                xor_offset: 0,
+                flags: selected.flags,
+                bitmap,
+            });
+        }
+
+        let mut options = PackBitmapIndex::OPTION_FULL_DAG;
+        if self.name_hash_cache.is_some() {
+            options |= PackBitmapIndex::OPTION_HASH_CACHE;
+        }
+
+        // The index checksum is only known once the body is serialised; the
+        // dedicated `write` path fills it in. `build` reports a placeholder of
+        // the correct format so the struct is self-consistent for callers that
+        // only need the decoded bitmaps.
+        let placeholder_checksum = ObjectId::from_raw(self.format, &vec![0u8; self.format.raw_len()])?;
+        Ok(PackBitmapIndex {
+            version: 1,
+            format: self.format,
+            options,
+            pack_checksum: self.pack_checksum.clone(),
+            index_checksum: placeholder_checksum,
+            type_bitmaps: PackBitmapTypeBitmaps {
+                commits,
+                trees,
+                blobs,
+                tags,
+            },
+            entries,
+            name_hash_cache: self.name_hash_cache.clone(),
+        })
+    }
+
+    /// Builds and serialises the `.bitmap` file, returning the on-disk bytes
+    /// (including the trailing index checksum).
+    pub fn write(&self) -> Result<Vec<u8>> {
+        self.build()?.write()
+    }
+}
+
+impl PackBitmapIndex {
+    /// Serialises this index into git's on-disk `.bitmap` byte layout.
+    ///
+    /// This is the exact inverse of [`PackBitmapIndex::parse`]: signature
+    /// `BITM`, version (u16 BE), options (u16 BE), entry count (u32 BE), the
+    /// pack checksum, the four type bitmaps (commits, trees, blobs, tags), each
+    /// commit entry (object position, XOR offset, flags, EWAH bitmap), the
+    /// optional name-hash cache, and finally the trailing index checksum over
+    /// everything written so far.
+    ///
+    /// The `index_checksum` field of `self` is ignored and recomputed from the
+    /// serialised body. Returns an error for unsupported versions, mismatched
+    /// object-id formats, an oversized entry table, or an inconsistent name-hash
+    /// cache.
+    pub fn write(&self) -> Result<Vec<u8>> {
+        if self.version != 1 {
+            return Err(GitError::Unsupported(format!(
+                "bitmap index version {}",
+                self.version
+            )));
+        }
+        let known_options = Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE;
+        if self.options & !known_options != 0 {
+            return Err(GitError::Unsupported(format!(
+                "bitmap index options {:#06x}",
+                self.options & !known_options
+            )));
+        }
+        if self.pack_checksum.format() != self.format {
+            return Err(GitError::InvalidObjectId(
+                "bitmap pack checksum format does not match index format".into(),
+            ));
+        }
+        if self.entries.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat(
+                "too many bitmap index entries".into(),
+            ));
+        }
+        let want_cache = self.options & Self::OPTION_HASH_CACHE != 0;
+        match (&self.name_hash_cache, want_cache) {
+            (Some(_), false) => {
+                return Err(GitError::InvalidFormat(
+                    "name hash cache present without OPTION_HASH_CACHE".into(),
+                ));
+            }
+            (None, true) => {
+                return Err(GitError::InvalidFormat(
+                    "OPTION_HASH_CACHE set without a name hash cache".into(),
+                ));
+            }
+            _ => {}
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(b"BITM");
+        out.extend_from_slice(&self.version.to_be_bytes());
+        out.extend_from_slice(&self.options.to_be_bytes());
+        out.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
+        out.extend_from_slice(self.pack_checksum.as_bytes());
+
+        self.type_bitmaps.commits.append_bytes(&mut out);
+        self.type_bitmaps.trees.append_bytes(&mut out);
+        self.type_bitmaps.blobs.append_bytes(&mut out);
+        self.type_bitmaps.tags.append_bytes(&mut out);
+
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if entry.xor_offset as usize > idx {
+                return Err(GitError::InvalidFormat(
+                    "bitmap index entry has invalid XOR offset".into(),
+                ));
+            }
+            out.extend_from_slice(&entry.object_position.to_be_bytes());
+            out.push(entry.xor_offset);
+            out.push(entry.flags);
+            entry.bitmap.append_bytes(&mut out);
+        }
+
+        if let Some(cache) = &self.name_hash_cache {
+            for value in cache {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+
+        let checksum = git_core::digest_bytes(self.format, &out)?;
+        out.extend_from_slice(checksum.as_bytes());
+        Ok(out)
+    }
+}
+
+/// Convenience wrapper that builds a `.bitmap` file in one call.
+///
+/// `object_types` lists the [`ObjectType`] of every pack object in pack order,
+/// `pack_checksum` is the pack's trailing checksum, and `commits` pairs each
+/// selected commit's pack position with the pack positions reachable from it.
+/// An optional `name_hash_cache` (one entry per object) may be supplied to emit
+/// the hash-cache extension.
+pub fn write_bitmap(
+    format: ObjectFormat,
+    pack_checksum: ObjectId,
+    object_types: &[ObjectType],
+    commits: &[(u32, Vec<u32>)],
+    name_hash_cache: Option<Vec<u32>>,
+) -> Result<Vec<u8>> {
+    let mut writer = PackBitmapWriter::new(format, pack_checksum, object_types)?;
+    if let Some(cache) = name_hash_cache {
+        writer = writer.with_name_hash_cache(cache)?;
+    }
+    for (commit_position, reachable) in commits {
+        writer.add_commit(*commit_position, reachable)?;
+    }
+    writer.write()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4532,5 +5119,396 @@ mod tests {
         let checksum = git_core::digest_bytes(format, &out).unwrap();
         out.extend_from_slice(checksum.as_bytes());
         out
+    }
+
+    // ---- EWAH encoder / bitmap writer tests ------------------------------
+
+    fn pack_checksum_sha1() -> ObjectId {
+        git_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap()
+    }
+
+    fn parse_ewah_bytes(bytes: &[u8]) -> EwahBitmap {
+        // Wrap the EWAH body with the surrounding offset bookkeeping the parser
+        // expects: a checksum offset that lies just past the serialised bitmap.
+        let mut offset = 0usize;
+        let checksum_offset = bytes.len();
+        parse_bitmap_ewah(bytes, &mut offset, checksum_offset, 0).unwrap()
+    }
+
+    #[test]
+    fn ewah_encodes_single_literal_word_matching_helper() {
+        // A bitmap whose only word is a literal must serialise as one RLW with
+        // literal_len == 1 followed by the literal, identical to the test
+        // helper used by the existing parser tests.
+        let ewah = EwahBitmap::from_words(64, &[0b101]).unwrap();
+        assert_eq!(ewah.words, ewah_literal_words(&[0b101]));
+        assert_eq!(ewah.rlw_position, 0);
+        assert_eq!(ewah.bit_size, 64);
+    }
+
+    #[test]
+    fn ewah_byte_layout_is_big_endian() {
+        let ewah = EwahBitmap::from_words(64, &[0x0102_0304_0506_0708]).unwrap();
+        let bytes = ewah.to_bytes();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&64u32.to_be_bytes()); // bit_size
+        expected.extend_from_slice(&2u32.to_be_bytes()); // word count: rlw + literal
+        expected.extend_from_slice(&(1u64 << 33).to_be_bytes()); // rlw: literal_len = 1
+        expected.extend_from_slice(&0x0102_0304_0506_0708u64.to_be_bytes());
+        expected.extend_from_slice(&0u32.to_be_bytes()); // rlw_position
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn ewah_empty_bitmap_serialises_like_git() {
+        let ewah = EwahBitmap::empty();
+        let bytes = ewah.to_bytes();
+        // bit_size = 0, word_count = 0, rlw_position = 0.
+        assert_eq!(bytes, vec![0u8; 12]);
+        // It must still parse and decode to nothing.
+        let parsed = parse_ewah_bytes(&bytes);
+        assert_eq!(parsed, ewah);
+        assert!(parsed.to_positions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ewah_compresses_clean_zero_run() {
+        // Three all-zero words followed by a literal: the encoder should emit a
+        // single RLW carrying a run of 3 clean-zero words plus one literal.
+        let ewah = EwahBitmap::from_words(256, &[0, 0, 0, 0b1]).unwrap();
+        assert_eq!(ewah.words.len(), 2, "expected one RLW plus one literal");
+        let rlw = ewah.words[0];
+        assert_eq!(rlw & 1, 0, "run bit should be zero");
+        assert_eq!((rlw >> 1) & 0xffff_ffff, 3, "run length should be 3");
+        assert_eq!(rlw >> 33, 1, "literal length should be 1");
+        assert_eq!(ewah.words[1], 0b1);
+    }
+
+    #[test]
+    fn ewah_compresses_clean_ones_run() {
+        let ewah = EwahBitmap::from_words(192, &[u64::MAX, u64::MAX, u64::MAX]).unwrap();
+        // Pure run of ones, no literals: one RLW only.
+        assert_eq!(ewah.words.len(), 1);
+        let rlw = ewah.words[0];
+        assert_eq!(rlw & 1, 1, "run bit should be one");
+        assert_eq!((rlw >> 1) & 0xffff_ffff, 3, "run length should be 3");
+        assert_eq!(rlw >> 33, 0, "no literals");
+    }
+
+    #[test]
+    fn ewah_run_then_literal_then_run_roundtrips() {
+        let words = vec![0, 0, 0xdead_beef, u64::MAX, u64::MAX, 0, 0xabc];
+        let bit_size = (words.len() * 64) as u32;
+        let ewah = EwahBitmap::from_words(bit_size, &words).unwrap();
+        assert_eq!(ewah.to_words().unwrap(), words);
+    }
+
+    #[test]
+    fn ewah_drops_trailing_clean_zero_words() {
+        // Trailing all-zero words beyond a literal carry no information and git
+        // does not serialise them, but to_words() restores them up to bit_size.
+        let words = vec![0b1, 0, 0, 0];
+        let ewah = EwahBitmap::from_words(1, &words).unwrap();
+        // bit_size of 1 means a single backing word.
+        assert_eq!(ewah.bit_size, 1);
+        assert_eq!(ewah.to_words().unwrap(), vec![0b1]);
+    }
+
+    #[test]
+    fn ewah_from_positions_roundtrips_via_positions() {
+        let positions = [0u32, 1, 63, 64, 65, 200, 511];
+        let ewah = EwahBitmap::from_positions(512, &positions).unwrap();
+        let mut decoded = ewah.to_positions().unwrap();
+        decoded.sort_unstable();
+        assert_eq!(decoded, positions);
+    }
+
+    #[test]
+    fn ewah_from_positions_dedupes_and_orders() {
+        let ewah = EwahBitmap::from_positions(128, &[100, 5, 100, 5, 5]).unwrap();
+        assert_eq!(ewah.to_positions().unwrap(), vec![5, 100]);
+    }
+
+    #[test]
+    fn ewah_huge_zero_run_spans_multiple_rlws() {
+        // A run longer than the 32-bit running-length field forces the encoder
+        // to emit more than one RLW. Use one literal bit far out, with a bit
+        // size large enough to exceed u32::MAX clean words is impractical, so
+        // assert the field arithmetic via a direct builder run instead.
+        let mut builder = EwahBuilder::new(0);
+        builder.add_empty_words(false, 0xffff_ffff);
+        builder.add_empty_words(false, 5);
+        let ewah = builder.finish().unwrap();
+        assert_eq!(ewah.words.len(), 2, "run split across two RLWs");
+        assert_eq!((ewah.words[0] >> 1) & 0xffff_ffff, 0xffff_ffff);
+        assert_eq!(ewah.words[1] & 1, 0);
+        assert_eq!((ewah.words[1] >> 1) & 0xffff_ffff, 5);
+        assert_eq!(ewah.rlw_position, 1);
+    }
+
+    #[test]
+    fn ewah_from_words_rejects_oversized_bit_size() {
+        // bit_size demands two words but only one is supplied.
+        assert!(EwahBitmap::from_words(65, &[0]).is_err());
+    }
+
+    #[test]
+    fn ewah_from_positions_rejects_out_of_range() {
+        assert!(EwahBitmap::from_positions(64, &[64]).is_err());
+    }
+
+    #[test]
+    fn ewah_serialised_bytes_reparse_to_equal_bitmap() {
+        // Exercise the full encode -> serialise -> parse loop for a non-trivial
+        // pattern and assert structural equality against the parser's model.
+        let words = vec![0, u64::MAX, 0x1234_5678_9abc_def0, 0, 0, 0xff];
+        let bit_size = (words.len() * 64) as u32;
+        let ewah = EwahBitmap::from_words(bit_size, &words).unwrap();
+        let bytes = ewah.to_bytes();
+        let parsed = parse_ewah_bytes(&bytes);
+        assert_eq!(parsed, ewah);
+        assert_eq!(parsed.to_words().unwrap(), words);
+    }
+
+    #[test]
+    fn pack_bitmap_index_write_parse_roundtrip_sha1() {
+        // commit, tree, blob in pack order; one selected commit reaching all.
+        let object_types = [ObjectType::Commit, ObjectType::Tree, ObjectType::Blob];
+        let bytes = write_bitmap(
+            ObjectFormat::Sha1,
+            pack_checksum_sha1(),
+            &object_types,
+            &[(0u32, vec![1u32, 2u32])],
+            None,
+        )
+        .unwrap();
+        assert_eq!(&bytes[..4], b"BITM");
+
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.options, PackBitmapIndex::OPTION_FULL_DAG);
+        assert_eq!(parsed.pack_checksum, pack_checksum_sha1());
+        assert_eq!(parsed.type_bitmaps.commits.to_positions().unwrap(), vec![0]);
+        assert_eq!(parsed.type_bitmaps.trees.to_positions().unwrap(), vec![1]);
+        assert_eq!(parsed.type_bitmaps.blobs.to_positions().unwrap(), vec![2]);
+        assert!(parsed.type_bitmaps.tags.to_positions().unwrap().is_empty());
+        assert_eq!(parsed.entries.len(), 1);
+        let entry = parsed.entry_for_pack_position(0).unwrap();
+        assert_eq!(entry.xor_offset, 0);
+        assert_eq!(entry.flags, 0);
+        assert_eq!(entry.bitmap.to_positions().unwrap(), vec![0, 1, 2]);
+        assert_eq!(parsed.name_hash_cache, None);
+    }
+
+    #[test]
+    fn pack_bitmap_index_write_parse_roundtrip_sha256() {
+        let pack_checksum = git_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        let object_types = [ObjectType::Commit, ObjectType::Tree];
+        let bytes = write_bitmap(
+            ObjectFormat::Sha256,
+            pack_checksum.clone(),
+            &object_types,
+            &[(0u32, vec![1u32])],
+            None,
+        )
+        .unwrap();
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha256, 2).unwrap();
+        assert_eq!(parsed.format, ObjectFormat::Sha256);
+        assert_eq!(parsed.pack_checksum, pack_checksum);
+        assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
+        assert_eq!(parsed.entries[0].bitmap.to_positions().unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn pack_bitmap_index_write_includes_name_hash_cache() {
+        let object_types = [ObjectType::Commit, ObjectType::Tree, ObjectType::Blob];
+        let cache = vec![0x1111_1111u32, 0x2222_2222, 0x3333_3333];
+        let bytes = write_bitmap(
+            ObjectFormat::Sha1,
+            pack_checksum_sha1(),
+            &object_types,
+            &[(0u32, vec![1u32, 2u32])],
+            Some(cache.clone()),
+        )
+        .unwrap();
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3).unwrap();
+        assert_eq!(
+            parsed.options,
+            PackBitmapIndex::OPTION_FULL_DAG | PackBitmapIndex::OPTION_HASH_CACHE
+        );
+        assert_eq!(parsed.name_hash_cache, Some(cache));
+    }
+
+    #[test]
+    fn pack_bitmap_writer_supports_multiple_commits() {
+        let object_types = [
+            ObjectType::Commit,
+            ObjectType::Commit,
+            ObjectType::Tree,
+            ObjectType::Blob,
+        ];
+        let mut writer =
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
+        writer.add_commit(0, &[2, 3]).unwrap();
+        writer.add_commit(1, &[2]).unwrap();
+        let bytes = writer.write().unwrap();
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 4).unwrap();
+        assert_eq!(parsed.entries.len(), 2);
+        assert_eq!(
+            parsed.type_bitmaps.commits.to_positions().unwrap(),
+            vec![0, 1]
+        );
+        let first = parsed.entry_for_pack_position(0).unwrap();
+        assert_eq!(first.bitmap.to_positions().unwrap(), vec![0, 2, 3]);
+        let second = parsed.entry_for_pack_position(1).unwrap();
+        assert_eq!(second.bitmap.to_positions().unwrap(), vec![1, 2]);
+    }
+
+    #[test]
+    fn pack_bitmap_index_recomputes_checksum_on_write() {
+        // The provided index_checksum field is ignored; write recomputes it so
+        // a bogus placeholder still produces a valid, parseable file.
+        let object_types = [ObjectType::Commit, ObjectType::Blob];
+        let writer =
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
+        let mut index = writer.build().unwrap();
+        // build() sets an all-zero placeholder checksum.
+        assert_eq!(index.index_checksum.as_bytes(), [0u8; 20]);
+        index.entries.clear(); // mutate the model after build
+        index.entries.push(PackBitmapEntry {
+            object_position: 0,
+            xor_offset: 0,
+            flags: 0,
+            bitmap: EwahBitmap::from_positions(2, &[0, 1]).unwrap(),
+        });
+        let bytes = index.write().unwrap();
+        // Parsing validates the trailing checksum, so a wrong checksum fails.
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 2).unwrap();
+        assert_ne!(parsed.index_checksum.as_bytes(), [0u8; 20]);
+    }
+
+    #[test]
+    fn pack_bitmap_writer_rejects_non_commit_selection() {
+        let object_types = [ObjectType::Commit, ObjectType::Blob];
+        let mut writer =
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
+        // Position 1 is a blob, not a commit.
+        assert!(writer.add_commit(1, &[]).is_err());
+        // Position 5 is out of range entirely.
+        assert!(writer.add_commit(5, &[]).is_err());
+        // Reachable position out of range.
+        assert!(writer.add_commit(0, &[9]).is_err());
+    }
+
+    #[test]
+    fn pack_bitmap_writer_rejects_checksum_format_mismatch() {
+        let sha256_checksum = git_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        assert!(
+            PackBitmapWriter::new(ObjectFormat::Sha1, sha256_checksum, &[ObjectType::Commit])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pack_bitmap_writer_rejects_bad_name_hash_cache_len() {
+        let writer =
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &[ObjectType::Commit])
+                .unwrap();
+        assert!(writer.with_name_hash_cache(vec![1, 2]).is_err());
+    }
+
+    #[test]
+    fn pack_bitmap_index_write_rejects_inconsistent_cache_flag() {
+        let mut index = PackBitmapWriter::new(
+            ObjectFormat::Sha1,
+            pack_checksum_sha1(),
+            &[ObjectType::Commit],
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        // Flag set but no cache present.
+        index.options |= PackBitmapIndex::OPTION_HASH_CACHE;
+        assert!(index.write().is_err());
+        // Cache present but flag missing.
+        index.options = PackBitmapIndex::OPTION_FULL_DAG;
+        index.name_hash_cache = Some(vec![0]);
+        assert!(index.write().is_err());
+    }
+
+    #[test]
+    fn write_bitmap_roundtrips_through_upstream_git_parser() {
+        // Build a real pack with git, then overwrite reachability with our own
+        // writer using the real pack checksum and object types, and confirm our
+        // bytes parse under the same parser that reads upstream bitmaps.
+        let root = unique_temp_dir("git-pack-bitmap-writer");
+        fs::create_dir_all(&root).unwrap();
+        let result = (|| {
+            run_git_success(&root, &["init", "-q", "-b", "main"]);
+            run_git_success(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "one",
+                ],
+            );
+            run_git_success(&root, &["repack", "-adb"]);
+            let pack_dir = root.join(".git").join("objects").join("pack");
+            let idx_path = single_path_with_extension(&pack_dir, "idx");
+            let index = PackIndex::parse(&fs::read(idx_path).unwrap(), ObjectFormat::Sha1).unwrap();
+            // Read object types from the pack so the type bitmaps are accurate.
+            let pack_path = single_path_with_extension(&pack_dir, "pack");
+            let pack = PackFile::parse_sha1(&fs::read(pack_path).unwrap()).unwrap();
+            // Map each index entry (sorted by oid) to its pack offset, then to a
+            // pack-order position so positions line up with the index ordering.
+            let mut offsets: Vec<u64> = index.entries.iter().map(|entry| entry.offset).collect();
+            offsets.sort_unstable();
+            let position_of = |offset: u64| -> u32 {
+                offsets.iter().position(|value| *value == offset).unwrap() as u32
+            };
+            let mut object_types = vec![ObjectType::Blob; index.entries.len()];
+            for entry in &index.entries {
+                let position = position_of(entry.offset) as usize;
+                // Find the parsed object at this pack offset to read its type.
+                if let Some(parsed) = pack
+                    .entries
+                    .iter()
+                    .find(|po| po.entry.offset == entry.offset)
+                {
+                    object_types[position] = parsed.object.object_type;
+                }
+            }
+            // Select the first commit position we find and reach everything.
+            let commit_position = object_types
+                .iter()
+                .position(|ty| *ty == ObjectType::Commit)
+                .unwrap() as u32;
+            let reachable: Vec<u32> = (0..index.entries.len() as u32).collect();
+            let bytes = write_bitmap(
+                ObjectFormat::Sha1,
+                index.pack_checksum.clone(),
+                &object_types,
+                &[(commit_position, reachable)],
+                None,
+            )
+            .unwrap();
+            let parsed =
+                PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, index.entries.len()).unwrap();
+            assert_eq!(parsed.pack_checksum, index.pack_checksum);
+            assert_eq!(parsed.entries.len(), 1);
+            assert_eq!(
+                parsed.entries[0].bitmap.to_positions().unwrap().len(),
+                index.entries.len()
+            );
+        })();
+        let _ = fs::remove_dir_all(&root);
+        result
     }
 }
