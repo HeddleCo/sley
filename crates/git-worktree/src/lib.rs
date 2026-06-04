@@ -7,7 +7,9 @@ use git_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use git_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::UNIX_EPOCH;
 use std::{env, fs};
 
@@ -231,8 +233,74 @@ pub fn update_index_paths(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
+    update_index_paths_impl(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        paths,
+        options,
+        None,
+    )
+}
+
+/// Like [`add_paths_to_index`], but runs the configured content filters
+/// (`core.autocrlf`/`text`/`eol` EOL conversion and `filter.<name>.clean`
+/// drivers) on each file's contents before hashing it into the object store.
+///
+/// `config` is the repository config used to resolve the filters; pass the
+/// parsed `<git_dir>/config` (the orchestrator typically already has this).
+pub fn add_paths_to_index_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    config: &GitConfig,
+) -> Result<UpdateIndexResult> {
+    update_index_paths_filtered(
+        worktree_root,
+        git_dir,
+        format,
+        paths,
+        UpdateIndexOptions {
+            add: true,
+            remove: false,
+            force_remove: false,
+            chmod: None,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+        },
+        config,
+    )
+}
+
+/// Like [`update_index_paths`], but applies the clean-side content filters (see
+/// [`apply_clean_filter`]) to file contents before they are hashed/written.
+pub fn update_index_paths_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+    config: &GitConfig,
+) -> Result<UpdateIndexResult> {
+    update_index_paths_impl(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        paths,
+        options,
+        Some(config),
+    )
+}
+
+fn update_index_paths_impl(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    options: UpdateIndexOptions,
+    clean_config: Option<&GitConfig>,
+) -> Result<UpdateIndexResult> {
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
@@ -292,6 +360,10 @@ pub fn update_index_paths(
             return Err(GitError::Exit(128));
         }
         let body = fs::read(&absolute)?;
+        let body = match clean_config {
+            Some(config) => apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?,
+            None => body,
+        };
         let object = EncodedObject::new(ObjectType::Blob, body);
         let oid = if options.info_only {
             object.object_id(format)?
@@ -2595,6 +2667,474 @@ impl AttributePattern {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Content filtering on the blob <-> worktree boundary
+//
+// Git runs two kinds of conversion when content crosses between the worktree
+// and the object database:
+//
+//   * the line-ending / `core.autocrlf` conversion (driven by the `text`,
+//     `eol` attributes and the `core.autocrlf` / `core.eol` config), and
+//   * the long-running `filter.<name>.clean` / `.smudge` driver filters
+//     (selected by the `filter=<name>` attribute and configured commands).
+//
+// "clean" runs on the way *into* the object store (worktree -> blob), e.g. on
+// `git add` / `git hash-object -w`. "smudge" runs on the way *out* (blob ->
+// worktree), e.g. on checkout / restore. The driver filter, when present,
+// wraps the EOL conversion: on clean git first runs the configured `clean`
+// command and then applies CRLF->LF normalization; on smudge git first applies
+// LF->CRLF and then runs the `smudge` command.
+// ---------------------------------------------------------------------------
+
+/// The line-ending conversion that applies to a path, derived from its
+/// attributes and the repository config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EolConversion {
+    /// No conversion: binary content, or text with `core.autocrlf=false` and no
+    /// `eol`/`text=auto` request to add carriage returns.
+    None,
+    /// Normalize to LF on clean; no carriage returns on smudge (`eol=lf`, or
+    /// `core.autocrlf=input`).
+    Lf,
+    /// Normalize to LF on clean; emit CRLF on smudge (`eol=crlf`, or
+    /// `core.autocrlf=true`).
+    Crlf,
+}
+
+/// How git should decide whether a path is text for the purpose of EOL
+/// conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDecision {
+    /// `-text` / `binary`: never convert.
+    Binary,
+    /// `text` is set explicitly: always treat as text.
+    Text,
+    /// `text=auto` (or implied by `core.autocrlf`): treat as text unless the
+    /// content looks binary.
+    Auto,
+    /// No opinion from attributes or config: leave content untouched.
+    Unspecified,
+}
+
+/// The fully resolved set of conversions that apply to a single path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContentFilterPlan {
+    text: TextDecision,
+    /// The conversion to apply when `text` resolves to "this is text".
+    eol: EolConversion,
+    /// `filter.<name>` driver, if assigned via attributes and configured.
+    driver: Option<FilterDriver>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FilterDriver {
+    name: Vec<u8>,
+    clean: Option<String>,
+    smudge: Option<String>,
+    required: bool,
+}
+
+impl ContentFilterPlan {
+    /// Build the plan for `path` from the parsed attributes and repo config.
+    fn resolve(config: &GitConfig, checks: &[AttributeCheck]) -> Self {
+        let text_attr = checks.iter().find(|check| check.attribute == b"text");
+        let eol_attr = checks.iter().find(|check| check.attribute == b"eol");
+        let filter_attr = checks.iter().find(|check| check.attribute == b"filter");
+
+        // Resolve the eol attribute first; `eol=crlf|lf` also forces text.
+        let eol_value = eol_attr.and_then(|check| match &check.state {
+            Some(AttributeState::Value(value)) => Some(value.clone()),
+            _ => None,
+        });
+
+        let mut text = match text_attr.map(|check| &check.state) {
+            Some(Some(AttributeState::Set)) => TextDecision::Text,
+            Some(Some(AttributeState::Unset)) => TextDecision::Binary,
+            Some(Some(AttributeState::Value(value))) if value == b"auto" => TextDecision::Auto,
+            // `text=<other>` is treated by git as a set text attribute.
+            Some(Some(AttributeState::Value(_))) => TextDecision::Text,
+            // `!text` (unspecified) or no text attribute: fall through.
+            _ => TextDecision::Unspecified,
+        };
+
+        // A concrete `eol` attribute implies the path is text even when `text`
+        // was left unspecified (git: `eol` without `text` is treated as
+        // `text=auto`-ish; upstream forces conversion). We honour eol only when
+        // text is not explicitly binary.
+        let eol = match (&text, eol_value.as_deref()) {
+            (TextDecision::Binary, _) => EolConversion::None,
+            (_, Some(b"crlf")) => {
+                if text == TextDecision::Unspecified {
+                    text = TextDecision::Text;
+                }
+                EolConversion::Crlf
+            }
+            (_, Some(b"lf")) => {
+                if text == TextDecision::Unspecified {
+                    text = TextDecision::Text;
+                }
+                EolConversion::Lf
+            }
+            // No eol attribute: derive direction from config.
+            _ => eol_from_config(config),
+        };
+
+        // When the path is text but neither `eol` nor `core.autocrlf`/`core.eol`
+        // asked for carriage returns, we still normalize to LF on clean. That is
+        // modelled by `EolConversion::Lf` (clean strips CR, smudge adds none).
+        let eol = match (&text, eol) {
+            (TextDecision::Text | TextDecision::Auto, EolConversion::None) => EolConversion::Lf,
+            (_, eol) => eol,
+        };
+
+        // If config does not enable autocrlf and there is no eol/text opinion,
+        // there is genuinely nothing to do.
+        let text = match (text, eol_attr.is_some()) {
+            (TextDecision::Unspecified, _) => {
+                // Without any text/eol attribute, only `core.autocrlf` can make a
+                // path eligible, and then it behaves like `text=auto`.
+                if autocrlf_enabled(config) {
+                    TextDecision::Auto
+                } else {
+                    TextDecision::Unspecified
+                }
+            }
+            (text, _) => text,
+        };
+
+        let driver = resolve_filter_driver(config, filter_attr);
+
+        ContentFilterPlan { text, eol, driver }
+    }
+
+    /// Whether EOL conversion should run for the given content.
+    fn convert_eol(&self, content: &[u8]) -> bool {
+        match self.text {
+            TextDecision::Binary | TextDecision::Unspecified => false,
+            TextDecision::Text => self.eol != EolConversion::None,
+            // `text=auto`: only when the blob does not look binary.
+            TextDecision::Auto => self.eol != EolConversion::None && !looks_binary(content),
+        }
+    }
+}
+
+/// Derive the smudge-direction line ending from `core.autocrlf` / `core.eol`.
+fn eol_from_config(config: &GitConfig) -> EolConversion {
+    if let Some(value) = config.get("core", None, "autocrlf") {
+        match value.to_ascii_lowercase().as_str() {
+            "input" => return EolConversion::Lf,
+            "true" | "yes" | "on" | "1" => return EolConversion::Crlf,
+            _ => {}
+        }
+    }
+    if config.get_bool("core", None, "autocrlf") == Some(true) {
+        return EolConversion::Crlf;
+    }
+    match config.get("core", None, "eol").map(|v| v.to_ascii_lowercase()) {
+        Some(ref v) if v == "crlf" => EolConversion::Crlf,
+        Some(ref v) if v == "lf" => EolConversion::Lf,
+        _ => EolConversion::None,
+    }
+}
+
+/// Whether `core.autocrlf` is set to anything that enables conversion
+/// (`true` or `input`).
+fn autocrlf_enabled(config: &GitConfig) -> bool {
+    if let Some(value) = config.get("core", None, "autocrlf")
+        && value.eq_ignore_ascii_case("input")
+    {
+        return true;
+    }
+    config.get_bool("core", None, "autocrlf") == Some(true)
+}
+
+/// Resolve the `filter=<name>` attribute against `filter.<name>.*` config.
+fn resolve_filter_driver(
+    config: &GitConfig,
+    filter_attr: Option<&AttributeCheck>,
+) -> Option<FilterDriver> {
+    let name = match filter_attr.map(|check| &check.state) {
+        Some(Some(AttributeState::Value(value))) => value.clone(),
+        // `filter` set/unset without a value selects no driver.
+        _ => return None,
+    };
+    let subsection = String::from_utf8_lossy(&name).into_owned();
+    let clean = config
+        .get("filter", Some(&subsection), "clean")
+        .filter(|cmd| !cmd.is_empty())
+        .map(str::to_owned);
+    let smudge = config
+        .get("filter", Some(&subsection), "smudge")
+        .filter(|cmd| !cmd.is_empty())
+        .map(str::to_owned);
+    let required = config
+        .get_bool("filter", Some(&subsection), "required")
+        .unwrap_or(false);
+    // A filter with neither command and not required is a no-op.
+    if clean.is_none() && smudge.is_none() && !required {
+        return None;
+    }
+    Some(FilterDriver {
+        name,
+        clean,
+        smudge,
+        required,
+    })
+}
+
+/// Heuristic mirroring git's `buffer_is_binary`: content is treated as binary
+/// when a NUL byte appears within the first 8000 bytes.
+fn looks_binary(content: &[u8]) -> bool {
+    const FIRST_FEW_BYTES: usize = 8000;
+    let window = &content[..content.len().min(FIRST_FEW_BYTES)];
+    window.contains(&0)
+}
+
+/// Strip carriage returns that immediately precede a line feed (CRLF -> LF).
+/// A lone CR (old-Mac line ending) is left untouched, matching git, which only
+/// collapses CRLF pairs.
+fn convert_crlf_to_lf(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len());
+    let mut index = 0;
+    while index < content.len() {
+        let byte = content[index];
+        if byte == b'\r' && content.get(index + 1) == Some(&b'\n') {
+            // Drop the CR; the LF is emitted on the next iteration.
+            index += 1;
+            continue;
+        }
+        out.push(byte);
+        index += 1;
+    }
+    out
+}
+
+/// Convert lone LF bytes to CRLF (LF -> CRLF). An LF already preceded by a CR
+/// is left as-is so content is not double-converted, matching git.
+fn convert_lf_to_crlf(content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(content.len() + content.len() / 16);
+    let mut prev = 0u8;
+    for &byte in content {
+        if byte == b'\n' && prev != b'\r' {
+            out.push(b'\r');
+        }
+        out.push(byte);
+        prev = byte;
+    }
+    out
+}
+
+/// Run a configured `clean`/`smudge` command as a subprocess, feeding `content`
+/// on stdin and returning its stdout. Errors carry enough context for the
+/// caller to decide whether the failure is fatal (required filter) or should be
+/// silently ignored (optional filter passthrough).
+fn run_filter_command(command: &str, path: &[u8], content: &[u8]) -> Result<Vec<u8>> {
+    // Git expands `%f` in the filter command to the path of the file being
+    // filtered (quoted). We perform the same substitution.
+    let display_path = String::from_utf8_lossy(path);
+    let expanded = command.replace("%f", &shell_quote(&display_path));
+    // Run through the platform shell so pipelines / arguments in the configured
+    // command behave the same way git's `run_command`-with-shell does.
+    let (shell, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    };
+    let mut child = Command::new(shell)
+        .arg(flag)
+        .arg(&expanded)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| GitError::Command(format!("failed to spawn filter `{command}`: {err}")))?;
+    // Write the content to the child's stdin on a separate thread so we never
+    // deadlock against a filter that streams output before consuming all input.
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command(format!("filter `{command}` stdin unavailable")))?;
+    let payload = content.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+        // Dropping `stdin` here closes the pipe so the child sees EOF.
+    });
+    let output = child
+        .wait_with_output()
+        .map_err(|err| GitError::Command(format!("filter `{command}` failed: {err}")))?;
+    // Join the writer; its own errors (e.g. broken pipe) are non-fatal because
+    // the child's exit status is the authoritative signal.
+    let _ = writer.join();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(GitError::Command(format!(
+            "filter `{command}` exited with {}: {}",
+            output.status,
+            stderr.trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+/// Minimal POSIX single-quote escaping for substituting `%f` into a shell
+/// command (used only for the path passed to driver filters).
+fn shell_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Apply the *clean* conversion to `content` for `path` (worktree -> blob):
+/// first the configured `filter.<name>.clean` driver (if any), then CRLF->LF
+/// normalization when EOL conversion applies.
+///
+/// `config` is the repository config (`GitConfig`) and `path` is the
+/// repository-relative path of the file (forward-slash separated, e.g.
+/// `src/main.rs`). When no filter or EOL conversion applies the input is
+/// returned unchanged.
+///
+/// A *required* driver (`filter.<name>.required=true`) whose `clean` command is
+/// missing or fails produces a [`GitError::Command`]; a non-required driver
+/// failure (or absence of a `clean` command) passes the content through
+/// unfiltered, matching git.
+pub fn apply_clean_filter(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    config: &GitConfig,
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    // On clean the worktree file exists, so the live `.gitattributes` chain is
+    // authoritative. `git_dir` is accepted for symmetry with the smudge entry
+    // point (which falls back to the index) and for future use.
+    let _ = git_dir.as_ref();
+    let checks = filter_attribute_checks(worktree_root.as_ref(), path)?;
+    apply_clean_filter_with_attributes(config, &checks, path, content)
+}
+
+/// Like [`apply_clean_filter`] but takes already-resolved attribute checks,
+/// letting callers that have computed attributes once reuse them.
+pub fn apply_clean_filter_with_attributes(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    let mut data = content.to_vec();
+    if let Some(driver) = &plan.driver {
+        data = run_driver(driver, driver.clean.as_deref(), path, &data)?;
+    }
+    if plan.convert_eol(&data) {
+        data = convert_crlf_to_lf(&data);
+    }
+    Ok(data)
+}
+
+/// Apply the *smudge* conversion to `content` for `path` (blob -> worktree):
+/// first LF->CRLF when EOL conversion applies, then the configured
+/// `filter.<name>.smudge` driver (if any).
+///
+/// Semantics mirror [`apply_clean_filter`]: a required driver with a missing or
+/// failing `smudge` command errors, while a non-required one passes the content
+/// through.
+pub fn apply_smudge_filter(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    config: &GitConfig,
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    // On smudge (checkout) the worktree file may not exist yet, so resolve the
+    // attributes from the `.gitattributes` recorded in the index.
+    let checks =
+        smudge_attribute_checks_from_index(worktree_root.as_ref(), git_dir.as_ref(), format, path)?;
+    apply_smudge_filter_with_attributes(config, &checks, path, content)
+}
+
+/// Like [`apply_smudge_filter`] but takes already-resolved attribute checks.
+pub fn apply_smudge_filter_with_attributes(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let plan = ContentFilterPlan::resolve(config, attributes);
+    let mut data = content.to_vec();
+    if plan.eol == EolConversion::Crlf && plan.convert_eol(&data) {
+        data = convert_lf_to_crlf(&data);
+    }
+    if let Some(driver) = &plan.driver {
+        data = run_driver(driver, driver.smudge.as_deref(), path, &data)?;
+    }
+    Ok(data)
+}
+
+/// Execute one direction of a driver filter, honouring the `required` flag.
+fn run_driver(
+    driver: &FilterDriver,
+    command: Option<&str>,
+    path: &[u8],
+    content: &[u8],
+) -> Result<Vec<u8>> {
+    let Some(command) = command else {
+        // No command in this direction. Required filters must error; optional
+        // ones pass content through unchanged.
+        if driver.required {
+            return Err(GitError::Command(format!(
+                "required filter `{}` has no configured command for this direction",
+                String::from_utf8_lossy(&driver.name)
+            )));
+        }
+        return Ok(content.to_vec());
+    };
+    match run_filter_command(command, path, content) {
+        Ok(output) => Ok(output),
+        Err(err) => {
+            if driver.required {
+                Err(err)
+            } else {
+                // Non-required filter failure: fall back to the unfiltered
+                // content, matching git's behaviour.
+                Ok(content.to_vec())
+            }
+        }
+    }
+}
+
+/// Compute the attributes relevant to content filtering (`text`, `eol`,
+/// `filter`) for `path` from the worktree `.gitattributes` chain.
+fn filter_attribute_checks(worktree_root: &Path, path: &[u8]) -> Result<Vec<AttributeCheck>> {
+    let requested = filter_attribute_names();
+    standard_attributes_for_path(worktree_root, path, &requested, false)
+}
+
+/// Compute filtering attributes for a checkout (blob -> worktree), reading
+/// `.gitattributes` from the index so the rules in the tree being checked out
+/// apply even before the worktree files exist.
+fn smudge_attribute_checks_from_index(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    path: &[u8],
+) -> Result<Vec<AttributeCheck>> {
+    let requested = filter_attribute_names();
+    standard_attributes_for_path_from_index(worktree_root, git_dir, format, path, &requested, false)
+}
+
+fn filter_attribute_names() -> Vec<Vec<u8>> {
+    vec![b"text".to_vec(), b"eol".to_vec(), b"filter".to_vec()]
+}
+
 pub fn deleted_index_entries(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -2716,11 +3256,119 @@ pub fn checkout_detached(
     })
 }
 
+/// Like [`checkout_branch`], but runs the smudge-side content filters
+/// (`core.autocrlf`/`text`/`eol` EOL conversion and `filter.<name>.smudge`
+/// drivers) on each blob as it is written to the worktree. `config` is the
+/// repository config used to resolve the filters.
+pub fn checkout_branch_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    branch: &str,
+    committer: Vec<u8>,
+    config: &GitConfig,
+) -> Result<CheckoutResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let branch_ref = branch_ref_name(branch)?;
+    let refs = FileRefStore::new(git_dir, format);
+    let target = match refs.read_ref(&branch_ref)? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) => {
+            return Err(GitError::Unsupported(
+                "checkout target branch must be direct".into(),
+            ));
+        }
+        None => return Err(GitError::NotFound(format!("branch {branch}"))),
+    };
+    let files = checkout_commit_to_index_and_worktree_filtered(
+        worktree_root,
+        git_dir,
+        format,
+        &target,
+        Some(config),
+    )?;
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Symbolic(branch_ref),
+        reflog: Some(ReflogEntry {
+            old_oid: target.clone(),
+            new_oid: target.clone(),
+            committer,
+            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
+        }),
+    });
+    tx.commit()?;
+    Ok(CheckoutResult {
+        branch: branch.into(),
+        oid: target,
+        files,
+    })
+}
+
+/// Like [`checkout_detached`], but runs the smudge-side content filters (see
+/// [`checkout_branch_filtered`]).
+pub fn checkout_detached_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target: &ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+    config: &GitConfig,
+) -> Result<CheckoutResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let files = checkout_commit_to_index_and_worktree_filtered(
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        Some(config),
+    )?;
+    let refs = FileRefStore::new(git_dir, format);
+    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Direct(target.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid: zero,
+            new_oid: target.clone(),
+            committer,
+            message,
+        }),
+    });
+    tx.commit()?;
+    Ok(CheckoutResult {
+        branch: target.to_string(),
+        oid: target.clone(),
+        files,
+    })
+}
+
 fn checkout_commit_to_index_and_worktree(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
     target: &ObjectId,
+) -> Result<usize> {
+    checkout_commit_to_index_and_worktree_filtered(worktree_root, git_dir, format, target, None)
+}
+
+/// Like [`checkout_commit_to_index_and_worktree`] but optionally runs the
+/// smudge-side content filters (see [`apply_smudge_filter`]) on each blob before
+/// it is written to the worktree. Attribute lookups use the `.gitattributes`
+/// recorded in the *target tree* so the rules of the checked-out commit apply.
+fn checkout_commit_to_index_and_worktree_filtered(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+    smudge_config: Option<&GitConfig>,
 ) -> Result<usize> {
     let status = short_status(worktree_root, git_dir, format)?;
     if !status.is_empty() {
@@ -2732,6 +3380,10 @@ fn checkout_commit_to_index_and_worktree(
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+
+    let attributes = smudge_config
+        .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
+        .transpose()?;
 
     for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
@@ -2749,11 +3401,18 @@ fn checkout_commit_to_index_and_worktree(
                 object.object_type.as_str()
             )));
         }
+        let body = match (smudge_config, &attributes) {
+            (Some(config), Some(matcher)) => {
+                let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
+                apply_smudge_filter_with_attributes(config, &checks, path, &object.body)?
+            }
+            _ => object.body,
+        };
         let file_path = worktree_path(worktree_root, path)?;
         if let Some(parent) = file_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&file_path, &object.body)?;
+        fs::write(&file_path, &body)?;
         let metadata = fs::metadata(&file_path)?;
         let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
         index_entry.mode = entry.mode;
@@ -2771,6 +3430,29 @@ fn checkout_commit_to_index_and_worktree(
         .write(format)?,
     )?;
     Ok(target_entries.len())
+}
+
+/// Build an [`AttributeMatcher`] from the `.gitattributes` files contained in a
+/// tree, plus the repo-level (`core.attributesFile`, `.git/info/attributes`)
+/// sources, mirroring [`standard_attributes_for_path_from_tree`].
+fn build_tree_attribute_matcher(
+    worktree_root: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<AttributeMatcher> {
+    let mut matcher = AttributeMatcher::default();
+    if !matcher.read_configured_attributes(worktree_root) {
+        matcher.read_default_global_attributes();
+    }
+    collect_attribute_patterns_from_tree(db, format, tree_oid, Vec::new(), &mut matcher)?;
+    read_attribute_patterns(
+        worktree_root.join(".git").join("info").join("attributes"),
+        &mut matcher,
+        &[],
+        b".git/info/attributes",
+    );
+    Ok(matcher)
 }
 
 /// Sparse- and skip-worktree-aware variant of
@@ -4936,6 +5618,334 @@ mod tests {
         assert!(index_entry_skip_worktree(skipped));
         // The skipped entry still carries the committed blob id and mode.
         assert_eq!(skipped.mode, 0o100644);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ----- content filtering: EOL / autocrlf + clean/smudge drivers -----
+
+    /// Build a [`GitConfig`] from raw config text.
+    fn config_from(text: &str) -> GitConfig {
+        GitConfig::parse(text.as_bytes()).unwrap()
+    }
+
+    /// Resolve attribute checks against an on-disk `.gitattributes` in `root`.
+    fn attrs(root: &Path, path: &[u8]) -> Vec<AttributeCheck> {
+        filter_attribute_checks(root, path).unwrap()
+    }
+
+    #[test]
+    fn crlf_to_lf_collapses_only_pairs() {
+        assert_eq!(convert_crlf_to_lf(b"a\r\nb\r\n"), b"a\nb\n");
+        // A lone CR (no following LF) is preserved.
+        assert_eq!(convert_crlf_to_lf(b"a\rb"), b"a\rb");
+        // An already-LF stream is unchanged.
+        assert_eq!(convert_crlf_to_lf(b"a\nb\n"), b"a\nb\n");
+    }
+
+    #[test]
+    fn lf_to_crlf_does_not_double_convert() {
+        assert_eq!(convert_lf_to_crlf(b"a\nb\n"), b"a\r\nb\r\n");
+        // Existing CRLF is left intact (no extra CR added).
+        assert_eq!(convert_lf_to_crlf(b"a\r\nb\r\n"), b"a\r\nb\r\n");
+    }
+
+    #[test]
+    fn autocrlf_round_trip_clean_then_smudge() {
+        // autocrlf=true: worktree CRLF -> blob LF on clean, blob LF -> worktree
+        // CRLF on smudge.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let worktree = b"line1\r\nline2\r\n";
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"file.txt", worktree)
+            .unwrap();
+        assert_eq!(blob, b"line1\nline2\n", "clean must normalize CRLF to LF");
+        let restored = apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob)
+            .unwrap();
+        assert_eq!(
+            restored, worktree,
+            "smudge must restore CRLF from the LF blob"
+        );
+    }
+
+    #[test]
+    fn autocrlf_input_normalizes_on_clean_but_not_smudge() {
+        // autocrlf=input: clean normalizes to LF, smudge leaves LF as-is.
+        let config = config_from("[core]\n\tautocrlf = input\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"file.txt", b"a\r\nb\r\n")
+                .unwrap();
+        assert_eq!(blob, b"a\nb\n");
+        let smudged =
+            apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob).unwrap();
+        assert_eq!(smudged, b"a\nb\n", "input mode must not add carriage returns");
+    }
+
+    #[test]
+    fn eol_crlf_attribute_drives_conversion_without_config() {
+        // No core.autocrlf; the `eol=crlf` attribute alone forces conversion.
+        let config = config_from("");
+        let checks = vec![AttributeCheck {
+            attribute: b"eol".to_vec(),
+            state: Some(AttributeState::Value(b"crlf".to_vec())),
+        }];
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"a.txt", b"x\r\ny\r\n").unwrap();
+        assert_eq!(blob, b"x\ny\n");
+        let smudged =
+            apply_smudge_filter_with_attributes(&config, &checks, b"a.txt", &blob).unwrap();
+        assert_eq!(smudged, b"x\r\ny\r\n");
+    }
+
+    #[test]
+    fn binary_attribute_disables_eol_conversion() {
+        // `-text` (binary) must leave CRLF/NUL content untouched in both
+        // directions even when autocrlf=true.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks = vec![AttributeCheck {
+            attribute: b"text".to_vec(),
+            state: Some(AttributeState::Unset),
+        }];
+        let content = b"\x00\x01\r\n\x02\r\n".to_vec();
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"data.bin", &content).unwrap();
+        assert_eq!(blob, content, "binary file must not be CRLF-normalized");
+        let smudged =
+            apply_smudge_filter_with_attributes(&config, &checks, b"data.bin", &blob).unwrap();
+        assert_eq!(smudged, content, "binary file must not gain carriage returns");
+    }
+
+    #[test]
+    fn autocrlf_auto_skips_binary_looking_content() {
+        // text=auto (via autocrlf) must not convert content that contains NUL.
+        let config = config_from("[core]\n\tautocrlf = true\n");
+        let checks: Vec<AttributeCheck> = Vec::new();
+        let content = b"a\r\n\x00b\r\n".to_vec();
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"f", &content).unwrap();
+        assert_eq!(blob, content, "binary-looking content stays untouched");
+    }
+
+    #[test]
+    fn autocrlf_via_add_and_checkout_round_trips() {
+        // End-to-end: a CRLF worktree file is stored as an LF blob by the
+        // filtered add path, and restored as CRLF by the filtered checkout.
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let config = config_from("[core]\n\tautocrlf = true\n");
+
+        fs::write(root.join("crlf.txt"), b"alpha\r\nbeta\r\n").unwrap();
+        add_paths_to_index_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from("crlf.txt")],
+            &config,
+        )
+        .unwrap();
+
+        // The stored blob must be LF-normalized.
+        let index = read_index(&git_dir);
+        let entry = index_entry_for(&index, b"crlf.txt");
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let blob = odb.read_object(&entry.oid).unwrap();
+        assert_eq!(blob.body, b"alpha\nbeta\n");
+
+        // Commit and point HEAD at it, then re-checkout with smudge filtering.
+        let tree = write_tree_from_index(&git_dir, ObjectFormat::Sha1).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        body.extend_from_slice(b"author T <t@e> 0 +0000\ncommitter T <t@e> 0 +0000\n\nm\n");
+        let mut odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let commit = odb
+            .write_object(EncodedObject::new(ObjectType::Commit, body))
+            .unwrap();
+        let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Direct(commit.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+
+        // Make the worktree match the committed (LF) blob so the tree is clean
+        // for checkout; `short_status`/`worktree_entries` compare by content
+        // hash and are not filter-aware. Checkout will then smudge it to CRLF.
+        fs::write(root.join("crlf.txt"), b"alpha\nbeta\n").unwrap();
+        checkout_detached_filtered(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &commit,
+            b"T <t@e> 0 +0000".to_vec(),
+            b"co".to_vec(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(root.join("crlf.txt")).unwrap(),
+            b"alpha\r\nbeta\r\n",
+            "checkout must restore CRLF line endings"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn driver_filter_clean_and_smudge_transform_both_directions() {
+        // filter=case: clean upper-cases (worktree -> blob), smudge lower-cases
+        // (blob -> worktree).
+        let config = config_from(
+            "[filter \"case\"]\n\tclean = tr a-z A-Z\n\tsmudge = tr A-Z a-z\n",
+        );
+        let checks = vec![AttributeCheck {
+            attribute: b"filter".to_vec(),
+            state: Some(AttributeState::Value(b"case".to_vec())),
+        }];
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"Hello World")
+                .unwrap();
+        assert_eq!(blob, b"HELLO WORLD", "clean driver must upper-case");
+        let worktree =
+            apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", b"HELLO WORLD")
+                .unwrap();
+        assert_eq!(worktree, b"hello world", "smudge driver must lower-case");
+    }
+
+    #[test]
+    fn driver_filter_resolved_from_gitattributes_file() {
+        // The filter name is read from a real `.gitattributes`, the commands from
+        // config; exercises the public worktree-rooted entry points.
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join(".gitattributes"), b"*.dat filter=rot\n").unwrap();
+        let config = config_from(
+            "[filter \"rot\"]\n\tclean = sed s/a/b/g\n\tsmudge = sed s/b/a/g\n",
+        );
+        // Clean reads attributes from the live worktree `.gitattributes`.
+        let blob =
+            apply_clean_filter(&root, &git_dir, &config, b"x.dat", b"banana").unwrap();
+        assert_eq!(blob, b"bbnbnb");
+        // Smudge reads attributes from the index (the worktree file may not
+        // exist yet during checkout), so stage `.gitattributes` first.
+        add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &[PathBuf::from(".gitattributes")],
+        )
+        .unwrap();
+        let smudged = apply_smudge_filter(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &config,
+            b"x.dat",
+            &blob,
+        )
+        .unwrap();
+        // sed s/b/a/g is not a perfect inverse, but verifies the smudge command
+        // ran on the blob bytes.
+        assert_eq!(smudged, b"aanana");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn required_filter_failure_is_fatal() {
+        // A required filter whose command fails must surface an error.
+        let config = config_from(
+            "[filter \"boom\"]\n\tclean = false\n\trequired = true\n",
+        );
+        let checks = vec![AttributeCheck {
+            attribute: b"filter".to_vec(),
+            state: Some(AttributeState::Value(b"boom".to_vec())),
+        }];
+        let err = apply_clean_filter_with_attributes(&config, &checks, b"f", b"data")
+            .expect_err("required filter failure must error");
+        assert!(matches!(err, GitError::Command(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn required_filter_missing_command_is_fatal() {
+        // required=true but no clean command for this direction is also fatal.
+        let config = config_from(
+            "[filter \"need\"]\n\tsmudge = cat\n\trequired = true\n",
+        );
+        let checks = vec![AttributeCheck {
+            attribute: b"filter".to_vec(),
+            state: Some(AttributeState::Value(b"need".to_vec())),
+        }];
+        let err = apply_clean_filter_with_attributes(&config, &checks, b"f", b"data")
+            .expect_err("required filter without a clean command must error");
+        assert!(matches!(err, GitError::Command(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn non_required_filter_failure_passes_through() {
+        // A non-required filter that fails must pass the content through
+        // unchanged rather than erroring.
+        let config = config_from("[filter \"opt\"]\n\tclean = false\n");
+        let checks = vec![AttributeCheck {
+            attribute: b"filter".to_vec(),
+            state: Some(AttributeState::Value(b"opt".to_vec())),
+        }];
+        let out =
+            apply_clean_filter_with_attributes(&config, &checks, b"f", b"keepme").unwrap();
+        assert_eq!(out, b"keepme", "optional filter failure passes content through");
+    }
+
+    #[test]
+    fn filter_with_no_command_is_noop() {
+        // filter=name with no configured commands and not required is ignored.
+        let config = config_from("");
+        let checks = vec![AttributeCheck {
+            attribute: b"filter".to_vec(),
+            state: Some(AttributeState::Value(b"ghost".to_vec())),
+        }];
+        let out =
+            apply_clean_filter_with_attributes(&config, &checks, b"f", b"unchanged").unwrap();
+        assert_eq!(out, b"unchanged");
+    }
+
+    #[test]
+    fn driver_and_eol_compose_on_clean_and_smudge() {
+        // filter=case + autocrlf=true: clean runs the driver then CRLF->LF;
+        // smudge runs LF->CRLF then the driver.
+        let config = config_from(
+            "[core]\n\tautocrlf = true\n[filter \"case\"]\n\tclean = tr a-z A-Z\n\tsmudge = tr A-Z a-z\n",
+        );
+        let checks = vec![
+            AttributeCheck {
+                attribute: b"filter".to_vec(),
+                state: Some(AttributeState::Value(b"case".to_vec())),
+            },
+            AttributeCheck {
+                attribute: b"text".to_vec(),
+                state: Some(AttributeState::Set),
+            },
+        ];
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"ab\r\ncd\r\n")
+                .unwrap();
+        assert_eq!(blob, b"AB\nCD\n", "clean: upper-case then CRLF->LF");
+        let worktree =
+            apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", &blob).unwrap();
+        assert_eq!(worktree, b"ab\r\ncd\r\n", "smudge: LF->CRLF then lower-case");
+    }
+
+    #[test]
+    fn attrs_helper_reads_filter_from_disk() {
+        let root = temp_root();
+        fs::write(root.join(".gitattributes"), b"*.txt text\n*.bin -text\n").unwrap();
+        let text = attrs(&root, b"a.txt");
+        assert!(text.iter().any(|c| c.attribute == b"text"
+            && c.state == Some(AttributeState::Set)));
+        let bin = attrs(&root, b"a.bin");
+        assert!(bin.iter().any(|c| c.attribute == b"text"
+            && c.state == Some(AttributeState::Unset)));
         fs::remove_dir_all(root).unwrap();
     }
 }

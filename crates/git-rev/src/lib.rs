@@ -1,5 +1,5 @@
 use git_core::{GitError, ObjectId, Result};
-use git_formats::{Commit, CommitGraph, Index, ObjectType, Tag, Tree};
+use git_formats::{Commit, CommitGraph, GitConfig, Index, ObjectType, Tag, Tree};
 use git_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use git_refs::{FileRefStore, PackedRef, RefTarget};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -59,6 +59,13 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     // colon here means the whole left side is the revision-ish to peel to a tree.
     if let Some((rev_part, path)) = split_rev_path(rev) {
         return resolve_rev_path(git_dir, format, reader, rev_part, path);
+    }
+    // `@`, `@{N}`, `<branch>@{N}`, `@{u}`/`@{upstream}`, `@{push}`, and `@{-N}` are
+    // resolved before the `^`/`~` suffix machinery so that a base like `HEAD@{1}^`
+    // first becomes the reflog value and only then has the parent suffix applied
+    // (the suffix splitter recurses back into this function on the `@{...}` base).
+    if let Some(oid) = resolve_at_selector(git_dir, format, rev)? {
+        return Ok(oid);
     }
     if let Some((base, suffix)) = split_revision_suffix(rev)? {
         if base.is_empty() {
@@ -124,6 +131,271 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
             _ => Ok(None),
         },
         None => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `@`, `@{...}`, and `<branch>@{...}` selectors
+// ---------------------------------------------------------------------------
+//
+// These are git's "at-mark" revision selectors:
+//   * bare `@`                  -> HEAD
+//   * `@{N}` / `<branch>@{N}`   -> the N-th prior value from the reflog
+//   * `@{u}` / `@{upstream}`    -> the branch's configured upstream tracking ref
+//   * `@{push}`                 -> the branch's push tracking ref
+//   * `@{-N}`                   -> the N-th previously checked-out branch
+// They are parsed ahead of the `^`/`~`/`:` suffix machinery so a base like
+// `HEAD@{1}^` resolves the reflog value first and then applies the suffix.
+
+/// Try to resolve `rev` as an at-mark selector.
+///
+/// Returns `Ok(None)` when `rev` is not an at-mark form (so the caller falls
+/// through to the normal suffix/name handling), `Ok(Some(oid))` on a successful
+/// resolution, and an error for a malformed or unsupported selector.
+fn resolve_at_selector(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    rev: &str,
+) -> Result<Option<ObjectId>> {
+    // Bare `@` is an alias for HEAD.
+    if rev == "@" {
+        let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+        return match resolve_revision_ref(&refs, "HEAD")? {
+            Some(oid) => Ok(Some(oid)),
+            None => Err(GitError::NotFound("revision @".into())),
+        };
+    }
+
+    // Everything else must be `<base>@{<selector>}` with the braces at the end.
+    let Some(open) = rev.find("@{") else {
+        return Ok(None);
+    };
+    let Some(inner) = rev.strip_suffix('}') else {
+        return Ok(None);
+    };
+    // `inner` still has the `<base>@{` prefix; keep only what is inside the braces.
+    let inner = &inner[open + 2..];
+    let base = &rev[..open];
+
+    // `@{-N}` is special: it names a previously checked-out branch and ignores
+    // any `<base>` to its left (git only accepts a bare `@{-N}`).
+    if let Some(rest) = inner.strip_prefix('-') {
+        if !base.is_empty() {
+            return Err(GitError::InvalidFormat(format!(
+                "invalid revision selector {rev}"
+            )));
+        }
+        let count = parse_at_count(rev, rest)?;
+        return Ok(Some(resolve_previous_checkout(
+            git_dir, format, count, rev,
+        )?));
+    }
+
+    if inner == "u" || inner == "upstream" {
+        return Ok(Some(resolve_upstream(git_dir, format, base, false, rev)?));
+    }
+    if inner == "push" {
+        return Ok(Some(resolve_upstream(git_dir, format, base, true, rev)?));
+    }
+    if inner.bytes().all(|byte| byte.is_ascii_digit()) {
+        let count = parse_at_count(rev, inner)?;
+        return Ok(Some(resolve_reflog_nth(git_dir, format, base, count, rev)?));
+    }
+
+    // Date-based selectors such as `@{yesterday}` / `@{2 days ago}` are not
+    // implemented; report them rather than silently mis-resolving.
+    Err(GitError::Unsupported(format!(
+        "revision selector @{{{inner}}}"
+    )))
+}
+
+/// Parse the numeric portion of an `@{N}` / `@{-N}` selector.
+fn parse_at_count(rev: &str, text: &str) -> Result<usize> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision selector {rev}"
+        )));
+    }
+    text.parse::<usize>()
+        .map_err(|_| GitError::InvalidFormat(format!("invalid revision selector {rev}")))
+}
+
+/// Map a `<base>@{...}` base to the full ref name whose reflog should be read.
+///
+/// An empty base means `HEAD`; `refs/...` is used verbatim; anything else is
+/// treated as a branch short-name under `refs/heads/`.
+fn reflog_ref_name(base: &str) -> String {
+    if base.is_empty() || base == "HEAD" {
+        "HEAD".to_string()
+    } else if base.starts_with("refs/") {
+        base.to_string()
+    } else {
+        format!("refs/heads/{base}")
+    }
+}
+
+/// Resolve `<base>@{N}` to the N-th prior value of `base` from its reflog.
+///
+/// The reflog is stored oldest-first, so `@{0}` is the most recent entry's new
+/// value and `@{N}` is the new value of the entry `N` positions earlier (which
+/// equals the old value recorded `N` moves ago). A reflog that is too short to
+/// satisfy `N` reports a git-style "log for '<base>' only has K entries" error.
+fn resolve_reflog_nth(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    base: &str,
+    n: usize,
+    rev: &str,
+) -> Result<ObjectId> {
+    let ref_name = reflog_ref_name(base);
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let entries = refs.read_reflog(&ref_name)?;
+    if entries.is_empty() {
+        return Err(GitError::NotFound(format!(
+            "no reflog for '{}' to resolve {rev}",
+            reflog_display_name(base)
+        )));
+    }
+    // `@{N}` counts back from the newest entry; index `len - 1 - n`.
+    let len = entries.len();
+    if n >= len {
+        return Err(GitError::NotFound(format!(
+            "log for '{}' only has {len} entries",
+            reflog_display_name(base)
+        )));
+    }
+    Ok(entries[len - 1 - n].new_oid.clone())
+}
+
+/// Human-facing name for a reflog target in error messages (HEAD, or the branch
+/// short name without the `refs/heads/` prefix, matching git's wording).
+fn reflog_display_name(base: &str) -> String {
+    if base.is_empty() {
+        "HEAD".to_string()
+    } else {
+        base.to_string()
+    }
+}
+
+/// Resolve `@{-N}` to the tip of the N-th previously checked-out branch.
+///
+/// HEAD's reflog is scanned newest-first for "checkout: moving from X to Y"
+/// entries; the N-th such entry's `X` (the branch we moved *away* from) is the
+/// answer, which is then resolved to its current tip.
+fn resolve_previous_checkout(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    n: usize,
+    rev: &str,
+) -> Result<ObjectId> {
+    if n == 0 {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision selector {rev}"
+        )));
+    }
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let entries = refs.read_reflog("HEAD")?;
+    let mut seen = 0usize;
+    for entry in entries.iter().rev() {
+        let Some(from) = checkout_move_source(&entry.message) else {
+            continue;
+        };
+        seen += 1;
+        if seen == n {
+            let from = from.to_string();
+            return resolve_revision_name(git_dir, format, &from).map_err(|_| {
+                GitError::NotFound(format!(
+                    "could not resolve previous branch '{from}' for {rev}"
+                ))
+            });
+        }
+    }
+    Err(GitError::NotFound(format!(
+        "not enough previous checkouts to resolve {rev}"
+    )))
+}
+
+/// Extract the source branch `X` from a HEAD reflog message of the form
+/// "checkout: moving from X to Y", or `None` for any other reflog message.
+fn checkout_move_source(message: &[u8]) -> Option<&str> {
+    let message = std::str::from_utf8(message).ok()?;
+    let rest = message.strip_prefix("checkout: moving from ")?;
+    // The remainder is "X to Y"; split on the last " to " so a branch named
+    // with embedded " to " still parses (git itself uses the final separator).
+    let (from, _to) = rest.rsplit_once(" to ")?;
+    Some(from)
+}
+
+/// Resolve `<base>@{u}` / `@{upstream}` (when `push` is false) or `@{push}`
+/// (when `push` is true) to the configured tracking ref's current value.
+///
+/// The branch is `base` (or the current branch when `base` is empty). The
+/// tracking ref is built from `branch.<name>.remote` (or `pushRemote` for the
+/// push form) plus the short name from `branch.<name>.merge`, yielding
+/// `refs/remotes/<remote>/<short>`. `@{push}` falls back to the upstream remote
+/// when no push-specific remote is configured.
+fn resolve_upstream(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    base: &str,
+    push: bool,
+    rev: &str,
+) -> Result<ObjectId> {
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let branch = if base.is_empty() {
+        refs.current_branch()?.ok_or_else(|| {
+            GitError::InvalidFormat(format!("HEAD is not a branch, cannot resolve {rev}"))
+        })?
+    } else if let Some(short) = base.strip_prefix("refs/heads/") {
+        short.to_string()
+    } else if base.starts_with("refs/") {
+        return Err(GitError::InvalidFormat(format!(
+            "{base} is not a branch, cannot resolve {rev}"
+        )));
+    } else {
+        base.to_string()
+    };
+
+    let config = read_repo_config(git_dir)?;
+    let merge = config
+        .get("branch", Some(&branch), "merge")
+        .ok_or_else(|| {
+            GitError::NotFound(format!("no upstream configured for branch '{branch}'"))
+        })?;
+    let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+
+    // For `@{push}` prefer a push-specific remote, falling back to the upstream
+    // remote (`branch.<name>.remote`) when none is set.
+    let remote = if push {
+        config
+            .get("branch", Some(&branch), "pushRemote")
+            .or_else(|| config.get("remote", None, "pushDefault"))
+            .or_else(|| config.get("branch", Some(&branch), "remote"))
+    } else {
+        config.get("branch", Some(&branch), "remote")
+    }
+    .ok_or_else(|| GitError::NotFound(format!("no upstream remote for branch '{branch}'")))?;
+
+    let tracking = format!("refs/remotes/{remote}/{short}");
+    match resolve_revision_ref(&refs, &tracking)? {
+        Some(oid) => Ok(oid),
+        None => Err(GitError::NotFound(format!(
+            "upstream tracking ref '{tracking}' for {rev} is missing"
+        ))),
+    }
+}
+
+/// Read the repository config (`<git_dir>/config`).
+///
+/// A missing config file is treated as empty rather than an error, mirroring how
+/// upstream resolution behaves in a freshly created repository with no branch
+/// configuration.
+fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
+    let path = git_dir.join("config");
+    match fs::read(&path) {
+        Ok(bytes) => GitConfig::parse(&bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GitConfig::default()),
+        Err(err) => Err(GitError::Io(err.to_string())),
     }
 }
 
@@ -963,7 +1235,7 @@ mod tests {
     use git_core::ObjectFormat;
     use git_formats::EncodedObject;
     use git_odb::{ObjectDatabase, ObjectWriter};
-    use git_refs::{RefTarget, RefUpdate};
+    use git_refs::{RefTarget, RefUpdate, ReflogEntry};
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1618,6 +1890,290 @@ mod tests {
             vec![base]
         );
         fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_bare_at_is_head() {
+        let git_dir = temp_git_dir();
+        let oid = test_oid(0xaa);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &oid);
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@").unwrap(),
+            oid
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_head_reflog_nth() {
+        let git_dir = temp_git_dir();
+        let c0 = test_oid(0x10);
+        let c1 = test_oid(0x11);
+        let c2 = test_oid(0x12);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &c2);
+        // Oldest-first reflog: c0 -> c1 -> c2 (c2 is the current value).
+        write_head_reflog(
+            &git_dir,
+            &[
+                (&zero_oid(), &c0, "commit (initial): c0"),
+                (&c0, &c1, "commit: c1"),
+                (&c1, &c2, "commit: c2"),
+            ],
+        );
+
+        // `@{0}` is the current value, `@{1}`/`@{2}` walk back through the log.
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}").unwrap(),
+            c2
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{1}").unwrap(),
+            c1
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{2}").unwrap(),
+            c0
+        );
+        // Out-of-range reports a git-style "only has N entries" error.
+        let err = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{5}").unwrap_err();
+        assert!(
+            matches!(&err, GitError::NotFound(msg) if msg.contains("only has 3 entries")),
+            "unexpected error: {err:?}"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_branch_reflog_nth() {
+        let git_dir = temp_git_dir();
+        let old = test_oid(0x20);
+        let new = test_oid(0x21);
+        set_branch(&git_dir, "topic", &new);
+        write_branch_reflog(
+            &git_dir,
+            "topic",
+            &[
+                (&zero_oid(), &old, "branch: Created"),
+                (&old, &new, "commit: work"),
+            ],
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{0}").unwrap(),
+            new
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{1}").unwrap(),
+            old
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_upstream_via_branch_config() {
+        let git_dir = temp_git_dir();
+        let tip = test_oid(0x30);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &tip);
+        set_ref(&git_dir, "refs/remotes/origin/main", &tip);
+        fs::write(
+            git_dir.join("config"),
+            b"[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+        )
+        .unwrap();
+
+        for spec in ["@{u}", "@{upstream}", "main@{upstream}"] {
+            assert_eq!(
+                resolve_revision(&git_dir, ObjectFormat::Sha1, spec).unwrap(),
+                tip,
+                "spec {spec}"
+            );
+        }
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_push_falls_back_to_upstream_then_uses_push_remote() {
+        let git_dir = temp_git_dir();
+        let up = test_oid(0x40);
+        let pushed = test_oid(0x41);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &up);
+        set_ref(&git_dir, "refs/remotes/origin/main", &up);
+
+        // No push-specific config: `@{push}` mirrors `@{u}` (origin/main).
+        fs::write(
+            git_dir.join("config"),
+            b"[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}").unwrap(),
+            up
+        );
+
+        // With a pushRemote, `@{push}` follows refs/remotes/<pushRemote>/<short>.
+        set_ref(&git_dir, "refs/remotes/fork/main", &pushed);
+        fs::write(
+            git_dir.join("config"),
+            b"[branch \"main\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/main\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}").unwrap(),
+            pushed
+        );
+        // `@{u}` still uses the upstream remote, not the push remote.
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{u}").unwrap(),
+            up
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_previous_checkout_branch() {
+        let git_dir = temp_git_dir();
+        let main_tip = test_oid(0x50);
+        let feature_tip = test_oid(0x51);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/feature\n").unwrap();
+        set_branch(&git_dir, "main", &main_tip);
+        set_branch(&git_dir, "feature", &feature_tip);
+        // Checkout history: ... -> feature -> main -> feature (newest last).
+        write_head_reflog(
+            &git_dir,
+            &[
+                (
+                    &feature_tip,
+                    &feature_tip,
+                    "checkout: moving from main to feature",
+                ),
+                (
+                    &feature_tip,
+                    &main_tip,
+                    "checkout: moving from feature to main",
+                ),
+                (
+                    &main_tip,
+                    &feature_tip,
+                    "checkout: moving from main to feature",
+                ),
+            ],
+        );
+        // `@{-1}` = branch we left most recently (main) -> its current tip.
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-1}").unwrap(),
+            main_tip
+        );
+        // `@{-2}` = the checkout before that (feature).
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-2}").unwrap(),
+            feature_tip
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn at_selector_composes_with_parent_suffix() {
+        // `@{0}^` must resolve the reflog value first, then apply `^`: the
+        // suffix splitter peels the `^` and recurses back into the `@{...}` base.
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .unwrap();
+        let parent = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"parent\n", 1000);
+        let child = write_dated_commit(&mut db, tree, vec![parent.clone()], b"child\n", 2000);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &child);
+        write_head_reflog(
+            &git_dir,
+            &[
+                (&zero_oid(), &parent, "commit (initial): parent"),
+                (&parent, &child, "commit: child"),
+            ],
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}").unwrap(),
+            child
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}^").unwrap(),
+            parent
+        );
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{0}~1").unwrap(),
+            parent
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_at_selector_rejects_unsupported_and_malformed() {
+        let git_dir = temp_git_dir();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &test_oid(0x60));
+        // Date-based selectors are not implemented.
+        let unsupported =
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{yesterday}").unwrap_err();
+        assert!(
+            matches!(&unsupported, GitError::Unsupported(_)),
+            "unexpected error: {unsupported:?}"
+        );
+        // `@{-N}` only applies to a bare base.
+        let bad_base = resolve_revision(&git_dir, ObjectFormat::Sha1, "main@{-1}").unwrap_err();
+        assert!(
+            matches!(&bad_base, GitError::InvalidFormat(_)),
+            "unexpected error: {bad_base:?}"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    fn test_oid(byte: u8) -> ObjectId {
+        ObjectId::from_hex(ObjectFormat::Sha1, &format!("{byte:02x}").repeat(20)).unwrap()
+    }
+
+    fn zero_oid() -> ObjectId {
+        ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap()
+    }
+
+    fn set_branch(git_dir: &Path, branch: &str, oid: &ObjectId) {
+        set_ref(git_dir, &format!("refs/heads/{branch}"), oid);
+    }
+
+    fn set_ref(git_dir: &Path, name: &str, oid: &ObjectId) {
+        let refs = FileRefStore::new(git_dir, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: name.to_string(),
+            expected: None,
+            new: RefTarget::Direct(oid.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+    }
+
+    fn write_head_reflog(git_dir: &Path, entries: &[(&ObjectId, &ObjectId, &str)]) {
+        write_reflog_for(git_dir, "HEAD", entries);
+    }
+
+    fn write_branch_reflog(git_dir: &Path, branch: &str, entries: &[(&ObjectId, &ObjectId, &str)]) {
+        write_reflog_for(git_dir, &format!("refs/heads/{branch}"), entries);
+    }
+
+    fn write_reflog_for(git_dir: &Path, name: &str, entries: &[(&ObjectId, &ObjectId, &str)]) {
+        let refs = FileRefStore::new(git_dir, ObjectFormat::Sha1);
+        let entries: Vec<ReflogEntry> = entries
+            .iter()
+            .map(|(old, new, message)| ReflogEntry {
+                old_oid: (*old).clone(),
+                new_oid: (*new).clone(),
+                committer: b"Example User <example@example.invalid> 1000 +0000".to_vec(),
+                message: message.as_bytes().to_vec(),
+            })
+            .collect();
+        refs.write_reflog(name, &entries).unwrap();
     }
 
     fn write_test_commit(
