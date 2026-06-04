@@ -4330,6 +4330,7 @@ pub fn remove_index_and_worktree_paths(
         selected.extend(matched);
     }
     if !options.cached && !options.force {
+        let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
         for path in &selected {
             let Some(index_entry) = index_entries.get(path) else {
                 continue;
@@ -4355,7 +4356,14 @@ pub fn remove_index_and_worktree_paths(
                         object.object_type.as_str()
                     )));
                 }
-                if fs::read(&worktree_file)? != object.body {
+                let worktree_bytes = apply_clean_filter(
+                    worktree_root,
+                    git_dir,
+                    &config,
+                    path,
+                    &fs::read(&worktree_file)?,
+                )?;
+                if worktree_bytes != object.body {
                     eprintln!("error: the following file has local modifications:");
                     eprintln!("    {}", String::from_utf8_lossy(path));
                     eprintln!("(use --cached to keep the file, or -f to force removal)");
@@ -4944,7 +4952,19 @@ fn worktree_entries(
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
-    collect_worktree_entries(worktree_root, git_dir, worktree_root, format, &mut entries)?;
+    // Worktree blobs are compared to the index by OID, so they must be passed
+    // through the clean filter (core.autocrlf / .gitattributes) first -- exactly
+    // as `git add` would store them. With no filter configured this is an exact
+    // passthrough, so unfiltered repositories see identical OIDs.
+    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    collect_worktree_entries(
+        worktree_root,
+        git_dir,
+        worktree_root,
+        format,
+        &config,
+        &mut entries,
+    )?;
     Ok(entries)
 }
 
@@ -4953,6 +4973,7 @@ fn collect_worktree_entries(
     git_dir: &Path,
     dir: &Path,
     format: ObjectFormat,
+    config: &GitConfig,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     if is_same_path(dir, git_dir) {
@@ -4969,13 +4990,14 @@ fn collect_worktree_entries(
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_worktree_entries(root, git_dir, &path, format, entries)?;
+            collect_worktree_entries(root, git_dir, &path, format, config, entries)?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
             let git_path = git_path_bytes(relative)?;
             let body = fs::read(&path)?;
+            let body = apply_clean_filter(root, git_dir, config, &git_path, &body)?;
             let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
             entries.insert(
                 git_path,

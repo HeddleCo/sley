@@ -2750,13 +2750,15 @@ fn cmd_clone(args: &[String]) -> Result<()> {
 
     if let Some(revision_oid) = revision_oid.as_ref() {
         if checkout {
-            git_worktree::checkout_detached(
+            let config = read_repo_config(&git_dir)?;
+            git_worktree::checkout_detached_filtered(
                 &destination,
                 &git_dir,
                 format,
                 revision_oid,
                 commit_identity_from_env("COMMITTER")?,
                 format!("clone: from {repository}").into_bytes(),
+                &config,
             )?;
             print_clone_detached_head_advice(revision_oid);
         } else {
@@ -2811,12 +2813,14 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         });
         tx.commit()?;
     }
-    git_worktree::checkout_branch(
+    let config = read_repo_config(&git_dir)?;
+    git_worktree::checkout_branch_filtered(
         &destination,
         &git_dir,
         format,
         &checkout_branch,
         commit_identity_from_env("COMMITTER")?,
+        &config,
     )?;
     if !checkout {
         remove_clone_worktree_files(&destination, &git_dir, format)?;
@@ -3029,12 +3033,14 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         });
         tx.commit()?;
     }
-    git_worktree::checkout_branch(
+    let config = read_repo_config(&git_dir)?;
+    git_worktree::checkout_branch_filtered(
         options.destination,
         &git_dir,
         format,
         &checkout_branch,
         commit_identity_from_env("COMMITTER")?,
+        &config,
     )?;
     if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
@@ -3848,7 +3854,8 @@ fn cmd_add(args: &[String]) -> Result<()> {
             .cloned()
             .collect::<Vec<_>>();
         if !action_paths.is_empty() {
-            git_worktree::update_index_paths(
+            let config = read_repo_config(&git_dir)?;
+            git_worktree::update_index_paths_filtered(
                 &worktree_root,
                 git_dir,
                 format,
@@ -3861,6 +3868,7 @@ fn cmd_add(args: &[String]) -> Result<()> {
                     info_only: false,
                     ignore_skip_worktree_entries: false,
                 },
+                &config,
             )?;
         }
         if verbose {
@@ -3890,7 +3898,8 @@ fn cmd_add(args: &[String]) -> Result<()> {
         .cloned()
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
-        git_worktree::update_index_paths(
+        let config = read_repo_config(&git_dir)?;
+        git_worktree::update_index_paths_filtered(
             &worktree_root,
             git_dir,
             format,
@@ -3903,6 +3912,7 @@ fn cmd_add(args: &[String]) -> Result<()> {
                 info_only: false,
                 ignore_skip_worktree_entries: false,
             },
+            &config,
         )?;
     }
     if verbose {
@@ -26449,12 +26459,14 @@ fn cmd_checkout(args: &[String]) -> Result<()> {
     };
     let branch = checkout_message.branch();
 
-    git_worktree::checkout_branch(
+    let config = read_repo_config(&git_dir)?;
+    git_worktree::checkout_branch_filtered(
         worktree_root,
         git_dir,
         format,
         branch,
         commit_identity_from_env("COMMITTER")?,
+        &config,
     )?;
     if !quiet {
         checkout_message.print();
@@ -29551,7 +29563,8 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
     if action_paths.is_empty() {
         return Ok(());
     }
-    git_worktree::update_index_paths(
+    let config = read_repo_config(git_dir)?;
+    git_worktree::update_index_paths_filtered(
         &worktree_root,
         git_dir,
         format,
@@ -29564,6 +29577,7 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
             info_only: false,
             ignore_skip_worktree_entries: false,
         },
+        &config,
     )?;
     Ok(())
 }
@@ -40524,7 +40538,8 @@ fn cmd_update_index(args: &[String]) -> Result<()> {
             assume_unchanged,
         )?;
     } else if !resolved_paths.is_empty() {
-        git_worktree::update_index_paths(
+        let config = read_repo_config(&git_dir)?;
+        git_worktree::update_index_paths_filtered(
             &worktree_root,
             git_dir.clone(),
             format,
@@ -40537,6 +40552,7 @@ fn cmd_update_index(args: &[String]) -> Result<()> {
                 info_only,
                 ignore_skip_worktree_entries,
             },
+            &config,
         )?;
         if verbose {
             print_update_index_path_actions(&worktree_root, &resolved_paths, force_remove)?;
