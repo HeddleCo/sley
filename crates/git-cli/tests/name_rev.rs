@@ -219,6 +219,7 @@ fn name_rev_basic_branches_and_tags_match_git() {
     }
     let root = unique_temp_dir("name-rev-basic");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     build_fixture(&repo);
 
     let merge = rev_parse(&repo, "HEAD");
@@ -265,6 +266,7 @@ fn name_rev_refs_and_exclude_filters_match_git() {
     }
     let root = unique_temp_dir("name-rev-refs");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     build_fixture(&repo);
 
     let merge = rev_parse(&repo, "HEAD");
@@ -317,6 +319,7 @@ fn name_rev_annotated_tag_match_git() {
     }
     let root = unique_temp_dir("name-rev-anno");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     git_ok(&repo, &["init", "-q", "-b", "main"]);
     commit_empty(&repo, "root");
     git_ok(&repo, &["checkout", "-q", "-b", "side"]);
@@ -354,6 +357,7 @@ fn name_rev_undefined_and_always_match_git() {
     }
     let root = unique_temp_dir("name-rev-undef");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     git_ok(&repo, &["init", "-b", "main", "-q"]);
     commit_empty(&repo, "c1");
     git_ok(&repo, &["tag", "t1"]);
@@ -396,6 +400,7 @@ fn name_rev_all_matches_git_sorted() {
     }
     let root = unique_temp_dir("name-rev-all");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     build_fixture(&repo);
 
     // `--all` lists every commit reachable from all refs (all refs are naming
@@ -416,6 +421,7 @@ fn name_rev_annotate_stdin_matches_git() {
     }
     let root = unique_temp_dir("name-rev-stdin");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     build_fixture(&repo);
 
     let head = rev_parse(&repo, "HEAD");
@@ -447,6 +453,7 @@ fn name_rev_usage_errors_match_git() {
     }
     let root = unique_temp_dir("name-rev-usage");
     let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
     build_fixture(&repo);
 
     for args in [
