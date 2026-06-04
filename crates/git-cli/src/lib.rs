@@ -29598,6 +29598,23 @@ fn print_clean_commit_status(git_dir: &Path, format: ObjectFormat) -> Result<()>
     Ok(())
 }
 
+/// Parse a git rename/copy similarity spec (`-M50`, `-M50%`, `-M0.5`, `--find-renames=75%`)
+/// into a 0..=100 threshold. A bare `-M` (no value) keeps the default.
+fn parse_similarity_threshold(spec: &str) -> u8 {
+    let spec = spec.strip_suffix('%').unwrap_or(spec);
+    match spec.parse::<f64>() {
+        Ok(value) => {
+            let pct = if value <= 1.0 && spec.contains('.') {
+                value * 100.0
+            } else {
+                value
+            };
+            pct.round().clamp(0.0, 100.0) as u8
+        }
+        Err(_) => git_diff_merge::DEFAULT_RENAME_THRESHOLD,
+    }
+}
+
 fn cmd_diff(args: &[String]) -> Result<()> {
     let mut name_status = false;
     let mut name_only = false;
@@ -29641,6 +29658,11 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut detect_copies = false;
     let mut find_copies_harder = false;
     let mut rename_empty = true;
+    // git enables rename detection by default (diff.renames defaults to true);
+    // --no-renames turns it off. -M/-C select the similarity thresholds.
+    let mut inexact_renames = true;
+    let mut rename_threshold = git_diff_merge::DEFAULT_RENAME_THRESHOLD;
+    let mut copy_threshold = git_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -29990,35 +30012,51 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                     .clone();
             }
             "-z" => z = true,
-            "-M" | "--find-renames" => detect_renames = true,
-            "-C" | "--find-copies" => detect_copies = true,
+            "-M" | "--find-renames" => {
+                detect_renames = true;
+                inexact_renames = true;
+            }
+            "-C" | "--find-copies" => {
+                detect_copies = true;
+                inexact_renames = true;
+            }
             "--find-copies-harder" => {
                 detect_copies = true;
                 find_copies_harder = true;
+                inexact_renames = true;
             }
             "--no-find-copies-harder" => {
                 find_copies_harder = false;
             }
             "--no-renames" => {
                 detect_renames = false;
+                inexact_renames = false;
             }
             "--rename-empty" => rename_empty = true,
             "--no-rename-empty" => rename_empty = false,
             value if value.starts_with("-M") && value.len() > 2 => {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 detect_renames = true;
+                inexact_renames = true;
+                rename_threshold = parse_similarity_threshold(&value[2..]);
             }
             value if let Some(value) = value.strip_prefix("--find-renames=") => {
                 log_validate_similarity_option(value, "find-renames")?;
                 detect_renames = true;
+                inexact_renames = true;
+                rename_threshold = parse_similarity_threshold(value);
             }
             value if value.starts_with("-C") && value.len() > 2 => {
                 log_validate_similarity_option(&value[2..], "find-copies")?;
                 detect_copies = true;
+                inexact_renames = true;
+                copy_threshold = parse_similarity_threshold(&value[2..]);
             }
             value if let Some(value) = value.strip_prefix("--find-copies=") => {
                 log_validate_similarity_option(value, "find-copies")?;
                 detect_copies = true;
+                inexact_renames = true;
+                copy_threshold = parse_similarity_threshold(value);
             }
             value if value.starts_with("--find-copies-harder=") => {
                 return log_option_takes_no_value_error("find-copies-harder");
@@ -30231,28 +30269,62 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         rename_empty,
     };
     let zero_worktree_oids = !cached && !head;
+    let rename_options = git_diff_merge::RenameDetectionOptions {
+        base: name_status_options,
+        detect_inexact: true,
+        rename_threshold,
+        copy_threshold,
+    };
     let entries = if cached {
-        git_diff_merge::diff_name_status_head_index_with_options(
-            &git_dir,
-            format,
-            name_status_options,
-        )?
+        if inexact_renames {
+            git_diff_merge::diff_name_status_head_index_with_rename_options(
+                &git_dir,
+                format,
+                rename_options,
+            )?
+        } else {
+            git_diff_merge::diff_name_status_head_index_with_options(
+                &git_dir,
+                format,
+                name_status_options,
+            )?
+        }
     } else if head {
-        git_diff_merge::diff_name_status_head_worktree_with_options(
-            worktree_root
-                .as_ref()
-                .expect("worktree root set for diff HEAD"),
-            &git_dir,
-            format,
-            name_status_options,
-        )?
+        let worktree_root = worktree_root
+            .as_ref()
+            .expect("worktree root set for diff HEAD");
+        if inexact_renames {
+            git_diff_merge::diff_name_status_head_worktree_with_rename_options(
+                worktree_root,
+                &git_dir,
+                format,
+                rename_options,
+            )?
+        } else {
+            git_diff_merge::diff_name_status_head_worktree_with_options(
+                worktree_root,
+                &git_dir,
+                format,
+                name_status_options,
+            )?
+        }
     } else {
-        git_diff_merge::diff_name_status_index_worktree_with_options(
-            worktree_root.as_ref().expect("worktree root set for diff"),
-            &git_dir,
-            format,
-            name_status_options,
-        )?
+        let worktree_root = worktree_root.as_ref().expect("worktree root set for diff");
+        if inexact_renames {
+            git_diff_merge::diff_name_status_index_worktree_with_rename_options(
+                worktree_root,
+                &git_dir,
+                format,
+                rename_options,
+            )?
+        } else {
+            git_diff_merge::diff_name_status_index_worktree_with_options(
+                worktree_root,
+                &git_dir,
+                format,
+                name_status_options,
+            )?
+        }
     };
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if let Some(needle) = pickaxe.as_deref() {

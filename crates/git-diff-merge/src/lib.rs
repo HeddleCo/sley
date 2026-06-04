@@ -634,8 +634,8 @@ impl NameStatus {
 
     pub fn label(self) -> String {
         match self {
-            Self::Renamed(score) => format!("R{score}"),
-            Self::Copied(score) => format!("C{score}"),
+            Self::Renamed(score) => format!("R{score:03}"),
+            Self::Copied(score) => format!("C{score:03}"),
             _ => self.code().to_string(),
         }
     }
@@ -3374,7 +3374,7 @@ new mode 100755
         assert_eq!(entries[0].status, NameStatus::Renamed(75));
         assert_eq!(entries[0].old_path.as_deref(), Some(b"a.txt".as_slice()));
         assert_eq!(entries[0].path, b"b.txt");
-        assert_eq!(entries[0].line(), "R75\ta.txt\tb.txt");
+        assert_eq!(entries[0].line(), "R075\ta.txt\tb.txt");
         fs::remove_dir_all(root).unwrap();
     }
 
