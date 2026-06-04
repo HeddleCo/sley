@@ -1,7 +1,11 @@
 [workspace]
 members = [
     "crates/git-core",
+    "crates/git-object",
+    "crates/git-config",
+    "crates/git-index",
     "crates/git-formats",
+    "crates/git-protocol",
     "crates/git-odb",
     "crates/git-refs",
     "crates/git-rev",
@@ -13,6 +17,7 @@ members = [
     "crates/git-fetch",
     "crates/git-fsck",
     "crates/git-archive",
+    "crates/git",
     "crates/git-cli",
     "crates/git-testkit",
 ]
