@@ -192,13 +192,17 @@ fn verify_one_tag(
         Err(err) => return Err(err),
     };
 
-    // The OID came back from the object database, so a read failure here is an
-    // unexpected corruption rather than a user error; treat it like an
-    // unresolvable argument so the run still processes every operand and exits 1.
+    // `resolve_revision` returns a valid object id for any full-length hex string
+    // *without* checking that the object exists (matching git's `get_oid`, which
+    // parses a complete oid directly). So a well-formed-but-absent oid — e.g. the
+    // all-zeros id — resolves here and then fails to read. git, in that case, asks
+    // the object database for the type, gets "none", and reports it as a non-tag
+    // object of type `(null)` rather than "tag not found" (the latter is reserved
+    // for arguments that never resolve to an oid at all, handled above).
     let object = match db.read_object(&oid) {
         Ok(object) => object,
         Err(_) => {
-            eprintln!("error: tag '{tag}' not found.");
+            eprintln!("error: {tag}: cannot verify a non-tag object of type (null).");
             return Ok(false);
         }
     };

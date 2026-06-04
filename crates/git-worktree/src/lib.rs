@@ -63,6 +63,11 @@ pub struct ApplySparseResult {
     /// Paths that were taken out of the worktree because they are out of cone;
     /// their index entry now has the skip-worktree bit set.
     pub skipped: Vec<Vec<u8>>,
+    /// Out-of-cone paths whose worktree file was *not* up to date with the index
+    /// and was therefore left in place (and its skip-worktree bit left clear),
+    /// matching git's data-loss-avoiding behavior. The caller surfaces these as
+    /// git's "The following paths are not up to date …" warning. Sorted by path.
+    pub not_up_to_date: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4039,12 +4044,14 @@ pub fn apply_sparse_checkout_with_mode(
         return Ok(ApplySparseResult {
             materialized: Vec::new(),
             skipped: Vec::new(),
+            not_up_to_date: Vec::new(),
         });
     };
     let matcher = SparseMatcher::new(sparse, mode);
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut materialized = Vec::new();
     let mut skipped = Vec::new();
+    let mut not_up_to_date = Vec::new();
     for entry in &mut index.entries {
         // Never touch conflicted entries.
         if index_entry_stage(entry) != 0 {
@@ -4058,17 +4065,61 @@ pub fn apply_sparse_checkout_with_mode(
             }
             materialized.push(entry.path.clone());
         } else {
-            set_skip_worktree(entry);
-            remove_worktree_file(worktree_root, &entry.path)?;
-            skipped.push(entry.path.clone());
+            // The path is out of cone, so its worktree file should be removed and
+            // the entry marked skip-worktree. But git refuses to delete a file
+            // that is *not up to date* with the index (e.g. one that reappeared in
+            // the worktree after the path was already sparse): it leaves the file,
+            // leaves the skip-worktree bit clear, and reports the path in its "not
+            // up to date" warning. Mirror that to avoid silent data loss.
+            let file_path = worktree_path(worktree_root, &entry.path)?;
+            match fs::symlink_metadata(&file_path) {
+                Ok(metadata) if !worktree_entry_is_uptodate(entry, &metadata) => {
+                    clear_skip_worktree(entry);
+                    not_up_to_date.push(entry.path.clone());
+                }
+                _ => {
+                    set_skip_worktree(entry);
+                    remove_worktree_file(worktree_root, &entry.path)?;
+                    skipped.push(entry.path.clone());
+                }
+            }
         }
     }
+    not_up_to_date.sort();
     normalize_index_version_for_extended_flags(&mut index);
     fs::write(index_path, index.write(format)?)?;
     Ok(ApplySparseResult {
         materialized,
         skipped,
+        not_up_to_date,
     })
+}
+
+/// Whether the worktree file described by `metadata` is up to date with `entry`'s
+/// cached index stat, using the size + mtime heuristic at the core of git's
+/// `ie_match_stat`. A freshly-checked-out (clean) file matches; a file that was
+/// deleted and later recreated — as happens when an out-of-cone path reappears in
+/// the worktree — gets a fresh mtime and so reads as modified, which is exactly
+/// the state git declines to overwrite during a sparse update.
+fn worktree_entry_is_uptodate(entry: &IndexEntry, metadata: &fs::Metadata) -> bool {
+    if u64::from(entry.size) != metadata.len() {
+        return false;
+    }
+    let Some((mtime_seconds, mtime_nanoseconds)) = file_mtime_parts(metadata) else {
+        // Without a usable mtime we cannot prove the file is clean; treat it as
+        // not up to date so a present file is never silently discarded.
+        return false;
+    };
+    u64::from(entry.mtime_seconds) == mtime_seconds
+        && u64::from(entry.mtime_nanoseconds) == mtime_nanoseconds
+}
+
+/// The file's modification time split into whole seconds and the sub-second
+/// nanosecond remainder, matching how git stores `mtime` in the index.
+fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
+    let modified = metadata.modified().ok()?;
+    let duration = modified.duration_since(UNIX_EPOCH).ok()?;
+    Some((duration.as_secs(), u64::from(duration.subsec_nanos())))
 }
 
 /// Checks out `target` like [`checkout_detached`], but materializes the

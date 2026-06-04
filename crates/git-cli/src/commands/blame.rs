@@ -735,12 +735,8 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
     }
     let mut selected: BTreeSet<usize> = BTreeSet::new();
     for range in &options.ranges {
-        let (start, end) = resolve_range(range, total, path)?;
-        if start > end {
-            // git accepts start>end (both valid) and prints nothing for it.
-            continue;
-        }
-        for line in start..=end {
+        let (lo, hi) = resolve_range(range, total, path)?;
+        for line in lo..=hi {
             selected.insert(line);
         }
     }
@@ -748,7 +744,15 @@ fn select_lines(lines: &[LineBlame], options: &BlameOptions, path: &str) -> Resu
 }
 
 /// Resolve one `-L` range against the file's `total` line count, applying git's
-/// defaults and error messages.
+/// defaults and error messages. Returns an inclusive `(lo, hi)` 1-based span,
+/// already clamped to the file, that the caller can iterate directly.
+///
+/// git accepts a "reversed" range (`-L 5,2`): it resolves both endpoints and
+/// then displays the *inclusive span between them*, i.e. `[min(start,end),
+/// max(start,end)]`. The "file has only N lines" error is therefore keyed off
+/// the *smaller* endpoint, not the literal start: `-L 100,2` lists lines 2..N
+/// (no error), while `-L 100,200` — whose smaller endpoint is also past the end
+/// — is the error. We mirror that exactly.
 fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, usize)> {
     let start = match range.start {
         RangeBound::Omitted => 1,
@@ -757,12 +761,10 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
         // relative start, so this is defensive and reports a usage error.
         RangeBound::Relative(_) => return Err(blame_usage_error()),
     };
+    // git validates the start line number before anything else (so `-L 0,+5` and
+    // `-L 0,3` both report the zero error rather than an empty-range/clamp).
     if start == 0 {
         eprintln!("fatal: -L invalid line number: 0");
-        return Err(GitError::Exit(128));
-    }
-    if start > total {
-        eprintln!("fatal: file {path} has only {total} lines");
         return Err(GitError::Exit(128));
     }
     let end = match range.end {
@@ -772,11 +774,27 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
                 eprintln!("fatal: -L invalid line number: 0");
                 return Err(GitError::Exit(128));
             }
-            n.min(total)
+            n
         }
-        RangeBound::Relative(count) => (start + count.saturating_sub(1)).min(total),
+        // `start,+0` is an empty range, which git rejects outright; otherwise the
+        // end is `start + count - 1` (a `+N` range can never be reversed).
+        RangeBound::Relative(count) => {
+            if count == 0 {
+                eprintln!("fatal: -L invalid empty range");
+                return Err(GitError::Exit(128));
+            }
+            start + count - 1
+        }
     };
-    Ok((start, end))
+    // Order the endpoints, then bound-check the lower one and clamp the upper one
+    // to the file, matching git's blame range handling.
+    let lo = start.min(end);
+    let hi = start.max(end);
+    if lo > total {
+        eprintln!("fatal: file {path} has only {total} lines");
+        return Err(GitError::Exit(128));
+    }
+    Ok((lo, hi.min(total)))
 }
 
 /// Print the selected lines in git blame's default format.

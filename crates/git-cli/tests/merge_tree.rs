@@ -85,8 +85,14 @@ fn default_branch(dir: &Path) -> String {
 /// Assert real `git merge-tree` and `git-rs merge-tree` produce identical
 /// stdout, stderr, and exit status for `args` run in `dir`.
 fn assert_same(dir: &Path, args: &[&str]) {
-    let reference = git(dir, args);
-    let candidate = git_rs(dir, args);
+    // Prepend the `merge-tree` subcommand so each case actually drives
+    // `git merge-tree …` rather than treating the first flag as a top-level
+    // git option.
+    let mut full: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    full.push("merge-tree");
+    full.extend_from_slice(args);
+    let reference = git(dir, &full);
+    let candidate = git_rs(dir, &full);
     assert_eq!(
         candidate.status.code(),
         reference.status.code(),

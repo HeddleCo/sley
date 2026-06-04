@@ -19,14 +19,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-wide monotonic counter that disambiguates temp directories created by
+/// different test threads. `libtest` runs tests in parallel, so two threads can
+/// observe the same `pid` and the same nanosecond clock reading; without a
+/// per-call serial the directory names collide and a second `git init` lands in a
+/// half-built repo (surfacing as `fatal: cannot mkdir …/repo: File exists`).
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("git-rs-{name}-{}-{nanos}", std::process::id()));
+    let serial = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "git-rs-{name}-{}-{nanos}-{serial}",
+        std::process::id()
+    ));
     fs::create_dir_all(&path).expect("create temp root");
     path
 }
@@ -293,9 +305,17 @@ fn verify_tag_usage_and_option_errors_match_git() {
         vec!["verify-tag", "--verbose=1"],
         vec!["verify-tag", "--raw=1"],
         vec!["verify-tag", "--format"],
-        // Help goes to stdout, exit 129.
+        // `-h` prints the short usage block to stdout, exit 129.
         vec!["verify-tag", "-h"],
-        vec!["verify-tag", "--help"],
+        // NB: `--help` is intentionally *not* exercised here. Real git treats
+        // `git verify-tag --help` as a request for the manual page and execs
+        // `man git-verify-tag`, whose output embeds the locally-installed git
+        // version and the page's build date (e.g. "Git 2.54.0 ... 2026-04-19")
+        // plus `man`-specific overstrike/formatting that varies with the host's
+        // terminal, locale, and man implementation. That output is inherently
+        // non-reproducible and host-specific, so a byte-for-byte differential
+        // assertion against it cannot pass portably; `-h` above is the stable,
+        // self-emitted usage path and is the meaningful thing to pin.
     ] {
         assert_same(&repo, &args);
     }

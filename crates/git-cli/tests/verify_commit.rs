@@ -17,14 +17,26 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Process-wide monotonic counter that disambiguates temp directories created by
+/// different test threads. `libtest` runs tests in parallel, so two threads can
+/// observe the same `pid` and the same nanosecond clock reading; without a
+/// per-call serial the directory names collide and a second `git init` lands in a
+/// half-built repo (surfacing as `fatal: cannot mkdir …/repo: File exists`).
+static TEMP_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system time before unix epoch")
         .as_nanos();
-    let path = std::env::temp_dir().join(format!("git-rs-{name}-{}-{nanos}", std::process::id()));
+    let serial = TEMP_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "git-rs-{name}-{}-{nanos}-{serial}",
+        std::process::id()
+    ));
     fs::create_dir_all(&path).expect("create temp root");
     path
 }

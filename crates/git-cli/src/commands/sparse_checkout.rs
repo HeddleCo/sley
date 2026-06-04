@@ -683,8 +683,37 @@ fn apply_current_sparse(ctx: &SparseContext) -> Result<()> {
         patterns,
         sparse_index: false,
     };
-    apply_sparse_checkout_with_mode(&ctx.worktree_root, &ctx.git_dir, ctx.format, &sparse, mode)?;
+    let result = apply_sparse_checkout_with_mode(
+        &ctx.worktree_root,
+        &ctx.git_dir,
+        ctx.format,
+        &sparse,
+        mode,
+    )?;
+    warn_not_up_to_date(&result.not_up_to_date);
     Ok(())
+}
+
+/// Emit git's warning for out-of-cone paths that were left in place because their
+/// worktree file was not up to date. Byte-for-byte identical to upstream,
+/// including the leading-tab list, the trailing blank line, and the follow-up
+/// "After fixing …" sentence. No-op when there is nothing to warn about.
+fn warn_not_up_to_date(paths: &[Vec<u8>]) {
+    if paths.is_empty() {
+        return;
+    }
+    let mut message =
+        b"warning: The following paths are not up to date and were left despite sparse patterns:\n"
+            .to_vec();
+    for path in paths {
+        message.push(b'\t');
+        message.extend_from_slice(path);
+        message.push(b'\n');
+    }
+    message.extend_from_slice(
+        b"\nAfter fixing the above paths, you may want to run `git sparse-checkout reapply`.\n",
+    );
+    let _ = io::stderr().write_all(&message);
 }
 
 // --------------------------------------------------------------------------
