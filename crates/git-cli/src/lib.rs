@@ -85,6 +85,9 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "clone" => cmd_clone(&args[1..]),
         "config" => cmd_config(&args[1..]),
         "count-objects" => cmd_count_objects(&args[1..]),
+        "gc" => cmd_gc(&args[1..]),
+        "repack" => cmd_repack(&args[1..]),
+        "apply" => cmd_apply(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "commit-graph" => cmd_commit_graph(&args[1..]),
         "commit-tree" => cmd_commit_tree(&args[1..]),
@@ -4581,6 +4584,187 @@ fn cmd_check_attr(args: &[String]) -> Result<()> {
         }
     }
     stdout.flush()?;
+    Ok(())
+}
+
+fn cmd_repack(args: &[String]) -> Result<()> {
+    let mut prune = false;
+    let mut quiet = false;
+    for arg in args {
+        match arg.as_str() {
+            "-d" => prune = true,
+            "-q" | "--quiet" => quiet = true,
+            // Accepted no-ops: we always rewrite every object into one pack.
+            "-a" | "-A" | "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
+            value if value.starts_with("--window") || value.starts_with("--depth") => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!("unsupported repack option {value}")));
+            }
+            value => {
+                return Err(GitError::Command(format!("unsupported repack argument {value}")));
+            }
+        }
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    if let Some(result) = git_odb::repack_all_objects(&common_git_dir, format)? {
+        git_odb::install_repack_result(&common_git_dir, format, &result, prune)?;
+    }
+    let _ = quiet;
+    Ok(())
+}
+
+fn cmd_gc(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            // Accepted no-ops for the M1 subset (we consolidate packs + drop
+            // redundant ones; aggressive unreachable pruning is deferred).
+            "--auto" | "--aggressive" | "--force" | "--no-detach" | "--prune" | "--no-prune"
+            | "--progress" | "--no-progress" | "--keep-largest-pack" => {}
+            value if value.starts_with("--prune=") => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!("unsupported gc option {value}")));
+            }
+            value => {
+                return Err(GitError::Command(format!("unsupported gc argument {value}")));
+            }
+        }
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    if let Some(result) = git_odb::repack_all_objects(&common_git_dir, format)? {
+        // gc removes packs/loose made redundant by the new pack (safe: only
+        // objects already present in the new pack are dropped).
+        git_odb::install_repack_result(&common_git_dir, format, &result, true)?;
+    }
+    let _ = quiet;
+    Ok(())
+}
+
+enum ApplyAction {
+    Write {
+        path: Vec<u8>,
+        mode: u32,
+        content: Vec<u8>,
+    },
+    Remove {
+        path: Vec<u8>,
+    },
+}
+
+fn cmd_apply(args: &[String]) -> Result<()> {
+    let mut check = false;
+    let mut files = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--apply" | "--stat" | "--numstat" | "--summary" | "-q" | "--quiet" | "--recount"
+            | "--allow-empty" | "--unsafe-paths" => {}
+            "-R" | "--reverse" => {
+                return Err(GitError::Unsupported("apply --reverse is not supported yet".into()));
+            }
+            "-3" | "--3way" | "--index" | "--cached" => {
+                return Err(GitError::Unsupported(format!("apply {arg} is not supported yet")));
+            }
+            "-p" | "-C" | "--whitespace" | "--directory" | "--exclude" | "--include" => {
+                iter.next();
+            }
+            "--" => {
+                files.extend(iter.by_ref().map(|value| value.to_string()));
+                break;
+            }
+            value
+                if value.starts_with("-p")
+                    || value.starts_with("--whitespace=")
+                    || value.starts_with("--directory=")
+                    || value.starts_with("--exclude=")
+                    || value.starts_with("--include=") => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!("unsupported apply option {value}")));
+            }
+            value => files.push(value.to_string()),
+        }
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let mut input = Vec::new();
+    if files.is_empty() {
+        io::stdin().read_to_end(&mut input)?;
+    } else {
+        for file in &files {
+            input.extend_from_slice(&fs::read(file)?);
+        }
+    }
+    let patches = git_diff_merge::parse_unified_patch(&input)?;
+
+    // Phase 1: compute every result first (git applies a patch atomically).
+    let mut actions = Vec::new();
+    for patch in &patches {
+        let base = if patch.is_new {
+            Vec::new()
+        } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
+            let rel = std::str::from_utf8(old)
+                .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
+            fs::read(worktree_root.join(rel)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let content = match git_diff_merge::apply_file_patch(&base, patch) {
+            git_diff_merge::ApplyOutcome::Applied(content) => content,
+            git_diff_merge::ApplyOutcome::Rejected => {
+                let name = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"");
+                eprintln!(
+                    "error: patch failed: {}",
+                    String::from_utf8_lossy(name)
+                );
+                return Err(GitError::Exit(1));
+            }
+        };
+        if patch.is_delete {
+            if let Some(old) = &patch.old_path {
+                actions.push(ApplyAction::Remove { path: old.clone() });
+            }
+        } else {
+            let mode = patch.new_mode.or(patch.old_mode).unwrap_or(0o100644);
+            let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+                return Err(GitError::InvalidFormat("patch missing target path".into()));
+            };
+            actions.push(ApplyAction::Write {
+                path: target,
+                mode,
+                content,
+            });
+            if patch.is_rename {
+                if let Some(old) = &patch.old_path {
+                    actions.push(ApplyAction::Remove { path: old.clone() });
+                }
+            }
+        }
+    }
+
+    if check {
+        return Ok(());
+    }
+    // Phase 2: materialize.
+    for action in actions {
+        match action {
+            ApplyAction::Write {
+                path,
+                mode,
+                content,
+            } => merge_write_worktree_file(&worktree_root, &path, &content, mode)?,
+            ApplyAction::Remove { path } => merge_remove_worktree_file(&worktree_root, &path)?,
+        }
+    }
     Ok(())
 }
 
