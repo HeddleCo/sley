@@ -295,3 +295,45 @@ fn show_ref_exclude_existing_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
     result
 }
+
+#[test]
+fn show_ref_reftable_repository_matches_upstream_git() {
+    let root = unique_temp_dir("show-ref-reftable");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        run_success("git", &root, &["init", "-q", "--ref-format=reftable"]);
+        run_success(
+            "git",
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        run_success("git", &root, &["tag", "v1.0"]);
+        run_success("git", &root, &["branch", "feature"]);
+
+        for args in [
+            vec!["show-ref"],
+            vec!["show-ref", "--head"],
+            vec!["show-ref", "--branches"],
+            vec!["show-ref", "--tags"],
+            vec!["show-ref", "--verify", "HEAD"],
+            vec!["show-ref", "--verify", "refs/heads/main"],
+            vec!["show-ref", "--exists", "refs/tags/v1.0"],
+        ] {
+            let expected = run("git", &root, &args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}

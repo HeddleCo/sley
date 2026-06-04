@@ -19,6 +19,15 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Output {
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
+fn run_with_env(program: &str, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
 fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = run(program, cwd, args);
     assert!(
@@ -91,6 +100,39 @@ fn prepare_remote_repo(root: &Path) -> PathBuf {
 
 fn file_url(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
+}
+
+fn percent_encoded_file_url(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
+}
+
+fn ssh_url(path: &Path) -> String {
+    format!("ssh://fake-host{}", path.to_string_lossy())
+}
+
+fn percent_encoded_ssh_url(path: &Path) -> String {
+    format!(
+        "ssh://fake-host{}",
+        path.to_string_lossy().replace(' ', "%20")
+    )
+}
+
+fn fake_ssh_script(root: &Path) -> PathBuf {
+    let script = root.join("fake-ssh.sh");
+    fs::write(
+        &script,
+        b"#!/bin/sh\nlast=''\nfor arg in \"$@\"; do last=$arg; done\neval \"exec $last\"\n",
+    )
+    .expect("write fake ssh script");
+    let mode = fs::metadata(&script).expect("stat fake ssh").permissions();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut mode = mode;
+        mode.set_mode(0o755);
+        fs::set_permissions(&script, mode).expect("chmod fake ssh");
+    }
+    script
 }
 
 #[test]
@@ -244,6 +286,80 @@ fn ls_remote_local_repository_matches_upstream_git() {
 }
 
 #[test]
+fn ls_remote_ssh_repository_matches_upstream_git_protocol_v0() {
+    let root = unique_temp_dir("ls-remote-ssh");
+    let result = (|| {
+        fs::create_dir_all(&root).expect("create root");
+        let remote = prepare_remote_repo(&root);
+        let fake_ssh = fake_ssh_script(&root);
+        let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
+        let remote_url = ssh_url(&remote);
+        let remote_scp = format!("fake-host:{}", remote.to_string_lossy());
+
+        for args in [
+            vec!["ls-remote", remote_url.as_str()],
+            vec!["ls-remote", "--heads", remote_url.as_str()],
+            vec!["ls-remote", "--tags", remote_url.as_str()],
+            vec!["ls-remote", "--refs", remote_url.as_str()],
+            vec!["ls-remote", "--symref", remote_url.as_str(), "HEAD"],
+            vec!["ls-remote", remote_url.as_str(), "feature/topic", "ann"],
+            vec!["ls-remote", "--exit-code", remote_url.as_str(), "missing"],
+            vec!["ls-remote", remote_scp.as_str(), "refs/heads/main"],
+        ] {
+            let mut expected_args = vec!["-c", "protocol.version=0"];
+            expected_args.extend(args.iter().copied());
+            let expected = run_with_env("git", &root, &expected_args, &[("GIT_SSH", fake_ssh)]);
+            let actual = run_with_env(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &root,
+                &args,
+                &[("GIT_SSH", fake_ssh)],
+            );
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn ls_remote_configured_percent_encoded_ssh_remote_matches_upstream_git() {
+    let root = unique_temp_dir("ls-remote-configured-percent-ssh");
+    let result = (|| {
+        fs::create_dir_all(&root).expect("create root");
+        let remote_dir = root.join("remote with space");
+        fs::create_dir_all(&remote_dir).expect("create remote dir");
+        let _remote = prepare_remote_repo(&remote_dir);
+        let remote = remote_dir.join("remote");
+        let fake_ssh = fake_ssh_script(&root);
+        let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
+        let remote_url = percent_encoded_ssh_url(&remote);
+        let client = root.join("client");
+        run_success("git", &root, &["init", "-q", "client"]);
+        run_success("git", &client, &["remote", "add", "origin", &remote_url]);
+
+        for args in [
+            vec!["ls-remote", "origin"],
+            vec!["ls-remote", "--symref", "origin", "HEAD"],
+            vec!["ls-remote", "--heads", "origin"],
+        ] {
+            let mut expected_args = vec!["-c", "protocol.version=0"];
+            expected_args.extend(args.iter().copied());
+            let expected = run_with_env("git", &client, &expected_args, &[("GIT_SSH", fake_ssh)]);
+            let actual = run_with_env(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &client,
+                &args,
+                &[("GIT_SSH", fake_ssh)],
+            );
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn ls_remote_configured_local_remote_matches_upstream_git() {
     let root = unique_temp_dir("ls-remote-configured");
     let result = (|| {
@@ -299,6 +415,52 @@ fn ls_remote_configured_local_remote_matches_upstream_git() {
             vec!["ls-remote", "alias-origin"],
             vec!["ls-remote", "--heads", "alias-origin"],
             vec!["ls-remote", "--get-url", "alias-origin"],
+        ] {
+            let expected = run("git", &client, &args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &client, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
+    let root = unique_temp_dir("ls-remote-configured-percent-file");
+    let result = (|| {
+        fs::create_dir_all(&root).expect("create root");
+        let remote = root.join("remote repo");
+        fs::create_dir_all(&remote).expect("create remote");
+        run_success("git", &remote, &["init", "-q"]);
+        run_success(
+            "git",
+            &remote,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        );
+        run_success("git", &remote, &["branch", "feature/topic"]);
+        let client = root.join("client");
+        run_success("git", &root, &["init", "-q", "client"]);
+        let remote_file_url = percent_encoded_file_url(&remote);
+        run_success(
+            "git",
+            &client,
+            &["remote", "add", "origin", remote_file_url.as_str()],
+        );
+
+        for args in [
+            vec!["ls-remote", "origin"],
+            vec!["ls-remote", "--heads", "origin"],
+            vec!["ls-remote", "--symref", "origin", "HEAD"],
         ] {
             let expected = run("git", &client, &args);
             let actual = run(env!("CARGO_BIN_EXE_git-rs"), &client, &args);

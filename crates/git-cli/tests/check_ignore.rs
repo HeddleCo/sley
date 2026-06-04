@@ -75,6 +75,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn fixture(root: &Path) {
     run("git", root, &["init", "-q"]);
+    write_fixture_contents(root);
+}
+
+fn sha256_fixture(root: &Path) {
+    run("git", root, &["init", "-q", "--object-format=sha256"]);
+    write_fixture_contents(root);
+}
+
+fn write_fixture_contents(root: &Path) {
     fs::write(root.join(".gitignore"), b"*.log\n!important.log\ndir/\n").expect("write gitignore");
     fs::write(root.join(".git/info/exclude"), b"*.cache\n").expect("write info exclude");
     fs::write(root.join("global-excludes"), b"*.global\n").expect("write global excludes");
@@ -225,6 +234,46 @@ fn check_ignore_matches_upstream_git() {
             (
                 vec!["check-ignore", "-z", "ignored.log", "visible.txt"],
                 None,
+            ),
+        ] {
+            let expected = git(&upstream, &args, stdin);
+            let actual = git_rs(&rust, &args, stdin);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn check_ignore_sha256_tracked_paths_match_upstream_git() {
+    let root = unique_temp_dir("check-ignore-sha256");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    let result = (|| {
+        sha256_fixture(&upstream);
+        sha256_fixture(&rust);
+
+        for (args, stdin) in [
+            (
+                vec![
+                    "check-ignore",
+                    "ignored.log",
+                    "important.log",
+                    "tracked.log",
+                    "visible.txt",
+                ],
+                None,
+            ),
+            (
+                vec!["check-ignore", "--no-index", "tracked.log", "visible.txt"],
+                None,
+            ),
+            (
+                vec!["check-ignore", "--stdin"],
+                Some(&b"ignored.log\ntracked.log\nvisible.txt\n"[..]),
             ),
         ] {
             let expected = git(&upstream, &args, stdin);

@@ -1,6 +1,7 @@
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -21,6 +22,53 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Output {
 
 fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = run(program, cwd, args);
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn run_success_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+    let mut child = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    child
+        .stdin
+        .as_mut()
+        .expect("child stdin")
+        .write_all(stdin)
+        .expect("write child stdin");
+    let output = child
+        .wait_with_output()
+        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+fn run_success_with_committer(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new(program)
+        .current_dir(cwd)
+        .env("GIT_COMMITTER_NAME", "Example User")
+        .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+        .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
     assert!(
         output.status.success(),
         "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -129,6 +177,16 @@ fn prepare_repo_with_stale_linked_worktree(repo: &Path, linked: &Path) {
 fn prepare_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
     run_success("git", repo, &["init", "-q"]);
+    prepare_worktree_add_contents(repo);
+}
+
+fn prepare_sha256_repo_for_worktree_add(repo: &Path) {
+    fs::create_dir_all(repo).expect("create repo");
+    run_success("git", repo, &["init", "-q", "--object-format=sha256"]);
+    prepare_worktree_add_contents(repo);
+}
+
+fn prepare_worktree_add_contents(repo: &Path) {
     fs::write(repo.join("file.txt"), b"base\n").expect("write tracked file");
     run_success("git", repo, &["add", "file.txt"]);
     run_success_with_identity(repo, &["commit", "-qm", "initial"]);
@@ -348,6 +406,236 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
             )
             .stdout,
             run("git", &upstream_topic, &["status", "--short"]).stdout
+        );
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn worktree_add_sha256_branch_matches_upstream_git() {
+    let root = unique_temp_dir("worktree-add-sha256");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        let upstream_area = root.join("upstream-area");
+        let actual_area = root.join("actual-area");
+        let upstream = upstream_area.join("repo");
+        let actual = actual_area.join("repo");
+        prepare_sha256_repo_for_worktree_add(&upstream);
+        prepare_sha256_repo_for_worktree_add(&actual);
+
+        let upstream_topic = upstream_area.join("topic-wt");
+        let actual_topic = actual_area.join("topic-wt");
+        let upstream_topic_arg = upstream_topic.to_string_lossy().into_owned();
+        let actual_topic_arg = actual_topic.to_string_lossy().into_owned();
+        let expected = run(
+            "git",
+            &upstream,
+            &["worktree", "add", "-q", &upstream_topic_arg, "topic"],
+        );
+        let actual_output = run(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual,
+            &["worktree", "add", "-q", &actual_topic_arg, "topic"],
+        );
+        assert_same_output(
+            actual_output,
+            expected,
+            &["worktree", "add", "-q", "<path>", "topic"],
+        );
+        for args in [
+            vec!["rev-parse", "--show-object-format=storage"],
+            vec!["status", "--short"],
+            vec!["ls-files", "--stage"],
+        ] {
+            let expected = run("git", &upstream_topic, &args);
+            let actual = run("git", &actual_topic, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn sha256_linked_worktree_commands_use_common_git_dir() {
+    let root = unique_temp_dir("worktree-sha256-common-dir");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        let upstream_area = root.join("upstream-area");
+        let actual_area = root.join("actual-area");
+        let upstream = upstream_area.join("repo");
+        let actual = actual_area.join("repo");
+        prepare_sha256_repo_for_worktree_add(&upstream);
+        prepare_sha256_repo_for_worktree_add(&actual);
+
+        let upstream_linked = upstream_area.join("topic-wt");
+        let actual_linked = actual_area.join("topic-wt");
+        let upstream_linked_arg = upstream_linked.to_string_lossy().into_owned();
+        let actual_linked_arg = actual_linked.to_string_lossy().into_owned();
+        run_success(
+            "git",
+            &upstream,
+            &["worktree", "add", "-q", &upstream_linked_arg, "topic"],
+        );
+        run_success(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual,
+            &["worktree", "add", "-q", &actual_linked_arg, "topic"],
+        );
+
+        for args in [
+            vec!["rev-parse", "--show-object-format=storage"],
+            vec!["cat-file", "-t", "HEAD"],
+            vec!["status", "--short", "-uall"],
+        ] {
+            let expected = run("git", &upstream_linked, &args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &actual_linked, &args);
+            assert_same_output(actual, expected, &args);
+        }
+
+        let expected_oid = run_success_with_stdin(
+            "git",
+            &upstream_linked,
+            &["hash-object", "-w", "--stdin"],
+            b"linked object\n",
+        );
+        let actual_oid = run_success_with_stdin(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &["hash-object", "-w", "--stdin"],
+            b"linked object\n",
+        );
+        assert_eq!(actual_oid, expected_oid);
+        let actual_oid = String::from_utf8(actual_oid)
+            .expect("oid is utf8")
+            .trim()
+            .to_string();
+        assert_eq!(actual_oid.len(), 64);
+        assert!(
+            actual
+                .join(".git")
+                .join("objects")
+                .join(&actual_oid[..2])
+                .join(&actual_oid[2..])
+                .is_file(),
+            "hash-object from linked worktree should write to common object directory"
+        );
+
+        fs::write(upstream_linked.join("linked.txt"), b"linked\n").expect("write upstream file");
+        fs::write(actual_linked.join("linked.txt"), b"linked\n").expect("write actual file");
+        run_success("git", &upstream_linked, &["add", "linked.txt"]);
+        run_success(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &["add", "linked.txt"],
+        );
+        for args in [
+            vec!["diff", "--cached", "--name-status", "HEAD"],
+            vec!["write-tree"],
+        ] {
+            let expected = run("git", &upstream_linked, &args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &actual_linked, &args);
+            assert_same_output(actual, expected, &args);
+        }
+
+        let upstream_head = run_success("git", &upstream_linked, &["rev-parse", "HEAD"]);
+        let actual_head = run_success(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &["rev-parse", "HEAD"],
+        );
+        assert_eq!(actual_head, upstream_head);
+        let upstream_head = String::from_utf8(upstream_head)
+            .expect("head oid is utf8")
+            .trim()
+            .to_string();
+        let actual_head = String::from_utf8(actual_head)
+            .expect("head oid is utf8")
+            .trim()
+            .to_string();
+        run_success_with_committer(
+            "git",
+            &upstream_linked,
+            &[
+                "reflog",
+                "write",
+                "HEAD",
+                &upstream_head,
+                &upstream_head,
+                "linked-head",
+            ],
+        );
+        run_success_with_committer(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &[
+                "reflog",
+                "write",
+                "HEAD",
+                &actual_head,
+                &actual_head,
+                "linked-head",
+            ],
+        );
+        run_success(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &["reflog", "exists", "HEAD"],
+        );
+        assert_eq!(
+            run_success(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &actual_linked,
+                &["reflog", "--format=%gs", "-1", "HEAD"],
+            ),
+            b"linked-head\n"
+        );
+
+        run_success_with_committer(
+            "git",
+            &upstream_linked,
+            &[
+                "update-ref",
+                "-m",
+                "linked-branch",
+                "refs/heads/from-linked",
+                &upstream_head,
+            ],
+        );
+        run_success_with_committer(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &[
+                "update-ref",
+                "-m",
+                "linked-branch",
+                "refs/heads/from-linked",
+                &actual_head,
+            ],
+        );
+        run_success(
+            env!("CARGO_BIN_EXE_git-rs"),
+            &actual_linked,
+            &["reflog", "exists", "refs/heads/from-linked"],
+        );
+        assert_eq!(
+            run_success(
+                env!("CARGO_BIN_EXE_git-rs"),
+                &actual_linked,
+                &["reflog", "--format=%gs", "-1", "refs/heads/from-linked"],
+            ),
+            b"linked-branch\n"
+        );
+        assert!(
+            actual
+                .join(".git")
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("from-linked")
+                .is_file(),
+            "update-ref from linked worktree should create shared branch reflog in the common git dir"
         );
     })();
     let _ = fs::remove_dir_all(&root);

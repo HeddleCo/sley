@@ -1,8 +1,10 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
+use git_formats::{GitConfig, Reftable, ReftableRefRecord, ReftableRefValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RefTarget {
@@ -252,6 +254,7 @@ impl<'a> RefTransaction<'a> {
 #[derive(Debug, Clone)]
 pub struct FileRefStore {
     git_dir: PathBuf,
+    common_dir: PathBuf,
     format: ObjectFormat,
 }
 
@@ -300,14 +303,20 @@ pub struct AppliedBundleRefUpdate {
 
 impl FileRefStore {
     pub fn new(git_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
+        let git_dir = git_dir.into();
+        let common_dir = repository_common_dir(&git_dir);
         Self {
-            git_dir: git_dir.into(),
+            git_dir,
+            common_dir,
             format,
         }
     }
 
     pub fn read_ref(&self, name: &str) -> Result<Option<RefTarget>> {
         validate_ref_name(name)?;
+        if self.uses_reftable()? {
+            return self.read_reftable_ref(name);
+        }
         if let Some(reference) = self.read_loose_ref(name)? {
             return Ok(Some(reference.target));
         }
@@ -363,14 +372,17 @@ impl FileRefStore {
     }
 
     pub fn list_refs(&self) -> Result<Vec<Ref>> {
+        if self.uses_reftable()? {
+            return self.list_reftable_refs();
+        }
         let mut refs = BTreeMap::new();
-        let packed_path = self.git_dir.join("packed-refs");
+        let packed_path = self.common_dir.join("packed-refs");
         if packed_path.exists() {
             for packed in parse_packed_refs(self.format, &fs::read(packed_path)?)? {
                 refs.insert(packed.reference.name.clone(), packed.reference);
             }
         }
-        let refs_dir = self.git_dir.join("refs");
+        let refs_dir = self.common_dir.join("refs");
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut refs)?;
         }
@@ -378,7 +390,10 @@ impl FileRefStore {
     }
 
     pub fn write_packed_refs(&self, refs: &[PackedRef]) -> Result<()> {
-        write_locked(&self.git_dir.join("packed-refs"), &write_packed_refs(refs)?)
+        write_locked(
+            &self.common_dir.join("packed-refs"),
+            &write_packed_refs(refs)?,
+        )
     }
 
     pub fn pack_refs(&self, prune_loose: bool) -> Result<Vec<PackedRef>> {
@@ -390,7 +405,7 @@ impl FileRefStore {
         F: FnMut(&str, &ObjectId) -> Result<Option<ObjectId>>,
     {
         let mut packed_refs = BTreeMap::new();
-        let packed_path = self.git_dir.join("packed-refs");
+        let packed_path = self.common_dir.join("packed-refs");
         if packed_path.exists() {
             for packed in parse_packed_refs(self.format, &fs::read(&packed_path)?)? {
                 packed_refs.insert(packed.reference.name.clone(), packed);
@@ -398,7 +413,7 @@ impl FileRefStore {
         }
 
         let mut loose_refs = BTreeMap::new();
-        let refs_dir = self.git_dir.join("refs");
+        let refs_dir = self.common_dir.join("refs");
         if refs_dir.exists() {
             self.collect_loose_refs(&refs_dir, "refs", &mut loose_refs)?;
         }
@@ -632,6 +647,21 @@ impl FileRefStore {
 
     pub fn delete_symbolic_ref(&self, name: &str) -> Result<bool> {
         validate_ref_name(name)?;
+        if self.uses_reftable()? {
+            let Some(target) = self.read_ref(name)? else {
+                return Ok(false);
+            };
+            if !matches!(target, RefTarget::Symbolic(_)) {
+                return Ok(false);
+            }
+            self.append_reftable_records(vec![ReftableRefRecord {
+                name: name.to_string(),
+                update_index: 0,
+                value: ReftableRefValue::Deletion,
+            }])?;
+            let _ = fs::remove_file(self.reflog_path(name));
+            return Ok(true);
+        }
         let Some(reference) = self.read_loose_ref(name)? else {
             return Ok(false);
         };
@@ -644,6 +674,22 @@ impl FileRefStore {
     }
 
     fn delete_direct_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
+        if self.uses_reftable()? {
+            let Some(target) = self.read_ref(name)? else {
+                return Err(GitError::NotFound(format!("{kind} {short_name}")));
+            };
+            let RefTarget::Direct(oid) = target else {
+                return Err(GitError::InvalidFormat(format!(
+                    "{kind} {short_name} is symbolic"
+                )));
+            };
+            self.append_reftable_records(vec![ReftableRefRecord {
+                name: name.to_string(),
+                update_index: 0,
+                value: ReftableRefValue::Deletion,
+            }])?;
+            return Ok(oid);
+        }
         let Some(reference) = self.read_loose_ref(name)? else {
             return self.delete_packed_ref(name, kind, short_name);
         };
@@ -660,7 +706,7 @@ impl FileRefStore {
     }
 
     fn delete_packed_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
-        let path = self.git_dir.join("packed-refs");
+        let path = self.common_dir.join("packed-refs");
         if !path.exists() {
             return Err(GitError::NotFound(format!("{kind} {short_name}")));
         }
@@ -690,13 +736,139 @@ impl FileRefStore {
     }
 
     fn read_packed_ref(&self, name: &str) -> Result<Option<PackedRef>> {
-        let path = self.git_dir.join("packed-refs");
+        let path = self.common_dir.join("packed-refs");
         if !path.exists() {
             return Ok(None);
         }
         Ok(parse_packed_refs(self.format, &fs::read(path)?)?
             .into_iter()
             .find(|reference| reference.reference.name == name))
+    }
+
+    fn read_reftable_ref(&self, name: &str) -> Result<Option<RefTarget>> {
+        for table in self.reftables()?.into_iter().rev() {
+            if let Some(record) = table.refs.into_iter().find(|record| record.name == name) {
+                return reftable_ref_target(record.value);
+            }
+        }
+        Ok(None)
+    }
+
+    fn list_reftable_refs(&self) -> Result<Vec<Ref>> {
+        let mut refs = BTreeMap::<String, Ref>::new();
+        for table in self.reftables()? {
+            for record in table.refs {
+                if !record.name.starts_with("refs/") {
+                    continue;
+                }
+                match reftable_ref_target(record.value)? {
+                    Some(target) => {
+                        refs.insert(
+                            record.name.clone(),
+                            Ref {
+                                name: record.name,
+                                target,
+                            },
+                        );
+                    }
+                    None => {
+                        refs.remove(&record.name);
+                    }
+                }
+            }
+        }
+        Ok(refs.into_values().collect())
+    }
+
+    fn reftables(&self) -> Result<Vec<Reftable>> {
+        let reftable_dir = self.common_dir.join("reftable");
+        let tables_list = reftable_dir.join("tables.list");
+        if !tables_list.exists() {
+            return Ok(Vec::new());
+        }
+        let text = fs::read_to_string(&tables_list)?;
+        let mut tables = Vec::new();
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if line.contains('/')
+                || line.contains('\\')
+                || Path::new(line).components().count() != 1
+            {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid reftable table name {line}"
+                )));
+            }
+            let table = Reftable::parse(&fs::read(reftable_dir.join(line))?)?;
+            if table.header.object_format != self.format {
+                return Err(GitError::InvalidFormat(format!(
+                    "reftable {line} has {} object ids in {} repository",
+                    table.header.object_format.name(),
+                    self.format.name()
+                )));
+            }
+            tables.push(table);
+        }
+        Ok(tables)
+    }
+
+    fn uses_reftable(&self) -> Result<bool> {
+        let config_path = self.common_dir.join("config");
+        if !config_path.exists() {
+            return Ok(false);
+        }
+        let config = GitConfig::parse(&fs::read(config_path)?)?;
+        Ok(matches!(
+            config.get("extensions", None, "refStorage"),
+            Some(value) if value.eq_ignore_ascii_case("reftable")
+        ))
+    }
+
+    fn append_reftable_records(&self, mut records: Vec<ReftableRefRecord>) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let reftable_dir = self.common_dir.join("reftable");
+        fs::create_dir_all(&reftable_dir)?;
+        let tables_list = reftable_dir.join("tables.list");
+        let mut table_names = if tables_list.exists() {
+            fs::read_to_string(&tables_list)?
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let update_index = self.next_reftable_update_index(&table_names)?;
+        for record in &mut records {
+            record.update_index = update_index;
+        }
+        let table_name = reftable_table_name(update_index);
+        let bytes = Reftable::write_ref_only(self.format, update_index, update_index, &records)?;
+        write_locked(&reftable_dir.join(&table_name), &bytes)?;
+        table_names.push(table_name);
+        let mut list = Vec::new();
+        for name in &table_names {
+            list.extend_from_slice(name.as_bytes());
+            list.push(b'\n');
+        }
+        write_locked(&tables_list, &list)
+    }
+
+    fn next_reftable_update_index(&self, table_names: &[String]) -> Result<u64> {
+        let reftable_dir = self.common_dir.join("reftable");
+        let mut max_update_index = 0;
+        for name in table_names {
+            let table = Reftable::parse(&fs::read(reftable_dir.join(name))?)?;
+            max_update_index = max_update_index.max(table.header.max_update_index);
+        }
+        max_update_index
+            .checked_add(1)
+            .ok_or_else(|| GitError::InvalidFormat("reftable update index overflow".into()))
     }
 
     fn collect_loose_refs(
@@ -720,6 +892,14 @@ impl FileRefStore {
     }
 
     fn write_loose_ref(&self, reference: &Ref) -> Result<()> {
+        if self.uses_reftable()? {
+            self.append_reftable_records(vec![ReftableRefRecord {
+                name: reference.name.clone(),
+                update_index: 0,
+                value: reftable_value_from_ref_target(&reference.target),
+            }])?;
+            return Ok(());
+        }
         let path = self.ref_path(&reference.name);
         let parent = path
             .parent()
@@ -768,12 +948,65 @@ impl FileRefStore {
     }
 
     fn ref_path(&self, name: &str) -> PathBuf {
-        self.git_dir.join(name)
+        self.ref_base_dir(name).join(name)
     }
 
     fn reflog_path(&self, name: &str) -> PathBuf {
-        self.git_dir.join("logs").join(name)
+        self.ref_base_dir(name).join("logs").join(name)
     }
+
+    fn ref_base_dir(&self, name: &str) -> &Path {
+        if name == "HEAD" {
+            &self.git_dir
+        } else {
+            &self.common_dir
+        }
+    }
+}
+
+fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
+    match value {
+        ReftableRefValue::Deletion => Ok(None),
+        ReftableRefValue::Direct(oid) | ReftableRefValue::Peeled { target: oid, .. } => {
+            Ok(Some(RefTarget::Direct(oid)))
+        }
+        ReftableRefValue::Symbolic(target) => {
+            validate_ref_name(&target)?;
+            Ok(Some(RefTarget::Symbolic(target)))
+        }
+    }
+}
+
+fn reftable_value_from_ref_target(target: &RefTarget) -> ReftableRefValue {
+    match target {
+        RefTarget::Direct(oid) => ReftableRefValue::Direct(oid.clone()),
+        RefTarget::Symbolic(target) => ReftableRefValue::Symbolic(target.clone()),
+    }
+}
+
+fn reftable_table_name(update_index: u64) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("0x{update_index:012x}-0x{update_index:012x}-git-rs-{nanos:x}.ref")
+}
+
+fn repository_common_dir(git_dir: &Path) -> PathBuf {
+    if let Some(common_dir) = std::env::var_os("GIT_COMMON_DIR") {
+        return PathBuf::from(common_dir);
+    }
+    let commondir = git_dir.join("commondir");
+    if let Ok(value) = fs::read_to_string(&commondir) {
+        let path = PathBuf::from(value.trim());
+        let common = if path.is_absolute() {
+            path
+        } else {
+            git_dir.join(path)
+        };
+        return fs::canonicalize(&common).unwrap_or(common);
+    }
+    git_dir.to_path_buf()
 }
 
 pub struct FileRefTransaction<'a> {
@@ -797,6 +1030,25 @@ impl<'a> FileRefTransaction<'a> {
                     update.name
                 )));
             }
+        }
+        if self.store.uses_reftable()? {
+            let mut records = Vec::with_capacity(self.updates.len());
+            let mut reflogs = Vec::new();
+            for update in self.updates {
+                records.push(ReftableRefRecord {
+                    name: update.name.clone(),
+                    update_index: 0,
+                    value: reftable_value_from_ref_target(&update.new),
+                });
+                if let Some(entry) = update.reflog {
+                    reflogs.push((update.name, entry));
+                }
+            }
+            self.store.append_reftable_records(records)?;
+            for (name, entry) in reflogs {
+                self.store.append_reflog(&name, &entry)?;
+            }
+            return Ok(());
         }
         for update in self.updates {
             self.store.write_loose_ref(&Ref {
@@ -1393,6 +1645,38 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
+    fn file_ref_store_resolves_linked_worktree_head_through_common_refs() {
+        let common = temp_git_dir();
+        let admin = common.join("worktrees").join("linked");
+        fs::create_dir_all(&admin).unwrap();
+        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::write(admin.join("HEAD"), b"ref: refs/heads/topic\n").unwrap();
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha256,
+            "08ffba112b648c22b5425f01bec2c37ffc524c4d48ef04337779df3973733050",
+        )
+        .unwrap();
+        fs::create_dir_all(common.join("refs").join("heads")).unwrap();
+        fs::write(
+            common.join("refs").join("heads").join("topic"),
+            format!("{oid}\n"),
+        )
+        .unwrap();
+
+        let store = FileRefStore::new(&admin, ObjectFormat::Sha256);
+        assert_eq!(
+            store.read_ref("HEAD").unwrap(),
+            Some(RefTarget::Symbolic("refs/heads/topic".into()))
+        );
+        assert_eq!(
+            store.read_ref("refs/heads/topic").unwrap(),
+            Some(RefTarget::Direct(oid))
+        );
+
+        fs::remove_dir_all(common).unwrap();
+    }
+
+    #[test]
     fn file_ref_store_creates_tag() {
         let git_dir = temp_git_dir();
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
@@ -1500,6 +1784,254 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert_eq!(refs[0].target, RefTarget::Direct(oid));
         assert!(git_dir.join("packed-refs").exists());
         assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_store_reads_reftable_stack_and_ignores_dummy_head() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n").unwrap();
+        let head_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let tag_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .unwrap();
+        let peeled_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        write_reftable_stack(
+            &git_dir,
+            &[(
+                "000000000001-000000000001-rust.ref",
+                vec![
+                    git_formats::ReftableRefRecord {
+                        name: "HEAD".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Symbolic("refs/heads/main".into()),
+                    },
+                    git_formats::ReftableRefRecord {
+                        name: "refs/heads/main".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(head_oid.clone()),
+                    },
+                    git_formats::ReftableRefRecord {
+                        name: "refs/tags/v1.0".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Peeled {
+                            target: tag_oid.clone(),
+                            peeled: peeled_oid,
+                        },
+                    },
+                ],
+            )],
+        );
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store.read_ref("HEAD").unwrap(),
+            Some(RefTarget::Symbolic("refs/heads/main".into()))
+        );
+        assert_eq!(
+            store.read_ref("refs/heads/main").unwrap(),
+            Some(RefTarget::Direct(head_oid.clone()))
+        );
+        assert_eq!(
+            store.read_ref("refs/tags/v1.0").unwrap(),
+            Some(RefTarget::Direct(tag_oid.clone()))
+        );
+        let refs = store.list_refs().unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                Ref {
+                    name: "refs/heads/main".into(),
+                    target: RefTarget::Direct(head_oid),
+                },
+                Ref {
+                    name: "refs/tags/v1.0".into(),
+                    target: RefTarget::Direct(tag_oid),
+                },
+            ]
+        );
+
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_store_applies_reftable_stack_overrides_and_deletions() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let first = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let second = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        write_reftable_stack(
+            &git_dir,
+            &[
+                (
+                    "000000000001-000000000001-base.ref",
+                    vec![
+                        git_formats::ReftableRefRecord {
+                            name: "refs/heads/main".into(),
+                            update_index: 1,
+                            value: ReftableRefValue::Direct(first),
+                        },
+                        git_formats::ReftableRefRecord {
+                            name: "refs/heads/topic".into(),
+                            update_index: 1,
+                            value: ReftableRefValue::Direct(second.clone()),
+                        },
+                    ],
+                ),
+                (
+                    "000000000002-000000000002-tip.ref",
+                    vec![
+                        git_formats::ReftableRefRecord {
+                            name: "refs/heads/main".into(),
+                            update_index: 2,
+                            value: ReftableRefValue::Direct(second.clone()),
+                        },
+                        git_formats::ReftableRefRecord {
+                            name: "refs/heads/topic".into(),
+                            update_index: 2,
+                            value: ReftableRefValue::Deletion,
+                        },
+                    ],
+                ),
+            ],
+        );
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert_eq!(
+            store.read_ref("refs/heads/main").unwrap(),
+            Some(RefTarget::Direct(second.clone()))
+        );
+        assert_eq!(store.read_ref("refs/heads/topic").unwrap(), None);
+        assert_eq!(
+            store.list_refs().unwrap(),
+            vec![Ref {
+                name: "refs/heads/main".into(),
+                target: RefTarget::Direct(second),
+            }]
+        );
+
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_store_writes_reftable_transaction_table() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let first = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let second = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        write_reftable_stack(
+            &git_dir,
+            &[(
+                "000000000001-000000000001-base.ref",
+                vec![git_formats::ReftableRefRecord {
+                    name: "refs/heads/main".into(),
+                    update_index: 1,
+                    value: ReftableRefValue::Direct(first),
+                }],
+            )],
+        );
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/main".into()),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(second.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store.read_ref("HEAD").unwrap(),
+            Some(RefTarget::Symbolic("refs/heads/main".into()))
+        );
+        assert_eq!(
+            store.read_ref("refs/heads/main").unwrap(),
+            Some(RefTarget::Direct(second.clone()))
+        );
+        assert_eq!(store.list_refs().unwrap().len(), 1);
+        assert!(!git_dir.join("HEAD").exists());
+        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list")).unwrap();
+        assert_eq!(tables.lines().count(), 2);
+        assert!(
+            tables.lines().last().unwrap().contains("git-rs"),
+            "expected rust-written reftable in tables.list, got {tables}"
+        );
+
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_store_deletes_reftable_refs_with_tombstones() {
+        let git_dir = temp_git_dir();
+        write_reftable_config(&git_dir);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        write_reftable_stack(
+            &git_dir,
+            &[(
+                "000000000001-000000000001-base.ref",
+                vec![
+                    git_formats::ReftableRefRecord {
+                        name: "refs/heads/main".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Direct(oid.clone()),
+                    },
+                    git_formats::ReftableRefRecord {
+                        name: "refs/alias/main".into(),
+                        update_index: 1,
+                        value: ReftableRefValue::Symbolic("refs/heads/main".into()),
+                    },
+                ],
+            )],
+        );
+
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        assert!(store.delete_symbolic_ref("refs/alias/main").unwrap());
+        assert_eq!(store.read_ref("refs/alias/main").unwrap(), None);
+        let deleted = store.delete_ref("refs/heads/main").unwrap();
+        assert_eq!(deleted.oid, oid);
+        assert_eq!(store.read_ref("refs/heads/main").unwrap(), None);
+        assert!(store.list_refs().unwrap().is_empty());
+        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list")).unwrap();
+        assert_eq!(tables.lines().count(), 3);
+
         fs::remove_dir_all(git_dir).unwrap();
     }
 
@@ -1699,5 +2231,36 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
     fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
         ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    }
+
+    fn write_reftable_config(git_dir: &Path) {
+        fs::write(
+            git_dir.join("config"),
+            b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n",
+        )
+        .unwrap();
+    }
+
+    fn write_reftable_stack(
+        git_dir: &Path,
+        tables: &[(&str, Vec<git_formats::ReftableRefRecord>)],
+    ) {
+        let reftable_dir = git_dir.join("reftable");
+        fs::create_dir_all(&reftable_dir).unwrap();
+        let mut list = String::new();
+        for (idx, (name, refs)) in tables.iter().enumerate() {
+            let update_index = (idx + 1) as u64;
+            let bytes = git_formats::Reftable::write_ref_only(
+                ObjectFormat::Sha1,
+                update_index,
+                update_index,
+                refs,
+            )
+            .unwrap();
+            fs::write(reftable_dir.join(name), bytes).unwrap();
+            list.push_str(name);
+            list.push('\n');
+        }
+        fs::write(reftable_dir.join("tables.list"), list).unwrap();
     }
 }

@@ -31,6 +31,28 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+fn run_success_with_fixed_identity(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Example User")
+        .env("GIT_AUTHOR_EMAIL", "example@example.invalid")
+        .env("GIT_AUTHOR_DATE", "@1 +0000")
+        .env("GIT_COMMITTER_NAME", "Example User")
+        .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
+        .env("GIT_COMMITTER_DATE", "@1 +0000")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     assert_eq!(
         actual.status.code(),
@@ -67,6 +89,65 @@ fn embed_submodule_git_dir(superproject: &Path, path: &str) {
     let target = fs::canonicalize(target).expect("canonicalize submodule gitdir");
     fs::remove_file(&dot_git).expect("remove submodule gitfile");
     fs::rename(target, dot_git).expect("embed submodule gitdir");
+}
+
+#[test]
+fn submodule_status_sha256_superproject_matches_upstream_git() {
+    let root = unique_temp_dir("submodule-status-sha256");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        let upstream_child = root.join("upstream-child");
+        let actual_child = root.join("actual-child");
+        let upstream_super = root.join("upstream-super");
+        let actual_super = root.join("actual-super");
+        for child in [&upstream_child, &actual_child] {
+            fs::create_dir_all(child).expect("create child repo");
+            run_success("git", child, &["init", "-q", "--object-format=sha256"]);
+            run_success_with_fixed_identity(
+                "git",
+                child,
+                &["commit", "--allow-empty", "-qm", "child"],
+            );
+        }
+        for (superproject, child) in [
+            (&upstream_super, &upstream_child),
+            (&actual_super, &actual_child),
+        ] {
+            fs::create_dir_all(superproject).expect("create superproject repo");
+            run_success(
+                "git",
+                superproject,
+                &["init", "-q", "--object-format=sha256"],
+            );
+            let child_arg = child.to_string_lossy().into_owned();
+            run_success(
+                "git",
+                superproject,
+                &[
+                    "-c",
+                    "protocol.file.allow=always",
+                    "submodule",
+                    "add",
+                    "-q",
+                    &child_arg,
+                    "sub",
+                ],
+            );
+        }
+
+        for args in [
+            vec!["rev-parse", "--show-object-format=storage"],
+            vec!["submodule", "status"],
+            vec!["submodule", "status", "--cached"],
+            vec!["submodule", "foreach", "printf \"%s\\n\" \"$sha1\""],
+        ] {
+            let expected = run("git", &upstream_super, &args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &actual_super, &args);
+            assert_same_output(actual, expected, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
 }
 
 #[test]

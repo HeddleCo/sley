@@ -1491,3 +1491,26 @@ fn update_index_stdin_modes_match_upstream_git() {
     let _ = fs::remove_dir_all(&root);
     result
 }
+
+#[test]
+fn update_index_adds_sha256_index_entries() {
+    let root = unique_temp_dir("update-index-sha256");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    let result = (|| {
+        run_success("git", &expected, &["init", "-q", "--object-format=sha256"]);
+        run_success("git", &actual, &["init", "-q", "--object-format=sha256"]);
+        fs::write(expected.join("a.txt"), b"sha256\n").expect("write expected fixture");
+        fs::write(actual.join("a.txt"), b"sha256\n").expect("write actual fixture");
+
+        let args = ["update-index", "--add", "a.txt"];
+        let expected_output = run("git", &expected, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+        assert_index_matches(&expected, &actual, &args);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}

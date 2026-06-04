@@ -1,22 +1,38 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
+use git_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use git_formats::{
     Bundle, BundlePrerequisite, BundleReference, Commit, CommitGraph, CommitGraphWriteEntry,
     ConfigEntry, ConfigSection, EncodedObject, GitConfig, Index, IndexEntry, ObjectType,
     RepositoryLayout, Tag, Tree, TreeEntry, tree_entry_object_type,
 };
 use git_odb::{
-    FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter, repository_objects_dir,
-    unbundle_objects, verify_bundle_prerequisites,
+    FileObjectDatabase, LooseObjectStore, ObjectPrefixResolution, ObjectReader, ObjectWriter,
+    build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
+    install_reachable_pack, repository_object_ids, repository_objects_dir,
+    verify_bundle_prerequisites,
 };
-use git_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
+use git_pack::{MultiPackIndex, MultiPackIndexEntry, PackIndex};
 use git_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry,
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use git_transport::{
-    FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RemoteTransport, encode_fetch_head,
-    fetch_ref_updates_to_fetch_head, parse_refspec, parse_remote_url, plan_fetch_ref_updates,
-    refspec_map_source,
+    FetchHeadRecord, FetchRefUpdate, GitService, PKT_LINE_MAX_PAYLOAD_LEN, ProtocolVersion,
+    PushSourceRef, ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest,
+    ReceivePackPushRequestOptions, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
+    RefAdvertisementSet, RemoteTransport, SideBandChannel, SideBandPacket, SshCommandVariant,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
+    UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
+    build_receive_pack_push_request, build_upload_pack_raw_packfile_response, encode_fetch_head,
+    encode_receive_pack_features, encode_upload_pack_features, fetch_ref_updates_to_fetch_head,
+    parse_receive_pack_features, parse_refspec, parse_remote_url, parse_upload_pack_features,
+    plan_fetch_ref_updates, plan_push_commands, read_receive_pack_push_options,
+    read_receive_pack_report_status, read_receive_pack_request, read_ref_advertisement_set,
+    read_upload_pack_negotiation_request, read_upload_pack_raw_packfile_response,
+    read_upload_pack_request, refspec_map_source, ssh_process_command,
+    write_receive_pack_push_request, write_receive_pack_report_status, write_ref_advertisement_set,
+    write_upload_pack_negotiation_request, write_upload_pack_packfile_response,
+    write_upload_pack_raw_packfile_response, write_upload_pack_request,
 };
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -26,7 +42,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Mutex;
 
 static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Vec::new());
@@ -58,6 +74,7 @@ fn run(args: Vec<String>) -> Result<()> {
     match command {
         "init" => cmd_init(&args[1..], &global.config),
         "add" => cmd_add(&args[1..]),
+        "archive" => cmd_archive(&args[1..]),
         "branch" => cmd_branch(&args[1..]),
         "bundle" => cmd_bundle(&args[1..]),
         "hash-object" => cmd_hash_object(&args[1..]),
@@ -75,6 +92,7 @@ fn run(args: Vec<String>) -> Result<()> {
         "diff" => cmd_diff(&args[1..]),
         "fetch" => cmd_fetch(&args[1..]),
         "for-each-ref" => cmd_for_each_ref(&args[1..]),
+        "fsck" => cmd_fsck(&args[1..]),
         "ls-remote" => cmd_ls_remote(&args[1..]),
         "ls-files" => cmd_ls_files(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
@@ -84,6 +102,9 @@ fn run(args: Vec<String>) -> Result<()> {
         "multi-pack-index" => cmd_multi_pack_index(&args[1..]),
         "mv" => cmd_mv(&args[1..]),
         "pack-refs" => cmd_pack_refs(&args[1..]),
+        "push" => cmd_push(&args[1..]),
+        "receive-pack" => cmd_receive_pack(&args[1..]),
+        "upload-pack" => cmd_upload_pack(&args[1..]),
         "write-tree" => cmd_write_tree(&args[1..]),
         "worktree" => cmd_worktree(&args[1..]),
         "update-index" => cmd_update_index(&args[1..]),
@@ -142,6 +163,166 @@ fn long_option_value<'a>(arg: &'a str, option: &str) -> Option<&'a str> {
 fn cmd_version() -> Result<()> {
     println!("git version {}", git_core::UPSTREAM_GIT_COMPAT_VERSION);
     Ok(())
+}
+
+fn cmd_archive(args: &[String]) -> Result<()> {
+    let mut format_name = "tar";
+    let mut prefix = Vec::new();
+    let mut output = None;
+    let mut treeish = None;
+    let mut pathspecs = Vec::new();
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if positional_only {
+            if treeish.is_none() {
+                treeish = Some(arg.as_str());
+            } else {
+                pathspecs.push(arg.as_bytes().to_vec());
+            }
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--format" => {
+                format_name = iter
+                    .next()
+                    .map(String::as_str)
+                    .ok_or_else(|| GitError::Command("archive --format requires a value".into()))?;
+            }
+            "--prefix" => {
+                prefix = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("archive --prefix requires a value".into()))?
+                    .as_bytes()
+                    .to_vec();
+            }
+            "-o" | "--output" => {
+                output = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("archive --output requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--format=") => {
+                format_name = &value["--format=".len()..];
+            }
+            value if value.starts_with("--prefix=") => {
+                prefix = value["--prefix=".len()..].as_bytes().to_vec();
+            }
+            value if value.starts_with("--output=") => {
+                output = Some(value["--output=".len()..].to_string());
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "unsupported archive option {value}"
+                )));
+            }
+            value => {
+                if treeish.is_none() {
+                    treeish = Some(value);
+                } else {
+                    pathspecs.push(value.as_bytes().to_vec());
+                }
+            }
+        }
+    }
+    if format_name != "tar" {
+        return Err(GitError::Command(format!(
+            "archive currently supports --format=tar, not {format_name}"
+        )));
+    }
+    let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let current_prefix = worktree_prefix(&cwd, &git_dir)?.into_bytes();
+    let pathspecs = archive_pathspecs_for_current_prefix(&current_prefix, pathspecs);
+    let oid = resolve_revision(&git_dir, format, treeish)?;
+    let object = db.read_object(&oid)?;
+    let (tree_oid, mtime, commit_id) = match object.object_type {
+        ObjectType::Commit => {
+            let commit = Commit::parse(format, &object.body)?;
+            (
+                commit.tree.clone(),
+                commit_graph_commit_time(&commit)?,
+                Some(oid),
+            )
+        }
+        ObjectType::Tree => (oid.clone(), current_unix_seconds().max(0) as u64, None),
+        ObjectType::Tag => {
+            let tree_oid = git_rev::peel_to_tree(&db, format, &oid)?;
+            (tree_oid, current_unix_seconds().max(0) as u64, None)
+        }
+        other => {
+            return Err(GitError::InvalidObject(format!(
+                "expected tree-ish {oid}, found {}",
+                other.as_str()
+            )));
+        }
+    };
+    let options = git_archive::TarArchiveOptions {
+        prefix,
+        strip_prefix: current_prefix,
+        mtime,
+        commit_id,
+        pathspecs,
+    };
+    if let Some(path) = output {
+        let mut file = fs::File::create(path)?;
+        handle_archive_result(git_archive::write_tar_archive(
+            &mut file, &db, format, &tree_oid, options,
+        ))
+    } else {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        handle_archive_result(git_archive::write_tar_archive(
+            &mut lock, &db, format, &tree_oid, options,
+        ))?;
+        lock.flush()?;
+        Ok(())
+    }
+}
+
+fn handle_archive_result(result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(GitError::InvalidPath(message)) if message.starts_with("pathspec ") => {
+            eprintln!("fatal: {message}");
+            Err(GitError::Exit(128))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn archive_pathspecs_for_current_prefix(
+    current_prefix: &[u8],
+    pathspecs: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    if current_prefix.is_empty() {
+        return pathspecs;
+    }
+    if pathspecs.is_empty() {
+        return vec![
+            current_prefix
+                .strip_suffix(b"/")
+                .unwrap_or(current_prefix)
+                .to_vec(),
+        ];
+    }
+    pathspecs
+        .into_iter()
+        .map(|pathspec| {
+            let pathspec = pathspec.strip_prefix(b"./").unwrap_or(&pathspec);
+            let mut full = Vec::with_capacity(current_prefix.len() + pathspec.len());
+            full.extend_from_slice(current_prefix);
+            full.extend_from_slice(pathspec);
+            full
+        })
+        .collect()
 }
 
 fn cmd_worktree(args: &[String]) -> Result<()> {
@@ -244,11 +425,6 @@ fn cmd_worktree_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "worktree add currently writes sha1 index entries".into(),
-        ));
-    }
     let path = resolve_cli_path(&cwd, &options.path);
     validate_worktree_add_destination(&path, &options.path)?;
     let store = FileRefStore::new(&common_git_dir, format);
@@ -864,6 +1040,9 @@ fn worktree_add_usage<T>() -> Result<T> {
 }
 
 fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
+    if let Some(common_dir) = env::var_os("GIT_COMMON_DIR") {
+        return Ok(PathBuf::from(common_dir));
+    }
     let commondir = git_dir.join("commondir");
     if commondir.is_file() {
         let value = fs::read_to_string(&commondir)?;
@@ -1328,7 +1507,7 @@ fn write_linked_worktree_checkout(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(())
 }
@@ -1367,7 +1546,7 @@ fn worktree_remove_has_local_changes(
     admin: &LinkedWorktreeAdmin,
     format: ObjectFormat,
 ) -> Result<bool> {
-    let index = read_repository_index(&admin.admin_dir)?.unwrap_or(Index {
+    let index = read_repository_index(&admin.admin_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -2433,7 +2612,14 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("warning: --shallow-exclude is ignored in local clones; use file:// instead.");
     }
     if partial_clone_filter.is_some() {
-        eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
+        let file_transport = parse_remote_url(&repository)
+            .map(|url| url.transport == RemoteTransport::File)
+            .unwrap_or(false);
+        if file_transport {
+            eprintln!("warning: filtering not recognized by server, ignoring");
+        } else {
+            eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
+        }
     }
     if !quiet {
         if bare {
@@ -2552,7 +2738,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
                 commit_identity_from_env("COMMITTER")?,
                 format!("clone: from {repository}").into_bytes(),
             )?;
-            remove_clone_worktree_files(&destination, &git_dir)?;
+            remove_clone_worktree_files(&destination, &git_dir, format)?;
         }
         if let Some(separate_git_dir) = separate_git_dir.as_deref() {
             apply_clone_separate_git_dir(&destination, &git_dir, separate_git_dir)?;
@@ -2603,7 +2789,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         commit_identity_from_env("COMMITTER")?,
     )?;
     if !checkout {
-        remove_clone_worktree_files(&destination, &git_dir)?;
+        remove_clone_worktree_files(&destination, &git_dir, format)?;
     } else if sparse {
         apply_clone_sparse_checkout(&destination, &git_dir, format)?;
     }
@@ -2913,17 +3099,14 @@ fn copy_local_revision_objects(
     revision_oid: &ObjectId,
 ) -> Result<()> {
     let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
-    let mut local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let objects = collect_bundle_objects(
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    install_reachable_pack(
         &remote_db,
+        &local_db,
         format,
         std::iter::once(revision_oid.clone()),
-        &HashSet::new(),
-    )?;
-    for object in objects {
-        local_db.write_object(object)?;
-    }
-    Ok(())
+    )
+    .map(|_| ())
 }
 
 fn apply_clone_bundle_uri(
@@ -2941,8 +3124,8 @@ fn apply_clone_bundle_uri(
         }
     };
     let prerequisite_reader = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
-    let result = match unbundle_objects(&bundle, &prerequisite_reader, &mut writer) {
+    let database = FileObjectDatabase::from_git_dir(git_dir, format);
+    let result = match install_bundle_pack(&bundle, &prerequisite_reader, &database) {
         Ok(result) => result,
         Err(_) => {
             warn_clone_bundle_uri_failed(&bundle_uri.uri);
@@ -2991,8 +3174,12 @@ fn apply_clone_sparse_checkout(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<()> {
-    let index_path = git_worktree::repository_index_path(git_dir);
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = git_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
     let sparse_paths = index
         .entries
         .iter()
@@ -3092,9 +3279,17 @@ fn apply_clone_separate_git_dir(
     Ok(())
 }
 
-fn remove_clone_worktree_files(worktree_root: &Path, git_dir: &Path) -> Result<()> {
-    let index_path = git_worktree::repository_index_path(git_dir);
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+fn remove_clone_worktree_files(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<()> {
+    let index = git_worktree::read_repository_index(git_dir, format)?.unwrap_or(Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    });
     for entry in &index.entries {
         let path = checkout_index_worktree_path(worktree_root, &entry.path)?;
         if path.exists() {
@@ -3110,7 +3305,7 @@ fn remove_clone_worktree_files(worktree_root: &Path, git_dir: &Path) -> Result<(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(())
 }
@@ -3383,8 +3578,8 @@ fn cmd_add(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     if update || all {
         let actions = resolve_add_update_actions(
             &cwd,
@@ -3920,12 +4115,13 @@ fn cmd_check_ignore(args: &[String]) -> Result<()> {
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let prefix = worktree_prefix(&cwd, &git_dir)?;
     let tracked_paths = if no_index {
         BTreeSet::new()
     } else {
-        check_ignore_tracked_paths(&git_dir)?
+        check_ignore_tracked_paths(&git_dir, format)?
     };
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
@@ -4210,6 +4406,83 @@ fn cmd_count_objects(args: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn cmd_fsck(args: &[String]) -> Result<()> {
+    let mut progress = true;
+    let mut report_dangling = true;
+    let mut report_unreachable = false;
+    for arg in args {
+        match arg.as_str() {
+            "--no-progress" => progress = false,
+            "--progress" => progress = true,
+            "--dangling" => report_dangling = true,
+            "--no-dangling" => report_dangling = false,
+            "--unreachable" => report_unreachable = true,
+            "--no-unreachable" => report_unreachable = false,
+            "--full" | "--strict" | "--connectivity-only" | "--name-objects" => {}
+            value => {
+                return Err(GitError::Command(format!(
+                    "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
+                )));
+            }
+        }
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let roots = fsck_root_oids(&git_dir, format)?;
+    if roots.is_empty() && progress {
+        eprintln!("notice: No default references");
+    }
+    let object_ids = repository_object_ids(&git_dir, format)?;
+    let report = git_fsck::fsck_objects_with_options(
+        &db,
+        format,
+        roots,
+        object_ids,
+        git_fsck::FsckOptions {
+            report_dangling,
+            report_unreachable,
+        },
+    );
+    for notice in &report.notices {
+        println!("{}", notice.message);
+    }
+    for issue in &report.issues {
+        println!("{}", issue.message);
+    }
+    if report.is_ok() {
+        Ok(())
+    } else {
+        Err(GitError::Exit(10))
+    }
+}
+
+fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    if let Some(target) = store.read_ref("HEAD")? {
+        let reference = Ref {
+            name: "HEAD".to_string(),
+            target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid.clone())
+        {
+            roots.push(oid);
+        }
+    }
+    for reference in store.list_refs()? {
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid.clone())
+        {
+            roots.push(oid);
+        }
+    }
+    Ok(roots)
 }
 
 fn cmd_merge_base(args: &[String]) -> Result<()> {
@@ -4580,13 +4853,12 @@ fn cmd_reflog(args: &[String]) -> Result<()> {
     let options = parse_reflog_show_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
     let mut entries = store.read_reflog(&options.reference)?;
     entries.reverse();
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let tip = resolve_revision(&common_git_dir, format, &options.reference)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let tip = resolve_revision(&git_dir, format, &options.reference)?;
     let reachable = ancestor_depths(&db, format, &tip)?;
     let mut seen = HashSet::new();
     let mut selected = Vec::new();
@@ -4783,8 +5055,7 @@ fn cmd_reflog_exists(args: &[String]) -> Result<()> {
     };
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    if common_git_dir.join("logs").join(reference).is_file() {
+    if reflog_path_for_ref(&git_dir, reference)?.is_file() {
         Ok(())
     } else {
         Err(GitError::Exit(1))
@@ -4816,10 +5087,8 @@ fn cmd_reflog_list(args: &[String]) -> Result<()> {
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let logs_dir = common_git_dir.join("logs");
     let mut names = BTreeSet::new();
-    collect_reflog_names(&logs_dir, &logs_dir, &mut names)?;
+    collect_repository_reflog_names(&git_dir, &mut names)?;
     for name in names {
         println!("{name}");
     }
@@ -4848,6 +5117,30 @@ fn collect_reflog_names(path: &Path, base: &Path, names: &mut BTreeSet<String>) 
         }
     }
     Ok(())
+}
+
+fn collect_repository_reflog_names(git_dir: &Path, names: &mut BTreeSet<String>) -> Result<()> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let common_logs = common_git_dir.join("logs");
+    collect_reflog_names(&common_logs, &common_logs, names)?;
+
+    let worktree_logs = git_dir.join("logs");
+    if worktree_logs != common_logs {
+        collect_reflog_names(&worktree_logs, &worktree_logs, names)?;
+    }
+    Ok(())
+}
+
+fn reflog_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(reflog_logs_dir_for_ref(git_dir, name)?.join(name))
+}
+
+fn reflog_logs_dir_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
+    if name == "HEAD" {
+        Ok(git_dir.join("logs"))
+    } else {
+        Ok(common_git_dir_for_git_dir(git_dir)?.join("logs"))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -4910,9 +5203,8 @@ fn cmd_reflog_delete(args: &[String]) -> Result<()> {
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
     let mut exit_code = 0;
     for spec in specs {
         if let Err(GitError::Exit(code)) = delete_reflog_entry(&store, &spec, options) {
@@ -5032,7 +5324,11 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
     let logs_dir = common_git_dir.join("logs");
     if options.all {
         if logs_dir.exists() {
-            fs::remove_dir_all(logs_dir)?;
+            fs::remove_dir_all(&logs_dir)?;
+        }
+        let worktree_logs_dir = git_dir.join("logs");
+        if worktree_logs_dir != logs_dir && worktree_logs_dir.exists() {
+            fs::remove_dir_all(worktree_logs_dir)?;
         }
         return Ok(());
     }
@@ -5040,7 +5336,8 @@ fn cmd_reflog_drop(args: &[String]) -> Result<()> {
     for reference in refs {
         let display = reference.clone();
         let reference = reflog_reference_name(Some(&reference))?;
-        let path = logs_dir.join(&reference);
+        let path = reflog_path_for_ref(&git_dir, &reference)?;
+        let logs_dir = reflog_logs_dir_for_ref(&git_dir, &reference)?;
         if !path.is_file() {
             eprintln!("error: reflog could not be found: '{display}'");
             exit_code = 255;
@@ -5095,16 +5392,15 @@ fn cmd_reflog_write(args: &[String]) -> Result<()> {
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
+    let format = repository_object_format(&git_dir)?;
     let old_oid = parse_reflog_write_oid(format, &args[1], "old")?;
     let new_oid = parse_reflog_write_oid(format, &args[2], "new")?;
     let zero = zero_oid(format)?;
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     validate_reflog_write_object(&db, &old_oid, &zero, "old")?;
     validate_reflog_write_object(&db, &new_oid, &zero, "new")?;
 
-    let store = FileRefStore::new(&common_git_dir, format);
+    let store = FileRefStore::new(&git_dir, format);
     store.append_reflog(
         reference,
         &ReflogEntry {
@@ -5194,22 +5490,20 @@ fn cmd_reflog_expire(args: &[String]) -> Result<()> {
 
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
     let mut targets = BTreeSet::new();
     if options.all {
-        let logs_dir = common_git_dir.join("logs");
-        collect_reflog_names(&logs_dir, &logs_dir, &mut targets)?;
+        collect_repository_reflog_names(&git_dir, &mut targets)?;
     }
     for reference in refs {
         targets.insert(reflog_reference_name(Some(&reference))?);
     }
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut exit_code = 0;
     for reference in targets {
         if let Err(GitError::Exit(code)) =
-            expire_reflog_entries(&store, &db, &common_git_dir, format, &reference, options)
+            expire_reflog_entries(&store, &db, &git_dir, format, &reference, options)
         {
             exit_code = code;
         }
@@ -6657,7 +6951,7 @@ fn create_stash_commit(
         eprintln!("You do not have the initial commit yet");
         return Err(GitError::Exit(1));
     };
-    let index = read_repository_index(&git_dir)?.unwrap_or(Index {
+    let index = read_repository_index(&git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
         extensions: Vec::new(),
@@ -9430,13 +9724,10 @@ fn write_check_attr_state(
     Ok(())
 }
 
-fn check_ignore_tracked_paths(git_dir: &Path) -> Result<BTreeSet<Vec<u8>>> {
-    let index_path = git_worktree::repository_index_path(git_dir);
-    if !index_path.exists() {
-        return Ok(BTreeSet::new());
-    }
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
-    Ok(index.entries.into_iter().map(|entry| entry.path).collect())
+fn check_ignore_tracked_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
+    Ok(git_worktree::read_repository_index(git_dir, format)?
+        .map(|index| index.entries.into_iter().map(|entry| entry.path).collect())
+        .unwrap_or_default())
 }
 
 fn cmd_rm(args: &[String]) -> Result<()> {
@@ -9547,8 +9838,8 @@ fn cmd_rm(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let resolved_paths = paths
         .into_iter()
         .map(|path| {
@@ -10282,7 +10573,781 @@ fn cmd_fetch(args: &[String]) -> Result<()> {
     {
         return fetch_bundle(&git_dir, format, &source, &refspecs, &bundle, options);
     }
+    if fetch_source_is_ssh(&source)? {
+        return fetch_ssh_repository(&git_dir, format, &source, &refspecs, options);
+    }
     fetch_local_repository(&git_dir, format, &source, &refspecs, options)
+}
+
+fn cmd_receive_pack(args: &[String]) -> Result<()> {
+    let repository = match args {
+        [repository] => repository,
+        _ => {
+            return Err(GitError::Command(
+                "receive-pack currently supports: receive-pack <repository>".into(),
+            ));
+        }
+    };
+    let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(repository)?)?;
+    let format = repository_object_format(&git_dir)?;
+    let features = receive_pack_features(format);
+    let mut advertisements = local_fetch_advertisements(&git_dir, format)?;
+    attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
+
+    {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        write_ref_advertisement_set(
+            &mut stdout,
+            &RefAdvertisementSet {
+                protocol: ProtocolVersion::V0,
+                refs: advertisements,
+                shallow: Vec::new(),
+            },
+        )?;
+        stdout.flush()?;
+    }
+
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let commands = read_receive_pack_request(format, &mut stdin)?;
+    let push_options = receive_pack_request_uses_push_options(&commands)
+        .then(|| read_receive_pack_push_options(&mut stdin))
+        .transpose()?;
+    let mut packfile = Vec::new();
+    stdin.read_to_end(&mut packfile)?;
+    let request = ReceivePackPushRequest {
+        commands,
+        push_options,
+        packfile,
+    };
+    let report = receive_pack_into_local_repository(&git_dir, format, &request)?;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_receive_pack_report_status(&mut stdout, &report)?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn receive_pack_request_uses_push_options(request: &ReceivePackRequest) -> bool {
+    request
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "push-options")
+}
+
+fn attach_receive_pack_capabilities(
+    advertisements: &mut Vec<RefAdvertisement>,
+    format: ObjectFormat,
+    features: &ReceivePackFeatures,
+) -> Result<()> {
+    let capabilities = encode_receive_pack_features(features)?;
+    if let Some(first) = advertisements.first_mut() {
+        first.capabilities = capabilities;
+    } else {
+        advertisements.push(RefAdvertisement {
+            oid: zero_oid(format)?,
+            name: "capabilities^{}".into(),
+            capabilities,
+        });
+    }
+    Ok(())
+}
+
+fn cmd_upload_pack(args: &[String]) -> Result<()> {
+    let repository = match args {
+        [repository] => repository,
+        _ => {
+            return Err(GitError::Command(
+                "upload-pack currently supports: upload-pack <repository>".into(),
+            ));
+        }
+    };
+    let git_dir = ls_remote_git_dir(repository)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let features = upload_pack_features(&git_dir, format)?;
+    let mut advertisements = local_fetch_advertisements(&git_dir, format)?;
+    attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
+
+    {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        write_ref_advertisement_set(
+            &mut stdout,
+            &RefAdvertisementSet {
+                protocol: ProtocolVersion::V0,
+                refs: advertisements,
+                shallow: Vec::new(),
+            },
+        )?;
+        stdout.flush()?;
+    }
+
+    let stdin = io::stdin();
+    let mut stdin = stdin.lock();
+    let Some(request) = read_upload_pack_request(format, &mut stdin)? else {
+        return Ok(());
+    };
+    let mut haves = HashSet::new();
+    loop {
+        let negotiation = read_upload_pack_negotiation_request(format, &mut stdin)?;
+        haves.extend(negotiation.haves);
+        if negotiation.done {
+            break;
+        }
+    }
+
+    let sideband = upload_pack_request_uses_sideband(&request);
+    let response = upload_pack_from_local_repository(&git_dir, format, &features, request, haves)?;
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    if sideband {
+        let response = upload_pack_sideband_response(response);
+        write_upload_pack_packfile_response(&mut stdout, &response)?;
+    } else {
+        write_upload_pack_raw_packfile_response(&mut stdout, &response)?;
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn upload_pack_features(git_dir: &Path, format: ObjectFormat) -> Result<UploadPackFeatures> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut symrefs = Vec::new();
+    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
+        symrefs.push(format!("HEAD:{target}"));
+    }
+    Ok(UploadPackFeatures {
+        object_format: Some(format),
+        side_band_64k: true,
+        symrefs,
+        ..UploadPackFeatures::default()
+    })
+}
+
+fn upload_pack_request_uses_sideband(request: &UploadPackRequest) -> bool {
+    request
+        .capabilities
+        .iter()
+        .any(|capability| matches!(capability.name.as_str(), "side-band" | "side-band-64k"))
+}
+
+fn upload_pack_sideband_response(
+    response: UploadPackRawPackfileResponse,
+) -> UploadPackPackfileResponse {
+    let mut sideband = Vec::new();
+    let chunk_len = PKT_LINE_MAX_PAYLOAD_LEN - 1;
+    for chunk in response.packfile.chunks(chunk_len) {
+        sideband.push(SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: chunk.to_vec(),
+        });
+    }
+    UploadPackPackfileResponse {
+        acknowledgments: response.acknowledgments,
+        sideband,
+    }
+}
+
+fn attach_upload_pack_capabilities(
+    advertisements: &mut Vec<RefAdvertisement>,
+    format: ObjectFormat,
+    features: &UploadPackFeatures,
+) -> Result<()> {
+    let capabilities = encode_upload_pack_features(features)?;
+    if let Some(first) = advertisements.first_mut() {
+        first.capabilities = capabilities;
+    } else {
+        advertisements.push(RefAdvertisement {
+            oid: zero_oid(format)?,
+            name: "capabilities^{}".into(),
+            capabilities,
+        });
+    }
+    Ok(())
+}
+
+fn upload_pack_from_local_repository(
+    git_dir: &Path,
+    format: ObjectFormat,
+    features: &UploadPackFeatures,
+    request: git_transport::UploadPackRequest,
+    haves: HashSet<ObjectId>,
+) -> Result<UploadPackRawPackfileResponse> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    build_upload_pack_raw_packfile_response(
+        features,
+        request,
+        haves,
+        |oid| db.contains(oid),
+        |wants, known_haves| {
+            let excluded = collect_reachable_object_ids(&db, format, known_haves)?;
+            build_reachable_pack(&db, format, wants, &excluded)
+                .map(|pack| pack.map(|pack| pack.pack))
+        },
+    )
+}
+
+fn cmd_push(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let mut quiet = false;
+    let mut set_upstream = false;
+    let mut delete = false;
+    let mut force = false;
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            "-u" | "--set-upstream" => set_upstream = true,
+            "--no-set-upstream" => set_upstream = false,
+            "-d" | "--delete" => delete = true,
+            "--no-delete" => delete = false,
+            "--repo" | "--receive-pack" | "--exec" => {
+                iter.next().ok_or_else(|| {
+                    GitError::Command(format!("push {} requires a value", arg.as_str()))
+                })?;
+            }
+            value
+                if value.starts_with("--repo=")
+                    || value.starts_with("--receive-pack=")
+                    || value.starts_with("--exec=") => {}
+            "--porcelain" | "--progress" | "--no-progress" | "--thin" | "--no-thin" => {}
+            "--" => {
+                positional.extend(iter.map(|value| value.to_string()));
+                break;
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "unsupported push option {value}"
+                )));
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+
+    let (remote, refspecs) = if delete {
+        let Some((remote, names)) = positional.split_first() else {
+            return Err(GitError::Command(
+                "push --delete requires at least one ref".into(),
+            ));
+        };
+        if names.is_empty() {
+            return Err(GitError::Command(
+                "push --delete requires at least one ref".into(),
+            ));
+        }
+        (
+            remote.clone(),
+            names.iter().map(|refspec| format!(":{refspec}")).collect(),
+        )
+    } else {
+        push_remote_and_refspecs(&store, &positional)?
+    };
+    let options = PushOptions {
+        quiet,
+        set_upstream,
+        force,
+    };
+    if push_remote_is_ssh(&remote)? {
+        push_ssh_repository(
+            &git_dir,
+            &common_git_dir,
+            format,
+            &remote,
+            &refspecs,
+            options,
+        )
+    } else {
+        push_local_repository(
+            &git_dir,
+            &common_git_dir,
+            format,
+            &remote,
+            &refspecs,
+            options,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PushOptions {
+    quiet: bool,
+    set_upstream: bool,
+    force: bool,
+}
+
+fn push_remote_is_ssh(remote: &str) -> Result<bool> {
+    let resolved = push_resolved_url(remote)?;
+    Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Ssh)
+}
+
+fn push_resolved_url(remote: &str) -> Result<String> {
+    if let Ok(git_dir) = discover_git_dir(&env::current_dir()?) {
+        let config = read_repo_config(&git_dir)?;
+        let configured = remote_config_values(&config, remote, "pushurl")
+            .into_iter()
+            .next()
+            .or_else(|| {
+                remote_config_values(&config, remote, "url")
+                    .into_iter()
+                    .next()
+            });
+        if let Some(url) = configured {
+            return Ok(rewrite_url_with_config(&config, &url, true));
+        }
+        return Ok(rewrite_url_with_config(&config, remote, true));
+    }
+    Ok(remote.to_string())
+}
+
+fn push_remote_and_refspecs(
+    store: &FileRefStore,
+    positional: &[String],
+) -> Result<(String, Vec<String>)> {
+    match positional {
+        [] => {
+            let branch = store.current_branch()?.ok_or_else(|| {
+                GitError::Command("push requires a refspec when HEAD is detached".into())
+            })?;
+            Ok(("origin".into(), vec![branch]))
+        }
+        [remote] => {
+            let branch = store.current_branch()?.ok_or_else(|| {
+                GitError::Command("push requires a refspec when HEAD is detached".into())
+            })?;
+            Ok((remote.clone(), vec![branch]))
+        }
+        [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
+    }
+}
+
+fn push_local_repository(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+    refspecs: &[String],
+    options: PushOptions,
+) -> Result<()> {
+    let remote_git_dir = ls_remote_git_dir(remote)?;
+    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+    let remote_format = repository_object_format(&remote_common_git_dir)?;
+    if remote_format != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository uses {}, local repository uses {}",
+            remote_format.name(),
+            format.name()
+        )));
+    }
+
+    let local_store = FileRefStore::new(git_dir, format);
+    let local_refs = local_push_source_refs(&local_store, format)?;
+    let remote_refs = local_fetch_advertisements(&remote_common_git_dir, format)?;
+    let refspecs = refspecs
+        .iter()
+        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut command_forces = Vec::new();
+    for refspec in &refspecs {
+        for command in plan_push_commands(
+            format,
+            &local_refs,
+            &remote_refs,
+            std::slice::from_ref(refspec),
+        )? {
+            command_forces.push((command, options.force || refspec.force));
+        }
+    }
+    let commands = command_forces
+        .iter()
+        .map(|(command, _)| command.clone())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        return Ok(());
+    }
+
+    let remote_excluded_tips = remote_refs
+        .iter()
+        .map(|reference| reference.oid.clone())
+        .collect::<Vec<_>>();
+    let starts = commands
+        .iter()
+        .filter(|command| !is_zero_object_id(&command.new_id))
+        .map(|command| command.new_id.clone());
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, format);
+    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
+        .map(|pack| pack.pack)
+        .unwrap_or_default();
+    let request = ReceivePackPushRequest {
+        commands: ReceivePackRequest {
+            shallow: Vec::new(),
+            commands: commands.clone(),
+            capabilities: Vec::new(),
+        },
+        push_options: None,
+        packfile,
+    };
+    receive_pack_into_local_repository(&remote_git_dir, format, &request)?;
+
+    if options.set_upstream {
+        configure_push_upstreams(git_dir, remote, &commands)?;
+    }
+    if !options.quiet {
+        eprintln!("To {remote}");
+        for command in &commands {
+            eprintln!("   {}  {}", command.new_id, command.name);
+        }
+    }
+    Ok(())
+}
+
+fn push_ssh_repository(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+    refspecs: &[String],
+    options: PushOptions,
+) -> Result<()> {
+    let remote_url = push_resolved_url(remote)?;
+    let parsed = parse_remote_url(&remote_url)?;
+    if parsed.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH receive-pack requires an SSH remote".into(),
+        ));
+    }
+    let ssh = ssh_process_command(
+        &parsed,
+        GitService::ReceivePack,
+        ssh_program(),
+        SshCommandVariant::OpenSsh,
+    )?;
+    let mut child = ProcessCommand::new(&ssh.program)
+        .args(&ssh.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
+
+    let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
+    let features = advertisement_set
+        .refs
+        .first()
+        .map(|advertisement| parse_receive_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(remote_format) = features.object_format {
+        if remote_format != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "remote repository uses {}, local repository uses {}",
+                remote_format.name(),
+                format.name()
+            )));
+        }
+    } else if format != ObjectFormat::Sha1 {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository did not advertise object-format for {} push",
+            format.name()
+        )));
+    }
+
+    let local_store = FileRefStore::new(git_dir, format);
+    let local_refs = local_push_source_refs(&local_store, format)?;
+    let parsed_refspecs = refspecs
+        .iter()
+        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
+        .collect::<Result<Vec<_>>>()?;
+    let mut command_forces = Vec::new();
+    for refspec in &parsed_refspecs {
+        for command in plan_push_commands(
+            format,
+            &local_refs,
+            &advertisement_set.refs,
+            std::slice::from_ref(refspec),
+        )? {
+            command_forces.push((command, options.force || refspec.force));
+        }
+    }
+    let commands = command_forces
+        .iter()
+        .map(|(command, _)| command.clone())
+        .collect::<Vec<_>>();
+    if commands.is_empty() {
+        drop(stdin);
+        let _ = child.wait_with_output()?;
+        return Ok(());
+    }
+
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    let remote_excluded_tips =
+        remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
+    let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
+    let starts = commands
+        .iter()
+        .filter(|command| !is_zero_object_id(&command.new_id))
+        .map(|command| command.new_id.clone());
+    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
+        .map(|pack| pack.pack)
+        .unwrap_or_default();
+    let request = build_receive_pack_push_request(
+        &features,
+        commands.clone(),
+        packfile,
+        ReceivePackPushRequestOptions {
+            report_status: features.report_status,
+            ofs_delta: features.ofs_delta,
+            quiet: options.quiet && features.quiet,
+            object_format: features
+                .object_format
+                .filter(|_| format != ObjectFormat::Sha1),
+            ..ReceivePackPushRequestOptions::default()
+        },
+    )?;
+    write_receive_pack_push_request(&mut stdin, &request)?;
+    drop(stdin);
+
+    if features.report_status {
+        let report = read_receive_pack_report_status(&mut stdout)?;
+        validate_receive_pack_report(&report)?;
+    } else {
+        let mut sink = Vec::new();
+        stdout.read_to_end(&mut sink)?;
+    }
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(GitError::Command(format!(
+            "ssh receive-pack failed for {remote_url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    if options.set_upstream {
+        configure_push_upstreams(git_dir, remote, &commands)?;
+    }
+    if !options.quiet {
+        eprintln!("To {remote}");
+        for command in &commands {
+            eprintln!("   {}  {}", command.new_id, command.name);
+        }
+    }
+    Ok(())
+}
+
+fn remote_advertisement_tips_known_to_local(
+    local_db: &FileObjectDatabase,
+    advertisements: &[RefAdvertisement],
+) -> Result<Vec<ObjectId>> {
+    let mut tips = Vec::new();
+    let mut seen = HashSet::new();
+    for advertisement in advertisements {
+        if is_zero_object_id(&advertisement.oid) || !seen.insert(advertisement.oid.clone()) {
+            continue;
+        }
+        if local_db.contains(&advertisement.oid)? {
+            tips.push(advertisement.oid.clone());
+        }
+    }
+    Ok(tips)
+}
+
+fn validate_receive_pack_report(report: &ReceivePackReportStatus) -> Result<()> {
+    if let git_transport::ReceivePackUnpackStatus::Error(message) = &report.unpack {
+        return Err(GitError::Command(format!(
+            "failed to push some refs: unpack failed: {message}"
+        )));
+    }
+    for status in &report.commands {
+        if let git_transport::ReceivePackCommandStatus::Ng { name, message } = status {
+            return Err(GitError::Command(format!(
+                "failed to push {name}: {message}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn receive_pack_into_local_repository(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    request: &ReceivePackPushRequest,
+) -> Result<ReceivePackReportStatus> {
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    apply_receive_pack_push_request(
+        &receive_pack_features(format),
+        request,
+        |name| match remote_store.read_ref(name)? {
+            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
+            Some(RefTarget::Symbolic(_)) | None => Ok(None),
+        },
+        |packfile| remote_db.install_raw_pack(packfile).map(|_| ()),
+        |oid| remote_db.contains(oid),
+        |commands| {
+            let mut tx = remote_store.transaction();
+            for command in commands {
+                tx.update(RefUpdate {
+                    name: command.name.clone(),
+                    expected: (!is_zero_object_id(&command.old_id))
+                        .then(|| RefTarget::Direct(command.old_id.clone())),
+                    new: RefTarget::Direct(command.new_id.clone()),
+                    reflog: None,
+                });
+            }
+            tx.commit()
+        },
+        |name| remote_store.delete_ref(name).map(|_| ()),
+    )
+}
+
+fn receive_pack_features(format: ObjectFormat) -> ReceivePackFeatures {
+    ReceivePackFeatures {
+        report_status: true,
+        delete_refs: true,
+        ofs_delta: true,
+        push_options: true,
+        quiet: true,
+        object_format: Some(format),
+        ..ReceivePackFeatures::default()
+    }
+}
+
+fn local_push_source_refs(
+    store: &FileRefStore,
+    format: ObjectFormat,
+) -> Result<Vec<PushSourceRef>> {
+    let mut refs = Vec::new();
+    for reference in store.list_refs()? {
+        let Some((oid, _)) = resolve_for_each_ref_target(store, &reference)? else {
+            continue;
+        };
+        if oid.format() != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "local ref {} has {} object id for {} repository",
+                reference.name,
+                oid.format().name(),
+                format.name()
+            )));
+        }
+        refs.push(PushSourceRef {
+            name: reference.name.clone(),
+            oid: oid.clone(),
+        });
+        if let Some(short) = reference.name.strip_prefix("refs/heads/") {
+            refs.push(PushSourceRef {
+                name: short.to_string(),
+                oid: oid.clone(),
+            });
+        }
+        if let Some(short) = reference.name.strip_prefix("refs/tags/") {
+            refs.push(PushSourceRef {
+                name: short.to_string(),
+                oid,
+            });
+        }
+    }
+    Ok(refs)
+}
+
+fn normalize_push_refspec(refspec: &str) -> String {
+    let (force, refspec) = refspec
+        .strip_prefix('+')
+        .map_or((false, refspec), |refspec| (true, refspec));
+    let normalized = if let Some((src, dst)) = refspec.split_once(':') {
+        let src = normalize_push_refname(src);
+        let dst = normalize_push_refname(dst);
+        format!("{src}:{dst}")
+    } else {
+        let name = normalize_push_refname(refspec);
+        format!("{name}:{name}")
+    };
+    if force {
+        format!("+{normalized}")
+    } else {
+        normalized
+    }
+}
+
+fn normalize_push_refname(name: &str) -> String {
+    if name.is_empty() || name.starts_with("refs/") {
+        name.to_string()
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
+fn is_zero_object_id(oid: &ObjectId) -> bool {
+    oid.as_bytes().iter().all(|byte| *byte == 0)
+}
+
+fn reject_non_fast_forward_pushes(
+    local_db: &FileObjectDatabase,
+    format: ObjectFormat,
+    command_forces: &[(ReceivePackCommand, bool)],
+) -> Result<()> {
+    for (command, force) in command_forces {
+        if *force
+            || !command.name.starts_with("refs/heads/")
+            || is_zero_object_id(&command.old_id)
+            || is_zero_object_id(&command.new_id)
+        {
+            continue;
+        }
+        let ancestors = ancestor_depths(local_db, format, &command.new_id)?;
+        if !ancestors.contains_key(&command.old_id) {
+            let short = command.name.trim_start_matches("refs/heads/");
+            return Err(GitError::Command(format!(
+                "failed to push some refs: non-fast-forward update to {short}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn configure_push_upstreams(
+    git_dir: &Path,
+    remote: &str,
+    commands: &[ReceivePackCommand],
+) -> Result<()> {
+    let mut config = read_repo_config(git_dir)?;
+    for command in commands {
+        let Some(branch) = command.name.strip_prefix("refs/heads/") else {
+            continue;
+        };
+        let remote_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "remote".into(),
+        };
+        config_set_value(&mut config, &remote_key, remote, false);
+        let merge_key = ConfigKey {
+            section: "branch".into(),
+            subsection: Some(branch.to_string()),
+            key: "merge".into(),
+        };
+        config_set_value(&mut config, &merge_key, &command.name, false);
+    }
+    write_repo_config(git_dir, &config)
 }
 
 #[derive(Clone, Copy)]
@@ -10311,8 +11376,8 @@ fn fetch_bundle(
         verify_bundle_prerequisites(bundle, &prerequisite_reader)?;
         bundle.references.clone()
     } else {
-        let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
-        unbundle_objects(bundle, &prerequisite_reader, &mut writer)?.references
+        let database = FileObjectDatabase::from_git_dir(git_dir, format);
+        install_bundle_pack(bundle, &prerequisite_reader, &database)?.references
     };
     if refspecs.is_empty() {
         if options.dry_run {
@@ -10373,6 +11438,9 @@ fn fetch_local_repository(
     let config = read_repo_config(git_dir)?;
     apply_configured_remote_tag_option(&config, source, &mut options);
     apply_configured_fetch_prune_option(&config, source, &mut options);
+    let promisor_remote = config
+        .get_bool("remote", Some(source), "promisor")
+        .unwrap_or(false);
     let configured_refspecs = if refspecs.is_empty() {
         remote_config_values(&config, source, "fetch")
     } else {
@@ -10386,7 +11454,7 @@ fn fetch_local_repository(
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
-    let advertisements = local_fetch_advertisements(&remote_common_git_dir, format)?;
+    let advertisements = local_fetch_advertisements(&remote_git_dir, format)?;
     let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
     let store = FileRefStore::new(git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, format);
@@ -10409,12 +11477,17 @@ fn fetch_local_repository(
             update.not_for_merge = true;
         }
     }
-    let mut local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let starts = updates.iter().map(|update| update.oid.clone());
-    let objects = collect_bundle_objects(&remote_db, format, starts, &HashSet::new())?;
-    for object in objects {
-        local_db.write_object(object)?;
-    }
+    let starts = updates
+        .iter()
+        .map(|update| update.oid.clone())
+        .collect::<Vec<_>>();
+    install_fetch_pack_via_local_upload_pack(
+        git_dir,
+        &remote_git_dir,
+        format,
+        starts,
+        promisor_remote,
+    )?;
     if options.dry_run {
         return Ok(());
     }
@@ -10443,6 +11516,295 @@ fn fetch_local_repository(
         prune_fetch_remote_tracking_refs(&config, &store, git_dir, source, options.quiet)?;
     }
     Ok(())
+}
+
+fn fetch_source_is_ssh(source: &str) -> Result<bool> {
+    let resolved = ls_remote_resolved_url(source)?;
+    Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Ssh)
+}
+
+fn fetch_ssh_repository(
+    git_dir: &Path,
+    format: ObjectFormat,
+    source: &str,
+    refspecs: &[String],
+    mut options: FetchOptions,
+) -> Result<()> {
+    let config = read_repo_config(git_dir)?;
+    apply_configured_remote_tag_option(&config, source, &mut options);
+    apply_configured_fetch_prune_option(&config, source, &mut options);
+    let promisor_remote = config
+        .get_bool("remote", Some(source), "promisor")
+        .unwrap_or(false);
+    let configured_refspecs = if refspecs.is_empty() {
+        remote_config_values(&config, source, "fetch")
+    } else {
+        Vec::new()
+    };
+    let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
+    let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
+    let fetch_head_source = fetch_head_source_description(&config, source);
+    let refspecs = fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
+    let refspecs = refspecs
+        .iter()
+        .map(|refspec| parse_refspec(refspec))
+        .collect::<Result<Vec<_>>>()?;
+    let resolved = ls_remote_resolved_url(source)?;
+    let (advertisements, features) = ssh_upload_pack_advertisements(&resolved, format)?;
+    let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
+    let store = FileRefStore::new(git_dir, format);
+    if options.fetch_all_tags {
+        mark_tag_refspec_updates_not_for_merge(&mut updates);
+    } else {
+        retain_missing_auto_follow_tags(&store, &mut updates)?;
+    }
+    if configured_remote_fetch {
+        for update in &mut updates {
+            update.not_for_merge = true;
+        }
+    }
+    let wants = updates
+        .iter()
+        .map(|update| update.oid.clone())
+        .collect::<Vec<_>>();
+    install_fetch_pack_via_ssh_upload_pack(
+        git_dir,
+        format,
+        &resolved,
+        &features,
+        wants,
+        promisor_remote,
+    )?;
+    if options.dry_run {
+        return Ok(());
+    }
+    if options.write_fetch_head {
+        if default_head_fetch
+            && updates.len() == 1
+            && updates[0].src == "HEAD"
+            && updates[0].dst.is_none()
+        {
+            write_default_fetch_head(git_dir, source, updates[0].oid.clone(), options.append)?;
+        } else {
+            write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
+        }
+    }
+    let ref_updates = updates
+        .iter()
+        .filter_map(|update| {
+            update.dst.as_ref().map(|dst| BundleRefUpdate {
+                name: dst.clone(),
+                oid: update.oid.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    store.apply_bundle_ref_updates(&ref_updates, None)?;
+    if options.prune && remote_exists(&config, source) {
+        prune_fetch_remote_tracking_refs_from_advertisements(
+            &config,
+            &store,
+            source,
+            &advertisements,
+            options.quiet,
+        )?;
+    }
+    Ok(())
+}
+
+fn install_fetch_pack_via_local_upload_pack(
+    git_dir: &Path,
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    wants: Vec<ObjectId>,
+    promisor: bool,
+) -> Result<()> {
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if wants
+        .iter()
+        .map(|want| local_db.contains(want))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|contains| contains)
+    {
+        return Ok(());
+    }
+
+    let features = upload_pack_features(remote_git_dir, format)?;
+    let request = UploadPackRequest {
+        wants,
+        ..UploadPackRequest::default()
+    };
+    let mut encoded_request = Vec::new();
+    write_upload_pack_request(&mut encoded_request, Some(&request))?;
+    let decoded_request = read_upload_pack_request(format, &mut encoded_request.as_slice())?
+        .ok_or_else(|| GitError::InvalidFormat("encoded upload-pack request was empty".into()))?;
+
+    let haves = local_have_oids(git_dir, format)?;
+    let negotiation = UploadPackNegotiationRequest { haves, done: true };
+    let mut encoded_negotiation = Vec::new();
+    write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
+    let decoded_negotiation =
+        read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
+
+    let response = upload_pack_from_local_repository(
+        remote_git_dir,
+        format,
+        &features,
+        decoded_request,
+        decoded_negotiation.haves.into_iter().collect(),
+    )?;
+    let mut encoded_response = Vec::new();
+    write_upload_pack_raw_packfile_response(&mut encoded_response, &response)?;
+    let decoded_response =
+        read_upload_pack_raw_packfile_response(format, &mut encoded_response.as_slice())?;
+    if promisor {
+        install_upload_pack_raw_promisor_response(&decoded_response, &local_db)?;
+    } else {
+        install_upload_pack_raw_response(&decoded_response, &local_db)?;
+    }
+    Ok(())
+}
+
+fn install_fetch_pack_via_ssh_upload_pack(
+    git_dir: &Path,
+    format: ObjectFormat,
+    remote_url: &str,
+    features: &UploadPackFeatures,
+    wants: Vec<ObjectId>,
+    promisor: bool,
+) -> Result<()> {
+    if wants.is_empty() {
+        return Ok(());
+    }
+    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if wants
+        .iter()
+        .map(|want| local_db.contains(want))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .all(|contains| contains)
+    {
+        return Ok(());
+    }
+    let request = UploadPackRequest {
+        wants,
+        ..UploadPackRequest::default()
+    };
+    let haves = local_have_oids(git_dir, format)?;
+    let response = ssh_upload_pack_fetch_response(remote_url, format, features, request, haves)?;
+    if promisor {
+        install_upload_pack_raw_promisor_response(&response, &local_db)?;
+    } else {
+        install_upload_pack_raw_response(&response, &local_db)?;
+    }
+    Ok(())
+}
+
+fn ssh_upload_pack_advertisements(
+    remote_url: &str,
+    format: ObjectFormat,
+) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
+    let parsed = parse_remote_url(remote_url)?;
+    if parsed.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH upload-pack requires an SSH remote".into(),
+        ));
+    }
+    let ssh = ssh_process_command(
+        &parsed,
+        GitService::UploadPack,
+        ssh_program(),
+        SshCommandVariant::OpenSsh,
+    )?;
+    let output = ProcessCommand::new(&ssh.program)
+        .args(&ssh.args)
+        .stdin(Stdio::null())
+        .output()?;
+    let mut stdout = output.stdout.as_slice();
+    let set = match read_ref_advertisement_set(format, &mut stdout) {
+        Ok(set) => set,
+        Err(_) if !output.status.success() => {
+            return Err(GitError::Command(format!(
+                "ssh upload-pack failed for {remote_url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    let features = set
+        .refs
+        .first()
+        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    Ok((set.refs, features))
+}
+
+fn ssh_upload_pack_fetch_response(
+    remote_url: &str,
+    format: ObjectFormat,
+    _features: &UploadPackFeatures,
+    request: UploadPackRequest,
+    haves: Vec<ObjectId>,
+) -> Result<UploadPackRawPackfileResponse> {
+    let parsed = parse_remote_url(remote_url)?;
+    if parsed.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH upload-pack requires an SSH remote".into(),
+        ));
+    }
+    let ssh = ssh_process_command(
+        &parsed,
+        GitService::UploadPack,
+        ssh_program(),
+        SshCommandVariant::OpenSsh,
+    )?;
+    let mut child = ProcessCommand::new(&ssh.program)
+        .args(&ssh.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("ssh upload-pack stdout was not piped".into()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
+
+    read_ref_advertisement_set(format, &mut stdout)?;
+    write_upload_pack_request(&mut stdin, Some(&request))?;
+    write_upload_pack_negotiation_request(
+        &mut stdin,
+        &UploadPackNegotiationRequest { haves, done: true },
+    )?;
+    drop(stdin);
+
+    let response = read_upload_pack_raw_packfile_response(format, &mut stdout)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(GitError::Command(format!(
+            "ssh upload-pack failed for {remote_url}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(response)
+}
+
+fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let mut seen = HashSet::new();
+    let mut haves = Vec::new();
+    for advertisement in local_fetch_advertisements(git_dir, format)? {
+        if seen.insert(advertisement.oid.clone()) {
+            haves.push(advertisement.oid);
+        }
+    }
+    Ok(haves)
 }
 
 fn apply_configured_remote_tag_option(
@@ -10577,7 +11939,7 @@ fn append_reachable_auto_follow_tags(
         .iter()
         .filter(|update| update.dst.is_some() && !update.src.starts_with("refs/tags/"))
         .map(|update| update.oid.clone());
-    let reachable = collect_bundle_object_ids(remote_db, format, starts)?;
+    let reachable = collect_reachable_object_ids(remote_db, format, starts)?;
     let mut fetched_srcs = updates
         .iter()
         .map(|update| update.src.clone())
@@ -10657,6 +12019,101 @@ fn prune_fetch_remote_tracking_refs(
         let mut stdout = io::stdout();
         prune_remote_tracking_refs(&mut stdout, config, store, git_dir, remote, false)
     }
+}
+
+fn prune_fetch_remote_tracking_refs_from_advertisements(
+    config: &GitConfig,
+    store: &FileRefStore,
+    remote: &str,
+    advertisements: &[RefAdvertisement],
+    quiet: bool,
+) -> Result<()> {
+    if quiet {
+        let mut sink = io::sink();
+        prune_remote_tracking_refs_from_advertisements(
+            &mut sink,
+            config,
+            store,
+            remote,
+            advertisements,
+            false,
+        )
+    } else {
+        let mut stdout = io::stdout();
+        prune_remote_tracking_refs_from_advertisements(
+            &mut stdout,
+            config,
+            store,
+            remote,
+            advertisements,
+            false,
+        )
+    }
+}
+
+fn prune_remote_tracking_refs_from_advertisements(
+    stdout: &mut impl Write,
+    config: &GitConfig,
+    store: &FileRefStore,
+    remote: &str,
+    advertisements: &[RefAdvertisement],
+    dry_run: bool,
+) -> Result<()> {
+    let remote_branches = advertisements
+        .iter()
+        .filter_map(|advertisement| advertisement.name.strip_prefix("refs/heads/"))
+        .collect::<BTreeSet<_>>();
+    let local_refs = store.list_refs()?;
+    let stale_branches = remote_tracking_branch_names(&local_refs, remote)
+        .into_iter()
+        .filter(|branch| !remote_branches.contains(branch.as_str()))
+        .collect::<Vec<_>>();
+    if stale_branches.is_empty() {
+        return Ok(());
+    }
+    let display_url = remote_config_values(config, remote, "url")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| remote.into());
+    writeln!(stdout, "Pruning {remote}")?;
+    writeln!(stdout, "URL: {display_url}")?;
+    let remote_head = format!("refs/remotes/{remote}/HEAD");
+    let remote_prefix = format!("refs/remotes/{remote}/");
+    let head_target = match store.read_ref(&remote_head)? {
+        Some(RefTarget::Symbolic(target)) => Some(target),
+        Some(RefTarget::Direct(_)) | None => None,
+    };
+    for branch in stale_branches {
+        let refname = format!("{remote_prefix}{branch}");
+        if dry_run {
+            writeln!(stdout, " * [would prune] {remote}/{branch}")?;
+            if head_target.as_deref() == Some(refname.as_str()) {
+                writeln!(
+                    stdout,
+                    " refs/remotes/{remote}/HEAD will become dangling after {refname} is deleted"
+                )?;
+            }
+            continue;
+        }
+        match store.read_ref(&refname)? {
+            Some(RefTarget::Symbolic(_)) => {
+                let _ = store.delete_symbolic_ref(&refname)?;
+            }
+            Some(RefTarget::Direct(_)) => {
+                let _ = store.delete_ref(&refname)?;
+            }
+            None => {}
+        }
+        writeln!(stdout, " * [pruned] {remote}/{branch}")?;
+        if head_target.as_deref() == Some(refname.as_str()) {
+            let _ = store.delete_symbolic_ref(&remote_head)?;
+            writeln!(
+                stdout,
+                " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn fetch_head_source_description(config: &GitConfig, source: &str) -> String {
@@ -10778,11 +12235,27 @@ fn cmd_ls_remote(args: &[String]) -> Result<()> {
         .map(repository_object_format)
         .transpose()?;
 
+    if let Some((mut records, format)) = ls_remote_ssh_records(repository, &options)? {
+        if options.exit_code && records.is_empty() {
+            return Err(GitError::Exit(2));
+        }
+        sort_ls_remote_records(
+            &mut records,
+            options.sort,
+            local_sort_git_dir.as_deref(),
+            local_sort_format.unwrap_or(format),
+        )?;
+        for record in records {
+            print_ls_remote_ref(&record, options.symref);
+        }
+        return Ok(());
+    }
+
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let store = FileRefStore::new(&git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut matched = false;
     let mut records = Vec::new();
 
@@ -10984,6 +12457,107 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
     Err(GitError::Exit(128))
 }
 
+fn ls_remote_ssh_records(
+    repository: &str,
+    options: &LsRemoteOptions,
+) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
+    let remote_url = ls_remote_resolved_url(repository)?;
+    let parsed = parse_remote_url(&remote_url)?;
+    if parsed.transport != RemoteTransport::Ssh {
+        return Ok(None);
+    }
+    let ssh = ssh_process_command(
+        &parsed,
+        GitService::UploadPack,
+        ssh_program(),
+        SshCommandVariant::OpenSsh,
+    )?;
+    let output = ProcessCommand::new(&ssh.program)
+        .args(&ssh.args)
+        .stdin(Stdio::null())
+        .output()?;
+    let mut stdout = output.stdout.as_slice();
+    let set = match read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout) {
+        Ok(set) => set,
+        Err(_) if !output.status.success() => {
+            return Err(GitError::Command(format!(
+                "ssh upload-pack failed for {remote_url}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Err(err) => return Err(err),
+    };
+    let features = set
+        .refs
+        .first()
+        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
+    if format != ObjectFormat::Sha1 {
+        return Err(GitError::Unsupported(format!(
+            "ssh ls-remote currently supports SHA-1 advertisements, got {}",
+            format.name()
+        )));
+    }
+    let symrefs = features
+        .symrefs
+        .iter()
+        .filter_map(|symref| symref.split_once(':'))
+        .map(|(name, target)| (name.to_string(), target.to_string()))
+        .collect::<HashMap<_, _>>();
+    let mut records = Vec::new();
+    for advertisement in set.refs {
+        if is_zero_object_id(&advertisement.oid) {
+            continue;
+        }
+        if options.refs_only
+            && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
+        {
+            continue;
+        }
+        let is_head = advertisement.name.starts_with("refs/heads/");
+        let is_tag = advertisement.name.starts_with("refs/tags/");
+        if (options.heads || options.tags)
+            && !((options.heads && is_head) || (options.tags && is_tag))
+        {
+            continue;
+        }
+        if !ls_remote_ref_matches(&advertisement.name, &options.patterns) {
+            continue;
+        }
+        records.push(LsRemoteRecord {
+            oid: advertisement.oid,
+            symref: symrefs.get(&advertisement.name).cloned(),
+            name: advertisement.name,
+        });
+    }
+    Ok(Some((records, format)))
+}
+
+fn ssh_program() -> String {
+    env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into())
+}
+
+fn ls_remote_resolved_url(repository: &str) -> Result<String> {
+    let cwd = env::current_dir()?;
+    let config = discover_git_dir(&cwd)
+        .ok()
+        .and_then(|git_dir| read_repo_config(&git_dir).ok());
+    let url = config
+        .as_ref()
+        .and_then(|config| {
+            remote_config_values(config, repository, "url")
+                .into_iter()
+                .next()
+        })
+        .unwrap_or_else(|| repository.to_string());
+    Ok(config
+        .as_ref()
+        .map(|config| rewrite_url_with_config(config, &url, false))
+        .unwrap_or(url))
+}
+
 fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
     if let Ok(path) = ls_remote_repository_path(repository, &cwd)
@@ -11016,13 +12590,50 @@ fn ls_remote_repository_path(repository: &str, cwd: &Path) -> Result<PathBuf> {
                 cwd.join(path)
             })
         }
-        RemoteTransport::File => Ok(PathBuf::from(parsed.path)),
+        RemoteTransport::File => Ok(PathBuf::from(percent_decode_url_path(&parsed.path)?)),
         RemoteTransport::Ssh
         | RemoteTransport::Git
         | RemoteTransport::Http
         | RemoteTransport::Https => Err(GitError::Unsupported(
             "ls-remote currently supports local repositories".into(),
         )),
+    }
+}
+
+fn percent_decode_url_path(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return Err(GitError::InvalidPath(format!(
+                    "invalid percent-encoded path {value:?}"
+                )));
+            }
+            let high = percent_hex_value(bytes[i + 1]).ok_or_else(|| {
+                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
+            })?;
+            let low = percent_hex_value(bytes[i + 2]).ok_or_else(|| {
+                GitError::InvalidPath(format!("invalid percent-encoded path {value:?}"))
+            })?;
+            decoded.push((high << 4) | low);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded)
+        .map_err(|_| GitError::InvalidPath(format!("invalid utf-8 file URL path {value:?}")))
+}
+
+fn percent_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -13169,7 +14780,7 @@ fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Resul
                 repository_relative_path_base(git_dir)?.join(path)
             }
         }
-        RemoteTransport::File => PathBuf::from(parsed.path),
+        RemoteTransport::File => PathBuf::from(percent_decode_url_path(&parsed.path)?),
         RemoteTransport::Ssh
         | RemoteTransport::Git
         | RemoteTransport::Http
@@ -13816,13 +15427,11 @@ fn cmd_bundle_create(args: &[String]) -> Result<()> {
     if selection.references.is_empty() {
         return Err(GitError::Command("Refusing to create empty bundle.".into()));
     }
-    let excluded = collect_bundle_object_ids(&db, format, selection.excludes)?;
-    let objects = collect_bundle_objects(&db, format, selection.starts, &excluded)?;
-    if objects.is_empty() {
+    let excluded = collect_reachable_object_ids(&db, format, selection.excludes)?;
+    let Some(pack) = build_reachable_pack(&db, format, selection.starts, &excluded)? else {
         eprintln!("fatal: Refusing to create empty bundle.");
         return Err(GitError::Exit(128));
-    }
-    let pack = PackFile::write_undeltified(&objects, format)?;
+    };
     let bundle = Bundle {
         version: if format == ObjectFormat::Sha1 { 2 } else { 3 },
         format,
@@ -13878,7 +15487,7 @@ fn cmd_bundle_list_heads(args: &[String]) -> Result<()> {
         ));
     };
     let refs = &args[1..];
-    let bundle = Bundle::parse(&fs::read(path)?, ObjectFormat::Sha1)?;
+    let bundle = Bundle::parse_standalone(&fs::read(path)?)?;
     print_bundle_refs(&bundle.references, refs)
 }
 
@@ -13904,8 +15513,8 @@ fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let bundle = Bundle::parse(&fs::read(path)?, format)?;
     let prerequisite_reader = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let mut writer = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let result = unbundle_objects(&bundle, &prerequisite_reader, &mut writer)?;
+    let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let result = install_bundle_pack(&bundle, &prerequisite_reader, &database)?;
     print_bundle_refs(&result.references, &refs)
 }
 
@@ -14077,80 +15686,6 @@ fn bundle_revision_selection(
         starts,
         excludes,
     })
-}
-
-fn collect_bundle_object_ids<I>(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    starts: I,
-) -> Result<HashSet<ObjectId>>
-where
-    I: IntoIterator<Item = ObjectId>,
-{
-    let mut seen = HashSet::new();
-    let mut objects = Vec::new();
-    for oid in starts {
-        collect_bundle_object(db, format, oid, &HashSet::new(), &mut seen, &mut objects)?;
-    }
-    Ok(seen)
-}
-
-fn collect_bundle_objects<I>(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    starts: I,
-    excluded: &HashSet<ObjectId>,
-) -> Result<Vec<EncodedObject>>
-where
-    I: IntoIterator<Item = ObjectId>,
-{
-    let mut seen = HashSet::new();
-    let mut objects = Vec::new();
-    for oid in starts {
-        collect_bundle_object(db, format, oid, excluded, &mut seen, &mut objects)?;
-    }
-    Ok(objects)
-}
-
-fn collect_bundle_object(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: ObjectId,
-    excluded: &HashSet<ObjectId>,
-    seen: &mut HashSet<ObjectId>,
-    objects: &mut Vec<EncodedObject>,
-) -> Result<()> {
-    if excluded.contains(&oid) {
-        return Ok(());
-    }
-    if !seen.insert(oid.clone()) {
-        return Ok(());
-    }
-    let object = db.read_object(&oid)?;
-    match object.object_type {
-        ObjectType::Commit => {
-            let commit = Commit::parse(format, &object.body)?;
-            objects.push(object);
-            collect_bundle_object(db, format, commit.tree, excluded, seen, objects)?;
-            for parent in commit.parents {
-                collect_bundle_object(db, format, parent, excluded, seen, objects)?;
-            }
-        }
-        ObjectType::Tree => {
-            let tree = Tree::parse(format, &object.body)?;
-            objects.push(object);
-            for entry in tree.entries {
-                collect_bundle_object(db, format, entry.oid, excluded, seen, objects)?;
-            }
-        }
-        ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
-            objects.push(object);
-            collect_bundle_object(db, format, tag.object, excluded, seen, objects)?;
-        }
-        ObjectType::Blob => objects.push(object),
-    }
-    Ok(())
 }
 
 fn cmd_branch(args: &[String]) -> Result<()> {
@@ -23157,6 +24692,7 @@ fn checkout_create_or_reset_branch(
 fn cmd_hash_object(args: &[String]) -> Result<()> {
     let mut object_type = ObjectType::Blob;
     let mut format = ObjectFormat::Sha1;
+    let mut explicit_format = false;
     let mut read_stdin = false;
     let mut read_stdin_paths = false;
     let mut allow_no_input = false;
@@ -23227,13 +24763,20 @@ fn cmd_hash_object(args: &[String]) -> Result<()> {
                 object_type = value[2..].parse()?;
             }
             "-w" => write = true,
-            "--object-format=sha1" => format = ObjectFormat::Sha1,
-            "--object-format=sha256" => format = ObjectFormat::Sha256,
+            "--object-format=sha1" => {
+                format = ObjectFormat::Sha1;
+                explicit_format = true;
+            }
+            "--object-format=sha256" => {
+                format = ObjectFormat::Sha256;
+                explicit_format = true;
+            }
             "--object-format" => {
                 format = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?
                     .parse()?;
+                explicit_format = true;
             }
             value if value.starts_with("--path=") => {}
             value => paths.push(PathBuf::from(value)),
@@ -23248,10 +24791,16 @@ fn cmd_hash_object(args: &[String]) -> Result<()> {
         ));
     }
     let mut store = None;
+    let cwd = env::current_dir()?;
     if write {
-        let git_dir = discover_git_dir(env::current_dir()?)?;
-        format = repository_object_format(&git_dir)?;
+        let git_dir = discover_git_dir(&cwd)?;
+        let repo_format = repository_object_format(&git_dir)?;
+        if !explicit_format {
+            format = repo_format;
+        }
         store = Some(LooseObjectStore::from_git_dir(&git_dir, format));
+    } else if !explicit_format && let Ok(git_dir) = discover_git_dir(&cwd) {
+        format = repository_object_format(&git_dir)?;
     }
     if read_stdin {
         let mut body = Vec::new();
@@ -31227,6 +32776,7 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut full_name = false;
     let mut deduplicate = false;
     let mut error_unmatch = false;
+    let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
     let mut iter = args.iter();
@@ -31293,8 +32843,13 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
             | "--no-eol"
             | "--no-killed"
             | "--no-resolve-undo"
-            | "--no-debug"
-            | "--no-abbrev" => {}
+            | "--no-debug" => {}
+            "--abbrev" => oid_abbrev = Some(7),
+            "--no-abbrev" => oid_abbrev = None,
+            value if let Some(value) = value.strip_prefix("--abbrev=") => {
+                let width = parse_abbrev(value)?;
+                oid_abbrev = (width != 0).then_some(width.max(4));
+            }
             "-z" => nul = true,
             value if value.starts_with("--exclude=") => {
                 let Some(pattern) = value.strip_prefix("--exclude=") else {
@@ -31323,7 +32878,7 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
             value if !value.starts_with('-') => path_args.push(arg.clone()),
             value => {
                 return Err(GitError::Command(format!(
-                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, and -z"
+                    "unsupported ls-files option {value}; currently supports --stage, --cached, --others, --deleted, --modified, --unmerged, --directory, --no-empty-directory, --full-name, --deduplicate, --error-unmatch, --abbrev[=<n>], --no-abbrev, and -z"
                 )));
             }
         }
@@ -31332,11 +32887,6 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "ls-files currently supports sha1 index files".into(),
-        ));
-    }
     for path in &exclude_from {
         let absolute = if Path::new(path).is_absolute() {
             PathBuf::from(path)
@@ -31403,9 +32953,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
     };
     if selected && !output_stage {
         if cached || deleted || modified {
-            let index_path = git_worktree::repository_index_path(&git_dir);
-            if index_path.exists() {
-                let index = Index::parse_v2_sha1(&std::fs::read(index_path)?)?;
+            if let Some(index) = git_worktree::read_repository_index(&git_dir, format)? {
+                let oid_candidates = ls_files_oid_candidates(&index);
                 if ignored && cached {
                     let ignored_entries = git_worktree::ignored_index_entries(
                         &worktree_root,
@@ -31425,6 +32974,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                             stage: false,
                             terminator,
                             deduplicate,
+                            oid_abbrev,
+                            oid_candidates: &oid_candidates,
                         },
                     )?;
                 } else {
@@ -31439,6 +32990,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                             stage: false,
                             terminator,
                             deduplicate,
+                            oid_abbrev,
+                            oid_candidates: &oid_candidates,
                         },
                     )?;
                 }
@@ -31450,11 +33003,17 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let index_path = git_worktree::repository_index_path(&git_dir);
-    if index_path.exists() {
-        let index = Index::parse_v2_sha1(&std::fs::read(index_path)?)?;
+    if let Some(index) = git_worktree::read_repository_index(&git_dir, format)? {
+        let oid_candidates = ls_files_oid_candidates(&index);
         if unmerged {
-            write_ls_files_unmerged(&mut stdout, index.entries.iter(), terminator, &pathspec)?;
+            write_ls_files_unmerged(
+                &mut stdout,
+                index.entries.iter(),
+                terminator,
+                &pathspec,
+                oid_abbrev,
+                &oid_candidates,
+            )?;
         } else if (deleted || modified) && output_stage {
             write_ls_files_index_with_selected(
                 &mut stdout,
@@ -31463,6 +33022,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                 modified_entries.iter(),
                 terminator,
                 &pathspec,
+                oid_abbrev,
+                &oid_candidates,
             )?;
         } else {
             write_ls_files_index(
@@ -31471,6 +33032,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                 output_stage,
                 terminator,
                 &pathspec,
+                oid_abbrev,
+                &oid_candidates,
             )?;
         }
     }
@@ -31486,12 +33049,22 @@ fn write_ls_files_unmerged<'a>(
     entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
     terminator: u8,
     pathspec: &LsFilesPathspec,
+    oid_abbrev: Option<usize>,
+    oid_candidates: &[ObjectId],
 ) -> Result<()> {
     for entry in entries {
         if index_entry_stage(entry) == 0 {
             continue;
         }
-        write_ls_files_index(stdout, [entry], true, terminator, pathspec)?;
+        write_ls_files_index(
+            stdout,
+            [entry],
+            true,
+            terminator,
+            pathspec,
+            oid_abbrev,
+            oid_candidates,
+        )?;
     }
     Ok(())
 }
@@ -31502,6 +33075,8 @@ fn write_ls_files_index<'a>(
     stage: bool,
     terminator: u8,
     pathspec: &LsFilesPathspec,
+    oid_abbrev: Option<usize>,
+    oid_candidates: &[ObjectId],
 ) -> Result<()> {
     for entry in entries {
         let Some(path) = pathspec.display(&entry.path) else {
@@ -31509,7 +33084,12 @@ fn write_ls_files_index<'a>(
         };
         if stage {
             let stage = index_entry_stage(entry);
-            write!(stdout, "{:06o} {} {stage}\t", entry.mode, entry.oid)?;
+            write!(
+                stdout,
+                "{:06o} {} {stage}\t",
+                entry.mode,
+                ls_files_oid(&entry.oid, oid_abbrev, oid_candidates)
+            )?;
         }
         write_ls_files_path(stdout, &path, terminator)?;
         stdout.write_all(&[terminator])?;
@@ -31524,6 +33104,8 @@ fn write_ls_files_index_with_selected<'a>(
     modified_entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
     terminator: u8,
     pathspec: &LsFilesPathspec,
+    oid_abbrev: Option<usize>,
+    oid_candidates: &[ObjectId],
 ) -> Result<()> {
     let deleted = deleted_entries.into_iter().collect::<Vec<_>>();
     let modified = modified_entries.into_iter().collect::<Vec<_>>();
@@ -31540,10 +33122,20 @@ fn write_ls_files_index_with_selected<'a>(
                 stage: true,
                 terminator,
                 deduplicate: false,
+                oid_abbrev,
+                oid_candidates,
             },
             &mut seen,
         )?;
-        write_ls_files_index(stdout, [entry], true, terminator, pathspec)?;
+        write_ls_files_index(
+            stdout,
+            [entry],
+            true,
+            terminator,
+            pathspec,
+            oid_abbrev,
+            oid_candidates,
+        )?;
     }
     Ok(())
 }
@@ -31609,7 +33201,12 @@ fn write_ls_files_entry(
     }
     if options.stage {
         let stage = index_entry_stage(entry);
-        write!(stdout, "{:06o} {} {stage}\t", entry.mode, entry.oid)?;
+        write!(
+            stdout,
+            "{:06o} {} {stage}\t",
+            entry.mode,
+            ls_files_oid(&entry.oid, options.oid_abbrev, options.oid_candidates)
+        )?;
     }
     write_ls_files_path(stdout, &path, options.terminator)?;
     stdout.write_all(&[options.terminator])?;
@@ -31629,12 +33226,26 @@ fn index_entry_stage(entry: &git_formats::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
 }
 
+fn ls_files_oid_candidates(index: &Index) -> Vec<ObjectId> {
+    index
+        .entries
+        .iter()
+        .map(|entry| entry.oid.clone())
+        .collect()
+}
+
+fn ls_files_oid(oid: &ObjectId, abbrev: Option<usize>, candidates: &[ObjectId]) -> String {
+    for_each_ref_abbrev_oid(oid, abbrev, candidates)
+}
+
 #[derive(Clone, Copy)]
-struct LsFilesWriteOptions {
+struct LsFilesWriteOptions<'a> {
     cached: bool,
     stage: bool,
     terminator: u8,
     deduplicate: bool,
+    oid_abbrev: Option<usize>,
+    oid_candidates: &'a [ObjectId],
 }
 
 struct LsFilesPathspec {
@@ -38371,13 +39982,14 @@ fn update_ref_delete_stdin(
 }
 
 fn update_ref_should_write_reflog(git_dir: &Path, name: &str, create_reflog: bool) -> Result<bool> {
-    if git_dir.join("logs").join(name).exists() || create_reflog {
+    if reflog_path_for_ref(git_dir, name)?.exists() || create_reflog {
         return Ok(true);
     }
     if let Some(value) = global_config_value("core.logAllRefUpdates")? {
         return Ok(update_ref_log_all_ref_updates_matches(name, &value));
     }
-    let Ok(config) = GitConfig::read(git_dir.join("config")) else {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
         return Ok(false);
     };
     Ok(config
@@ -38608,7 +40220,7 @@ fn cmd_rev_parse(args: &[String]) -> Result<()> {
                     }
                     continue;
                 }
-                let oid = match git_rev::resolve_revision(&git_dir, format, rev) {
+                let oid = match resolve_revision(&git_dir, format, rev) {
                     Ok(oid) => oid,
                     Err(_) if verify && quiet => return Err(GitError::Exit(1)),
                     Err(_) if verify => {
@@ -39349,13 +40961,14 @@ fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
     let options = parse_submodule_status_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let submodules = read_submodule_configs(&worktree_root)?;
     let selected = filter_submodules(&cwd, &worktree_root, submodules, &options.paths)?;
     if quiet || options.quiet {
         return Ok(());
     }
-    let index = read_repository_index(&git_dir)?;
+    let index = read_repository_index(&git_dir, format)?;
     for submodule in selected {
         print_submodule_status_tree(
             &cwd,
@@ -39547,9 +41160,10 @@ fn cmd_submodule_foreach(args: &[String], quiet: bool) -> Result<()> {
     let options = parse_submodule_foreach_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let submodules = read_submodule_configs(&worktree_root)?;
-    let index = read_repository_index(&git_dir)?;
+    let index = read_repository_index(&git_dir, format)?;
     run_submodule_foreach_tree(&cwd, &worktree_root, &index, &submodules, &options)
 }
 
@@ -39557,12 +41171,13 @@ fn cmd_submodule_summary(args: &[String], quiet: bool) -> Result<()> {
     let options = parse_submodule_summary_options(args, quiet)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     if options.quiet || options.summary_limit == Some(0) {
         return Ok(());
     }
     let submodules = read_submodule_configs(&worktree_root)?;
-    let index = read_repository_index(&git_dir)?;
+    let index = read_repository_index(&git_dir, format)?;
     let selected = select_submodules_for_summary(&cwd, &worktree_root, &submodules, &options);
     for submodule in selected {
         print_submodule_summary(
@@ -40102,10 +41717,10 @@ fn submodule_worktree_has_local_changes(
     let Ok((git_dir, _)) = submodule_head(&submodule_root) else {
         return Ok(false);
     };
-    let Some(index) = read_repository_index(&git_dir)? else {
+    let format = repository_object_format(&git_dir)?;
+    let Some(index) = read_repository_index(&git_dir, format)? else {
         return submodule_worktree_has_entries(&submodule_root);
     };
-    let format = repository_object_format(&git_dir)?;
     let mut tracked = BTreeSet::new();
     for entry in &index.entries {
         tracked.insert(String::from_utf8_lossy(&entry.path).into_owned());
@@ -40186,7 +41801,8 @@ fn run_submodule_foreach_tree(
         run_submodule_foreach_command(cwd, worktree_root, index, submodule, options)?;
         if options.recursive {
             let nested_configs = read_submodule_configs(&submodule_root)?;
-            let nested_index = read_repository_index(&submodule_git_dir)?;
+            let nested_format = repository_object_format(&submodule_git_dir)?;
+            let nested_index = read_repository_index(&submodule_git_dir, nested_format)?;
             run_submodule_foreach_tree(
                 cwd,
                 &submodule_root,
@@ -40585,12 +42201,8 @@ fn lexical_relative_path(root: &Path, target: &Path) -> Option<String> {
     )
 }
 
-fn read_repository_index(git_dir: &Path) -> Result<Option<Index>> {
-    let index_path = git_worktree::repository_index_path(git_dir);
-    if !index_path.exists() {
-        return Ok(None);
-    }
-    Ok(Some(Index::parse_v2_sha1(&fs::read(index_path)?)?))
+fn read_repository_index(git_dir: &Path, format: ObjectFormat) -> Result<Option<Index>> {
+    git_worktree::read_repository_index(git_dir, format)
 }
 
 fn print_submodule_status_tree(
@@ -40611,7 +42223,8 @@ fn print_submodule_status_tree(
     };
     let nested_configs = read_submodule_configs(&submodule_root)?;
     let nested = filter_submodules(cwd, &submodule_root, nested_configs, &[])?;
-    let nested_index = read_repository_index(&git_dir)?;
+    let nested_format = repository_object_format(&git_dir)?;
+    let nested_index = read_repository_index(&git_dir, nested_format)?;
     for nested_submodule in nested {
         print_submodule_status_tree(
             cwd,
@@ -44710,6 +46323,17 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+        Some("pack-thin-sha256") => {
+            let result = git_testkit::thin_pack_read_parity_sha256()?;
+            println!(
+                "pack-thin {} entries={} {} {}",
+                result.format.name(),
+                result.entries,
+                result.base_oid,
+                result.changed_oid
+            );
+            Ok(())
+        }
         Some("pack-write-delta") => {
             let result = git_testkit::rust_delta_pack_write_interop_parity()?;
             println!(
@@ -44751,8 +46375,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("ls-tree {}", result.tree_oid);
             Ok(())
         }
+        Some("ls-tree-sha256") => {
+            let result = git_testkit::ls_tree_parity_sha256()?;
+            println!("ls-tree {}", result.tree_oid);
+            Ok(())
+        }
         Some("cat-file") => {
             let result = git_testkit::cat_file_revision_parity()?;
+            println!("cat-file {}", result.revs.join(" "));
+            Ok(())
+        }
+        Some("cat-file-sha256") => {
+            let result = git_testkit::cat_file_revision_parity_sha256()?;
             println!("cat-file {}", result.revs.join(" "));
             Ok(())
         }
@@ -44761,8 +46395,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("commit-tree {}", result.rust);
             Ok(())
         }
+        Some("commit-tree-sha256") => {
+            let result = git_testkit::commit_tree_parity_sha256()?;
+            println!("commit-tree {}", result.rust);
+            Ok(())
+        }
         Some("commit") => {
             let result = git_testkit::commit_index_parity()?;
+            println!("commit {}", result.head);
+            Ok(())
+        }
+        Some("commit-sha256") => {
+            let result = git_testkit::commit_index_parity_sha256()?;
             println!("commit {}", result.head);
             Ok(())
         }
@@ -44771,8 +46415,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.upstream);
             Ok(())
         }
+        Some("branch-sha256") => {
+            let result = git_testkit::branch_create_parity_sha256()?;
+            print!("{}", result.upstream);
+            Ok(())
+        }
         Some("branch-current") => {
             let result = git_testkit::branch_show_current_parity()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
+        Some("branch-current-sha256") => {
+            let result = git_testkit::branch_show_current_parity_sha256()?;
             print!("{}", result.rust);
             Ok(())
         }
@@ -44781,8 +46435,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("branch-delete {}", result.deleted_oid);
             Ok(())
         }
+        Some("branch-delete-sha256") => {
+            let result = git_testkit::branch_delete_parity_sha256()?;
+            println!("branch-delete {}", result.deleted_oid);
+            Ok(())
+        }
         Some("checkout") => {
             let result = git_testkit::checkout_branch_parity()?;
+            println!("checkout {} {}", result.branch, result.head);
+            Ok(())
+        }
+        Some("checkout-sha256") => {
+            let result = git_testkit::checkout_branch_parity_sha256()?;
             println!("checkout {} {}", result.branch, result.head);
             Ok(())
         }
@@ -44791,8 +46455,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.upstream);
             Ok(())
         }
+        Some("tag-sha256") => {
+            let result = git_testkit::tag_create_parity_sha256()?;
+            print!("{}", result.upstream);
+            Ok(())
+        }
         Some("tag-delete") => {
             let result = git_testkit::tag_delete_parity()?;
+            println!("tag-delete {}", result.deleted_oid);
+            Ok(())
+        }
+        Some("tag-delete-sha256") => {
+            let result = git_testkit::tag_delete_parity_sha256()?;
             println!("tag-delete {}", result.deleted_oid);
             Ok(())
         }
@@ -44801,8 +46475,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("annotated-tag {} {}", result.tag_oid, result.target_oid);
             Ok(())
         }
+        Some("annotated-tag-sha256") => {
+            let result = git_testkit::annotated_tag_create_parity_sha256()?;
+            println!("annotated-tag {} {}", result.tag_oid, result.target_oid);
+            Ok(())
+        }
         Some("diff") => {
             let result = git_testkit::diff_name_status_parity()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
+        Some("diff-sha256") => {
+            let result = git_testkit::diff_name_status_parity_sha256()?;
             print!("{}", result.rust);
             Ok(())
         }
@@ -44811,13 +46495,28 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.rust);
             Ok(())
         }
+        Some("rev-parse-sha256") => {
+            let result = git_testkit::rev_parse_parity_sha256()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
         Some("rev-parse-parents") => {
             let result = git_testkit::rev_parse_parent_parity()?;
             print!("{}", result.rust);
             Ok(())
         }
+        Some("rev-parse-parents-sha256") => {
+            let result = git_testkit::rev_parse_parent_parity_sha256()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
         Some("rev-parse-peel") => {
             let result = git_testkit::rev_parse_peel_parity()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
+        Some("rev-parse-peel-sha256") => {
+            let result = git_testkit::rev_parse_peel_parity_sha256()?;
             print!("{}", result.rust);
             Ok(())
         }
@@ -44832,18 +46531,56 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.rust);
             Ok(())
         }
+        Some("add-status-sha256") => {
+            let result = git_testkit::add_status_parity_sha256()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
         Some("index") => {
             let result = git_testkit::index_round_trip_parity()?;
-            println!("index entries={} bytes={}", result.entries, result.byte_len);
+            println!(
+                "index format={} entries={} bytes={}",
+                result.format.name(),
+                result.entries,
+                result.byte_len
+            );
+            Ok(())
+        }
+        Some("index-sha256") => {
+            let result = git_testkit::index_round_trip_parity_sha256()?;
+            println!(
+                "index format={} entries={} bytes={}",
+                result.format.name(),
+                result.entries,
+                result.byte_len
+            );
             Ok(())
         }
         Some("update-index") => {
             let result = git_testkit::update_index_add_parity()?;
-            println!("update-index {}", result.expected.trim_end());
+            println!(
+                "update-index format={} {}",
+                result.format.name(),
+                result.expected.trim_end()
+            );
+            Ok(())
+        }
+        Some("update-index-sha256") => {
+            let result = git_testkit::update_index_add_parity_sha256()?;
+            println!(
+                "update-index format={} {}",
+                result.format.name(),
+                result.expected.trim_end()
+            );
             Ok(())
         }
         Some("ls-files") => {
             let result = git_testkit::ls_files_stage_parity()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
+        Some("ls-files-sha256") => {
+            let result = git_testkit::ls_files_stage_parity_sha256()?;
             print!("{}", result.rust);
             Ok(())
         }
@@ -44852,8 +46589,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("update-ref-delete {}", result.deleted_oid);
             Ok(())
         }
+        Some("update-ref-delete-sha256") => {
+            let result = git_testkit::update_ref_delete_parity_sha256()?;
+            println!("update-ref-delete {}", result.deleted_oid);
+            Ok(())
+        }
         Some("update-ref-delete-packed") => {
             let result = git_testkit::update_ref_delete_packed_parity()?;
+            println!("update-ref-delete-packed {}", result.deleted_oid);
+            Ok(())
+        }
+        Some("update-ref-delete-packed-sha256") => {
+            let result = git_testkit::update_ref_delete_packed_parity_sha256()?;
             println!("update-ref-delete-packed {}", result.deleted_oid);
             Ok(())
         }
@@ -44866,13 +46613,32 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             );
             Ok(())
         }
+        Some("reflog-expire-sha256") => {
+            let result = git_testkit::reflog_expire_parity_sha256()?;
+            println!(
+                "reflog-expire removed={} {}",
+                result.removed,
+                result.after.trim_end()
+            );
+            Ok(())
+        }
         Some("write-tree") => {
             let result = git_testkit::write_tree_parity()?;
             println!("write-tree {}", result.rust);
             Ok(())
         }
+        Some("write-tree-sha256") => {
+            let result = git_testkit::write_tree_parity_sha256()?;
+            println!("write-tree {}", result.rust);
+            Ok(())
+        }
         Some("log") => {
             let result = git_testkit::log_parity()?;
+            println!("log {}", result.commit_oid);
+            Ok(())
+        }
+        Some("log-sha256") => {
+            let result = git_testkit::log_parity_sha256()?;
             println!("log {}", result.commit_oid);
             Ok(())
         }
@@ -44928,8 +46694,18 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("refs {} {}", result.name, result.oid);
             Ok(())
         }
+        Some("refs-sha256") => {
+            let result = git_testkit::loose_ref_interop_parity_sha256()?;
+            println!("refs {} {}", result.name, result.oid);
+            Ok(())
+        }
         Some("refs-packed") => {
             let result = git_testkit::packed_ref_interop_parity()?;
+            println!("refs-packed {} {}", result.name, result.oid);
+            Ok(())
+        }
+        Some("refs-packed-sha256") => {
+            let result = git_testkit::packed_ref_interop_parity_sha256()?;
             println!("refs-packed {} {}", result.name, result.oid);
             Ok(())
         }
@@ -44938,8 +46714,21 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             println!("refs-pack {} {}", result.name, result.oid);
             Ok(())
         }
+        Some("refs-pack-sha256") => {
+            let result = git_testkit::packed_ref_compaction_interop_parity_sha256()?;
+            println!("refs-pack {} {}", result.name, result.oid);
+            Ok(())
+        }
         Some("refs-pack-peeled") => {
             let result = git_testkit::peeled_packed_ref_compaction_interop_parity()?;
+            println!(
+                "refs-pack-peeled {} {} {}",
+                result.name, result.tag_oid, result.peeled_oid
+            );
+            Ok(())
+        }
+        Some("refs-pack-peeled-sha256") => {
+            let result = git_testkit::peeled_packed_ref_compaction_interop_parity_sha256()?;
             println!(
                 "refs-pack-peeled {} {} {}",
                 result.name, result.tag_oid, result.peeled_oid
@@ -44952,8 +46741,19 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.tags_rust);
             Ok(())
         }
+        Some("show-ref-sha256") => {
+            let result = git_testkit::show_ref_filter_parity_sha256()?;
+            print!("{}", result.heads_rust);
+            print!("{}", result.tags_rust);
+            Ok(())
+        }
         Some("show-ref-verify") => {
             let result = git_testkit::show_ref_verify_parity()?;
+            print!("{}", result.rust);
+            Ok(())
+        }
+        Some("show-ref-verify-sha256") => {
+            let result = git_testkit::show_ref_verify_parity_sha256()?;
             print!("{}", result.rust);
             Ok(())
         }
@@ -44964,8 +46764,15 @@ fn cmd_testkit(args: &[String]) -> Result<()> {
             print!("{}", result.switched_rust);
             Ok(())
         }
+        Some("symbolic-ref-sha256") => {
+            let result = git_testkit::symbolic_ref_parity_sha256()?;
+            print!("{}", result.head_rust);
+            print!("{}", result.short_rust);
+            print!("{}", result.switched_rust);
+            Ok(())
+        }
         _ => Err(GitError::Command(
-            "testkit currently supports: hash-object, hash-object-sha256, loose-sha256, config, index, update-index, ls-files, update-ref-delete, update-ref-delete-packed, reflog-expire, write-tree, commit-tree, commit, branch, branch-current, branch-delete, checkout, tag, tag-delete, annotated-tag, diff, rev-parse, rev-parse-parents, rev-parse-peel, rev-parse-object-format, add-status, ls-tree, cat-file, log, pack-read, pack-read-sha256, packed-odb, packed-odb-sha256, pack-delta, pack-delta-sha256, packed-odb-delta, packed-odb-delta-sha256, pack-thin, pack-index, pack-index-sha256, pack-write, pack-write-sha256, pack-write-delta, pack-write-delta-sha256, refs, refs-packed, refs-pack, refs-pack-peeled, show-ref, show-ref-verify, symbolic-ref"
+            "testkit currently supports: hash-object, hash-object-sha256, loose-sha256, config, index, index-sha256, update-index, update-index-sha256, ls-files, ls-files-sha256, update-ref-delete, update-ref-delete-sha256, update-ref-delete-packed, update-ref-delete-packed-sha256, reflog-expire, reflog-expire-sha256, write-tree, write-tree-sha256, commit-tree, commit-tree-sha256, commit, commit-sha256, branch, branch-sha256, branch-current, branch-current-sha256, branch-delete, branch-delete-sha256, checkout, checkout-sha256, tag, tag-sha256, tag-delete, tag-delete-sha256, annotated-tag, annotated-tag-sha256, diff, diff-sha256, rev-parse, rev-parse-sha256, rev-parse-parents, rev-parse-parents-sha256, rev-parse-peel, rev-parse-peel-sha256, rev-parse-object-format, add-status, add-status-sha256, ls-tree, ls-tree-sha256, cat-file, cat-file-sha256, log, log-sha256, pack-read, pack-read-sha256, packed-odb, packed-odb-sha256, pack-delta, pack-delta-sha256, packed-odb-delta, packed-odb-delta-sha256, pack-thin, pack-thin-sha256, pack-index, pack-index-sha256, pack-write, pack-write-sha256, pack-write-delta, pack-write-delta-sha256, refs, refs-sha256, refs-packed, refs-packed-sha256, refs-pack, refs-pack-sha256, refs-pack-peeled, refs-pack-peeled-sha256, show-ref, show-ref-sha256, show-ref-verify, show-ref-verify-sha256, symbolic-ref, symbolic-ref-sha256"
                 .into(),
         )),
     }
@@ -45022,7 +46829,8 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
 }
 
 fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
-    let config = git_dir.join("config");
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let config = common_git_dir.join("config");
     let Ok(config) = GitConfig::read(config) else {
         return Ok(ObjectFormat::Sha1);
     };
@@ -45167,6 +46975,16 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
         };
         return fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()));
     }
+    if git_dir.join("commondir").is_file() {
+        let gitdir_file = git_dir.join("gitdir");
+        if gitdir_file.is_file() {
+            let value = fs::read_to_string(&gitdir_file)?;
+            let worktree_git_file = resolve_admin_path(git_dir, value.trim());
+            if let Some(worktree) = worktree_git_file.parent() {
+                return fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()));
+            }
+        }
+    }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
         return Err(GitError::Unsupported(
             "update-index currently requires a non-bare worktree".into(),
@@ -45215,7 +47033,44 @@ fn superproject_working_tree(git_dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     git_rev::resolve_revision(git_dir, format, rev)
+}
+
+fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {
+    if rev.len() < 4
+        || rev.len() >= format.hex_len()
+        || !rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !revision_ref_name_exists(git_dir, format, rev)
+    {
+        return;
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    if matches!(
+        db.resolve_prefix(rev),
+        Ok(ObjectPrefixResolution::Unique(_) | ObjectPrefixResolution::Ambiguous(_))
+    ) {
+        eprintln!("warning: refname '{rev}' is ambiguous.");
+    }
+}
+
+fn revision_ref_name_exists(git_dir: &Path, format: ObjectFormat, rev: &str) -> bool {
+    let refs = FileRefStore::new(git_dir, format);
+    if rev == "HEAD" {
+        return refs.read_ref("HEAD").ok().flatten().is_some();
+    }
+    if rev.starts_with("refs/") {
+        return refs.read_ref(rev).ok().flatten().is_some();
+    }
+    refs.read_ref(&format!("refs/heads/{rev}"))
+        .ok()
+        .flatten()
+        .is_some()
+        || refs
+            .read_ref(&format!("refs/tags/{rev}"))
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {

@@ -130,6 +130,17 @@ pub fn repository_index_path(git_dir: impl AsRef<Path>) -> PathBuf {
         .unwrap_or_else(|| git_dir.as_ref().join("index"))
 }
 
+pub fn read_repository_index(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<Option<Index>> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(Index::parse(&fs::read(index_path)?, format)?))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoveOptions {
     pub recursive: bool,
@@ -186,16 +197,11 @@ pub fn update_index_paths(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -272,7 +278,7 @@ pub fn update_index_paths(
         .sort_by(|left, right| left.path.cmp(&right.path));
     normalize_index_version_for_extended_flags(&mut index);
     index.extensions = index_extensions_without_cache_tree(&index.extensions);
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -288,11 +294,6 @@ pub fn refresh_index_paths(
     ignore_missing: bool,
     really_refresh: bool,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -302,7 +303,7 @@ pub fn refresh_index_paths(
             updated: Vec::new(),
         });
     }
-    let mut index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let mut index = Index::parse(&fs::read(&index_path)?, format)?;
     let selected_paths = paths
         .iter()
         .map(|path| {
@@ -364,7 +365,7 @@ pub fn refresh_index_paths(
         }
         *entry = index_entry_from_metadata(entry.path.clone(), oid, &metadata);
     }
-    fs::write(&index_path, index.write_sha1()?)?;
+    fs::write(&index_path, index.write(format)?)?;
     if needs_update && !quiet {
         return Err(GitError::Exit(1));
     }
@@ -381,11 +382,6 @@ pub fn update_index_again(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -395,7 +391,7 @@ pub fn update_index_again(
             updated: Vec::new(),
         });
     }
-    let index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
     let selected_paths = selected_git_paths(worktree_root, paths)?;
@@ -431,16 +427,11 @@ pub fn set_index_assume_unchanged_paths(
     paths: &[PathBuf],
     assume_unchanged: bool,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -473,7 +464,7 @@ pub fn set_index_assume_unchanged_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -510,16 +501,11 @@ pub fn set_index_skip_worktree_paths(
     paths: &[PathBuf],
     skip_worktree: bool,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -556,7 +542,7 @@ pub fn set_index_skip_worktree_paths(
         }
     }
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -570,16 +556,11 @@ pub fn set_index_fsmonitor_valid_paths(
     paths: &[PathBuf],
     _fsmonitor_valid: bool,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -622,11 +603,6 @@ pub fn set_index_version(
     format: ObjectFormat,
     version: u32,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     if !matches!(version, 2..=4) {
         return Err(GitError::Unsupported(format!(
             "update-index currently supports --index-version 2, 3, or 4, got {version}"
@@ -635,7 +611,7 @@ pub fn set_index_version(
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -646,7 +622,7 @@ pub fn set_index_version(
     };
     index.version = version;
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -657,15 +633,10 @@ pub fn force_write_index(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -675,7 +646,7 @@ pub fn force_write_index(
         }
     };
     normalize_index_version_for_extended_flags(&mut index);
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated: Vec::new(),
@@ -714,15 +685,10 @@ pub fn update_index_cacheinfo(
     entries: &[CacheInfoEntry],
     add: bool,
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -770,7 +736,7 @@ pub fn update_index_cacheinfo(
     index
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -782,15 +748,10 @@ pub fn update_index_index_info(
     format: ObjectFormat,
     records: &[IndexInfoRecord],
 ) -> Result<UpdateIndexResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "update-index currently writes sha1 index entries".into(),
-        ));
-    }
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -843,7 +804,7 @@ pub fn update_index_index_info(
             .cmp(&right.path)
             .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
     });
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -899,14 +860,9 @@ pub fn write_tree_from_index_with_options(
     format: ObjectFormat,
     options: WriteTreeOptions,
 ) -> Result<ObjectId> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "write-tree currently reads sha1 index entries".into(),
-        ));
-    }
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
-    let index = Index::parse_v2_sha1(&fs::read(&index_path)?)?;
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
     let entries = write_tree_entries_for_prefix(&index.entries, options.prefix.as_deref())?;
     let mut root = TreeNode::default();
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -995,16 +951,11 @@ pub fn short_status_with_options(
     format: ObjectFormat,
     options: ShortStatusOptions,
 ) -> Result<Vec<ShortStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "status currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir)?;
+    let index = read_index_entries(git_dir, format)?;
     let worktree = worktree_entries(worktree_root, git_dir, format)?;
     let ignores = IgnoreMatcher::from_worktree_root(worktree_root)?;
     let mut paths = BTreeSet::new();
@@ -1181,14 +1132,9 @@ pub fn untracked_paths_with_options(
     format: ObjectFormat,
     options: UntrackedPathOptions,
 ) -> Result<Vec<Vec<u8>>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "ls-files --others currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index = read_index_entries(git_dir)?;
+    let index = read_index_entries(git_dir, format)?;
     let ignores = IgnoreMatcher::from_sources(
         worktree_root,
         options.exclude_standard,
@@ -1288,11 +1234,6 @@ pub fn standard_attributes_for_path_from_index(
     requested: &[Vec<u8>],
     all: bool,
 ) -> Result<Vec<AttributeCheck>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "check-attr --cached currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let mut matcher = AttributeMatcher::default();
@@ -1300,7 +1241,7 @@ pub fn standard_attributes_for_path_from_index(
         matcher.read_default_global_attributes();
     }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    collect_attribute_patterns_from_index(git_dir, &db, &mut matcher)?;
+    collect_attribute_patterns_from_index(git_dir, format, &db, &mut matcher)?;
     read_attribute_patterns(
         worktree_root.join(".git").join("info").join("attributes"),
         &mut matcher,
@@ -1379,6 +1320,9 @@ fn collect_untracked_directory_paths(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
+        if is_worktree_dot_git(root, &path) {
+            continue;
+        }
         if is_same_path(&path, git_dir) {
             continue;
         }
@@ -1437,6 +1381,9 @@ fn directory_has_file(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if is_worktree_dot_git(root, &path) {
+            continue;
+        }
         if is_same_path(&path, git_dir) {
             continue;
         }
@@ -1470,6 +1417,9 @@ fn directory_has_ignored(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if is_worktree_dot_git(root, &path) {
+            continue;
+        }
         if is_same_path(&path, git_dir) {
             continue;
         }
@@ -1528,6 +1478,9 @@ fn collect_ignored_untracked_paths(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
+        if is_worktree_dot_git(context.root, &path) {
+            continue;
+        }
         if is_same_path(&path, context.git_dir) {
             continue;
         }
@@ -2232,6 +2185,7 @@ fn collect_attribute_patterns_from_tree(
 
 fn collect_attribute_patterns_from_index(
     git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
@@ -2239,7 +2193,7 @@ fn collect_attribute_patterns_from_index(
     if !index_path.exists() {
         return Ok(());
     }
-    let mut entries = Index::parse_v2_sha1(&fs::read(index_path)?)?.entries;
+    let mut entries = Index::parse(&fs::read(index_path)?, format)?.entries;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let is_attributes_file =
@@ -2435,18 +2389,13 @@ pub fn deleted_index_entries(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<Vec<IndexEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "ls-files --deleted currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(Vec::new());
     }
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = Index::parse(&fs::read(index_path)?, format)?;
     let mut deleted = Vec::new();
     for entry in index.entries {
         if !worktree_path(worktree_root, &entry.path)?.exists() {
@@ -2461,11 +2410,6 @@ pub fn modified_index_entries(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<Vec<IndexEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "ls-files --modified currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -2473,7 +2417,7 @@ pub fn modified_index_entries(
         return Ok(Vec::new());
     }
     let worktree = worktree_entries(worktree_root, git_dir, format)?;
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = Index::parse(&fs::read(index_path)?, format)?;
     let mut modified = Vec::new();
     for entry in index.entries {
         let Some(worktree_entry) = worktree.get(&entry.path) else {
@@ -2494,11 +2438,6 @@ pub fn checkout_branch(
     branch: &str,
     committer: Vec<u8>,
 ) -> Result<CheckoutResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "checkout currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let branch_ref = branch_ref_name(branch)?;
@@ -2541,11 +2480,6 @@ pub fn checkout_detached(
     committer: Vec<u8>,
     message: Vec<u8>,
 ) -> Result<CheckoutResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "checkout currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, target)?;
@@ -2588,7 +2522,7 @@ fn checkout_commit_to_index_and_worktree(
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
 
-    for path in read_index_entries(git_dir)?.keys() {
+    for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
             remove_worktree_file(worktree_root, path)?;
         }
@@ -2623,7 +2557,7 @@ fn checkout_commit_to_index_and_worktree(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(target_entries.len())
 }
@@ -2634,18 +2568,13 @@ pub fn restore_worktree_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Err(GitError::Exit(1));
     }
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = Index::parse(&fs::read(index_path)?, format)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -2691,16 +2620,11 @@ pub fn restore_index_paths_from_head(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --staged currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -2711,7 +2635,15 @@ pub fn restore_index_paths_from_head(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head_entries = head_tree_entries(git_dir, format, &db)?;
-    restore_index_paths_from_entries(worktree_root, git_dir, &db, index, &head_entries, paths)
+    restore_index_paths_from_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        index,
+        &head_entries,
+        paths,
+    )
 }
 
 pub fn restore_index_paths_from_tree(
@@ -2721,16 +2653,11 @@ pub fn restore_index_paths_from_tree(
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --staged --source currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -2741,12 +2668,21 @@ pub fn restore_index_paths_from_tree(
     };
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let source_entries = tree_entries(&db, format, tree_oid)?;
-    restore_index_paths_from_entries(worktree_root, git_dir, &db, index, &source_entries, paths)
+    restore_index_paths_from_entries(
+        worktree_root,
+        git_dir,
+        format,
+        &db,
+        index,
+        &source_entries,
+        paths,
+    )
 }
 
 fn restore_index_paths_from_entries(
     worktree_root: &Path,
     git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
@@ -2814,7 +2750,7 @@ fn restore_index_paths_from_entries(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(RestoreResult {
         restored: restored.len(),
@@ -2827,16 +2763,11 @@ pub fn restore_index_and_worktree_paths_from_head(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --staged --worktree currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -2850,6 +2781,7 @@ pub fn restore_index_and_worktree_paths_from_head(
     restore_index_and_worktree_paths_from_entries(
         worktree_root,
         git_dir,
+        format,
         &db,
         index,
         &head_entries,
@@ -2864,16 +2796,11 @@ pub fn restore_index_and_worktree_paths_from_tree(
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --staged --worktree --source currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -2887,6 +2814,7 @@ pub fn restore_index_and_worktree_paths_from_tree(
     restore_index_and_worktree_paths_from_entries(
         worktree_root,
         git_dir,
+        format,
         &db,
         index,
         &source_entries,
@@ -2897,6 +2825,7 @@ pub fn restore_index_and_worktree_paths_from_tree(
 fn restore_index_and_worktree_paths_from_entries(
     worktree_root: &Path,
     git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     index: Index,
     source_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
@@ -2965,7 +2894,7 @@ fn restore_index_and_worktree_paths_from_entries(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(RestoreResult {
         restored: restored.len(),
@@ -2978,11 +2907,6 @@ pub fn reset_index_and_worktree_to_commit(
     format: ObjectFormat,
     commit_oid: &ObjectId,
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "reset --hard currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -2990,7 +2914,7 @@ pub fn reset_index_and_worktree_to_commit(
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
 
-    for path in read_index_entries(git_dir)?.keys() {
+    for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
             remove_worktree_file(worktree_root, path)?;
         }
@@ -3025,7 +2949,7 @@ pub fn reset_index_and_worktree_to_commit(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(RestoreResult {
         restored: target_entries.len(),
@@ -3038,11 +2962,6 @@ pub fn reset_index_to_commit(
     format: ObjectFormat,
     commit_oid: &ObjectId,
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "reset --mixed currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -3062,7 +2981,7 @@ pub fn reset_index_to_commit(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(RestoreResult {
         restored: target_entries.len(),
@@ -3075,16 +2994,11 @@ pub fn restore_worktree_paths_from_head(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --source currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -3105,16 +3019,11 @@ pub fn restore_worktree_paths_from_tree(
     tree_oid: &ObjectId,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "restore --source currently reads sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -3196,16 +3105,11 @@ pub fn remove_index_and_worktree_paths(
     paths: &[PathBuf],
     options: RemoveOptions,
 ) -> Result<RemoveResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "rm currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -3318,7 +3222,7 @@ pub fn remove_index_and_worktree_paths(
             extensions: Vec::new(),
             checksum: None,
         }
-        .write_sha1()?,
+        .write(format)?,
     )?;
     Ok(RemoveResult {
         removed: selected.into_iter().collect(),
@@ -3333,16 +3237,11 @@ pub fn move_index_and_worktree_path(
     destination: &Path,
     options: MoveOptions,
 ) -> Result<MoveResult> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "mv currently writes sha1 index entries".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
-        Index::parse_v2_sha1(&fs::read(&index_path)?)?
+        Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
             version: 2,
@@ -3509,7 +3408,7 @@ pub fn move_index_and_worktree_path(
             .entries
             .sort_by(|left, right| left.path.cmp(&right.path));
         index.extensions.clear();
-        fs::write(index_path, index.write_sha1()?)?;
+        fs::write(index_path, index.write(format)?)?;
         return Ok(MoveResult {
             source: source_path,
             destination: destination_path,
@@ -3598,7 +3497,7 @@ pub fn move_index_and_worktree_path(
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
     index.extensions.clear();
-    fs::write(index_path, index.write_sha1()?)?;
+    fs::write(index_path, index.write(format)?)?;
     Ok(MoveResult {
         source: source_path,
         destination: destination_path,
@@ -3773,12 +3672,15 @@ struct TrackedEntry {
     oid: ObjectId,
 }
 
-fn read_index_entries(git_dir: &Path) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+fn read_index_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Ok(BTreeMap::new());
     }
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = Index::parse(&fs::read(index_path)?, format)?;
     Ok(index
         .entries
         .into_iter()
@@ -3894,6 +3796,9 @@ fn collect_worktree_entries(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
+        if is_worktree_dot_git(root, &path) {
+            continue;
+        }
         if is_same_path(&path, git_dir) {
             continue;
         }
@@ -3923,6 +3828,11 @@ fn collect_worktree_entries(
 
 fn is_same_path(left: &Path, right: &Path) -> bool {
     left == right
+}
+
+fn is_worktree_dot_git(root: &Path, path: &Path) -> bool {
+    path.strip_prefix(root)
+        .is_ok_and(|relative| relative == Path::new(".git"))
 }
 
 fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
@@ -4143,6 +4053,37 @@ mod tests {
         let index =
             Index::parse_v2_sha1(&fs::read(repository_index_path(git_dir)).unwrap()).unwrap();
         assert_eq!(index.entries[0].path, b"hello.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn update_index_and_write_tree_support_sha256() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+        let result = add_paths_to_index(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha256,
+            &[PathBuf::from("hello.txt")],
+        )
+        .unwrap();
+        assert_eq!(result.entries, 1);
+
+        let index = Index::parse(
+            &fs::read(repository_index_path(&git_dir)).unwrap(),
+            ObjectFormat::Sha256,
+        )
+        .unwrap();
+        assert_eq!(index.entries[0].path, b"hello.txt");
+        assert_eq!(index.entries[0].oid.format(), ObjectFormat::Sha256);
+
+        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha256).unwrap();
+        assert_eq!(tree_oid.format(), ObjectFormat::Sha256);
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
+        let tree = odb.read_object(&tree_oid).unwrap();
+        assert_eq!(tree.object_type, ObjectType::Tree);
         fs::remove_dir_all(root).unwrap();
     }
 

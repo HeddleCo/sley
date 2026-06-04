@@ -77,6 +77,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_repo(root: &Path) {
     git(root, &["init", "-q"]);
+    prepare_repo_contents(root);
+}
+
+fn prepare_sha256_repo(root: &Path) {
+    git(root, &["init", "-q", "--object-format=sha256"]);
+    prepare_repo_contents(root);
+}
+
+fn prepare_repo_contents(root: &Path) {
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     git(root, &["add", "file.txt"]);
     run_with_identity(root, &["commit", "-m", "base", "-q"]);
@@ -113,6 +122,49 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset"
         );
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn reset_sha256_mixed_and_hard_match_upstream_git() {
+    let root = unique_temp_dir("reset-sha256");
+    let upstream_mixed = root.join("upstream-mixed");
+    let rust_mixed = root.join("rust-mixed");
+    let upstream_hard = root.join("upstream-hard");
+    let rust_hard = root.join("rust-hard");
+    for repo in [&upstream_mixed, &rust_mixed, &upstream_hard, &rust_hard] {
+        fs::create_dir_all(repo).expect("create repo");
+        prepare_sha256_repo(repo);
+        fs::write(repo.join("file.txt"), b"second\n").expect("write second");
+        git(repo, &["add", "file.txt"]);
+        run_with_identity(repo, &["commit", "-m", "second", "-q"]);
+        fs::write(repo.join("file.txt"), b"dirty\n").expect("write dirty");
+        git(repo, &["add", "file.txt"]);
+    }
+    let result = (|| {
+        let args = ["reset", "--mixed", "HEAD~1"];
+        let expected = run_output("git", &upstream_mixed, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &rust_mixed, &args);
+        assert_same_output(actual, expected, &args);
+
+        let args = ["reset", "--hard", "HEAD~1"];
+        let expected = run_output("git", &upstream_hard, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &rust_hard, &args);
+        assert_same_output(actual, expected, &args);
+
+        for (upstream, rust) in [(&upstream_mixed, &rust_mixed), (&upstream_hard, &rust_hard)] {
+            for args in [
+                vec!["rev-parse", "HEAD"],
+                vec!["status", "--short"],
+                vec!["ls-files", "--stage"],
+            ] {
+                let expected = run_output("git", upstream, &args);
+                let actual = run_output("git", rust, &args);
+                assert_same_output(actual, expected, &args);
+            }
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

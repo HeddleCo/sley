@@ -127,16 +127,11 @@ pub fn diff_name_status_head_worktree_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "diff --name-status currently reads sha1 repositories".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir)?;
+    let index = read_index_entries(git_dir, format)?;
     let worktree = worktree_entries(worktree_root, git_dir, format)?;
     let changes =
         diff_name_status_maps(&head, &worktree, head.keys().chain(index.keys()), options)?;
@@ -157,15 +152,10 @@ pub fn diff_name_status_head_index_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "diff --cached currently reads sha1 repositories".into(),
-        ));
-    }
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir)?;
+    let index = read_index_entries(git_dir, format)?;
     diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)
 }
 
@@ -188,14 +178,9 @@ pub fn diff_name_status_index_worktree_with_options(
     format: ObjectFormat,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "diff currently reads sha1 repositories".into(),
-        ));
-    }
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index = read_index_entries(git_dir)?;
+    let index = read_index_entries(git_dir, format)?;
     let worktree = worktree_entries(worktree_root, git_dir, format)?;
     diff_name_status_maps(&index, &worktree, index.keys(), options)
 }
@@ -207,11 +192,6 @@ pub fn diff_name_status_trees_with_options(
     right_tree: &ObjectId,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "tree diff currently reads sha1 repositories".into(),
-        ));
-    }
     let mut left_entries = BTreeMap::new();
     collect_tree_entries(db, format, left_tree, Vec::new(), &mut left_entries)?;
     let mut right_entries = BTreeMap::new();
@@ -230,11 +210,6 @@ pub fn diff_name_status_empty_tree_with_options(
     right_tree: &ObjectId,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(
-            "tree diff currently reads sha1 repositories".into(),
-        ));
-    }
     let left_entries = BTreeMap::new();
     let mut right_entries = BTreeMap::new();
     collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
@@ -432,12 +407,15 @@ struct TrackedEntry {
     oid: ObjectId,
 }
 
-fn read_index_entries(git_dir: &Path) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+fn read_index_entries(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let index_path = git_dir.join("index");
     if !index_path.exists() {
         return Ok(BTreeMap::new());
     }
-    let index = Index::parse_v2_sha1(&fs::read(index_path)?)?;
+    let index = Index::parse(&fs::read(index_path)?, format)?;
     Ok(index
         .entries
         .into_iter()

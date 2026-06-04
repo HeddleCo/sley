@@ -1354,6 +1354,54 @@ fn stash_push_matches_upstream_git() {
 }
 
 #[test]
+fn stash_push_sha256_tracked_changes_match_upstream_git() {
+    let root = unique_temp_dir("stash-push-sha256");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        let upstream = root.join("upstream");
+        let actual = root.join("actual");
+        for repo in [&upstream, &actual] {
+            fs::create_dir_all(repo).expect("create repo");
+            git(repo, &["init", "-q", "--object-format=sha256"]);
+            git(repo, &["config", "user.name", "Example User"]);
+            git(repo, &["config", "user.email", "example@example.invalid"]);
+            fs::write(repo.join("a.txt"), b"base\n").expect("write base fixture");
+            git(repo, &["add", "a.txt"]);
+            let output = run_output_with_fixed_identity("git", repo, &["commit", "-qm", "base"]);
+            assert!(
+                output.status.success(),
+                "git commit failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            fs::write(repo.join("a.txt"), b"staged\n").expect("write staged fixture");
+            git(repo, &["add", "a.txt"]);
+            fs::write(repo.join("a.txt"), b"worktree\n").expect("write worktree fixture");
+        }
+
+        let args = ["stash", "push", "-m", "sha256 tracked"];
+        let expected = run_output_with_fixed_identity("git", &upstream, &args);
+        let actual_output =
+            run_output_with_fixed_identity(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+
+        for check_args in [
+            vec!["rev-parse", "--show-object-format=storage"],
+            vec!["stash", "list", "--format=%gs"],
+            vec!["stash", "show", "--name-status"],
+            vec!["status", "--short"],
+        ] {
+            let expected = run_output("git", &upstream, &check_args);
+            let actual_output = run_output(env!("CARGO_BIN_EXE_git-rs"), &actual, &check_args);
+            assert_same_output(actual_output, expected, &check_args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn stash_save_matches_upstream_git() {
     let root = unique_temp_dir("stash-save");
     let result = (|| {

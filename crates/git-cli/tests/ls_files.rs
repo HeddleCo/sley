@@ -315,11 +315,46 @@ fn ls_files_short_option_aliases_match_upstream_git() {
             vec!["ls-files", "--no-killed"],
             vec!["ls-files", "--no-resolve-undo"],
             vec!["ls-files", "--no-debug"],
+            vec!["ls-files", "-s", "--abbrev"],
+            vec!["ls-files", "-s", "--abbrev=12"],
+            vec!["ls-files", "-s", "--abbrev=1"],
+            vec!["ls-files", "-s", "--abbrev=0"],
             vec!["ls-files", "--no-abbrev"],
             vec!["ls-files", "--", "tracked.txt"],
             vec!["ls-files", "--", "--dash.txt"],
             vec!["ls-files", "-s", "--", "--dash.txt"],
             vec!["ls-files", "-z", "--", "--dash.txt"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
+    let root = unique_temp_dir("ls-files-sha256");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q", "--object-format=sha256"]);
+        fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
+        fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked fixture");
+        git(&root, &["add", "modify.txt", "tracked.txt"]);
+        fs::write(root.join("modify.txt"), b"after\n").expect("modify tracked fixture");
+
+        for args in [
+            vec!["ls-files", "--stage"],
+            vec!["ls-files", "--stage", "--abbrev"],
+            vec!["ls-files", "--stage", "--abbrev=12"],
+            vec!["ls-files", "--stage", "--abbrev=1"],
+            vec!["ls-files", "--stage", "--abbrev=0"],
+            vec!["ls-files", "--stage", "--no-abbrev"],
+            vec!["ls-files", "--cached"],
+            vec!["ls-files", "--modified"],
+            vec!["ls-files", "--stage", "--modified"],
         ] {
             let expected = git(&root, &args);
             let actual = git_rs(&root, &args);

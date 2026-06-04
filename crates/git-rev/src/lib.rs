@@ -1,6 +1,6 @@
 use git_core::{GitError, ObjectId, Result};
 use git_formats::{Commit, CommitGraph, ObjectType, Tag};
-use git_odb::{FileObjectDatabase, ObjectReader};
+use git_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use git_refs::{FileRefStore, PackedRef, RefTarget};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -65,6 +65,34 @@ fn resolve_revision_name(
         return ObjectId::from_hex(format, rev);
     }
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    if let Some(oid) = resolve_revision_ref(&refs, rev)? {
+        return Ok(oid);
+    }
+    if rev.len() >= 4
+        && rev.len() < format.hex_len()
+        && rev.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        match db.resolve_prefix(rev)? {
+            ObjectPrefixResolution::Unique(oid) => return Ok(oid),
+            ObjectPrefixResolution::Ambiguous(matches) => {
+                let mut names = matches
+                    .into_iter()
+                    .map(|oid| oid.to_string())
+                    .collect::<Vec<_>>();
+                names.sort();
+                return Err(GitError::InvalidObjectId(format!(
+                    "short object ID {rev} is ambiguous: {}",
+                    names.join(", ")
+                )));
+            }
+            ObjectPrefixResolution::Missing => {}
+        }
+    }
+    Err(GitError::NotFound(format!("revision {rev}")))
+}
+
+fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectId>> {
     let target = if rev == "HEAD" {
         refs.read_ref("HEAD")?
     } else if rev.starts_with("refs/") {
@@ -74,12 +102,12 @@ fn resolve_revision_name(
             .or(refs.read_ref(&format!("refs/tags/{rev}"))?)
     };
     match target {
-        Some(RefTarget::Direct(oid)) => Ok(oid),
+        Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
         Some(RefTarget::Symbolic(name)) => match refs.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => Ok(oid),
-            _ => Err(GitError::NotFound(format!("revision {rev}"))),
+            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
+            _ => Ok(None),
         },
-        None => Err(GitError::NotFound(format!("revision {rev}"))),
+        None => Ok(None),
     }
 }
 
@@ -483,6 +511,53 @@ mod tests {
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}~2"))
                 .unwrap(),
             base
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_revision_supports_abbreviated_loose_object_ids() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oid = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"abbrev\n".to_vec()))
+            .unwrap();
+
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, &oid.to_hex()[..8]).unwrap(),
+            oid
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_revision_prefers_ref_over_abbreviated_object_id() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let object = db
+            .write_object(EncodedObject::new(
+                ObjectType::Blob,
+                b"abbrev conflict\n".to_vec(),
+            ))
+            .unwrap();
+        let target = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: format!("refs/heads/{}", &object.to_hex()[..4]),
+            expected: None,
+            new: RefTarget::Direct(target.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+
+        assert_eq!(
+            resolve_revision(&git_dir, ObjectFormat::Sha1, &object.to_hex()[..4]).unwrap(),
+            target
         );
         fs::remove_dir_all(git_dir).unwrap();
     }

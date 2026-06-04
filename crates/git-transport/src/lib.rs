@@ -114,6 +114,20 @@ pub struct RemoteUrl {
     pub path: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshCommandVariant {
+    OpenSsh,
+    Plink,
+    TortoisePlink,
+    Simple,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProcessCommand {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GitCredential {
     pub protocol: Option<String>,
@@ -1355,6 +1369,75 @@ pub fn ssh_service_command(service: GitService, repository_path: &str) -> Result
         service.as_str(),
         quote_ssh_repository_path(repository_path)
     ))
+}
+
+pub fn ssh_process_command(
+    remote: &RemoteUrl,
+    service: GitService,
+    program: impl Into<String>,
+    variant: SshCommandVariant,
+) -> Result<SshProcessCommand> {
+    if remote.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH process command requires an SSH remote".into(),
+        ));
+    }
+    let program = program.into();
+    validate_ssh_program(&program)?;
+    let args = ssh_process_args(remote, service, variant)?;
+    Ok(SshProcessCommand { program, args })
+}
+
+pub fn ssh_process_args(
+    remote: &RemoteUrl,
+    service: GitService,
+    variant: SshCommandVariant,
+) -> Result<Vec<String>> {
+    if remote.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH process arguments require an SSH remote".into(),
+        ));
+    }
+    let mut args = Vec::new();
+    if let Some(port) = remote.port {
+        match variant {
+            SshCommandVariant::OpenSsh => {
+                args.push("-p".into());
+                args.push(port.to_string());
+            }
+            SshCommandVariant::Plink | SshCommandVariant::TortoisePlink => {
+                args.push("-P".into());
+                args.push(port.to_string());
+            }
+            SshCommandVariant::Simple => {
+                return Err(GitError::InvalidFormat(
+                    "simple SSH variant cannot pass a port".into(),
+                ));
+            }
+        }
+    }
+    args.push(ssh_host_argument(remote)?);
+    args.push(ssh_service_command(service, &remote.path)?);
+    Ok(args)
+}
+
+pub fn ssh_host_argument(remote: &RemoteUrl) -> Result<String> {
+    if remote.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH host argument requires an SSH remote".into(),
+        ));
+    }
+    let host = remote
+        .host
+        .as_deref()
+        .ok_or_else(|| GitError::InvalidFormat("SSH remote is missing a host".into()))?;
+    validate_remote_host(host)?;
+    if let Some(user) = &remote.user {
+        validate_ssh_user(user)?;
+        Ok(format!("{user}@{host}"))
+    } else {
+        Ok(host.to_string())
+    }
 }
 
 pub fn smart_http_advertisement_content_type(service: GitService) -> Result<String> {
@@ -4485,6 +4568,41 @@ pub fn validate_upload_pack_request_features(
     Ok(())
 }
 
+pub fn build_upload_pack_raw_packfile_response<C, B>(
+    features: &UploadPackFeatures,
+    request: UploadPackRequest,
+    haves: impl IntoIterator<Item = ObjectId>,
+    mut contains_object: C,
+    mut build_pack: B,
+) -> Result<UploadPackRawPackfileResponse>
+where
+    C: FnMut(&ObjectId) -> Result<bool>,
+    B: FnMut(Vec<ObjectId>, Vec<ObjectId>) -> Result<Option<Vec<u8>>>,
+{
+    validate_upload_pack_request_features(features, &request)?;
+    for want in &request.wants {
+        if !contains_object(want)? {
+            return Err(GitError::InvalidObject(format!(
+                "upload-pack requested missing object {want}"
+            )));
+        }
+    }
+    let known_haves = haves
+        .into_iter()
+        .filter_map(|oid| match contains_object(&oid) {
+            Ok(true) => Some(Ok(oid)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let packfile = build_pack(request.wants, known_haves)?
+        .ok_or_else(|| GitError::InvalidObject("upload-pack request produced empty pack".into()))?;
+    Ok(UploadPackRawPackfileResponse {
+        acknowledgments: vec![UploadPackAcknowledgment::Nak],
+        packfile,
+    })
+}
+
 pub fn parse_upload_pack_shallow_update(
     format: ObjectFormat,
     frames: &[PktLineFrame],
@@ -5472,6 +5590,81 @@ pub fn validate_receive_pack_push_request_features(
         ));
     }
     Ok(())
+}
+
+pub fn apply_receive_pack_push_request<R, I, C, U, D>(
+    features: &ReceivePackFeatures,
+    request: &ReceivePackPushRequest,
+    mut read_ref: R,
+    mut install_pack: I,
+    mut contains_object: C,
+    mut apply_updates: U,
+    mut delete_ref: D,
+) -> Result<ReceivePackReportStatus>
+where
+    R: FnMut(&str) -> Result<Option<ObjectId>>,
+    I: FnMut(&[u8]) -> Result<()>,
+    C: FnMut(&ObjectId) -> Result<bool>,
+    U: FnMut(&[ReceivePackCommand]) -> Result<()>,
+    D: FnMut(&str) -> Result<()>,
+{
+    validate_receive_pack_push_request_features(features, request)?;
+
+    for command in request
+        .commands
+        .commands
+        .iter()
+        .filter(|command| is_receive_pack_delete_command(command))
+    {
+        if !is_zero_oid(&command.old_id) && read_ref(&command.name)? != Some(command.old_id.clone())
+        {
+            return Err(GitError::Transaction(format!(
+                "expected ref {} to match",
+                command.name
+            )));
+        }
+    }
+
+    let updates = request
+        .commands
+        .commands
+        .iter()
+        .filter(|command| !is_receive_pack_delete_command(command))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !updates.is_empty() {
+        install_pack(&request.packfile)?;
+        for command in &updates {
+            if !contains_object(&command.new_id)? {
+                return Err(GitError::InvalidObject(format!(
+                    "receive-pack packfile did not provide {}",
+                    command.new_id
+                )));
+            }
+        }
+        apply_updates(&updates)?;
+    }
+
+    for command in request
+        .commands
+        .commands
+        .iter()
+        .filter(|command| is_receive_pack_delete_command(command))
+    {
+        delete_ref(&command.name)?;
+    }
+
+    Ok(ReceivePackReportStatus {
+        unpack: ReceivePackUnpackStatus::Ok,
+        commands: request
+            .commands
+            .commands
+            .iter()
+            .map(|command| ReceivePackCommandStatus::Ok {
+                name: command.name.clone(),
+            })
+            .collect(),
+    })
 }
 
 pub fn parse_receive_pack_report_status(
@@ -6956,6 +7149,11 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
         "ssh" | "git" | "http" | "https" => {
             let (authority, path) = split_remote_authority_and_path(rest)?;
             let (user, host, port) = parse_remote_authority(authority, true)?;
+            let path = if scheme == "ssh" {
+                percent_decode_remote_path(&path)?
+            } else {
+                path
+            };
             Ok(RemoteUrl {
                 transport: match scheme.as_str() {
                     "ssh" => RemoteTransport::Ssh,
@@ -6988,6 +7186,44 @@ fn split_remote_authority_and_path(value: &str) -> Result<(&str, String)> {
     }
     validate_remote_path("remote path", path)?;
     Ok((authority, path.to_string()))
+}
+
+fn percent_decode_remote_path(value: &str) -> Result<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len() {
+                return Err(GitError::InvalidFormat(format!(
+                    "invalid percent-encoded remote path {value:?}"
+                )));
+            }
+            let high = percent_hex_value(bytes[idx + 1]).ok_or_else(|| {
+                GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
+            })?;
+            let low = percent_hex_value(bytes[idx + 2]).ok_or_else(|| {
+                GitError::InvalidFormat(format!("invalid percent-encoded remote path {value:?}"))
+            })?;
+            out.push((high << 4) | low);
+            idx += 3;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    let decoded = String::from_utf8(out).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    validate_remote_path("remote path", &decoded)?;
+    Ok(decoded)
+}
+
+fn percent_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn parse_remote_authority(
@@ -7158,6 +7394,35 @@ fn validate_ssh_repository_path(value: &str) -> Result<()> {
     if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
         return Err(GitError::InvalidFormat(
             "SSH repository path contains a delimiter byte".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_program(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(GitError::InvalidFormat("SSH program is empty".into()));
+    }
+    if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r' | 0)) {
+        return Err(GitError::InvalidFormat(
+            "SSH program contains a delimiter byte".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_user(value: &str) -> Result<()> {
+    if value.is_empty() {
+        return Err(GitError::InvalidFormat("SSH user is empty".into()));
+    }
+    if value.bytes().any(|byte| {
+        matches!(
+            byte,
+            b'@' | b'/' | b'?' | b'#' | b' ' | b'\t' | b'\n' | b'\r' | 0
+        )
+    }) {
+        return Err(GitError::InvalidFormat(
+            "SSH user contains a delimiter byte".into(),
         ));
     }
     Ok(())
@@ -7940,6 +8205,16 @@ mod tests {
             }
         );
         assert_eq!(
+            parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s.git").unwrap(),
+            RemoteUrl {
+                transport: RemoteTransport::Ssh,
+                user: Some("git".into()),
+                host: Some("example.com".into()),
+                port: None,
+                path: "/org/repo space/it's.git".into(),
+            }
+        );
+        assert_eq!(
             parse_remote_url("git@example.com:org/repo.git").unwrap(),
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
@@ -7959,6 +8234,8 @@ mod tests {
         assert!(parse_remote_url("https://exa mple/repo.git").is_err());
         assert!(parse_remote_url("ssh://host:abc/repo.git").is_err());
         assert!(parse_remote_url("ssh://[2001:db8::1/repo.git").is_err());
+        assert!(parse_remote_url("ssh://host/repo%2").is_err());
+        assert!(parse_remote_url("ssh://host/repo%0a.git").is_err());
         assert!(parse_remote_url("git@example.com:").is_err());
         assert!(parse_remote_url("repo.git\n").is_err());
     }
@@ -8814,6 +9091,104 @@ mod tests {
         assert_eq!(
             ssh_service_command(GitService::UploadArchive, "/srv/it's.git").unwrap(),
             "git-upload-archive '/srv/it'\\''s.git'"
+        );
+    }
+
+    #[test]
+    fn ssh_process_command_builds_openssh_arguments() {
+        let remote = parse_remote_url("ssh://git@example.com:2222/srv/repo.git").unwrap();
+        assert_eq!(
+            ssh_process_command(
+                &remote,
+                GitService::UploadPack,
+                "ssh",
+                SshCommandVariant::OpenSsh,
+            )
+            .unwrap(),
+            SshProcessCommand {
+                program: "ssh".into(),
+                args: vec![
+                    "-p".into(),
+                    "2222".into(),
+                    "git@example.com".into(),
+                    "git-upload-pack '/srv/repo.git'".into(),
+                ],
+            }
+        );
+
+        let remote = parse_remote_url("ssh://git@[2001:db8::1]:2222/org/it%27s.git").unwrap();
+        assert_eq!(
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh).unwrap(),
+            vec![
+                "-p".to_string(),
+                "2222".to_string(),
+                "git@2001:db8::1".to_string(),
+                "git-upload-pack '/org/it'\\''s.git'".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ssh_process_command_builds_scp_like_and_plink_arguments() {
+        let remote = parse_remote_url("git@example.com:team/it isn't.git").unwrap();
+        assert_eq!(
+            ssh_process_args(&remote, GitService::ReceivePack, SshCommandVariant::OpenSsh).unwrap(),
+            vec![
+                "git@example.com".to_string(),
+                "git-receive-pack 'team/it isn'\\''t.git'".to_string(),
+            ]
+        );
+
+        let remote = parse_remote_url("example.com:team/project.git").unwrap();
+        assert_eq!(
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh).unwrap(),
+            vec![
+                "example.com".to_string(),
+                "git-upload-pack 'team/project.git'".to_string(),
+            ]
+        );
+
+        let remote = parse_remote_url("ssh://example.com:29418/team/project.git").unwrap();
+        assert_eq!(
+            ssh_process_args(&remote, GitService::UploadArchive, SshCommandVariant::Plink,)
+                .unwrap(),
+            vec![
+                "-P".to_string(),
+                "29418".to_string(),
+                "example.com".to_string(),
+                "git-upload-archive '/team/project.git'".to_string(),
+            ]
+        );
+        assert_eq!(
+            ssh_process_args(
+                &remote,
+                GitService::UploadArchive,
+                SshCommandVariant::TortoisePlink,
+            )
+            .unwrap()[0],
+            "-P"
+        );
+    }
+
+    #[test]
+    fn ssh_process_command_rejects_invalid_inputs() {
+        let local = parse_remote_url("../repo.git").unwrap();
+        assert!(
+            ssh_process_args(&local, GitService::UploadPack, SshCommandVariant::OpenSsh).is_err()
+        );
+
+        let remote = parse_remote_url("ssh://example.com:2222/repo.git").unwrap();
+        assert!(
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::Simple).is_err()
+        );
+        assert!(
+            ssh_process_command(
+                &remote,
+                GitService::UploadPack,
+                "ssh\n",
+                SshCommandVariant::OpenSsh,
+            )
+            .is_err()
         );
     }
 
@@ -10879,6 +11254,85 @@ mod tests {
     }
 
     #[test]
+    fn upload_pack_raw_response_builder_filters_unknown_haves_and_builds_pack() {
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let known_have = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let unknown_have = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "3333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let existing = std::collections::HashSet::from([want.clone(), known_have.clone()]);
+
+        let response = build_upload_pack_raw_packfile_response(
+            &UploadPackFeatures::default(),
+            UploadPackRequest {
+                wants: vec![want.clone()],
+                ..UploadPackRequest::default()
+            },
+            [known_have.clone(), unknown_have],
+            |oid| Ok(existing.contains(oid)),
+            |wants, haves| {
+                assert_eq!(wants, vec![want.clone()]);
+                assert_eq!(haves, vec![known_have.clone()]);
+                Ok(Some(b"PACKmock".to_vec()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.acknowledgments,
+            vec![UploadPackAcknowledgment::Nak]
+        );
+        assert_eq!(response.packfile, b"PACKmock");
+    }
+
+    #[test]
+    fn upload_pack_raw_response_builder_rejects_missing_want_and_empty_pack() {
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+
+        assert!(
+            build_upload_pack_raw_packfile_response(
+                &UploadPackFeatures::default(),
+                UploadPackRequest {
+                    wants: vec![want.clone()],
+                    ..UploadPackRequest::default()
+                },
+                Vec::<ObjectId>::new(),
+                |_| Ok(false),
+                |_, _| Ok(Some(b"PACKmock".to_vec())),
+            )
+            .is_err()
+        );
+
+        assert!(
+            build_upload_pack_raw_packfile_response(
+                &UploadPackFeatures::default(),
+                UploadPackRequest {
+                    wants: vec![want],
+                    ..UploadPackRequest::default()
+                },
+                Vec::<ObjectId>::new(),
+                |_| Ok(true),
+                |_, _| Ok(None),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn upload_pack_request_parses_and_encodes_initial_fetch_request() {
         let want = ObjectId::from_hex(
             ObjectFormat::Sha1,
@@ -12065,6 +12519,127 @@ mod tests {
                 }],
                 ..ReceivePackFeatures::default()
             })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn receive_pack_apply_helper_installs_pack_verifies_objects_and_reports_ok() {
+        let old_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let new_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let request = ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: old_id.clone(),
+                    new_id: new_id.clone(),
+                    name: "refs/heads/main".into(),
+                }],
+                ..ReceivePackRequest::default()
+            },
+            packfile: b"PACKpayload".to_vec(),
+            ..ReceivePackPushRequest::default()
+        };
+        let installed = std::cell::Cell::new(false);
+        let applied = std::cell::RefCell::new(Vec::new());
+
+        let report = apply_receive_pack_push_request(
+            &ReceivePackFeatures::default(),
+            &request,
+            |_| unreachable!("update stale-old checks belong to the ref transaction callback"),
+            |packfile| {
+                assert_eq!(packfile, b"PACKpayload");
+                installed.set(true);
+                Ok(())
+            },
+            |oid| Ok(oid == &new_id),
+            |commands| {
+                applied.borrow_mut().extend_from_slice(commands);
+                Ok(())
+            },
+            |_| unreachable!("no delete command should be applied"),
+        )
+        .unwrap();
+
+        assert!(installed.get());
+        assert_eq!(applied.into_inner(), request.commands.commands);
+        assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
+        assert_eq!(
+            report.commands,
+            vec![ReceivePackCommandStatus::Ok {
+                name: "refs/heads/main".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn receive_pack_apply_helper_preserves_delete_only_and_stale_delete_rules() {
+        let old_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let other_id = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let zero = zero_object_id(ObjectFormat::Sha1).unwrap();
+        let request = ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: old_id.clone(),
+                    new_id: zero,
+                    name: "refs/heads/main".into(),
+                }],
+                ..ReceivePackRequest::default()
+            },
+            ..ReceivePackPushRequest::default()
+        };
+        let features = ReceivePackFeatures {
+            delete_refs: true,
+            ..ReceivePackFeatures::default()
+        };
+        let installed = std::cell::Cell::new(false);
+        let deleted = std::cell::RefCell::new(Vec::new());
+
+        let report = apply_receive_pack_push_request(
+            &features,
+            &request,
+            |_| Ok(Some(old_id.clone())),
+            |_| {
+                installed.set(true);
+                Ok(())
+            },
+            |_| Ok(false),
+            |_| unreachable!("delete-only request should not apply updates"),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(!installed.get());
+        assert_eq!(deleted.into_inner(), vec!["refs/heads/main"]);
+        assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
+        assert!(
+            apply_receive_pack_push_request(
+                &features,
+                &request,
+                |_| Ok(Some(other_id.clone())),
+                |_| Ok(()),
+                |_| Ok(false),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
             .is_err()
         );
     }

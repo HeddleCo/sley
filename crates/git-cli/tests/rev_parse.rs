@@ -665,6 +665,100 @@ fn rev_parse_verify_quiet_missing_matches_upstream_git() {
 }
 
 #[test]
+fn rev_parse_abbreviated_object_ids_match_upstream_git() {
+    let root = unique_temp_dir("rev-parse-abbrev-object-id");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
+        git(&root, &["add", "payload.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        let head = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
+            .expect("HEAD is utf8")
+            .trim()
+            .to_string();
+        let loose_prefix = &head[..8];
+        assert_eq!(
+            git_rs(&root, &["rev-parse", loose_prefix]),
+            git(&root, &["rev-parse", loose_prefix])
+        );
+
+        git(&root, &["gc", "--quiet"]);
+        let packed_prefix = &head[..10];
+        assert_eq!(
+            git_rs(&root, &["rev-parse", packed_prefix]),
+            git(&root, &["rev-parse", packed_prefix])
+        );
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn rev_parse_hex_refname_prefers_ref_and_warns_like_upstream_git() {
+    let root = unique_temp_dir("rev-parse-hex-refname");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("first.txt"), b"first\n").expect("write first");
+        git(&root, &["add", "first.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "first",
+                "-q",
+            ],
+        );
+        let first = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
+            .expect("first HEAD is utf8")
+            .trim()
+            .to_string();
+        let hex_ref = &first[..4];
+        fs::write(root.join("second.txt"), b"second\n").expect("write second");
+        git(&root, &["add", "second.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "second",
+                "-q",
+            ],
+        );
+        git(&root, &["branch", hex_ref, "HEAD"]);
+
+        let args = ["rev-parse", hex_ref];
+        let expected = run_status("git", &root, &args);
+        let actual = run_status(env!("CARGO_BIN_EXE_git-rs"), &root, &args);
+        assert_eq!(actual, expected);
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
     let root = unique_temp_dir("rev-parse-commit-graph");
     fs::create_dir_all(&root).expect("create temp root");

@@ -77,6 +77,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_repo(root: &Path) {
     git(root, &["init", "-q"]);
+    prepare_repo_contents(root);
+}
+
+fn prepare_sha256_repo(root: &Path) {
+    git(root, &["init", "-q", "--object-format=sha256"]);
+    prepare_repo_contents(root);
+}
+
+fn prepare_repo_contents(root: &Path) {
     fs::create_dir_all(root.join("dir")).expect("create dir");
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested");
@@ -118,6 +127,44 @@ fn rm_tracked_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm"
         );
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn rm_sha256_tracked_paths_match_upstream_git() {
+    let root = unique_temp_dir("rm-sha256");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    let result = (|| {
+        prepare_sha256_repo(&upstream);
+        prepare_sha256_repo(&rust);
+
+        let args = ["rm", "file.txt", "dir/nested.txt"];
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_git-rs"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            upstream.join("file.txt").exists(),
+            rust.join("file.txt").exists(),
+            "worktree file presence differed"
+        );
+        assert_eq!(
+            upstream.join("dir/nested.txt").exists(),
+            rust.join("dir/nested.txt").exists(),
+            "nested worktree file presence differed"
+        );
+        for args in [
+            vec!["diff", "--cached", "--name-status"],
+            vec!["status", "--short"],
+        ] {
+            let expected = run_output("git", &upstream, &args);
+            let actual = run_output("git", &rust, &args);
+            assert_same_output(actual, expected, &args);
+        }
     })();
     let _ = fs::remove_dir_all(&root);
     result

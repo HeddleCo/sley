@@ -50,6 +50,13 @@ pub struct PackWrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackIndexBuild {
+    pub index: Vec<u8>,
+    pub pack_checksum: ObjectId,
+    pub entries: Vec<PackIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackIndex {
     pub version: u32,
     pub fanout: [u32; 256],
@@ -81,6 +88,41 @@ pub struct PackMtimes {
     pub mtimes: Vec<u32>,
     pub pack_checksum: ObjectId,
     pub index_checksum: ObjectId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackBitmapIndex {
+    pub version: u16,
+    pub format: ObjectFormat,
+    pub options: u16,
+    pub pack_checksum: ObjectId,
+    pub index_checksum: ObjectId,
+    pub type_bitmaps: PackBitmapTypeBitmaps,
+    pub entries: Vec<PackBitmapEntry>,
+    pub name_hash_cache: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackBitmapTypeBitmaps {
+    pub commits: EwahBitmap,
+    pub trees: EwahBitmap,
+    pub blobs: EwahBitmap,
+    pub tags: EwahBitmap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackBitmapEntry {
+    pub object_position: u32,
+    pub xor_offset: u8,
+    pub flags: u8,
+    pub bitmap: EwahBitmap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EwahBitmap {
+    pub bit_size: u32,
+    pub words: Vec<u64>,
+    pub rlw_position: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +199,20 @@ impl PackFile {
 
     pub fn parse_bundle(bundle: &Bundle) -> Result<Self> {
         Self::parse(&bundle.pack, bundle.format)
+    }
+
+    pub fn index_pack(bytes: &[u8], format: ObjectFormat) -> Result<PackWrite> {
+        let PackIndexBuild {
+            index,
+            pack_checksum,
+            entries,
+        } = PackIndex::write_v2_for_pack(bytes, format)?;
+        Ok(PackWrite {
+            pack: bytes.to_vec(),
+            index,
+            checksum: pack_checksum,
+            entries,
+        })
     }
 
     pub fn parse_thin<F>(bytes: &[u8], format: ObjectFormat, external_base: F) -> Result<Self>
@@ -366,6 +422,139 @@ impl PackFile {
 }
 
 impl PackIndex {
+    pub fn write_v2_for_pack_sha1(pack_bytes: &[u8]) -> Result<PackIndexBuild> {
+        Self::write_v2_for_pack(pack_bytes, ObjectFormat::Sha1)
+    }
+
+    pub fn write_v2_for_pack(pack_bytes: &[u8], format: ObjectFormat) -> Result<PackIndexBuild> {
+        let trailer_len = format.raw_len();
+        if pack_bytes.len() < 12 + trailer_len {
+            return Err(GitError::InvalidFormat("pack file too short".into()));
+        }
+        let trailer_offset = pack_bytes.len() - trailer_len;
+        let pack_checksum = git_core::digest_bytes(format, &pack_bytes[..trailer_offset])?;
+        let expected = ObjectId::from_raw(format, &pack_bytes[trailer_offset..])?;
+        if pack_checksum != expected {
+            return Err(GitError::InvalidFormat(format!(
+                "pack checksum mismatch: expected {expected}, got {pack_checksum}"
+            )));
+        }
+
+        if &pack_bytes[..4] != b"PACK" {
+            return Err(GitError::InvalidFormat("missing PACK signature".into()));
+        }
+        let version = u32_be(&pack_bytes[4..8]);
+        if version != 2 && version != 3 {
+            return Err(GitError::Unsupported(format!("pack version {version}")));
+        }
+        let count = u32_be(&pack_bytes[8..12]) as usize;
+        let mut offset = 12usize;
+        let mut parsed_entries = Vec::with_capacity(count);
+        let mut raw_entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry_offset = offset;
+            let header = parse_entry_header(pack_bytes, &mut offset)?;
+            let base = match header.kind {
+                PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
+                    pack_bytes,
+                    &mut offset,
+                    entry_offset as u64,
+                )?)),
+                PackObjectKind::RefDelta => {
+                    let hash_len = format.raw_len();
+                    if offset + hash_len > trailer_offset {
+                        return Err(GitError::InvalidFormat(
+                            "truncated ref-delta base object id".into(),
+                        ));
+                    }
+                    let oid = ObjectId::from_raw(format, &pack_bytes[offset..offset + hash_len])?;
+                    offset += hash_len;
+                    Some(DeltaBase::Ref(oid))
+                }
+                _ => None,
+            };
+            let mut decoder = ZlibDecoder::new(&pack_bytes[offset..trailer_offset]);
+            let mut body = Vec::with_capacity(header.size.min(usize::MAX as u64) as usize);
+            decoder.read_to_end(&mut body)?;
+            if body.len() as u64 != header.size {
+                return Err(GitError::InvalidObject(format!(
+                    "pack object declared {} bytes, decoded {}",
+                    header.size,
+                    body.len()
+                )));
+            }
+            let consumed = decoder.total_in() as usize;
+            if consumed == 0 {
+                return Err(GitError::InvalidFormat(
+                    "empty compressed pack entry".into(),
+                ));
+            }
+            offset = offset
+                .checked_add(consumed)
+                .ok_or_else(|| GitError::InvalidFormat("pack offset overflow".into()))?;
+            if offset > trailer_offset {
+                return Err(GitError::InvalidFormat(
+                    "pack entry extends past checksum".into(),
+                ));
+            }
+            raw_entries.push((
+                entry_offset as u64,
+                crc32fast::hash(&pack_bytes[entry_offset..offset]),
+            ));
+            if let Some(base) = base {
+                parsed_entries.push(ParsedPackEntry::Delta {
+                    base,
+                    compressed_size: consumed as u64,
+                    delta_size: header.size,
+                    offset: entry_offset as u64,
+                    delta: body,
+                });
+            } else {
+                let object_type = match header.kind {
+                    PackObjectKind::Commit => ObjectType::Commit,
+                    PackObjectKind::Tree => ObjectType::Tree,
+                    PackObjectKind::Blob => ObjectType::Blob,
+                    PackObjectKind::Tag => ObjectType::Tag,
+                    PackObjectKind::OfsDelta | PackObjectKind::RefDelta => unreachable!(),
+                };
+                let object = EncodedObject::new(object_type, body);
+                let oid = object.object_id(format)?;
+                parsed_entries.push(ParsedPackEntry::Resolved(PackObject {
+                    entry: PackEntry {
+                        oid,
+                        compressed_size: consumed as u64,
+                        uncompressed_size: header.size,
+                        offset: entry_offset as u64,
+                    },
+                    object,
+                }));
+            }
+        }
+        if offset != trailer_offset {
+            return Err(GitError::InvalidFormat(format!(
+                "pack has {} trailing bytes before checksum",
+                trailer_offset - offset
+            )));
+        }
+
+        let resolved = resolve_pack_entries(parsed_entries, format, &mut |_| Ok(None))?;
+        let entries = resolved
+            .iter()
+            .zip(raw_entries)
+            .map(|(object, (offset, crc32))| PackIndexEntry {
+                oid: object.entry.oid.clone(),
+                crc32,
+                offset,
+            })
+            .collect::<Vec<_>>();
+        let index = PackIndex::write_v2(format, &entries, &pack_checksum)?;
+        Ok(PackIndexBuild {
+            index,
+            pack_checksum,
+            entries,
+        })
+    }
+
     pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {
         Self::parse(bytes, ObjectFormat::Sha1)
     }
@@ -802,6 +991,218 @@ impl PackMtimes {
             index_checksum,
         })
     }
+}
+
+impl PackBitmapIndex {
+    pub const OPTION_FULL_DAG: u16 = 0x0001;
+    pub const OPTION_HASH_CACHE: u16 = 0x0004;
+
+    pub fn parse(bytes: &[u8], format: ObjectFormat, object_count: usize) -> Result<Self> {
+        let hash_len = format.raw_len();
+        let min_len = 12usize
+            .checked_add(hash_len * 2)
+            .ok_or_else(|| GitError::InvalidFormat("bitmap index length overflow".into()))?;
+        if bytes.len() < min_len {
+            return Err(GitError::InvalidFormat("bitmap index too short".into()));
+        }
+        if &bytes[..4] != b"BITM" {
+            return Err(GitError::InvalidFormat(
+                "missing bitmap index signature".into(),
+            ));
+        }
+        let version = u16_be(&bytes[4..6]);
+        if version != 1 {
+            return Err(GitError::Unsupported(format!(
+                "bitmap index version {version}"
+            )));
+        }
+        let options = u16_be(&bytes[6..8]);
+        let known_options = Self::OPTION_FULL_DAG | Self::OPTION_HASH_CACHE;
+        if options & !known_options != 0 {
+            return Err(GitError::Unsupported(format!(
+                "bitmap index options {:#06x}",
+                options & !known_options
+            )));
+        }
+        let entry_count = u32_be(&bytes[8..12]) as usize;
+        let checksum_offset = bytes.len() - hash_len;
+        let actual_index_checksum = git_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        let index_checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
+        if actual_index_checksum != index_checksum {
+            return Err(GitError::InvalidFormat(format!(
+                "bitmap index checksum mismatch: expected {index_checksum}, got {actual_index_checksum}"
+            )));
+        }
+
+        let pack_checksum_end = 12usize
+            .checked_add(hash_len)
+            .ok_or_else(|| GitError::InvalidFormat("bitmap index length overflow".into()))?;
+        let pack_checksum = ObjectId::from_raw(format, &bytes[12..pack_checksum_end])?;
+        let mut offset = pack_checksum_end;
+        let commits = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+        let trees = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+        let blobs = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+        let tags = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+
+        let mut entries = Vec::with_capacity(entry_count);
+        for idx in 0..entry_count {
+            if checksum_offset.saturating_sub(offset) < 6 {
+                return Err(GitError::InvalidFormat(
+                    "truncated bitmap index entry".into(),
+                ));
+            }
+            let object_position = u32_be(&bytes[offset..offset + 4]);
+            offset += 4;
+            if object_position as usize >= object_count {
+                return Err(GitError::InvalidFormat(
+                    "bitmap index entry points past object table".into(),
+                ));
+            }
+            let xor_offset = bytes[offset];
+            offset += 1;
+            if xor_offset as usize > idx || xor_offset > 160 {
+                return Err(GitError::InvalidFormat(
+                    "bitmap index entry has invalid XOR offset".into(),
+                ));
+            }
+            let flags = bytes[offset];
+            offset += 1;
+            let bitmap = parse_bitmap_ewah(bytes, &mut offset, checksum_offset, object_count)?;
+            entries.push(PackBitmapEntry {
+                object_position,
+                xor_offset,
+                flags,
+                bitmap,
+            });
+        }
+
+        let name_hash_cache = if options & Self::OPTION_HASH_CACHE != 0 {
+            let cache_len = object_count
+                .checked_mul(4)
+                .ok_or_else(|| GitError::InvalidFormat("bitmap hash cache overflow".into()))?;
+            if checksum_offset.saturating_sub(offset) < cache_len {
+                return Err(GitError::InvalidFormat(
+                    "truncated bitmap hash cache".into(),
+                ));
+            }
+            let mut cache = Vec::with_capacity(object_count);
+            for _ in 0..object_count {
+                cache.push(u32_be(&bytes[offset..offset + 4]));
+                offset += 4;
+            }
+            Some(cache)
+        } else {
+            None
+        };
+
+        if offset != checksum_offset {
+            return Err(GitError::InvalidFormat(format!(
+                "bitmap index has {} trailing bytes",
+                checksum_offset - offset
+            )));
+        }
+
+        Ok(Self {
+            version,
+            format,
+            options,
+            pack_checksum,
+            index_checksum,
+            type_bitmaps: PackBitmapTypeBitmaps {
+                commits,
+                trees,
+                blobs,
+                tags,
+            },
+            entries,
+            name_hash_cache,
+        })
+    }
+
+    pub fn entry_for_pack_position(&self, position: u32) -> Option<&PackBitmapEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.object_position == position)
+    }
+}
+
+fn parse_bitmap_ewah(
+    bytes: &[u8],
+    offset: &mut usize,
+    checksum_offset: usize,
+    _object_count: usize,
+) -> Result<EwahBitmap> {
+    if checksum_offset.saturating_sub(*offset) < 12 {
+        return Err(GitError::InvalidFormat("truncated EWAH bitmap".into()));
+    }
+    let bit_size = u32_be(&bytes[*offset..*offset + 4]);
+    *offset += 4;
+    let word_count = u32_be(&bytes[*offset..*offset + 4]) as usize;
+    *offset += 4;
+    let words_len = word_count
+        .checked_mul(8)
+        .ok_or_else(|| GitError::InvalidFormat("EWAH word table overflow".into()))?;
+    if checksum_offset.saturating_sub(*offset) < words_len + 4 {
+        return Err(GitError::InvalidFormat("truncated EWAH word table".into()));
+    }
+    let mut words = Vec::with_capacity(word_count);
+    for _ in 0..word_count {
+        words.push(u64_be(&bytes[*offset..*offset + 8]));
+        *offset += 8;
+    }
+    let rlw_position = u32_be(&bytes[*offset..*offset + 4]);
+    *offset += 4;
+    validate_ewah_words(bit_size, &words, rlw_position)?;
+    Ok(EwahBitmap {
+        bit_size,
+        words,
+        rlw_position,
+    })
+}
+
+fn validate_ewah_words(bit_size: u32, words: &[u64], rlw_position: u32) -> Result<()> {
+    if words.is_empty() {
+        if rlw_position != 0 || bit_size != 0 {
+            return Err(GitError::InvalidFormat(
+                "EWAH bitmap has invalid empty RLW".into(),
+            ));
+        }
+        return Ok(());
+    }
+    if rlw_position as usize >= words.len() {
+        return Err(GitError::InvalidFormat(
+            "EWAH RLW position points past word table".into(),
+        ));
+    }
+    let mut word_idx = 0usize;
+    let mut decoded_words = 0u64;
+    while word_idx < words.len() {
+        let rlw = words[word_idx];
+        let run_words = (rlw >> 1) & 0xffff_ffff;
+        let literal_words = (rlw >> 33) as usize;
+        word_idx += 1;
+        word_idx = word_idx
+            .checked_add(literal_words)
+            .ok_or_else(|| GitError::InvalidFormat("EWAH literal word overflow".into()))?;
+        if word_idx > words.len() {
+            return Err(GitError::InvalidFormat(
+                "EWAH literal words extend past word table".into(),
+            ));
+        }
+        decoded_words = decoded_words
+            .checked_add(run_words)
+            .and_then(|value| value.checked_add(literal_words as u64))
+            .ok_or_else(|| GitError::InvalidFormat("EWAH decoded size overflow".into()))?;
+    }
+    let decoded_bits = decoded_words
+        .checked_mul(64)
+        .ok_or_else(|| GitError::InvalidFormat("EWAH decoded bit size overflow".into()))?;
+    if decoded_bits < u64::from(bit_size) {
+        return Err(GitError::InvalidFormat(
+            "EWAH bitmap decodes fewer bits than declared".into(),
+        ));
+    }
+    Ok(())
 }
 
 impl MultiPackIndex {
@@ -1565,6 +1966,10 @@ fn next_byte(bytes: &[u8], offset: &mut usize) -> Result<u8> {
     Ok(byte)
 }
 
+fn u16_be(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[0], bytes[1]])
+}
+
 fn u32_be(bytes: &[u8]) -> u32 {
     u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
 }
@@ -1910,7 +2315,11 @@ mod tests {
     use super::*;
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
+    use std::fs;
     use std::io::Write;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_single_blob_pack() {
@@ -2000,6 +2409,48 @@ mod tests {
         assert_eq!(index.pack_checksum.format(), ObjectFormat::Sha256);
         assert_eq!(index.index_checksum.format(), ObjectFormat::Sha256);
         assert_eq!(index.find(&oid).unwrap().offset, 12);
+    }
+
+    #[test]
+    fn indexes_existing_sha256_pack_bytes() {
+        let object = EncodedObject::new(ObjectType::Blob, b"index raw sha256 pack\n".to_vec());
+        let written =
+            PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
+                .unwrap();
+
+        let indexed = PackIndex::write_v2_for_pack(&written.pack, ObjectFormat::Sha256).unwrap();
+        let index = PackIndex::parse(&indexed.index, ObjectFormat::Sha256).unwrap();
+
+        assert_eq!(indexed.pack_checksum, written.checksum);
+        assert_eq!(indexed.entries, written.entries);
+        assert_eq!(index.pack_checksum, written.checksum);
+        assert_eq!(index.entries, written.entries);
+    }
+
+    #[test]
+    fn indexes_existing_delta_pack_bytes() {
+        let (base, changed) = similar_blob_objects();
+        let written = PackFile::write_with_delta_strategy(
+            &[base.clone(), changed.clone()],
+            ObjectFormat::Sha1,
+            DeltaStrategy::OfsDelta,
+        )
+        .unwrap();
+
+        let indexed = PackIndex::write_v2_for_pack_sha1(&written.pack).unwrap();
+        let index = PackIndex::parse_v2_sha1(&indexed.index).unwrap();
+        let changed_oid = changed.object_id(ObjectFormat::Sha1).unwrap();
+
+        assert_eq!(indexed.pack_checksum, written.checksum);
+        assert_eq!(indexed.entries, written.entries);
+        assert_eq!(
+            index.find(&changed_oid).unwrap().offset,
+            written.entries[1].offset
+        );
+        assert_eq!(
+            index.find(&changed_oid).unwrap().crc32,
+            written.entries[1].crc32
+        );
     }
 
     #[test]
@@ -2106,6 +2557,14 @@ mod tests {
         let last = pack.len() - 1;
         pack[last] ^= 1;
         assert!(PackFile::parse_sha1(&pack).is_err());
+    }
+
+    #[test]
+    fn raw_pack_index_rejects_bad_pack_checksum() {
+        let mut pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"hello\n");
+        let last = pack.len() - 1;
+        pack[last] ^= 1;
+        assert!(PackIndex::write_v2_for_pack_sha1(&pack).is_err());
     }
 
     #[test]
@@ -2609,6 +3068,184 @@ mod tests {
     }
 
     #[test]
+    fn parses_pack_bitmap_index_with_hash_cache() {
+        let pack_checksum = git_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let bitmap = pack_bitmap_index(
+            ObjectFormat::Sha1,
+            3,
+            PackBitmapIndex::OPTION_FULL_DAG | PackBitmapIndex::OPTION_HASH_CACHE,
+            &pack_checksum,
+            &[(2, 0, 1, &[0b101])],
+            Some(&[0x1111_1111, 0x2222_2222, 0x3333_3333]),
+        );
+
+        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha1, 3).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.format, ObjectFormat::Sha1);
+        assert_eq!(
+            parsed.options,
+            PackBitmapIndex::OPTION_FULL_DAG | PackBitmapIndex::OPTION_HASH_CACHE
+        );
+        assert_eq!(parsed.pack_checksum, pack_checksum);
+        assert_eq!(parsed.type_bitmaps.commits.bit_size, 3);
+        assert_eq!(parsed.type_bitmaps.trees.bit_size, 3);
+        assert_eq!(parsed.entries.len(), 1);
+        let entry = parsed.entry_for_pack_position(2).unwrap();
+        assert_eq!(entry.xor_offset, 0);
+        assert_eq!(entry.flags, 1);
+        assert_eq!(entry.bitmap.words, ewah_literal_words(&[0b101]));
+        assert_eq!(
+            parsed.name_hash_cache,
+            Some(vec![0x1111_1111, 0x2222_2222, 0x3333_3333])
+        );
+    }
+
+    #[test]
+    fn parses_pack_bitmap_index_sha256() {
+        let pack_checksum = git_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        let bitmap = pack_bitmap_index(
+            ObjectFormat::Sha256,
+            2,
+            PackBitmapIndex::OPTION_FULL_DAG,
+            &pack_checksum,
+            &[(0, 0, 0, &[0b11])],
+            None,
+        );
+
+        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha256, 2).unwrap();
+        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.format, ObjectFormat::Sha256);
+        assert_eq!(parsed.pack_checksum, pack_checksum);
+        assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
+        assert_eq!(parsed.entries[0].object_position, 0);
+        assert_eq!(parsed.name_hash_cache, None);
+    }
+
+    #[test]
+    fn parses_upstream_git_written_pack_bitmap_index() {
+        let root = unique_temp_dir("git-pack-bitmap-upstream");
+        fs::create_dir_all(&root).unwrap();
+        let result = (|| {
+            run_git_success(&root, &["init", "-q", "-b", "main"]);
+            run_git_success(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "one",
+                ],
+            );
+            run_git_success(
+                &root,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-q",
+                    "-m",
+                    "two",
+                ],
+            );
+            run_git_success(&root, &["repack", "-adb"]);
+            let pack_dir = root.join(".git").join("objects").join("pack");
+            let idx_path = single_path_with_extension(&pack_dir, "idx");
+            let bitmap_path = single_path_with_extension(&pack_dir, "bitmap");
+            let index = PackIndex::parse(&fs::read(idx_path).unwrap(), ObjectFormat::Sha1).unwrap();
+            let bitmap = PackBitmapIndex::parse(
+                &fs::read(bitmap_path).unwrap(),
+                ObjectFormat::Sha1,
+                index.entries.len(),
+            )
+            .unwrap();
+            assert_eq!(bitmap.pack_checksum, index.pack_checksum);
+            assert!(!bitmap.entries.is_empty());
+        })();
+        let _ = fs::remove_dir_all(&root);
+        result
+    }
+
+    #[test]
+    fn rejects_bad_pack_bitmap_index_header_and_checksum() {
+        let pack_checksum = git_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let bitmap = pack_bitmap_index(
+            ObjectFormat::Sha1,
+            1,
+            PackBitmapIndex::OPTION_FULL_DAG,
+            &pack_checksum,
+            &[(0, 0, 0, &[1])],
+            None,
+        );
+
+        let mut bad_signature = bitmap.clone();
+        bad_signature[0] = b'X';
+        assert!(PackBitmapIndex::parse(&bad_signature, ObjectFormat::Sha1, 1).is_err());
+
+        let mut bad_version = bitmap.clone();
+        bad_version[5] = 2;
+        refresh_trailing_checksum(ObjectFormat::Sha1, &mut bad_version);
+        assert!(PackBitmapIndex::parse(&bad_version, ObjectFormat::Sha1, 1).is_err());
+
+        let mut bad_option = bitmap.clone();
+        bad_option[7] = 0x20;
+        refresh_trailing_checksum(ObjectFormat::Sha1, &mut bad_option);
+        assert!(PackBitmapIndex::parse(&bad_option, ObjectFormat::Sha1, 1).is_err());
+
+        let mut bad_checksum = bitmap;
+        let last = bad_checksum.len() - 1;
+        bad_checksum[last] ^= 1;
+        assert!(PackBitmapIndex::parse(&bad_checksum, ObjectFormat::Sha1, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_bad_pack_bitmap_index_ewah_and_entries() {
+        let pack_checksum = git_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let bitmap = pack_bitmap_index(
+            ObjectFormat::Sha1,
+            2,
+            PackBitmapIndex::OPTION_FULL_DAG,
+            &pack_checksum,
+            &[(0, 0, 0, &[0b01]), (1, 1, 0, &[0b11])],
+            None,
+        );
+
+        let mut truncated = bitmap.clone();
+        truncated.truncate(truncated.len() - ObjectFormat::Sha1.raw_len() - 1);
+        refresh_trailing_checksum(ObjectFormat::Sha1, &mut truncated);
+        assert!(PackBitmapIndex::parse(&truncated, ObjectFormat::Sha1, 2).is_err());
+
+        let mut out_of_range_position = pack_bitmap_index(
+            ObjectFormat::Sha1,
+            2,
+            PackBitmapIndex::OPTION_FULL_DAG,
+            &pack_checksum,
+            &[(2, 0, 0, &[0b01])],
+            None,
+        );
+        assert!(PackBitmapIndex::parse(&out_of_range_position, ObjectFormat::Sha1, 2).is_err());
+        refresh_trailing_checksum(ObjectFormat::Sha1, &mut out_of_range_position);
+        assert!(PackBitmapIndex::parse(&out_of_range_position, ObjectFormat::Sha1, 2).is_err());
+
+        let invalid_xor = pack_bitmap_index(
+            ObjectFormat::Sha1,
+            2,
+            PackBitmapIndex::OPTION_FULL_DAG,
+            &pack_checksum,
+            &[(0, 1, 0, &[0b01])],
+            None,
+        );
+        assert!(PackBitmapIndex::parse(&invalid_xor, ObjectFormat::Sha1, 2).is_err());
+    }
+
+    #[test]
     fn parses_single_entry_pack_index_sha256() {
         let oid =
             git_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello sha256\n").unwrap();
@@ -2726,6 +3363,96 @@ mod tests {
         let checksum = git_core::digest_bytes(format, &pack).unwrap();
         pack.extend_from_slice(checksum.as_bytes());
         pack
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("git-rs-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn run_git_success(cwd: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn single_path_with_extension(dir: &Path, extension: &str) -> PathBuf {
+        let mut paths = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
+            .collect::<Vec<_>>();
+        assert_eq!(paths.len(), 1, "expected one .{extension} file");
+        paths.remove(0)
+    }
+
+    fn pack_bitmap_index(
+        format: ObjectFormat,
+        object_count: u32,
+        options: u16,
+        pack_checksum: &ObjectId,
+        entries: &[(u32, u8, u8, &[u64])],
+        name_hash_cache: Option<&[u32]>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"BITM");
+        out.extend_from_slice(&1u16.to_be_bytes());
+        out.extend_from_slice(&options.to_be_bytes());
+        out.extend_from_slice(&(entries.len() as u32).to_be_bytes());
+        out.extend_from_slice(pack_checksum.as_bytes());
+        write_test_ewah(&mut out, object_count, &[0b001]);
+        write_test_ewah(&mut out, object_count, &[0b010]);
+        write_test_ewah(&mut out, object_count, &[0b100]);
+        write_test_ewah(&mut out, object_count, &[0]);
+        for (position, xor_offset, flags, words) in entries {
+            out.extend_from_slice(&position.to_be_bytes());
+            out.push(*xor_offset);
+            out.push(*flags);
+            write_test_ewah(&mut out, object_count, words);
+        }
+        if let Some(cache) = name_hash_cache {
+            for value in cache {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+        }
+        let checksum = git_core::digest_bytes(format, &out).unwrap();
+        out.extend_from_slice(checksum.as_bytes());
+        out
+    }
+
+    fn write_test_ewah(out: &mut Vec<u8>, bit_size: u32, literals: &[u64]) {
+        out.extend_from_slice(&bit_size.to_be_bytes());
+        let words = ewah_literal_words(literals);
+        out.extend_from_slice(&(words.len() as u32).to_be_bytes());
+        for word in words {
+            out.extend_from_slice(&word.to_be_bytes());
+        }
+        out.extend_from_slice(&0u32.to_be_bytes());
+    }
+
+    fn ewah_literal_words(literals: &[u64]) -> Vec<u64> {
+        let rlw = (literals.len() as u64) << 33;
+        let mut words = vec![rlw];
+        words.extend_from_slice(literals);
+        words
+    }
+
+    fn refresh_trailing_checksum(format: ObjectFormat, bytes: &mut [u8]) {
+        let checksum_offset = bytes.len() - format.raw_len();
+        let checksum = git_core::digest_bytes(format, &bytes[..checksum_offset]).unwrap();
+        bytes[checksum_offset..].copy_from_slice(checksum.as_bytes());
     }
 
     fn append_suffix_delta(base: &[u8], result: &[u8]) -> Vec<u8> {

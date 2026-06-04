@@ -10,6 +10,9 @@ members = [
     "crates/git-sequencer",
     "crates/git-pack",
     "crates/git-transport",
+    "crates/git-fetch",
+    "crates/git-fsck",
+    "crates/git-archive",
     "crates/git-cli",
     "crates/git-testkit",
 ]
@@ -27,4 +30,3 @@ unsafe_code = "forbid"
 unwrap_used = "deny"
 dbg_macro = "deny"
 todo = "deny"
-

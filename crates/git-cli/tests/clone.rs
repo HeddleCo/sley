@@ -31,6 +31,75 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+fn loose_object_path(git_dir: &Path, oid: &str) -> PathBuf {
+    git_dir.join("objects").join(&oid[..2]).join(&oid[2..])
+}
+
+fn repository_pack_pair(git_dir: &Path) -> (PathBuf, PathBuf) {
+    let pack_dir = git_dir.join("objects").join("pack");
+    let mut packs = Vec::new();
+    let mut indexes = Vec::new();
+    for entry in fs::read_dir(&pack_dir).expect("read pack dir") {
+        let path = entry.expect("read pack entry").path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("pack") => packs.push(path),
+            Some("idx") => indexes.push(path),
+            _ => {}
+        }
+    }
+    assert_eq!(
+        packs.len(),
+        1,
+        "expected one pack in {}",
+        pack_dir.display()
+    );
+    assert_eq!(
+        indexes.len(),
+        1,
+        "expected one pack index in {}",
+        pack_dir.display()
+    );
+    assert_eq!(
+        packs[0].file_stem(),
+        indexes[0].file_stem(),
+        "pack and index stem should match"
+    );
+    (packs.remove(0), indexes.remove(0))
+}
+
+fn repository_promisor_sidecars(git_dir: &Path) -> Vec<PathBuf> {
+    let pack_dir = git_dir.join("objects").join("pack");
+    let mut promisors = fs::read_dir(&pack_dir)
+        .expect("read pack dir")
+        .map(|entry| entry.expect("read pack entry").path())
+        .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("promisor"))
+        .collect::<Vec<_>>();
+    promisors.sort();
+    promisors
+}
+
+fn assert_reachable_objects_stored_in_pack(repo: &Path, git_dir: &Path) {
+    let (_pack_path, index_path) = repository_pack_pair(git_dir);
+    let index_arg = index_path.to_string_lossy();
+    run_success("git", repo, &["verify-pack", "-v", &index_arg]);
+
+    let objects = String::from_utf8(run_success(
+        "git",
+        repo,
+        &["rev-list", "--objects", "--all", "HEAD"],
+    ))
+    .expect("rev-list output is utf8");
+    for oid in objects
+        .lines()
+        .filter_map(|line| line.split_whitespace().next())
+    {
+        assert!(
+            !loose_object_path(git_dir, oid).exists(),
+            "cloned object {oid} should be stored in pack, not as loose object"
+        );
+    }
+}
+
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
     assert_eq!(
         actual.status.code(),
@@ -134,6 +203,30 @@ fn create_source_repo(root: &Path) {
     run_success("git", root, &["tag", "v1.0"]);
 }
 
+fn create_sha256_nested_source_repo(root: &Path) {
+    run_success("git", root, &["init", "-q", "--object-format=sha256"]);
+    fs::create_dir_all(root.join("dir")).expect("create source dir");
+    fs::create_dir_all(root.join("deep/nested")).expect("create source nested dir");
+    fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
+    fs::write(root.join("dir/file.txt"), b"dir\n").expect("write dir payload");
+    fs::write(root.join("deep/nested/file.txt"), b"deep\n").expect("write deep payload");
+    run_success("git", root, &["add", "."]);
+    run_success(
+        "git",
+        root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+            "-q",
+        ],
+    );
+}
+
 fn add_feature_commit(root: &Path) {
     run_success("git", root, &["checkout", "-q", "feature/topic"]);
     fs::write(root.join("payload.txt"), b"feature payload\n").expect("write feature payload");
@@ -207,6 +300,7 @@ fn clone_local_repository_matches_upstream_git() {
             fs::read(expected_repo.join("payload.txt")).expect("read expected payload"),
             fs::read(actual_repo.join("payload.txt")).expect("read actual payload")
         );
+        assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo.join(".git"));
     })();
     let _ = fs::remove_dir_all(&root);
     result
@@ -305,6 +399,7 @@ fn clone_local_repository_bare_matches_upstream_git() {
             actual_repo.join("FETCH_HEAD").exists(),
             "bare clone FETCH_HEAD presence differed"
         );
+        assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo);
     })();
     let _ = fs::remove_dir_all(&root);
     result
@@ -726,6 +821,50 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
 }
 
 #[test]
+fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
+    let root = unique_temp_dir("clone-sha256-index-options");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    let result = (|| {
+        create_sha256_nested_source_repo(&source);
+        let source_arg = source.to_str().expect("source path is utf8");
+
+        for (label, options) in [
+            ("no-checkout", vec!["--no-checkout"]),
+            ("sparse", vec!["--sparse"]),
+        ] {
+            let expected_repo = root.join(format!("{label}-expected"));
+            let actual_repo = root.join(format!("{label}-actual"));
+            let expected_arg = expected_repo.to_str().expect("expected path is utf8");
+            let actual_arg = actual_repo.to_str().expect("actual path is utf8");
+            let mut expected_args = vec!["clone", "-q"];
+            expected_args.extend(options.iter().copied());
+            expected_args.extend([source_arg, expected_arg]);
+            let mut actual_args = vec!["clone", "-q"];
+            actual_args.extend(options.iter().copied());
+            actual_args.extend([source_arg, actual_arg]);
+
+            let expected = run("git", &root, &expected_args);
+            let actual = run(env!("CARGO_BIN_EXE_git-rs"), &root, &actual_args);
+            assert_same_output(actual, expected, &actual_args);
+
+            for args in [
+                vec!["rev-parse", "--show-object-format=storage"],
+                vec!["show-ref"],
+                vec!["status", "--short"],
+                vec!["ls-files", "--stage"],
+            ] {
+                let expected = run("git", &expected_repo, &args);
+                let actual = run("git", &actual_repo, &args);
+                assert_same_output(actual, expected, &args);
+            }
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn clone_local_repository_tag_options_match_upstream_git() {
     let root = unique_temp_dir("clone-local-tag-options");
     let source = root.join("source");
@@ -892,6 +1031,12 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
                 actual_repo.join("payload.txt").exists(),
                 "payload presence differed for {label}"
             );
+            let actual_git_dir = if bare_layout {
+                actual_repo.clone()
+            } else {
+                actual_repo.join(".git")
+            };
+            assert_reachable_objects_stored_in_pack(&actual_repo, &actual_git_dir);
         }
 
         let expected_repo = root.join("revision-reset-expected");
@@ -1264,6 +1409,61 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
+fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
+    let root = unique_temp_dir("clone-file-filter-promisor-pack");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    let result = (|| {
+        create_source_repo(&source);
+        add_feature_commit(&source);
+        let source_arg = format!("file://{}", source.display());
+        let expected_repo = root.join("expected");
+        let actual_repo = root.join("actual");
+        let expected_arg = expected_repo.to_str().expect("expected path is utf8");
+        let actual_arg = actual_repo.to_str().expect("actual path is utf8");
+        let expected_args = vec![
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            source_arg.as_str(),
+            expected_arg,
+        ];
+        let actual_args = vec![
+            "clone",
+            "-q",
+            "--filter=blob:none",
+            source_arg.as_str(),
+            actual_arg,
+        ];
+
+        let expected = run("git", &root, &expected_args);
+        let actual = run(env!("CARGO_BIN_EXE_git-rs"), &root, &actual_args);
+        assert_same_output(actual, expected, &actual_args);
+
+        for args in [
+            vec!["config", "--get", "remote.origin.promisor"],
+            vec!["config", "--get", "remote.origin.partialclonefilter"],
+            vec!["show-ref"],
+            vec!["status", "--short"],
+        ] {
+            let expected = run("git", &expected_repo, &args);
+            let actual = run("git", &actual_repo, &args);
+            assert_same_output(actual, expected, &args);
+        }
+
+        let actual_git_dir = actual_repo.join(".git");
+        let promisors = repository_promisor_sidecars(&actual_git_dir);
+        assert_eq!(promisors.len(), 1);
+        assert_eq!(fs::read(&promisors[0]).expect("read promisor"), b"");
+        let (pack, index) = repository_pack_pair(&actual_git_dir);
+        assert_eq!(promisors[0].file_stem(), pack.file_stem());
+        assert_eq!(promisors[0].file_stem(), index.file_stem());
     })();
     let _ = fs::remove_dir_all(&root);
     result

@@ -34,12 +34,24 @@ dependencies = [
 ]
 
 [[package]]
-name = "git-cli"
+name = "git-archive"
 version = "0.1.0"
 dependencies = [
  "git-core",
- "git-diff-merge",
  "git-formats",
+ "git-odb",
+]
+
+[[package]]
+name = "git-cli"
+version = "0.1.0"
+dependencies = [
+ "git-archive",
+ "git-core",
+ "git-diff-merge",
+ "git-fetch",
+ "git-formats",
+ "git-fsck",
  "git-odb",
  "git-pack",
  "git-refs",
@@ -65,10 +77,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-fetch"
+version = "0.1.0"
+dependencies = [
+ "git-core",
+ "git-formats",
+ "git-odb",
+ "git-pack",
+ "git-transport",
+]
+
+[[package]]
 name = "git-formats"
 version = "0.1.0"
 dependencies = [
  "git-core",
+]
+
+[[package]]
+name = "git-fsck"
+version = "0.1.0"
+dependencies = [
+ "git-core",
+ "git-formats",
+ "git-odb",
 ]
 
 [[package]]
@@ -96,6 +128,7 @@ name = "git-refs"
 version = "0.1.0"
 dependencies = [
  "git-core",
+ "git-formats",
 ]
 
 [[package]]

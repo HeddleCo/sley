@@ -3,12 +3,644 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+const REFTABLE_MAGIC: &[u8; 4] = b"REFT";
+const REFTABLE_MAX_BLOCK_SIZE: u32 = 0x00ff_ffff;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectType {
     Blob,
     Tree,
     Commit,
     Tag,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReftableVersion {
+    V1,
+    V2,
+}
+
+impl ReftableVersion {
+    fn number(self) -> u8 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+        }
+    }
+
+    fn header_len(self) -> usize {
+        match self {
+            Self::V1 => 24,
+            Self::V2 => 28,
+        }
+    }
+
+    fn footer_len(self) -> usize {
+        match self {
+            Self::V1 => 68,
+            Self::V2 => 72,
+        }
+    }
+
+    fn from_number(value: u8) -> Result<Self> {
+        match value {
+            1 => Ok(Self::V1),
+            2 => Ok(Self::V2),
+            other => Err(GitError::InvalidFormat(format!(
+                "unsupported reftable version {other}"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReftableHeader {
+    pub version: ReftableVersion,
+    pub block_size: u32,
+    pub min_update_index: u64,
+    pub max_update_index: u64,
+    pub object_format: ObjectFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReftableRefValue {
+    Deletion,
+    Direct(ObjectId),
+    Peeled { target: ObjectId, peeled: ObjectId },
+    Symbolic(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReftableRefRecord {
+    pub name: String,
+    pub update_index: u64,
+    pub value: ReftableRefValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reftable {
+    pub header: ReftableHeader,
+    pub refs: Vec<ReftableRefRecord>,
+}
+
+impl Reftable {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let header = parse_reftable_header(bytes)?;
+        let footer = parse_reftable_footer(bytes, header.version)?;
+        if footer.version != header.version
+            || footer.block_size != header.block_size
+            || footer.min_update_index != header.min_update_index
+            || footer.max_update_index != header.max_update_index
+            || footer.object_format != header.object_format
+        {
+            return Err(GitError::InvalidFormat(
+                "reftable footer header does not match file header".into(),
+            ));
+        }
+        let footer_start = bytes.len() - header.version.footer_len();
+        if footer.obj_id_len > header.object_format.raw_len() as u8 {
+            return Err(GitError::InvalidFormat(
+                "reftable object id abbreviation length exceeds hash length".into(),
+            ));
+        }
+        let ref_end = [
+            footer.ref_index_position,
+            footer.obj_position,
+            footer.obj_index_position,
+            footer.log_position,
+            footer.log_index_position,
+            footer_start as u64,
+        ]
+        .into_iter()
+        .filter(|position| *position != 0)
+        .min()
+        .unwrap_or(footer_start as u64) as usize;
+        let mut refs = Vec::new();
+        let mut offset = header.version.header_len();
+        while offset < ref_end {
+            if bytes[offset] == 0 {
+                offset += 1;
+                continue;
+            }
+            let block_type = bytes[offset];
+            if block_type != b'r' {
+                break;
+            }
+            let block_len = read_u24(bytes, offset + 1)? as usize;
+            let block_end = if offset == header.version.header_len() {
+                block_len
+            } else {
+                offset
+                    .checked_add(block_len)
+                    .ok_or_else(|| GitError::InvalidFormat("reftable block overflow".into()))?
+            };
+            if block_end > ref_end || block_end > bytes.len() {
+                return Err(GitError::InvalidFormat(
+                    "reftable ref block extends past section".into(),
+                ));
+            }
+            refs.extend(parse_reftable_ref_block(
+                &bytes[offset..block_end],
+                offset,
+                header,
+            )?);
+            offset = block_end;
+        }
+        Ok(Self { header, refs })
+    }
+
+    pub fn write_ref_only(
+        format: ObjectFormat,
+        min_update_index: u64,
+        max_update_index: u64,
+        refs: &[ReftableRefRecord],
+    ) -> Result<Vec<u8>> {
+        let version = match format {
+            ObjectFormat::Sha1 => ReftableVersion::V1,
+            ObjectFormat::Sha256 => ReftableVersion::V2,
+        };
+        let header = ReftableHeader {
+            version,
+            block_size: 0,
+            min_update_index,
+            max_update_index,
+            object_format: format,
+        };
+        let mut refs = refs.to_vec();
+        refs.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut out = write_reftable_header(header);
+        if !refs.is_empty() {
+            let block_start = out.len();
+            out.push(b'r');
+            out.extend_from_slice(&[0, 0, 0]);
+            let mut previous_name = Vec::new();
+            let mut restart_offsets = Vec::new();
+            for record in &refs {
+                if record.update_index < min_update_index || record.update_index > max_update_index
+                {
+                    return Err(GitError::InvalidFormat(format!(
+                        "reftable ref {} update index {} outside header bounds",
+                        record.name, record.update_index
+                    )));
+                }
+                restart_offsets.push(out.len() as u32);
+                write_reftable_ref_record(
+                    &mut out,
+                    format,
+                    min_update_index,
+                    &previous_name,
+                    0,
+                    record,
+                )?;
+                previous_name = record.name.as_bytes().to_vec();
+            }
+            for offset in &restart_offsets {
+                write_u24(&mut out, *offset)?;
+            }
+            let restart_count = u16::try_from(restart_offsets.len())
+                .map_err(|_| GitError::InvalidFormat("too many reftable restart offsets".into()))?;
+            out.extend_from_slice(&restart_count.to_be_bytes());
+            let block_len = out.len();
+            if block_len > REFTABLE_MAX_BLOCK_SIZE as usize {
+                return Err(GitError::InvalidFormat(
+                    "reftable ref block exceeds maximum size".into(),
+                ));
+            }
+            write_u24_at(&mut out, block_start + 1, block_len as u32)?;
+        }
+        out.extend_from_slice(&write_reftable_footer(header, 0, 0, 0, 0, 0)?);
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReftableFooter {
+    version: ReftableVersion,
+    block_size: u32,
+    min_update_index: u64,
+    max_update_index: u64,
+    object_format: ObjectFormat,
+    ref_index_position: u64,
+    obj_position: u64,
+    obj_id_len: u8,
+    obj_index_position: u64,
+    log_position: u64,
+    log_index_position: u64,
+}
+
+fn parse_reftable_header(bytes: &[u8]) -> Result<ReftableHeader> {
+    if bytes.len() < 24 {
+        return Err(GitError::InvalidFormat("truncated reftable header".into()));
+    }
+    if &bytes[..4] != REFTABLE_MAGIC {
+        return Err(GitError::InvalidFormat("missing reftable magic".into()));
+    }
+    let version = ReftableVersion::from_number(bytes[4])?;
+    if bytes.len() < version.header_len() {
+        return Err(GitError::InvalidFormat("truncated reftable header".into()));
+    }
+    let block_size = read_u24(bytes, 5)?;
+    let min_update_index = read_u64(bytes, 8)?;
+    let max_update_index = read_u64(bytes, 16)?;
+    let object_format = match version {
+        ReftableVersion::V1 => ObjectFormat::Sha1,
+        ReftableVersion::V2 => match bytes.get(24..28) {
+            Some(b"sha1") => ObjectFormat::Sha1,
+            Some(b"s256") => ObjectFormat::Sha256,
+            Some(value) => {
+                return Err(GitError::InvalidFormat(format!(
+                    "unsupported reftable hash id {}",
+                    String::from_utf8_lossy(value)
+                )));
+            }
+            None => return Err(GitError::InvalidFormat("truncated reftable hash id".into())),
+        },
+    };
+    Ok(ReftableHeader {
+        version,
+        block_size,
+        min_update_index,
+        max_update_index,
+        object_format,
+    })
+}
+
+fn write_reftable_header(header: ReftableHeader) -> Vec<u8> {
+    let mut out = Vec::with_capacity(header.version.header_len());
+    out.extend_from_slice(REFTABLE_MAGIC);
+    out.push(header.version.number());
+    write_u24(&mut out, header.block_size).expect("header block size fits u24");
+    out.extend_from_slice(&header.min_update_index.to_be_bytes());
+    out.extend_from_slice(&header.max_update_index.to_be_bytes());
+    if header.version == ReftableVersion::V2 {
+        out.extend_from_slice(match header.object_format {
+            ObjectFormat::Sha1 => b"sha1",
+            ObjectFormat::Sha256 => b"s256",
+        });
+    }
+    out
+}
+
+fn parse_reftable_footer(bytes: &[u8], version: ReftableVersion) -> Result<ReftableFooter> {
+    let footer_len = version.footer_len();
+    if bytes.len() < footer_len {
+        return Err(GitError::InvalidFormat("truncated reftable footer".into()));
+    }
+    let start = bytes.len() - footer_len;
+    let crc_start = bytes.len() - 4;
+    let expected = read_u32(bytes, crc_start)?;
+    let actual = crc32(&bytes[start..crc_start]);
+    if expected != actual {
+        return Err(GitError::InvalidFormat(format!(
+            "reftable footer crc mismatch: expected {expected:08x}, got {actual:08x}"
+        )));
+    }
+    let header = parse_reftable_header(&bytes[start..])?;
+    let mut offset = start + version.header_len();
+    let ref_index_position = read_u64(bytes, offset)?;
+    offset += 8;
+    let obj_position_and_len = read_u64(bytes, offset)?;
+    offset += 8;
+    let obj_index_position = read_u64(bytes, offset)?;
+    offset += 8;
+    let log_position = read_u64(bytes, offset)?;
+    offset += 8;
+    let log_index_position = read_u64(bytes, offset)?;
+    Ok(ReftableFooter {
+        version: header.version,
+        block_size: header.block_size,
+        min_update_index: header.min_update_index,
+        max_update_index: header.max_update_index,
+        object_format: header.object_format,
+        ref_index_position,
+        obj_position: obj_position_and_len >> 5,
+        obj_id_len: (obj_position_and_len & 0x1f) as u8,
+        obj_index_position,
+        log_position,
+        log_index_position,
+    })
+}
+
+fn write_reftable_footer(
+    header: ReftableHeader,
+    ref_index_position: u64,
+    obj_position: u64,
+    obj_id_len: u8,
+    obj_index_position: u64,
+    log_position: u64,
+) -> Result<Vec<u8>> {
+    if obj_id_len > 31 {
+        return Err(GitError::InvalidFormat(
+            "reftable object id abbreviation length exceeds 31".into(),
+        ));
+    }
+    let mut out = write_reftable_header(header);
+    out.extend_from_slice(&ref_index_position.to_be_bytes());
+    out.extend_from_slice(&((obj_position << 5) | u64::from(obj_id_len)).to_be_bytes());
+    out.extend_from_slice(&obj_index_position.to_be_bytes());
+    out.extend_from_slice(&log_position.to_be_bytes());
+    out.extend_from_slice(&0u64.to_be_bytes());
+    let crc = crc32(&out);
+    out.extend_from_slice(&crc.to_be_bytes());
+    Ok(out)
+}
+
+fn parse_reftable_ref_block(
+    block: &[u8],
+    block_start: usize,
+    header: ReftableHeader,
+) -> Result<Vec<ReftableRefRecord>> {
+    if block.len() < 6 || block[0] != b'r' {
+        return Err(GitError::InvalidFormat("invalid reftable ref block".into()));
+    }
+    let restart_count = read_u16(block, block.len() - 2)? as usize;
+    if restart_count == 0 {
+        return Err(GitError::InvalidFormat(
+            "reftable ref block has no restart offsets".into(),
+        ));
+    }
+    let restart_table_start = block
+        .len()
+        .checked_sub(2 + restart_count * 3)
+        .ok_or_else(|| GitError::InvalidFormat("truncated reftable restart table".into()))?;
+    let mut restart_offsets = Vec::with_capacity(restart_count);
+    for idx in 0..restart_count {
+        restart_offsets.push(read_u24(block, restart_table_start + idx * 3)? as usize);
+    }
+    if restart_offsets.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(GitError::InvalidFormat(
+            "reftable restart offsets are not sorted".into(),
+        ));
+    }
+    let mut offset = 4;
+    let mut previous_name = Vec::new();
+    let mut records = Vec::new();
+    while offset < restart_table_start {
+        let record_offset = block_start + offset;
+        let restart = restart_offsets.contains(&record_offset);
+        let record = parse_reftable_ref_record(
+            block,
+            &mut offset,
+            restart_table_start,
+            header,
+            &previous_name,
+            restart,
+        )?;
+        previous_name = record.name.as_bytes().to_vec();
+        records.push(record);
+    }
+    if offset != restart_table_start {
+        return Err(GitError::InvalidFormat(
+            "reftable ref block ended inside record".into(),
+        ));
+    }
+    Ok(records)
+}
+
+fn parse_reftable_ref_record(
+    block: &[u8],
+    offset: &mut usize,
+    end: usize,
+    header: ReftableHeader,
+    previous_name: &[u8],
+    restart: bool,
+) -> Result<ReftableRefRecord> {
+    let prefix_len = read_reftable_varint(block, offset, end)? as usize;
+    if prefix_len > previous_name.len() {
+        return Err(GitError::InvalidFormat(
+            "reftable ref prefix exceeds previous name".into(),
+        ));
+    }
+    if restart && prefix_len != 0 {
+        return Err(GitError::InvalidFormat(
+            "reftable restart record uses prefix compression".into(),
+        ));
+    }
+    let suffix_len_and_type = read_reftable_varint(block, offset, end)?;
+    let suffix_len = (suffix_len_and_type >> 3) as usize;
+    let value_type = (suffix_len_and_type & 0x7) as u8;
+    let suffix_end = offset
+        .checked_add(suffix_len)
+        .ok_or_else(|| GitError::InvalidFormat("reftable suffix overflow".into()))?;
+    if suffix_end > end {
+        return Err(GitError::InvalidFormat("truncated reftable suffix".into()));
+    }
+    let mut name = previous_name[..prefix_len].to_vec();
+    name.extend_from_slice(&block[*offset..suffix_end]);
+    *offset = suffix_end;
+    let update_index_delta = read_reftable_varint(block, offset, end)?;
+    let update_index = header
+        .min_update_index
+        .checked_add(update_index_delta)
+        .ok_or_else(|| GitError::InvalidFormat("reftable update index overflow".into()))?;
+    let value = match value_type {
+        0 => ReftableRefValue::Deletion,
+        1 => ReftableRefValue::Direct(read_reftable_oid(block, offset, end, header.object_format)?),
+        2 => ReftableRefValue::Peeled {
+            target: read_reftable_oid(block, offset, end, header.object_format)?,
+            peeled: read_reftable_oid(block, offset, end, header.object_format)?,
+        },
+        3 => {
+            let target_len = read_reftable_varint(block, offset, end)? as usize;
+            let target_end = offset.checked_add(target_len).ok_or_else(|| {
+                GitError::InvalidFormat("reftable symbolic target overflow".into())
+            })?;
+            if target_end > end {
+                return Err(GitError::InvalidFormat(
+                    "truncated reftable symbolic target".into(),
+                ));
+            }
+            let target = std::str::from_utf8(&block[*offset..target_end])
+                .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+                .to_string();
+            *offset = target_end;
+            ReftableRefValue::Symbolic(target)
+        }
+        other => {
+            return Err(GitError::InvalidFormat(format!(
+                "unsupported reftable ref value type {other}"
+            )));
+        }
+    };
+    let name = std::str::from_utf8(&name)
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?
+        .to_string();
+    Ok(ReftableRefRecord {
+        name,
+        update_index,
+        value,
+    })
+}
+
+fn write_reftable_ref_record(
+    out: &mut Vec<u8>,
+    format: ObjectFormat,
+    min_update_index: u64,
+    previous_name: &[u8],
+    prefix_len: usize,
+    record: &ReftableRefRecord,
+) -> Result<()> {
+    let name = record.name.as_bytes();
+    if prefix_len > previous_name.len() || prefix_len > name.len() {
+        return Err(GitError::InvalidFormat(
+            "reftable ref prefix exceeds name".into(),
+        ));
+    }
+    let value_type = match &record.value {
+        ReftableRefValue::Deletion => 0,
+        ReftableRefValue::Direct(_) => 1,
+        ReftableRefValue::Peeled { .. } => 2,
+        ReftableRefValue::Symbolic(_) => 3,
+    };
+    write_reftable_varint(out, prefix_len as u64);
+    write_reftable_varint(out, (((name.len() - prefix_len) as u64) << 3) | value_type);
+    out.extend_from_slice(&name[prefix_len..]);
+    write_reftable_varint(out, record.update_index - min_update_index);
+    match &record.value {
+        ReftableRefValue::Deletion => {}
+        ReftableRefValue::Direct(oid) => {
+            if oid.format() != format {
+                return Err(GitError::InvalidFormat(
+                    "reftable direct ref object format mismatch".into(),
+                ));
+            }
+            out.extend_from_slice(oid.as_bytes());
+        }
+        ReftableRefValue::Peeled { target, peeled } => {
+            if target.format() != format || peeled.format() != format {
+                return Err(GitError::InvalidFormat(
+                    "reftable peeled ref object format mismatch".into(),
+                ));
+            }
+            out.extend_from_slice(target.as_bytes());
+            out.extend_from_slice(peeled.as_bytes());
+        }
+        ReftableRefValue::Symbolic(target) => {
+            write_reftable_varint(out, target.len() as u64);
+            out.extend_from_slice(target.as_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn read_reftable_oid(
+    block: &[u8],
+    offset: &mut usize,
+    end: usize,
+    format: ObjectFormat,
+) -> Result<ObjectId> {
+    let oid_end = offset
+        .checked_add(format.raw_len())
+        .ok_or_else(|| GitError::InvalidFormat("reftable object id overflow".into()))?;
+    if oid_end > end {
+        return Err(GitError::InvalidFormat(
+            "truncated reftable object id".into(),
+        ));
+    }
+    let oid = ObjectId::from_raw(format, &block[*offset..oid_end])?;
+    *offset = oid_end;
+    Ok(oid)
+}
+
+fn read_reftable_varint(bytes: &[u8], offset: &mut usize, end: usize) -> Result<u64> {
+    if *offset >= end {
+        return Err(GitError::InvalidFormat("truncated reftable varint".into()));
+    }
+    let mut value = u64::from(bytes[*offset] & 0x7f);
+    while bytes[*offset] & 0x80 != 0 {
+        *offset += 1;
+        if *offset >= end {
+            return Err(GitError::InvalidFormat("truncated reftable varint".into()));
+        }
+        value = value
+            .checked_add(1)
+            .and_then(|value| value.checked_shl(7))
+            .ok_or_else(|| GitError::InvalidFormat("reftable varint overflow".into()))?
+            | u64::from(bytes[*offset] & 0x7f);
+    }
+    *offset += 1;
+    Ok(value)
+}
+
+fn write_reftable_varint(out: &mut Vec<u8>, mut value: u64) {
+    let mut bytes = [0u8; 10];
+    let mut pos = bytes.len() - 1;
+    bytes[pos] = (value & 0x7f) as u8;
+    while value > 0x7f {
+        value = (value >> 7) - 1;
+        pos -= 1;
+        bytes[pos] = ((value & 0x7f) as u8) | 0x80;
+    }
+    out.extend_from_slice(&bytes[pos..]);
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    let raw = bytes
+        .get(offset..offset + 2)
+        .ok_or_else(|| GitError::InvalidFormat("truncated uint16".into()))?;
+    Ok(u16::from_be_bytes([raw[0], raw[1]]))
+}
+
+fn read_u24(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 3)
+        .ok_or_else(|| GitError::InvalidFormat("truncated uint24".into()))?;
+    Ok((u32::from(raw[0]) << 16) | (u32::from(raw[1]) << 8) | u32::from(raw[2]))
+}
+
+fn write_u24(out: &mut Vec<u8>, value: u32) -> Result<()> {
+    if value > REFTABLE_MAX_BLOCK_SIZE {
+        return Err(GitError::InvalidFormat(format!(
+            "uint24 value {value} exceeds maximum"
+        )));
+    }
+    out.push((value >> 16) as u8);
+    out.push((value >> 8) as u8);
+    out.push(value as u8);
+    Ok(())
+}
+
+fn write_u24_at(out: &mut [u8], offset: usize, value: u32) -> Result<()> {
+    if value > REFTABLE_MAX_BLOCK_SIZE {
+        return Err(GitError::InvalidFormat(format!(
+            "uint24 value {value} exceeds maximum"
+        )));
+    }
+    let target = out
+        .get_mut(offset..offset + 3)
+        .ok_or_else(|| GitError::InvalidFormat("uint24 write is out of bounds".into()))?;
+    target[0] = (value >> 16) as u8;
+    target[1] = (value >> 8) as u8;
+    target[2] = value as u8;
+    Ok(())
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| GitError::InvalidFormat("truncated uint32".into()))?;
+    Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    let raw = bytes
+        .get(offset..offset + 8)
+        .ok_or_else(|| GitError::InvalidFormat("truncated uint64".into()))?;
+    Ok(u64::from_be_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            let mask = 0u32.wrapping_sub(crc & 1);
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
 }
 
 impl ObjectType {
@@ -1067,6 +1699,10 @@ pub struct BundleReference {
 }
 
 impl Bundle {
+    pub fn parse_standalone(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes, ObjectFormat::Sha1)
+    }
+
     pub fn parse(bytes: &[u8], default_format: ObjectFormat) -> Result<Self> {
         let (signature, mut offset) = next_lf_line(bytes, 0)
             .ok_or_else(|| GitError::InvalidFormat("bundle missing signature".into()))?;
@@ -1688,15 +2324,14 @@ pub struct IndexEntry {
 }
 
 impl Index {
-    pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {
-        let hash_len = ObjectFormat::Sha1.raw_len();
+    pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
+        let hash_len = format.raw_len();
         if bytes.len() < 12 + hash_len {
             return Err(GitError::InvalidFormat("index header too short".into()));
         }
         let checksum_offset = bytes.len() - hash_len;
-        let actual_checksum =
-            git_core::digest_bytes(ObjectFormat::Sha1, &bytes[..checksum_offset])?;
-        let checksum = ObjectId::from_raw(ObjectFormat::Sha1, &bytes[checksum_offset..])?;
+        let actual_checksum = git_core::digest_bytes(format, &bytes[..checksum_offset])?;
+        let checksum = ObjectId::from_raw(format, &bytes[checksum_offset..])?;
         if actual_checksum != checksum {
             return Err(GitError::InvalidFormat(format!(
                 "index checksum mismatch: expected {checksum}, got {actual_checksum}"
@@ -1713,13 +2348,16 @@ impl Index {
         let mut offset = 12;
         let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
-            if checksum_offset.saturating_sub(offset) < 62 {
+            let entry_header_len = 40 + hash_len + 2;
+            if checksum_offset.saturating_sub(offset) < entry_header_len {
                 return Err(GitError::InvalidFormat("truncated index entry".into()));
             }
             let start = offset;
-            let oid = ObjectId::from_raw(ObjectFormat::Sha1, &bytes[offset + 40..offset + 60])?;
-            let flags = u16_be(&bytes[offset + 60..offset + 62]);
-            offset += 62;
+            let oid_start = offset + 40;
+            let oid_end = oid_start + hash_len;
+            let oid = ObjectId::from_raw(format, &bytes[oid_start..oid_end])?;
+            let flags = u16_be(&bytes[oid_end..oid_end + 2]);
+            offset = oid_end + 2;
             let flags_extended = if flags & INDEX_FLAG_EXTENDED != 0 {
                 if checksum_offset.saturating_sub(offset) < 2 {
                     return Err(GitError::InvalidFormat(
@@ -1798,6 +2436,10 @@ impl Index {
         })
     }
 
+    pub fn parse_v2_sha1(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes, ObjectFormat::Sha1)
+    }
+
     pub fn write_v2_sha1(&self) -> Result<Vec<u8>> {
         if self.version != 2 {
             return Err(GitError::Unsupported(
@@ -1817,6 +2459,10 @@ impl Index {
     }
 
     pub fn write_sha1(&self) -> Result<Vec<u8>> {
+        self.write(ObjectFormat::Sha1)
+    }
+
+    pub fn write(&self, format: ObjectFormat) -> Result<Vec<u8>> {
         if !(2..=4).contains(&self.version) {
             return Err(GitError::Unsupported(
                 "canonical writer currently emits index v2/v3/v4".into(),
@@ -1839,10 +2485,11 @@ impl Index {
             out.extend_from_slice(&entry.uid.to_be_bytes());
             out.extend_from_slice(&entry.gid.to_be_bytes());
             out.extend_from_slice(&entry.size.to_be_bytes());
-            if entry.oid.format() != ObjectFormat::Sha1 {
-                return Err(GitError::Unsupported(
-                    "index v2 writer expects sha1 ids".into(),
-                ));
+            if entry.oid.format() != format {
+                return Err(GitError::Unsupported(format!(
+                    "index writer expects {} ids",
+                    format.name()
+                )));
             }
             out.extend_from_slice(entry.oid.as_bytes());
             let has_extended_flags =
@@ -1877,7 +2524,7 @@ impl Index {
             }
         }
         out.extend_from_slice(&self.extensions);
-        let checksum = git_core::digest_bytes(ObjectFormat::Sha1, &out)?;
+        let checksum = git_core::digest_bytes(format, &out)?;
         out.extend_from_slice(checksum.as_bytes());
         Ok(out)
     }
@@ -1960,6 +2607,9 @@ fn hash_function_id(format: ObjectFormat) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn framed_object_round_trips() {
@@ -1985,6 +2635,142 @@ mod tests {
             Tree::parse(ObjectFormat::Sha1, &tree.write()).unwrap(),
             tree
         );
+    }
+
+    #[test]
+    fn reftable_empty_table_round_trips() {
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 1, 1, &[]).unwrap();
+        let table = Reftable::parse(&bytes).unwrap();
+
+        assert_eq!(table.header.version, ReftableVersion::V1);
+        assert_eq!(table.header.object_format, ObjectFormat::Sha1);
+        assert_eq!(table.refs, Vec::new());
+    }
+
+    #[test]
+    fn reftable_ref_only_table_round_trips_refs() {
+        let head = oid("1111111111111111111111111111111111111111");
+        let tag = oid("2222222222222222222222222222222222222222");
+        let peeled = oid("3333333333333333333333333333333333333333");
+        let refs = vec![
+            ReftableRefRecord {
+                name: "refs/tags/v1".into(),
+                update_index: 7,
+                value: ReftableRefValue::Peeled {
+                    target: tag.clone(),
+                    peeled: peeled.clone(),
+                },
+            },
+            ReftableRefRecord {
+                name: "HEAD".into(),
+                update_index: 7,
+                value: ReftableRefValue::Symbolic("refs/heads/main".into()),
+            },
+            ReftableRefRecord {
+                name: "refs/heads/main".into(),
+                update_index: 7,
+                value: ReftableRefValue::Direct(head.clone()),
+            },
+        ];
+
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 7, 7, &refs).unwrap();
+        let table = Reftable::parse(&bytes).unwrap();
+
+        assert_eq!(table.header.min_update_index, 7);
+        assert_eq!(table.header.max_update_index, 7);
+        assert_eq!(
+            table.refs,
+            vec![
+                ReftableRefRecord {
+                    name: "HEAD".into(),
+                    update_index: 7,
+                    value: ReftableRefValue::Symbolic("refs/heads/main".into()),
+                },
+                ReftableRefRecord {
+                    name: "refs/heads/main".into(),
+                    update_index: 7,
+                    value: ReftableRefValue::Direct(head),
+                },
+                ReftableRefRecord {
+                    name: "refs/tags/v1".into(),
+                    update_index: 7,
+                    value: ReftableRefValue::Peeled {
+                        target: tag,
+                        peeled,
+                    },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn reftable_sha256_uses_version_2_hash_id() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha256,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let refs = vec![ReftableRefRecord {
+            name: "refs/heads/main".into(),
+            update_index: 3,
+            value: ReftableRefValue::Direct(oid.clone()),
+        }];
+
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha256, 3, 3, &refs).unwrap();
+        let table = Reftable::parse(&bytes).unwrap();
+
+        assert_eq!(table.header.version, ReftableVersion::V2);
+        assert_eq!(table.header.object_format, ObjectFormat::Sha256);
+        assert_eq!(table.refs[0].value, ReftableRefValue::Direct(oid));
+    }
+
+    #[test]
+    fn upstream_git_reads_rust_written_minimal_reftable() {
+        let root = unique_temp_dir("reftable-upstream");
+        fs::create_dir_all(&root).expect("create temp repo");
+        let result = (|| {
+            run_success("git", &root, &["init", "-q"]);
+            let oid = run_success_with_stdin(
+                "git",
+                &root,
+                &["hash-object", "-w", "--stdin"],
+                b"payload\n",
+            );
+            let oid = String::from_utf8(oid).expect("oid is utf8");
+            let oid = ObjectId::from_hex(ObjectFormat::Sha1, oid.trim()).unwrap();
+            let git_dir = root.join(".git");
+            fs::write(
+                git_dir.join("config"),
+                b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n",
+            )
+            .expect("write config");
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n").expect("write HEAD");
+            let reftable_dir = git_dir.join("reftable");
+            fs::create_dir_all(&reftable_dir).expect("create reftable dir");
+            let table_name = "000000000001-000000000001-rust.ref";
+            let table = Reftable::write_ref_only(
+                ObjectFormat::Sha1,
+                1,
+                1,
+                &[ReftableRefRecord {
+                    name: "refs/heads/main".into(),
+                    update_index: 1,
+                    value: ReftableRefValue::Direct(oid.clone()),
+                }],
+            )
+            .unwrap();
+            fs::write(reftable_dir.join(table_name), table).expect("write reftable");
+            fs::write(reftable_dir.join("tables.list"), format!("{table_name}\n"))
+                .expect("write tables.list");
+
+            let output = run_success("git", &root, &["show-ref"]);
+            assert_eq!(
+                String::from_utf8(output).expect("show-ref output is utf8"),
+                format!("{oid} refs/heads/main\n")
+            );
+        })();
+        let _ = fs::remove_dir_all(&root);
+        result
     }
 
     #[test]
@@ -2433,6 +3219,24 @@ mod tests {
     }
 
     #[test]
+    fn standalone_bundle_parse_uses_sha1_default_and_header_object_format_override() {
+        let sha1 = git_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n").unwrap();
+        let sha256 = git_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n").unwrap();
+
+        let sha1_bytes = format!("# v2 git bundle\n{sha1} refs/heads/main\n\nPACK").into_bytes();
+        let sha1_bundle = Bundle::parse_standalone(&sha1_bytes).unwrap();
+        assert_eq!(sha1_bundle.format, ObjectFormat::Sha1);
+        assert_eq!(sha1_bundle.references[0].oid, sha1);
+
+        let sha256_bytes =
+            format!("# v3 git bundle\n@object-format=sha256\n{sha256} refs/heads/main\n\nPACK")
+                .into_bytes();
+        let sha256_bundle = Bundle::parse_standalone(&sha256_bytes).unwrap();
+        assert_eq!(sha256_bundle.format, ObjectFormat::Sha256);
+        assert_eq!(sha256_bundle.references[0].oid, sha256);
+    }
+
+    #[test]
     fn writes_bundle_v2_header_and_pack() {
         let prerequisite =
             git_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"base\n").unwrap();
@@ -2656,6 +3460,39 @@ mod tests {
     }
 
     #[test]
+    fn index_v2_round_trips_sha256_entry() {
+        let index = Index {
+            version: 2,
+            entries: vec![IndexEntry {
+                ctime_seconds: 1,
+                ctime_nanoseconds: 2,
+                mtime_seconds: 3,
+                mtime_nanoseconds: 4,
+                dev: 5,
+                ino: 6,
+                mode: 0o100644,
+                uid: 7,
+                gid: 8,
+                size: 6,
+                oid: git_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello\n")
+                    .unwrap(),
+                flags: 5,
+                flags_extended: 0,
+                path: b"a.txt".to_vec(),
+            }],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let bytes = index.write(ObjectFormat::Sha256).unwrap();
+        let parsed = Index::parse(&bytes, ObjectFormat::Sha256).unwrap();
+        assert_eq!(parsed.version, index.version);
+        assert_eq!(parsed.entries, index.entries);
+        assert_eq!(parsed.extensions, index.extensions);
+        assert!(parsed.checksum.is_some());
+        assert!(Index::parse_v2_sha1(&bytes).is_err());
+    }
+
+    #[test]
     fn index_v4_round_trips_prefix_compressed_paths() {
         let long_path = vec![b'a'; 140];
         let index = Index {
@@ -2730,6 +3567,58 @@ mod tests {
 
     fn oid(hex: &str) -> ObjectId {
         ObjectId::from_hex(ObjectFormat::Sha1, hex).unwrap()
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("git-rs-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
+        let output = Command::new(program)
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    fn run_success_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
+        let mut child = Command::new(program)
+            .current_dir(cwd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|err| panic!("failed to spawn {program} {args:?}: {err}"));
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin is piped")
+            .write_all(stdin)
+            .expect("write stdin");
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"));
+        assert!(
+            output.status.success(),
+            "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
     }
 
     fn commit_graph(

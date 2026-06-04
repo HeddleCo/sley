@@ -239,6 +239,53 @@ fn diff_name_only_matches_upstream_git() {
 }
 
 #[test]
+fn diff_sha256_name_status_matches_upstream_git() {
+    let root = unique_temp_dir("diff-sha256-name-status");
+    fs::create_dir_all(&root).expect("create temp repo");
+    let result = (|| {
+        git(&root, &["init", "-q", "--object-format=sha256"]);
+        fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
+        fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
+        git(&root, &["add", "delete.txt", "modify.txt"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+
+        fs::remove_file(root.join("delete.txt")).expect("remove delete fixture");
+        fs::write(root.join("modify.txt"), b"after\n").expect("modify fixture");
+        fs::write(root.join("new.txt"), b"new\n").expect("write new fixture");
+        git(&root, &["add", "new.txt"]);
+
+        for args in [
+            vec!["diff", "--name-status"],
+            vec!["diff", "--name-only"],
+            vec!["diff", "--name-status", "HEAD"],
+            vec!["diff", "--name-only", "HEAD"],
+            vec!["diff", "--cached", "--name-status"],
+            vec!["diff", "--cached", "--name-only"],
+            vec!["diff", "--cached", "--name-status", "HEAD"],
+            vec!["diff", "--cached", "--name-only", "HEAD"],
+        ] {
+            let expected = git(&root, &args);
+            let actual = git_rs(&root, &args);
+            assert_eq!(actual, expected, "git-rs output differed for {args:?}");
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn diff_quoted_paths_match_upstream_git() {
     for (case, path) in [
         ("space", "space name.txt"),

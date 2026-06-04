@@ -206,6 +206,50 @@ fn hash_object_multiple_inputs_match_upstream_git() {
 }
 
 #[test]
+fn hash_object_sha256_repo_default_matches_upstream_git() {
+    let root = unique_temp_dir("hash-object-sha256-default");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    let result = (|| {
+        run("git", &expected, &["init", "-q", "--object-format=sha256"]);
+        run("git", &actual, &["init", "-q", "--object-format=sha256"]);
+        for repo in [&expected, &actual] {
+            fs::write(repo.join("one.txt"), b"one\n").expect("write one");
+            fs::write(repo.join("two.txt"), b"two\n").expect("write two");
+            fs::write(repo.join("paths.txt"), b"one.txt\ntwo.txt\n").expect("write path list");
+        }
+
+        for (args, stdin) in [
+            (vec!["hash-object", "--stdin"], b"stdin\n".as_slice()),
+            (vec!["hash-object", "one.txt"], b"".as_slice()),
+            (
+                vec!["hash-object", "--stdin", "one.txt"],
+                b"stdin\n".as_slice(),
+            ),
+            (
+                vec!["hash-object", "--stdin-paths"],
+                b"one.txt\ntwo.txt\n".as_slice(),
+            ),
+        ] {
+            let expected_output = run_output_with_stdin("git", &expected, &args, stdin);
+            let actual_output =
+                run_output_with_stdin(env!("CARGO_BIN_EXE_git-rs"), &actual, &args, stdin);
+            assert_same_output(actual_output, expected_output, &args);
+            assert!(
+                String::from_utf8_lossy(&git_rs(&actual, &args, stdin))
+                    .lines()
+                    .all(|line| line.len() == 64),
+                "expected SHA-256 object ids for {args:?}"
+            );
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn hash_object_filter_path_and_option_errors_match_upstream_git() {
     let root = unique_temp_dir("hash-object-filter-path");
     fs::create_dir_all(&root).expect("create temp repo");

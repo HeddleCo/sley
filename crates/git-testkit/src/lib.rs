@@ -106,6 +106,7 @@ pub struct ThinPackReadParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefInteropParity {
+    pub format: ObjectFormat,
     pub name: String,
     pub oid: String,
     pub upstream_show_ref: String,
@@ -113,6 +114,7 @@ pub struct RefInteropParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeeledPackedRefInteropParity {
+    pub format: ObjectFormat,
     pub name: String,
     pub tag_oid: String,
     pub peeled_oid: String,
@@ -121,6 +123,7 @@ pub struct PeeledPackedRefInteropParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowRefFilterParity {
+    pub format: ObjectFormat,
     pub heads_upstream: String,
     pub heads_rust: String,
     pub tags_upstream: String,
@@ -143,6 +146,7 @@ pub struct ShowRefFilterParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShowRefVerifyParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub hash_upstream: String,
@@ -155,6 +159,7 @@ pub struct ShowRefVerifyParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolicRefParity {
+    pub format: ObjectFormat,
     pub head_upstream: String,
     pub head_rust: String,
     pub short_upstream: String,
@@ -213,6 +218,7 @@ pub struct ConfigInteropParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsTreeParity {
+    pub format: ObjectFormat,
     pub tree_oid: String,
     pub upstream: String,
     pub rust: String,
@@ -250,6 +256,7 @@ pub struct LsTreeParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogParity {
+    pub format: ObjectFormat,
     pub commit_oid: String,
     pub upstream: String,
     pub rust: String,
@@ -257,6 +264,7 @@ pub struct LogParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatFileRevisionParity {
+    pub format: ObjectFormat,
     pub revs: Vec<String>,
     pub upstream: Vec<Vec<u8>>,
     pub rust: Vec<Vec<u8>>,
@@ -264,18 +272,21 @@ pub struct CatFileRevisionParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexParity {
+    pub format: ObjectFormat,
     pub entries: usize,
     pub byte_len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateIndexParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub expected: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LsFilesStageParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub upstream_z: Vec<u8>,
@@ -326,6 +337,7 @@ pub struct LsFilesStageParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateRefDeleteParity {
+    pub format: ObjectFormat,
     pub before: String,
     pub after: String,
     pub deleted_oid: String,
@@ -333,6 +345,7 @@ pub struct UpdateRefDeleteParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReflogExpireParity {
+    pub format: ObjectFormat,
     pub before: String,
     pub after: String,
     pub removed: usize,
@@ -340,12 +353,14 @@ pub struct ReflogExpireParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriteTreeParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitTreeParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub body: Vec<u8>,
@@ -353,6 +368,7 @@ pub struct CommitTreeParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitIndexParity {
+    pub format: ObjectFormat,
     pub head: String,
     pub updated_ref: String,
     pub log: String,
@@ -360,6 +376,7 @@ pub struct CommitIndexParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddStatusParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub porcelain_upstream: String,
@@ -374,6 +391,7 @@ pub struct AddStatusParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub expected: String,
     pub points_at_upstream: String,
@@ -388,12 +406,14 @@ pub struct BranchParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchShowCurrentParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchDeleteParity {
+    pub format: ObjectFormat,
     pub before: String,
     pub after: String,
     pub deleted_oid: String,
@@ -401,6 +421,7 @@ pub struct BranchDeleteParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckoutParity {
+    pub format: ObjectFormat,
     pub branch: String,
     pub head: String,
     pub body: Vec<u8>,
@@ -409,6 +430,7 @@ pub struct CheckoutParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub expected: String,
     pub show_ref: String,
@@ -416,6 +438,7 @@ pub struct TagParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagDeleteParity {
+    pub format: ObjectFormat,
     pub before: String,
     pub after: String,
     pub deleted_oid: String,
@@ -423,6 +446,7 @@ pub struct TagDeleteParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnnotatedTagParity {
+    pub format: ObjectFormat,
     pub tag_oid: String,
     pub target_oid: String,
     pub upstream_type: String,
@@ -433,6 +457,7 @@ pub struct AnnotatedTagParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffNameStatusParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub name_only_upstream: String,
@@ -449,6 +474,7 @@ pub struct DiffNameStatusParity {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevParseParity {
+    pub format: ObjectFormat,
     pub upstream: String,
     pub rust: String,
     pub short_upstream: String,
@@ -712,10 +738,17 @@ fn repeated_blob_body(common_line: &str, final_line: &str) -> Vec<u8> {
 }
 
 pub fn thin_pack_read_parity() -> Result<ThinPackReadParity> {
+    thin_pack_read_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn thin_pack_read_parity_sha256() -> Result<ThinPackReadParity> {
+    thin_pack_read_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn thin_pack_read_parity_for_format(format: ObjectFormat) -> Result<ThinPackReadParity> {
     let root = unique_temp_dir("git-rs-pack-thin");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<ThinPackReadParity> {
-        let format = ObjectFormat::Sha1;
         init_repo_for_format(&root, format)?;
         let base_body = repeated_blob_body("common payload\n", "base payload\n");
         let changed_body = repeated_blob_body("common payload\n", "changed payload\n");
@@ -811,10 +844,18 @@ pub fn thin_pack_read_parity() -> Result<ThinPackReadParity> {
 }
 
 pub fn loose_ref_interop_parity() -> Result<RefInteropParity> {
+    loose_ref_interop_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn loose_ref_interop_parity_sha256() -> Result<RefInteropParity> {
+    loose_ref_interop_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn loose_ref_interop_parity_for_format(format: ObjectFormat) -> Result<RefInteropParity> {
     let root = unique_temp_dir("git-rs-ref-interop");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RefInteropParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_for_format(&root, format)?;
         let oid = String::from_utf8_lossy(&run_git(
             &root,
             ["hash-object", "-w", "--stdin"],
@@ -822,16 +863,16 @@ pub fn loose_ref_interop_parity() -> Result<RefInteropParity> {
         )?)
         .trim()
         .to_string();
-        let oid = ObjectId::from_hex(ObjectFormat::Sha1, &oid)?;
+        let oid = ObjectId::from_hex(format, &oid)?;
         let name = "refs/heads/git-rs-ref-interop";
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: name.into(),
             expected: None,
             new: RefTarget::Direct(oid.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: ObjectId::from_raw(ObjectFormat::Sha1, &[0; 20])?,
+                old_oid: zero_oid(format)?,
                 new_oid: oid.clone(),
                 committer: b"Git Rs <git-rs@example.invalid> 0 +0000".to_vec(),
                 message: b"interop".to_vec(),
@@ -847,6 +888,7 @@ pub fn loose_ref_interop_parity() -> Result<RefInteropParity> {
             )));
         }
         Ok(RefInteropParity {
+            format,
             name: name.into(),
             oid: oid.to_hex(),
             upstream_show_ref: upstream,
@@ -857,10 +899,18 @@ pub fn loose_ref_interop_parity() -> Result<RefInteropParity> {
 }
 
 pub fn packed_ref_interop_parity() -> Result<RefInteropParity> {
+    packed_ref_interop_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn packed_ref_interop_parity_sha256() -> Result<RefInteropParity> {
+    packed_ref_interop_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn packed_ref_interop_parity_for_format(format: ObjectFormat) -> Result<RefInteropParity> {
     let root = unique_temp_dir("git-rs-packed-ref-interop");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RefInteropParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_for_format(&root, format)?;
         let oid = String::from_utf8_lossy(&run_git(
             &root,
             ["hash-object", "-w", "--stdin"],
@@ -868,9 +918,9 @@ pub fn packed_ref_interop_parity() -> Result<RefInteropParity> {
         )?)
         .trim()
         .to_string();
-        let oid = ObjectId::from_hex(ObjectFormat::Sha1, &oid)?;
+        let oid = ObjectId::from_hex(format, &oid)?;
         let name = "refs/heads/git-rs-packed-ref-interop";
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.write_packed_refs(&[PackedRef {
             reference: Ref {
                 name: name.into(),
@@ -887,6 +937,7 @@ pub fn packed_ref_interop_parity() -> Result<RefInteropParity> {
             )));
         }
         Ok(RefInteropParity {
+            format,
             name: name.into(),
             oid: oid.to_hex(),
             upstream_show_ref: upstream,
@@ -897,10 +948,20 @@ pub fn packed_ref_interop_parity() -> Result<RefInteropParity> {
 }
 
 pub fn packed_ref_compaction_interop_parity() -> Result<RefInteropParity> {
+    packed_ref_compaction_interop_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn packed_ref_compaction_interop_parity_sha256() -> Result<RefInteropParity> {
+    packed_ref_compaction_interop_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn packed_ref_compaction_interop_parity_for_format(
+    format: ObjectFormat,
+) -> Result<RefInteropParity> {
     let root = unique_temp_dir("git-rs-packed-ref-compaction");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RefInteropParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_for_format(&root, format)?;
         let oid = String::from_utf8_lossy(&run_git(
             &root,
             ["hash-object", "-w", "--stdin"],
@@ -908,9 +969,9 @@ pub fn packed_ref_compaction_interop_parity() -> Result<RefInteropParity> {
         )?)
         .trim()
         .to_string();
-        let oid = ObjectId::from_hex(ObjectFormat::Sha1, &oid)?;
+        let oid = ObjectId::from_hex(format, &oid)?;
         let name = "refs/heads/git-rs-packed-ref-compaction";
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: name.into(),
@@ -939,6 +1000,7 @@ pub fn packed_ref_compaction_interop_parity() -> Result<RefInteropParity> {
             )));
         }
         Ok(RefInteropParity {
+            format,
             name: name.into(),
             oid: oid.to_hex(),
             upstream_show_ref: upstream,
@@ -949,15 +1011,26 @@ pub fn packed_ref_compaction_interop_parity() -> Result<RefInteropParity> {
 }
 
 pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefInteropParity> {
+    peeled_packed_ref_compaction_interop_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn peeled_packed_ref_compaction_interop_parity_sha256() -> Result<PeeledPackedRefInteropParity>
+{
+    peeled_packed_ref_compaction_interop_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn peeled_packed_ref_compaction_interop_parity_for_format(
+    format: ObjectFormat,
+) -> Result<PeeledPackedRefInteropParity> {
     let root = unique_temp_dir("git-rs-peeled-packed-ref-compaction");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<PeeledPackedRefInteropParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_for_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -967,7 +1040,7 @@ pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefIn
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -975,7 +1048,7 @@ pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefIn
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let tag_oid = git_sequencer::create_annotated_tag(
             &mut db,
             git_sequencer::TagCreate {
@@ -987,10 +1060,9 @@ pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefIn
             },
         )?;
         let name = "refs/tags/v-peel";
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_tag("v-peel", tag_oid.clone())?;
-        let packed =
-            git_rev::pack_refs_with_auto_peel(root.join(".git"), ObjectFormat::Sha1, true)?;
+        let packed = git_rev::pack_refs_with_auto_peel(root.join(".git"), format, true)?;
         let Some(packed_tag) = packed.iter().find(|packed| packed.reference.name == name) else {
             return Err(GitError::InvalidFormat(
                 "packed refs did not include annotated tag".into(),
@@ -1013,6 +1085,7 @@ pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefIn
             )));
         }
         Ok(PeeledPackedRefInteropParity {
+            format,
             name: name.into(),
             tag_oid: tag_oid.to_hex(),
             peeled_oid: peeled_oid.to_hex(),
@@ -1024,11 +1097,19 @@ pub fn peeled_packed_ref_compaction_interop_parity() -> Result<PeeledPackedRefIn
 }
 
 pub fn symbolic_ref_parity() -> Result<SymbolicRefParity> {
+    symbolic_ref_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn symbolic_ref_parity_sha256() -> Result<SymbolicRefParity> {
+    symbolic_ref_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn symbolic_ref_parity_for_format(format: ObjectFormat) -> Result<SymbolicRefParity> {
     let root = unique_temp_dir("git-rs-symbolic-ref");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<SymbolicRefParity> {
-        run_git(&root, ["init", "-q"], &[])?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        init_repo_with_format(&root, format)?;
+        let store = FileRefStore::new(root.join(".git"), format);
         let head_upstream =
             String::from_utf8_lossy(&run_git(&root, ["symbolic-ref", "HEAD"], &[])?).to_string();
         let short_upstream =
@@ -1072,6 +1153,7 @@ pub fn symbolic_ref_parity() -> Result<SymbolicRefParity> {
             )));
         }
         Ok(SymbolicRefParity {
+            format,
             head_upstream,
             head_rust,
             short_upstream,
@@ -1085,15 +1167,23 @@ pub fn symbolic_ref_parity() -> Result<SymbolicRefParity> {
 }
 
 pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
+    show_ref_filter_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn show_ref_filter_parity_sha256() -> Result<ShowRefFilterParity> {
+    show_ref_filter_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn show_ref_filter_parity_for_format(format: ObjectFormat) -> Result<ShowRefFilterParity> {
     let root = unique_temp_dir("git-rs-show-ref-filter");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<ShowRefFilterParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -1103,7 +1193,7 @@ pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -1111,14 +1201,14 @@ pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
             commit.oid.clone(),
             identity.clone(),
             b"branch: Created from main".to_vec(),
         )?;
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let tag_oid = git_sequencer::create_annotated_tag(
             &mut db,
             git_sequencer::TagCreate {
@@ -1171,11 +1261,11 @@ pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
         let tags_hash_abbrev_rust =
             format_show_refs_with_options(&refs, "refs/tags/", true, Some(8));
         let tags_deref_rust =
-            format_show_refs_deref(&db, ObjectFormat::Sha1, &refs, "refs/tags/", false, None)?;
+            format_show_refs_deref(&db, format, &refs, "refs/tags/", false, None)?;
         let tags_deref_hash_rust =
-            format_show_refs_deref(&db, ObjectFormat::Sha1, &refs, "refs/tags/", true, None)?;
+            format_show_refs_deref(&db, format, &refs, "refs/tags/", true, None)?;
         let tags_deref_abbrev_rust =
-            format_show_refs_deref(&db, ObjectFormat::Sha1, &refs, "refs/tags/", false, Some(8))?;
+            format_show_refs_deref(&db, format, &refs, "refs/tags/", false, Some(8))?;
         if heads_rust != heads_upstream
             || tags_rust != tags_upstream
             || heads_hash_rust != heads_hash_upstream
@@ -1191,6 +1281,7 @@ pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
             )));
         }
         Ok(ShowRefFilterParity {
+            format,
             heads_upstream,
             heads_rust,
             tags_upstream,
@@ -1216,15 +1307,23 @@ pub fn show_ref_filter_parity() -> Result<ShowRefFilterParity> {
 }
 
 pub fn show_ref_verify_parity() -> Result<ShowRefVerifyParity> {
+    show_ref_verify_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn show_ref_verify_parity_sha256() -> Result<ShowRefVerifyParity> {
+    show_ref_verify_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn show_ref_verify_parity_for_format(format: ObjectFormat) -> Result<ShowRefVerifyParity> {
     let root = unique_temp_dir("git-rs-show-ref-verify");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<ShowRefVerifyParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -1234,7 +1333,7 @@ pub fn show_ref_verify_parity() -> Result<ShowRefVerifyParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -1242,8 +1341,8 @@ pub fn show_ref_verify_parity() -> Result<ShowRefVerifyParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let tag_oid = git_sequencer::create_annotated_tag(
             &mut db,
             git_sequencer::TagCreate {
@@ -1316,6 +1415,7 @@ pub fn show_ref_verify_parity() -> Result<ShowRefVerifyParity> {
             )));
         }
         Ok(ShowRefVerifyParity {
+            format,
             upstream,
             rust,
             hash_upstream,
@@ -1811,10 +1911,18 @@ pub fn repository_config_interop_parity() -> Result<ConfigInteropParity> {
 }
 
 pub fn ls_tree_parity() -> Result<LsTreeParity> {
+    ls_tree_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn ls_tree_parity_sha256() -> Result<LsTreeParity> {
+    ls_tree_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn ls_tree_parity_for_format(format: ObjectFormat) -> Result<LsTreeParity> {
     let root = unique_temp_dir("git-rs-ls-tree");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<LsTreeParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         run_git(&root, ["config", "user.name", "Example User"], &[])?;
         run_git(
             &root,
@@ -1853,7 +1961,7 @@ pub fn ls_tree_parity() -> Result<LsTreeParity> {
             ],
             &[],
         )?;
-        let db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let revs = [tree_oid.as_str(), "HEAD", "refs/tags/v1.0"];
         let mut upstream = String::new();
         let mut rust = String::new();
@@ -1964,67 +2072,84 @@ pub fn ls_tree_parity() -> Result<LsTreeParity> {
                 ["ls-tree", "-r", "--name-only", "-z", rev],
                 &[],
             )?);
-            let oid = git_rev::resolve_revision(root.join(".git"), ObjectFormat::Sha1, rev)?;
-            let tree_oid = git_rev::peel_to_tree(&db, ObjectFormat::Sha1, &oid)?;
+            let oid = git_rev::resolve_revision(root.join(".git"), format, rev)?;
+            let tree_oid = git_rev::peel_to_tree(&db, format, &oid)?;
             let tree_object = db.read_object(&tree_oid)?;
             if tree_object.object_type != ObjectType::Tree {
                 return Err(GitError::InvalidObject(
                     "tree-ish did not produce a tree".into(),
                 ));
             }
-            rust.push_str(&format_tree_entries(&tree_object.body)?);
-            name_only_rust.push_str(&format_tree_names(&tree_object.body)?);
+            rust.push_str(&format_tree_entries(format, &tree_object.body)?);
+            name_only_rust.push_str(&format_tree_names(format, &tree_object.body)?);
             object_only_rust.push_str(&String::from_utf8_lossy(&format_tree_object_ids(
+                format,
                 &tree_object.body,
                 b'\n',
             )?));
             long_rust.push_str(&String::from_utf8_lossy(&format_tree_entries_long(
                 &db,
+                format,
                 &tree_object.body,
                 b'\n',
             )?));
             recursive_rust.push_str(&format_tree_entries_recursive(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 false,
             )?);
             recursive_object_only_rust.push_str(&String::from_utf8_lossy(
-                &format_tree_object_ids_recursive(&db, &tree_object.body, "", b'\n')?,
+                &format_tree_object_ids_recursive(&db, format, &tree_object.body, "", b'\n')?,
             ));
             recursive_long_rust.push_str(&String::from_utf8_lossy(
-                &format_tree_entries_recursive_long(&db, &tree_object.body, "", b'\n')?,
+                &format_tree_entries_recursive_long(&db, format, &tree_object.body, "", b'\n')?,
             ));
             recursive_name_only_rust.push_str(&format_tree_entries_recursive(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 true,
             )?);
-            z_rust.extend_from_slice(&format_tree_entries_z(&tree_object.body)?);
-            name_only_z_rust.extend_from_slice(&format_tree_names_z(&tree_object.body)?);
-            object_only_z_rust.extend_from_slice(&format_tree_object_ids(&tree_object.body, 0)?);
-            long_z_rust.extend_from_slice(&format_tree_entries_long(&db, &tree_object.body, 0)?);
+            z_rust.extend_from_slice(&format_tree_entries_z(format, &tree_object.body)?);
+            name_only_z_rust.extend_from_slice(&format_tree_names_z(format, &tree_object.body)?);
+            object_only_z_rust.extend_from_slice(&format_tree_object_ids(
+                format,
+                &tree_object.body,
+                0,
+            )?);
+            long_z_rust.extend_from_slice(&format_tree_entries_long(
+                &db,
+                format,
+                &tree_object.body,
+                0,
+            )?);
             recursive_z_rust.extend_from_slice(&format_tree_entries_recursive_z(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 false,
             )?);
             recursive_object_only_z_rust.extend_from_slice(&format_tree_object_ids_recursive(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 0,
             )?);
             recursive_long_z_rust.extend_from_slice(&format_tree_entries_recursive_long(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 0,
             )?);
             recursive_name_only_z_rust.extend_from_slice(&format_tree_entries_recursive_z(
                 &db,
+                format,
                 &tree_object.body,
                 "",
                 true,
@@ -2052,6 +2177,7 @@ pub fn ls_tree_parity() -> Result<LsTreeParity> {
             )));
         }
         Ok(LsTreeParity {
+            format,
             tree_oid,
             upstream,
             rust,
@@ -2091,8 +2217,8 @@ pub fn ls_tree_parity() -> Result<LsTreeParity> {
     result
 }
 
-fn format_tree_entries(body: &[u8]) -> Result<String> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+fn format_tree_entries(format: ObjectFormat, body: &[u8]) -> Result<String> {
+    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
     for entry in tree.entries {
         out.push_str(&format!(
@@ -2106,8 +2232,8 @@ fn format_tree_entries(body: &[u8]) -> Result<String> {
     Ok(out)
 }
 
-fn format_tree_names(body: &[u8]) -> Result<String> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+fn format_tree_names(format: ObjectFormat, body: &[u8]) -> Result<String> {
+    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
     for entry in tree.entries {
         out.push_str(&format!("{}\n", String::from_utf8_lossy(&entry.name)));
@@ -2115,8 +2241,8 @@ fn format_tree_names(body: &[u8]) -> Result<String> {
     Ok(out)
 }
 
-fn format_tree_entries_z(body: &[u8]) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+fn format_tree_entries_z(format: ObjectFormat, body: &[u8]) -> Result<Vec<u8>> {
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         write!(
@@ -2132,8 +2258,8 @@ fn format_tree_entries_z(body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn format_tree_names_z(body: &[u8]) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+fn format_tree_names_z(format: ObjectFormat, body: &[u8]) -> Result<Vec<u8>> {
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         out.extend_from_slice(&entry.name);
@@ -2142,8 +2268,8 @@ fn format_tree_names_z(body: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn format_tree_object_ids(body: &[u8], terminator: u8) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+fn format_tree_object_ids(format: ObjectFormat, body: &[u8], terminator: u8) -> Result<Vec<u8>> {
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         write!(out, "{}", entry.oid)?;
@@ -2154,10 +2280,11 @@ fn format_tree_object_ids(body: &[u8], terminator: u8) -> Result<Vec<u8>> {
 
 fn format_tree_entries_long(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     body: &[u8],
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         let object_type = tree_entry_object_type(entry.mode);
@@ -2188,11 +2315,12 @@ fn tree_entry_size_field(
 
 fn format_tree_entries_recursive(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     body: &[u8],
     prefix: &str,
     name_only: bool,
 ) -> Result<String> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
     for entry in tree.entries {
         let name = String::from_utf8_lossy(&entry.name);
@@ -2206,6 +2334,7 @@ fn format_tree_entries_recursive(
             }
             out.push_str(&format_tree_entries_recursive(
                 db,
+                format,
                 &object.body,
                 &format!("{path}/"),
                 name_only,
@@ -2227,11 +2356,12 @@ fn format_tree_entries_recursive(
 
 fn format_tree_entries_recursive_long(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     body: &[u8],
     prefix: &str,
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         let name = String::from_utf8_lossy(&entry.name);
@@ -2245,6 +2375,7 @@ fn format_tree_entries_recursive_long(
             }
             out.extend_from_slice(&format_tree_entries_recursive_long(
                 db,
+                format,
                 &object.body,
                 &format!("{path}/"),
                 terminator,
@@ -2268,11 +2399,12 @@ fn format_tree_entries_recursive_long(
 
 fn format_tree_object_ids_recursive(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     body: &[u8],
     prefix: &str,
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         if entry.mode == 0o040000 {
@@ -2285,6 +2417,7 @@ fn format_tree_object_ids_recursive(
             let name = String::from_utf8_lossy(&entry.name);
             out.extend_from_slice(&format_tree_object_ids_recursive(
                 db,
+                format,
                 &object.body,
                 &format!("{prefix}{name}/"),
                 terminator,
@@ -2299,11 +2432,12 @@ fn format_tree_object_ids_recursive(
 
 fn format_tree_entries_recursive_z(
     db: &FileObjectDatabase,
+    format: ObjectFormat,
     body: &[u8],
     prefix: &str,
     name_only: bool,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(ObjectFormat::Sha1, body)?;
+    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
     for entry in tree.entries {
         let name = String::from_utf8_lossy(&entry.name);
@@ -2317,6 +2451,7 @@ fn format_tree_entries_recursive_z(
             }
             out.extend_from_slice(&format_tree_entries_recursive_z(
                 db,
+                format,
                 &object.body,
                 &format!("{path}/"),
                 name_only,
@@ -2340,10 +2475,18 @@ fn format_tree_entries_recursive_z(
 }
 
 pub fn log_parity() -> Result<LogParity> {
+    log_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn log_parity_sha256() -> Result<LogParity> {
+    log_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn log_parity_for_format(format: ObjectFormat) -> Result<LogParity> {
     let root = unique_temp_dir("git-rs-log");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<LogParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         run_git(&root, ["config", "user.name", "Example User"], &[])?;
         run_git(
             &root,
@@ -2380,7 +2523,7 @@ pub fn log_parity() -> Result<LogParity> {
             ],
             &[],
         )?;
-        let db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let revs = ["HEAD", "refs/tags/v1.0"];
         let mut upstream = String::new();
         let mut rust = String::new();
@@ -2402,9 +2545,9 @@ pub fn log_parity() -> Result<LogParity> {
                 )?)
                 .trim_end_matches('\n'),
             );
-            let oid = git_rev::resolve_revision(root.join(".git"), ObjectFormat::Sha1, rev)?;
-            let commit = git_rev::peel_to_commit(&db, ObjectFormat::Sha1, &oid)?;
-            rust.push_str(&format_log_record(&db, &commit)?);
+            let oid = git_rev::resolve_revision(root.join(".git"), format, rev)?;
+            let commit = git_rev::peel_to_commit(&db, format, &oid)?;
+            rust.push_str(&format_log_record(&db, format, &commit)?);
         }
         if rust != upstream {
             return Err(GitError::Command(format!(
@@ -2412,6 +2555,7 @@ pub fn log_parity() -> Result<LogParity> {
             )));
         }
         Ok(LogParity {
+            format,
             commit_oid,
             upstream,
             rust,
@@ -2421,8 +2565,12 @@ pub fn log_parity() -> Result<LogParity> {
     result
 }
 
-fn format_log_record(reader: &impl ObjectReader, oid: &ObjectId) -> Result<String> {
-    let records = git_rev::walk_commits(reader, ObjectFormat::Sha1, [oid.clone()])?;
+fn format_log_record(
+    reader: &impl ObjectReader,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<String> {
+    let records = git_rev::walk_commits(reader, format, [oid.clone()])?;
     let record = records
         .first()
         .ok_or_else(|| GitError::NotFound("commit record".into()))?;
@@ -2444,15 +2592,23 @@ fn format_log_record(reader: &impl ObjectReader, oid: &ObjectId) -> Result<Strin
 }
 
 pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
+    cat_file_revision_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn cat_file_revision_parity_sha256() -> Result<CatFileRevisionParity> {
+    cat_file_revision_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn cat_file_revision_parity_for_format(format: ObjectFormat) -> Result<CatFileRevisionParity> {
     let root = unique_temp_dir("git-rs-cat-file-rev");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<CatFileRevisionParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -2462,7 +2618,7 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -2470,7 +2626,7 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let tag_oid = git_sequencer::create_annotated_tag(
             &mut db,
             git_sequencer::TagCreate {
@@ -2481,7 +2637,7 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
                 message: b"release v2\n".to_vec(),
             },
         )?;
-        FileRefStore::new(root.join(".git"), ObjectFormat::Sha1).create_tag("v2.0", tag_oid)?;
+        FileRefStore::new(root.join(".git"), format).create_tag("v2.0", tag_oid)?;
 
         let revs = vec![
             "HEAD".to_string(),
@@ -2493,7 +2649,7 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
         for rev in &revs {
             for mode in ["-e", "-t", "-s", "-p"] {
                 upstream.push(run_git(&root, ["cat-file", mode, rev.as_str()], &[])?);
-                rust.push(rust_cat_file(&root, mode, rev)?);
+                rust.push(rust_cat_file(&root, format, mode, rev)?);
             }
         }
         if rust != upstream {
@@ -2502,6 +2658,7 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
             ));
         }
         Ok(CatFileRevisionParity {
+            format,
             revs,
             upstream,
             rust,
@@ -2511,31 +2668,17 @@ pub fn cat_file_revision_parity() -> Result<CatFileRevisionParity> {
     result
 }
 
-fn rust_cat_file(root: &Path, mode: &str, rev: &str) -> Result<Vec<u8>> {
+fn rust_cat_file(root: &Path, format: ObjectFormat, mode: &str, rev: &str) -> Result<Vec<u8>> {
     let git_dir = root.join(".git");
-    let oid = git_rev::resolve_revision(&git_dir, ObjectFormat::Sha1, rev)?;
-    let db = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+    let oid = git_rev::resolve_revision(&git_dir, format, rev)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&oid)?;
     match mode {
         "-e" => Ok(Vec::new()),
         "-t" => Ok(format!("{}\n", object.object_type.as_str()).into_bytes()),
         "-s" => Ok(format!("{}\n", object.body.len()).into_bytes()),
         "-p" if object.object_type == ObjectType::Tree => {
-            let tree = Tree::parse(ObjectFormat::Sha1, &object.body)?;
-            let mut out = Vec::new();
-            for entry in tree.entries {
-                out.extend_from_slice(
-                    format!(
-                        "{:06o} {} {}\t{}\n",
-                        entry.mode,
-                        tree_entry_object_type(entry.mode).as_str(),
-                        entry.oid,
-                        String::from_utf8_lossy(&entry.name)
-                    )
-                    .as_bytes(),
-                );
-            }
-            Ok(out)
+            Ok(format_tree_entries(format, &object.body)?.into_bytes())
         }
         "-p" => Ok(object.body),
         _ => Err(GitError::Command(format!(
@@ -2545,21 +2688,30 @@ fn rust_cat_file(root: &Path, mode: &str, rev: &str) -> Result<Vec<u8>> {
 }
 
 pub fn index_round_trip_parity() -> Result<IndexParity> {
+    index_round_trip_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn index_round_trip_parity_sha256() -> Result<IndexParity> {
+    index_round_trip_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn index_round_trip_parity_for_format(format: ObjectFormat) -> Result<IndexParity> {
     let root = unique_temp_dir("git-rs-index");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<IndexParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         run_git(&root, ["add", "hello.txt"], &[])?;
         let bytes = fs::read(root.join(".git").join("index"))?;
-        let index = Index::parse_v2_sha1(&bytes)?;
-        let written = index.write_v2_sha1()?;
+        let index = Index::parse(&bytes, format)?;
+        let written = index.write(format)?;
         if written != bytes {
             return Err(GitError::InvalidFormat(
                 "index did not round-trip byte-for-byte".into(),
             ));
         }
         Ok(IndexParity {
+            format,
             entries: index.entries.len(),
             byte_len: bytes.len(),
         })
@@ -2569,15 +2721,23 @@ pub fn index_round_trip_parity() -> Result<IndexParity> {
 }
 
 pub fn update_index_add_parity() -> Result<UpdateIndexParity> {
+    update_index_add_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn update_index_add_parity_sha256() -> Result<UpdateIndexParity> {
+    update_index_add_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn update_index_add_parity_for_format(format: ObjectFormat) -> Result<UpdateIndexParity> {
     let root = unique_temp_dir("git-rs-update-index");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<UpdateIndexParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         let update = git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let oid = update
@@ -2592,17 +2752,29 @@ pub fn update_index_add_parity() -> Result<UpdateIndexParity> {
                 "ls-files mismatch: expected {expected:?}, got {upstream:?}"
             )));
         }
-        Ok(UpdateIndexParity { upstream, expected })
+        Ok(UpdateIndexParity {
+            format,
+            upstream,
+            expected,
+        })
     })();
     let _ = fs::remove_dir_all(&root);
     result
 }
 
 pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
+    ls_files_stage_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn ls_files_stage_parity_sha256() -> Result<LsFilesStageParity> {
+    ls_files_stage_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn ls_files_stage_parity_for_format(format: ObjectFormat) -> Result<LsFilesStageParity> {
     let root = unique_temp_dir("git-rs-ls-files-stage");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<LsFilesStageParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::create_dir_all(root.join("src"))?;
         fs::create_dir_all(root.join("docs"))?;
         fs::write(root.join("README.md"), b"hello\n")?;
@@ -2613,7 +2785,7 @@ pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[
                 PathBuf::from("README.md"),
                 PathBuf::from("modified.txt"),
@@ -2624,7 +2796,7 @@ pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
         fs::remove_file(root.join("src").join("lib.rs"))?;
         let upstream =
             String::from_utf8_lossy(&run_git(&root, ["ls-files", "--stage"], &[])?).to_string();
-        let index = Index::parse_v2_sha1(&fs::read(root.join(".git").join("index"))?)?;
+        let index = Index::parse(&fs::read(root.join(".git").join("index"))?, format)?;
         let rust = String::from_utf8_lossy(&format_ls_files(&index, true, b'\n')).to_string();
         let upstream_z = run_git(&root, ["ls-files", "-z"], &[])?;
         let rust_z = format_ls_files(&index, false, 0);
@@ -2638,8 +2810,7 @@ pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
         let rust_cached_z = format_ls_files(&index, false, 0);
         let upstream_others =
             String::from_utf8_lossy(&run_git(&root, ["ls-files", "--others"], &[])?).to_string();
-        let other_paths =
-            git_worktree::untracked_paths(&root, root.join(".git"), ObjectFormat::Sha1)?;
+        let other_paths = git_worktree::untracked_paths(&root, root.join(".git"), format)?;
         let rust_others =
             String::from_utf8_lossy(&format_ls_file_paths(&other_paths, b'\n')).to_string();
         let upstream_others_z = run_git(&root, ["ls-files", "--others", "-z"], &[])?;
@@ -2659,11 +2830,11 @@ pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
         let upstream_deleted =
             String::from_utf8_lossy(&run_git(&root, ["ls-files", "--deleted"], &[])?).to_string();
         let deleted_entries =
-            git_worktree::deleted_index_entries(&root, root.join(".git"), ObjectFormat::Sha1)?;
+            git_worktree::deleted_index_entries(&root, root.join(".git"), format)?;
         let upstream_modified =
             String::from_utf8_lossy(&run_git(&root, ["ls-files", "--modified"], &[])?).to_string();
         let modified_entries =
-            git_worktree::modified_index_entries(&root, root.join(".git"), ObjectFormat::Sha1)?;
+            git_worktree::modified_index_entries(&root, root.join(".git"), format)?;
         let rust_modified = String::from_utf8_lossy(&format_ls_files_from_entries(
             &modified_entries,
             false,
@@ -2848,6 +3019,7 @@ pub fn ls_files_stage_parity() -> Result<LsFilesStageParity> {
             )));
         }
         Ok(LsFilesStageParity {
+            format,
             upstream,
             rust,
             upstream_z,
@@ -3041,15 +3213,23 @@ fn format_ls_file_paths(paths: &[Vec<u8>], terminator: u8) -> Vec<u8> {
 }
 
 pub fn update_ref_delete_parity() -> Result<UpdateRefDeleteParity> {
+    update_ref_delete_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn update_ref_delete_parity_sha256() -> Result<UpdateRefDeleteParity> {
+    update_ref_delete_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn update_ref_delete_parity_for_format(format: ObjectFormat) -> Result<UpdateRefDeleteParity> {
     let root = unique_temp_dir("git-rs-update-ref-delete");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<UpdateRefDeleteParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3059,7 +3239,7 @@ pub fn update_ref_delete_parity() -> Result<UpdateRefDeleteParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3067,14 +3247,14 @@ pub fn update_ref_delete_parity() -> Result<UpdateRefDeleteParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/topic".into(),
             expected: None,
             new: RefTarget::Direct(commit.oid.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: ObjectId::from_raw(ObjectFormat::Sha1, &[0; 20])?,
+                old_oid: zero_oid(format)?,
                 new_oid: commit.oid.clone(),
                 committer: identity,
                 message: b"update by test".to_vec(),
@@ -3098,6 +3278,7 @@ pub fn update_ref_delete_parity() -> Result<UpdateRefDeleteParity> {
             )));
         }
         Ok(UpdateRefDeleteParity {
+            format,
             before,
             after,
             deleted_oid: deleted.oid.to_hex(),
@@ -3108,15 +3289,25 @@ pub fn update_ref_delete_parity() -> Result<UpdateRefDeleteParity> {
 }
 
 pub fn update_ref_delete_packed_parity() -> Result<UpdateRefDeleteParity> {
+    update_ref_delete_packed_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn update_ref_delete_packed_parity_sha256() -> Result<UpdateRefDeleteParity> {
+    update_ref_delete_packed_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn update_ref_delete_packed_parity_for_format(
+    format: ObjectFormat,
+) -> Result<UpdateRefDeleteParity> {
     let root = unique_temp_dir("git-rs-update-ref-delete-packed");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<UpdateRefDeleteParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3126,7 +3317,7 @@ pub fn update_ref_delete_packed_parity() -> Result<UpdateRefDeleteParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -3134,7 +3325,7 @@ pub fn update_ref_delete_packed_parity() -> Result<UpdateRefDeleteParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.write_packed_refs(&[PackedRef {
             reference: Ref {
                 name: "refs/heads/topic".into(),
@@ -3159,6 +3350,7 @@ pub fn update_ref_delete_packed_parity() -> Result<UpdateRefDeleteParity> {
             )));
         }
         Ok(UpdateRefDeleteParity {
+            format,
             before,
             after,
             deleted_oid: deleted.oid.to_hex(),
@@ -3169,15 +3361,23 @@ pub fn update_ref_delete_packed_parity() -> Result<UpdateRefDeleteParity> {
 }
 
 pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
+    reflog_expire_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn reflog_expire_parity_sha256() -> Result<ReflogExpireParity> {
+    reflog_expire_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn reflog_expire_parity_for_format(format: ObjectFormat) -> Result<ReflogExpireParity> {
     let root = unique_temp_dir("git-rs-reflog-expire");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<ReflogExpireParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"one\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity_old = git_sequencer::format_commit_identity(
@@ -3187,7 +3387,7 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
         )?;
         let _first = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity_old.clone(),
                 committer: identity_old,
@@ -3200,7 +3400,7 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity_new = git_sequencer::format_commit_identity(
@@ -3210,7 +3410,7 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
         )?;
         let _second = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity_new.clone(),
                 committer: identity_new,
@@ -3225,7 +3425,7 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
             &[],
         )?)
         .to_string();
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         let removed = store.expire_reflog_older_than("refs/heads/main", 80)?;
         let after = String::from_utf8_lossy(&run_git(
             &root,
@@ -3246,6 +3446,7 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
         }
 
         Ok(ReflogExpireParity {
+            format,
             before,
             after,
             removed,
@@ -3256,21 +3457,28 @@ pub fn reflog_expire_parity() -> Result<ReflogExpireParity> {
 }
 
 pub fn write_tree_parity() -> Result<WriteTreeParity> {
+    write_tree_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn write_tree_parity_sha256() -> Result<WriteTreeParity> {
+    write_tree_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn write_tree_parity_for_format(format: ObjectFormat) -> Result<WriteTreeParity> {
     let root = unique_temp_dir("git-rs-write-tree");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<WriteTreeParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::create_dir_all(root.join("src"))?;
         fs::write(root.join("README.md"), b"readme\n")?;
         fs::write(root.join("src").join("lib.rs"), b"pub fn demo() {}\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("README.md"), PathBuf::from("src/lib.rs")],
         )?;
-        let rust =
-            git_worktree::write_tree_from_index(root.join(".git"), ObjectFormat::Sha1)?.to_hex();
+        let rust = git_worktree::write_tree_from_index(root.join(".git"), format)?.to_hex();
         let upstream = String::from_utf8_lossy(&run_git(&root, ["write-tree"], &[])?)
             .trim()
             .to_string();
@@ -3279,17 +3487,29 @@ pub fn write_tree_parity() -> Result<WriteTreeParity> {
                 "write-tree mismatch: expected {upstream}, got {rust}"
             )));
         }
-        Ok(WriteTreeParity { upstream, rust })
+        Ok(WriteTreeParity {
+            format,
+            upstream,
+            rust,
+        })
     })();
     let _ = fs::remove_dir_all(&root);
     result
 }
 
 pub fn commit_tree_parity() -> Result<CommitTreeParity> {
+    commit_tree_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn commit_tree_parity_sha256() -> Result<CommitTreeParity> {
+    commit_tree_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn commit_tree_parity_for_format(format: ObjectFormat) -> Result<CommitTreeParity> {
     let root = unique_temp_dir("git-rs-commit-tree");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<CommitTreeParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         let tree = String::from_utf8_lossy(&run_git(&root, ["mktree"], &[])?)
             .trim()
             .to_string();
@@ -3314,11 +3534,11 @@ pub fn commit_tree_parity() -> Result<CommitTreeParity> {
             "example@example.invalid",
             "@0 +0000",
         )?;
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let rust = git_sequencer::create_commit(
             &mut db,
             git_sequencer::CommitCreate {
-                tree: ObjectId::from_hex(ObjectFormat::Sha1, &tree)?,
+                tree: ObjectId::from_hex(format, &tree)?,
                 parents: Vec::new(),
                 author: identity.clone(),
                 committer: identity,
@@ -3333,6 +3553,7 @@ pub fn commit_tree_parity() -> Result<CommitTreeParity> {
         }
         let body = run_git_owned(&root, &["cat-file".into(), "-p".into(), rust.clone()], &[])?;
         Ok(CommitTreeParity {
+            format,
             upstream,
             rust,
             body,
@@ -3343,15 +3564,23 @@ pub fn commit_tree_parity() -> Result<CommitTreeParity> {
 }
 
 pub fn commit_index_parity() -> Result<CommitIndexParity> {
+    commit_index_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn commit_index_parity_sha256() -> Result<CommitIndexParity> {
+    commit_index_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn commit_index_parity_for_format(format: ObjectFormat) -> Result<CommitIndexParity> {
     let root = unique_temp_dir("git-rs-commit-index");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<CommitIndexParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3361,7 +3590,7 @@ pub fn commit_index_parity() -> Result<CommitIndexParity> {
         )?;
         let result = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -3395,6 +3624,7 @@ pub fn commit_index_parity() -> Result<CommitIndexParity> {
             )));
         }
         Ok(CommitIndexParity {
+            format,
             head,
             updated_ref: result.updated_ref,
             log,
@@ -3405,16 +3635,24 @@ pub fn commit_index_parity() -> Result<CommitIndexParity> {
 }
 
 pub fn add_status_parity() -> Result<AddStatusParity> {
+    add_status_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn add_status_parity_sha256() -> Result<AddStatusParity> {
+    add_status_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn add_status_parity_for_format(format: ObjectFormat) -> Result<AddStatusParity> {
     let root = unique_temp_dir("git-rs-add-status");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<AddStatusParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         fs::write(root.join("extra.txt"), b"extra\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let upstream =
@@ -3428,13 +3666,13 @@ pub fn add_status_parity() -> Result<AddStatusParity> {
             &[],
         )?)
         .to_string();
-        let entries = git_worktree::short_status(&root, root.join(".git"), ObjectFormat::Sha1)?;
+        let entries = git_worktree::short_status(&root, root.join(".git"), format)?;
         let rust = entries
             .iter()
             .map(|entry| format!("{}\n", entry.line()))
             .collect::<String>();
         let porcelain_rust = rust.clone();
-        let branch_header = status_branch_header(&root.join(".git"), ObjectFormat::Sha1)?;
+        let branch_header = status_branch_header(&root.join(".git"), format)?;
         let porcelain_branch_rust = format!("{branch_header}\n{rust}");
         let porcelain_z_upstream = run_git(&root, ["status", "--porcelain=v1", "-z"], &[])?;
         let porcelain_z_rust = format_short_status_z(&entries);
@@ -3452,6 +3690,7 @@ pub fn add_status_parity() -> Result<AddStatusParity> {
             )));
         }
         Ok(AddStatusParity {
+            format,
             upstream,
             rust,
             porcelain_upstream,
@@ -3510,15 +3749,23 @@ fn status_branch_header(git_dir: &Path, format: ObjectFormat) -> Result<String> 
 }
 
 pub fn branch_create_parity() -> Result<BranchParity> {
+    branch_create_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn branch_create_parity_sha256() -> Result<BranchParity> {
+    branch_create_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn branch_create_parity_for_format(format: ObjectFormat) -> Result<BranchParity> {
     let root = unique_temp_dir("git-rs-branch");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<BranchParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3528,7 +3775,7 @@ pub fn branch_create_parity() -> Result<BranchParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3536,7 +3783,7 @@ pub fn branch_create_parity() -> Result<BranchParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         let commit_oid = commit.oid.clone();
         let commit_hex = commit_oid.to_hex();
         store.create_branch(
@@ -3582,6 +3829,7 @@ pub fn branch_create_parity() -> Result<BranchParity> {
             )));
         }
         Ok(BranchParity {
+            format,
             upstream,
             expected,
             points_at_upstream,
@@ -3599,15 +3847,25 @@ pub fn branch_create_parity() -> Result<BranchParity> {
 }
 
 pub fn branch_show_current_parity() -> Result<BranchShowCurrentParity> {
+    branch_show_current_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn branch_show_current_parity_sha256() -> Result<BranchShowCurrentParity> {
+    branch_show_current_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn branch_show_current_parity_for_format(
+    format: ObjectFormat,
+) -> Result<BranchShowCurrentParity> {
     let root = unique_temp_dir("git-rs-branch-show-current");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<BranchShowCurrentParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3617,7 +3875,7 @@ pub fn branch_show_current_parity() -> Result<BranchShowCurrentParity> {
         )?;
         git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -3627,7 +3885,7 @@ pub fn branch_show_current_parity() -> Result<BranchShowCurrentParity> {
         )?;
         let upstream = String::from_utf8_lossy(&run_git(&root, ["branch", "--show-current"], &[])?)
             .to_string();
-        let rust = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1)
+        let rust = FileRefStore::new(root.join(".git"), format)
             .current_branch()?
             .map(|branch| format!("{branch}\n"))
             .unwrap_or_default();
@@ -3636,22 +3894,34 @@ pub fn branch_show_current_parity() -> Result<BranchShowCurrentParity> {
                 "branch --show-current mismatch: expected {upstream:?}, got {rust:?}"
             )));
         }
-        Ok(BranchShowCurrentParity { upstream, rust })
+        Ok(BranchShowCurrentParity {
+            format,
+            upstream,
+            rust,
+        })
     })();
     let _ = fs::remove_dir_all(&root);
     result
 }
 
 pub fn branch_delete_parity() -> Result<BranchDeleteParity> {
+    branch_delete_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn branch_delete_parity_sha256() -> Result<BranchDeleteParity> {
+    branch_delete_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn branch_delete_parity_for_format(format: ObjectFormat) -> Result<BranchDeleteParity> {
     let root = unique_temp_dir("git-rs-branch-delete");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<BranchDeleteParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3661,7 +3931,7 @@ pub fn branch_delete_parity() -> Result<BranchDeleteParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3669,7 +3939,7 @@ pub fn branch_delete_parity() -> Result<BranchDeleteParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
             commit.oid.clone(),
@@ -3690,6 +3960,7 @@ pub fn branch_delete_parity() -> Result<BranchDeleteParity> {
             )));
         }
         Ok(BranchDeleteParity {
+            format,
             before,
             after,
             deleted_oid: deleted.oid.to_hex(),
@@ -3700,10 +3971,18 @@ pub fn branch_delete_parity() -> Result<BranchDeleteParity> {
 }
 
 pub fn checkout_branch_parity() -> Result<CheckoutParity> {
+    checkout_branch_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn checkout_branch_parity_sha256() -> Result<CheckoutParity> {
+    checkout_branch_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<CheckoutParity> {
     let root = unique_temp_dir("git-rs-checkout");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<CheckoutParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         let identity = git_sequencer::format_commit_identity(
             "Example User",
             "example@example.invalid",
@@ -3714,12 +3993,12 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let feature_commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3727,7 +4006,7 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
                 reflog_message: b"commit: feature subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
             feature_commit.oid.clone(),
@@ -3739,12 +4018,12 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3753,13 +4032,7 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
             },
         )?;
 
-        git_worktree::checkout_branch(
-            &root,
-            root.join(".git"),
-            ObjectFormat::Sha1,
-            "feature",
-            identity,
-        )?;
+        git_worktree::checkout_branch(&root, root.join(".git"), format, "feature", identity)?;
         let branch = String::from_utf8_lossy(&run_git(&root, ["branch", "--show-current"], &[])?)
             .trim()
             .to_string();
@@ -3779,6 +4052,7 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
             )));
         }
         Ok(CheckoutParity {
+            format,
             branch,
             head,
             body,
@@ -3790,15 +4064,23 @@ pub fn checkout_branch_parity() -> Result<CheckoutParity> {
 }
 
 pub fn tag_create_parity() -> Result<TagParity> {
+    tag_create_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn tag_create_parity_sha256() -> Result<TagParity> {
+    tag_create_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn tag_create_parity_for_format(format: ObjectFormat) -> Result<TagParity> {
     let root = unique_temp_dir("git-rs-tag");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<TagParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3808,7 +4090,7 @@ pub fn tag_create_parity() -> Result<TagParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -3816,7 +4098,7 @@ pub fn tag_create_parity() -> Result<TagParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_tag("v1.0", commit.oid.clone())?;
         let upstream =
             String::from_utf8_lossy(&run_git(&root, ["tag", "--list"], &[])?).to_string();
@@ -3835,6 +4117,7 @@ pub fn tag_create_parity() -> Result<TagParity> {
             )));
         }
         Ok(TagParity {
+            format,
             upstream,
             expected,
             show_ref,
@@ -3845,15 +4128,23 @@ pub fn tag_create_parity() -> Result<TagParity> {
 }
 
 pub fn tag_delete_parity() -> Result<TagDeleteParity> {
+    tag_delete_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn tag_delete_parity_sha256() -> Result<TagDeleteParity> {
+    tag_delete_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn tag_delete_parity_for_format(format: ObjectFormat) -> Result<TagDeleteParity> {
     let root = unique_temp_dir("git-rs-tag-delete");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<TagDeleteParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3863,7 +4154,7 @@ pub fn tag_delete_parity() -> Result<TagDeleteParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -3871,7 +4162,7 @@ pub fn tag_delete_parity() -> Result<TagDeleteParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_tag("v1.0", commit.oid.clone())?;
         let before = String::from_utf8_lossy(&run_git(&root, ["tag", "--list"], &[])?).to_string();
         let deleted = store.delete_tag("v1.0")?;
@@ -3883,6 +4174,7 @@ pub fn tag_delete_parity() -> Result<TagDeleteParity> {
             )));
         }
         Ok(TagDeleteParity {
+            format,
             before,
             after,
             deleted_oid: deleted.oid.to_hex(),
@@ -3893,15 +4185,23 @@ pub fn tag_delete_parity() -> Result<TagDeleteParity> {
 }
 
 pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
+    annotated_tag_create_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn annotated_tag_create_parity_sha256() -> Result<AnnotatedTagParity> {
+    annotated_tag_create_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn annotated_tag_create_parity_for_format(format: ObjectFormat) -> Result<AnnotatedTagParity> {
     let root = unique_temp_dir("git-rs-annotated-tag");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<AnnotatedTagParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -3911,7 +4211,7 @@ pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity.clone(),
@@ -3919,7 +4219,7 @@ pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), ObjectFormat::Sha1);
+        let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let tag_oid = git_sequencer::create_annotated_tag(
             &mut db,
             git_sequencer::TagCreate {
@@ -3930,7 +4230,7 @@ pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
                 message: b"release v2\n".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_tag("v2.0", tag_oid.clone())?;
         let upstream_type =
             String::from_utf8_lossy(&run_git(&root, ["cat-file", "-t", "refs/tags/v2.0"], &[])?)
@@ -3959,6 +4259,7 @@ pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
             )));
         }
         Ok(AnnotatedTagParity {
+            format,
             tag_oid: tag_oid.to_hex(),
             target_oid: commit.oid.to_hex(),
             upstream_type,
@@ -3972,17 +4273,25 @@ pub fn annotated_tag_create_parity() -> Result<AnnotatedTagParity> {
 }
 
 pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
+    diff_name_status_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn diff_name_status_parity_sha256() -> Result<DiffNameStatusParity> {
+    diff_name_status_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNameStatusParity> {
     let root = unique_temp_dir("git-rs-diff-name-status");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<DiffNameStatusParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("add.txt"), b"base add\n")?;
         fs::write(root.join("delete.txt"), b"delete\n")?;
         fs::write(root.join("modify.txt"), b"before\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[
                 PathBuf::from("add.txt"),
                 PathBuf::from("delete.txt"),
@@ -3996,7 +4305,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
         )?;
         git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -4012,7 +4321,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("new.txt")],
         )?;
         fs::write(root.join("untracked.txt"), b"ignored by diff\n")?;
@@ -4035,29 +4344,22 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
             &[],
         )?)
         .to_string();
-        let rust = git_diff_merge::diff_name_status_head_worktree(
-            &root,
-            root.join(".git"),
-            ObjectFormat::Sha1,
-        )?
-        .into_iter()
-        .map(|entry| format!("{}\n", entry.line()))
-        .collect::<String>();
-        let name_only_rust = git_diff_merge::diff_name_status_head_worktree(
-            &root,
-            root.join(".git"),
-            ObjectFormat::Sha1,
-        )?
-        .into_iter()
-        .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
-        .collect::<String>();
-        let cached_rust =
-            git_diff_merge::diff_name_status_head_index(root.join(".git"), ObjectFormat::Sha1)?
+        let rust =
+            git_diff_merge::diff_name_status_head_worktree(&root, root.join(".git"), format)?
                 .into_iter()
                 .map(|entry| format!("{}\n", entry.line()))
                 .collect::<String>();
+        let name_only_rust =
+            git_diff_merge::diff_name_status_head_worktree(&root, root.join(".git"), format)?
+                .into_iter()
+                .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
+                .collect::<String>();
+        let cached_rust = git_diff_merge::diff_name_status_head_index(root.join(".git"), format)?
+            .into_iter()
+            .map(|entry| format!("{}\n", entry.line()))
+            .collect::<String>();
         let cached_name_only_rust =
-            git_diff_merge::diff_name_status_head_index(root.join(".git"), ObjectFormat::Sha1)?
+            git_diff_merge::diff_name_status_head_index(root.join(".git"), format)?
                 .into_iter()
                 .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
                 .collect::<String>();
@@ -4078,7 +4380,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[
                 PathBuf::from("copy-source.txt"),
                 PathBuf::from("rename-old.txt"),
@@ -4091,7 +4393,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
         )?;
         git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -4131,7 +4433,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
         .to_string();
         let rename_copy_entries = git_diff_merge::diff_name_status_head_index_with_options(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_diff_merge::DiffNameStatusOptions {
                 detect_renames: true,
                 detect_copies: true,
@@ -4155,6 +4457,7 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
             )));
         }
         Ok(DiffNameStatusParity {
+            format,
             upstream,
             rust,
             name_only_upstream,
@@ -4174,15 +4477,23 @@ pub fn diff_name_status_parity() -> Result<DiffNameStatusParity> {
 }
 
 pub fn rev_parse_parity() -> Result<RevParseParity> {
+    rev_parse_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn rev_parse_parity_sha256() -> Result<RevParseParity> {
+    rev_parse_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn rev_parse_parity_for_format(format: ObjectFormat) -> Result<RevParseParity> {
     let root = unique_temp_dir("git-rs-rev-parse");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RevParseParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         fs::write(root.join("hello.txt"), b"hello\n")?;
         git_worktree::add_paths_to_index(
             &root,
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             &[PathBuf::from("hello.txt")],
         )?;
         let identity = git_sequencer::format_commit_identity(
@@ -4192,7 +4503,7 @@ pub fn rev_parse_parity() -> Result<RevParseParity> {
         )?;
         let commit = git_sequencer::commit_index(
             root.join(".git"),
-            ObjectFormat::Sha1,
+            format,
             git_sequencer::CommitIndexOptions {
                 author: identity.clone(),
                 committer: identity,
@@ -4200,7 +4511,7 @@ pub fn rev_parse_parity() -> Result<RevParseParity> {
                 reflog_message: b"commit: initial subject".to_vec(),
             },
         )?;
-        let store = FileRefStore::new(root.join(".git"), ObjectFormat::Sha1);
+        let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
             commit.oid.clone(),
@@ -4227,7 +4538,7 @@ pub fn rev_parse_parity() -> Result<RevParseParity> {
         for rev in revs {
             rust.push_str(&format!(
                 "{}\n",
-                git_rev::resolve_revision(root.join(".git"), ObjectFormat::Sha1, rev)?
+                git_rev::resolve_revision(root.join(".git"), format, rev)?
             ));
         }
         let short_upstream =
@@ -4430,6 +4741,7 @@ pub fn rev_parse_parity() -> Result<RevParseParity> {
             )));
         }
         Ok(RevParseParity {
+            format,
             upstream,
             rust,
             short_upstream,
@@ -4541,10 +4853,25 @@ fn rev_parse_object_format_output(format: ObjectFormat) -> String {
 }
 
 pub fn rev_parse_parent_parity() -> Result<RevParseParity> {
+    rev_parse_parent_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn rev_parse_parent_parity_sha256() -> Result<RevParseParity> {
+    rev_parse_parent_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn rev_parse_parent_parity_for_format(format: ObjectFormat) -> Result<RevParseParity> {
     let root = unique_temp_dir("git-rs-rev-parse-parents");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RevParseParity> {
-        run_git(&root, ["init", "-q", "-b", "main"], &[])?;
+        match format {
+            ObjectFormat::Sha1 => run_git(&root, ["init", "-q", "-b", "main"], &[])?,
+            ObjectFormat::Sha256 => run_git(
+                &root,
+                ["init", "-q", "--object-format=sha256", "-b", "main"],
+                &[],
+            )?,
+        };
         run_git(&root, ["config", "user.name", "Example User"], &[])?;
         run_git(
             &root,
@@ -4612,7 +4939,7 @@ pub fn rev_parse_parent_parity() -> Result<RevParseParity> {
         for rev in revs {
             rust.push_str(&format!(
                 "{}\n",
-                git_rev::resolve_revision(root.join(".git"), ObjectFormat::Sha1, rev)?
+                git_rev::resolve_revision(root.join(".git"), format, rev)?
             ));
         }
         if rust != upstream {
@@ -4621,6 +4948,7 @@ pub fn rev_parse_parent_parity() -> Result<RevParseParity> {
             )));
         }
         Ok(RevParseParity {
+            format,
             upstream,
             rust,
             short_upstream: String::new(),
@@ -4678,10 +5006,18 @@ pub fn rev_parse_parent_parity() -> Result<RevParseParity> {
 }
 
 pub fn rev_parse_peel_parity() -> Result<RevParseParity> {
+    rev_parse_peel_parity_for_format(ObjectFormat::Sha1)
+}
+
+pub fn rev_parse_peel_parity_sha256() -> Result<RevParseParity> {
+    rev_parse_peel_parity_for_format(ObjectFormat::Sha256)
+}
+
+pub fn rev_parse_peel_parity_for_format(format: ObjectFormat) -> Result<RevParseParity> {
     let root = unique_temp_dir("git-rs-rev-parse-peel");
     fs::create_dir_all(&root)?;
     let result = (|| -> Result<RevParseParity> {
-        run_git(&root, ["init", "-q"], &[])?;
+        init_repo_with_format(&root, format)?;
         run_git(&root, ["config", "user.name", "Example User"], &[])?;
         run_git(
             &root,
@@ -4747,7 +5083,7 @@ pub fn rev_parse_peel_parity() -> Result<RevParseParity> {
         for rev in revs {
             rust.push_str(&format!(
                 "{}\n",
-                git_rev::resolve_revision(root.join(".git"), ObjectFormat::Sha1, rev)?
+                git_rev::resolve_revision(root.join(".git"), format, rev)?
             ));
         }
         if rust != upstream {
@@ -4756,6 +5092,7 @@ pub fn rev_parse_peel_parity() -> Result<RevParseParity> {
             )));
         }
         Ok(RevParseParity {
+            format,
             upstream,
             rust,
             short_upstream: String::new(),
@@ -4946,6 +5283,17 @@ fn run_git_owned(cwd: &Path, args: &[String], stdin: &[u8]) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
+fn init_repo_with_format(root: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
+    match format {
+        ObjectFormat::Sha1 => run_git(root, ["init", "-q"], &[]),
+        ObjectFormat::Sha256 => run_git(root, ["init", "-q", "--object-format=sha256"], &[]),
+    }
+}
+
+fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
+    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
         "{}-{}-{}",
@@ -5021,12 +5369,37 @@ mod tests {
     fn reads_upstream_thin_pack_with_external_base() {
         let result = thin_pack_read_parity().unwrap();
         assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_thin_pack_read_parity(result);
+    }
+
+    #[test]
+    fn reads_upstream_thin_pack_with_external_base_sha256() {
+        let result = thin_pack_read_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_thin_pack_read_parity(result);
+    }
+
+    fn assert_thin_pack_read_parity(result: ThinPackReadParity) {
         assert_eq!(result.entries, 3);
+        assert_eq!(result.base_oid.len(), result.format.hex_len());
+        assert_eq!(result.changed_oid.len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_git_reads_loose_ref_written_by_rust_store() {
         let result = loose_ref_interop_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_ref_interop_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_loose_sha256_ref_written_by_rust_store() {
+        let result = loose_ref_interop_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_ref_interop_parity(result);
+    }
+
+    fn assert_ref_interop_parity(result: RefInteropParity) {
         assert_eq!(
             result.upstream_show_ref,
             format!("{} {}\n", result.oid, result.name)
@@ -5036,24 +5409,46 @@ mod tests {
     #[test]
     fn upstream_git_reads_packed_ref_written_by_rust_store() {
         let result = packed_ref_interop_parity().unwrap();
-        assert_eq!(
-            result.upstream_show_ref,
-            format!("{} {}\n", result.oid, result.name)
-        );
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_ref_interop_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_packed_sha256_ref_written_by_rust_store() {
+        let result = packed_ref_interop_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_compacted_packed_ref_written_by_rust_store() {
         let result = packed_ref_compaction_interop_parity().unwrap();
-        assert_eq!(
-            result.upstream_show_ref,
-            format!("{} {}\n", result.oid, result.name)
-        );
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_ref_interop_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_compacted_packed_sha256_ref_written_by_rust_store() {
+        let result = packed_ref_compaction_interop_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_peeled_compacted_packed_ref_written_by_rust_store() {
         let result = peeled_packed_ref_compaction_interop_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_peeled_packed_ref_interop_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_peeled_compacted_packed_sha256_ref_written_by_rust_store() {
+        let result = peeled_packed_ref_compaction_interop_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_peeled_packed_ref_interop_parity(result);
+    }
+
+    fn assert_peeled_packed_ref_interop_parity(result: PeeledPackedRefInteropParity) {
         assert_eq!(
             result.upstream_show_ref,
             format!(
@@ -5066,6 +5461,18 @@ mod tests {
     #[test]
     fn rust_show_ref_filters_match_upstream_git() {
         let result = show_ref_filter_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_show_ref_filter_parity(result);
+    }
+
+    #[test]
+    fn rust_show_ref_filters_match_upstream_git_sha256() {
+        let result = show_ref_filter_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_show_ref_filter_parity(result);
+    }
+
+    fn assert_show_ref_filter_parity(result: ShowRefFilterParity) {
         assert_eq!(result.heads_rust, result.heads_upstream);
         assert_eq!(result.tags_rust, result.tags_upstream);
         assert_eq!(result.heads_hash_rust, result.heads_hash_upstream);
@@ -5086,6 +5493,18 @@ mod tests {
     #[test]
     fn rust_show_ref_verify_matches_upstream_git() {
         let result = show_ref_verify_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_show_ref_verify_parity(result);
+    }
+
+    #[test]
+    fn rust_show_ref_verify_matches_upstream_git_sha256() {
+        let result = show_ref_verify_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_show_ref_verify_parity(result);
+    }
+
+    fn assert_show_ref_verify_parity(result: ShowRefVerifyParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.hash_rust, result.hash_upstream);
         assert_eq!(result.deref_rust, result.deref_upstream);
@@ -5096,6 +5515,18 @@ mod tests {
     #[test]
     fn rust_symbolic_ref_matches_upstream_git() {
         let result = symbolic_ref_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_symbolic_ref_parity(result);
+    }
+
+    #[test]
+    fn rust_symbolic_ref_matches_upstream_git_sha256() {
+        let result = symbolic_ref_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_symbolic_ref_parity(result);
+    }
+
+    fn assert_symbolic_ref_parity(result: SymbolicRefParity) {
         assert_eq!(result.head_rust, result.head_upstream);
         assert_eq!(result.short_rust, result.short_upstream);
         assert_eq!(result.switched_rust, result.switched_upstream);
@@ -5203,6 +5634,18 @@ mod tests {
     #[test]
     fn rust_ls_tree_matches_upstream_git() {
         let result = ls_tree_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_ls_tree_parity(result);
+    }
+
+    #[test]
+    fn rust_ls_tree_matches_upstream_git_sha256() {
+        let result = ls_tree_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_ls_tree_parity(result);
+    }
+
+    fn assert_ls_tree_parity(result: LsTreeParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.name_only_rust, result.name_only_upstream);
         assert_eq!(result.object_only_rust, result.object_only_upstream);
@@ -5239,33 +5682,80 @@ mod tests {
     #[test]
     fn rust_log_matches_minimal_upstream_git_format() {
         let result = log_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+    }
+
+    #[test]
+    fn rust_log_matches_minimal_upstream_git_format_sha256() {
+        let result = log_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_cat_file_resolves_revisions_like_upstream_git() {
         let result = cat_file_revision_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
         assert_eq!(&result.revs[..2], ["HEAD", "refs/tags/v2.0"]);
-        assert_eq!(result.revs[2].len(), ObjectFormat::Sha1.hex_len());
+        assert_eq!(result.revs[2].len(), result.format.hex_len());
+    }
+
+    #[test]
+    fn rust_cat_file_resolves_revisions_like_upstream_git_sha256() {
+        let result = cat_file_revision_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_eq!(result.rust, result.upstream);
+        assert_eq!(&result.revs[..2], ["HEAD", "refs/tags/v2.0"]);
+        assert_eq!(result.revs[2].len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_index_round_trips_byte_for_byte() {
         let result = index_round_trip_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.entries, 1);
         assert!(result.byte_len > 20);
     }
 
     #[test]
+    fn upstream_sha256_index_round_trips_byte_for_byte() {
+        let result = index_round_trip_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_eq!(result.entries, 1);
+        assert!(result.byte_len > 32);
+    }
+
+    #[test]
     fn upstream_git_reads_rust_update_index_add() {
         let result = update_index_add_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.upstream, result.expected);
+    }
+
+    #[test]
+    fn upstream_git_reads_rust_sha256_update_index_add() {
+        let result = update_index_add_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.upstream, result.expected);
     }
 
     #[test]
     fn rust_ls_files_stage_matches_upstream_git() {
         let result = ls_files_stage_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_ls_files_stage_parity(result);
+    }
+
+    #[test]
+    fn rust_ls_files_stage_matches_upstream_git_sha256() {
+        let result = ls_files_stage_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_ls_files_stage_parity(result);
+    }
+
+    fn assert_ls_files_stage_parity(result: LsFilesStageParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.rust_z, result.upstream_z);
         assert_eq!(result.rust_stage_z, result.upstream_stage_z);
@@ -5312,22 +5802,52 @@ mod tests {
     #[test]
     fn upstream_git_observes_rust_update_ref_delete() {
         let result = update_ref_delete_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
-        assert_eq!(result.deleted_oid.len(), ObjectFormat::Sha1.hex_len());
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
+    }
+
+    #[test]
+    fn upstream_git_observes_rust_update_ref_delete_sha256() {
+        let result = update_ref_delete_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert!(result.before.contains("refs/heads/topic"));
+        assert!(!result.after.contains("refs/heads/topic"));
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_git_observes_rust_update_ref_delete_packed() {
         let result = update_ref_delete_packed_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
-        assert_eq!(result.deleted_oid.len(), ObjectFormat::Sha1.hex_len());
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
+    }
+
+    #[test]
+    fn upstream_git_observes_rust_update_ref_delete_packed_sha256() {
+        let result = update_ref_delete_packed_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert!(result.before.contains("refs/heads/topic"));
+        assert!(!result.after.contains("refs/heads/topic"));
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_git_observes_rust_reflog_expire() {
         let result = reflog_expire_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.before, "commit: second\ncommit: first\n");
+        assert_eq!(result.after, "commit: second\n");
+    }
+
+    #[test]
+    fn upstream_git_observes_rust_reflog_expire_sha256() {
+        let result = reflog_expire_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.removed, 1);
         assert_eq!(result.before, "commit: second\ncommit: first\n");
         assert_eq!(result.after, "commit: second\n");
@@ -5336,12 +5856,29 @@ mod tests {
     #[test]
     fn rust_write_tree_matches_upstream_git() {
         let result = write_tree_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+    }
+
+    #[test]
+    fn rust_write_tree_matches_upstream_git_sha256() {
+        let result = write_tree_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_commit_tree_matches_upstream_git() {
         let result = commit_tree_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+        assert!(String::from_utf8_lossy(&result.body).contains("initial subject"));
+    }
+
+    #[test]
+    fn rust_commit_tree_matches_upstream_git_sha256() {
+        let result = commit_tree_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
         assert!(String::from_utf8_lossy(&result.body).contains("initial subject"));
     }
@@ -5349,6 +5886,15 @@ mod tests {
     #[test]
     fn upstream_git_reads_rust_commit_index_result() {
         let result = commit_index_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.updated_ref, "refs/heads/main");
+        assert!(result.log.contains("initial subject"));
+    }
+
+    #[test]
+    fn upstream_git_reads_rust_commit_index_result_sha256() {
+        let result = commit_index_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.updated_ref, "refs/heads/main");
         assert!(result.log.contains("initial subject"));
     }
@@ -5356,6 +5902,18 @@ mod tests {
     #[test]
     fn rust_add_status_matches_upstream_git_short_status() {
         let result = add_status_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_add_status_parity(result);
+    }
+
+    #[test]
+    fn rust_add_status_matches_upstream_git_short_status_sha256() {
+        let result = add_status_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_add_status_parity(result);
+    }
+
+    fn assert_add_status_parity(result: AddStatusParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.porcelain_rust, result.porcelain_upstream);
         assert_eq!(
@@ -5372,6 +5930,18 @@ mod tests {
     #[test]
     fn upstream_git_lists_rust_created_branch() {
         let result = branch_create_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_branch_create_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_lists_rust_created_branch_sha256() {
+        let result = branch_create_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_branch_create_parity(result);
+    }
+
+    fn assert_branch_create_parity(result: BranchParity) {
         assert_eq!(result.upstream, result.expected);
         assert_eq!(result.remotes_upstream, result.remotes_expected);
         assert_eq!(result.all_upstream, result.all_expected);
@@ -5382,21 +5952,54 @@ mod tests {
     #[test]
     fn rust_branch_show_current_matches_upstream_git() {
         let result = branch_show_current_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+    }
+
+    #[test]
+    fn rust_branch_show_current_matches_upstream_git_sha256() {
+        let result = branch_show_current_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn upstream_git_observes_rust_deleted_branch() {
         let result = branch_delete_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_branch_delete_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_observes_rust_deleted_branch_sha256() {
+        let result = branch_delete_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_branch_delete_parity(result);
+    }
+
+    fn assert_branch_delete_parity(result: BranchDeleteParity) {
         assert_eq!(result.before, "  feature\n* main\n");
         assert_eq!(result.after, "* main\n");
-        assert_eq!(result.deleted_oid.len(), ObjectFormat::Sha1.hex_len());
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_git_reads_rust_checkout_branch_result() {
         let result = checkout_branch_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_checkout_branch_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_rust_checkout_branch_result_sha256() {
+        let result = checkout_branch_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_checkout_branch_parity(result);
+    }
+
+    fn assert_checkout_branch_parity(result: CheckoutParity) {
         assert_eq!(result.branch, "feature");
+        assert_eq!(result.head.len(), result.format.hex_len());
         assert_eq!(result.body, b"feature\n");
         assert!(result.status.is_empty());
     }
@@ -5404,6 +6007,18 @@ mod tests {
     #[test]
     fn upstream_git_lists_rust_created_tag() {
         let result = tag_create_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_tag_create_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_lists_rust_created_tag_sha256() {
+        let result = tag_create_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_tag_create_parity(result);
+    }
+
+    fn assert_tag_create_parity(result: TagParity) {
         assert_eq!(result.upstream, result.expected);
         assert!(result.show_ref.contains("refs/tags/v1.0"));
     }
@@ -5411,15 +6026,41 @@ mod tests {
     #[test]
     fn upstream_git_observes_rust_deleted_tag() {
         let result = tag_delete_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_tag_delete_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_observes_rust_deleted_tag_sha256() {
+        let result = tag_delete_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_tag_delete_parity(result);
+    }
+
+    fn assert_tag_delete_parity(result: TagDeleteParity) {
         assert_eq!(result.before, "v1.0\n");
         assert!(result.after.is_empty());
-        assert_eq!(result.deleted_oid.len(), ObjectFormat::Sha1.hex_len());
+        assert_eq!(result.deleted_oid.len(), result.format.hex_len());
     }
 
     #[test]
     fn upstream_git_reads_rust_created_annotated_tag() {
         let result = annotated_tag_create_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_annotated_tag_create_parity(result);
+    }
+
+    #[test]
+    fn upstream_git_reads_rust_created_annotated_tag_sha256() {
+        let result = annotated_tag_create_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_annotated_tag_create_parity(result);
+    }
+
+    fn assert_annotated_tag_create_parity(result: AnnotatedTagParity) {
         assert_eq!(result.upstream_type, "tag");
+        assert_eq!(result.tag_oid.len(), result.format.hex_len());
+        assert_eq!(result.target_oid.len(), result.format.hex_len());
         assert_eq!(result.upstream_body, result.expected_body);
         assert!(result.show_ref.contains("refs/tags/v2.0"));
     }
@@ -5427,6 +6068,18 @@ mod tests {
     #[test]
     fn rust_diff_name_status_matches_upstream_git() {
         let result = diff_name_status_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_diff_name_status_parity(result);
+    }
+
+    #[test]
+    fn rust_diff_name_status_matches_upstream_git_sha256() {
+        let result = diff_name_status_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_diff_name_status_parity(result);
+    }
+
+    fn assert_diff_name_status_parity(result: DiffNameStatusParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.name_only_rust, result.name_only_upstream);
         assert_eq!(result.cached_rust, result.cached_upstream);
@@ -5444,6 +6097,18 @@ mod tests {
     #[test]
     fn rust_rev_parse_matches_upstream_git() {
         let result = rev_parse_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_rev_parse_parity(result);
+    }
+
+    #[test]
+    fn rust_rev_parse_matches_upstream_git_sha256() {
+        let result = rev_parse_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
+        assert_rev_parse_parity(result);
+    }
+
+    fn assert_rev_parse_parity(result: RevParseParity) {
         assert_eq!(result.rust, result.upstream);
         assert_eq!(result.short_rust, result.short_upstream);
         assert_eq!(result.short_8_rust, result.short_8_upstream);
@@ -5502,12 +6167,28 @@ mod tests {
     #[test]
     fn rust_rev_parse_parent_syntax_matches_upstream_git() {
         let result = rev_parse_parent_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+    }
+
+    #[test]
+    fn rust_rev_parse_parent_syntax_matches_upstream_git_sha256() {
+        let result = rev_parse_parent_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_rev_parse_peel_syntax_matches_upstream_git() {
         let result = rev_parse_peel_parity().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha1);
+        assert_eq!(result.rust, result.upstream);
+    }
+
+    #[test]
+    fn rust_rev_parse_peel_syntax_matches_upstream_git_sha256() {
+        let result = rev_parse_peel_parity_sha256().unwrap();
+        assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 }

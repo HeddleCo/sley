@@ -81,6 +81,33 @@ fn symbolic_ref_quiet_matches_upstream_git() {
 }
 
 #[test]
+fn symbolic_ref_reftable_repository_matches_upstream_git() {
+    let root = unique_temp_dir("symbolic-ref-reftable");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&root).expect("create temp root");
+    let result = (|| {
+        fs::create_dir_all(&expected).expect("create expected repo dir");
+        fs::create_dir_all(&actual).expect("create actual repo dir");
+        run_success("git", &expected, &["init", "-q", "--ref-format=reftable"]);
+        run_success("git", &actual, &["init", "-q", "--ref-format=reftable"]);
+
+        for args in [
+            vec!["symbolic-ref", "refs/alias/rust", "refs/heads/main"],
+            vec!["symbolic-ref", "refs/alias/rust"],
+            vec!["symbolic-ref", "--delete", "refs/alias/rust"],
+            vec!["symbolic-ref", "--quiet", "refs/alias/rust"],
+        ] {
+            let expected_output = run("git", &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn symbolic_ref_update_options_match_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-update-options");
     let expected = root.join("expected");

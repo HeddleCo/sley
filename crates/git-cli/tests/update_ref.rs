@@ -524,6 +524,36 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
 }
 
 #[test]
+fn update_ref_reftable_repository_matches_upstream_git() {
+    let root = unique_temp_dir("update-ref-reftable");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    let result = (|| {
+        run_success("git", &expected, &["init", "-q", "--ref-format=reftable"]);
+        run_success("git", &actual, &["init", "-q", "--ref-format=reftable"]);
+
+        let oid = write_blob(&expected, "payload.txt", b"payload\n");
+        let actual_oid = write_blob(&actual, "payload.txt", b"payload\n");
+        assert_eq!(actual_oid, oid);
+
+        for args in [
+            vec!["update-ref", "refs/tags/rust", oid.as_str()],
+            vec!["show-ref", "refs/tags/rust"],
+            vec!["update-ref", "-d", "refs/tags/rust", oid.as_str()],
+            vec!["show-ref", "refs/tags/rust"],
+        ] {
+            let expected_output = run("git", &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_git-rs"), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
+        }
+    })();
+    let _ = fs::remove_dir_all(&root);
+    result
+}
+
+#[test]
 fn update_ref_stdin_basic_commands_match_upstream_git() {
     let root = unique_temp_dir("update-ref-stdin");
     let expected = root.join("expected");

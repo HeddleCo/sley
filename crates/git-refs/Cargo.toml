@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 git-core = { path = "../git-core" }
+git-formats = { path = "../git-formats" }
 
 [lints]
 workspace = true
-
