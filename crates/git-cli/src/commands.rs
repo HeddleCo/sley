@@ -6,5 +6,6 @@
 //! `cmd_*` entry points the dispatcher in `run` calls, which are `pub(crate)`.
 
 pub(crate) mod attrs;
+pub(crate) mod branch;
 pub(crate) mod stash;
 pub(crate) mod trees;
