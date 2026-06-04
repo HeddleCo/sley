@@ -30,6 +30,40 @@ pub struct SparseCheckout {
     pub sparse_index: bool,
 }
 
+/// Selects how the patterns in a [`SparseCheckout`] are interpreted when
+/// deciding which index paths are "in cone" (kept in the worktree).
+///
+/// * [`SparseCheckoutMode::Full`] interprets the patterns exactly like
+///   `.gitignore` lines (full pattern matching, including `*`, `?`, `**`,
+///   character classes, anchoring with a leading `/`, directory-only `/`
+///   suffixes, and `!` negation). A path is *included* when the last pattern
+///   that matches it is not negated. This mirrors upstream Git's non-cone
+///   `core.sparseCheckout` behaviour.
+/// * [`SparseCheckoutMode::Cone`] interprets the patterns as the restricted
+///   directory-prefix form Git emits for `core.sparseCheckoutCone`: a literal
+///   `/*` (top-level files), the recursive-parent guard `!/*/`, and anchored
+///   directory patterns such as `/dir/` (everything under `dir/`) plus the
+///   parent guards `/dir/*` and `!/dir/*/`. Matching is purely prefix based,
+///   so glob metacharacters are treated literally.
+/// * [`SparseCheckoutMode::Auto`] inspects the patterns and uses cone matching
+///   when every pattern fits the cone grammar above, otherwise full matching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SparseCheckoutMode {
+    #[default]
+    Auto,
+    Full,
+    Cone,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplySparseResult {
+    /// Paths whose worktree file was (re)materialized because they are in cone.
+    pub materialized: Vec<Vec<u8>>,
+    /// Paths that were taken out of the worktree because they are out of cone;
+    /// their index entry now has the skip-worktree bit set.
+    pub skipped: Vec<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateIndexResult {
     pub entries: usize,
@@ -1596,6 +1630,183 @@ impl IgnoreMatcher {
     }
 }
 
+/// Decides whether a worktree path is included by a [`SparseCheckout`].
+///
+/// In [`SparseCheckoutMode::Full`] the sparse patterns are compiled with the
+/// same `.gitignore` grammar used elsewhere in this crate ([`IgnorePattern`]);
+/// a path is *in cone* when the last matching pattern is positive. In
+/// [`SparseCheckoutMode::Cone`] the patterns are reduced to a set of recursive
+/// directory prefixes plus a flag for whether top-level files are kept, and
+/// inclusion is decided by literal prefix containment.
+#[derive(Debug)]
+enum SparseMatcher {
+    Full { patterns: Vec<IgnorePattern> },
+    Cone(ConeMatcher),
+}
+
+#[derive(Debug, Default)]
+struct ConeMatcher {
+    /// `true` when files directly at the repository root are in cone (`/*`).
+    root_files: bool,
+    /// Directory prefixes (without leading or trailing `/`) whose entire
+    /// subtree is in cone, e.g. `dir1/dir2`.
+    recursive_dirs: Vec<Vec<u8>>,
+    /// Parent directories that are in cone only for their direct files
+    /// (the `/dir/*` guard Git emits so intermediate directories keep their
+    /// own files). Stored without leading or trailing `/`.
+    parent_dirs: Vec<Vec<u8>>,
+}
+
+impl SparseMatcher {
+    fn new(sparse: &SparseCheckout, mode: SparseCheckoutMode) -> Self {
+        let resolved = match mode {
+            SparseCheckoutMode::Auto => {
+                if patterns_are_cone(&sparse.patterns) {
+                    SparseCheckoutMode::Cone
+                } else {
+                    SparseCheckoutMode::Full
+                }
+            }
+            other => other,
+        };
+        match resolved {
+            SparseCheckoutMode::Cone => SparseMatcher::Cone(ConeMatcher::compile(&sparse.patterns)),
+            // `Auto` has been resolved above; everything else is full matching.
+            _ => {
+                let mut patterns = Vec::new();
+                for pattern in &sparse.patterns {
+                    push_ignore_pattern(&mut patterns, pattern, &[], b"sparse-checkout", 0);
+                }
+                SparseMatcher::Full { patterns }
+            }
+        }
+    }
+
+    /// Returns `true` when the given file path should be present in the
+    /// worktree under this sparse specification.
+    fn includes_file(&self, path: &[u8]) -> bool {
+        match self {
+            SparseMatcher::Full { patterns } => {
+                let mut included = false;
+                for pattern in patterns {
+                    if pattern.matches(path, false) {
+                        included = !pattern.negated;
+                    }
+                }
+                included
+            }
+            SparseMatcher::Cone(cone) => cone.includes_file(path),
+        }
+    }
+}
+
+impl ConeMatcher {
+    fn compile(patterns: &[Vec<u8>]) -> Self {
+        let mut matcher = ConeMatcher::default();
+        for raw in patterns {
+            let line = sparse_clean_line(raw);
+            if line.is_empty() || line.starts_with(b"#") {
+                continue;
+            }
+            // Negated guards such as `!/*/` and `!/dir/*/` only exist to stop a
+            // recursive match from pulling in nested directories; the positive
+            // patterns already capture the cone, so we ignore the negations.
+            if line.starts_with(b"!") {
+                continue;
+            }
+            if line == b"/*" {
+                matcher.root_files = true;
+                continue;
+            }
+            // `/dir/` -> recursive subtree.
+            if let Some(rest) = line.strip_prefix(b"/")
+                && let Some(dir) = rest.strip_suffix(b"/")
+                && !dir.is_empty()
+            {
+                matcher.recursive_dirs.push(dir.to_vec());
+                continue;
+            }
+            // `/dir/*` -> direct files of `dir` only (parent guard).
+            if let Some(rest) = line.strip_prefix(b"/")
+                && let Some(dir) = rest.strip_suffix(b"/*")
+                && !dir.is_empty()
+            {
+                matcher.parent_dirs.push(dir.to_vec());
+                continue;
+            }
+        }
+        matcher
+    }
+
+    fn includes_file(&self, path: &[u8]) -> bool {
+        let parent = match path.iter().rposition(|byte| *byte == b'/') {
+            Some(index) => &path[..index],
+            None => {
+                // A path with no slash is a top-level file.
+                return self.root_files;
+            }
+        };
+        if self
+            .recursive_dirs
+            .iter()
+            .any(|dir| path_is_under_dir(path, dir))
+        {
+            return true;
+        }
+        self.parent_dirs.iter().any(|dir| dir.as_slice() == parent)
+    }
+}
+
+/// Strips a CR, leading/trailing whitespace, and an optional trailing slash is
+/// preserved (cone patterns are slash sensitive) from a raw sparse line.
+fn sparse_clean_line(raw: &[u8]) -> &[u8] {
+    let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+    trim_ascii_whitespace(line)
+}
+
+/// Returns `true` when `path` is the directory `dir` itself or lives anywhere
+/// beneath it.
+fn path_is_under_dir(path: &[u8], dir: &[u8]) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    path.strip_prefix(dir)
+        .is_some_and(|rest| rest.first() == Some(&b'/'))
+}
+
+/// Heuristic used by [`SparseCheckoutMode::Auto`]: the pattern set is cone
+/// shaped when every (non-comment, non-blank) line is one of the restricted
+/// cone forms Git emits.
+fn patterns_are_cone(patterns: &[Vec<u8>]) -> bool {
+    let mut saw_pattern = false;
+    for raw in patterns {
+        let line = sparse_clean_line(raw);
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        saw_pattern = true;
+        let body = line.strip_prefix(b"!").unwrap_or(line);
+        let is_cone_shaped = body == b"/*"
+            || body == b"/*/"
+            || (body.starts_with(b"/")
+                && (body.ends_with(b"/") || body.ends_with(b"/*"))
+                && !sparse_has_glob_meta(body));
+        if !is_cone_shaped {
+            return false;
+        }
+    }
+    saw_pattern
+}
+
+/// Detects glob metacharacters that disqualify a line from cone interpretation.
+/// A single trailing `/*` is allowed by the caller and handled separately.
+fn sparse_has_glob_meta(body: &[u8]) -> bool {
+    let trimmed = body.strip_suffix(b"/*").unwrap_or(body);
+    trimmed
+        .iter()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
+}
+
 fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {
     let Ok(config) = GitConfig::read(root.join(".git").join("config")) else {
         return false;
@@ -2562,6 +2773,118 @@ fn checkout_commit_to_index_and_worktree(
     Ok(target_entries.len())
 }
 
+/// Sparse- and skip-worktree-aware variant of
+/// [`checkout_commit_to_index_and_worktree`].
+///
+/// When `sparse` is `None` this behaves like the plain checkout except that it
+/// preserves any pre-existing skip-worktree bits (so an already-sparse worktree
+/// is not silently re-expanded). When `sparse` is `Some`, every target path is
+/// additionally classified against the patterns: in-cone paths are written and
+/// have their skip-worktree bit cleared, while out-of-cone paths are left out
+/// of the worktree, get their skip-worktree bit set, and have any stale file
+/// removed.
+fn checkout_commit_to_index_and_worktree_sparse(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+    sparse: Option<(&SparseCheckout, SparseCheckoutMode)>,
+) -> Result<usize> {
+    let previously_skipped = skip_worktree_paths(git_dir, format)?;
+    // Honor skip-worktree: a path whose worktree file is intentionally absent
+    // must not be treated as a dirty (deleted) change blocking the checkout.
+    let status = short_status(worktree_root, git_dir, format)?;
+    if status
+        .iter()
+        .any(|entry| !previously_skipped.contains(&entry.path))
+    {
+        return Err(GitError::Transaction(
+            "checkout requires a clean working tree".into(),
+        ));
+    }
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let commit = read_commit(&db, format, target)?;
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+
+    let matcher = sparse.map(|(spec, mode)| SparseMatcher::new(spec, mode));
+
+    for path in read_index_entries(git_dir, format)?.keys() {
+        if target_entries.contains_key(path) {
+            continue;
+        }
+        // Do not disturb the worktree state of an intentionally skipped path.
+        if previously_skipped.contains(path) {
+            continue;
+        }
+        remove_worktree_file(worktree_root, path)?;
+    }
+
+    let mut index_entries = Vec::new();
+    for (path, entry) in &target_entries {
+        let in_cone = matcher.as_ref().is_none_or(|matcher| {
+            // A path already marked skip-worktree stays out unless it now
+            // matches the sparse cone, mirroring upstream "honor skip-worktree".
+            matcher.includes_file(path)
+        });
+        let index_entry = if in_cone {
+            let object = db.read_object(&entry.oid)?;
+            if object.object_type != ObjectType::Blob {
+                return Err(GitError::InvalidObject(format!(
+                    "expected blob {}, found {}",
+                    entry.oid,
+                    object.object_type.as_str()
+                )));
+            }
+            let file_path = worktree_path(worktree_root, path)?;
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&file_path, &object.body)?;
+            let metadata = fs::metadata(&file_path)?;
+            let mut index_entry =
+                index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+            index_entry.mode = entry.mode;
+            // `index_entry_from_metadata` leaves flags_extended at 0, so the
+            // skip-worktree bit is already clear for in-cone paths.
+            index_entry
+        } else {
+            // Out of cone: ensure no stale worktree file remains and synthesize
+            // an index entry straight from the tree (no worktree metadata),
+            // then mark it skip-worktree.
+            remove_worktree_file(worktree_root, path)?;
+            let mut index_entry = restored_head_index_entry(worktree_root, &db, path, entry)?;
+            set_skip_worktree(&mut index_entry);
+            index_entry
+        };
+        index_entries.push(index_entry);
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut index = Index {
+        version: 2,
+        entries: index_entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(repository_index_path(git_dir), index.write(format)?)?;
+    Ok(target_entries.len())
+}
+
+fn skip_worktree_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<Vec<u8>>> {
+    let index_path = repository_index_path(git_dir);
+    if !index_path.exists() {
+        return Ok(BTreeSet::new());
+    }
+    let index = Index::parse(&fs::read(index_path)?, format)?;
+    Ok(index
+        .entries
+        .into_iter()
+        .filter(index_entry_skip_worktree)
+        .map(|entry| entry.path)
+        .collect())
+}
+
 pub fn restore_worktree_paths(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -2986,6 +3309,166 @@ pub fn reset_index_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
+}
+
+/// Enforces a [`SparseCheckout`] against the current index and worktree.
+///
+/// Every stage-0 index entry is classified with the sparse patterns (see
+/// [`SparseCheckoutMode`] for the matching semantics):
+///
+/// * **In cone**: the skip-worktree bit is cleared and, if the worktree file is
+///   missing, it is re-materialized from the entry's blob in the object
+///   database. Existing worktree files are left untouched so local content is
+///   preserved.
+/// * **Out of cone**: the skip-worktree bit is set and any existing worktree
+///   file is removed (empty parent directories are pruned).
+///
+/// Conflicted entries (stage != 0) are never given the skip-worktree bit and
+/// are left alone, matching upstream Git. The index is rewritten in place.
+pub fn apply_sparse_checkout(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    sparse: &SparseCheckout,
+) -> Result<ApplySparseResult> {
+    apply_sparse_checkout_with_mode(
+        worktree_root,
+        git_dir,
+        format,
+        sparse,
+        SparseCheckoutMode::Auto,
+    )
+}
+
+/// Like [`apply_sparse_checkout`] but lets the caller force the pattern
+/// interpretation instead of auto-detecting it.
+pub fn apply_sparse_checkout_with_mode(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    sparse: &SparseCheckout,
+    mode: SparseCheckoutMode,
+) -> Result<ApplySparseResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let index_path = repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        return Ok(ApplySparseResult {
+            materialized: Vec::new(),
+            skipped: Vec::new(),
+        });
+    };
+    let matcher = SparseMatcher::new(sparse, mode);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut materialized = Vec::new();
+    let mut skipped = Vec::new();
+    for entry in &mut index.entries {
+        // Never touch conflicted entries.
+        if index_entry_stage(entry) != 0 {
+            continue;
+        }
+        if matcher.includes_file(&entry.path) {
+            clear_skip_worktree(entry);
+            let file_path = worktree_path(worktree_root, &entry.path)?;
+            if !file_path.exists() {
+                materialize_index_entry_file(&db, &file_path, entry)?;
+            }
+            materialized.push(entry.path.clone());
+        } else {
+            set_skip_worktree(entry);
+            remove_worktree_file(worktree_root, &entry.path)?;
+            skipped.push(entry.path.clone());
+        }
+    }
+    normalize_index_version_for_extended_flags(&mut index);
+    fs::write(index_path, index.write(format)?)?;
+    Ok(ApplySparseResult {
+        materialized,
+        skipped,
+    })
+}
+
+/// Checks out `target` like [`checkout_detached`], but materializes the
+/// worktree through the supplied [`SparseCheckout`]: out-of-cone paths are not
+/// written, get their skip-worktree bit set, and have any stale worktree file
+/// removed. Existing public checkout entry points are unchanged; this is an
+/// additive sparse-aware variant.
+///
+/// The pattern interpretation is auto-detected ([`SparseCheckoutMode::Auto`]);
+/// to reconcile an existing checkout under an explicit mode use
+/// [`apply_sparse_checkout_with_mode`].
+pub fn checkout_detached_sparse(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    target: &ObjectId,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+    sparse: &SparseCheckout,
+) -> Result<CheckoutResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let files = checkout_commit_to_index_and_worktree_sparse(
+        worktree_root,
+        git_dir,
+        format,
+        target,
+        Some((sparse, SparseCheckoutMode::Auto)),
+    )?;
+    let refs = FileRefStore::new(git_dir, format);
+    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Direct(target.clone()),
+        reflog: Some(ReflogEntry {
+            old_oid: zero,
+            new_oid: target.clone(),
+            committer,
+            message,
+        }),
+    });
+    tx.commit()?;
+    Ok(CheckoutResult {
+        branch: target.to_string(),
+        oid: target.clone(),
+        files,
+    })
+}
+
+fn materialize_index_entry_file(
+    db: &FileObjectDatabase,
+    file_path: &Path,
+    entry: &IndexEntry,
+) -> Result<()> {
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(file_path, object.body)?;
+    Ok(())
+}
+
+fn set_skip_worktree(entry: &mut IndexEntry) {
+    entry.flags |= INDEX_FLAG_EXTENDED;
+    entry.flags_extended |= INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+}
+
+fn clear_skip_worktree(entry: &mut IndexEntry) {
+    entry.flags_extended &= !INDEX_EXTENDED_FLAG_SKIP_WORKTREE;
+    if entry.flags_extended == 0 {
+        entry.flags &= !INDEX_FLAG_EXTENDED;
+    }
 }
 
 pub fn restore_worktree_paths_from_head(
@@ -4143,5 +4626,316 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn index_entry_for<'a>(index: &'a Index, path: &[u8]) -> &'a IndexEntry {
+        index
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing index entry for {}",
+                    String::from_utf8_lossy(path)
+                )
+            })
+    }
+
+    fn read_index(git_dir: &Path) -> Index {
+        Index::parse(
+            &fs::read(repository_index_path(git_dir)).unwrap(),
+            ObjectFormat::Sha1,
+        )
+        .unwrap()
+    }
+
+    /// Stages `paths` from the worktree, writes their tree, wraps it in a commit
+    /// object, and points `refs/heads/main` + `HEAD` at it. Returns the commit
+    /// id. After this call the index reflects the committed tree.
+    fn build_commit(root: &Path, git_dir: &Path, paths: &[&str]) -> ObjectId {
+        let path_bufs = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
+        add_paths_to_index(root, git_dir, ObjectFormat::Sha1, &path_bufs).unwrap();
+        let tree = write_tree_from_index(git_dir, ObjectFormat::Sha1).unwrap();
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        body.extend_from_slice(b"author Test <test@example.com> 0 +0000\n");
+        body.extend_from_slice(b"committer Test <test@example.com> 0 +0000\n");
+        body.extend_from_slice(b"\n");
+        body.extend_from_slice(b"sparse fixture\n");
+        let mut odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+        let commit = odb
+            .write_object(EncodedObject::new(ObjectType::Commit, body))
+            .unwrap();
+        let refs = FileRefStore::new(git_dir, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(commit.clone()),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/main".into()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+        commit
+    }
+
+    fn full_sparse(patterns: &[&[u8]]) -> SparseCheckout {
+        SparseCheckout {
+            patterns: patterns.iter().map(|pattern| pattern.to_vec()).collect(),
+            sparse_index: false,
+        }
+    }
+
+    #[test]
+    fn apply_sparse_checkout_full_mode_skips_out_of_cone_paths() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("in")).unwrap();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::write(root.join("in").join("keep.txt"), b"keep\n").unwrap();
+        fs::write(root.join("out").join("drop.txt"), b"drop\n").unwrap();
+        fs::write(root.join("top.txt"), b"top\n").unwrap();
+        build_commit(
+            &root,
+            &git_dir,
+            &["in/keep.txt", "out/drop.txt", "top.txt"],
+        );
+
+        // Full (non-cone) pattern: keep only the `in/` subtree.
+        let sparse = full_sparse(&[b"/in/"]);
+        let result = apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            SparseCheckoutMode::Full,
+        )
+        .unwrap();
+
+        assert!(root.join("in").join("keep.txt").exists());
+        assert!(!root.join("out").join("drop.txt").exists());
+        assert!(!root.join("top.txt").exists());
+        assert!(result.materialized.contains(&b"in/keep.txt".to_vec()));
+        assert!(result.skipped.contains(&b"out/drop.txt".to_vec()));
+        assert!(result.skipped.contains(&b"top.txt".to_vec()));
+
+        let index = read_index(&git_dir);
+        assert!(!index_entry_skip_worktree(index_entry_for(&index, b"in/keep.txt")));
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"out/drop.txt"
+        )));
+        assert!(index_entry_skip_worktree(index_entry_for(&index, b"top.txt")));
+        // Out-of-cone entries are preserved in the index, just not on disk.
+        assert_eq!(index.entries.len(), 3);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_sparse_checkout_toggle_rematerializes() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("a")).unwrap();
+        fs::create_dir_all(root.join("b")).unwrap();
+        fs::write(root.join("a").join("file.txt"), b"a\n").unwrap();
+        fs::write(root.join("b").join("file.txt"), b"b\n").unwrap();
+        build_commit(&root, &git_dir, &["a/file.txt", "b/file.txt"]);
+
+        // First narrow to `a/`.
+        apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &full_sparse(&[b"/a/"]),
+            SparseCheckoutMode::Full,
+        )
+        .unwrap();
+        assert!(root.join("a").join("file.txt").exists());
+        assert!(!root.join("b").join("file.txt").exists());
+        let index = read_index(&git_dir);
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"b/file.txt"
+        )));
+
+        // Now switch the cone to `b/`: `a/` must leave, `b/` must come back with
+        // the correct content, and the skip-worktree bits must flip.
+        apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &full_sparse(&[b"/b/"]),
+            SparseCheckoutMode::Full,
+        )
+        .unwrap();
+        assert!(!root.join("a").join("file.txt").exists());
+        assert!(root.join("b").join("file.txt").exists());
+        assert_eq!(
+            fs::read(root.join("b").join("file.txt")).unwrap(),
+            b"b\n"
+        );
+        let index = read_index(&git_dir);
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"a/file.txt"
+        )));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"b/file.txt"
+        )));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_sparse_checkout_cone_mode_matches_directory_prefixes() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("kept").join("nested")).unwrap();
+        fs::create_dir_all(root.join("other")).unwrap();
+        fs::write(root.join("kept").join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("kept").join("nested").join("b.txt"), b"b\n").unwrap();
+        fs::write(root.join("other").join("c.txt"), b"c\n").unwrap();
+        fs::write(root.join("root.txt"), b"r\n").unwrap();
+        build_commit(
+            &root,
+            &git_dir,
+            &[
+                "kept/a.txt",
+                "kept/nested/b.txt",
+                "other/c.txt",
+                "root.txt",
+            ],
+        );
+
+        // Standard cone patterns: top-level files plus the whole `kept/` tree.
+        let sparse = SparseCheckout {
+            patterns: vec![
+                b"/*".to_vec(),
+                b"!/*/".to_vec(),
+                b"/kept/".to_vec(),
+            ],
+            sparse_index: false,
+        };
+        // Auto mode should detect cone shape on its own.
+        assert!(patterns_are_cone(&sparse.patterns));
+        apply_sparse_checkout(&root, &git_dir, ObjectFormat::Sha1, &sparse).unwrap();
+
+        assert!(root.join("root.txt").exists());
+        assert!(root.join("kept").join("a.txt").exists());
+        assert!(root.join("kept").join("nested").join("b.txt").exists());
+        assert!(!root.join("other").join("c.txt").exists());
+
+        let index = read_index(&git_dir);
+        assert!(!index_entry_skip_worktree(index_entry_for(&index, b"root.txt")));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"kept/a.txt"
+        )));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"kept/nested/b.txt"
+        )));
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"other/c.txt"
+        )));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_sparse_checkout_honors_preexisting_skip_worktree_via_idempotence() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("in")).unwrap();
+        fs::create_dir_all(root.join("out")).unwrap();
+        fs::write(root.join("in").join("keep.txt"), b"keep\n").unwrap();
+        fs::write(root.join("out").join("drop.txt"), b"drop\n").unwrap();
+        build_commit(&root, &git_dir, &["in/keep.txt", "out/drop.txt"]);
+
+        let sparse = full_sparse(&[b"/in/"]);
+        apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            SparseCheckoutMode::Full,
+        )
+        .unwrap();
+        assert!(!root.join("out").join("drop.txt").exists());
+
+        // Re-applying the same spec is a no-op: the already-skipped file stays
+        // absent and the bit stays set (we do not resurrect it).
+        let result = apply_sparse_checkout_with_mode(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &sparse,
+            SparseCheckoutMode::Full,
+        )
+        .unwrap();
+        assert!(!root.join("out").join("drop.txt").exists());
+        assert!(root.join("in").join("keep.txt").exists());
+        assert!(result.skipped.contains(&b"out/drop.txt".to_vec()));
+        let index = read_index(&git_dir);
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"out/drop.txt"
+        )));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checkout_detached_sparse_only_writes_in_cone_paths() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(root.join("keep")).unwrap();
+        fs::create_dir_all(root.join("skip")).unwrap();
+        fs::write(root.join("keep").join("a.txt"), b"a\n").unwrap();
+        fs::write(root.join("skip").join("b.txt"), b"b\n").unwrap();
+        let commit = build_commit(&root, &git_dir, &["keep/a.txt", "skip/b.txt"]);
+
+        // The worktree is clean and matches the commit. A sparse checkout must
+        // keep the in-cone file and evict the out-of-cone one.
+        let sparse = full_sparse(&[b"/keep/"]);
+        let result = checkout_detached_sparse(
+            &root,
+            &git_dir,
+            ObjectFormat::Sha1,
+            &commit,
+            b"Test <test@example.com> 0 +0000".to_vec(),
+            b"checkout".to_vec(),
+            &sparse,
+        )
+        .unwrap();
+        assert_eq!(result.files, 2);
+
+        assert!(root.join("keep").join("a.txt").exists());
+        assert_eq!(
+            fs::read(root.join("keep").join("a.txt")).unwrap(),
+            b"a\n"
+        );
+        assert!(!root.join("skip").join("b.txt").exists());
+
+        let index = read_index(&git_dir);
+        assert_eq!(index.entries.len(), 2);
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"keep/a.txt"
+        )));
+        let skipped = index_entry_for(&index, b"skip/b.txt");
+        assert!(index_entry_skip_worktree(skipped));
+        // The skipped entry still carries the committed blob id and mode.
+        assert_eq!(skipped.mode, 0o100644);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -3378,9 +3378,364 @@ impl Index {
         out.extend_from_slice(checksum.as_bytes());
         Ok(out)
     }
+
+    /// Iterate the optional/required extension chunks stored in `self.extensions`.
+    ///
+    /// The extension area of an index is a flat sequence of
+    /// `[4-byte signature][4-byte big-endian length][body]` records, terminated
+    /// by the trailing object-id checksum (which is *not* part of
+    /// `self.extensions`). This returns `(signature, body)` for each record in
+    /// order, or an error if the area is malformed.
+    pub fn extension_chunks(&self) -> Result<Vec<([u8; 4], &[u8])>> {
+        parse_index_extension_chunks(&self.extensions)
+    }
+
+    /// Return the raw body of the first extension chunk with `signature`, if any.
+    pub fn extension(&self, signature: &[u8; 4]) -> Result<Option<&[u8]>> {
+        Ok(self
+            .extension_chunks()?
+            .into_iter()
+            .find(|(id, _)| id == signature)
+            .map(|(_, body)| body))
+    }
+
+    /// Parse the `TREE` (cache-tree) extension, if present.
+    ///
+    /// `format` selects the object-id width used for the embedded tree ids.
+    pub fn cache_tree(&self, format: ObjectFormat) -> Result<Option<CacheTree>> {
+        match self.extension(b"TREE")? {
+            Some(body) => Ok(Some(CacheTree::parse(format, body)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Replace (or insert) the `TREE` extension with `cache_tree`, keeping every
+    /// other extension chunk in its original order.
+    ///
+    /// Passing `None` removes the `TREE` extension. The serialized cache-tree is
+    /// byte-compatible with upstream git, so the rewritten `self.extensions`
+    /// round-trips through [`Index::cache_tree`] and is readable by `git`.
+    pub fn set_cache_tree(&mut self, cache_tree: Option<&CacheTree>) -> Result<()> {
+        let chunks = self.extension_chunks()?;
+        let mut rebuilt = Vec::with_capacity(self.extensions.len());
+        let mut replaced = false;
+        for (id, body) in chunks {
+            if &id == b"TREE" {
+                if let Some(cache_tree) = cache_tree {
+                    encode_index_extension(&mut rebuilt, b"TREE", &cache_tree.write()?)?;
+                }
+                replaced = true;
+            } else {
+                encode_index_extension(&mut rebuilt, &id, body)?;
+            }
+        }
+        if !replaced && let Some(cache_tree) = cache_tree {
+            // git emits `TREE` ahead of most other extensions; when none was
+            // present we prepend it so freshly written indexes match git's
+            // ordering.
+            let mut prefixed = Vec::with_capacity(rebuilt.len() + cache_tree_estimate(cache_tree));
+            encode_index_extension(&mut prefixed, b"TREE", &cache_tree.write()?)?;
+            prefixed.extend_from_slice(&rebuilt);
+            rebuilt = prefixed;
+        }
+        self.extensions = rebuilt;
+        Ok(())
+    }
 }
 
 const INDEX_FLAG_EXTENDED: u16 = 0x4000;
+
+/// The cache-tree (`TREE`) extension: a recursive cache of the tree object ids
+/// that a fully-staged index would write, mirroring `struct cache_tree` in git.
+///
+/// On disk the extension body is a pre-order (depth-first) sequence of records,
+/// one per node of the directory tree. Each record is:
+///
+/// ```text
+/// <path-component> NUL          (the root node's component is empty)
+/// <ASCII entry_count> SP <ASCII subtree_count> LF
+/// <raw object id>               (present iff entry_count >= 0)
+/// ```
+///
+/// `entry_count` is the number of blobs/subtrees the cached tree object spans,
+/// or `-1` when the entry is invalid (dirty); an invalid entry stores no object
+/// id. `subtree_count` is the number of immediate child directories, whose
+/// records follow recursively. [`CacheTree`] models the root node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTree {
+    /// Number of index entries covered by this (sub)tree, or `-1` if invalid.
+    pub entry_count: i32,
+    /// The cached tree object id, present iff `entry_count >= 0`.
+    pub oid: Option<ObjectId>,
+    /// Immediate child directories, in the order git stores them (sorted).
+    pub subtrees: Vec<CacheTreeChild>,
+}
+
+/// A named child of a [`CacheTree`] node (a subdirectory's cached tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheTreeChild {
+    /// The directory's path component (no separators, never empty).
+    pub name: Vec<u8>,
+    /// The cached subtree rooted at this directory.
+    pub tree: CacheTree,
+}
+
+impl CacheTree {
+    /// Parse the body of a `TREE` extension (the bytes after the 8-byte
+    /// signature/length header).
+    pub fn parse(format: ObjectFormat, body: &[u8]) -> Result<Self> {
+        let mut offset = 0usize;
+        let (entry_count, oid, subtrees) =
+            parse_cache_tree_node(format, body, &mut offset, &[])?;
+        if offset != body.len() {
+            return Err(GitError::InvalidFormat(
+                "trailing bytes after cache-tree root".into(),
+            ));
+        }
+        Ok(Self {
+            entry_count,
+            oid,
+            subtrees,
+        })
+    }
+
+    /// Serialize this cache-tree to a `TREE` extension body, byte-compatible
+    /// with upstream git. Returns an error if an entry's validity flag and its
+    /// object id disagree, or if a child name contains a NUL or `/`.
+    pub fn write(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        write_cache_tree_node(self, b"", &mut out)?;
+        Ok(out)
+    }
+
+    /// Serialize this cache-tree as a complete extension chunk (the
+    /// `TREE` signature, big-endian length, and body) ready to splice into an
+    /// index's extension area.
+    pub fn to_extension_bytes(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        encode_index_extension(&mut out, b"TREE", &self.write()?)?;
+        Ok(out)
+    }
+}
+
+/// Rough upper bound on a serialized cache-tree extension chunk, used only to
+/// pre-size buffers.
+fn cache_tree_estimate(tree: &CacheTree) -> usize {
+    fn node(tree: &CacheTree) -> usize {
+        let own = 8
+            + tree
+                .oid
+                .as_ref()
+                .map(|oid| oid.as_bytes().len())
+                .unwrap_or(0)
+            + 16;
+        tree.subtrees
+            .iter()
+            .fold(own, |acc, child| acc + child.name.len() + 1 + node(&child.tree))
+    }
+    8 + node(tree)
+}
+
+fn parse_cache_tree_node(
+    format: ObjectFormat,
+    body: &[u8],
+    offset: &mut usize,
+    expected_name: &[u8],
+) -> Result<(i32, Option<ObjectId>, Vec<CacheTreeChild>)> {
+    // <name> NUL
+    let name_start = *offset;
+    while body.get(*offset).copied() != Some(0) {
+        *offset += 1;
+        if *offset >= body.len() {
+            return Err(GitError::InvalidFormat(
+                "unterminated cache-tree path component".into(),
+            ));
+        }
+    }
+    if &body[name_start..*offset] != expected_name {
+        return Err(GitError::InvalidFormat(
+            "cache-tree path component does not match parent record".into(),
+        ));
+    }
+    *offset += 1; // consume NUL
+
+    // <entry_count> SP <subtree_count> LF
+    let count_start = *offset;
+    while body.get(*offset).copied() != Some(b' ') {
+        *offset += 1;
+        if *offset >= body.len() {
+            return Err(GitError::InvalidFormat(
+                "unterminated cache-tree entry count".into(),
+            ));
+        }
+    }
+    let entry_count: i32 = std::str::from_utf8(&body[count_start..*offset])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| GitError::InvalidFormat("invalid cache-tree entry count".into()))?;
+    *offset += 1; // consume SP
+
+    let subtree_start = *offset;
+    while body.get(*offset).copied() != Some(b'\n') {
+        *offset += 1;
+        if *offset >= body.len() {
+            return Err(GitError::InvalidFormat(
+                "unterminated cache-tree subtree count".into(),
+            ));
+        }
+    }
+    let subtree_count: usize = std::str::from_utf8(&body[subtree_start..*offset])
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .ok_or_else(|| GitError::InvalidFormat("invalid cache-tree subtree count".into()))?;
+    *offset += 1; // consume LF
+
+    // <object id> only when the entry is valid (entry_count >= 0).
+    let oid = if entry_count >= 0 {
+        let oid_end = offset
+            .checked_add(format.raw_len())
+            .ok_or_else(|| GitError::InvalidFormat("cache-tree object id overflow".into()))?;
+        if oid_end > body.len() {
+            return Err(GitError::InvalidFormat(
+                "truncated cache-tree object id".into(),
+            ));
+        }
+        let oid = ObjectId::from_raw(format, &body[*offset..oid_end])?;
+        *offset = oid_end;
+        Some(oid)
+    } else {
+        None
+    };
+
+    let mut subtrees = Vec::with_capacity(subtree_count);
+    let mut previous_name: Option<&[u8]> = None;
+    for _ in 0..subtree_count {
+        // Peek the child's name so we can validate sort order while still
+        // delegating the NUL handling to the recursive call.
+        let child_name_start = *offset;
+        let mut scan = *offset;
+        while body.get(scan).copied() != Some(0) {
+            scan += 1;
+            if scan >= body.len() {
+                return Err(GitError::InvalidFormat(
+                    "unterminated cache-tree path component".into(),
+                ));
+            }
+        }
+        let child_name = body[child_name_start..scan].to_vec();
+        if child_name.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "cache-tree subtree has empty name".into(),
+            ));
+        }
+        if let Some(previous) = previous_name
+            && previous >= child_name.as_slice()
+        {
+            return Err(GitError::InvalidFormat(
+                "cache-tree subtrees are not sorted".into(),
+            ));
+        }
+        let (child_entry_count, child_oid, grandchildren) =
+            parse_cache_tree_node(format, body, offset, &child_name)?;
+        subtrees.push(CacheTreeChild {
+            name: child_name,
+            tree: CacheTree {
+                entry_count: child_entry_count,
+                oid: child_oid,
+                subtrees: grandchildren,
+            },
+        });
+        previous_name = subtrees.last().map(|child| child.name.as_slice());
+    }
+
+    Ok((entry_count, oid, subtrees))
+}
+
+fn write_cache_tree_node(tree: &CacheTree, name: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    if name.contains(&0) || name.contains(&b'/') {
+        return Err(GitError::InvalidFormat(
+            "cache-tree path component contains NUL or separator".into(),
+        ));
+    }
+    out.extend_from_slice(name);
+    out.push(0);
+    out.extend_from_slice(tree.entry_count.to_string().as_bytes());
+    out.push(b' ');
+    out.extend_from_slice(tree.subtrees.len().to_string().as_bytes());
+    out.push(b'\n');
+    match (&tree.oid, tree.entry_count >= 0) {
+        (Some(oid), true) => out.extend_from_slice(oid.as_bytes()),
+        (None, false) => {}
+        (Some(_), false) => {
+            return Err(GitError::InvalidFormat(
+                "invalid cache-tree entry must not carry an object id".into(),
+            ));
+        }
+        (None, true) => {
+            return Err(GitError::InvalidFormat(
+                "valid cache-tree entry is missing its object id".into(),
+            ));
+        }
+    }
+    // git keeps subtrees sorted by name; enforce it so output is canonical.
+    let mut previous: Option<&[u8]> = None;
+    for child in &tree.subtrees {
+        if let Some(previous) = previous
+            && previous >= child.name.as_slice()
+        {
+            return Err(GitError::InvalidFormat(
+                "cache-tree subtrees must be sorted by name".into(),
+            ));
+        }
+        previous = Some(child.name.as_slice());
+        write_cache_tree_node(&child.tree, &child.name, out)?;
+    }
+    Ok(())
+}
+
+/// Walk the flat extension area of an index, returning each
+/// `(4-byte signature, body)` record in order.
+fn parse_index_extension_chunks(extensions: &[u8]) -> Result<Vec<([u8; 4], &[u8])>> {
+    let mut chunks = Vec::new();
+    let mut offset = 0usize;
+    while offset < extensions.len() {
+        if extensions.len() - offset < 8 {
+            return Err(GitError::InvalidFormat(
+                "truncated index extension header".into(),
+            ));
+        }
+        let signature = [
+            extensions[offset],
+            extensions[offset + 1],
+            extensions[offset + 2],
+            extensions[offset + 3],
+        ];
+        let len = u32_be(&extensions[offset + 4..offset + 8]) as usize;
+        let body_start = offset + 8;
+        let body_end = body_start
+            .checked_add(len)
+            .ok_or_else(|| GitError::InvalidFormat("index extension length overflow".into()))?;
+        if body_end > extensions.len() {
+            return Err(GitError::InvalidFormat(
+                "index extension body extends past end".into(),
+            ));
+        }
+        chunks.push((signature, &extensions[body_start..body_end]));
+        offset = body_end;
+    }
+    Ok(chunks)
+}
+
+/// Append a single extension chunk (`signature`, big-endian length, `body`) to
+/// `out`.
+fn encode_index_extension(out: &mut Vec<u8>, signature: &[u8; 4], body: &[u8]) -> Result<()> {
+    let len = u32::try_from(body.len())
+        .map_err(|_| GitError::InvalidFormat("index extension body too large".into()))?;
+    out.extend_from_slice(signature);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(body);
+    Ok(())
+}
 
 fn decode_index_v4_path_strip_len(
     bytes: &[u8],
@@ -4867,6 +5222,333 @@ mod tests {
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         assert!(Index::parse_v2_sha1(&bytes).is_err());
+    }
+
+    /// Build a minimal index entry for the given path / object id.
+    fn index_entry(path: &[u8], hex: &str) -> IndexEntry {
+        IndexEntry {
+            ctime_seconds: 1,
+            ctime_nanoseconds: 2,
+            mtime_seconds: 3,
+            mtime_nanoseconds: 4,
+            dev: 5,
+            ino: 6,
+            mode: 0o100644,
+            uid: 7,
+            gid: 8,
+            size: 9,
+            oid: oid(hex),
+            // git stores `min(path_len, 0xfff)` in the low 12 bits of `flags`.
+            flags: u16::try_from(path.len().min(0xfff)).unwrap(),
+            flags_extended: 0,
+            path: path.to_vec(),
+        }
+    }
+
+    /// Three entries with shared prefixes; the middle one carries the
+    /// skip-worktree extended flag (on-disk value `0x4000`).
+    fn sample_index(version: u32) -> Index {
+        let mut skip = index_entry(b"src/lib.rs", "2e65efe2a145dda7ee51d1741299f848e5bf752e");
+        skip.flags |= INDEX_FLAG_EXTENDED;
+        skip.flags_extended = INDEX_SKIP_WORKTREE_ON_DISK;
+        Index {
+            version,
+            entries: vec![
+                index_entry(b"README.md", "ce013625030ba8dba906f756967f9e9ca394464a"),
+                index_entry(b"src/bin.rs", "1234567890123456789012345678901234567890"),
+                skip,
+                index_entry(b"src/main.rs", "abcdef0123456789abcdef0123456789abcdef01"),
+            ],
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    }
+
+    /// On-disk extended-flags bit for skip-worktree (git's `CE_SKIP_WORKTREE`
+    /// stored as `flags >> 16`).
+    const INDEX_SKIP_WORKTREE_ON_DISK: u16 = 0x4000;
+
+    #[test]
+    fn index_v3_round_trips_skip_worktree_extended_flags() {
+        let index = sample_index(3);
+        let bytes = index.write_sha1().unwrap();
+        // Header advertises version 3.
+        assert_eq!(&bytes[0..4], b"DIRC");
+        assert_eq!(u32_be(&bytes[4..8]), 3);
+        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        assert_eq!(parsed.version, 3);
+        assert_eq!(parsed.entries, index.entries);
+        assert_eq!(parsed.extensions, index.extensions);
+        // The skip-worktree entry must round-trip its extended bit + flag.
+        let skip = parsed
+            .entries
+            .iter()
+            .find(|entry| entry.path == b"src/lib.rs")
+            .unwrap();
+        assert_ne!(skip.flags & INDEX_FLAG_EXTENDED, 0);
+        assert_eq!(skip.flags_extended, INDEX_SKIP_WORKTREE_ON_DISK);
+        // Plain entries stay v2-style (no extended bit, no extended field).
+        let plain = parsed
+            .entries
+            .iter()
+            .find(|entry| entry.path == b"README.md")
+            .unwrap();
+        assert_eq!(plain.flags & INDEX_FLAG_EXTENDED, 0);
+        assert_eq!(plain.flags_extended, 0);
+    }
+
+    #[test]
+    fn index_all_versions_round_trip_same_entries() {
+        // The same logical entries should survive a write/parse cycle for every
+        // supported on-disk version, differing only in `version`.
+        for version in [2u32, 3, 4] {
+            let mut index = sample_index(version);
+            if version == 2 {
+                // v2 cannot encode extended flags; drop them for this case.
+                for entry in &mut index.entries {
+                    entry.flags &= !INDEX_FLAG_EXTENDED;
+                    entry.flags_extended = 0;
+                }
+            }
+            let bytes = index.write_sha1().unwrap();
+            assert_eq!(u32_be(&bytes[4..8]), version);
+            let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+            assert_eq!(parsed.version, version, "version {version}");
+            assert_eq!(parsed.entries, index.entries, "entries for v{version}");
+        }
+    }
+
+    #[test]
+    fn index_v2_writer_rejects_extended_flags() {
+        let index = sample_index(2);
+        // The entries still carry extended flags but the version is 2.
+        assert!(index.write_v2_sha1().is_err());
+    }
+
+    #[test]
+    fn index_v4_path_compression_emits_documented_bytes() {
+        // Two entries sharing the prefix "src/": "src/main.rs" then
+        // "src/main.txt". The shared prefix is "src/main." (9 bytes), so the
+        // second entry strips `len("src/main.rs") - 9 = 2` bytes and stores the
+        // suffix "txt".
+        let index = Index {
+            version: 4,
+            entries: vec![
+                index_entry(b"src/main.rs", "ce013625030ba8dba906f756967f9e9ca394464a"),
+                index_entry(b"src/main.txt", "2e65efe2a145dda7ee51d1741299f848e5bf752e"),
+            ],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let bytes = index.write_sha1().unwrap();
+        // strip_len = 2 -> single varint byte 0x02, then "txt", then NUL.
+        let needle = [0x02, b't', b'x', b't', 0x00];
+        assert!(
+            bytes.windows(needle.len()).any(|window| window == needle),
+            "expected compressed suffix bytes {needle:02x?} in v4 index"
+        );
+        // First entry's full path "src/main.rs" is preceded by strip_len 0.
+        let first = [0x00, b's', b'r', b'c', b'/', b'm', b'a', b'i', b'n'];
+        assert!(bytes.windows(first.len()).any(|window| window == first));
+        // Round-trips.
+        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        assert_eq!(parsed.entries, index.entries);
+
+        // A long strip length uses the multi-byte offset varint git expects.
+        let long = vec![b'a'; 200];
+        let index = Index {
+            version: 4,
+            entries: vec![
+                index_entry(&long, "ce013625030ba8dba906f756967f9e9ca394464a"),
+                index_entry(b"b", "2e65efe2a145dda7ee51d1741299f848e5bf752e"),
+            ],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let bytes = index.write_sha1().unwrap();
+        // strip_len = 200: encode_varint(200) = [0x80, 0x48] (offset form),
+        // followed by suffix "b" and NUL.
+        let needle = [0x80, 0x48, b'b', 0x00];
+        assert!(
+            bytes.windows(needle.len()).any(|window| window == needle),
+            "expected multi-byte strip varint {needle:02x?}"
+        );
+        assert_eq!(Index::parse_v2_sha1(&bytes).unwrap().entries, index.entries);
+    }
+
+    #[test]
+    fn cache_tree_round_trips_documented_layout() {
+        // Mirrors the byte layout git writes: a root spanning 3 entries with one
+        // subtree "sub" spanning 2 entries.
+        let root_oid = oid("13a501cf10c293c9dcb9e49bf6b9bf5f312633d9");
+        let sub_oid = oid("e891cb7572e731c71e3fe1be567821fa5298612d");
+        let mut expected = Vec::new();
+        expected.push(0); // empty root name
+        expected.extend_from_slice(b"3 1\n");
+        expected.extend_from_slice(root_oid.as_bytes());
+        expected.extend_from_slice(b"sub\0");
+        expected.extend_from_slice(b"2 0\n");
+        expected.extend_from_slice(sub_oid.as_bytes());
+
+        let cache_tree = CacheTree {
+            entry_count: 3,
+            oid: Some(root_oid.clone()),
+            subtrees: vec![CacheTreeChild {
+                name: b"sub".to_vec(),
+                tree: CacheTree {
+                    entry_count: 2,
+                    oid: Some(sub_oid.clone()),
+                    subtrees: Vec::new(),
+                },
+            }],
+        };
+        assert_eq!(cache_tree.write().unwrap(), expected);
+        assert_eq!(
+            CacheTree::parse(ObjectFormat::Sha1, &expected).unwrap(),
+            cache_tree
+        );
+    }
+
+    #[test]
+    fn cache_tree_invalid_entry_has_no_oid() {
+        // An invalid (dirty) node uses entry_count -1 and stores no object id.
+        let mut body = Vec::new();
+        body.push(0);
+        body.extend_from_slice(b"-1 0\n");
+        let cache_tree = CacheTree::parse(ObjectFormat::Sha1, &body).unwrap();
+        assert_eq!(cache_tree.entry_count, -1);
+        assert!(cache_tree.oid.is_none());
+        assert_eq!(cache_tree.write().unwrap(), body);
+        // A valid count with a missing id, or invalid count with an id, is rejected.
+        let bad = CacheTree {
+            entry_count: -1,
+            oid: Some(oid("ce013625030ba8dba906f756967f9e9ca394464a")),
+            subtrees: Vec::new(),
+        };
+        assert!(bad.write().is_err());
+    }
+
+    #[test]
+    fn index_set_and_get_cache_tree_round_trips_through_index() {
+        let mut index = sample_index(2);
+        for entry in &mut index.entries {
+            entry.flags &= !INDEX_FLAG_EXTENDED;
+            entry.flags_extended = 0;
+        }
+        let cache_tree = CacheTree {
+            entry_count: 4,
+            oid: Some(oid("13a501cf10c293c9dcb9e49bf6b9bf5f312633d9")),
+            subtrees: vec![CacheTreeChild {
+                name: b"src".to_vec(),
+                tree: CacheTree {
+                    entry_count: 3,
+                    oid: Some(oid("e891cb7572e731c71e3fe1be567821fa5298612d")),
+                    subtrees: Vec::new(),
+                },
+            }],
+        };
+        index.set_cache_tree(Some(&cache_tree)).unwrap();
+        // Extensions now carry a TREE chunk that the generic walker can find.
+        assert!(index.extension(b"TREE").unwrap().is_some());
+        // It survives a full index write/parse cycle.
+        let bytes = index.write_sha1().unwrap();
+        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        assert_eq!(parsed.extensions, index.extensions);
+        assert_eq!(
+            parsed.cache_tree(ObjectFormat::Sha1).unwrap(),
+            Some(cache_tree)
+        );
+        // Removing it clears the chunk.
+        let mut without = parsed.clone();
+        without.set_cache_tree(None).unwrap();
+        assert!(without.extension(b"TREE").unwrap().is_none());
+        assert!(without.cache_tree(ObjectFormat::Sha1).unwrap().is_none());
+    }
+
+    #[test]
+    fn index_preserves_unknown_raw_extensions() {
+        // An extension the typed layer does not understand must round-trip
+        // untouched, and the generic walker must still locate it.
+        let mut extensions = Vec::new();
+        encode_index_extension(&mut extensions, b"link", b"\x00\x01\x02opaque").unwrap();
+        let mut index = sample_index(2);
+        for entry in &mut index.entries {
+            entry.flags &= !INDEX_FLAG_EXTENDED;
+            entry.flags_extended = 0;
+        }
+        index.extensions = extensions.clone();
+        let bytes = index.write_sha1().unwrap();
+        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        assert_eq!(parsed.extensions, extensions);
+        assert_eq!(parsed.extension(b"link").unwrap(), Some(&b"\x00\x01\x02opaque"[..]));
+        // Setting a cache tree leaves the unknown chunk intact.
+        let mut updated = parsed.clone();
+        updated
+            .set_cache_tree(Some(&CacheTree {
+                entry_count: -1,
+                oid: None,
+                subtrees: Vec::new(),
+            }))
+            .unwrap();
+        assert_eq!(
+            updated.extension(b"link").unwrap(),
+            Some(&b"\x00\x01\x02opaque"[..])
+        );
+    }
+
+    #[test]
+    fn git_reads_rust_written_v4_index() {
+        // Gate on a usable `git`.
+        if Command::new("git").arg("--version").output().is_err() {
+            eprintln!("skipping: git not available");
+            return;
+        }
+        let dir = unique_temp_dir("index-v4-git");
+        fs::create_dir_all(&dir).unwrap();
+        run_success("git", &dir, &["init", "-q"]);
+
+        // Write two blobs via git so the object ids exist in the repo, then
+        // build a v4 index referencing them with a matching cache tree and let
+        // `git ls-files` read it back.
+        let readme_oid = String::from_utf8(run_success_with_stdin(
+            "git",
+            &dir,
+            &["hash-object", "-w", "--stdin"],
+            b"readme\n",
+        ))
+        .unwrap();
+        let main_oid = String::from_utf8(run_success_with_stdin(
+            "git",
+            &dir,
+            &["hash-object", "-w", "--stdin"],
+            b"fn main() {}\n",
+        ))
+        .unwrap();
+        let readme_oid = readme_oid.trim();
+        let main_oid = main_oid.trim();
+
+        let index = Index {
+            version: 4,
+            entries: vec![
+                index_entry(b"README.md", readme_oid),
+                index_entry(b"src/main.rs", main_oid),
+            ],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        let bytes = index.write_sha1().unwrap();
+        fs::write(dir.join(".git").join("index"), &bytes).unwrap();
+
+        let listed = run_success("git", &dir, &["ls-files"]);
+        let listed = String::from_utf8(listed).unwrap();
+        assert_eq!(listed, "README.md\nsrc/main.rs\n", "git ls-files output");
+
+        // git must agree the on-disk version is 4.
+        let version = run_success("git", &dir, &["update-index", "--show-index-version"]);
+        let version = String::from_utf8(version).unwrap();
+        assert_eq!(version.trim(), "4");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn oid(hex: &str) -> ObjectId {
