@@ -57,6 +57,8 @@ static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 
+mod commands;
+
 pub fn run(args: Vec<String>) -> Result<()> {
     let global = apply_global_options(&args)?;
     set_global_config_overrides(global.config.clone());
@@ -105,7 +107,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "push" => cmd_push(&args[1..]),
         "receive-pack" => cmd_receive_pack(&args[1..]),
         "upload-pack" => cmd_upload_pack(&args[1..]),
-        "write-tree" => cmd_write_tree(&args[1..]),
+        "write-tree" => commands::trees::cmd_write_tree(&args[1..]),
         "worktree" => cmd_worktree(&args[1..]),
         "update-index" => cmd_update_index(&args[1..]),
         "update-ref" => cmd_update_ref(&args[1..]),
@@ -39905,46 +39907,6 @@ fn commit_identity_timestamp_i64(raw: &[u8]) -> Result<i64> {
     commit_identity_timestamp(raw)
         .parse::<i64>()
         .map_err(|_| GitError::InvalidObject("commit identity is missing timestamp".into()))
-}
-
-fn cmd_write_tree(args: &[String]) -> Result<()> {
-    let mut missing_ok = false;
-    let mut prefix = None;
-    let mut idx = 0;
-    while idx < args.len() {
-        match args[idx].as_str() {
-            "--missing-ok" => missing_ok = true,
-            "--no-missing-ok" => missing_ok = false,
-            "--no-prefix" => prefix = None,
-            "--prefix" => {
-                idx += 1;
-                let Some(value) = args.get(idx) else {
-                    return Err(GitError::Command("--prefix requires a value".into()));
-                };
-                prefix = Some(value.as_bytes().to_vec());
-            }
-            value => {
-                if let Some(value) = value.strip_prefix("--prefix=") {
-                    prefix = Some(value.as_bytes().to_vec());
-                    idx += 1;
-                    continue;
-                }
-                return Err(GitError::Command(format!(
-                    "unsupported write-tree option {value}"
-                )));
-            }
-        }
-        idx += 1;
-    }
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let oid = git_worktree::write_tree_from_index_with_options(
-        git_dir,
-        format,
-        git_worktree::WriteTreeOptions { missing_ok, prefix },
-    )?;
-    println!("{oid}");
-    Ok(())
 }
 
 fn cmd_update_index(args: &[String]) -> Result<()> {
