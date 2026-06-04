@@ -473,6 +473,7 @@ fn describe_one(
             db,
             format,
             options,
+            abbrev,
             search.unannotated_cnt,
             target,
             dirty_suffix,
@@ -733,12 +734,13 @@ fn describe_no_candidate(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     options: &DescribeOptions,
+    abbrev: usize,
     unannotated_cnt: usize,
     target: &ObjectId,
     dirty_suffix: Option<&str>,
 ) -> Result<()> {
     if options.always {
-        let short = describe_abbrev_oid(db, format, target, describe_always_abbrev(options))?;
+        let short = describe_abbrev_oid(db, format, target, abbrev)?;
         println!("{short}{}", dirty_suffix.unwrap_or(""));
         return Ok(());
     }
@@ -755,13 +757,6 @@ fn describe_no_candidate(
 
 /// `--always` still respects an explicit `--abbrev=0` request by widening to the
 /// minimum, mirroring git's fallback which never prints a zero-length name.
-fn describe_always_abbrev(options: &DescribeOptions) -> usize {
-    match options.abbrev {
-        Some(0) => MINIMUM_ABBREV,
-        _ => options.abbrev.unwrap_or(DEFAULT_ABBREV_SENTINEL),
-    }
-}
-
 /// Item for the commit-date priority queue. `Ord` yields a max-heap on date so
 /// the newest commit is processed first; ties fall back to oid for determinism.
 struct DescribeQueueItem {
