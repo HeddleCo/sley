@@ -5,4 +5,5 @@
 //! modules' private items; the only items a submodule must expose are the
 //! `cmd_*` entry points the dispatcher in `run` calls, which are `pub(crate)`.
 
+pub(crate) mod attrs;
 pub(crate) mod trees;
