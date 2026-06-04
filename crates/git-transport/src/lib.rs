@@ -109,6 +109,7 @@ pub enum RemoteTransport {
 pub struct RemoteUrl {
     pub transport: RemoteTransport,
     pub user: Option<String>,
+    pub password: Option<String>,
     pub host: Option<String>,
     pub port: Option<u16>,
     pub path: String,
@@ -701,7 +702,7 @@ pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
         let (authority, path) = value.split_at(colon);
         let path = &path[1..];
         validate_remote_path("remote path", path)?;
-        let (user, host, port) = parse_remote_authority(authority, false)?;
+        let (user, _password, host, port) = parse_remote_authority(authority, false, false)?;
         if port.is_some() {
             return Err(GitError::InvalidFormat(
                 "scp-like SSH remote must not include a port".into(),
@@ -710,6 +711,7 @@ pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
         return Ok(RemoteUrl {
             transport: RemoteTransport::Ssh,
             user,
+            password: None,
             host: Some(host),
             port: None,
             path: path.to_string(),
@@ -719,6 +721,7 @@ pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
     Ok(RemoteUrl {
         transport: RemoteTransport::Local,
         user: None,
+        password: None,
         host: None,
         port: None,
         path: value.to_string(),
@@ -1330,6 +1333,57 @@ pub fn smart_http_rpc_path(repository_path: &str, service: GitService) -> Result
     validate_smart_http_service(service)?;
     let repository_path = normalize_http_repository_path(repository_path)?;
     Ok(format!("{repository_path}/{}", service.as_str()))
+}
+
+/// Build the absolute smart-HTTP service-discovery URL for `remote`, e.g.
+/// `https://host:443/org/repo.git/info/refs?service=git-upload-pack`.
+///
+/// The scheme is derived from `remote.transport` (only `Http`/`Https` are
+/// accepted). Any userinfo/password embedded in `remote` is intentionally
+/// excluded; credentials are supplied separately as request headers.
+pub fn http_smart_info_refs_url(remote: &RemoteUrl, service: GitService) -> Result<String> {
+    let origin = http_remote_origin(remote)?;
+    let path = smart_http_info_refs_path(&remote.path, service)?;
+    Ok(format!("{origin}{path}"))
+}
+
+/// Build the absolute smart-HTTP RPC URL for `remote`, e.g.
+/// `https://host:443/org/repo.git/git-upload-pack`.
+///
+/// The scheme is derived from `remote.transport` (only `Http`/`Https` are
+/// accepted). Any userinfo/password embedded in `remote` is intentionally
+/// excluded; credentials are supplied separately as request headers.
+pub fn http_smart_rpc_url(remote: &RemoteUrl, service: GitService) -> Result<String> {
+    let origin = http_remote_origin(remote)?;
+    let path = smart_http_rpc_path(&remote.path, service)?;
+    Ok(format!("{origin}{path}"))
+}
+
+/// Render the `scheme://host[:port]` origin for an http(s) remote, never
+/// including userinfo. IPv6 hosts are bracketed.
+fn http_remote_origin(remote: &RemoteUrl) -> Result<String> {
+    let scheme = match remote.transport {
+        RemoteTransport::Http => "http",
+        RemoteTransport::Https => "https",
+        _ => {
+            return Err(GitError::InvalidFormat(
+                "smart HTTP URL requires an http or https remote".into(),
+            ));
+        }
+    };
+    let host = remote
+        .host
+        .as_deref()
+        .ok_or_else(|| GitError::InvalidFormat("smart HTTP remote is missing a host".into()))?;
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    match remote.port {
+        Some(port) => Ok(format!("{scheme}://{host}:{port}")),
+        None => Ok(format!("{scheme}://{host}")),
+    }
 }
 
 pub fn dumb_http_info_refs_path(repository_path: &str) -> Result<String> {
@@ -7141,14 +7195,18 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
             Ok(RemoteUrl {
                 transport: RemoteTransport::File,
                 user: None,
+                password: None,
                 host: None,
                 port: None,
                 path: rest.to_string(),
             })
         }
         "ssh" | "git" | "http" | "https" => {
+            let is_http = scheme == "http" || scheme == "https";
             let (authority, path) = split_remote_authority_and_path(rest)?;
-            let (user, host, port) = parse_remote_authority(authority, true)?;
+            // Only http(s) userinfo may carry an embedded password; SSH/git keep
+            // their authority verbatim so existing behavior does not regress.
+            let (user, password, host, port) = parse_remote_authority(authority, true, is_http)?;
             let path = if scheme == "ssh" {
                 percent_decode_remote_path(&path)?
             } else {
@@ -7163,6 +7221,7 @@ fn parse_remote_url_with_scheme(scheme: &str, rest: &str) -> Result<RemoteUrl> {
                     _ => unreachable!("matched remote URL scheme"),
                 },
                 user,
+                password,
                 host: Some(host),
                 port,
                 path,
@@ -7226,27 +7285,48 @@ fn percent_hex_value(byte: u8) -> Option<u8> {
     }
 }
 
+/// Parsed remote authority: `(user, password, host, port)`. Password is only
+/// ever populated for http(s) authorities (see `parse_remote_authority`).
+type ParsedAuthority = (Option<String>, Option<String>, String, Option<u16>);
+
 fn parse_remote_authority(
     value: &str,
     allow_port: bool,
-) -> Result<(Option<String>, String, Option<u16>)> {
+    split_password: bool,
+) -> Result<ParsedAuthority> {
     if value.is_empty() {
         return Err(GitError::InvalidFormat(
             "remote URL is missing a host".into(),
         ));
     }
-    let (user, host_port) = match value.rsplit_once('@') {
-        Some((user, host_port)) => {
-            if user.is_empty() {
+    let (user, password, host_port) = match value.rsplit_once('@') {
+        Some((userinfo, host_port)) => {
+            if userinfo.is_empty() {
                 return Err(GitError::InvalidFormat("remote URL user is empty".into()));
             }
-            (Some(user.to_string()), host_port)
+            if split_password {
+                // For http(s) URLs the userinfo may embed a password as
+                // "user:pass"; split on the first ':' so the password can be
+                // surfaced separately and kept out of derived URLs.
+                match userinfo.split_once(':') {
+                    Some((user, password)) => (
+                        Some(user.to_string()),
+                        Some(password.to_string()),
+                        host_port,
+                    ),
+                    None => (Some(userinfo.to_string()), None, host_port),
+                }
+            } else {
+                // SSH/scp-like authorities keep the userinfo verbatim, matching
+                // existing behavior (no embedded-password concept).
+                (Some(userinfo.to_string()), None, host_port)
+            }
         }
-        None => (None, value),
+        None => (None, None, value),
     };
     let (host, port) = parse_remote_host_port(host_port, allow_port)?;
     validate_remote_host(&host)?;
-    Ok((user, host, port))
+    Ok((user, password, host, port))
 }
 
 fn parse_remote_host_port(value: &str, allow_port: bool) -> Result<(String, Option<u16>)> {
@@ -7667,6 +7747,129 @@ fn trim_trailing_lf(input: &[u8]) -> &[u8] {
     input.strip_suffix(b"\n").unwrap_or(input)
 }
 
+/// User-Agent advertised by the built-in HTTP transport client.
+#[cfg(feature = "http-client")]
+pub const HTTP_USER_AGENT: &str = "git/2.54.0 (git-rs)";
+
+/// A buffered HTTP response whose body streams directly from the network.
+///
+/// Note that *any* HTTP status (including 4xx/5xx) is reported here with a
+/// populated [`status`](HttpResponse::status); transport-level failures are
+/// reported as [`Err`] from the [`HttpClient`] methods instead.
+#[cfg(feature = "http-client")]
+pub struct HttpResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub body: Box<dyn std::io::Read + Send>,
+}
+
+/// Minimal byte-transport over HTTP(S) used to drive smart-HTTP git transport.
+///
+/// Implementations must surface HTTP error statuses (401/403/404/5xx) as
+/// `Ok(HttpResponse { status, .. })` so callers can react to them (for example,
+/// retrying a 401 with credentials). Only genuine transport failures
+/// (DNS/connect/TLS/timeout/protocol) are reported as `Err`.
+#[cfg(feature = "http-client")]
+pub trait HttpClient {
+    /// Issue a `GET` for `url`, sending the additional `headers`.
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse>;
+
+    /// Issue a `POST` for `url` with `body`, sending `content_type` and the
+    /// additional `headers`.
+    fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<HttpResponse>;
+}
+
+/// [`HttpClient`] backed by [`ureq`] with rustls + bundled Mozilla roots.
+#[cfg(feature = "http-client")]
+pub struct UreqHttpClient {
+    agent: ureq::Agent,
+}
+
+#[cfg(feature = "http-client")]
+impl UreqHttpClient {
+    pub fn new() -> Self {
+        // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
+        // response (carrying status + body) rather than an error, which is what
+        // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
+        let config = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .user_agent(HTTP_USER_AGENT)
+            .build();
+        Self {
+            agent: config.into(),
+        }
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl Default for UreqHttpClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(feature = "http-client")]
+impl HttpClient for UreqHttpClient {
+    fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        let mut request = self.agent.get(url);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request
+            .call()
+            .map_err(|err| http_transport_error(url, &err))?;
+        Ok(http_response_from_ureq(response))
+    }
+
+    fn post(
+        &self,
+        url: &str,
+        content_type: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> Result<HttpResponse> {
+        let mut request = self.agent.post(url).header("Content-Type", content_type);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = request
+            .send(body)
+            .map_err(|err| http_transport_error(url, &err))?;
+        Ok(http_response_from_ureq(response))
+    }
+}
+
+/// Convert a successful ureq response into an [`HttpResponse`] that streams its
+/// body from the connection (the body is never buffered into memory here).
+#[cfg(feature = "http-client")]
+fn http_response_from_ureq(response: ureq::http::Response<ureq::Body>) -> HttpResponse {
+    let status = response.status().as_u16();
+    let content_type = response
+        .headers()
+        .get(ureq::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string());
+    let body = response.into_body().into_reader();
+    HttpResponse {
+        status,
+        content_type,
+        body: Box::new(body),
+    }
+}
+
+/// Map a genuine ureq transport/protocol failure to a [`GitError`], always
+/// including the offending `url` in the message.
+#[cfg(feature = "http-client")]
+fn http_transport_error(url: &str, err: &ureq::Error) -> GitError {
+    GitError::Io(format!("HTTP request to {url} failed: {err}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7827,12 +8030,10 @@ mod tests {
         assert!(parse_error_line(b"ERR \n").is_err());
         assert!(parse_error_line(b"ERR bad\0message\n").is_err());
         assert!(parse_error_line(b"NAK\n").is_err());
-        assert!(
-            encode_error_line(&ProtocolErrorLine {
-                message: "bad\nmessage".into(),
-            })
-            .is_err()
-        );
+        assert!(encode_error_line(&ProtocolErrorLine {
+            message: "bad\nmessage".into(),
+        })
+        .is_err());
         assert!(read_error_line(&mut &b"0000"[..]).is_err());
     }
 
@@ -7904,17 +8105,15 @@ mod tests {
             parse_service_request(b"git-upload-pack /repo.git\0\0version=2\0version=1\0").is_err()
         );
         assert!(parse_service_request(b"git-upload-pack /repo.git\0\0version=0\0").is_err());
-        assert!(
-            encode_service_request(&ServiceRequest {
-                service: GitService::UploadPack,
-                path: "/repo.git".into(),
-                host: None,
-                parameters: Vec::new(),
-                protocol: Some(ProtocolVersion::V0),
-                extra_parameters: Vec::new(),
-            })
-            .is_err()
-        );
+        assert!(encode_service_request(&ServiceRequest {
+            service: GitService::UploadPack,
+            path: "/repo.git".into(),
+            host: None,
+            parameters: Vec::new(),
+            protocol: Some(ProtocolVersion::V0),
+            extra_parameters: Vec::new(),
+        })
+        .is_err());
         assert!(read_service_request(&mut &b"0000"[..]).is_err());
     }
 
@@ -7961,20 +8160,16 @@ mod tests {
         assert!(parse_service_announcement(b"# service=git-not-a-service\n").is_err());
         assert!(parse_service_announcement(b"# service=git-upload-pack\0\n").is_err());
         assert!(parse_service_announcement_stream(&[]).is_err());
-        assert!(
-            parse_service_announcement_stream(&[PktLineFrame::Data(
-                b"# service=git-upload-pack\n".to_vec(),
-            )])
-            .is_err()
-        );
-        assert!(
-            parse_service_announcement_stream(&[
-                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                PktLineFrame::Data(b"extra\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_service_announcement_stream(&[PktLineFrame::Data(
+            b"# service=git-upload-pack\n".to_vec(),
+        )])
+        .is_err());
+        assert!(parse_service_announcement_stream(&[
+            PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+            PktLineFrame::Data(b"extra\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
         assert!(parse_service_announcement_stream(&[PktLineFrame::Flush]).is_err());
         assert!(read_service_announcement(&mut &b"0000"[..]).is_err());
     }
@@ -8086,50 +8281,42 @@ mod tests {
     #[test]
     fn service_discovery_response_rejects_malformed_streams() {
         assert!(parse_service_discovery_response(ObjectFormat::Sha1, &[]).is_err());
-        assert!(
-            parse_service_discovery_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_service_discovery_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                    PktLineFrame::Data(b"version 2\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_service_discovery_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                    PktLineFrame::Flush,
-                    PktLineFrame::Delimiter,
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_service_discovery_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                    PktLineFrame::Flush,
-                    PktLineFrame::Data(b"version 2\n".to_vec()),
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_service_discovery_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_service_discovery_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_service_discovery_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Delimiter,
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_service_discovery_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -8139,6 +8326,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Local,
                 user: None,
+                password: None,
                 host: None,
                 port: None,
                 path: "../repo.git".into(),
@@ -8149,6 +8337,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Local,
                 user: None,
+                password: None,
                 host: None,
                 port: None,
                 path: "C:/work/repo.git".into(),
@@ -8159,6 +8348,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::File,
                 user: None,
+                password: None,
                 host: None,
                 port: None,
                 path: "/tmp/repo.git".into(),
@@ -8169,6 +8359,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Https,
                 user: None,
+                password: None,
                 host: Some("example.com".into()),
                 port: None,
                 path: "/org/repo.git".into(),
@@ -8179,6 +8370,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Http,
                 user: None,
+                password: None,
                 host: Some("example.com".into()),
                 port: Some(8080),
                 path: "/repo.git".into(),
@@ -8189,6 +8381,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Git,
                 user: None,
+                password: None,
                 host: Some("example.com".into()),
                 port: None,
                 path: "/repo.git".into(),
@@ -8199,6 +8392,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
+                password: None,
                 host: Some("2001:db8::1".into()),
                 port: Some(2222),
                 path: "/org/repo.git".into(),
@@ -8209,6 +8403,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
+                password: None,
                 host: Some("example.com".into()),
                 port: None,
                 path: "/org/repo space/it's.git".into(),
@@ -8219,6 +8414,7 @@ mod tests {
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
+                password: None,
                 host: Some("example.com".into()),
                 port: None,
                 path: "org/repo.git".into(),
@@ -8318,36 +8514,28 @@ mod tests {
         assert!(parse_git_credential(b"protocol=http\r\n\n").is_err());
         assert!(parse_git_credential(b"protocol=http\nhost=example.com\n\ntrailing").is_err());
         assert!(parse_git_credential(b"protocol=http\nprotocol=https\n\n").is_err());
-        assert!(
-            encode_git_credential(&GitCredential {
-                protocol: Some("http\nhttps".into()),
-                ..GitCredential::default()
-            })
-            .is_err()
-        );
-        assert!(
-            encode_git_credential(&GitCredential {
-                extra: vec![("protocol".into(), "https".into())],
-                ..GitCredential::default()
-            })
-            .is_err()
-        );
-        assert!(
-            git_credential_basic_authorization(&GitCredential {
-                username: Some("ali:ce".into()),
-                password: Some("secret".into()),
-                ..GitCredential::default()
-            })
-            .is_err()
-        );
-        assert!(
-            git_credential_basic_authorization(&GitCredential {
-                username: Some("alice".into()),
-                password: Some("sec\nret".into()),
-                ..GitCredential::default()
-            })
-            .is_err()
-        );
+        assert!(encode_git_credential(&GitCredential {
+            protocol: Some("http\nhttps".into()),
+            ..GitCredential::default()
+        })
+        .is_err());
+        assert!(encode_git_credential(&GitCredential {
+            extra: vec![("protocol".into(), "https".into())],
+            ..GitCredential::default()
+        })
+        .is_err());
+        assert!(git_credential_basic_authorization(&GitCredential {
+            username: Some("ali:ce".into()),
+            password: Some("secret".into()),
+            ..GitCredential::default()
+        })
+        .is_err());
+        assert!(git_credential_basic_authorization(&GitCredential {
+            username: Some("alice".into()),
+            password: Some("sec\nret".into()),
+            ..GitCredential::default()
+        })
+        .is_err());
         assert!(git_credential_bearer_authorization("").is_err());
         assert!(git_credential_bearer_authorization("tok\nen").is_err());
     }
@@ -8444,16 +8632,14 @@ mod tests {
         assert!(parse_refspec("refs/heads/**:refs/remotes/origin/*").is_err());
         assert!(parse_refspec("refs/heads/main:refs/remotes/origin/main:extra").is_err());
         assert!(parse_refspec("refs/heads/main\n").is_err());
-        assert!(
-            encode_refspec(&RefSpec {
-                force: false,
-                negative: false,
-                src: Some("refs/heads/*".into()),
-                dst: Some("refs/remotes/origin/main".into()),
-                pattern: true,
-            })
-            .is_err()
-        );
+        assert!(encode_refspec(&RefSpec {
+            force: false,
+            negative: false,
+            src: Some("refs/heads/*".into()),
+            dst: Some("refs/remotes/origin/main".into()),
+            pattern: true,
+        })
+        .is_err());
     }
 
     #[test]
@@ -8527,33 +8713,27 @@ mod tests {
 
     #[test]
     fn fetch_head_records_reject_malformed_lines() {
-        assert!(
-            parse_fetch_head(
-                ObjectFormat::Sha1,
-                b"1111111111111111111111111111111111111111\t\tbranch 'main'"
-            )
-            .is_err()
-        );
-        assert!(
-            parse_fetch_head(
-                ObjectFormat::Sha1,
-                b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
-            )
-            .is_err()
-        );
+        assert!(parse_fetch_head(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\t\tbranch 'main'"
+        )
+        .is_err());
+        assert!(parse_fetch_head(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
+        )
+        .is_err());
         assert!(parse_fetch_head(ObjectFormat::Sha1, b"not-a-hash\t\tbranch 'main'\n").is_err());
-        assert!(
-            encode_fetch_head(&[FetchHeadRecord {
-                oid: ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111"
-                )
-                .unwrap(),
-                not_for_merge: false,
-                description: "bad\ndescription".into(),
-            }])
-            .is_err()
-        );
+        assert!(encode_fetch_head(&[FetchHeadRecord {
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111"
+            )
+            .unwrap(),
+            not_for_merge: false,
+            description: "bad\ndescription".into(),
+        }])
+        .is_err());
     }
 
     #[test]
@@ -8661,18 +8841,18 @@ mod tests {
             name: "refs/heads/main".into(),
             capabilities: Vec::new(),
         }];
-        assert!(
-            plan_fetch_ref_updates(
-                &refs,
-                &[parse_refspec("refs/heads/missing").unwrap()],
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            plan_fetch_ref_updates(&refs, &[parse_refspec(":refs/heads/main").unwrap()], false)
-                .is_err()
-        );
+        assert!(plan_fetch_ref_updates(
+            &refs,
+            &[parse_refspec("refs/heads/missing").unwrap()],
+            false
+        )
+        .is_err());
+        assert!(plan_fetch_ref_updates(
+            &refs,
+            &[parse_refspec(":refs/heads/main").unwrap()],
+            false
+        )
+        .is_err());
     }
 
     #[test]
@@ -8796,24 +8976,20 @@ mod tests {
                 name: "refs/heads/review/topic".into(),
             }]
         );
-        assert!(
-            plan_push_commands(
-                ObjectFormat::Sha1,
-                &local_refs,
-                &[],
-                &[parse_refspec("^refs/heads/topic").unwrap()],
-            )
-            .is_err()
-        );
-        assert!(
-            plan_push_commands(
-                ObjectFormat::Sha1,
-                &local_refs,
-                &[],
-                &[parse_refspec(":refs/heads/missing").unwrap()],
-            )
-            .is_err()
-        );
+        assert!(plan_push_commands(
+            ObjectFormat::Sha1,
+            &local_refs,
+            &[],
+            &[parse_refspec("^refs/heads/topic").unwrap()],
+        )
+        .is_err());
+        assert!(plan_push_commands(
+            ObjectFormat::Sha1,
+            &local_refs,
+            &[],
+            &[parse_refspec(":refs/heads/missing").unwrap()],
+        )
+        .is_err());
     }
 
     #[test]
@@ -8932,36 +9108,30 @@ mod tests {
         );
         assert!(request.packfile.is_empty());
 
-        assert!(
-            build_receive_pack_push_request(
-                &ReceivePackFeatures::default(),
-                request.commands.commands.clone(),
-                Vec::new(),
-                ReceivePackPushRequestOptions::default(),
-            )
-            .is_err()
-        );
-        assert!(
-            build_receive_pack_push_request(
-                &features,
-                request.commands.commands,
-                b"PACK".to_vec(),
-                ReceivePackPushRequestOptions::default(),
-            )
-            .is_err()
-        );
-        assert!(
-            build_receive_pack_push_request(
-                &features,
-                Vec::new(),
-                Vec::new(),
-                ReceivePackPushRequestOptions {
-                    push_options: vec!["ci.skip".into()],
-                    ..ReceivePackPushRequestOptions::default()
-                },
-            )
-            .is_err()
-        );
+        assert!(build_receive_pack_push_request(
+            &ReceivePackFeatures::default(),
+            request.commands.commands.clone(),
+            Vec::new(),
+            ReceivePackPushRequestOptions::default(),
+        )
+        .is_err());
+        assert!(build_receive_pack_push_request(
+            &features,
+            request.commands.commands,
+            b"PACK".to_vec(),
+            ReceivePackPushRequestOptions::default(),
+        )
+        .is_err());
+        assert!(build_receive_pack_push_request(
+            &features,
+            Vec::new(),
+            Vec::new(),
+            ReceivePackPushRequestOptions {
+                push_options: vec!["ci.skip".into()],
+                ..ReceivePackPushRequestOptions::default()
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -9044,6 +9214,102 @@ mod tests {
     }
 
     #[test]
+    fn http_smart_urls_build_absolute_urls_from_remote() {
+        // https without an explicit port.
+        let remote = parse_remote_url("https://example.com/org/repo.git").unwrap();
+        assert_eq!(
+            http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap(),
+            "https://example.com/org/repo.git/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(
+            http_smart_rpc_url(&remote, GitService::UploadPack).unwrap(),
+            "https://example.com/org/repo.git/git-upload-pack"
+        );
+
+        // https with an explicit port and a .git suffix path.
+        let remote = parse_remote_url("https://example.com:8443/org/repo.git").unwrap();
+        assert_eq!(
+            http_smart_info_refs_url(&remote, GitService::ReceivePack).unwrap(),
+            "https://example.com:8443/org/repo.git/info/refs?service=git-receive-pack"
+        );
+        assert_eq!(
+            http_smart_rpc_url(&remote, GitService::ReceivePack).unwrap(),
+            "https://example.com:8443/org/repo.git/git-receive-pack"
+        );
+
+        // http scheme is honored too.
+        let remote = parse_remote_url("http://example.com/repo").unwrap();
+        assert_eq!(
+            http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap(),
+            "http://example.com/repo/info/refs?service=git-upload-pack"
+        );
+    }
+
+    #[test]
+    fn http_smart_urls_never_include_userinfo() {
+        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("alice"));
+        assert_eq!(remote.password.as_deref(), Some("s3cret"));
+        let info = http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap();
+        let rpc = http_smart_rpc_url(&remote, GitService::UploadPack).unwrap();
+        assert_eq!(
+            info,
+            "https://example.com/org/repo.git/info/refs?service=git-upload-pack"
+        );
+        assert_eq!(rpc, "https://example.com/org/repo.git/git-upload-pack");
+        assert!(!info.contains("alice"));
+        assert!(!info.contains("s3cret"));
+        assert!(!rpc.contains('@'));
+    }
+
+    #[test]
+    fn http_smart_urls_bracket_ipv6_hosts() {
+        let remote = parse_remote_url("https://[2001:db8::1]:8443/repo.git").unwrap();
+        assert_eq!(
+            http_smart_rpc_url(&remote, GitService::UploadPack).unwrap(),
+            "https://[2001:db8::1]:8443/repo.git/git-upload-pack"
+        );
+    }
+
+    #[test]
+    fn http_smart_urls_reject_non_http_transports() {
+        let remote = parse_remote_url("ssh://git@example.com/repo.git").unwrap();
+        assert!(http_smart_info_refs_url(&remote, GitService::UploadPack).is_err());
+        assert!(http_smart_rpc_url(&remote, GitService::UploadPack).is_err());
+
+        let remote = parse_remote_url("git://example.com/repo.git").unwrap();
+        assert!(http_smart_info_refs_url(&remote, GitService::UploadPack).is_err());
+    }
+
+    #[test]
+    fn remote_url_parser_extracts_http_password_but_not_ssh() {
+        // http(s) userinfo is split into user + password.
+        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("alice"));
+        assert_eq!(remote.password.as_deref(), Some("s3cret"));
+
+        let remote = parse_remote_url("http://bob:pw@example.com:8080/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("bob"));
+        assert_eq!(remote.password.as_deref(), Some("pw"));
+        assert_eq!(remote.port, Some(8080));
+
+        // http(s) user without a password leaves the password unset.
+        let remote = parse_remote_url("https://token@example.com/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("token"));
+        assert_eq!(remote.password, None);
+
+        // SSH userinfo is preserved verbatim (no embedded-password concept), so
+        // behavior does not regress for scp-like or ssh:// forms.
+        let remote = parse_remote_url("ssh://git@example.com/org/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("git"));
+        assert_eq!(remote.password, None);
+
+        let remote = parse_remote_url("git@example.com:org/repo.git").unwrap();
+        assert_eq!(remote.user.as_deref(), Some("git"));
+        assert_eq!(remote.password, None);
+    }
+
+    #[test]
     fn smart_http_helpers_reject_invalid_services_paths_and_content_types() {
         let oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
@@ -9060,22 +9326,18 @@ mod tests {
         assert!(dumb_http_pack_index_path("/repo.git?query", &oid).is_err());
         assert!(smart_http_info_refs_path("/repo.git", GitService::UploadArchive).is_err());
         assert!(smart_http_advertisement_content_type(GitService::UploadArchive).is_err());
-        assert!(
-            parse_smart_http_advertisement_content_type(
-                "application/x-git-upload-archive-advertisement"
-            )
-            .is_err()
-        );
+        assert!(parse_smart_http_advertisement_content_type(
+            "application/x-git-upload-archive-advertisement"
+        )
+        .is_err());
         assert!(
             parse_smart_http_rpc_request_content_type("application/x-git-upload-pack-result")
                 .is_err()
         );
-        assert!(
-            parse_smart_http_rpc_result_content_type(
-                "application/x-git-receive-pack-result; charset=utf-8"
-            )
-            .is_err()
-        );
+        assert!(parse_smart_http_rpc_result_content_type(
+            "application/x-git-receive-pack-result; charset=utf-8"
+        )
+        .is_err());
     }
 
     #[test]
@@ -9181,15 +9443,13 @@ mod tests {
         assert!(
             ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::Simple).is_err()
         );
-        assert!(
-            ssh_process_command(
-                &remote,
-                GitService::UploadPack,
-                "ssh\n",
-                SshCommandVariant::OpenSsh,
-            )
-            .is_err()
-        );
+        assert!(ssh_process_command(
+            &remote,
+            GitService::UploadPack,
+            "ssh\n",
+            SshCommandVariant::OpenSsh,
+        )
+        .is_err());
     }
 
     #[test]
@@ -9234,20 +9494,16 @@ mod tests {
         assert!(parse_git_protocol_header("version=0").is_err());
         assert!(parse_git_protocol_header("version=2:").is_err());
         assert!(parse_git_protocol_header("bad\nparameter").is_err());
-        assert!(
-            encode_git_protocol_header(&GitProtocolHeader {
-                protocol: Some(ProtocolVersion::V0),
-                extra_parameters: Vec::new(),
-            })
-            .is_err()
-        );
-        assert!(
-            encode_git_protocol_header(&GitProtocolHeader {
-                protocol: None,
-                extra_parameters: vec!["bad:parameter".into()],
-            })
-            .is_err()
-        );
+        assert!(encode_git_protocol_header(&GitProtocolHeader {
+            protocol: Some(ProtocolVersion::V0),
+            extra_parameters: Vec::new(),
+        })
+        .is_err());
+        assert!(encode_git_protocol_header(&GitProtocolHeader {
+            protocol: None,
+            extra_parameters: vec!["bad:parameter".into()],
+        })
+        .is_err());
     }
 
     #[test]
@@ -9370,36 +9626,28 @@ mod tests {
             parse_sideband_stream(&[PktLineFrame::Data(vec![1, b'P', b'A', b'C', b'K'])]).is_err()
         );
         assert!(parse_sideband_stream(&[PktLineFrame::Delimiter, PktLineFrame::Flush]).is_err());
-        assert!(
-            parse_sideband_stream(&[
-                PktLineFrame::Data(vec![1, b'P', b'A']),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(vec![1, b'C', b'K']),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_sideband_stream(&[
-                PktLineFrame::Data(vec![1, b'P', b'A']),
-                PktLineFrame::Data(b"\x04bad".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_sideband_packet(&SideBandPacket {
-                channel: SideBandChannel::Data,
-                data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
-            })
-            .is_err()
-        );
-        assert!(
-            demux_sideband_packets(&[SideBandPacket {
-                channel: SideBandChannel::Fatal,
-                data: b"remote died\n".to_vec(),
-            }])
-            .is_err()
-        );
+        assert!(parse_sideband_stream(&[
+            PktLineFrame::Data(vec![1, b'P', b'A']),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(vec![1, b'C', b'K']),
+        ])
+        .is_err());
+        assert!(parse_sideband_stream(&[
+            PktLineFrame::Data(vec![1, b'P', b'A']),
+            PktLineFrame::Data(b"\x04bad".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(encode_sideband_packet(&SideBandPacket {
+            channel: SideBandChannel::Data,
+            data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
+        })
+        .is_err());
+        assert!(demux_sideband_packets(&[SideBandPacket {
+            channel: SideBandChannel::Fatal,
+            data: b"remote died\n".to_vec(),
+        }])
+        .is_err());
     }
 
     #[test]
@@ -9436,27 +9684,21 @@ mod tests {
     #[test]
     fn upload_archive_request_rejects_malformed_streams() {
         assert!(parse_upload_archive_request(&[PktLineFrame::Flush]).is_err());
-        assert!(
-            parse_upload_archive_request(&[
-                PktLineFrame::Data(b"--format=tar\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_upload_archive_request(&[
-                PktLineFrame::Data(b"argument HEAD\n".to_vec()),
-                PktLineFrame::Delimiter,
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_upload_archive_request(&UploadArchiveRequest {
-                arguments: vec!["bad\narg".into()],
-            })
-            .is_err()
-        );
+        assert!(parse_upload_archive_request(&[
+            PktLineFrame::Data(b"--format=tar\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(parse_upload_archive_request(&[
+            PktLineFrame::Data(b"argument HEAD\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(encode_upload_archive_request(&UploadArchiveRequest {
+            arguments: vec!["bad\narg".into()],
+        })
+        .is_err());
     }
 
     #[test]
@@ -9527,29 +9769,23 @@ mod tests {
     #[test]
     fn upload_archive_response_rejects_malformed_streams() {
         assert!(parse_upload_archive_response(&[]).is_err());
-        assert!(
-            parse_upload_archive_response(&[
-                PktLineFrame::Data(b"ACK\n".to_vec()),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(b"\x01tail".to_vec()),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_upload_archive_response(&[
-                PktLineFrame::Data(b"NACK\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_upload_archive_response(&[
-                PktLineFrame::Data(b"NACK denied\n".to_vec()),
-                PktLineFrame::Data(b"\x02extra\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_upload_archive_response(&[
+            PktLineFrame::Data(b"ACK\n".to_vec()),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"\x01tail".to_vec()),
+        ])
+        .is_err());
+        assert!(parse_upload_archive_response(&[
+            PktLineFrame::Data(b"NACK\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(parse_upload_archive_response(&[
+            PktLineFrame::Data(b"NACK denied\n".to_vec()),
+            PktLineFrame::Data(b"\x02extra\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
         assert!(
             encode_upload_archive_response(&UploadArchiveResponse::Nack {
                 message: "bad\nmessage".into(),
@@ -9596,13 +9832,11 @@ mod tests {
         assert!(parse_capabilities(b"multi_ack  thin-pack").is_err());
         assert!(parse_capabilities(b"agent=").is_err());
         assert!(parse_capabilities(b"symref=HEAD:refs/heads/main\nbad").is_err());
-        assert!(
-            encode_capabilities(&[Capability {
-                name: "bad name".into(),
-                value: None,
-            }])
-            .is_err()
-        );
+        assert!(encode_capabilities(&[Capability {
+            name: "bad name".into(),
+            value: None,
+        }])
+        .is_err());
     }
 
     #[test]
@@ -9616,33 +9850,27 @@ mod tests {
             .unwrap(),
             ObjectFormat::Sha256
         );
-        assert!(
-            protocol_v2_object_format(&[Capability {
+        assert!(protocol_v2_object_format(&[Capability {
+            name: "object-format".into(),
+            value: None,
+        }])
+        .is_err());
+        assert!(protocol_v2_object_format(&[
+            Capability {
                 name: "object-format".into(),
-                value: None,
-            }])
-            .is_err()
-        );
-        assert!(
-            protocol_v2_object_format(&[
-                Capability {
-                    name: "object-format".into(),
-                    value: Some("sha1".into()),
-                },
-                Capability {
-                    name: "object-format".into(),
-                    value: Some("sha256".into()),
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            protocol_v2_object_format(&[Capability {
+                value: Some("sha1".into()),
+            },
+            Capability {
                 name: "object-format".into(),
-                value: Some("unknown".into()),
-            }])
-            .is_err()
-        );
+                value: Some("sha256".into()),
+            },
+        ])
+        .is_err());
+        assert!(protocol_v2_object_format(&[Capability {
+            name: "object-format".into(),
+            value: Some("unknown".into()),
+        }])
+        .is_err());
     }
 
     #[test]
@@ -9682,59 +9910,51 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(
-            validate_protocol_v2_command_request_capabilities(
-                &handshake,
-                &ProtocolV2CommandRequest {
-                    command: "ls-refs".into(),
-                    capabilities: Vec::new(),
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_protocol_v2_command_request_capabilities(
-                &handshake,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: vec![Capability {
-                        name: "server-option".into(),
-                        value: None,
-                    }],
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_protocol_v2_command_request_capabilities(
-                &handshake,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: vec![Capability {
-                        name: "object-format".into(),
-                        value: Some("sha256".into()),
-                    }],
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_protocol_v2_command_request_capabilities(
-                &handshake,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: vec![Capability {
-                        name: "agent".into(),
-                        value: None,
-                    }],
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
+        assert!(validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "ls-refs".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "server-option".into(),
+                    value: None,
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "object-format".into(),
+                    value: Some("sha256".into()),
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(validate_protocol_v2_command_request_capabilities(
+            &handshake,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: vec![Capability {
+                    name: "agent".into(),
+                    value: None,
+                }],
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -9782,33 +10002,27 @@ mod tests {
 
     #[test]
     fn protocol_v2_command_options_reject_malformed_known_capabilities() {
-        assert!(
-            parse_protocol_v2_command_options(&[
-                Capability {
-                    name: "agent".into(),
-                    value: Some("git-rs/0".into()),
-                },
-                Capability {
-                    name: "agent".into(),
-                    value: Some("git-rs/1".into()),
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_command_options(&[Capability {
-                name: "object-format".into(),
-                value: Some("sha512".into()),
-            }])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_command_options(&[Capability {
-                name: "server-option".into(),
-                value: None,
-            }])
-            .is_err()
-        );
+        assert!(parse_protocol_v2_command_options(&[
+            Capability {
+                name: "agent".into(),
+                value: Some("git-rs/0".into()),
+            },
+            Capability {
+                name: "agent".into(),
+                value: Some("git-rs/1".into()),
+            },
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_command_options(&[Capability {
+            name: "object-format".into(),
+            value: Some("sha512".into()),
+        }])
+        .is_err());
+        assert!(parse_protocol_v2_command_options(&[Capability {
+            name: "server-option".into(),
+            value: None,
+        }])
+        .is_err());
         assert!(
             encode_protocol_v2_command_options(&ProtocolV2CommandOptions {
                 extra: vec![Capability {
@@ -9850,38 +10064,32 @@ mod tests {
             .unwrap(),
             ProtocolV2LsRefsFeatures::default()
         );
-        assert!(
-            parse_protocol_v2_ls_refs_features(&[Capability {
-                name: "fetch".into(),
-                value: Some("filter".into()),
-            }])
-            .unwrap()
-            .is_none()
-        );
+        assert!(parse_protocol_v2_ls_refs_features(&[Capability {
+            name: "fetch".into(),
+            value: Some("filter".into()),
+        }])
+        .unwrap()
+        .is_none());
     }
 
     #[test]
     fn protocol_v2_ls_refs_features_reject_malformed_advertisements() {
-        assert!(
-            parse_protocol_v2_ls_refs_features(&[
-                Capability {
-                    name: "ls-refs".into(),
-                    value: None,
-                },
-                Capability {
-                    name: "ls-refs".into(),
-                    value: None,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_ls_refs_features(&[Capability {
+        assert!(parse_protocol_v2_ls_refs_features(&[
+            Capability {
                 name: "ls-refs".into(),
-                value: Some("unborn  custom".into()),
-            }])
-            .is_err()
-        );
+                value: None,
+            },
+            Capability {
+                name: "ls-refs".into(),
+                value: None,
+            },
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_ls_refs_features(&[Capability {
+            name: "ls-refs".into(),
+            value: Some("unborn  custom".into()),
+        }])
+        .is_err());
         assert!(
             encode_protocol_v2_ls_refs_capability(&ProtocolV2LsRefsFeatures {
                 unknown: vec!["unborn".into()],
@@ -9960,26 +10168,22 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_features_reject_malformed_advertisements() {
-        assert!(
-            parse_protocol_v2_fetch_features(&[
-                Capability {
-                    name: "fetch".into(),
-                    value: None,
-                },
-                Capability {
-                    name: "fetch".into(),
-                    value: None,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_features(&[Capability {
+        assert!(parse_protocol_v2_fetch_features(&[
+            Capability {
                 name: "fetch".into(),
-                value: Some("filter  shallow".into()),
-            }])
-            .is_err()
-        );
+                value: None,
+            },
+            Capability {
+                name: "fetch".into(),
+                value: None,
+            },
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_fetch_features(&[Capability {
+            name: "fetch".into(),
+            value: Some("filter  shallow".into()),
+        }])
+        .is_err());
         assert!(
             encode_protocol_v2_fetch_capability(&ProtocolV2FetchFeatures {
                 unknown: vec!["filter".into()],
@@ -10004,13 +10208,11 @@ mod tests {
             &features,
             &ProtocolV2FetchRequest {
                 want_refs: vec!["refs/heads/main".into()],
-                shallow: vec![
-                    ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap(),
-                ],
+                shallow: vec![ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .unwrap()],
                 deepen: Some(1),
                 filter: Some("blob:none".into()),
                 packfile_uris: Some("https".into()),
@@ -10027,24 +10229,20 @@ mod tests {
             sideband_all: true,
             ..ProtocolV2FetchRequest::default()
         };
-        assert!(
-            validate_protocol_v2_fetch_request_features(
-                &ProtocolV2FetchFeatures::default(),
-                &request,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_protocol_v2_fetch_request_features(
-                &ProtocolV2FetchFeatures {
-                    ref_in_want: true,
-                    filter: true,
-                    ..ProtocolV2FetchFeatures::default()
-                },
-                &request,
-            )
-            .is_err()
-        );
+        assert!(validate_protocol_v2_fetch_request_features(
+            &ProtocolV2FetchFeatures::default(),
+            &request,
+        )
+        .is_err());
+        assert!(validate_protocol_v2_fetch_request_features(
+            &ProtocolV2FetchFeatures {
+                ref_in_want: true,
+                filter: true,
+                ..ProtocolV2FetchFeatures::default()
+            },
+            &request,
+        )
+        .is_err());
     }
 
     #[test]
@@ -10136,13 +10334,11 @@ mod tests {
     fn protocol_v2_object_info_request_streams_round_trip() {
         let request = ProtocolV2ObjectInfoRequest {
             size: true,
-            oids: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-            ],
+            oids: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
         };
         let mut encoded = Vec::new();
         write_protocol_v2_object_info_request(&mut encoded, &request).unwrap();
@@ -10158,68 +10354,58 @@ mod tests {
 
     #[test]
     fn protocol_v2_object_info_request_rejects_malformed_arguments() {
-        assert!(
-            ProtocolV2ObjectInfoRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "object-info".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2ObjectInfoRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "object-info".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"size".to_vec(), b"size".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2ObjectInfoRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "object-info".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"size".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2ObjectInfoRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "object-info".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_protocol_v2_object_info_command_request(
-                &TransportHandshake {
-                    protocol: ProtocolVersion::V2,
-                    capabilities: Vec::new(),
-                },
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "object-info".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![
-                        b"size".to_vec(),
-                        b"oid 1111111111111111111111111111111111111111".to_vec(),
-                    ],
-                },
-            )
-            .is_err()
-        );
+        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec(), b"size".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(validate_protocol_v2_object_info_command_request(
+            &TransportHandshake {
+                protocol: ProtocolVersion::V2,
+                capabilities: Vec::new(),
+            },
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "object-info".into(),
+                capabilities: Vec::new(),
+                arguments: vec![
+                    b"size".to_vec(),
+                    b"oid 1111111111111111111111111111111111111111".to_vec(),
+                ],
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -10301,13 +10487,11 @@ mod tests {
             .unwrap(),
             ProtocolV2Command::ObjectInfo(ProtocolV2ObjectInfoRequest {
                 size: true,
-                oids: vec![
-                    ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap()
-                ],
+                oids: vec![ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .unwrap()],
             })
         );
 
@@ -10323,18 +10507,16 @@ mod tests {
             classify_protocol_v2_command_request(&handshake, ObjectFormat::Sha1, &unknown).unwrap(),
             ProtocolV2Command::Unknown(unknown)
         );
-        assert!(
-            classify_protocol_v2_command_request(
-                &handshake,
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "not-advertised".into(),
-                    capabilities: Vec::new(),
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
+        assert!(classify_protocol_v2_command_request(
+            &handshake,
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "not-advertised".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
     }
 
     #[test]
@@ -10435,13 +10617,11 @@ mod tests {
         assert!(
             parse_ref_advertisement(ObjectFormat::Sha1, b"not-an-oid refs/heads/main\n").is_err()
         );
-        assert!(
-            parse_ref_advertisement(
-                ObjectFormat::Sha1,
-                b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
-            )
-            .is_err()
-        );
+        assert!(parse_ref_advertisement(
+            ObjectFormat::Sha1,
+            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
+        )
+        .is_err());
     }
 
     #[test]
@@ -10608,13 +10788,11 @@ mod tests {
                     value: Some("HEAD:refs/heads/main".into()),
                 }],
             }],
-            shallow: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "2222222222222222222222222222222222222222",
-                )
-                .unwrap(),
-            ],
+            shallow: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "2222222222222222222222222222222222222222",
+            )
+            .unwrap()],
         };
         let mut encoded = Vec::new();
         write_ref_advertisement_set(&mut encoded, &set).unwrap();
@@ -10630,162 +10808,126 @@ mod tests {
 
     #[test]
     fn advertised_refs_reject_malformed_streams() {
-        assert!(
-            parse_ref_advertisements(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-                )],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisements(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisements(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(
-                        b"2222222222222222222222222222222222222222 refs/heads/main\0thin-pack\n"
-                            .to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisement_set(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(b"version 1\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisement_set(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"version 2\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisement_set(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"shallow 1111111111111111111111111111111111111111\n".to_vec()
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisement_set(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(b"shallow not-an-oid\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_ref_advertisement_set(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
-                    PktLineFrame::Data(
-                        b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            encode_ref_advertisements(&[
-                RefAdvertisement {
-                    oid: ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap(),
-                    name: "HEAD".into(),
-                    capabilities: Vec::new(),
-                },
-                RefAdvertisement {
-                    oid: ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "2222222222222222222222222222222222222222",
-                    )
-                    .unwrap(),
-                    name: "refs/heads/main".into(),
-                    capabilities: vec![Capability {
-                        name: "thin-pack".into(),
-                        value: None,
-                    }],
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_ref_advertisement(&RefAdvertisement {
+        assert!(parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
+            )],
+        )
+        .is_err());
+        assert!(parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err());
+        assert!(parse_ref_advertisements(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(
+                    b"2222222222222222222222222222222222222222 refs/heads/main\0thin-pack\n"
+                        .to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"version 1\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"shallow not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),),
+                PktLineFrame::Data(b"shallow 2222222222222222222222222222222222222222\n".to_vec()),
+                PktLineFrame::Data(
+                    b"3333333333333333333333333333333333333333 refs/heads/main\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(encode_ref_advertisements(&[
+            RefAdvertisement {
                 oid: ObjectId::from_hex(
                     ObjectFormat::Sha1,
                     "1111111111111111111111111111111111111111",
                 )
                 .unwrap(),
-                name: "bad ref".into(),
+                name: "HEAD".into(),
                 capabilities: Vec::new(),
-            })
-            .is_err()
-        );
-        assert!(
-            encode_ref_advertisement_set(&RefAdvertisementSet {
-                protocol: ProtocolVersion::V2,
-                refs: Vec::new(),
-                shallow: Vec::new(),
-            })
-            .is_err()
-        );
-        assert!(
-            encode_ref_advertisement_set(&RefAdvertisementSet {
-                protocol: ProtocolVersion::V0,
-                refs: Vec::new(),
-                shallow: vec![
-                    ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap()
-                ],
-            })
-            .is_err()
-        );
+            },
+            RefAdvertisement {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .unwrap(),
+                name: "refs/heads/main".into(),
+                capabilities: vec![Capability {
+                    name: "thin-pack".into(),
+                    value: None,
+                }],
+            },
+        ])
+        .is_err());
+        assert!(encode_ref_advertisement(&RefAdvertisement {
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap(),
+            name: "bad ref".into(),
+            capabilities: Vec::new(),
+        })
+        .is_err());
+        assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
+            protocol: ProtocolVersion::V2,
+            refs: Vec::new(),
+            shallow: Vec::new(),
+        })
+        .is_err());
+        assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
+            protocol: ProtocolVersion::V0,
+            refs: Vec::new(),
+            shallow: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
+        })
+        .is_err());
     }
 
     #[test]
@@ -10858,43 +11000,35 @@ mod tests {
 
     #[test]
     fn dumb_http_info_refs_reject_malformed_records() {
-        assert!(
-            parse_dumb_http_info_refs(
-                ObjectFormat::Sha1,
-                b"1111111111111111111111111111111111111111 refs/heads/main\n",
-            )
-            .is_err()
-        );
-        assert!(
-            parse_dumb_http_info_refs(
-                ObjectFormat::Sha1,
-                b"1111111111111111111111111111111111111111\trefs/heads/main",
-            )
-            .is_err()
-        );
+        assert!(parse_dumb_http_info_refs(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111 refs/heads/main\n",
+        )
+        .is_err());
+        assert!(parse_dumb_http_info_refs(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\trefs/heads/main",
+        )
+        .is_err());
         assert!(
             parse_dumb_http_info_refs(ObjectFormat::Sha1, b"not-an-oid\trefs/heads/main\n")
                 .is_err()
         );
-        assert!(
-            parse_dumb_http_info_refs(
+        assert!(parse_dumb_http_info_refs(
+            ObjectFormat::Sha1,
+            b"1111111111111111111111111111111111111111\tbad ref\n",
+        )
+        .is_err());
+        assert!(encode_dumb_http_info_refs(&[DumbHttpRefRecord {
+            oid: ObjectId::from_hex(
                 ObjectFormat::Sha1,
-                b"1111111111111111111111111111111111111111\tbad ref\n",
+                "1111111111111111111111111111111111111111",
             )
-            .is_err()
-        );
-        assert!(
-            encode_dumb_http_info_refs(&[DumbHttpRefRecord {
-                oid: ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-                name: "refs/tags/v1.0^{}".into(),
-                peeled: false,
-            }])
-            .is_err()
-        );
+            .unwrap(),
+            name: "refs/tags/v1.0^{}".into(),
+            peeled: false,
+        }])
+        .is_err());
     }
 
     #[test]
@@ -10982,28 +11116,22 @@ mod tests {
 
     #[test]
     fn dumb_http_packs_reject_malformed_records() {
-        assert!(
-            parse_dumb_http_packs(
-                ObjectFormat::Sha1,
-                b"P pack-1111111111111111111111111111111111111111.pack",
-            )
-            .is_err()
-        );
-        assert!(
-            parse_dumb_http_packs(
-                ObjectFormat::Sha1,
-                b"pack-1111111111111111111111111111111111111111.pack\n",
-            )
-            .is_err()
-        );
+        assert!(parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"P pack-1111111111111111111111111111111111111111.pack",
+        )
+        .is_err());
+        assert!(parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"pack-1111111111111111111111111111111111111111.pack\n",
+        )
+        .is_err());
         assert!(parse_dumb_http_packs(ObjectFormat::Sha1, b"P pack-not-a-hash.pack\n",).is_err());
-        assert!(
-            parse_dumb_http_packs(
-                ObjectFormat::Sha1,
-                b"P pack-1111111111111111111111111111111111111111.idx\n",
-            )
-            .is_err()
-        );
+        assert!(parse_dumb_http_packs(
+            ObjectFormat::Sha1,
+            b"P pack-1111111111111111111111111111111111111111.idx\n",
+        )
+        .is_err());
     }
 
     #[test]
@@ -11106,13 +11234,11 @@ mod tests {
         );
 
         let request = UploadPackRequest {
-            wants: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-            ],
+            wants: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
             capabilities: vec![
                 Capability {
                     name: "multi_ack_detailed".into(),
@@ -11139,13 +11265,11 @@ mod tests {
                     value: Some("git-rs".into()),
                 },
             ],
-            shallow: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "2222222222222222222222222222222222222222",
-                )
-                .unwrap(),
-            ],
+            shallow: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "2222222222222222222222222222222222222222",
+            )
+            .unwrap()],
             deepen: Some(5),
             deepen_since: Some(1_710_000_000),
             deepen_not: vec!["refs/tags/base".into()],
@@ -11167,90 +11291,78 @@ mod tests {
             ..UploadPackFeatures::default()
         };
 
-        assert!(
-            validate_upload_pack_request_features(
-                &features,
-                &UploadPackRequest {
-                    wants: vec![want.clone()],
-                    capabilities: vec![Capability {
-                        name: "ofs-delta".into(),
-                        value: None,
-                    }],
-                    ..UploadPackRequest::default()
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_upload_pack_request_features(
-                &features,
-                &UploadPackRequest {
-                    wants: vec![want.clone()],
-                    shallow: vec![want.clone()],
-                    ..UploadPackRequest::default()
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_upload_pack_request_features(
-                &features,
-                &UploadPackRequest {
-                    wants: vec![want.clone()],
-                    filter: Some("blob:none".into()),
-                    ..UploadPackRequest::default()
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_upload_pack_request_features(
-                &UploadPackFeatures {
-                    side_band: true,
-                    side_band_64k: true,
-                    ..UploadPackFeatures::default()
-                },
-                &UploadPackRequest {
-                    wants: vec![want.clone()],
-                    capabilities: vec![
-                        Capability {
-                            name: "side-band".into(),
-                            value: None,
-                        },
-                        Capability {
-                            name: "side-band-64k".into(),
-                            value: None,
-                        },
-                    ],
-                    ..UploadPackRequest::default()
-                },
-            )
-            .is_err()
-        );
-
-        assert!(
-            parse_upload_pack_features(&[
-                Capability {
-                    name: "thin-pack".into(),
-                    value: None,
-                },
-                Capability {
-                    name: "thin-pack".into(),
-                    value: None,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_upload_pack_features(&UploadPackFeatures {
-                unknown: vec![Capability {
-                    name: "filter".into(),
+        assert!(validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want.clone()],
+                capabilities: vec![Capability {
+                    name: "ofs-delta".into(),
                     value: None,
                 }],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err());
+        assert!(validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want.clone()],
+                shallow: vec![want.clone()],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err());
+        assert!(validate_upload_pack_request_features(
+            &features,
+            &UploadPackRequest {
+                wants: vec![want.clone()],
+                filter: Some("blob:none".into()),
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err());
+        assert!(validate_upload_pack_request_features(
+            &UploadPackFeatures {
+                side_band: true,
+                side_band_64k: true,
                 ..UploadPackFeatures::default()
-            })
-            .is_err()
-        );
+            },
+            &UploadPackRequest {
+                wants: vec![want.clone()],
+                capabilities: vec![
+                    Capability {
+                        name: "side-band".into(),
+                        value: None,
+                    },
+                    Capability {
+                        name: "side-band-64k".into(),
+                        value: None,
+                    },
+                ],
+                ..UploadPackRequest::default()
+            },
+        )
+        .is_err());
+
+        assert!(parse_upload_pack_features(&[
+            Capability {
+                name: "thin-pack".into(),
+                value: None,
+            },
+            Capability {
+                name: "thin-pack".into(),
+                value: None,
+            },
+        ])
+        .is_err());
+        assert!(encode_upload_pack_features(&UploadPackFeatures {
+            unknown: vec![Capability {
+                name: "filter".into(),
+                value: None,
+            }],
+            ..UploadPackFeatures::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -11303,33 +11415,29 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            build_upload_pack_raw_packfile_response(
-                &UploadPackFeatures::default(),
-                UploadPackRequest {
-                    wants: vec![want.clone()],
-                    ..UploadPackRequest::default()
-                },
-                Vec::<ObjectId>::new(),
-                |_| Ok(false),
-                |_, _| Ok(Some(b"PACKmock".to_vec())),
-            )
-            .is_err()
-        );
+        assert!(build_upload_pack_raw_packfile_response(
+            &UploadPackFeatures::default(),
+            UploadPackRequest {
+                wants: vec![want.clone()],
+                ..UploadPackRequest::default()
+            },
+            Vec::<ObjectId>::new(),
+            |_| Ok(false),
+            |_, _| Ok(Some(b"PACKmock".to_vec())),
+        )
+        .is_err());
 
-        assert!(
-            build_upload_pack_raw_packfile_response(
-                &UploadPackFeatures::default(),
-                UploadPackRequest {
-                    wants: vec![want],
-                    ..UploadPackRequest::default()
-                },
-                Vec::<ObjectId>::new(),
-                |_| Ok(true),
-                |_, _| Ok(None),
-            )
-            .is_err()
-        );
+        assert!(build_upload_pack_raw_packfile_response(
+            &UploadPackFeatures::default(),
+            UploadPackRequest {
+                wants: vec![want],
+                ..UploadPackRequest::default()
+            },
+            Vec::<ObjectId>::new(),
+            |_| Ok(true),
+            |_, _| Ok(None),
+        )
+        .is_err());
     }
 
     #[test]
@@ -11403,13 +11511,11 @@ mod tests {
     #[test]
     fn upload_pack_request_streams_round_trip() {
         let request = UploadPackRequest {
-            wants: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-            ],
+            wants: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
             capabilities: vec![Capability {
                 name: "ofs-delta".into(),
                 value: None,
@@ -11431,85 +11537,65 @@ mod tests {
 
     #[test]
     fn upload_pack_request_rejects_malformed_requests() {
-        assert!(
-            parse_upload_pack_request(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"want 1111111111111111111111111111111111111111\n".to_vec(),
-                )],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_request(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_request(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(
-                        b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_request(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"want 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(b"deepen 1\n".to_vec()),
-                    PktLineFrame::Data(b"want 2222222222222222222222222222222222222222\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_request(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"want 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                    PktLineFrame::Data(b"filter blob:none\n".to_vec()),
-                    PktLineFrame::Data(b"filter tree:0\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"want 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err());
+        assert!(parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
+                ),
+                PktLineFrame::Data(
+                    b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Data(b"deepen 1\n".to_vec()),
+                PktLineFrame::Data(b"want 2222222222222222222222222222222222222222\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"want 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Data(b"filter blob:none\n".to_vec()),
+                PktLineFrame::Data(b"filter tree:0\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
         assert!(encode_upload_pack_request(Some(&UploadPackRequest::default())).is_err());
-        assert!(
-            encode_upload_pack_request(Some(&UploadPackRequest {
-                wants: vec![
-                    ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap()
-                ],
-                deepen: Some(0),
-                ..UploadPackRequest::default()
-            }))
-            .is_err()
-        );
+        assert!(encode_upload_pack_request(Some(&UploadPackRequest {
+            wants: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
+            deepen: Some(0),
+            ..UploadPackRequest::default()
+        }))
+        .is_err());
     }
 
     #[test]
@@ -11567,49 +11653,39 @@ mod tests {
 
     #[test]
     fn upload_pack_shallow_update_rejects_malformed_records() {
-        assert!(
-            parse_upload_pack_shallow_update(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
-                )],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_shallow_update(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_shallow_update(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                    PktLineFrame::Data(
-                        b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),
-                    ),
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_shallow_update(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err());
+        assert!(parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err());
+        assert!(parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(
+                    b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),
+                ),
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_shallow_update(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -11665,13 +11741,11 @@ mod tests {
     #[test]
     fn upload_pack_negotiation_request_streams_round_trip() {
         let first = UploadPackNegotiationRequest {
-            haves: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-            ],
+            haves: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
             done: false,
         };
         let second = UploadPackNegotiationRequest {
@@ -11697,43 +11771,33 @@ mod tests {
 
     #[test]
     fn upload_pack_negotiation_request_rejects_malformed_rounds() {
-        assert!(
-            parse_upload_pack_negotiation_request(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"have 1111111111111111111111111111111111111111\n".to_vec(),
-                )],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_negotiation_request(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"want 1111111111111111111111111111111111111111\n".to_vec(),
-                )],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_negotiation_request(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"done\n".to_vec()),
-                    PktLineFrame::Data(
-                        b"have 1111111111111111111111111111111111111111\n".to_vec(),
-                    ),
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_negotiation_request(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-            )
-            .is_err()
-        );
+        assert!(parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"have 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err());
+        assert!(parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"want 1111111111111111111111111111111111111111\n".to_vec(),
+            )],
+        )
+        .is_err());
+        assert!(parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"done\n".to_vec()),
+                PktLineFrame::Data(b"have 1111111111111111111111111111111111111111\n".to_vec(),),
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_negotiation_request(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err());
     }
 
     #[test]
@@ -11802,20 +11866,16 @@ mod tests {
         );
         assert_eq!(input, b"tail");
         assert!(parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ACK not-an-oid\n").is_err());
-        assert!(
-            parse_upload_pack_acknowledgment(
-                ObjectFormat::Sha1,
-                b"ACK 1111111111111111111111111111111111111111 unknown\n",
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_acknowledgment(
-                ObjectFormat::Sha1,
-                b"ACK 1111111111111111111111111111111111111111 ready extra\n",
-            )
-            .is_err()
-        );
+        assert!(parse_upload_pack_acknowledgment(
+            ObjectFormat::Sha1,
+            b"ACK 1111111111111111111111111111111111111111 unknown\n",
+        )
+        .is_err());
+        assert!(parse_upload_pack_acknowledgment(
+            ObjectFormat::Sha1,
+            b"ACK 1111111111111111111111111111111111111111 ready extra\n",
+        )
+        .is_err());
         assert!(
             parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ERR remote died\n").is_err()
         );
@@ -11900,55 +11960,45 @@ mod tests {
 
     #[test]
     fn upload_pack_packfile_response_rejects_malformed_streams() {
-        assert!(
-            parse_upload_pack_packfile_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(b"NAK\n".to_vec())],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_packfile_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_packfile_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"\x01PACK".to_vec()),
-                    PktLineFrame::Data(
-                        b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_packfile_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"NAK\n".to_vec()),
-                    PktLineFrame::Flush,
-                    PktLineFrame::Data(b"\x01PACK".to_vec()),
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_upload_pack_packfile_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"NAK\n".to_vec()),
-                    PktLineFrame::Data(b"\x04bad".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"NAK\n".to_vec())],
+        )
+        .is_err());
+        assert!(parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err());
+        assert!(parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"\x01PACK".to_vec()),
+                PktLineFrame::Data(
+                    b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"NAK\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"\x01PACK".to_vec()),
+            ],
+        )
+        .is_err());
+        assert!(parse_upload_pack_packfile_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"NAK\n".to_vec()),
+                PktLineFrame::Data(b"\x04bad".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -12197,50 +12247,42 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            parse_receive_pack_request(
+        assert!(parse_receive_pack_request(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(encode_receive_pack_request(&ReceivePackRequest {
+            shallow: vec![ObjectId::from_hex(
                 ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
+                "1111111111111111111111111111111111111111",
             )
-            .is_err()
-        );
-        assert!(
-            encode_receive_pack_request(&ReceivePackRequest {
-                shallow: vec![
-                    ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap()
-                ],
-                ..ReceivePackRequest::default()
-            })
-            .is_err()
-        );
-        assert!(
-            encode_receive_pack_request(&ReceivePackRequest {
-                commands: vec![ReceivePackCommand {
-                    old_id: ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "1111111111111111111111111111111111111111",
-                    )
-                    .unwrap(),
-                    new_id: ObjectId::from_hex(
-                        ObjectFormat::Sha1,
-                        "2222222222222222222222222222222222222222",
-                    )
-                    .unwrap(),
-                    name: "bad ref".into(),
-                }],
-                ..ReceivePackRequest::default()
-            })
-            .is_err()
-        );
+            .unwrap()],
+            ..ReceivePackRequest::default()
+        })
+        .is_err());
+        assert!(encode_receive_pack_request(&ReceivePackRequest {
+            commands: vec![ReceivePackCommand {
+                old_id: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .unwrap(),
+                new_id: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .unwrap(),
+                name: "bad ref".into(),
+            }],
+            ..ReceivePackRequest::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -12394,133 +12436,117 @@ mod tests {
             name: "refs/heads/main".into(),
         };
 
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![update.clone()],
-                        capabilities: vec![Capability {
-                            name: "push-options".into(),
-                            value: None,
-                        }],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: b"PACKpayload".to_vec(),
+        assert!(validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    capabilities: vec![Capability {
+                        name: "push-options".into(),
+                        value: None,
+                    }],
+                    ..ReceivePackRequest::default()
                 },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![update.clone()],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: Some(Vec::new()),
-                    packfile: b"PACKpayload".to_vec(),
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
+            },
+        )
+        .is_err());
+        assert!(validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    ..ReceivePackRequest::default()
                 },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![ReceivePackCommand {
-                            old_id: old_id.clone(),
-                            new_id: zero.clone(),
-                            name: "refs/heads/main".into(),
-                        }],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: Vec::new(),
+                push_options: Some(Vec::new()),
+                packfile: b"PACKpayload".to_vec(),
+            },
+        )
+        .is_err());
+        assert!(validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![ReceivePackCommand {
+                        old_id: old_id.clone(),
+                        new_id: zero.clone(),
+                        name: "refs/heads/main".into(),
+                    }],
+                    ..ReceivePackRequest::default()
                 },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![update.clone()],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: Vec::new(),
+                push_options: None,
+                packfile: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update.clone()],
+                    ..ReceivePackRequest::default()
                 },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &ReceivePackFeatures {
-                    delete_refs: true,
-                    ..ReceivePackFeatures::default()
-                },
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![ReceivePackCommand {
-                            old_id,
-                            new_id: zero,
-                            name: "refs/heads/main".into(),
-                        }],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: b"PACKpayload".to_vec(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            validate_receive_pack_push_request_features(
-                &features,
-                &ReceivePackPushRequest {
-                    commands: ReceivePackRequest {
-                        commands: vec![update],
-                        capabilities: vec![Capability {
-                            name: "atomic".into(),
-                            value: None,
-                        }],
-                        ..ReceivePackRequest::default()
-                    },
-                    push_options: None,
-                    packfile: b"PACKpayload".to_vec(),
-                },
-            )
-            .is_err()
-        );
-
-        assert!(
-            parse_receive_pack_features(&[
-                Capability {
-                    name: "push-options".into(),
-                    value: None,
-                },
-                Capability {
-                    name: "push-options".into(),
-                    value: None,
-                },
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_receive_pack_features(&ReceivePackFeatures {
-                unknown: vec![Capability {
-                    name: "atomic".into(),
-                    value: None,
-                }],
+                push_options: None,
+                packfile: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(validate_receive_pack_push_request_features(
+            &ReceivePackFeatures {
+                delete_refs: true,
                 ..ReceivePackFeatures::default()
-            })
-            .is_err()
-        );
+            },
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![ReceivePackCommand {
+                        old_id,
+                        new_id: zero,
+                        name: "refs/heads/main".into(),
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
+            },
+        )
+        .is_err());
+        assert!(validate_receive_pack_push_request_features(
+            &features,
+            &ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    commands: vec![update],
+                    capabilities: vec![Capability {
+                        name: "atomic".into(),
+                        value: None,
+                    }],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: b"PACKpayload".to_vec(),
+            },
+        )
+        .is_err());
+
+        assert!(parse_receive_pack_features(&[
+            Capability {
+                name: "push-options".into(),
+                value: None,
+            },
+            Capability {
+                name: "push-options".into(),
+                value: None,
+            },
+        ])
+        .is_err());
+        assert!(encode_receive_pack_features(&ReceivePackFeatures {
+            unknown: vec![Capability {
+                name: "atomic".into(),
+                value: None,
+            }],
+            ..ReceivePackFeatures::default()
+        })
+        .is_err());
     }
 
     #[test]
@@ -12630,18 +12656,16 @@ mod tests {
         assert!(!installed.get());
         assert_eq!(deleted.into_inner(), vec!["refs/heads/main"]);
         assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
-        assert!(
-            apply_receive_pack_push_request(
-                &features,
-                &request,
-                |_| Ok(Some(other_id.clone())),
-                |_| Ok(()),
-                |_| Ok(false),
-                |_| Ok(()),
-                |_| Ok(()),
-            )
-            .is_err()
-        );
+        assert!(apply_receive_pack_push_request(
+            &features,
+            &request,
+            |_| Ok(Some(other_id.clone())),
+            |_| Ok(()),
+            |_| Ok(false),
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+        .is_err());
     }
 
     #[test]
@@ -12753,14 +12777,12 @@ mod tests {
 
     #[test]
     fn receive_pack_push_request_rejects_malformed_sections() {
-        assert!(
-            parse_receive_pack_push_request(
-                ObjectFormat::Sha1,
-                b"0014not-a-command\n0000PACK",
-                false,
-            )
-            .is_err()
-        );
+        assert!(parse_receive_pack_push_request(
+            ObjectFormat::Sha1,
+            b"0014not-a-command\n0000PACK",
+            false,
+        )
+        .is_err());
 
         let request = ReceivePackPushRequest {
             commands: ReceivePackRequest {
@@ -12785,23 +12807,19 @@ mod tests {
         let encoded = encode_receive_pack_push_request(&request).unwrap();
         assert!(parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, true).is_err());
 
-        assert!(
-            encode_receive_pack_push_request(&ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    shallow: vec![
-                        ObjectId::from_hex(
-                            ObjectFormat::Sha1,
-                            "1111111111111111111111111111111111111111",
-                        )
-                        .unwrap()
-                    ],
-                    ..ReceivePackRequest::default()
-                },
-                push_options: None,
-                packfile: Vec::new(),
-            })
-            .is_err()
-        );
+        assert!(encode_receive_pack_push_request(&ReceivePackPushRequest {
+            commands: ReceivePackRequest {
+                shallow: vec![ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .unwrap()],
+                ..ReceivePackRequest::default()
+            },
+            push_options: None,
+            packfile: Vec::new(),
+        })
+        .is_err());
     }
 
     #[test]
@@ -12863,52 +12881,40 @@ mod tests {
     #[test]
     fn receive_pack_report_status_rejects_malformed_status_lines() {
         assert!(parse_receive_pack_report_status(&[]).is_err());
-        assert!(
-            parse_receive_pack_report_status(&[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status(&[
-                PktLineFrame::Flush,
-                PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status(&[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status(&[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            encode_receive_pack_report_status(&ReceivePackReportStatus {
-                unpack: ReceivePackUnpackStatus::Error("".into()),
-                commands: Vec::new(),
-            })
-            .is_err()
-        );
-        assert!(
-            encode_receive_pack_report_status(&ReceivePackReportStatus {
-                unpack: ReceivePackUnpackStatus::Ok,
-                commands: vec![ReceivePackCommandStatus::Ok {
-                    name: "bad ref".into(),
-                }],
-            })
-            .is_err()
-        );
+        assert!(parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+        ])
+        .is_err());
+        assert!(parse_receive_pack_report_status(&[
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+        ])
+        .is_err());
+        assert!(parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(parse_receive_pack_report_status(&[
+            PktLineFrame::Data(b"unpack ok\n".to_vec()),
+            PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Error("".into()),
+            commands: Vec::new(),
+        })
+        .is_err());
+        assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
+            unpack: ReceivePackUnpackStatus::Ok,
+            commands: vec![ReceivePackCommandStatus::Ok {
+                name: "bad ref".into(),
+            }],
+        })
+        .is_err());
     }
 
     #[test]
@@ -12994,54 +13000,46 @@ mod tests {
     #[test]
     fn receive_pack_report_status_v2_rejects_malformed_options() {
         assert!(parse_receive_pack_report_status_v2(ObjectFormat::Sha1, &[]).is_err());
-        assert!(
-            parse_receive_pack_report_status_v2(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status_v2(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                    PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
-                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status_v2(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                    PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                    PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_report_status_v2(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                    PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-                    PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_receive_pack_report_status_v2(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
         assert!(
             encode_receive_pack_report_status_v2(&ReceivePackReportStatusV2 {
                 unpack: ReceivePackUnpackStatus::Ok,
@@ -13102,21 +13100,17 @@ mod tests {
             parse_receive_pack_push_options(&[PktLineFrame::Delimiter, PktLineFrame::Flush])
                 .is_err()
         );
-        assert!(
-            parse_receive_pack_push_options(&[
-                PktLineFrame::Data(b"ci.skip\n".to_vec()),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(b"after\n".to_vec()),
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_receive_pack_push_options(&[
-                PktLineFrame::Data(b"bad\0option\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_receive_pack_push_options(&[
+            PktLineFrame::Data(b"ci.skip\n".to_vec()),
+            PktLineFrame::Flush,
+            PktLineFrame::Data(b"after\n".to_vec()),
+        ])
+        .is_err());
+        assert!(parse_receive_pack_push_options(&[
+            PktLineFrame::Data(b"bad\0option\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
         assert!(encode_receive_pack_push_options(&["bad\noption".to_string()]).is_err());
     }
 
@@ -13193,44 +13187,36 @@ mod tests {
             handshake
         );
         assert!(input.is_empty());
-        assert!(
-            encode_protocol_v2_advertisement(&TransportHandshake {
-                protocol: ProtocolVersion::V1,
-                capabilities: Vec::new(),
-            })
-            .is_err()
-        );
+        assert!(encode_protocol_v2_advertisement(&TransportHandshake {
+            protocol: ProtocolVersion::V1,
+            capabilities: Vec::new(),
+        })
+        .is_err());
     }
 
     #[test]
     fn protocol_v2_advertisement_rejects_malformed_sequences() {
         assert!(parse_protocol_v2_advertisement(&[]).is_err());
-        assert!(
-            parse_protocol_v2_advertisement(&[
-                PktLineFrame::Data(b"version 1\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 1\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
         assert!(
             parse_protocol_v2_advertisement(&[PktLineFrame::Data(b"version 2\n".to_vec())])
                 .is_err()
         );
-        assert!(
-            parse_protocol_v2_advertisement(&[
-                PktLineFrame::Data(b"version 2\n".to_vec()),
-                PktLineFrame::Delimiter,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_advertisement(&[
-                PktLineFrame::Data(b"version 2\n".to_vec()),
-                PktLineFrame::Data(b"fetch=\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 2\n".to_vec()),
+            PktLineFrame::Delimiter,
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_advertisement(&[
+            PktLineFrame::Data(b"version 2\n".to_vec()),
+            PktLineFrame::Data(b"fetch=\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
     }
 
     #[test]
@@ -13353,31 +13339,25 @@ mod tests {
     #[test]
     fn protocol_v2_command_request_rejects_malformed_sequences() {
         assert!(parse_protocol_v2_command_request(&[]).is_err());
-        assert!(
-            parse_protocol_v2_command_request(&[
-                PktLineFrame::Data(b"agent=git-rs/0\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_command_request(&[
-                PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-                PktLineFrame::Delimiter,
-                PktLineFrame::Delimiter,
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_command_request(&[
-                PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-                PktLineFrame::Delimiter,
-                PktLineFrame::Data(b"\n".to_vec()),
-                PktLineFrame::Flush,
-            ])
-            .is_err()
-        );
+        assert!(parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"agent=git-rs/0\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Delimiter,
+            PktLineFrame::Flush,
+        ])
+        .is_err());
+        assert!(parse_protocol_v2_command_request(&[
+            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+            PktLineFrame::Delimiter,
+            PktLineFrame::Data(b"\n".to_vec()),
+            PktLineFrame::Flush,
+        ])
+        .is_err());
         assert!(
             encode_protocol_v2_command_request(&ProtocolV2CommandRequest {
                 command: "bad command".into(),
@@ -13545,18 +13525,16 @@ mod tests {
             records
         );
         assert_eq!(input, b"tail");
-        assert!(
-            parse_protocol_v2_ls_refs_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-                    ),
-                    PktLineFrame::ResponseEnd
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+                ),
+                PktLineFrame::ResponseEnd
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -13599,15 +13577,13 @@ mod tests {
 
     #[test]
     fn protocol_v2_ls_refs_response_rejects_malformed_records() {
-        assert!(
-            parse_protocol_v2_ls_refs_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(
-                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-                )],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+            )],
+        )
+        .is_err());
         assert!(
             parse_protocol_v2_ls_refs_response(
                 ObjectFormat::Sha1,
@@ -13621,18 +13597,16 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            parse_protocol_v2_ls_refs_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_ls_refs_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
         assert!(
             encode_protocol_v2_ls_refs_response(&[ProtocolV2LsRefsRecord::Ref(
                 ProtocolV2LsRefsRef {
@@ -13720,58 +13694,48 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_request_rejects_malformed_arguments() {
-        assert!(
-            ProtocolV2FetchRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "ls-refs".into(),
-                    capabilities: Vec::new(),
-                    arguments: Vec::new(),
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2FetchRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"want not-an-oid".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2FetchRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"deepen 0".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2FetchRequest::from_command_request(
-                ObjectFormat::Sha1,
-                &ProtocolV2CommandRequest {
-                    command: "fetch".into(),
-                    capabilities: Vec::new(),
-                    arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
-                },
-            )
-            .is_err()
-        );
-        assert!(
-            ProtocolV2FetchRequest {
-                deepen: Some(0),
-                ..ProtocolV2FetchRequest::default()
-            }
-            .to_command_request()
-            .is_err()
-        );
+        assert!(ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "ls-refs".into(),
+                capabilities: Vec::new(),
+                arguments: Vec::new(),
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"want not-an-oid".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"deepen 0".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2FetchRequest::from_command_request(
+            ObjectFormat::Sha1,
+            &ProtocolV2CommandRequest {
+                command: "fetch".into(),
+                capabilities: Vec::new(),
+                arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
+            },
+        )
+        .is_err());
+        assert!(ProtocolV2FetchRequest {
+            deepen: Some(0),
+            ..ProtocolV2FetchRequest::default()
+        }
+        .to_command_request()
+        .is_err());
     }
 
     #[test]
@@ -14032,32 +13996,28 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_sideband_all_response_rejects_malformed_sideband() {
-        assert!(
-            parse_protocol_v2_fetch_sideband_all_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_sideband_all_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(
-                        encode_sideband_packet(&SideBandPacket {
-                            channel: SideBandChannel::Fatal,
-                            data: b"remote died\n".to_vec(),
-                        })
-                        .unwrap(),
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_fetch_sideband_all_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_fetch_sideband_all_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(
+                    encode_sideband_packet(&SideBandPacket {
+                        channel: SideBandChannel::Fatal,
+                        data: b"remote died\n".to_vec(),
+                    })
+                    .unwrap(),
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -14090,13 +14050,11 @@ mod tests {
     fn protocol_v2_object_info_response_streams_and_exchanges() {
         let request = ProtocolV2ObjectInfoRequest {
             size: true,
-            oids: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-            ],
+            oids: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .unwrap()],
         };
         let response = ProtocolV2ObjectInfoResponse {
             size: true,
@@ -14141,44 +14099,36 @@ mod tests {
     #[test]
     fn protocol_v2_object_info_response_rejects_malformed_records() {
         assert!(parse_protocol_v2_object_info_response(ObjectFormat::Sha1, &[]).is_err());
-        assert!(
-            parse_protocol_v2_object_info_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(b"size\n".to_vec())],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_object_info_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_object_info_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"size\n".to_vec()),
-                    PktLineFrame::Data(
-                        b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_object_info_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"size\n".to_vec()),
-                    PktLineFrame::Delimiter,
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"size\n".to_vec())],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"size\n".to_vec()),
+                PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()
+                ),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_object_info_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"size\n".to_vec()),
+                PktLineFrame::Delimiter,
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
         assert!(
             encode_protocol_v2_object_info_response(&ProtocolV2ObjectInfoResponse {
                 size: false,
@@ -14204,16 +14154,14 @@ mod tests {
             sections
         );
         assert_eq!(input, b"tail");
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                    PktLineFrame::ResponseEnd,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::ResponseEnd,
+            ],
+        )
+        .is_err());
     }
 
     #[test]
@@ -14282,13 +14230,11 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_packfile_demux_rejects_duplicate_or_bad_sideband() {
-        assert!(
-            demux_protocol_v2_fetch_packfile(&[
-                ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
-                ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
-            ])
-            .is_err()
-        );
+        assert!(demux_protocol_v2_fetch_packfile(&[
+            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
+            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
+        ])
+        .is_err());
         assert!(
             demux_protocol_v2_fetch_packfile(&[ProtocolV2FetchResponseSection::Packfile(vec![
                 b"\x03remote died\n".to_vec()
@@ -14305,55 +14251,43 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_response_rejects_malformed_sections() {
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                    PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-                    PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
-        assert!(
-            parse_protocol_v2_fetch_response(
-                ObjectFormat::Sha1,
-                &[
-                    PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-                    PktLineFrame::Data(
-                        b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()
-                    ),
-                    PktLineFrame::Flush,
-                ],
-            )
-            .is_err()
-        );
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
+        assert!(parse_protocol_v2_fetch_response(
+            ObjectFormat::Sha1,
+            &[
+                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                PktLineFrame::Data(b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()),
+                PktLineFrame::Flush,
+            ],
+        )
+        .is_err());
         assert!(
             encode_protocol_v2_fetch_response(&[ProtocolV2FetchResponseSection::WantedRefs(vec![
                 ProtocolV2FetchWantedRef {

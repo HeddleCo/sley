@@ -1,9 +1,9 @@
-use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use flate2::Compression;
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
 use git_formats::{
-    Bundle, BundleReference, Commit, EncodedObject, ObjectType, Tag, Tree, parse_framed_object,
+    parse_framed_object, Bundle, BundleReference, Commit, EncodedObject, ObjectType, Tag, Tree,
 };
 use git_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
 use std::collections::{HashMap, HashSet};
@@ -262,7 +262,11 @@ where
     if objects.is_empty() {
         return Ok(None);
     }
-    PackFile::write_undeltified(&objects, format).map(Some)
+    // Delta-compress reachable packs (used by install/push/fetch) via git-pack's
+    // sliding-window selection. Self-contained, ofs-delta by default; round-trips
+    // through the existing parser. PackWrite shape is unchanged, so callers are
+    // unaffected.
+    PackFile::write_packed(&objects, format).map(Some)
 }
 
 fn collect_reachable_object<R>(
@@ -1373,16 +1377,14 @@ mod tests {
         assert_eq!(pack.entries[0].oid, oid.clone());
 
         let excluded = HashSet::from([oid]);
-        assert!(
-            build_reachable_pack(
-                &db,
-                format,
-                pack.entries.into_iter().map(|entry| entry.oid),
-                &excluded
-            )
-            .unwrap()
-            .is_none()
-        );
+        assert!(build_reachable_pack(
+            &db,
+            format,
+            pack.entries.into_iter().map(|entry| entry.oid),
+            &excluded
+        )
+        .unwrap()
+        .is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -21,6 +21,102 @@ pub enum DeltaStrategy {
     OfsDelta,
 }
 
+/// Default sliding-window size used by [`PackFile::write_packed`].
+///
+/// Each object is compared against up to this many previously emitted
+/// candidates of the same type when searching for a small delta. Matches git's
+/// default `pack.window`.
+pub const DEFAULT_PACK_WINDOW: usize = 10;
+
+/// Default maximum delta chain depth used by [`PackFile::write_packed`].
+///
+/// A delta may reference a base that is itself a delta; this bounds how long
+/// such chains may grow so that reconstructing any object stays cheap and the
+/// reader's recursion stays shallow. Matches git's default `pack.depth`.
+pub const DEFAULT_PACK_DEPTH: usize = 50;
+
+/// Options controlling sliding-window delta selection during pack generation.
+///
+/// Construct with [`PackWriteOptions::new`] (sensible defaults) and adjust with
+/// the builder-style setters, or build one directly. Used by
+/// [`PackFile::write_packed_with_options`] and [`PackFile::write_thin`].
+#[derive(Debug, Clone)]
+pub struct PackWriteOptions {
+    /// Number of previous same-type candidates each object is deltified
+    /// against. Larger windows find better deltas at higher cost.
+    pub window: usize,
+    /// Maximum delta chain depth. A value of `0` disables deltification.
+    pub depth: usize,
+    /// When `true`, in-pack deltas are encoded as ofs-deltas (the default and
+    /// git's preference). When `false`, in-pack deltas use ref-deltas. Deltas
+    /// against external thin-pack bases always use ref-deltas regardless.
+    pub prefer_ofs_delta: bool,
+    /// External base objects, keyed by object id, that are *not* written into
+    /// the pack but may be used as delta bases. Supplying any entries here
+    /// produces a thin pack (see [`PackFile::write_thin`]). Empty by default,
+    /// yielding a self-contained pack.
+    pub thin_bases: HashMap<ObjectId, EncodedObject>,
+    /// When `true` (the default), objects are reordered by type and size for
+    /// better delta locality. When `false`, the input order is preserved (the
+    /// emitted pack lists objects in the order supplied); deltas then only
+    /// reference earlier input objects. Reordering is always skipped when
+    /// deltification is disabled (`depth == 0`), since it has no effect there.
+    pub reorder: bool,
+}
+
+impl Default for PackWriteOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PackWriteOptions {
+    /// Options with git-compatible defaults: window
+    /// [`DEFAULT_PACK_WINDOW`], depth [`DEFAULT_PACK_DEPTH`], ofs-deltas, and
+    /// no external thin bases.
+    pub fn new() -> Self {
+        Self {
+            window: DEFAULT_PACK_WINDOW,
+            depth: DEFAULT_PACK_DEPTH,
+            prefer_ofs_delta: true,
+            thin_bases: HashMap::new(),
+            reorder: true,
+        }
+    }
+
+    /// Set the sliding-window size.
+    pub fn with_window(mut self, window: usize) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Set the maximum delta chain depth (`0` disables deltas).
+    pub fn with_depth(mut self, depth: usize) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// Choose whether in-pack deltas use ofs-delta (`true`) or ref-delta
+    /// (`false`) base references.
+    pub fn with_prefer_ofs_delta(mut self, prefer_ofs_delta: bool) -> Self {
+        self.prefer_ofs_delta = prefer_ofs_delta;
+        self
+    }
+
+    /// Provide the set of external base objects permitted for a thin pack.
+    pub fn with_thin_bases(mut self, thin_bases: HashMap<ObjectId, EncodedObject>) -> Self {
+        self.thin_bases = thin_bases;
+        self
+    }
+
+    /// Choose whether objects may be reordered for delta locality (`true`) or
+    /// emitted in input order (`false`).
+    pub fn with_reorder(mut self, reorder: bool) -> Self {
+        self.reorder = reorder;
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepackPolicy {
     pub write_bitmaps: bool,
@@ -340,75 +436,166 @@ impl PackFile {
         Self::write_undeltified(objects, ObjectFormat::Sha1)
     }
 
+    /// Write a pack with every object stored undeltified (no delta entries).
+    ///
+    /// This is the simple, self-contained encoding; objects appear in the given
+    /// order. For smaller output that exploits similarity between objects, use
+    /// [`PackFile::write_packed`].
     pub fn write_undeltified(objects: &[EncodedObject], format: ObjectFormat) -> Result<PackWrite> {
-        Self::write_with_delta_strategy(objects, format, DeltaStrategy::None)
+        let options = PackWriteOptions::new().with_depth(0).with_reorder(false);
+        Self::write_packed_impl(objects, format, &options)
     }
 
+    /// Write a pack, deltifying adjacent same-type objects per `delta_strategy`.
+    ///
+    /// Retained for API compatibility. [`DeltaStrategy::None`] produces an
+    /// undeltified pack; [`DeltaStrategy::OfsDelta`]/[`DeltaStrategy::RefDelta`]
+    /// run sliding-window delta selection (see [`PackFile::write_packed`])
+    /// emitting the requested in-pack base-reference style. Prefer
+    /// [`PackFile::write_packed`]/[`PackFile::write_packed_with_options`] for
+    /// new code.
     pub fn write_with_delta_strategy(
         objects: &[EncodedObject],
         format: ObjectFormat,
         delta_strategy: DeltaStrategy,
     ) -> Result<PackWrite> {
+        // Preserve input order to match the historical behavior of this
+        // function (deltas only ever reference earlier input objects).
+        let options = match delta_strategy {
+            DeltaStrategy::None => PackWriteOptions::new().with_depth(0).with_reorder(false),
+            DeltaStrategy::OfsDelta => PackWriteOptions::new()
+                .with_prefer_ofs_delta(true)
+                .with_reorder(false),
+            DeltaStrategy::RefDelta => PackWriteOptions::new()
+                .with_prefer_ofs_delta(false)
+                .with_reorder(false),
+        };
+        Self::write_packed_impl(objects, format, &options)
+    }
+
+    /// Write a pack using sliding-window delta selection with git-compatible
+    /// defaults (window [`DEFAULT_PACK_WINDOW`], depth [`DEFAULT_PACK_DEPTH`],
+    /// ofs-deltas, self-contained).
+    ///
+    /// Objects are grouped by type and ordered for good deltas, then each is
+    /// compared against a window of previously emitted candidates; the smallest
+    /// acceptable delta is kept, otherwise the object is stored undeltified. The
+    /// result round-trips through [`PackFile::parse`].
+    pub fn write_packed(objects: &[EncodedObject], format: ObjectFormat) -> Result<PackWrite> {
+        Self::write_packed_with_options(objects, format, &PackWriteOptions::new())
+    }
+
+    /// Like [`PackFile::write_packed`] but with caller-supplied
+    /// [`PackWriteOptions`] (window, depth, base-reference style, and optional
+    /// external thin bases).
+    pub fn write_packed_with_options(
+        objects: &[EncodedObject],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+    ) -> Result<PackWrite> {
+        Self::write_packed_impl(objects, format, options)
+    }
+
+    /// Write a thin pack: objects may be deltified against `external_bases`
+    /// that are *not* included in the pack, referenced by ref-delta to their
+    /// object id.
+    ///
+    /// The receiver must already have (or otherwise obtain) those base objects
+    /// and resolve the pack with [`PackFile::parse_thin`]. Window and depth use
+    /// the defaults; pass options via [`PackFile::write_packed_with_options`]
+    /// with [`PackWriteOptions::with_thin_bases`] for finer control.
+    pub fn write_thin(
+        objects: &[EncodedObject],
+        format: ObjectFormat,
+        external_bases: HashMap<ObjectId, EncodedObject>,
+    ) -> Result<PackWrite> {
+        let options = PackWriteOptions::new().with_thin_bases(external_bases);
+        Self::write_packed_impl(objects, format, &options)
+    }
+
+    fn write_packed_impl(
+        objects: &[EncodedObject],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+    ) -> Result<PackWrite> {
         if objects.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));
         }
+
+        // Compute object ids up front; they are needed both for the index and,
+        // for ref-deltas, inside the pack entries themselves.
+        let mut object_ids: Vec<ObjectId> = Vec::with_capacity(objects.len());
+        for object in objects {
+            object_ids.push(object.object_id(format)?);
+        }
+
+        // Validate external thin bases share the pack's hash format.
+        for oid in options.thin_bases.keys() {
+            if oid.format() != format {
+                return Err(GitError::InvalidObjectId(
+                    "thin pack base object id format does not match pack format".into(),
+                ));
+            }
+        }
+
+        // Decide, for each object, whether it is stored undeltified or as a
+        // delta against another object (in-pack or an external thin base), and
+        // obtain the emit order. In-pack deltas only ever reference candidates
+        // that appear earlier in `order`, so emitting in `order` guarantees a
+        // base is always written before any object that deltas against it.
+        let (plan, order) = plan_pack_deltas(objects, &object_ids, options)?;
+
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
         pack.extend_from_slice(&2u32.to_be_bytes());
         pack.extend_from_slice(&(objects.len() as u32).to_be_bytes());
+
         let mut index_entries = Vec::with_capacity(objects.len());
-        let mut written_offsets: Vec<usize> = Vec::with_capacity(objects.len());
-        let mut object_ids: Vec<ObjectId> = Vec::with_capacity(objects.len());
-        for (idx, object) in objects.iter().enumerate() {
-            let offset = pack.len();
-            if offset > u64::MAX as usize {
-                return Err(GitError::InvalidFormat("pack offset overflow".into()));
-            }
-            let oid = object.object_id(format)?;
+        // Pack offset at which each original object index was written, or
+        // `None` until it has been emitted.
+        let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
+
+        for &idx in &order {
+            let offset = pack.len() as u64;
             let mut entry_bytes = Vec::new();
-            let delta_base = idx.checked_sub(1).filter(|_| {
-                delta_strategy != DeltaStrategy::None
-                    && objects[idx - 1].object_type == object.object_type
-            });
-            if let Some(base_idx) = delta_base {
-                let base = &objects[base_idx];
-                let delta = create_pack_delta(&base.body, &object.body);
-                if delta.len() < object.body.len() {
-                    match delta_strategy {
-                        DeltaStrategy::None => unreachable!(),
-                        DeltaStrategy::RefDelta => {
-                            write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
-                            entry_bytes.extend_from_slice(object_ids[base_idx].as_bytes());
-                        }
-                        DeltaStrategy::OfsDelta => {
-                            write_pack_entry_header_kind(&mut entry_bytes, 6, delta.len() as u64);
-                            let relative = offset
-                                .checked_sub(written_offsets[base_idx])
-                                .ok_or_else(|| {
-                                    GitError::InvalidFormat(
-                                        "ofs-delta base offset is after delta".into(),
-                                    )
-                                })?;
-                            write_ofs_delta_offset(&mut entry_bytes, relative as u64)?;
-                        }
-                    }
-                    write_compressed_payload(&mut entry_bytes, &delta)?;
-                } else {
-                    write_undeltified_entry(&mut entry_bytes, object)?;
+            match &plan[idx].base {
+                PlannedBase::None => {
+                    write_undeltified_entry(&mut entry_bytes, &objects[idx])?;
                 }
-            } else {
-                write_undeltified_entry(&mut entry_bytes, object)?;
+                PlannedBase::InPack { base_idx, delta } => {
+                    let base_offset = written_offsets[*base_idx].ok_or_else(|| {
+                        GitError::InvalidFormat(
+                            "in-pack delta base emitted after dependent object".into(),
+                        )
+                    })?;
+                    if options.prefer_ofs_delta {
+                        write_pack_entry_header_kind(&mut entry_bytes, 6, delta.len() as u64);
+                        let relative = offset.checked_sub(base_offset).ok_or_else(|| {
+                            GitError::InvalidFormat("ofs-delta base offset is after delta".into())
+                        })?;
+                        write_ofs_delta_offset(&mut entry_bytes, relative)?;
+                    } else {
+                        write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
+                        entry_bytes.extend_from_slice(object_ids[*base_idx].as_bytes());
+                    }
+                    write_compressed_payload(&mut entry_bytes, delta)?;
+                }
+                PlannedBase::External { base_oid, delta } => {
+                    write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
+                    entry_bytes.extend_from_slice(base_oid.as_bytes());
+                    write_compressed_payload(&mut entry_bytes, delta)?;
+                }
             }
             let crc32 = crc32fast::hash(&entry_bytes);
             pack.extend_from_slice(&entry_bytes);
+            written_offsets[idx] = Some(offset);
             index_entries.push(PackIndexEntry {
-                oid: oid.clone(),
+                oid: object_ids[idx].clone(),
                 crc32,
-                offset: offset as u64,
+                offset,
             });
-            written_offsets.push(offset);
-            object_ids.push(oid);
         }
+
         let checksum = git_core::digest_bytes(format, &pack)?;
         pack.extend_from_slice(checksum.as_bytes());
         let index = PackIndex::write_v2(format, &index_entries, &checksum)?;
@@ -1788,19 +1975,322 @@ fn decoded_delta_result_size(delta: &[u8]) -> Result<u64> {
     read_delta_varint(delta, &mut cursor)
 }
 
-fn create_pack_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
-    let mut delta = Vec::new();
-    write_delta_varint(&mut delta, base.len() as u64);
-    write_delta_varint(&mut delta, target.len() as u64);
+/// Size, in bytes, of the fixed blocks used to index a base object for delta
+/// compression. Matches git's `diff-delta.c` block size so copy regions can be
+/// discovered anywhere in the base, not just at a shared prefix.
+const DELTA_BLOCK_SIZE: usize = 16;
 
-    let common_prefix = base
-        .iter()
-        .zip(target.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    write_delta_copy(&mut delta, 0, common_prefix as u64);
-    write_delta_insert(&mut delta, &target[common_prefix..]);
-    delta
+/// An index over a base object's content used to generate deltas against it.
+///
+/// The index hashes every aligned [`DELTA_BLOCK_SIZE`]-byte block of the base
+/// and maps that hash to the block's starting offsets. Building it once and
+/// reusing it across many candidate targets (as the sliding window does) keeps
+/// delta generation close to linear in the combined input size.
+struct DeltaIndex<'a> {
+    base: &'a [u8],
+    blocks: HashMap<u32, Vec<usize>>,
+}
+
+impl<'a> DeltaIndex<'a> {
+    fn new(base: &'a [u8]) -> Self {
+        let mut blocks: HashMap<u32, Vec<usize>> = HashMap::new();
+        if base.len() >= DELTA_BLOCK_SIZE {
+            // Index every aligned block. Iterate from the end so that the
+            // earliest offsets end up last; callers prefer lower offsets which
+            // keep copy commands compact, and they scan the bucket in order.
+            let mut offset = base.len() - DELTA_BLOCK_SIZE;
+            loop {
+                let hash = block_hash(&base[offset..offset + DELTA_BLOCK_SIZE]);
+                let bucket = blocks.entry(hash).or_default();
+                // Bound the chain length per hash bucket so a pathological base
+                // (many identical blocks) cannot make generation quadratic.
+                if bucket.len() < DELTA_MAX_CHAIN {
+                    bucket.push(offset);
+                }
+                if offset == 0 {
+                    break;
+                }
+                offset -= 1;
+            }
+        }
+        Self { base, blocks }
+    }
+
+    /// Generate a delta that reconstructs `target` from this index's base.
+    fn delta(&self, target: &[u8]) -> Vec<u8> {
+        let base = self.base;
+        let mut delta = Vec::new();
+        write_delta_varint(&mut delta, base.len() as u64);
+        write_delta_varint(&mut delta, target.len() as u64);
+
+        let mut pending_insert_start = 0usize;
+        let mut pos = 0usize;
+        while pos < target.len() {
+            let mut best_len = 0usize;
+            let mut best_offset = 0usize;
+            if pos + DELTA_BLOCK_SIZE <= target.len() {
+                let hash = block_hash(&target[pos..pos + DELTA_BLOCK_SIZE]);
+                if let Some(candidates) = self.blocks.get(&hash) {
+                    for &candidate in candidates {
+                        // Confirm the block actually matches (hash collisions are
+                        // possible) before measuring how far it extends.
+                        let max_len = (base.len() - candidate).min(target.len() - pos);
+                        let mut len = 0usize;
+                        while len < max_len && base[candidate + len] == target[pos + len] {
+                            len += 1;
+                        }
+                        if len > best_len {
+                            best_len = len;
+                            best_offset = candidate;
+                        }
+                    }
+                }
+            }
+
+            if best_len >= DELTA_BLOCK_SIZE {
+                if pending_insert_start < pos {
+                    write_delta_insert(&mut delta, &target[pending_insert_start..pos]);
+                }
+                write_delta_copy(&mut delta, best_offset as u64, best_len as u64);
+                pos += best_len;
+                pending_insert_start = pos;
+            } else {
+                pos += 1;
+            }
+        }
+        if pending_insert_start < target.len() {
+            write_delta_insert(&mut delta, &target[pending_insert_start..]);
+        }
+        delta
+    }
+}
+
+/// Maximum number of base offsets retained per block-hash bucket. Caps the work
+/// done extending candidate matches for inputs with many repeated blocks.
+const DELTA_MAX_CHAIN: usize = 64;
+
+/// Hash a fixed-size block of base/target bytes into a bucket key.
+///
+/// A simple multiplicative (FNV-style) hash is sufficient here: matches are
+/// always verified byte-for-byte before use, so collisions only cost a little
+/// extra comparison work and never affect correctness.
+fn block_hash(block: &[u8]) -> u32 {
+    let mut hash = 0u32;
+    for &byte in block {
+        hash = hash.wrapping_mul(0x0100_0193) ^ u32::from(byte);
+    }
+    hash
+}
+
+/// Generate a delta encoding that reconstructs `target` from `base`.
+///
+/// Kept as a free function for the existing adjacent-object delta path and for
+/// callers/tests that only deltify a single pair. For batch pack generation the
+/// sliding window reuses a [`DeltaIndex`] across many targets instead.
+fn create_pack_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    DeltaIndex::new(base).delta(target)
+}
+
+/// The chosen storage form for a single object during pack generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedBase {
+    /// Stored undeltified (a base for others, or no good delta was found).
+    None,
+    /// Delta against another object in this pack, identified by its original
+    /// index. The pre-computed `delta` bytes reconstruct the object from that
+    /// base's body.
+    InPack { base_idx: usize, delta: Vec<u8> },
+    /// Delta against an external (thin-pack) base, referenced by object id.
+    External { base_oid: ObjectId, delta: Vec<u8> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedEntry {
+    base: PlannedBase,
+}
+
+/// Maximum number of external thin-pack bases compared against any single
+/// object. Bounds the work of the thin path when a large base set is supplied.
+const DELTA_MAX_EXTERNAL_BASES: usize = 64;
+
+/// Rank object types for delta grouping. Objects of the same type are far more
+/// likely to delta well, so the sort groups by this rank first.
+fn delta_type_rank(object_type: ObjectType) -> u8 {
+    match object_type {
+        ObjectType::Commit => 0,
+        ObjectType::Tree => 1,
+        ObjectType::Blob => 2,
+        ObjectType::Tag => 3,
+    }
+}
+
+/// Decide how each object is stored (undeltified or deltified) and the order in
+/// which objects are emitted into the pack.
+///
+/// # Ordering
+///
+/// Candidates are sorted by `(type, size descending, object id)`:
+/// * **type** — only same-type objects are deltified against one another, so
+///   grouping by type keeps the sliding window full of viable bases. Type rank
+///   follows [`delta_type_rank`] (commit, tree, blob, tag).
+/// * **size descending** — larger objects come first so smaller, later objects
+///   delta against larger bases (git's heuristic). Raw [`EncodedObject`]s carry
+///   no path/name, so the usual path-hash key is unavailable; size is the next
+///   best locality signal.
+/// * **object id** — a deterministic tiebreaker for reproducible packs.
+///
+/// # Selection
+///
+/// Each object is compared against the previous up to `window` same-type
+/// candidates (and, for thin packs, up to [`DELTA_MAX_EXTERNAL_BASES`] external
+/// bases of the same type). The smallest delta whose encoded length is strictly
+/// less than the object's own body is kept; otherwise the object is stored
+/// undeltified. Delta chain depth is bounded by `options.depth` (a base may
+/// only be used if doing so keeps the resulting chain within the bound); a depth
+/// of `0` disables deltification entirely.
+///
+/// Returns the per-object plan (indexed by original object index) together with
+/// the emit order. Every in-pack delta references a candidate that is earlier in
+/// the emit order, so emitting in that order writes each base before any object
+/// that depends on it.
+fn plan_pack_deltas(
+    objects: &[EncodedObject],
+    object_ids: &[ObjectId],
+    options: &PackWriteOptions,
+) -> Result<(Vec<PlannedEntry>, Vec<usize>)> {
+    let count = objects.len();
+    let mut plan: Vec<PlannedEntry> = (0..count)
+        .map(|_| PlannedEntry {
+            base: PlannedBase::None,
+        })
+        .collect();
+
+    // Processing order. Deltas only point backwards within this order, which is
+    // therefore also a valid emit order. Reordering by type/size improves delta
+    // locality but is skipped when disabled or when deltification is off.
+    let mut order: Vec<usize> = (0..count).collect();
+    if options.reorder && options.depth > 0 {
+        order.sort_by(|&left, &right| {
+            delta_type_rank(objects[left].object_type)
+                .cmp(&delta_type_rank(objects[right].object_type))
+                .then_with(|| objects[right].body.len().cmp(&objects[left].body.len()))
+                .then_with(|| {
+                    object_ids[left]
+                        .as_bytes()
+                        .cmp(object_ids[right].as_bytes())
+                })
+        });
+    }
+
+    if options.depth == 0 {
+        return Ok((plan, order));
+    }
+
+    // Pre-build delta indexes for external thin-pack bases, grouped by type so
+    // an object only compares against compatible bases.
+    let mut external_indexes: Vec<(ObjectId, ObjectType, DeltaIndex<'_>)> =
+        Vec::with_capacity(options.thin_bases.len());
+    for (oid, object) in &options.thin_bases {
+        external_indexes.push((
+            oid.clone(),
+            object.object_type,
+            DeltaIndex::new(&object.body),
+        ));
+    }
+
+    // Chain depth ending at each object (0 = undeltified). Used to keep delta
+    // chains within `options.depth`.
+    let mut depth = vec![0usize; count];
+    // Sliding window of recently processed original indices, most recent last.
+    let mut window: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+
+    for &idx in &order {
+        let target = &objects[idx].body;
+        let target_type = objects[idx].object_type;
+
+        let mut best_delta: Option<Vec<u8>> = None;
+        let mut best_base = PlannedBase::None;
+
+        // Try in-pack candidates from the window (same type only).
+        for &base_idx in window.iter().rev() {
+            if objects[base_idx].object_type != target_type {
+                continue;
+            }
+            // Using this base would make the new chain depth + 1; skip if that
+            // would exceed the configured maximum.
+            if depth[base_idx] + 1 > options.depth {
+                continue;
+            }
+            let delta = create_pack_delta(&objects[base_idx].body, target);
+            if !delta_is_acceptable(&delta, target.len()) {
+                continue;
+            }
+            if best_delta
+                .as_ref()
+                .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base = PlannedBase::InPack {
+                    base_idx,
+                    delta: Vec::new(),
+                };
+            }
+        }
+
+        // Try external thin-pack bases (ref-delta; external base is depth 0, so
+        // the resulting chain depth is 1, always within a non-zero bound).
+        for (base_oid, base_type, base_index) in
+            external_indexes.iter().take(DELTA_MAX_EXTERNAL_BASES)
+        {
+            if *base_type != target_type {
+                continue;
+            }
+            let delta = base_index.delta(target);
+            if !delta_is_acceptable(&delta, target.len()) {
+                continue;
+            }
+            if best_delta
+                .as_ref()
+                .is_none_or(|current| delta.len() < current.len())
+            {
+                best_delta = Some(delta);
+                best_base = PlannedBase::External {
+                    base_oid: base_oid.clone(),
+                    delta: Vec::new(),
+                };
+            }
+        }
+
+        if let Some(delta) = best_delta {
+            match best_base {
+                PlannedBase::InPack { base_idx, .. } => {
+                    depth[idx] = depth[base_idx] + 1;
+                    plan[idx].base = PlannedBase::InPack { base_idx, delta };
+                }
+                PlannedBase::External { base_oid, .. } => {
+                    depth[idx] = 1;
+                    plan[idx].base = PlannedBase::External { base_oid, delta };
+                }
+                PlannedBase::None => {}
+            }
+        }
+
+        // Add this object to the window for subsequent candidates.
+        window.push_back(idx);
+        while window.len() > options.window {
+            window.pop_front();
+        }
+    }
+
+    Ok((plan, order))
+}
+
+/// Whether a generated delta is worth using instead of storing the object
+/// undeltified. The encoded delta must be strictly smaller than the object's own
+/// body; otherwise the undeltified form is the same size or smaller and is
+/// always self-contained.
+fn delta_is_acceptable(delta: &[u8], target_len: usize) -> bool {
+    !delta.is_empty() && delta.len() < target_len
 }
 
 fn write_delta_varint(out: &mut Vec<u8>, mut value: u64) {
@@ -3264,6 +3754,347 @@ mod tests {
         assert_eq!(parsed.find(&oid).unwrap().offset, 12);
         assert_eq!(parsed.find(&oid).unwrap().crc32, 0x1234_5678);
         assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
+    }
+
+    #[test]
+    fn write_packed_deltifies_similar_blobs_and_round_trips_sha1() {
+        write_packed_deltifies_similar_blobs_and_round_trips(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn write_packed_deltifies_similar_blobs_and_round_trips_sha256() {
+        write_packed_deltifies_similar_blobs_and_round_trips(ObjectFormat::Sha256);
+    }
+
+    fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {
+        let objects = similar_blob_family(8);
+        let packed = PackFile::write_packed(&objects, format).unwrap();
+        let undeltified = PackFile::write_undeltified(&objects, format).unwrap();
+
+        // The whole point of delta selection: the packed output is smaller than
+        // storing every object undeltified.
+        assert!(
+            packed.pack.len() < undeltified.pack.len(),
+            "expected delta pack ({}) smaller than undeltified pack ({})",
+            packed.pack.len(),
+            undeltified.pack.len()
+        );
+
+        // At least one object must actually be stored as a delta.
+        let kinds = pack_entry_kinds(&packed.pack, format);
+        let delta_count = kinds
+            .iter()
+            .filter(|kind| matches!(kind, PackObjectKind::OfsDelta | PackObjectKind::RefDelta))
+            .count();
+        assert!(
+            delta_count >= 1,
+            "expected at least one delta entry, found kinds {kinds:?}"
+        );
+
+        // Round-trip: every original object reconstructs byte-for-byte.
+        let parsed = PackFile::parse(&packed.pack, format).unwrap();
+        assert_eq!(parsed.entries.len(), objects.len());
+        for object in &objects {
+            let oid = object.object_id(format).unwrap();
+            let found = parsed
+                .entries
+                .iter()
+                .find(|entry| entry.entry.oid == oid)
+                .unwrap_or_else(|| panic!("object {oid} missing from parsed pack"));
+            assert_eq!(&found.object, object, "object {oid} did not round-trip");
+        }
+
+        // The index must agree with the pack and locate every object.
+        let index = PackIndex::parse(&packed.index, format).unwrap();
+        assert_eq!(index.pack_checksum, packed.checksum);
+        for object in &objects {
+            let oid = object.object_id(format).unwrap();
+            assert!(index.find(&oid).is_some(), "index missing {oid}");
+        }
+    }
+
+    #[test]
+    fn write_packed_emits_ofs_delta_by_default() {
+        let objects = similar_blob_family(6);
+        let packed = PackFile::write_packed(&objects, ObjectFormat::Sha1).unwrap();
+        let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
+        assert!(
+            kinds.iter().any(|kind| *kind == PackObjectKind::OfsDelta),
+            "expected an ofs-delta entry by default, found {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|kind| *kind == PackObjectKind::RefDelta),
+            "default self-contained pack must not use ref-delta, found {kinds:?}"
+        );
+        // Round-trips.
+        assert!(PackFile::parse(&packed.pack, ObjectFormat::Sha1).is_ok());
+    }
+
+    #[test]
+    fn write_packed_can_emit_ref_delta() {
+        let objects = similar_blob_family(6);
+        let options = PackWriteOptions::new().with_prefer_ofs_delta(false);
+        let packed =
+            PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options).unwrap();
+        let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
+        assert!(
+            kinds.iter().any(|kind| *kind == PackObjectKind::RefDelta),
+            "expected a ref-delta entry, found {kinds:?}"
+        );
+        assert!(
+            !kinds.iter().any(|kind| *kind == PackObjectKind::OfsDelta),
+            "ref-delta mode must not emit ofs-delta, found {kinds:?}"
+        );
+
+        // Ref-delta packs are still self-contained here, so they round-trip
+        // without any external base lookup.
+        let parsed = PackFile::parse(&packed.pack, ObjectFormat::Sha1).unwrap();
+        assert_eq!(parsed.entries.len(), objects.len());
+    }
+
+    #[test]
+    fn write_packed_bounds_delta_chain_depth() {
+        // A long chain of progressively-modified blobs. With a large window
+        // every object could otherwise delta against its immediate predecessor,
+        // forming a chain as long as the input.
+        let objects = incremental_blob_chain(20);
+        let format = ObjectFormat::Sha1;
+
+        for max_depth in [1usize, 2, 5] {
+            let options = PackWriteOptions::new()
+                .with_window(20)
+                .with_depth(max_depth);
+            let packed = PackFile::write_packed_with_options(&objects, format, &options).unwrap();
+
+            let depths = pack_entry_depths(&packed.pack, format);
+            let observed = depths.iter().copied().max().unwrap_or(0);
+            assert!(
+                observed <= max_depth,
+                "max chain depth {observed} exceeded bound {max_depth}"
+            );
+
+            // Still correct: round-trips byte-for-byte.
+            let parsed = PackFile::parse(&packed.pack, format).unwrap();
+            for object in &objects {
+                let oid = object.object_id(format).unwrap();
+                let found = parsed
+                    .entries
+                    .iter()
+                    .find(|entry| entry.entry.oid == oid)
+                    .unwrap();
+                assert_eq!(&found.object, object);
+            }
+        }
+    }
+
+    #[test]
+    fn write_packed_depth_zero_stores_everything_undeltified() {
+        let objects = similar_blob_family(5);
+        let options = PackWriteOptions::new().with_depth(0);
+        let packed =
+            PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options).unwrap();
+        let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
+        assert!(
+            kinds
+                .iter()
+                .all(|kind| !matches!(kind, PackObjectKind::OfsDelta | PackObjectKind::RefDelta)),
+            "depth 0 must disable deltas, found {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn write_thin_uses_external_base_and_round_trips_sha1() {
+        write_thin_uses_external_base_and_round_trips(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn write_thin_uses_external_base_and_round_trips_sha256() {
+        write_thin_uses_external_base_and_round_trips(ObjectFormat::Sha256);
+    }
+
+    fn write_thin_uses_external_base_and_round_trips(format: ObjectFormat) {
+        // The base object stays OUT of the pack; only `target` is written, as a
+        // ref-delta against the external base's object id.
+        let base = blob_with_marker("EXTERNAL-BASE");
+        let target = blob_with_marker("EXTERNAL-TARGET");
+        let base_oid = base.object_id(format).unwrap();
+
+        let mut external = HashMap::new();
+        external.insert(base_oid.clone(), base.clone());
+        let packed = PackFile::write_thin(std::slice::from_ref(&target), format, external).unwrap();
+
+        // Exactly one entry, encoded as a ref-delta to the external base.
+        let kinds = pack_entry_kinds(&packed.pack, format);
+        assert_eq!(kinds, vec![PackObjectKind::RefDelta]);
+
+        // The external base reference must be the base oid.
+        let mut offset = 12usize;
+        let header = parse_entry_header(&packed.pack, &mut offset).unwrap();
+        assert_eq!(header.kind, PackObjectKind::RefDelta);
+        let referenced =
+            ObjectId::from_raw(format, &packed.pack[offset..offset + format.raw_len()]).unwrap();
+        assert_eq!(referenced, base_oid);
+
+        // A plain (non-thin) parse fails: the base is not present.
+        assert!(PackFile::parse(&packed.pack, format).is_err());
+
+        // A thin parse that supplies the external base reconstructs the target.
+        let parsed = PackFile::parse_thin(&packed.pack, format, |oid| {
+            if oid == &base_oid {
+                Ok(Some(base.clone()))
+            } else {
+                Ok(None)
+            }
+        })
+        .unwrap();
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(parsed.entries[0].object, target);
+    }
+
+    #[test]
+    fn write_packed_preserves_distinct_objects_with_no_similarity() {
+        // Unrelated objects: nothing should delta, but the pack must still be
+        // valid and complete.
+        let objects = vec![
+            EncodedObject::new(ObjectType::Blob, b"alpha distinct\n".to_vec()),
+            EncodedObject::new(ObjectType::Tree, vec![0u8; 0]),
+            EncodedObject::new(ObjectType::Commit, b"tree 0000\n".to_vec()),
+        ];
+        let format = ObjectFormat::Sha1;
+        let packed = PackFile::write_packed(&objects, format).unwrap();
+        let parsed = PackFile::parse(&packed.pack, format).unwrap();
+        assert_eq!(parsed.entries.len(), objects.len());
+        for object in &objects {
+            let oid = object.object_id(format).unwrap();
+            assert!(parsed.entries.iter().any(|entry| entry.entry.oid == oid));
+        }
+    }
+
+    /// Build a family of blobs that all share a large common region but differ
+    /// in a marker placed in the *middle*, so a good delta finds copy regions on
+    /// both sides of the change.
+    fn similar_blob_family(count: usize) -> Vec<EncodedObject> {
+        let mut common_head = Vec::new();
+        for _ in 0..200 {
+            common_head.extend_from_slice(b"shared header line for delta testing\n");
+        }
+        let mut common_tail = Vec::new();
+        for _ in 0..200 {
+            common_tail.extend_from_slice(b"shared trailer line for delta testing\n");
+        }
+        (0..count)
+            .map(|idx| {
+                let mut body = common_head.clone();
+                body.extend_from_slice(format!("UNIQUE MIDDLE MARKER NUMBER {idx}\n").as_bytes());
+                body.extend_from_slice(&common_tail);
+                EncodedObject::new(ObjectType::Blob, body)
+            })
+            .collect()
+    }
+
+    /// Build a chain where each blob is the previous one plus an appended line,
+    /// so each is highly similar to its predecessor.
+    fn incremental_blob_chain(count: usize) -> Vec<EncodedObject> {
+        let mut body = Vec::new();
+        for _ in 0..100 {
+            body.extend_from_slice(b"baseline content shared across the whole chain\n");
+        }
+        let mut objects = Vec::with_capacity(count);
+        for idx in 0..count {
+            body.extend_from_slice(format!("appended unique line {idx}\n").as_bytes());
+            objects.push(EncodedObject::new(ObjectType::Blob, body.clone()));
+        }
+        objects
+    }
+
+    fn blob_with_marker(marker: &str) -> EncodedObject {
+        let mut body = Vec::new();
+        for _ in 0..150 {
+            body.extend_from_slice(b"common body shared between base and target\n");
+        }
+        body.extend_from_slice(marker.as_bytes());
+        body.push(b'\n');
+        for _ in 0..150 {
+            body.extend_from_slice(b"more common body shared between objects\n");
+        }
+        EncodedObject::new(ObjectType::Blob, body)
+    }
+
+    /// Classify every entry in a pack (in pack order) by its on-disk kind.
+    fn pack_entry_kinds(pack: &[u8], format: ObjectFormat) -> Vec<PackObjectKind> {
+        pack_entry_descriptors(pack, format)
+            .into_iter()
+            .map(|descriptor| descriptor.kind)
+            .collect()
+    }
+
+    /// Compute each entry's delta chain depth (0 = undeltified base), in pack
+    /// order. Entries always appear after their in-pack bases, so a single
+    /// forward pass suffices.
+    fn pack_entry_depths(pack: &[u8], format: ObjectFormat) -> Vec<usize> {
+        let descriptors = pack_entry_descriptors(pack, format);
+        let mut depth_by_offset: HashMap<u64, usize> = HashMap::new();
+        let mut depths = Vec::with_capacity(descriptors.len());
+        for descriptor in &descriptors {
+            let depth = match &descriptor.base {
+                EntryBase::None => 0,
+                EntryBase::Offset(base_offset) => {
+                    depth_by_offset.get(base_offset).copied().unwrap_or(0) + 1
+                }
+                // Ref-delta to an in-pack base: look it up by offset via oid is
+                // unnecessary for these tests (which only use ofs-delta for the
+                // chains), so treat as depth 1 if unknown.
+                EntryBase::Ref => 1,
+            };
+            depth_by_offset.insert(descriptor.offset, depth);
+            depths.push(depth);
+        }
+        depths
+    }
+
+    struct EntryDescriptor {
+        offset: u64,
+        kind: PackObjectKind,
+        base: EntryBase,
+    }
+
+    enum EntryBase {
+        None,
+        Offset(u64),
+        Ref,
+    }
+
+    fn pack_entry_descriptors(pack: &[u8], format: ObjectFormat) -> Vec<EntryDescriptor> {
+        let trailer_offset = pack.len() - format.raw_len();
+        let count = u32_be(&pack[8..12]) as usize;
+        let mut offset = 12usize;
+        let mut descriptors = Vec::with_capacity(count);
+        for _ in 0..count {
+            let entry_offset = offset as u64;
+            let header = parse_entry_header(pack, &mut offset).unwrap();
+            let base = match header.kind {
+                PackObjectKind::OfsDelta => {
+                    let base_offset =
+                        parse_ofs_delta_base_offset(pack, &mut offset, entry_offset).unwrap();
+                    EntryBase::Offset(base_offset)
+                }
+                PackObjectKind::RefDelta => {
+                    offset += format.raw_len();
+                    EntryBase::Ref
+                }
+                _ => EntryBase::None,
+            };
+            let mut decoder = ZlibDecoder::new(&pack[offset..trailer_offset]);
+            let mut body = Vec::new();
+            decoder.read_to_end(&mut body).unwrap();
+            offset += decoder.total_in() as usize;
+            descriptors.push(EntryDescriptor {
+                offset: entry_offset,
+                kind: header.kind,
+                base,
+            });
+        }
+        descriptors
     }
 
     fn similar_blob_objects() -> (EncodedObject, EncodedObject) {
