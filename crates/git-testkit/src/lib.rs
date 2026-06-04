@@ -5303,6 +5303,304 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     ))
 }
 
+/// Harness for running UPSTREAM git's own `t/*.sh` test suite against the
+/// git-rs binary.
+///
+/// Upstream git ships a TAP-emitting shell test framework (`t/test-lib.sh` plus
+/// `t/tNNNN-*.sh` scripts). `test-lib.sh` can exercise an externally installed
+/// git via the `GIT_TEST_INSTALLED` environment variable, which must point at a
+/// directory containing a working `git` executable. This module drives
+/// `scripts/run-upstream-tests.sh`, which builds such a directory whose `git`
+/// is a shim around the git-rs binary, runs a configurable subset of upstream
+/// scripts against it, and aggregates the results. Running the upstream suite is
+/// the ultimate parity oracle.
+///
+/// # Environment / layout
+///
+/// Point the harness at an upstream git source checkout's `t/` directory via one
+/// of these environment variables:
+///
+/// * `GIT_RS_UPSTREAM_T` — absolute path to the upstream git `t/` directory.
+/// * `GIT_SRC_DIR` — absolute path to a git source root (we use `$GIT_SRC_DIR/t`).
+///
+/// The `t/` directory must come from a *built* checkout: `test-lib.sh` sources
+/// `GIT-BUILD-OPTIONS` and requires `t/helper/test-tool` and the `templates/blt`
+/// directory, all of which a build produces. See `run_upstream_default_subset`
+/// for a worked example of how to prepare one.
+pub mod upstream {
+    use git_core::{GitError, Result};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    /// The default foundational subset of upstream scripts.
+    ///
+    /// These target commands git-rs already implements (init, cat-file,
+    /// hash-object, config, rev-parse, ls-files, ls-tree, symbolic-ref) and are
+    /// small enough that a run finishes quickly. Names are exact upstream
+    /// filenames as of git master.
+    pub const DEFAULT_SCRIPTS: &[&str] = &[
+        "t0001-init.sh",
+        "t1006-cat-file.sh",
+        "t1007-hash-object.sh",
+        "t1300-config.sh",
+        "t1500-rev-parse.sh",
+        "t3000-ls-files-others.sh",
+        "t3103-ls-tree-misc.sh",
+        "t1401-symbolic-ref.sh",
+    ];
+
+    /// Maps each foundational git subcommand to the single upstream script that
+    /// exercises it. This is the inverse of the runner's `command_alias` table;
+    /// keep the two in sync. Callers can target one command by name via
+    /// [`script_for_command`] / [`run_upstream_command`] instead of memorising
+    /// `tNNNN` numbers.
+    pub const FOUNDATIONAL_COMMANDS: &[(&str, &str)] = &[
+        ("init", "t0001-init.sh"),
+        ("cat-file", "t1006-cat-file.sh"),
+        ("hash-object", "t1007-hash-object.sh"),
+        ("config", "t1300-config.sh"),
+        ("rev-parse", "t1500-rev-parse.sh"),
+        ("ls-files", "t3000-ls-files-others.sh"),
+        ("ls-tree", "t3103-ls-tree-misc.sh"),
+        ("symbolic-ref", "t1401-symbolic-ref.sh"),
+    ];
+
+    /// Resolve a foundational command name (e.g. `"config"`) to its upstream
+    /// script basename (e.g. `"t1300-config.sh"`). Returns `None` for unknown
+    /// names. The runner also accepts the command name directly as an argument.
+    pub fn script_for_command(command: &str) -> Option<&'static str> {
+        FOUNDATIONAL_COMMANDS
+            .iter()
+            .find(|(name, _)| *name == command)
+            .map(|(_, script)| *script)
+    }
+
+    /// Resolve an upstream script basename back to its friendly command name.
+    pub fn command_for_script(script: &str) -> Option<&'static str> {
+        FOUNDATIONAL_COMMANDS
+            .iter()
+            .find(|(_, s)| *s == script)
+            .map(|(name, _)| *name)
+    }
+
+    /// Per-script result parsed from the runner's output.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ScriptResult {
+        /// Upstream script basename, e.g. `t0001-init.sh`.
+        pub script: String,
+        /// Friendly command name (e.g. `config`) when the script is one of the
+        /// foundational subset; otherwise falls back to the script basename.
+        pub command: String,
+        /// `PASS`, `FAIL`, or `TIMEOUT`.
+        pub result: String,
+        /// Count of TAP `ok` assertions.
+        pub ok: u32,
+        /// Count of TAP `not ok` assertions.
+        pub failed: u32,
+    }
+
+    impl ScriptResult {
+        /// Total assertions actually run (`ok + not ok`). Note this can be less
+        /// than the script's TAP plan when the script aborted or timed out
+        /// partway through.
+        pub fn total(&self) -> u32 {
+            self.ok + self.failed
+        }
+
+        /// Assertion pass rate in percent (0–100), or 0 when nothing ran.
+        pub fn pass_rate(&self) -> u32 {
+            // `checked_div` yields `None` (-> 0) when no assertions ran, avoiding
+            // a divide-by-zero without a manual guard.
+            (self.ok.saturating_mul(100))
+                .checked_div(self.total())
+                .unwrap_or(0)
+        }
+    }
+
+    /// Outcome of attempting to run the upstream suite.
+    #[derive(Debug, Clone)]
+    pub enum UpstreamRunOutcome {
+        /// No upstream `t/` directory was configured (neither `GIT_RS_UPSTREAM_T`
+        /// nor `GIT_SRC_DIR` is set). Holds a human-readable reason. This is a
+        /// clean skip, not a failure.
+        Skipped(String),
+        /// The runner executed. Holds the parsed per-script results and the path
+        /// to the full text report, plus whether every script passed.
+        Ran {
+            results: Vec<ScriptResult>,
+            report_path: PathBuf,
+            all_passed: bool,
+        },
+    }
+
+    /// Resolve the upstream git `t/` directory from the environment, returning
+    /// `None` (rather than an error) when nothing is configured so callers can
+    /// skip cleanly.
+    pub fn upstream_t_dir() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("GIT_RS_UPSTREAM_T")
+            && !dir.is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
+        if let Ok(root) = std::env::var("GIT_SRC_DIR")
+            && !root.is_empty()
+        {
+            return Some(PathBuf::from(root).join("t"));
+        }
+        None
+    }
+
+    /// Absolute path to `scripts/run-upstream-tests.sh` shipped with this crate.
+    pub fn runner_script_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("scripts")
+            .join("run-upstream-tests.sh")
+    }
+
+    /// Run the upstream suite over the default foundational subset.
+    ///
+    /// Returns [`UpstreamRunOutcome::Skipped`] when no upstream `t/` directory is
+    /// configured; otherwise runs the suite and parses the per-script results.
+    /// `git_rs_bin`, when provided, is exported as `GIT_RS_BIN` so the runner
+    /// uses exactly that binary (handy from an integration test via
+    /// `env!("CARGO_BIN_EXE_git-rs")`); otherwise the runner resolves the binary
+    /// itself.
+    pub fn run_upstream_default_subset(
+        git_rs_bin: Option<&Path>,
+    ) -> Result<UpstreamRunOutcome> {
+        run_upstream_scripts(DEFAULT_SCRIPTS, git_rs_bin)
+    }
+
+    /// Like [`run_upstream_default_subset`] but with an explicit script list.
+    /// Each entry may be a foundational command name (`config`), a basename
+    /// (`t0001-init.sh`), a numeric prefix (`t0001`), or a glob (`t13*`); the
+    /// runner resolves it against the upstream `t/` directory.
+    pub fn run_upstream_scripts(
+        scripts: &[&str],
+        git_rs_bin: Option<&Path>,
+    ) -> Result<UpstreamRunOutcome> {
+        run_upstream_scripts_labeled(scripts, git_rs_bin, None)
+    }
+
+    /// Run a single foundational command's upstream script by name (e.g.
+    /// `"config"`, `"cat-file"`). The runner also accepts the command name
+    /// directly, so this is a thin, discoverable wrapper. `label`, when given,
+    /// is recorded in the report and the append-only pass-rate history so trends
+    /// are attributable across runs (e.g. a git short-SHA).
+    pub fn run_upstream_command(
+        command: &str,
+        git_rs_bin: Option<&Path>,
+        label: Option<&str>,
+    ) -> Result<UpstreamRunOutcome> {
+        run_upstream_scripts_labeled(&[command], git_rs_bin, label)
+    }
+
+    /// Like [`run_upstream_scripts`] but also records a caller-provided `label`
+    /// (passed through as `GIT_RS_RUN_LABEL`) in the report and history. The
+    /// library deliberately never reads a clock; when `label` is `None` the
+    /// runner script supplies a UTC timestamp at the shell layer.
+    pub fn run_upstream_scripts_labeled(
+        scripts: &[&str],
+        git_rs_bin: Option<&Path>,
+        label: Option<&str>,
+    ) -> Result<UpstreamRunOutcome> {
+        if upstream_t_dir().is_none() {
+            return Ok(UpstreamRunOutcome::Skipped(
+                "no upstream git t/ directory configured; \
+                 set GIT_RS_UPSTREAM_T (path to git's t/ dir) or \
+                 GIT_SRC_DIR (a built git source root, we use $GIT_SRC_DIR/t)"
+                    .into(),
+            ));
+        }
+
+        let runner = runner_script_path();
+        if !runner.exists() {
+            return Err(GitError::NotFound(format!(
+                "runner script missing: {}",
+                runner.display()
+            )));
+        }
+
+        let mut command = Command::new("sh");
+        command.arg(&runner);
+        for script in scripts {
+            command.arg(script);
+        }
+        if let Some(bin) = git_rs_bin {
+            command.env("GIT_RS_BIN", bin);
+        }
+        if let Some(label) = label {
+            command.env("GIT_RS_RUN_LABEL", label);
+        }
+
+        let output = command
+            .output()
+            .map_err(|err| GitError::Command(format!("failed to spawn runner: {err}")))?;
+
+        // The runner prints the per-script result table to stdout and logs the
+        // report path to stderr; parse each from its respective stream.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let results = parse_results(&stdout);
+        let report_path = report_path_from_logs(&stdout)
+            .or_else(|| report_path_from_logs(&stderr))
+            .unwrap_or_else(default_report_path);
+
+        Ok(UpstreamRunOutcome::Ran {
+            results,
+            report_path,
+            // The runner exits 0 only when every selected script passed.
+            all_passed: output.status.success(),
+        })
+    }
+
+    fn default_report_path() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("upstream-report.txt")
+    }
+
+    fn report_path_from_logs(text: &str) -> Option<PathBuf> {
+        text.lines().find_map(|line| {
+            line.strip_prefix("Full report written to: ")
+                .map(|path| PathBuf::from(path.trim()))
+        })
+    }
+
+    /// Parse the per-script result rows the runner prints, e.g.:
+    /// `t0001-init.sh                FAIL        39    63  rc=1 ...`
+    pub(crate) fn parse_results(stdout: &str) -> Vec<ScriptResult> {
+        let mut results = Vec::new();
+        for line in stdout.lines() {
+            let mut fields = line.split_whitespace();
+            let Some(script) = fields.next() else {
+                continue;
+            };
+            // Rows start with an upstream script basename.
+            if !(script.starts_with('t') && script.ends_with(".sh")) {
+                continue;
+            }
+            let Some(result) = fields.next() else {
+                continue;
+            };
+            if !matches!(result, "PASS" | "FAIL" | "TIMEOUT") {
+                continue;
+            }
+            let ok = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let failed = fields.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+            let command = command_for_script(script)
+                .map(str::to_string)
+                .unwrap_or_else(|| script.to_string());
+            results.push(ScriptResult {
+                script: script.to_string(),
+                command,
+                result: result.to_string(),
+                ok,
+                failed,
+            });
+        }
+        results
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6190,5 +6488,72 @@ mod tests {
         let result = rev_parse_peel_parity_sha256().unwrap();
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
+    }
+
+    // --- upstream module helpers (pure; no git required) ------------------
+
+    #[test]
+    fn upstream_command_script_mapping_is_bijective() {
+        use crate::upstream::{
+            DEFAULT_SCRIPTS, FOUNDATIONAL_COMMANDS, command_for_script, script_for_command,
+        };
+        // Every foundational command resolves to a script and back.
+        for (name, script) in FOUNDATIONAL_COMMANDS {
+            assert_eq!(script_for_command(name), Some(*script));
+            assert_eq!(command_for_script(script), Some(*name));
+        }
+        // The command map and the DEFAULT_SCRIPTS list cover the same scripts.
+        let mut mapped: Vec<&str> = FOUNDATIONAL_COMMANDS.iter().map(|(_, s)| *s).collect();
+        mapped.sort_unstable();
+        let mut defaults: Vec<&str> = DEFAULT_SCRIPTS.to_vec();
+        defaults.sort_unstable();
+        assert_eq!(mapped, defaults);
+        // Unknown names resolve to None.
+        assert_eq!(script_for_command("definitely-not-a-command"), None);
+        assert_eq!(command_for_script("t9999-nope.sh"), None);
+    }
+
+    #[test]
+    fn upstream_parse_results_extracts_command_and_counts() {
+        use crate::upstream::parse_results;
+        // A representative slice of the runner's stdout table.
+        let stdout = "\
+SCRIPT                       RESULT      OK  FAIL  DETAIL
+-------------------------------------------------------------------------
+t1300-config.sh              FAIL       131   367  rc=1 (1..498)
+t3103-ls-tree-misc.sh        TIMEOUT      1     9  exceeded 120s
+t9999-custom.sh              PASS       10     0  1..10
+not-a-row should be ignored
+";
+        let results = parse_results(stdout);
+        assert_eq!(results.len(), 3);
+
+        let cfg = &results[0];
+        assert_eq!(cfg.script, "t1300-config.sh");
+        assert_eq!(cfg.command, "config");
+        assert_eq!(cfg.result, "FAIL");
+        assert_eq!(cfg.ok, 131);
+        assert_eq!(cfg.failed, 367);
+        assert_eq!(cfg.total(), 498);
+        assert_eq!(cfg.pass_rate(), 26); // 131*100/498
+
+        // A non-foundational script falls back to its basename for `command`.
+        let custom = &results[2];
+        assert_eq!(custom.command, "t9999-custom.sh");
+        assert_eq!(custom.pass_rate(), 100);
+    }
+
+    #[test]
+    fn upstream_pass_rate_handles_zero_total() {
+        use crate::upstream::ScriptResult;
+        let empty = ScriptResult {
+            script: "t0000.sh".into(),
+            command: "t0000.sh".into(),
+            result: "TIMEOUT".into(),
+            ok: 0,
+            failed: 0,
+        };
+        assert_eq!(empty.total(), 0);
+        assert_eq!(empty.pass_rate(), 0);
     }
 }

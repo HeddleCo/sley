@@ -1,0 +1,251 @@
+================================================================================
+git-rs UPSTREAM GAP MAP (foundational subset)
+================================================================================
+
+Source oracle : upstream git v2.54.0 t/*.sh suite, run against the git-rs binary
+                via crates/git-testkit/scripts/run-upstream-tests.sh.
+Hash algo     : sha1 (GIT_TEST_DEFAULT_HASH=sha1 — REQUIRED, see "Harness note").
+Pass/total    : counts are TAP assertions actually executed (ok / ok+not-ok).
+                The TAP plan total is noted separately where the script aborts
+                or hangs before finishing.
+
+This is the curated, themed companion to the auto-generated upstream-report.txt
+(which lists every failing "not ok N - <title>" verbatim). Use this file to
+decide which command-hardening agents to spawn; use upstream-report.txt for the
+raw per-assertion detail of a specific run.
+
+Classification legend:
+  [CLI]    git-cli layer: flag/option parsing, output formatting, error text,
+           process exit codes, alias/-c handling, repo discovery.
+  [REV]    git-rev layer: revision/object-name resolution (<rev>:<path>, ^{},
+           :/search, --short abbreviation, --since pass-through).
+  [FMT]    git-formats / git-odb: config file parser/writer, object structure
+           validation, attribute/filter application.
+  [REFS]   git-refs: ref name validation, d/f conflicts, reflog.
+  [WT]     git-worktree: working-tree walk (ls-files), checkout, worktree add.
+  [AUX]    unimplemented auxiliary command surfaced as a dependency
+           (fast-import, clone/fetch, submodule, repack, rev-list filters).
+
+--------------------------------------------------------------------------------
+SCOREBOARD (sha1)
+--------------------------------------------------------------------------------
+  command       pass / run     plan   pass%   notes
+  init            39 / 102      102    38%
+  cat-file       115 / 291      291    40%    (1 upstream known-breakage among them)
+  hash-object     21 /  40       40    52%
+  config         131 / 498      498    26%    runs each test twice: legacy + subcommand modes
+  rev-parse       68 /  82       82*   83%    *aborts/hangs at test 81 (see CRITICAL bug)
+  ls-files         4 /  15       15    26%
+  ls-tree          1 /  10       10    10%
+  symbolic-ref    13 /  25       25    52%
+
+--------------------------------------------------------------------------------
+CRITICAL: rev-parse --short=N infinite loop  [REV]
+--------------------------------------------------------------------------------
+`git rev-parse --short=N <rev>` spins at 100% CPU forever when N >= the full
+hash hex length (40 for sha1, 64 for sha256). --short=40, --short=41, --short=100
+all hang; --short=39 is fine. Upstream clamps to the full hash length and just
+prints the whole oid. This single hang aborts t1500 at test 81 and, without a
+timeout, orphans a spinning process. The harness now caps each script (Perl
+alarm fallback that kills the child's process group), so the batch survives, but
+the bug itself must be fixed in the abbreviation/unique-prefix search (clamp the
+requested length to the hash length + add a loop-termination guard).
+Minimal repro:
+    git init r && cd r && git commit --allow-empty -m x
+    git rev-parse --short=40 HEAD     # hangs
+
+--------------------------------------------------------------------------------
+CROSS-CUTTING THEMES (fix once, many scripts improve)
+--------------------------------------------------------------------------------
+
+T1. Usage errors must exit 129, not 1.  [CLI]
+    git-rs detects bad option combos and prints good messages, but exits 1.
+    Upstream uses exit code 129 for usage errors; tests assert
+    `test_expect_code 129`. This is the dominant ls-tree failure (8 of 9) and a
+    large share of cat-file's ~56 "usage:" failures.
+    Examples: `ls-tree --long --name-only`, `cat-file -e -p`, `cat-file -p`
+    (no object). Affects: ls-tree, cat-file, hash-object, likely all commands.
+
+T2. Aliases and `-c` overrides are not expanded.  [CLI]
+    `git aliasedinit` (alias for init) -> "unsupported command aliasedinit".
+    Affects: init (aliasedinit, script), config ("unsupported command
+    hello-world/checkconfig/CamelCased/x"). Alias expansion from [alias] config
+    is unimplemented.
+
+T3. config writer lowercases names and drops case.  [CLI]/[FMT]
+    Writing `Section.Movie` produces `[section] movie = ...`; git preserves the
+    variable name case as typed (`Movie`) and the existing section-header case
+    (`[Sections]`, not `[sections]`). Lookups are case-insensitive (correct) but
+    WRITES must preserve case. Cascades into nearly every config write/compare
+    test. Examples: "mixed case", "similar section", "uppercase section".
+
+T4. checkout -B / -b / --orphan fails on clean repos.  [WT]
+    `git checkout -B main` (and `-b`, `--orphan`) -> "transaction failed:
+    checkout requires a clean working tree" even when the tree is clean.
+    Breaks setup steps in t1500 (test 1) and t1401 (tests 14, 15), cascading.
+
+--------------------------------------------------------------------------------
+PER-COMMAND DETAIL
+--------------------------------------------------------------------------------
+
+=== init  (t0001-init.sh)  39/102 ===
+  * [T2] Aliases unsupported: `git aliasedinit` fails (3 tests).
+  * [CLI] Templates: --template, init.templatedir (+ ~ expansion) ignored.
+      "init with --template", "init with init.templatedir set".
+  * [WT/CLI] Separate gitdir / linked worktrees: --separate-git-dir, re-init
+      moving .git link/symlink, re-init from a linked worktree (~12 tests).
+      "init with separate gitdir", "re-init to move gitdir(...)".
+  * [REFS/CLI] reftable backend + extension validation: --ref-format=reftable,
+      init.defaultRefFormat, GIT_DEFAULT_REF_FORMAT, extensions.refStorage /
+      extensions.objectFormat rejection on repo v0, garbage-format errors
+      (~18 tests). "init with --ref-format=reftable", "extensions.refStorage
+      with unknown backend".
+  * [CLI] Default branch / object format: init.defaultBranch advice,
+      --initial-branch, invalid-branch-name validation, GIT_DEFAULT_HASH /
+      init.defaultObjectFormat. "init honors GIT_DEFAULT_HASH",
+      "overridden default initial branch name (config)".
+  * [CLI] shared/umask: core.sharedRepository, --shared, umask-vs-shared dirs.
+  * [CLI] The config CLI gaps (T3 + value-pattern, below) also surface here via
+      the check_config helper (16x "config requires <key>..." + 16x "config
+      action requires exactly one key").
+
+=== cat-file  (t1006-cat-file.sh)  115/291 ===
+  * [T1] ~56 "usage:" tests want exit 129 for incompatible/extra options:
+      "cmdmode -e -p", "incompatible options: --path with --batch",
+      "-e requires another option", "too many arguments: -e one two three".
+  * [CLI] Batch object arguments rejected (43x "cat-file batch modes do not
+      take object arguments"): `--batch <oid>`, `--batch-check <oid>`,
+      `--batch-command`, and NUL forms `-z`/`-Z`. Modern git accepts oid args.
+      "--batch, -z with multiple oids gives correct format".
+  * [CLI/REV] Batch format atoms: %(objectmode) (4x), %(deltabase), %(rest)
+      handling, custom --batch-check / --batch-command formats.
+      "--batch-check with %(objectmode)", "%(deltabase) reports packed deltas".
+  * [CLI] --follow-symlinks for --batch-check entirely unsupported (~20 tests).
+      "git cat-file --batch-check --follow-symlinks works for ...".
+  * [CLI] Legacy `cat-file <type> <object>` form unsupported (blob/commit/tag):
+      "unsupported cat-file mode blob; expected -e, -t, -s, or -p".
+  * [REV] <rev>:<path> and peel/search resolution: "<oid>:hello",
+      "HEAD:newline", "foo{bar:hello", "other^{/testing:}:hello".
+      "object reference with curly brace", "via commit text search".
+  * [CLI] Error text / exit code on bogus|missing short/full OID differ from
+      git ("cat-file -s error on bogus short OID", x12 variants).
+  * [FMT] Corrupt/broken object handling: "-e is OK with a broken object",
+      "cat-file -t and -s on corrupt loose object", "zlib dictionary".
+  * [AUX] --batch-all-objects path pulls in rev-list --filter-provided-objects
+      (8x) and repack (2x).
+
+=== hash-object  (t1007-hash-object.sh)  21/40 ===
+  * [T1/CLI] No mutually-exclusive flag validation (these SUCCEED but must
+      fail): --stdin --stdin, --stdin --stdin-paths, --stdin-paths <file>,
+      --path with --stdin-paths. "multiple '--stdin's are rejected".
+  * [CLI] The "blob exists in database" checks invoke `git cat-file blob <oid>`
+      (legacy form) -> fails (same as cat-file legacy-form gap). ~7 tests.
+  * [FMT] core.autocrlf / .gitattributes filters not applied: crlf and non-crlf
+      inputs hash identically. "set up crlf tests".
+  * [FMT] Object-structure validation on `-t tree|commit|tag --stdin`:
+      "too-short tree", "malformed mode in tree", "duplicate filename in tree",
+      "corrupt commit", "corrupt tag" are not detected.
+  * [CLI] -t bogus / -t bl error wording differs slightly (mostly cosmetic).
+
+=== config  (t1300-config.sh)  131/498 ===
+  NOTE: this script runs the WHOLE body twice: once "legacy" (--list/--get/
+  --get-all/--get-regexp/--unset/...) and once "subcommands" (git config list/
+  get/set/unset/...). git-rs supports neither fully, hence ~2x duplicated titles.
+  * [CLI] Modern `git config <subcommand>` syntax unimplemented (BIG: this is
+      roughly half the failures). `git config list/get/set/unset` ->
+      "config requires <key> ..." or "--list does not accept positional
+      arguments". 132x "config requires <key> [<value>] or an explicit action".
+  * [T3] Writer lowercases variable names + section headers (see cross-cutting).
+  * [CLI] value-pattern positional unsupported: `git config k v <pattern>` and
+      `git config k <pattern>` (3rd arg) -> "config requires <key> ...".
+      "replace with non-match", "set all config with value-pattern".
+  * [CLI] --comment= unsupported: "config write action requires <key> <value>".
+      "append comments".
+  * [FMT] Config FILE parser rejects valid forms: bare/implicit-bool keys
+      ("true1" with no '='), and 54x "config key is invalid". "get --bool-or-int".
+  * [CLI] --file - (stdin) and --file <path> with the list subcommand:
+      "config --list does not accept positional arguments" (20x).
+      "alternative GIT_CONFIG (--file)", "invalid stdin config".
+  * [CLI] Type system: --type=color unsupported (6x "config value type color is
+      not supported"), --type validation (nonsense), --bool/--int/--bool-or-int/
+      --path/--expiry-date edge cases, bad-unit/bad-bool parsing differences.
+  * [CLI] --default only-with--get, --rename-section/--get-regexp arity, multi
+      get-all/replace-all/unset-all semantics, --show-scope, urlmatch.
+  * [T2] Alias/-c tests: "unsupported command hello-world/checkconfig/...".
+
+=== rev-parse  (t1500-rev-parse.sh)  68/82 ===
+  * [REV] CRITICAL --short=N hang for N>=hashlen (see top). Test 81.
+  * [CLI] core.bare not honored for --is-inside-work-tree / --is-bare-repository:
+      with core.bare=true git-rs returns "true" (in work tree); git says "false"
+      (~5 tests across GIT_DIR variants). Repo discovery doesn't read core.bare.
+  * [CLI] Revision-limiting options not passed through: --since=/--until=/
+      --max-age. "unsupported rev-parse option --since=...". "rev-parse --since=
+      unsqueezed ordering".
+  * [REV] :/ and HEAD^{/} commit-message search unsupported. ":/ and HEAD^{/}
+      favor more recent matching commits".
+  * [REFS/CLI] extensions.refstorage=broken not validated: --show-ref-format
+      succeeds (prints "files") instead of erroring. "with invalid storage".
+  * [WT] Cascade from checkout -B (T4) + `git worktree add` not working:
+      breaks "setup", --path-format=absolute/relative (need the worktree).
+  * [AUX] --is-shallow-repository (needs clone --depth from local; clone can't
+      resolve refs/heads/main), --show-superproject-working-tree (needs
+      submodule add). "rev-parse --is-shallow-repository in shallow repo".
+
+=== ls-files  (t3000-ls-files-others.sh)  4/15 ===
+  * [WT] --others drops symlinks: a symlink ("path1") is never listed in
+      untracked output; git lists it. Dominant cause (nearly every failure).
+      "ls-files --others".
+  * [WT] Descends into a dir containing a .git file: lists
+      "not-a-submodule/.git"; git treats it as another repo and does not.
+      "ls-files --others handles non-submodule .git".
+  * [WT] --directory pathspec edge cases: deep-dir pathspec, mixed dir/file
+      pathspecs, glob filetype matching, immediate-paths-under-one-dir.
+      "ls-files -o --directory with single deep dir pathspec".
+
+=== ls-tree  (t3103-ls-tree-misc.sh)  1/10 ===
+  * [T1] 8 of 9 failures are the exit-129 issue: git-rs correctly rejects
+      incompatible option pairs (--long/--name-only, --name-status/--format,
+      --object-only/--long, etc.) and prints good text, but exits 1 not 129.
+      "usage: incompatible options: --long --name-only".
+  * [CLI] One missing combo check: --name-only --name-status is not detected as
+      incompatible (errors "ls-tree requires a tree-ish" instead). Test 5.
+  * [REV] Broken-tree test needs `rev-parse HEAD:a` (path-in-tree) which fails:
+      "not found: revision HEAD:a". "ls-tree fails with non-zero exit code on
+      broken tree".
+
+=== symbolic-ref  (t1401-symbolic-ref.sh)  13/25 ===
+  * [REFS] Over-strict ref-name validation for non-HEAD symrefs: NOTHEAD, FOO,
+      ORIG_HEAD as a symref name or target -> "invalid path: invalid ref name".
+      git allows one-level all-caps names and pseudo-refs. ~5 tests.
+      "symbolic-ref can be deleted", "allows top-level target for non-HEAD".
+  * [CLI] Error text mismatch: delete of a non-symref prints
+      "git-rs: invalid path: invalid ref name FOO"; git prints
+      "fatal: Cannot delete FOO, not a symbolic ref". "fails to delete missing".
+  * [REFS] d/f conflict handling: writing refs/heads/df/conflict over refs/
+      heads/df, and resolving a d/f symref, raise raw io errors
+      ("Is a directory (os error 21)") instead of graceful ref errors.
+      "does not create ref d/f conflicts", "can resolve d/f name (ENOTDIR)".
+  * [WT] checkout -b/--orphan cascade (T4): "symbolic-ref writes reflog entry".
+  * [CLI] --short edge cases: utf8, name-with-suffix, almost-matching, percent.
+      "symbolic-ref --short handles complex utf8 case".
+
+--------------------------------------------------------------------------------
+HARNESS NOTE (why GIT_TEST_DEFAULT_HASH matters)
+--------------------------------------------------------------------------------
+This checkout's GIT-BUILD-OPTIONS omits GIT_TEST_BUILTIN_HASH. Upstream
+test-lib's test_detect_hash then leaves $test_hash_algo empty, so EVERY
+`test_oid` lookup aborts the script with "BUG: undefined key '...'", poisoning
+otherwise-passing assertions (e.g. hash-object jumped 13->21 ok, cat-file
+95->115, config 110->131 once a hash was set). The runner now defaults
+GIT_TEST_DEFAULT_HASH=sha1 (override with GIT_RS_DEFAULT_HASH=sha256). Always
+keep this set when interpreting results.
+
+Suggested agent order (impact-first):
+  1. rev-parse --short=N hang fix (correctness + unblocks t1500).         [REV]
+  2. Usage exit code 129 (T1): ls-tree + cat-file jump immediately.       [CLI]
+  3. config writer case preservation (T3) + value-pattern + --comment.    [CLI/FMT]
+  4. config `list/get/set/unset` subcommands (unlocks ~half of t1300).    [CLI]
+  5. ls-files --others symlink + embedded-.git handling.                  [WT]
+  6. checkout -B/-b/--orphan clean-tree bug (T4): unblocks several setups.[WT]
+  7. symbolic-ref ref-name validation + error text + d/f conflicts.       [REFS]
+  8. alias / -c expansion (T2).                                           [CLI]
