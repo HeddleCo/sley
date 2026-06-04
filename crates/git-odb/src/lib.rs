@@ -269,6 +269,315 @@ where
     PackFile::write_packed(&objects, format).map(Some)
 }
 
+/// Outcome of consolidating every object in a repository into a single pack.
+///
+/// This is the engine for `git gc` / `git repack`: [`repack_all_objects`]
+/// produces the bytes for one new delta-compressed pack plus its index, and
+/// reports which on-disk artifacts the caller could now remove. No deletions
+/// are performed by the engine itself; the CLI decides reachability policy and
+/// performs any pruning (see [`install_repack_result`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepackResult {
+    /// Bytes of the freshly written `.pack` file.
+    pub pack: Vec<u8>,
+    /// Bytes of the matching `.idx` file for [`RepackResult::pack`].
+    pub idx: Vec<u8>,
+    /// Number of distinct objects contained in the new pack.
+    pub object_count: usize,
+    /// Absolute paths of pre-existing `*.pack` files now superseded by the new
+    /// pack (every object they hold is present in [`RepackResult::pack`]).
+    pub obsolete_packs: Vec<PathBuf>,
+    /// Loose object ids that are now also present in the new pack and therefore
+    /// redundant on disk.
+    pub packed_loose: Vec<ObjectId>,
+}
+
+/// Gather every object in `git_dir` (loose objects and every existing pack) and
+/// write them into a single new delta-compressed pack.
+///
+/// Returns the new pack/index bytes, the count of packed objects, the list of
+/// pre-existing pack files that the new pack supersedes, and the loose object
+/// ids that are now packed. Nothing is deleted: the caller (CLI) decides
+/// reachability policy and performs any pruning, optionally via
+/// [`install_repack_result`].
+///
+/// Returns `Ok(None)` when the repository contains no objects at all.
+pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    // Enumerate every object id reachable on disk: loose objects, every pack
+    // index, and any multi-pack-index. `object_ids_in_objects_dir` already
+    // unions all of these and de-duplicates them.
+    let all_oids = object_ids_in_objects_dir(&objects_dir, format)?;
+    if all_oids.is_empty() {
+        return Ok(None);
+    }
+
+    // Read each object's canonical encoding so the new pack stores byte-for-byte
+    // identical payloads. Loose objects take precedence over packed copies in
+    // `FileObjectDatabase::read_object`, but both decode to the same bytes.
+    let mut objects = Vec::with_capacity(all_oids.len());
+    for oid in &all_oids {
+        objects.push(database.read_object(oid)?);
+    }
+
+    let written = PackFile::write_packed(&objects, format)?;
+    let object_count = written.entries.len();
+
+    // The new pack contains every object on disk, so every pre-existing pack is
+    // fully superseded. We still record the exact pack paths (not the index
+    // paths) so the caller can delete the right files. The pack we are about to
+    // write is excluded by name in case its checksum collides with an existing
+    // pack (identical contents).
+    let new_pack_file_name = format!("pack-{}.pack", written.checksum.to_hex());
+    let obsolete_packs = existing_pack_files(&objects_dir.join("pack"))?
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some(&new_pack_file_name))
+        .collect();
+
+    // Loose object ids that the new pack now also holds (which is all of them,
+    // since they were gathered into it).
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by_key(ObjectId::to_hex);
+
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs,
+        packed_loose,
+    }))
+}
+
+/// Write the consolidated pack from a [`RepackResult`] into
+/// `objects/pack/` and, when `prune` is set, remove the now-redundant
+/// pre-existing packs and packed loose objects.
+///
+/// Pruning is opt-in and deliberately conservative: an object or pack is only
+/// removed after verifying it is actually present in the freshly written pack
+/// on disk. Concretely:
+///
+/// * a loose object is removed only if its id appears in the new pack;
+/// * a pre-existing pack is removed only if it is not the pack we just wrote
+///   *and* every object listed in its `.idx` is present in the new pack (its
+///   `.idx` and known sidecars are removed alongside it);
+/// * a stale `multi-pack-index` is removed only if every pack it references is
+///   being removed, so no reader is ever left pointing at a deleted pack.
+pub fn install_repack_result(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &RepackResult,
+    prune: bool,
+) -> Result<()> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let pack_dir = objects_dir.join("pack");
+    fs::create_dir_all(&pack_dir)?;
+
+    // Recompute the pack checksum from the written bytes rather than trusting
+    // the caller-provided name; this keeps the on-disk file name canonical and
+    // lets us re-derive the object set the new pack actually contains.
+    let parsed_pack = PackFile::parse(&result.pack, format)?;
+    let pack_name = format!("pack-{}", parsed_pack.checksum.to_hex());
+    let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
+    let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
+    write_pack_component(&new_pack_path, &result.pack)?;
+    write_pack_component(&new_index_path, &result.idx)?;
+
+    if !prune {
+        return Ok(());
+    }
+
+    // The authoritative set of object ids that are now safely packed.
+    let present: HashSet<ObjectId> = parsed_pack
+        .entries
+        .iter()
+        .map(|entry| entry.entry.oid.clone())
+        .collect();
+
+    prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
+    prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
+    Ok(())
+}
+
+/// List loose objects under `git_dir` that are *not* reachable from `roots`,
+/// optionally deleting them.
+///
+/// Reachability is computed with [`collect_reachable_object_ids`] over the
+/// repository's object database, so trees, parents, and tag targets are all
+/// followed. When `delete` is `false` the returned ids are merely reported;
+/// when `true` each unreachable loose object file is removed (packed copies are
+/// never touched). Deletion is therefore opt-in.
+pub fn prune_unreachable_loose<I>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: I,
+    delete: bool,
+) -> Result<Vec<ObjectId>>
+where
+    I: IntoIterator<Item = ObjectId>,
+{
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let reachable = collect_reachable_object_ids(&database, format, roots)?;
+
+    let store = LooseObjectStore::new(objects_dir.clone(), format);
+    let mut pruned: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| !reachable.contains(oid))
+        .collect();
+    pruned.sort_by_key(ObjectId::to_hex);
+
+    if delete {
+        for oid in &pruned {
+            let path = store.object_path(oid)?;
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(GitError::Io(err.to_string())),
+            }
+        }
+    }
+    Ok(pruned)
+}
+
+/// Loose object ids under `objects_dir`, sorted by hex, with packed objects
+/// excluded.
+fn loose_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let mut oids = HashSet::new();
+    collect_loose_object_ids(objects_dir, format, &mut oids)?;
+    let mut oids = oids.into_iter().collect::<Vec<_>>();
+    oids.sort_by_key(ObjectId::to_hex);
+    Ok(oids)
+}
+
+/// Absolute paths of every `*.pack` file directly inside `pack_dir`, sorted for
+/// deterministic output.
+fn existing_pack_files(pack_dir: &Path) -> Result<Vec<PathBuf>> {
+    if !pack_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut packs = Vec::new();
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("pack") && path.is_file() {
+            packs.push(path);
+        }
+    }
+    packs.sort();
+    Ok(packs)
+}
+
+/// Remove pre-existing packs whose every object is contained in `present`,
+/// skipping `keep` (the pack just written). A stale multi-pack-index that only
+/// references removed packs is removed too.
+fn prune_packs_contained_in(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    present: &HashSet<ObjectId>,
+    keep: &Path,
+) -> Result<()> {
+    let pack_dir = objects_dir.join("pack");
+    let keep_stem = keep.file_stem().map(|stem| stem.to_owned());
+    let mut removed_stems: HashSet<String> = HashSet::new();
+
+    for pack_path in existing_pack_files(&pack_dir)? {
+        if pack_path == keep {
+            continue;
+        }
+        let Some(stem) = pack_path.file_stem() else {
+            continue;
+        };
+        if Some(stem) == keep_stem.as_deref() {
+            continue;
+        }
+        let index_path = pack_path.with_extension("idx");
+        if !index_path.exists() {
+            // Without an index we cannot prove containment; leave it alone.
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
+        if !index
+            .entries
+            .iter()
+            .all(|entry| present.contains(&entry.oid))
+        {
+            continue;
+        }
+        // Every object in this pack is safely in the new pack: remove the pack,
+        // its index, and any known sidecar files.
+        remove_file_if_exists(&pack_path)?;
+        remove_file_if_exists(&index_path)?;
+        for ext in ["promisor", "keep", "rev", "mtimes", "bitmap"] {
+            remove_file_if_exists(&pack_path.with_extension(ext))?;
+        }
+        removed_stems.insert(stem.to_string_lossy().into_owned());
+    }
+
+    prune_stale_multi_pack_index(&pack_dir, format, &removed_stems)?;
+    Ok(())
+}
+
+/// Remove a `multi-pack-index` if every pack it names was removed (its stems
+/// are all in `removed_stems`), preventing readers from following it to a
+/// deleted pack.
+fn prune_stale_multi_pack_index(
+    pack_dir: &Path,
+    format: ObjectFormat,
+    removed_stems: &HashSet<String>,
+) -> Result<()> {
+    if removed_stems.is_empty() {
+        return Ok(());
+    }
+    let midx_path = pack_dir.join("multi-pack-index");
+    if !midx_path.exists() {
+        return Ok(());
+    }
+    let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
+    let all_referenced_removed = midx.pack_names.iter().all(|name| {
+        let stem = name.strip_suffix(".idx").unwrap_or(name);
+        removed_stems.contains(stem)
+    });
+    if all_referenced_removed {
+        remove_file_if_exists(&midx_path)?;
+    }
+    Ok(())
+}
+
+/// Remove each loose object in `candidates` whose id is in `present`, leaving
+/// any object not actually packed untouched.
+fn prune_loose_objects<'a, I>(
+    objects_dir: &Path,
+    format: ObjectFormat,
+    candidates: I,
+    present: &HashSet<ObjectId>,
+) -> Result<()>
+where
+    I: IntoIterator<Item = &'a ObjectId>,
+{
+    let store = LooseObjectStore::new(objects_dir.to_path_buf(), format);
+    for oid in candidates {
+        if !present.contains(oid) {
+            continue;
+        }
+        remove_file_if_exists(&store.object_path(oid)?)?;
+    }
+    Ok(())
+}
+
+/// Remove `path` if it exists, treating a missing file as success.
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
+}
+
 fn collect_reachable_object<R>(
     reader: &R,
     format: ObjectFormat,
@@ -1725,6 +2034,250 @@ mod tests {
 
         assert!(unbundle_objects(&bundle, &prerequisite_reader, &mut writer).is_err());
         assert!(!writer.contains(&oid));
+    }
+
+    /// Build a commit -> tree -> blob graph in `db`, returning the three object
+    /// ids and their canonical encodings as `(oid, object)` pairs.
+    fn write_commit_graph(
+        db: &mut FileObjectDatabase,
+        format: ObjectFormat,
+        payload: &[u8],
+    ) -> Vec<(ObjectId, EncodedObject)> {
+        let blob = EncodedObject::new(ObjectType::Blob, payload.to_vec());
+        let blob_oid = db.write_object(blob.clone()).unwrap();
+        let tree = EncodedObject::new(
+            ObjectType::Tree,
+            Tree {
+                entries: vec![TreeEntry {
+                    mode: 0o100644,
+                    name: b"payload.txt".to_vec(),
+                    oid: blob_oid.clone(),
+                }],
+            }
+            .write(),
+        );
+        let tree_oid = db.write_object(tree.clone()).unwrap();
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        let commit = EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree: tree_oid.clone(),
+                parents: Vec::new(),
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: b"initial\n".to_vec(),
+            }
+            .write(),
+        );
+        let commit_oid = db.write_object(commit.clone()).unwrap();
+        vec![(commit_oid, commit), (tree_oid, tree), (blob_oid, blob)]
+    }
+
+    fn repack_all_objects_consolidates_loose_and_pack(format: ObjectFormat) {
+        let root = temp_root("git-rs-repack-all");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        // A pre-existing pack holds one blob; the rest of the graph is loose.
+        let packed_blob = EncodedObject::new(ObjectType::Blob, b"already packed\n".to_vec());
+        let packed_oid = packed_blob.object_id(format).unwrap();
+        let existing_pack =
+            PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
+        let existing = db.install_pack(&existing_pack).unwrap();
+
+        let graph = write_commit_graph(&mut db, format, b"repack payload\n");
+
+        let mut expected: HashMap<ObjectId, EncodedObject> = graph.iter().cloned().collect();
+        expected.insert(packed_oid.clone(), packed_blob.clone());
+
+        let result = repack_all_objects(&git_dir, format)
+            .unwrap()
+            .expect("repository has objects");
+
+        // The new pack round-trips and contains every original object byte-for-byte.
+        assert_eq!(result.object_count, expected.len());
+        let parsed = PackFile::parse(&result.pack, format).unwrap();
+        assert_eq!(parsed.entries.len(), expected.len());
+        for entry in &parsed.entries {
+            let want = expected
+                .get(&entry.entry.oid)
+                .expect("packed object was in the repository");
+            assert_eq!(&entry.object, want);
+            assert_eq!(entry.object.object_id(format).unwrap(), entry.entry.oid);
+        }
+        // The generated index parses and agrees with the pack checksum.
+        let idx = PackIndex::parse(&result.idx, format).unwrap();
+        assert_eq!(idx.pack_checksum, parsed.checksum);
+        assert_eq!(idx.entries.len(), expected.len());
+
+        // The pre-existing pack is reported obsolete (by its .pack path).
+        assert_eq!(result.obsolete_packs, vec![existing.pack_path.clone()]);
+        // Every loose object id is reported as now packed.
+        let mut want_loose: Vec<ObjectId> = graph.iter().map(|(oid, _)| oid.clone()).collect();
+        want_loose.sort_by_key(ObjectId::to_hex);
+        assert_eq!(result.packed_loose, want_loose);
+        assert!(!result.packed_loose.contains(&packed_oid));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repack_all_objects_consolidates_loose_and_pack_sha1() {
+        repack_all_objects_consolidates_loose_and_pack(ObjectFormat::Sha1);
+    }
+
+    #[test]
+    fn repack_all_objects_consolidates_loose_and_pack_sha256() {
+        repack_all_objects_consolidates_loose_and_pack(ObjectFormat::Sha256);
+    }
+
+    #[test]
+    fn repack_all_objects_returns_none_for_empty_repository() {
+        let root = temp_root("git-rs-repack-empty");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+
+        assert!(repack_all_objects(&git_dir, ObjectFormat::Sha1)
+            .unwrap()
+            .is_none());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_repack_result_writes_pack_without_pruning_by_default() {
+        let root = temp_root("git-rs-repack-install-nodelete");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, format, b"install no prune\n");
+
+        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+        install_repack_result(&git_dir, format, &result, false).unwrap();
+
+        // New pack is on disk and readable.
+        let parsed = PackFile::parse(&result.pack, format).unwrap();
+        let pack_dir = git_dir.join("objects").join("pack");
+        let pack_path = pack_dir.join(format!("pack-{}.pack", parsed.checksum.to_hex()));
+        let idx_path = pack_dir.join(format!("pack-{}.idx", parsed.checksum.to_hex()));
+        assert!(pack_path.exists());
+        assert!(idx_path.exists());
+        // Loose objects survive because prune was not requested.
+        for (oid, object) in &graph {
+            assert!(db.loose().object_path(oid).unwrap().exists());
+            assert_eq!(db.read_object(oid).unwrap(), *object);
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_repack_result_prunes_obsolete_packs_and_loose_objects() {
+        let root = temp_root("git-rs-repack-install-prune");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let packed_blob = EncodedObject::new(ObjectType::Blob, b"prune packed\n".to_vec());
+        let existing_pack =
+            PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
+        let existing = db.install_pack(&existing_pack).unwrap();
+        let graph = write_commit_graph(&mut db, format, b"prune payload\n");
+
+        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+        let new_pack_checksum = PackFile::parse(&result.pack, format).unwrap().checksum;
+        install_repack_result(&git_dir, format, &result, true).unwrap();
+
+        // Obsolete pack and its index are gone.
+        assert!(!existing.pack_path.exists());
+        assert!(!existing.index_path.exists());
+        // Packed loose objects are gone from disk.
+        for (oid, _) in &graph {
+            assert!(!db.loose().object_path(oid).unwrap().exists());
+        }
+        // The new consolidated pack remains and still serves every object.
+        let pack_dir = git_dir.join("objects").join("pack");
+        assert!(pack_dir
+            .join(format!("pack-{}.pack", new_pack_checksum.to_hex()))
+            .exists());
+        let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
+        for (oid, object) in &graph {
+            assert!(reopened.contains(oid).unwrap());
+            assert_eq!(reopened.read_object(oid).unwrap(), *object);
+        }
+        let packed_oid = packed_blob.object_id(format).unwrap();
+        assert_eq!(reopened.read_object(&packed_oid).unwrap(), packed_blob);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_repack_result_keeps_loose_object_absent_from_new_pack() {
+        // Safety: a loose object whose id is not in the new pack must survive
+        // pruning even if the caller lists it in `packed_loose`.
+        let root = temp_root("git-rs-repack-install-safety");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, format, b"safety packed\n");
+
+        let mut result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+
+        // A loose object that is NOT in the new pack, but mislabeled as packed.
+        let stray = EncodedObject::new(ObjectType::Blob, b"never packed\n".to_vec());
+        let stray_oid = db.write_object(stray.clone()).unwrap();
+        assert!(!result.packed_loose.contains(&stray_oid));
+        result.packed_loose.push(stray_oid.clone());
+
+        install_repack_result(&git_dir, format, &result, true).unwrap();
+
+        // The stray loose object is untouched because it is not in the new pack.
+        assert!(db.loose().object_path(&stray_oid).unwrap().exists());
+        assert_eq!(db.read_object(&stray_oid).unwrap(), stray);
+        // Genuinely packed loose objects were still removed.
+        for (oid, _) in &graph {
+            assert!(!db.loose().object_path(oid).unwrap().exists());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_unreachable_loose_reports_and_deletes_only_unreachable() {
+        let root = temp_root("git-rs-prune-unreachable");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let graph = write_commit_graph(&mut db, format, b"reachable payload\n");
+        let commit_oid = graph[0].0.clone();
+
+        // A dangling loose blob not referenced by the commit graph.
+        let dangling = EncodedObject::new(ObjectType::Blob, b"dangling\n".to_vec());
+        let dangling_oid = db.write_object(dangling).unwrap();
+
+        // Report-only pass leaves everything on disk.
+        let reported =
+            prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], false).unwrap();
+        assert_eq!(reported, vec![dangling_oid.clone()]);
+        assert!(db.loose().object_path(&dangling_oid).unwrap().exists());
+
+        // Deleting pass removes only the unreachable object.
+        let deleted =
+            prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], true).unwrap();
+        assert_eq!(deleted, vec![dangling_oid.clone()]);
+        assert!(!db.loose().object_path(&dangling_oid).unwrap().exists());
+        for (oid, object) in &graph {
+            assert!(db.loose().object_path(oid).unwrap().exists());
+            assert_eq!(db.read_object(oid).unwrap(), *object);
+        }
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

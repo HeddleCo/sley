@@ -178,6 +178,52 @@ pub fn parse_reflog(format: ObjectFormat, bytes: &[u8]) -> Result<Vec<ReflogEntr
     Ok(entries)
 }
 
+/// Expire reflog entries, mirroring `git reflog expire` semantics.
+///
+/// Entries are kept when their committer timestamp is at or after `cutoff_unix`.
+/// Entries whose `new_oid` is unreachable (per `is_reachable`) are held to the
+/// stricter `expire_unreachable_cutoff` when one is supplied: such an entry is
+/// dropped when its timestamp falls below either cutoff. When
+/// `expire_unreachable_cutoff` is `None`, reachability does not relax the single
+/// `cutoff_unix` bound.
+///
+/// The most recent entry (the one describing the ref's current value) is always
+/// preserved, exactly as git refuses to expire the tip of a reflog, even when it
+/// is older than the cutoff. Relative order of the surviving entries is kept.
+///
+/// This is a pure function over already-parsed entries so callers can read,
+/// filter, and rewrite reflogs however they like; see
+/// [`FileRefStore::expire_reflog_file`] for a filesystem convenience built on top
+/// of it.
+pub fn expire_reflog(
+    entries: &[ReflogEntry],
+    cutoff_unix: i64,
+    expire_unreachable_cutoff: Option<i64>,
+    is_reachable: impl Fn(&ObjectId) -> bool,
+) -> Result<Vec<ReflogEntry>> {
+    let last_index = entries.len().checked_sub(1);
+    let mut retained = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        // Always keep the most recent entry: it records the current ref value
+        // and git never expires it.
+        if Some(index) == last_index {
+            retained.push(entry.clone());
+            continue;
+        }
+        let timestamp = entry.timestamp_seconds()?;
+        let mut expired = timestamp < cutoff_unix;
+        if let Some(unreachable_cutoff) = expire_unreachable_cutoff
+            && !is_reachable(&entry.new_oid)
+        {
+            expired = expired || timestamp < unreachable_cutoff;
+        }
+        if !expired {
+            retained.push(entry.clone());
+        }
+    }
+    Ok(retained)
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct RefStore {
     refs: HashMap<String, RefTarget>,
@@ -369,6 +415,48 @@ impl FileRefStore {
         }
         write_locked(&path, &bytes)?;
         Ok(original_len - retained.len())
+    }
+
+    /// Read a ref's reflog, expire entries with [`expire_reflog`], and rewrite
+    /// the file with the survivors.
+    ///
+    /// Reachability of each entry's `new_oid` is delegated to `is_reachable` so
+    /// the caller can supply whatever object-graph knowledge it has. Rewriting is
+    /// opt-in via `write`: when `false` nothing is written and the function only
+    /// reports how many entries would be removed (a dry run). When `true` the
+    /// reflog is rewritten atomically (lock file + rename) only if at least one
+    /// entry was removed; an unchanged reflog is left untouched. Returns the
+    /// number of entries removed.
+    pub fn expire_reflog_file(
+        &self,
+        name: &str,
+        cutoff_unix: i64,
+        expire_unreachable_cutoff: Option<i64>,
+        write: bool,
+        is_reachable: impl Fn(&ObjectId) -> bool,
+    ) -> Result<usize> {
+        validate_ref_name(name)?;
+        let path = self.reflog_path(name);
+        if !path.exists() {
+            return Ok(0);
+        }
+        let entries = parse_reflog(self.format, &fs::read(&path)?)?;
+        let original_len = entries.len();
+        let retained = expire_reflog(
+            &entries,
+            cutoff_unix,
+            expire_unreachable_cutoff,
+            is_reachable,
+        )?;
+        let removed = original_len - retained.len();
+        if write && removed > 0 {
+            let mut bytes = Vec::new();
+            for entry in &retained {
+                bytes.extend_from_slice(&entry.to_line());
+            }
+            write_locked(&path, &bytes)?;
+        }
+        Ok(removed)
     }
 
     pub fn list_refs(&self) -> Result<Vec<Ref>> {
@@ -1019,11 +1107,32 @@ impl<'a> FileRefTransaction<'a> {
         self.updates.push(update);
     }
 
+    /// Commit all queued updates atomically and durably.
+    ///
+    /// All updates succeed together or none take effect. For the loose-ref
+    /// backend the sequence is:
+    ///
+    /// 1. Coalesce updates that target the same ref so each ref is touched once
+    ///    (the final `new` value wins, reflog entries accumulate in order, and
+    ///    the `expected` precondition from the first queued update is enforced).
+    /// 2. Take an exclusive `<ref>.lock` file for every ref up front. Acquiring a
+    ///    lock fails if another writer already holds it, guaranteeing isolation.
+    /// 3. Re-verify every `expected` old value *while holding the locks*, closing
+    ///    the check-then-write race that a pre-lock verification would leave open.
+    /// 4. Write each new value into its lock file and `fsync` it.
+    /// 5. Atomically `rename` each lock file over the real ref.
+    ///
+    /// If any step fails, every ref already renamed in this commit is restored to
+    /// the exact bytes it held beforehand (or removed if it did not exist), and
+    /// all outstanding lock files are deleted, so the repository is left exactly
+    /// as it was. Reflog entries are appended only after every ref update has
+    /// landed.
     pub fn commit(self) -> Result<()> {
-        for update in &self.updates {
-            validate_ref_name(&update.name)?;
+        let FileRefTransaction { store, updates } = self;
+        let updates = coalesce_ref_updates(updates)?;
+        for update in &updates {
             if let Some(expected) = &update.expected
-                && self.store.read_ref(&update.name)?.as_ref() != Some(expected)
+                && store.read_ref(&update.name)?.as_ref() != Some(expected)
             {
                 return Err(GitError::Transaction(format!(
                     "expected ref {} to match",
@@ -1031,36 +1140,238 @@ impl<'a> FileRefTransaction<'a> {
                 )));
             }
         }
-        if self.store.uses_reftable()? {
-            let mut records = Vec::with_capacity(self.updates.len());
+        if store.uses_reftable()? {
+            let mut records = Vec::with_capacity(updates.len());
             let mut reflogs = Vec::new();
-            for update in self.updates {
+            for update in updates {
                 records.push(ReftableRefRecord {
                     name: update.name.clone(),
                     update_index: 0,
                     value: reftable_value_from_ref_target(&update.new),
                 });
-                if let Some(entry) = update.reflog {
-                    reflogs.push((update.name, entry));
+                for entry in update.reflog {
+                    reflogs.push((update.name.clone(), entry));
                 }
             }
-            self.store.append_reftable_records(records)?;
+            store.append_reftable_records(records)?;
             for (name, entry) in reflogs {
-                self.store.append_reflog(&name, &entry)?;
+                store.append_reflog(&name, &entry)?;
             }
             return Ok(());
         }
-        for update in self.updates {
-            self.store.write_loose_ref(&Ref {
-                name: update.name.clone(),
-                target: update.new,
-            })?;
-            if let Some(entry) = update.reflog {
-                self.store.append_reflog(&update.name, &entry)?;
+        store.commit_loose(updates)
+    }
+}
+
+impl FileRefStore {
+    /// Atomic, all-or-nothing commit for the loose-ref backend. See
+    /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
+    fn commit_loose(&self, updates: Vec<CoalescedRefUpdate>) -> Result<()> {
+        let mut pending = Vec::with_capacity(updates.len());
+        // Acquire every lock first; bail (releasing what we hold) on any failure.
+        for update in &updates {
+            let path = self.ref_path(&update.name);
+            let parent = path
+                .parent()
+                .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
+            if let Err(err) = fs::create_dir_all(parent) {
+                release_pending_locks(&pending);
+                return Err(GitError::Io(err.to_string()));
+            }
+            let lock_path = match lock_path_for(&path) {
+                Ok(lock_path) => lock_path,
+                Err(err) => {
+                    release_pending_locks(&pending);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                release_pending_locks(&pending);
+                return Err(GitError::Io(format!(
+                    "could not lock ref {}: {err}",
+                    update.name
+                )));
+            }
+            pending.push(PendingRefWrite {
+                path,
+                lock_path,
+                contents: write_loose_ref(&Ref {
+                    name: update.name.clone(),
+                    target: update.new.clone(),
+                }),
+            });
+        }
+
+        // Verify expectations under lock, then capture prior on-disk state for
+        // rollback. read_ref consults loose then packed refs, matching the
+        // pre-lock check, so a concurrent change is caught here.
+        let mut originals = Vec::with_capacity(updates.len());
+        for (update, write) in updates.iter().zip(&pending) {
+            if let Some(expected) = &update.expected {
+                match self.read_ref(&update.name) {
+                    Ok(current) if current.as_ref() == Some(expected) => {}
+                    Ok(_) => {
+                        release_pending_locks(&pending);
+                        return Err(GitError::Transaction(format!(
+                            "expected ref {} to match",
+                            update.name
+                        )));
+                    }
+                    Err(err) => {
+                        release_pending_locks(&pending);
+                        return Err(err);
+                    }
+                }
+            }
+            match read_optional_file(&write.path) {
+                Ok(original) => originals.push(original),
+                Err(err) => {
+                    release_pending_locks(&pending);
+                    return Err(err);
+                }
+            }
+        }
+
+        // Stage every new value into its lock file. Nothing has been renamed
+        // yet, so on failure we only need to drop the lock files.
+        for write in &pending {
+            if let Err(err) = stage_lock_file(&write.lock_path, &write.contents) {
+                release_pending_locks(&pending);
+                return Err(err);
+            }
+        }
+
+        // Atomically swap each lock file into place; on failure restore the refs
+        // already renamed and drop the remaining locks.
+        for index in 0..pending.len() {
+            if let Err(err) = fs::rename(&pending[index].lock_path, &pending[index].path) {
+                rollback_after_rename(&pending, &originals, index);
+                return Err(GitError::Io(err.to_string()));
+            }
+        }
+
+        // All refs are durable; append reflogs last, matching git's ordering.
+        for update in updates {
+            for entry in update.reflog {
+                self.append_reflog(&update.name, &entry)?;
             }
         }
         Ok(())
     }
+}
+
+/// A ref update with all writes that targeted the same name folded together.
+struct CoalescedRefUpdate {
+    name: String,
+    expected: Option<RefTarget>,
+    new: RefTarget,
+    reflog: Vec<ReflogEntry>,
+}
+
+/// Fold repeated updates to the same ref into one, preserving first-seen order.
+/// The last queued value wins, reflog entries accumulate in order, and the
+/// `expected` precondition is taken from the first update (the state the caller
+/// asserted before any change in this transaction).
+fn coalesce_ref_updates(updates: Vec<RefUpdate>) -> Result<Vec<CoalescedRefUpdate>> {
+    let mut order: Vec<String> = Vec::new();
+    let mut by_name: HashMap<String, CoalescedRefUpdate> = HashMap::new();
+    for update in updates {
+        validate_ref_name(&update.name)?;
+        match by_name.get_mut(&update.name) {
+            Some(existing) => {
+                existing.new = update.new;
+                if let Some(entry) = update.reflog {
+                    existing.reflog.push(entry);
+                }
+            }
+            None => {
+                order.push(update.name.clone());
+                by_name.insert(
+                    update.name.clone(),
+                    CoalescedRefUpdate {
+                        name: update.name,
+                        expected: update.expected,
+                        new: update.new,
+                        reflog: update.reflog.into_iter().collect(),
+                    },
+                );
+            }
+        }
+    }
+    let mut coalesced = Vec::with_capacity(order.len());
+    for name in order {
+        if let Some(update) = by_name.remove(&name) {
+            coalesced.push(update);
+        }
+    }
+    Ok(coalesced)
+}
+
+/// A staged loose-ref write: the target ref path, its lock file, and the bytes
+/// to install.
+struct PendingRefWrite {
+    path: PathBuf,
+    lock_path: PathBuf,
+    contents: Vec<u8>,
+}
+
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(GitError::Io(err.to_string())),
+    }
+}
+
+fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(lock_path)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Delete every still-held lock file. Used when a transaction aborts before any
+/// rename, so nothing on disk has changed yet.
+fn release_pending_locks(pending: &[PendingRefWrite]) {
+    for write in pending {
+        let _ = fs::remove_file(&write.lock_path);
+    }
+}
+
+/// Roll back after `renamed` refs have already been swapped into place: restore
+/// each to its captured bytes (or remove it if it did not previously exist),
+/// then drop the lock files that have not yet been renamed.
+fn rollback_after_rename(
+    pending: &[PendingRefWrite],
+    originals: &[Option<Vec<u8>>],
+    renamed: usize,
+) {
+    for index in 0..renamed {
+        match &originals[index] {
+            Some(bytes) => {
+                let _ = restore_file_atomically(&pending[index].path, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&pending[index].path);
+            }
+        }
+    }
+    for write in pending.iter().skip(renamed) {
+        let _ = fs::remove_file(&write.lock_path);
+    }
+}
+
+/// Best-effort atomic restore of `path` to `bytes` during rollback, reusing the
+/// write-to-temp-then-rename dance so a crash mid-rollback cannot truncate a ref.
+fn restore_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_locked(path, bytes)
 }
 
 pub fn branch_ref_name(branch: &str) -> Result<String> {
@@ -2216,6 +2527,292 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let bytes = fs::read_to_string(git_dir.join("packed-refs")).unwrap();
         assert!(bytes.contains(&format!("^{peeled_oid}\n")));
         assert!(!git_dir.join("refs").join("tags").join("v1.0").exists());
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    fn reflog_entry(new_oid: &ObjectId, timestamp: i64, message: &str) -> ReflogEntry {
+        ReflogEntry {
+            old_oid: zero_oid(new_oid.format()).unwrap(),
+            new_oid: new_oid.clone(),
+            committer: format!("Git Rs <git-rs@example.invalid> {timestamp} +0000").into_bytes(),
+            message: message.as_bytes().to_vec(),
+        }
+    }
+
+    #[test]
+    fn expire_reflog_drops_old_entries_and_keeps_latest() {
+        let oid_a = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let oid_b = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let oid_c = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .unwrap();
+        let entries = vec![
+            reflog_entry(&oid_a, 10, "oldest"),
+            reflog_entry(&oid_b, 100, "middle"),
+            reflog_entry(&oid_c, 20, "latest"),
+        ];
+
+        // Cutoff drops the oldest entry; the most recent entry survives even
+        // though its timestamp (20) is below the cutoff (50).
+        let retained = expire_reflog(&entries, 50, None, |_| true).unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].message, b"middle");
+        assert_eq!(retained[1].message, b"latest");
+    }
+
+    #[test]
+    fn expire_reflog_applies_stricter_unreachable_cutoff() {
+        let reachable = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let unreachable = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let tip = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .unwrap();
+        // Both candidate entries sit above the lenient cutoff (50) but below the
+        // stricter unreachable cutoff (150). Only the unreachable one is dropped.
+        let entries = vec![
+            reflog_entry(&reachable, 100, "reachable"),
+            reflog_entry(&unreachable, 100, "unreachable"),
+            reflog_entry(&tip, 200, "tip"),
+        ];
+        let retained = expire_reflog(&entries, 50, Some(150), |oid| oid == &reachable || oid == &tip)
+            .unwrap();
+        assert_eq!(retained.len(), 2);
+        assert_eq!(retained[0].message, b"reachable");
+        assert_eq!(retained[1].message, b"tip");
+    }
+
+    #[test]
+    fn expire_reflog_keeps_single_entry_below_cutoff() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let entries = vec![reflog_entry(&oid, 1, "only")];
+        let retained = expire_reflog(&entries, i64::MAX, Some(i64::MAX), |_| false).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].message, b"only");
+    }
+
+    #[test]
+    fn file_ref_store_expire_reflog_file_rewrites_and_dry_runs() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let first = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let second = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        store
+            .write_reflog(
+                "refs/heads/main",
+                &[
+                    reflog_entry(&first, 10, "old"),
+                    reflog_entry(&second, 100, "new"),
+                ],
+            )
+            .unwrap();
+
+        // Dry run reports the removal count without touching the file.
+        let would_remove = store
+            .expire_reflog_file("refs/heads/main", 50, None, false, |_| true)
+            .unwrap();
+        assert_eq!(would_remove, 1);
+        assert_eq!(store.read_reflog("refs/heads/main").unwrap().len(), 2);
+
+        // Opt-in rewrite drops the stale entry and leaves the latest.
+        let removed = store
+            .expire_reflog_file("refs/heads/main", 50, None, true, |_| true)
+            .unwrap();
+        assert_eq!(removed, 1);
+        let log = store.read_reflog("refs/heads/main").unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].new_oid, second);
+        assert!(
+            !git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_transaction_commits_all_refs_atomically() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let main_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let topic_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let tag_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .unwrap();
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(main_oid.clone()),
+            reflog: Some(reflog_entry(&main_oid, 0, "create main")),
+        });
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(topic_oid.clone()),
+            reflog: None,
+        });
+        tx.update(RefUpdate {
+            name: "refs/tags/v1.0".into(),
+            expected: None,
+            new: RefTarget::Direct(tag_oid.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+
+        assert_eq!(
+            store.read_ref("refs/heads/main").unwrap(),
+            Some(RefTarget::Direct(main_oid.clone()))
+        );
+        assert_eq!(
+            store.read_ref("refs/heads/topic").unwrap(),
+            Some(RefTarget::Direct(topic_oid))
+        );
+        assert_eq!(
+            store.read_ref("refs/tags/v1.0").unwrap(),
+            Some(RefTarget::Direct(tag_oid))
+        );
+        let main_log = store.read_reflog("refs/heads/main").unwrap();
+        assert_eq!(main_log.len(), 1);
+        assert_eq!(main_log[0].new_oid, main_oid);
+        // No lock files survive a successful commit.
+        assert!(!git_dir.join("refs").join("heads").join("main.lock").exists());
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("topic.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn file_ref_transaction_rolls_back_all_refs_on_expected_mismatch() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let old_topic = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .unwrap();
+        let new_main = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .unwrap();
+        let new_tag = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "18f002b4484b838b205a48b1e9e6763ba5e3a607",
+        )
+        .unwrap();
+        let wrong_expected = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "0000000000000000000000000000000000000001",
+        )
+        .unwrap();
+
+        // Seed an existing topic ref so the failing update has a real prior value
+        // to be compared against (and left untouched).
+        let mut seed = store.transaction();
+        seed.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(old_topic.clone()),
+            reflog: None,
+        });
+        seed.commit().unwrap();
+
+        let mut tx = store.transaction();
+        // 1st ref: brand new, would succeed in isolation.
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(new_main.clone()),
+            reflog: Some(reflog_entry(&new_main, 0, "create main")),
+        });
+        // 2nd ref: expected value does not match on disk -> whole tx must abort.
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: Some(RefTarget::Direct(wrong_expected)),
+            new: RefTarget::Direct(new_main.clone()),
+            reflog: None,
+        });
+        // 3rd ref: brand new, must not be written because the tx aborts.
+        tx.update(RefUpdate {
+            name: "refs/tags/v1.0".into(),
+            expected: None,
+            new: RefTarget::Direct(new_tag),
+            reflog: None,
+        });
+        let result = tx.commit();
+        assert!(result.is_err());
+
+        // Nothing changed: the new refs were never created and the existing one
+        // keeps its original value.
+        assert_eq!(store.read_ref("refs/heads/main").unwrap(), None);
+        assert_eq!(
+            store.read_ref("refs/heads/topic").unwrap(),
+            Some(RefTarget::Direct(old_topic))
+        );
+        assert_eq!(store.read_ref("refs/tags/v1.0").unwrap(), None);
+        assert!(store.read_reflog("refs/heads/main").unwrap().is_empty());
+
+        // All lock files were released.
+        assert!(!git_dir.join("refs").join("heads").join("main.lock").exists());
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("topic.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
         fs::remove_dir_all(git_dir).unwrap();
     }
 

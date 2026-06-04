@@ -1166,6 +1166,732 @@ fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
         .into_bytes())
 }
 
+// ---------------------------------------------------------------------------
+// Unified / git diff patch parsing and application (engine for `git apply`/`git am`).
+//
+// Operates purely on in-memory byte buffers; the caller is responsible for
+// reading/writing blobs from the working tree or the object database. The
+// parser understands the textual format git produces (`diff --git`, `---`/`+++`
+// file headers, `@@` hunk headers, context/`+`/`-` body lines, the
+// `\ No newline at end of file` marker, `/dev/null` for added/deleted files,
+// file mode headers, and `rename from`/`rename to` headers).
+// ---------------------------------------------------------------------------
+
+/// A single line inside a hunk. The stored bytes never include the trailing
+/// line terminator; whether the line is terminated by `\n` is tracked
+/// separately on the [`Hunk`] (see [`Hunk::old_no_newline`] /
+/// [`Hunk::new_no_newline`]) so the no-final-newline case can be reproduced
+/// byte-for-byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HunkLine {
+    /// A line present in both the old and new versions.
+    Context(Vec<u8>),
+    /// A line added by the patch (present only in the new version).
+    Insert(Vec<u8>),
+    /// A line removed by the patch (present only in the old version).
+    Delete(Vec<u8>),
+}
+
+impl HunkLine {
+    /// The line content, without any trailing newline.
+    pub fn content(&self) -> &[u8] {
+        match self {
+            Self::Context(bytes) | Self::Insert(bytes) | Self::Delete(bytes) => bytes,
+        }
+    }
+}
+
+/// A single `@@ -old_start,old_len +new_start,new_len @@` hunk.
+///
+/// `old_start` / `new_start` are 1-based line numbers as they appear in the
+/// patch header. The `*_no_newline` flags record that the final line on that
+/// side of the hunk is *not* terminated by a newline (the `\ No newline at end
+/// of file` marker).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    pub old_start: usize,
+    pub old_len: usize,
+    pub new_start: usize,
+    pub new_len: usize,
+    pub lines: Vec<HunkLine>,
+    /// The last context/deleted line of the old file lacks a trailing newline.
+    pub old_no_newline: bool,
+    /// The last context/inserted line of the new file lacks a trailing newline.
+    pub new_no_newline: bool,
+}
+
+/// A patch targeting a single file. Produced by [`parse_unified_patch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilePatch {
+    /// Path on the `a/` (old) side, or `None` for a newly created file.
+    pub old_path: Option<Vec<u8>>,
+    /// Path on the `b/` (new) side, or `None` for a deleted file.
+    pub new_path: Option<Vec<u8>>,
+    /// Mode of the old file, when a mode header was present.
+    pub old_mode: Option<u32>,
+    /// Mode of the new file, when a mode header was present.
+    pub new_mode: Option<u32>,
+    pub hunks: Vec<Hunk>,
+    /// The patch creates a new file (`--- /dev/null` / `new file mode`).
+    pub is_new: bool,
+    /// The patch deletes the file (`+++ /dev/null` / `deleted file mode`).
+    pub is_delete: bool,
+    /// The patch renames the file (`rename from`/`rename to`).
+    pub is_rename: bool,
+}
+
+/// Outcome of applying a [`FilePatch`] to a base buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyOutcome {
+    /// The patch applied cleanly; carries the resulting file bytes.
+    Applied(Vec<u8>),
+    /// At least one hunk's context/deleted lines did not match the base.
+    Rejected,
+}
+
+/// Maximum number of lines git-style hunk application will search away from the
+/// recorded position (in either direction) before giving up.
+const MAX_HUNK_OFFSET: usize = 1_000;
+
+/// Parse a unified/git diff into one [`FilePatch`] per file it touches.
+///
+/// The parser is intentionally lenient about leading commentary (commit
+/// messages, `index <oid>..<oid>` lines, etc.): anything that is not part of a
+/// recognised header or hunk body is skipped. It errors only on structurally
+/// invalid hunks (bad `@@` headers, body lines that overflow the declared hunk
+/// counts, or hunk bodies that appear with no preceding file header).
+pub fn parse_unified_patch(input: &[u8]) -> Result<Vec<FilePatch>> {
+    let lines = split_patch_lines(input);
+    let mut parser = PatchParser {
+        lines: &lines,
+        index: 0,
+    };
+    parser.parse()
+}
+
+/// Apply a single-file patch to `base`, returning the patched bytes.
+///
+/// Each hunk's context and deleted lines must match `base` exactly. Application
+/// first tries the line recorded in the hunk header and, if that does not
+/// match, searches outward (the same offset-tolerant behaviour git uses) up to
+/// [`MAX_HUNK_OFFSET`] lines in each direction. If any hunk cannot be located,
+/// the whole patch is [`ApplyOutcome::Rejected`] and `base` is left untouched.
+///
+/// New-file patches (empty/ignored base) and the no-final-newline case are
+/// handled byte-accurately.
+pub fn apply_file_patch(base: &[u8], patch: &FilePatch) -> ApplyOutcome {
+    // A pure deletion with no hunks yields an empty file.
+    if patch.is_delete && patch.hunks.is_empty() {
+        return ApplyOutcome::Applied(Vec::new());
+    }
+    // A new file: the only sensible base is empty; ignore whatever was passed
+    // and build the result from the inserted lines.
+    let base_for_match: &[u8] = if patch.is_new { b"" } else { base };
+
+    let base_lines = split_blob_lines(base_for_match);
+
+    // We walk the base line list, copying untouched lines and splicing hunks.
+    let mut result: Vec<Line> = Vec::new();
+    // Index into `base_lines` of the next line we have not yet emitted.
+    let mut cursor: usize = 0;
+    // Running offset applied to subsequent hunk positions (git carries the
+    // offset from earlier hunks forward as a hint).
+    let mut running_offset: isize = 0;
+
+    for hunk in &patch.hunks {
+        let located = match locate_hunk(&base_lines, hunk, cursor, running_offset) {
+            Some(pos) => pos,
+            None => return ApplyOutcome::Rejected,
+        };
+        if located < cursor {
+            // Overlapping/out-of-order application is not representable.
+            return ApplyOutcome::Rejected;
+        }
+        // Copy untouched lines preceding this hunk.
+        for line in &base_lines[cursor..located] {
+            result.push(line.clone());
+        }
+        // Emit the hunk: context + inserts replace context + deletes.
+        let mut consumed = 0usize; // old-side lines consumed from base
+        for hl in &hunk.lines {
+            match hl {
+                HunkLine::Context(bytes) => {
+                    result.push(Line {
+                        content: bytes.clone(),
+                        no_newline: false,
+                    });
+                    consumed += 1;
+                }
+                HunkLine::Delete(_) => {
+                    consumed += 1;
+                }
+                HunkLine::Insert(bytes) => {
+                    result.push(Line {
+                        content: bytes.clone(),
+                        no_newline: false,
+                    });
+                }
+            }
+        }
+        // Apply the no-newline flags to the last emitted new-side line and the
+        // last consumed old-side line as appropriate.
+        let new_end = located + consumed;
+        if hunk.new_no_newline
+            && let Some(last) = result.last_mut()
+        {
+            last.no_newline = true;
+        }
+        cursor = new_end;
+        // Update running offset by how far the located position drifted from the
+        // naive expectation, so later hunks search around the adjusted spot.
+        let expected = expected_position(hunk, running_offset);
+        running_offset += located as isize - expected;
+        let _ = hunk.old_no_newline; // honoured implicitly via context matching
+    }
+
+    // Copy any trailing untouched lines. These carry their original
+    // newline-state (including a no-final-newline marker on the base's last
+    // line), so the trailing-newline status is preserved automatically when no
+    // hunk touches the tail.
+    for line in &base_lines[cursor..] {
+        result.push(line.clone());
+    }
+
+    ApplyOutcome::Applied(join_lines(&result))
+}
+
+/// A line with its content (sans terminator) and whether it is newline-terminated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Line {
+    content: Vec<u8>,
+    no_newline: bool,
+}
+
+/// Split a blob into [`Line`]s. A trailing `\n` does not produce an empty final
+/// line; instead the last real line is marked `no_newline = false`. A file that
+/// does not end in `\n` marks its final line `no_newline = true`. An empty blob
+/// produces no lines.
+fn split_blob_lines(data: &[u8]) -> Vec<Line> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    while start < data.len() {
+        match data[start..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let end = start + rel;
+                lines.push(Line {
+                    content: data[start..end].to_vec(),
+                    no_newline: false,
+                });
+                start = end + 1;
+            }
+            None => {
+                lines.push(Line {
+                    content: data[start..].to_vec(),
+                    no_newline: true,
+                });
+                start = data.len();
+            }
+        }
+    }
+    lines
+}
+
+/// Reassemble lines into a byte buffer, honouring per-line newline state.
+fn join_lines(lines: &[Line]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in lines {
+        out.extend_from_slice(&line.content);
+        if !line.no_newline {
+            out.push(b'\n');
+        }
+    }
+    out
+}
+
+/// The naive 0-based position where a hunk expects to apply, given the running
+/// offset accumulated from earlier hunks.
+fn expected_position(hunk: &Hunk, running_offset: isize) -> isize {
+    // `old_start` is 1-based; an empty old side (new-file hunk) uses 0.
+    let base = if hunk.old_start == 0 {
+        0
+    } else {
+        hunk.old_start as isize - 1
+    };
+    base + running_offset
+}
+
+/// Locate the 0-based base-line index at which `hunk`'s old-side (context +
+/// delete) lines match. Tries the expected position first, then expands the
+/// search symmetrically outward. Returns `None` if no match is found within
+/// [`MAX_HUNK_OFFSET`].
+fn locate_hunk(
+    base_lines: &[Line],
+    hunk: &Hunk,
+    min_pos: usize,
+    running_offset: isize,
+) -> Option<usize> {
+    let old_side = old_side_lines(hunk);
+    let expected = expected_position(hunk, running_offset);
+    // Clamp the starting guess into range.
+    let guess = expected.max(0) as usize;
+
+    // Try the exact guess first.
+    if guess >= min_pos && hunk_matches_at(base_lines, &old_side, hunk, guess) {
+        return Some(guess);
+    }
+    // Expand outward.
+    for delta in 1..=MAX_HUNK_OFFSET {
+        // Forward.
+        if let Some(pos) = guess.checked_add(delta)
+            && pos >= min_pos
+            && hunk_matches_at(base_lines, &old_side, hunk, pos)
+        {
+            return Some(pos);
+        }
+        // Backward.
+        if let Some(pos) = guess.checked_sub(delta)
+            && pos >= min_pos
+            && hunk_matches_at(base_lines, &old_side, hunk, pos)
+        {
+            return Some(pos);
+        }
+    }
+    None
+}
+
+/// The old-side (context + delete) line contents of a hunk, in order.
+fn old_side_lines(hunk: &Hunk) -> Vec<&[u8]> {
+    hunk.lines
+        .iter()
+        .filter_map(|hl| match hl {
+            HunkLine::Context(bytes) | HunkLine::Delete(bytes) => Some(bytes.as_slice()),
+            HunkLine::Insert(_) => None,
+        })
+        .collect()
+}
+
+/// Whether `old_side` matches `base_lines` starting at `pos`, including the
+/// trailing-newline expectation when the hunk declares one.
+fn hunk_matches_at(base_lines: &[Line], old_side: &[&[u8]], hunk: &Hunk, pos: usize) -> bool {
+    if pos + old_side.len() > base_lines.len() {
+        return false;
+    }
+    for (i, expected) in old_side.iter().enumerate() {
+        if base_lines[pos + i].content.as_slice() != *expected {
+            return false;
+        }
+    }
+    // If the hunk asserts the old file's final line lacks a newline, the last
+    // matched line must indeed be the file's terminal line and lack a newline.
+    if hunk.old_no_newline && !old_side.is_empty() {
+        let last = pos + old_side.len() - 1;
+        if last + 1 != base_lines.len() || !base_lines[last].no_newline {
+            return false;
+        }
+    }
+    true
+}
+
+/// Split raw patch bytes into lines, preserving the *content* without the
+/// trailing `\n` (a final unterminated line is kept). Carriage returns are kept
+/// as-is so CRLF patch bodies round-trip.
+fn split_patch_lines(input: &[u8]) -> Vec<&[u8]> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    while start < input.len() {
+        match input[start..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                let end = start + rel;
+                lines.push(&input[start..end]);
+                start = end + 1;
+            }
+            None => {
+                lines.push(&input[start..]);
+                start = input.len();
+            }
+        }
+    }
+    lines
+}
+
+struct PatchParser<'a> {
+    lines: &'a [&'a [u8]],
+    index: usize,
+}
+
+impl<'a> PatchParser<'a> {
+    fn parse(&mut self) -> Result<Vec<FilePatch>> {
+        let mut patches = Vec::new();
+        while self.index < self.lines.len() {
+            let line = self.lines[self.index];
+            if line.starts_with(b"diff --git ") {
+                patches.push(self.parse_file(Some(line))?);
+            } else if line.starts_with(b"--- ") {
+                // A bare unified diff with no `diff --git` header.
+                patches.push(self.parse_file(None)?);
+            } else if line.starts_with(b"@@ ") {
+                return Err(GitError::InvalidFormat(
+                    "hunk header encountered before any file header".to_string(),
+                ));
+            } else {
+                // Skip commentary / unrelated lines.
+                self.index += 1;
+            }
+        }
+        Ok(patches)
+    }
+
+    /// Parse one file's headers and hunks. When `diff_line` is `Some`, the
+    /// current line is the `diff --git` header (already inspected by the
+    /// caller); otherwise parsing starts at a `--- ` line.
+    fn parse_file(&mut self, diff_line: Option<&[u8]>) -> Result<FilePatch> {
+        let mut patch = FilePatch {
+            old_path: None,
+            new_path: None,
+            old_mode: None,
+            new_mode: None,
+            hunks: Vec::new(),
+            is_new: false,
+            is_delete: false,
+            is_rename: false,
+        };
+        // Default paths from `diff --git a/x b/x` if present (overridden by
+        // `---`/`+++` lines when those carry real paths).
+        if let Some(diff_line) = diff_line {
+            if let Some((a, b)) = parse_diff_git_paths(diff_line) {
+                patch.old_path = Some(a);
+                patch.new_path = Some(b);
+            }
+            self.index += 1;
+        }
+
+        // Extended headers until the first `---`/`@@`/next `diff --git`.
+        while self.index < self.lines.len() {
+            let line = self.lines[self.index];
+            if line.starts_with(b"--- ") {
+                self.parse_old_file_header(line, &mut patch);
+                self.index += 1;
+                break;
+            } else if line.starts_with(b"@@ ") {
+                // No `---`/`+++` (e.g. pure rename or mode change with no body).
+                break;
+            } else if line.starts_with(b"diff --git ") {
+                // Next file began with no body for this one.
+                return Ok(patch);
+            } else if let Some(rest) = strip_prefix(line, b"old mode ") {
+                patch.old_mode = parse_octal(rest);
+            } else if let Some(rest) = strip_prefix(line, b"new mode ") {
+                patch.new_mode = parse_octal(rest);
+            } else if let Some(rest) = strip_prefix(line, b"new file mode ") {
+                patch.is_new = true;
+                patch.new_mode = parse_octal(rest);
+            } else if let Some(rest) = strip_prefix(line, b"deleted file mode ") {
+                patch.is_delete = true;
+                patch.old_mode = parse_octal(rest);
+            } else if let Some(rest) = strip_prefix(line, b"rename from ") {
+                patch.is_rename = true;
+                patch.old_path = Some(rest.to_vec());
+            } else if let Some(rest) = strip_prefix(line, b"rename to ") {
+                patch.is_rename = true;
+                patch.new_path = Some(rest.to_vec());
+            } else {
+                // `index ..`, `similarity index`, `copy from/to`, etc. — ignore.
+                self.index += 1;
+                continue;
+            }
+            self.index += 1;
+        }
+
+        // `+++` header (the old-file branch above already advanced past `---`).
+        if self.index < self.lines.len() && self.lines[self.index].starts_with(b"+++ ") {
+            self.parse_new_file_header(self.lines[self.index], &mut patch);
+            self.index += 1;
+        }
+
+        // Hunks.
+        while self.index < self.lines.len() {
+            let line = self.lines[self.index];
+            if line.starts_with(b"@@ ") {
+                let hunk = self.parse_hunk()?;
+                patch.hunks.push(hunk);
+            } else if line.starts_with(b"diff --git ") {
+                break;
+            } else if line.starts_with(b"--- ") {
+                // Start of a subsequent bare diff.
+                break;
+            } else {
+                // Trailing commentary between/after hunks.
+                self.index += 1;
+            }
+        }
+
+        Ok(patch)
+    }
+
+    fn parse_old_file_header(&self, line: &[u8], patch: &mut FilePatch) {
+        let rest = strip_prefix(line, b"--- ").unwrap_or(line);
+        let path = strip_header_path(rest);
+        match path {
+            HeaderPath::DevNull => {
+                patch.is_new = true;
+                patch.old_path = None;
+            }
+            HeaderPath::Path(p) => {
+                // Only override if we did not already learn a real path.
+                if patch.old_path.is_none() || !patch.is_rename {
+                    patch.old_path = Some(p);
+                }
+            }
+        }
+    }
+
+    fn parse_new_file_header(&self, line: &[u8], patch: &mut FilePatch) {
+        let rest = strip_prefix(line, b"+++ ").unwrap_or(line);
+        let path = strip_header_path(rest);
+        match path {
+            HeaderPath::DevNull => {
+                patch.is_delete = true;
+                patch.new_path = None;
+            }
+            HeaderPath::Path(p) => {
+                if patch.new_path.is_none() || !patch.is_rename {
+                    patch.new_path = Some(p);
+                }
+            }
+        }
+    }
+
+    fn parse_hunk(&mut self) -> Result<Hunk> {
+        let header = self.lines[self.index];
+        let (old_start, old_len, new_start, new_len) = parse_hunk_header(header)?;
+        self.index += 1;
+
+        let mut hunk = Hunk {
+            old_start,
+            old_len,
+            new_start,
+            new_len,
+            lines: Vec::new(),
+            old_no_newline: false,
+            new_no_newline: false,
+        };
+        let mut old_seen = 0usize;
+        let mut new_seen = 0usize;
+
+        while self.index < self.lines.len() {
+            // Stop when both sides are satisfied.
+            if old_seen >= old_len && new_seen >= new_len {
+                break;
+            }
+            let line = self.lines[self.index];
+            if line.is_empty() {
+                // A wholly empty line in a unified diff is a context line whose
+                // content is the empty string (git emits a bare ` `, but some
+                // tooling/email transport strips the trailing space).
+                hunk.lines.push(HunkLine::Context(Vec::new()));
+                old_seen += 1;
+                new_seen += 1;
+                self.index += 1;
+                continue;
+            }
+            match line[0] {
+                b' ' => {
+                    hunk.lines.push(HunkLine::Context(line[1..].to_vec()));
+                    old_seen += 1;
+                    new_seen += 1;
+                }
+                b'+' => {
+                    hunk.lines.push(HunkLine::Insert(line[1..].to_vec()));
+                    new_seen += 1;
+                }
+                b'-' => {
+                    hunk.lines.push(HunkLine::Delete(line[1..].to_vec()));
+                    old_seen += 1;
+                }
+                b'\\' => {
+                    // `\ No newline at end of file` — applies to the line just
+                    // emitted. Set the appropriate side flag(s).
+                    self.mark_no_newline(&mut hunk);
+                    self.index += 1;
+                    continue;
+                }
+                _ => {
+                    // Anything else terminates the hunk body.
+                    break;
+                }
+            }
+            self.index += 1;
+        }
+
+        // A trailing `\ No newline` may follow the final body line even after
+        // the counts are satisfied; consume it.
+        if self.index < self.lines.len() && self.lines[self.index].starts_with(b"\\") {
+            self.mark_no_newline(&mut hunk);
+            self.index += 1;
+        }
+
+        if old_seen != old_len || new_seen != new_len {
+            return Err(GitError::InvalidFormat(format!(
+                "hunk body line counts mismatch: header declared -{old_len},+{new_len} \
+                 but body had -{old_seen},+{new_seen}"
+            )));
+        }
+
+        Ok(hunk)
+    }
+
+    /// Set the no-newline flag based on the kind of the most recently pushed
+    /// hunk line.
+    fn mark_no_newline(&self, hunk: &mut Hunk) {
+        match hunk.lines.last() {
+            Some(HunkLine::Context(_)) => {
+                hunk.old_no_newline = true;
+                hunk.new_no_newline = true;
+            }
+            Some(HunkLine::Insert(_)) => hunk.new_no_newline = true,
+            Some(HunkLine::Delete(_)) => hunk.old_no_newline = true,
+            None => {}
+        }
+    }
+}
+
+enum HeaderPath {
+    DevNull,
+    Path(Vec<u8>),
+}
+
+/// Extract the path from a `---`/`+++` header tail, stripping a leading `a/` or
+/// `b/` prefix, an optional trailing timestamp (separated by a tab), and
+/// recognising `/dev/null`.
+fn strip_header_path(rest: &[u8]) -> HeaderPath {
+    // Cut a trailing tab-delimited timestamp if present.
+    let path = match rest.iter().position(|&b| b == b'\t') {
+        Some(tab) => &rest[..tab],
+        None => rest,
+    };
+    let path = trim_ascii_end(path);
+    if path == b"/dev/null" {
+        return HeaderPath::DevNull;
+    }
+    // Strip a leading `a/` or `b/` (git's default prefixes).
+    let stripped = if path.starts_with(b"a/") || path.starts_with(b"b/") {
+        &path[2..]
+    } else {
+        path
+    };
+    HeaderPath::Path(stripped.to_vec())
+}
+
+/// Parse the two paths out of `diff --git a/<x> b/<y>`. Returns the paths with
+/// their `a/`/`b/` prefixes stripped. Returns `None` when the line cannot be
+/// split unambiguously (e.g. paths containing spaces, which git would quote).
+fn parse_diff_git_paths(line: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let rest = strip_prefix(line, b"diff --git ")?;
+    // Quoted paths are uncommon in this engine's inputs; bail and let the
+    // `---`/`+++` headers supply the names instead.
+    if rest.first() == Some(&b'"') {
+        return None;
+    }
+    // Find the split point: the boundary between the `a/...` and `b/...` halves.
+    // git separates them with a single space; the simplest robust heuristic is
+    // to look for ` b/` preceded by an `a/` start.
+    if !rest.starts_with(b"a/") {
+        return None;
+    }
+    let sep = find_subslice(rest, b" b/")?;
+    let a = &rest[2..sep];
+    let b = &rest[sep + 3..];
+    Some((a.to_vec(), b.to_vec()))
+}
+
+/// Parse an `@@ -l,s +l,s @@` header into `(old_start, old_len, new_start,
+/// new_len)`. A missing `,s` means a length of 1.
+fn parse_hunk_header(line: &[u8]) -> Result<(usize, usize, usize, usize)> {
+    let err = || GitError::InvalidFormat(format!("malformed hunk header: {}", lossy(line)));
+    let rest = strip_prefix(line, b"@@ ").ok_or_else(err)?;
+    // Up to the closing ` @@`.
+    let close = find_subslice(rest, b" @@").ok_or_else(err)?;
+    let ranges = &rest[..close];
+    let mut parts = ranges.split(|&b| b == b' ').filter(|p| !p.is_empty());
+    let old = parts.next().ok_or_else(err)?;
+    let new = parts.next().ok_or_else(err)?;
+    let old = strip_prefix(old, b"-").ok_or_else(err)?;
+    let new = strip_prefix(new, b"+").ok_or_else(err)?;
+    let (old_start, old_len) = parse_range(old).ok_or_else(err)?;
+    let (new_start, new_len) = parse_range(new).ok_or_else(err)?;
+    Ok((old_start, old_len, new_start, new_len))
+}
+
+/// Parse `start[,len]` into `(start, len)`, defaulting `len` to 1.
+fn parse_range(range: &[u8]) -> Option<(usize, usize)> {
+    match range.iter().position(|&b| b == b',') {
+        Some(comma) => {
+            let start = parse_usize(&range[..comma])?;
+            let len = parse_usize(&range[comma + 1..])?;
+            Some((start, len))
+        }
+        None => Some((parse_usize(range)?, 1)),
+    }
+}
+
+fn parse_usize(bytes: &[u8]) -> Option<usize> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value: usize = 0;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(value)
+}
+
+fn parse_octal(bytes: &[u8]) -> Option<u32> {
+    let trimmed = trim_ascii_end(bytes);
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut value: u32 = 0;
+    for &b in trimmed {
+        if !(b'0'..=b'7').contains(&b) {
+            return None;
+        }
+        value = value.checked_mul(8)?.checked_add((b - b'0') as u32)?;
+    }
+    Some(value)
+}
+
+fn strip_prefix<'b>(line: &'b [u8], prefix: &[u8]) -> Option<&'b [u8]> {
+    if line.starts_with(prefix) {
+        Some(&line[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
+    let mut end = bytes.len();
+    while end > 0 && (bytes[end - 1] == b' ' || bytes[end - 1] == b'\r') {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+fn lossy(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1481,5 +2207,364 @@ mod tests {
         let result = merge_blobs(base, base, theirs, &merge_opts());
         assert!(!result.conflicted);
         assert_eq!(result.content, theirs.to_vec());
+    }
+    fn applied(outcome: ApplyOutcome) -> Vec<u8> {
+        match outcome {
+            ApplyOutcome::Applied(bytes) => bytes,
+            ApplyOutcome::Rejected => panic!("expected Applied, got Rejected"),
+        }
+    }
+
+    #[test]
+    fn parse_multi_file_patch() {
+        let patch = b"\
+diff --git a/one.txt b/one.txt
+index aaaaaaa..bbbbbbb 100644
+--- a/one.txt
++++ b/one.txt
+@@ -1,3 +1,3 @@
+ alpha
+-beta
++BETA
+ gamma
+diff --git a/two.txt b/two.txt
+index ccccccc..ddddddd 100644
+--- a/two.txt
++++ b/two.txt
+@@ -1,2 +1,3 @@
+ first
++inserted
+ second
+";
+        let patches = parse_unified_patch(patch).unwrap();
+        assert_eq!(patches.len(), 2);
+
+        assert_eq!(patches[0].old_path.as_deref(), Some(b"one.txt".as_slice()));
+        assert_eq!(patches[0].new_path.as_deref(), Some(b"one.txt".as_slice()));
+        assert_eq!(patches[0].old_mode, None);
+        assert_eq!(patches[0].hunks.len(), 1);
+        let h = &patches[0].hunks[0];
+        assert_eq!(
+            (h.old_start, h.old_len, h.new_start, h.new_len),
+            (1, 3, 1, 3)
+        );
+        assert_eq!(
+            h.lines,
+            vec![
+                HunkLine::Context(b"alpha".to_vec()),
+                HunkLine::Delete(b"beta".to_vec()),
+                HunkLine::Insert(b"BETA".to_vec()),
+                HunkLine::Context(b"gamma".to_vec()),
+            ]
+        );
+
+        assert_eq!(patches[1].new_path.as_deref(), Some(b"two.txt".as_slice()));
+        assert_eq!(patches[1].hunks[0].new_len, 3);
+    }
+
+    #[test]
+    fn parse_default_hunk_range_length() {
+        // `@@ -1 +1,2 @@` (no comma) means a length of 1 on the old side.
+        let patch = b"\
+--- a/x
++++ b/x
+@@ -1 +1,2 @@
+ line
++added
+";
+        let patches = parse_unified_patch(patch).unwrap();
+        let h = &patches[0].hunks[0];
+        assert_eq!(
+            (h.old_start, h.old_len, h.new_start, h.new_len),
+            (1, 1, 1, 2)
+        );
+    }
+
+    #[test]
+    fn parse_hunk_header_before_file_errors() {
+        let patch = b"@@ -1,1 +1,1 @@\n context\n";
+        assert!(parse_unified_patch(patch).is_err());
+    }
+
+    #[test]
+    fn parse_mismatched_counts_errors() {
+        // Header promises two old lines but only one is present.
+        let patch = b"--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n only\n+new\n";
+        assert!(parse_unified_patch(patch).is_err());
+    }
+
+    #[test]
+    fn apply_clean_hunk() {
+        let base = b"alpha\nbeta\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+        )
+        .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"alpha\nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn apply_with_line_offset() {
+        // The hunk header points at line 1, but the matching context actually
+        // lives a few lines down; the offset search must find it.
+        let base = b"pre1\npre2\npre3\nalpha\nbeta\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+        )
+        .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"pre1\npre2\npre3\nalpha\nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn apply_with_negative_line_offset() {
+        // Recorded position is well past the real location; search backward.
+        let base = b"alpha\nbeta\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -50,3 +50,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+        )
+        .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"alpha\nBETA\ngamma\n");
+    }
+
+    #[test]
+    fn apply_multiple_hunks() {
+        let base = b"a\nb\nc\nd\ne\nf\ng\nh\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n\
+@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n\
+@@ -6,3 +6,3 @@\n f\n-g\n+G\n h\n",
+        )
+        .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"a\nB\nc\nd\ne\nf\nG\nh\n");
+    }
+
+    #[test]
+    fn reject_on_context_mismatch() {
+        let base = b"alpha\nDIFFERENT\ngamma\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
+        )
+        .unwrap();
+        assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn parse_and_apply_new_file() {
+        let patch = parse_unified_patch(
+            b"\
+diff --git a/new.txt b/new.txt
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++hello
++world
+",
+        )
+        .unwrap();
+        assert!(patches_first_is_new(&patch));
+        assert_eq!(patch[0].old_path, None);
+        assert_eq!(patch[0].new_path.as_deref(), Some(b"new.txt".as_slice()));
+        assert_eq!(patch[0].new_mode, Some(0o100644));
+        // Base is ignored for a new file.
+        let out = applied(apply_file_patch(b"garbage that is ignored", &patch[0]));
+        assert_eq!(out, b"hello\nworld\n");
+    }
+
+    fn patches_first_is_new(patches: &[FilePatch]) -> bool {
+        patches.first().map(|p| p.is_new).unwrap_or(false)
+    }
+
+    #[test]
+    fn parse_and_apply_delete_file() {
+        let patch = parse_unified_patch(
+            b"\
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 1111111..0000000
+--- a/gone.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-hello
+-world
+",
+        )
+        .unwrap();
+        assert!(patch[0].is_delete);
+        assert_eq!(patch[0].old_path.as_deref(), Some(b"gone.txt".as_slice()));
+        assert_eq!(patch[0].new_path, None);
+        assert_eq!(patch[0].old_mode, Some(0o100644));
+        let out = applied(apply_file_patch(b"hello\nworld\n", &patch[0]));
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn parse_rename_headers() {
+        let patch = parse_unified_patch(
+            b"\
+diff --git a/old/name.txt b/new/name.txt
+similarity index 100%
+rename from old/name.txt
+rename to new/name.txt
+",
+        )
+        .unwrap();
+        assert!(patch[0].is_rename);
+        assert_eq!(
+            patch[0].old_path.as_deref(),
+            Some(b"old/name.txt".as_slice())
+        );
+        assert_eq!(
+            patch[0].new_path.as_deref(),
+            Some(b"new/name.txt".as_slice())
+        );
+        assert!(patch[0].hunks.is_empty());
+    }
+
+    #[test]
+    fn parse_mode_change_headers() {
+        let patch = parse_unified_patch(
+            b"\
+diff --git a/script.sh b/script.sh
+old mode 100644
+new mode 100755
+",
+        )
+        .unwrap();
+        assert_eq!(patch[0].old_mode, Some(0o100644));
+        assert_eq!(patch[0].new_mode, Some(0o100755));
+        assert!(!patch[0].is_new);
+        assert!(!patch[0].is_delete);
+    }
+
+    #[test]
+    fn no_final_newline_base_preserved_when_untouched() {
+        // The change is on line 1; the final line has no newline and is not in
+        // the hunk, so its no-newline state must survive.
+        let base = b"alpha\nbeta\nnotail"; // "notail" has no trailing \n
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n").unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"ALPHA\nbeta\nnotail");
+    }
+
+    #[test]
+    fn no_final_newline_added_by_patch() {
+        // Old file ends with a newline; patch rewrites the last line to one
+        // without a trailing newline.
+        let base = b"alpha\nbeta\n";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -2,1 +2,1 @@\n-beta\n+beta-notail\n\\ No newline at end of file\n",
+        )
+        .unwrap();
+        assert!(patch[0].hunks[0].new_no_newline);
+        assert!(!patch[0].hunks[0].old_no_newline);
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"alpha\nbeta-notail");
+    }
+
+    #[test]
+    fn no_final_newline_in_base_matched_and_kept() {
+        // Both sides lack a trailing newline; context match must require the
+        // base's final line to itself be newline-free.
+        let base = b"alpha\nbeta"; // no trailing newline
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-alpha\n+ALPHA\n beta\n\\ No newline at end of file\n",
+        )
+        .unwrap();
+        assert!(patch[0].hunks[0].old_no_newline);
+        assert!(patch[0].hunks[0].new_no_newline);
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"ALPHA\nbeta");
+    }
+
+    #[test]
+    fn no_final_newline_mismatch_rejected() {
+        // Patch asserts the old file has no trailing newline, but the base does.
+        // That must be rejected rather than silently mis-applied.
+        let base = b"alpha\nbeta\n"; // HAS trailing newline
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ b/x\n@@ -2,1 +2,1 @@\n-beta\n\\ No newline at end of file\n+beta2\n",
+        )
+        .unwrap();
+        assert!(patch[0].hunks[0].old_no_newline);
+        assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
+    }
+
+    #[test]
+    fn delete_with_no_final_newline() {
+        // Deleting the entire content of a file that had no trailing newline.
+        let base = b"only line no newline";
+        let patch = parse_unified_patch(
+            b"--- a/x\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-only line no newline\n\\ No newline at end of file\n",
+        )
+        .unwrap();
+        assert!(patch[0].is_delete);
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"");
+    }
+
+    #[test]
+    fn apply_pure_insertion_hunk() {
+        let base = b"first\nsecond\n";
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n first\n+middle\n second\n")
+                .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"first\nmiddle\nsecond\n");
+    }
+
+    #[test]
+    fn apply_pure_deletion_hunk() {
+        let base = b"first\nmiddle\nsecond\n";
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,3 +1,2 @@\n first\n-middle\n second\n")
+                .unwrap();
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"first\nsecond\n");
+    }
+
+    #[test]
+    fn apply_then_reparse_round_trip() {
+        // Hand-written unified diff -> apply -> the result is exactly the new
+        // file content the diff describes. Re-parsing the same patch yields an
+        // identical structure (idempotent parse).
+        let base = b"l1\nl2\nl3\nl4\nl5\n";
+        let text = b"--- a/f\n+++ b/f\n@@ -2,3 +2,4 @@\n l2\n-l3\n+L3\n+L3b\n l4\n";
+        let p1 = parse_unified_patch(text).unwrap();
+        let p2 = parse_unified_patch(text).unwrap();
+        assert_eq!(p1, p2);
+        let out = applied(apply_file_patch(base, &p1[0]));
+        assert_eq!(out, b"l1\nl2\nL3\nL3b\nl4\nl5\n");
+    }
+
+    #[test]
+    fn empty_context_line_without_trailing_space() {
+        // Some transports strip the single leading space from blank context
+        // lines; the parser treats a wholly empty body line as blank context.
+        let base = b"a\n\nb\n";
+        let patch =
+            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n\n-b\n+B\n").unwrap();
+        assert_eq!(patch[0].hunks[0].lines[1], HunkLine::Context(Vec::new()));
+        let out = applied(apply_file_patch(base, &patch[0]));
+        assert_eq!(out, b"a\n\nB\n");
+    }
+
+    #[test]
+    fn split_blob_lines_handles_edge_cases() {
+        assert!(split_blob_lines(b"").is_empty());
+        let single = split_blob_lines(b"abc");
+        assert_eq!(single.len(), 1);
+        assert!(single[0].no_newline);
+        let terminated = split_blob_lines(b"abc\n");
+        assert_eq!(terminated.len(), 1);
+        assert!(!terminated[0].no_newline);
+        let blank_then_eof = split_blob_lines(b"x\n");
+        assert_eq!(blank_then_eof.len(), 1);
     }
 }
