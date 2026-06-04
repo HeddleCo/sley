@@ -1,10 +1,10 @@
 use git_core::{GitError, ObjectId, Result};
-use git_formats::{Commit, CommitGraph, ObjectType, Tag};
+use git_formats::{Commit, CommitGraph, Index, ObjectType, Tag, Tree};
 use git_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use git_refs::{FileRefStore, PackedRef, RefTarget};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionSpec {
@@ -44,6 +44,22 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     reader: &R,
     rev: &str,
 ) -> Result<ObjectId> {
+    // `:/text` and `:[N:]path` are anchored at the start of the spec; handle them
+    // before the `^`/`~` suffix machinery so the leading colon is not mistaken
+    // for a normal revision name.
+    if let Some(text) = rev.strip_prefix(":/") {
+        return search_commit_message_all(git_dir, format, reader, text);
+    }
+    if let Some(rest) = rev.strip_prefix(':') {
+        let (stage, path) = parse_index_stage_path(rest);
+        return resolve_index_path(git_dir, format, stage, path);
+    }
+    // `<rev>:<path>` resolves to the object at `<path>` within `<rev>`'s tree. The
+    // colon binds looser than the `^`/`~` navigation suffixes, so an unsuffixed
+    // colon here means the whole left side is the revision-ish to peel to a tree.
+    if let Some((rev_part, path)) = split_rev_path(rev) {
+        return resolve_rev_path(git_dir, format, reader, rev_part, path);
+    }
     if let Some((base, suffix)) = split_revision_suffix(rev)? {
         if base.is_empty() {
             return Err(GitError::InvalidFormat(format!(
@@ -112,10 +128,12 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RevisionSuffix {
+enum RevisionSuffix<'a> {
     Parent(usize),
     FirstParent(usize),
     Peel(PeelKind),
+    /// `<rev>^{/text}` — first matching commit in `<rev>`'s first-parent ancestry.
+    Search(&'a str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,7 +145,7 @@ enum PeelKind {
     Tag,
 }
 
-fn split_revision_suffix(rev: &str) -> Result<Option<(&str, RevisionSuffix)>> {
+fn split_revision_suffix(rev: &str) -> Result<Option<(&str, RevisionSuffix<'_>)>> {
     let caret = rev.rfind('^');
     let tilde = rev.rfind('~');
     let Some((op, pos)) = (match (caret, tilde) {
@@ -144,6 +162,9 @@ fn split_revision_suffix(rev: &str) -> Result<Option<(&str, RevisionSuffix)>> {
     let suffix = &suffix[1..];
     match op {
         '^' => {
+            if let Some(text) = parse_search_suffix(rev, suffix)? {
+                return Ok(Some((base, RevisionSuffix::Search(text))));
+            }
             let parent = if suffix.is_empty() {
                 1
             } else if let Some(kind) = parse_peel_suffix(rev, suffix)? {
@@ -196,6 +217,18 @@ fn parse_peel_suffix(rev: &str, suffix: &str) -> Result<Option<PeelKind>> {
     Ok(Some(kind))
 }
 
+fn parse_search_suffix<'a>(rev: &str, suffix: &'a str) -> Result<Option<&'a str>> {
+    let Some(inner) = suffix.strip_prefix("{/") else {
+        return Ok(None);
+    };
+    let Some(text) = inner.strip_suffix('}') else {
+        return Err(GitError::InvalidFormat(format!(
+            "invalid revision search suffix in {rev}"
+        )));
+    };
+    Ok(Some(text))
+}
+
 fn parse_revision_count(rev: &str, text: &str) -> Result<usize> {
     text.parse::<usize>()
         .map_err(|_| GitError::InvalidFormat(format!("invalid revision suffix in {rev}")))
@@ -206,7 +239,7 @@ fn apply_revision_suffix<R: ObjectReader>(
     reader: &R,
     format: git_core::ObjectFormat,
     base: &ObjectId,
-    suffix: RevisionSuffix,
+    suffix: RevisionSuffix<'_>,
     raw_rev: &str,
 ) -> Result<ObjectId> {
     match suffix {
@@ -232,6 +265,9 @@ fn apply_revision_suffix<R: ObjectReader>(
             Ok(current)
         }
         RevisionSuffix::Peel(kind) => peel_revision(reader, format, base, kind),
+        RevisionSuffix::Search(text) => {
+            search_commit_message_first_parent(git_dir, reader, format, base, text)
+        }
     }
 }
 
@@ -430,6 +466,495 @@ pub fn walk_commits<R: ObjectReader>(
         });
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// `<rev>:<path>` resolution
+// ---------------------------------------------------------------------------
+
+/// Resolve `<rev>:<path>` to the object id of `<path>` within `<rev>`'s tree.
+///
+/// `rev` is peeled to a tree (so a commit, tag, or tree id all work) and then
+/// `path` is walked component by component. The result is the blob id for a
+/// file path or the subtree id for a directory path; an empty `path` resolves
+/// to the tree itself. Missing components and attempts to descend through a
+/// non-tree entry both report a git-style "path '<path>' does not exist in
+/// '<rev>'" error.
+pub fn resolve_rev_path<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    rev: &str,
+    path: &str,
+) -> Result<ObjectId> {
+    let rev_oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
+    let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
+    resolve_tree_path(reader, format, &tree_oid, path)
+        .ok_or_else(|| GitError::NotFound(format!("path '{path}' does not exist in '{rev}'")))
+}
+
+/// Walk `path` within the tree `tree_oid`, returning the id of the entry it
+/// names, or `None` if any component is missing or a component before the last
+/// is not a tree. An empty `path` returns `tree_oid` unchanged.
+fn resolve_tree_path<R: ObjectReader>(
+    reader: &R,
+    format: git_core::ObjectFormat,
+    tree_oid: &ObjectId,
+    path: &str,
+) -> Option<ObjectId> {
+    let mut current = tree_oid.clone();
+    // Split on '/', skipping empty components so leading/trailing/duplicate
+    // separators ("a//b", "/a", "dir/") behave the way git's pathspec does.
+    let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if components.is_empty() {
+        return Some(current);
+    }
+    let last = components.len() - 1;
+    for (idx, component) in components.iter().enumerate() {
+        let object = reader.read_object(&current).ok()?;
+        if object.object_type != ObjectType::Tree {
+            // Cannot descend through a blob (or anything non-tree).
+            return None;
+        }
+        let tree = Tree::parse(format, &object.body).ok()?;
+        let entry = tree
+            .entries
+            .iter()
+            .find(|entry| entry.name == component.as_bytes())?;
+        if idx == last {
+            return Some(entry.oid.clone());
+        }
+        // Intermediate component must itself be a tree to keep descending.
+        if git_formats::tree_entry_object_type(entry.mode) != ObjectType::Tree {
+            return None;
+        }
+        current = entry.oid.clone();
+    }
+    Some(current)
+}
+
+/// Split `<rev>:<path>` into its revision and path halves.
+///
+/// Returns `None` when the spec is not a rev/path form, i.e. when there is no
+/// colon, when the colon is part of a leading `:` index spec (handled
+/// elsewhere), or when the left side is empty. The split uses the first colon
+/// so paths may themselves contain colons.
+fn split_rev_path(rev: &str) -> Option<(&str, &str)> {
+    let colon = rev.find(':')?;
+    if colon == 0 {
+        return None;
+    }
+    Some((&rev[..colon], &rev[colon + 1..]))
+}
+
+// ---------------------------------------------------------------------------
+// `:[N:]<path>` index-stage resolution
+// ---------------------------------------------------------------------------
+
+/// Parse the portion after a leading `:` into `(stage, path)`.
+///
+/// `:<path>` selects stage 0; `:N:<path>` (N in 0..=3) selects stage N. When
+/// the leading token is not a single 0-3 digit followed by a colon the whole
+/// string is treated as a stage-0 path.
+fn parse_index_stage_path(rest: &str) -> (u8, &str) {
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && matches!(bytes[0], b'0'..=b'3') {
+        return (bytes[0] - b'0', &rest[2..]);
+    }
+    (0, rest)
+}
+
+/// Resolve `path` at `stage` in the on-disk index, returning the recorded blob
+/// id. Reports git-style errors for a missing index, a path absent from the
+/// index, and a path present only at other stages.
+fn resolve_index_path(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    stage: u8,
+    path: &str,
+) -> Result<ObjectId> {
+    let index_path = repository_index_path(git_dir);
+    let bytes = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(GitError::NotFound(format!(
+                "path '{path}' is not in the index"
+            )));
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    let index = Index::parse(&bytes, format)?;
+    let mut path_exists = false;
+    for entry in &index.entries {
+        if entry.path != path.as_bytes() {
+            continue;
+        }
+        path_exists = true;
+        if index_entry_stage(entry) == stage {
+            return Ok(entry.oid.clone());
+        }
+    }
+    if path_exists {
+        Err(GitError::NotFound(format!(
+            "path '{path}' is in the index, but not at stage {stage}"
+        )))
+    } else {
+        Err(GitError::NotFound(format!(
+            "path '{path}' is not in the index"
+        )))
+    }
+}
+
+/// Extract the merge stage (0-3) from an index entry's flags (bits 12-13).
+fn index_entry_stage(entry: &git_formats::IndexEntry) -> u8 {
+    ((entry.flags >> 12) & 0x3) as u8
+}
+
+/// Locate the index file, honoring `GIT_INDEX_FILE` like the rest of git.
+fn repository_index_path(git_dir: &Path) -> PathBuf {
+    std::env::var_os("GIT_INDEX_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| git_dir.join("index"))
+}
+
+// ---------------------------------------------------------------------------
+// Commit-message search (`:/text` and `<rev>^{/text}`)
+// ---------------------------------------------------------------------------
+//
+// Matching is a plain substring test against the raw commit message; this crate
+// has no regex dependency, so `:/text` and `^{/text}` find commits whose
+// message *contains* `text` rather than matching it as a POSIX regular
+// expression. An empty pattern matches the most recent candidate, mirroring
+// git's "return the youngest commit" behavior for `:/`.
+
+/// `:/text` — newest commit (across all refs) whose message contains `text`.
+///
+/// "Newest" is approximated by committer timestamp, falling back to the order
+/// commits are discovered when timestamps are unavailable, which matches git's
+/// observable behavior for the common case.
+fn search_commit_message_all<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    text: &str,
+) -> Result<ObjectId> {
+    let starts = all_ref_commit_starts(git_dir, format, reader)?;
+    let mut best: Option<(i64, ObjectId)> = None;
+    for record in walk_commits(reader, format, starts)? {
+        if !commit_message_contains(&record.commit, text) {
+            continue;
+        }
+        let when = commit_committer_time(&record.commit).unwrap_or(i64::MIN);
+        if best
+            .as_ref()
+            .is_none_or(|(best_when, _)| when >= *best_when)
+        {
+            best = Some((when, record.oid));
+        }
+    }
+    best.map(|(_, oid)| oid)
+        .ok_or_else(|| GitError::NotFound(format!("no commit matching ':/{text}'")))
+}
+
+/// `<rev>^{/text}` — first commit reachable from `base` along the first-parent
+/// chain whose message contains `text`.
+fn search_commit_message_first_parent<R: ObjectReader>(
+    git_dir: &Path,
+    reader: &R,
+    format: git_core::ObjectFormat,
+    base: &ObjectId,
+    text: &str,
+) -> Result<ObjectId> {
+    let start = peel_to_commit(reader, format, base)?;
+    let mut current = Some(start);
+    let mut seen = HashSet::new();
+    while let Some(oid) = current {
+        if !seen.insert(oid.clone()) {
+            break;
+        }
+        let object = reader.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "expected commit {oid}, found {}",
+                object.object_type.as_str()
+            )));
+        }
+        let commit = Commit::parse(format, &object.body)?;
+        if commit_message_contains(&commit, text) {
+            return Ok(oid);
+        }
+        current = commit_parents_with_graph(git_dir, reader, format, &oid)?
+            .into_iter()
+            .next();
+    }
+    Err(GitError::NotFound(format!(
+        "no commit matching '^{{/{text}}}' in first-parent history"
+    )))
+}
+
+fn commit_message_contains(commit: &Commit, text: &str) -> bool {
+    if text.is_empty() {
+        return true;
+    }
+    // Search the raw bytes so non-UTF-8 messages still match where possible.
+    commit
+        .message
+        .windows(text.len())
+        .any(|window| window == text.as_bytes())
+}
+
+/// Best-effort committer timestamp (seconds since epoch) from a commit's
+/// committer line, used only to order `:/text` candidates.
+fn commit_committer_time(commit: &Commit) -> Option<i64> {
+    let line = std::str::from_utf8(&commit.committer).ok()?;
+    // Format: "Name <email> <seconds> <tz>"; the timestamp is the
+    // second-to-last whitespace-separated field.
+    let mut fields = line.rsplit(' ');
+    let _tz = fields.next()?;
+    fields.next()?.parse::<i64>().ok()
+}
+
+/// Collect commit starting points from every ref (peeling tags to commits) for
+/// a repository-wide `:/text` search.
+fn all_ref_commit_starts<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+) -> Result<Vec<ObjectId>> {
+    let refs = FileRefStore::new(git_dir.to_path_buf(), format);
+    let mut starts = Vec::new();
+    let mut seen = HashSet::new();
+    for reference in refs.list_refs()? {
+        let oid = match reference.target {
+            RefTarget::Direct(oid) => oid,
+            RefTarget::Symbolic(_) => continue,
+        };
+        // Skip refs whose objects (or tag targets) are not present/commit-ish.
+        let Ok(commit) = peel_to_commit(reader, format, &oid) else {
+            continue;
+        };
+        if seen.insert(commit.clone()) {
+            starts.push(commit);
+        }
+    }
+    Ok(starts)
+}
+
+// ---------------------------------------------------------------------------
+// Revision ranges (`A..B` and `A...B`)
+// ---------------------------------------------------------------------------
+
+/// A parsed revision range expression.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionRange {
+    /// `A..B` — commits reachable from `B` but not from `A`.
+    Asymmetric { start: String, end: String },
+    /// `A...B` — commits reachable from exactly one of `A`/`B` (symmetric
+    /// difference).
+    Symmetric { left: String, right: String },
+}
+
+/// Parse `A..B` / `A...B` range syntax.
+///
+/// Returns `None` when `spec` is not a range. An omitted side defaults to
+/// `HEAD` (so `..B`, `A..`, `...B`, etc. behave like git). `...` is checked
+/// before `..` so the symmetric form is not misread as an asymmetric one. A
+/// trailing `..`/`...` with the wrong number of dots (more than two/three) is
+/// rejected as a malformed range.
+pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
+    if let Some((left, right)) = spec.split_once("...") {
+        if left.contains("..") || right.contains("..") {
+            return None;
+        }
+        return Some(RevisionRange::Symmetric {
+            left: default_range_side(left).to_string(),
+            right: default_range_side(right).to_string(),
+        });
+    }
+    if let Some((left, right)) = spec.split_once("..") {
+        if left.contains("..") || right.contains("..") {
+            return None;
+        }
+        return Some(RevisionRange::Asymmetric {
+            start: default_range_side(left).to_string(),
+            end: default_range_side(right).to_string(),
+        });
+    }
+    None
+}
+
+fn default_range_side(side: &str) -> &str {
+    if side.is_empty() {
+        "HEAD"
+    } else {
+        side
+    }
+}
+
+/// Resolve a parsed range to the set of commit oids it selects.
+///
+/// `A..B` yields commits reachable from `B` but not `A`; `A...B` yields the
+/// symmetric difference (reachable from `A` or `B` but not both). Endpoints are
+/// resolved as revisions and peeled to commits before traversal. The returned
+/// vector is unordered.
+pub fn resolve_revision_range<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    range: &RevisionRange,
+) -> Result<Vec<ObjectId>> {
+    match range {
+        RevisionRange::Asymmetric { start, end } => {
+            let start_oid = resolve_range_endpoint(git_dir, format, reader, start)?;
+            let end_oid = resolve_range_endpoint(git_dir, format, reader, end)?;
+            let excluded = ancestor_set(git_dir, reader, format, &start_oid)?;
+            let included = ancestor_set(git_dir, reader, format, &end_oid)?;
+            Ok(included
+                .into_iter()
+                .filter(|oid| !excluded.contains(oid))
+                .collect())
+        }
+        RevisionRange::Symmetric { left, right } => {
+            let left_oid = resolve_range_endpoint(git_dir, format, reader, left)?;
+            let right_oid = resolve_range_endpoint(git_dir, format, reader, right)?;
+            let left_set = ancestor_set(git_dir, reader, format, &left_oid)?;
+            let right_set = ancestor_set(git_dir, reader, format, &right_oid)?;
+            let mut out = Vec::new();
+            for oid in &left_set {
+                if !right_set.contains(oid) {
+                    out.push(oid.clone());
+                }
+            }
+            for oid in &right_set {
+                if !left_set.contains(oid) {
+                    out.push(oid.clone());
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn resolve_range_endpoint<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    rev: &str,
+) -> Result<ObjectId> {
+    let oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
+    peel_to_commit(reader, format, &oid)
+}
+
+/// Compute the set of commits reachable from `start` (inclusive) following all
+/// parent edges. Uses the commit-graph for parent lookups when available.
+fn ancestor_set<R: ObjectReader>(
+    git_dir: &Path,
+    reader: &R,
+    format: git_core::ObjectFormat,
+    start: &ObjectId,
+) -> Result<HashSet<ObjectId>> {
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::from([start.clone()]);
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+            pending.push_back(parent);
+        }
+    }
+    Ok(seen)
+}
+
+/// Determine whether `ancestor` is reachable from `descendant` via parent
+/// edges (an ancestor check). A commit is considered its own ancestor.
+pub fn is_ancestor<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    ancestor: &ObjectId,
+    descendant: &ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let mut seen = HashSet::new();
+    let mut pending = VecDeque::from([descendant.clone()]);
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+            if &parent == ancestor {
+                return Ok(true);
+            }
+            pending.push_back(parent);
+        }
+    }
+    Ok(false)
+}
+
+/// Compute the merge bases (best common ancestors) of two commits, mirroring
+/// the generation-free history walk used elsewhere in the project. Self-contained
+/// so callers do not need the CLI's merge-base machinery.
+pub fn merge_bases<R: ObjectReader>(
+    git_dir: &Path,
+    format: git_core::ObjectFormat,
+    reader: &R,
+    left: &ObjectId,
+    right: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let left_depths = ancestor_depths(git_dir, reader, format, left)?;
+    let right_depths = ancestor_depths(git_dir, reader, format, right)?;
+    let candidates: Vec<ObjectId> = left_depths
+        .keys()
+        .filter(|oid| right_depths.contains_key(*oid))
+        .cloned()
+        .collect();
+    // Keep only the lowest common ancestors: drop any candidate that has another
+    // candidate strictly closer to *both* endpoints (i.e. a descendant common
+    // ancestor).
+    let mut bases: Vec<ObjectId> = candidates
+        .iter()
+        .filter(|candidate| {
+            !candidates.iter().any(|other| {
+                other != *candidate
+                    && depth_lt(&left_depths, other, candidate)
+                    && depth_lt(&right_depths, other, candidate)
+            })
+        })
+        .cloned()
+        .collect();
+    bases.sort_by_key(|oid| oid.to_hex());
+    Ok(bases)
+}
+
+fn depth_lt(depths: &HashMap<ObjectId, usize>, a: &ObjectId, b: &ObjectId) -> bool {
+    match (depths.get(a), depths.get(b)) {
+        (Some(a_depth), Some(b_depth)) => a_depth < b_depth,
+        _ => false,
+    }
+}
+
+/// BFS the ancestry of `start`, recording the shortest distance to each commit.
+fn ancestor_depths<R: ObjectReader>(
+    git_dir: &Path,
+    reader: &R,
+    format: git_core::ObjectFormat,
+    start: &ObjectId,
+) -> Result<HashMap<ObjectId, usize>> {
+    let mut depths = HashMap::new();
+    let mut pending = VecDeque::from([(start.clone(), 0usize)]);
+    while let Some((oid, depth)) = pending.pop_front() {
+        if depths.get(&oid).is_some_and(|existing| *existing <= depth) {
+            continue;
+        }
+        depths.insert(oid.clone(), depth);
+        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+            pending.push_back((parent, depth + 1));
+        }
+    }
+    Ok(depths)
 }
 
 #[cfg(test)]
@@ -767,6 +1292,334 @@ mod tests {
         fs::remove_dir_all(git_dir).unwrap();
     }
 
+    #[test]
+    fn resolve_rev_path_finds_nested_blob_and_subtree() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
+            .unwrap();
+        let sub = write_tree(&mut db, &[(0o100644, b"file.txt", &blob)]);
+        let dir = write_tree(&mut db, &[(0o040000, b"sub", &sub)]);
+        let root = write_tree(&mut db, &[(0o040000, b"dir", &dir)]);
+        let commit = write_test_commit(&mut db, root.clone(), Vec::new(), b"init\n");
+
+        // Nested blob via `<rev>:<path>`.
+        assert_eq!(
+            resolve_rev_path(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &commit.to_hex(),
+                "dir/sub/file.txt"
+            )
+            .unwrap(),
+            blob
+        );
+        // Subtree path resolves to the subtree id.
+        assert_eq!(
+            resolve_rev_path(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &commit.to_hex(),
+                "dir/sub"
+            )
+            .unwrap(),
+            sub
+        );
+        // Empty path resolves to the commit's tree.
+        assert_eq!(
+            resolve_rev_path(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "").unwrap(),
+            root
+        );
+        // Resolvable through the unified string resolver too.
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &format!("{commit}:dir/sub/file.txt"),
+            )
+            .unwrap(),
+            blob
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_rev_path_reports_missing_and_non_tree_paths() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let blob = db
+            .write_object(EncodedObject::new(ObjectType::Blob, b"root\n".to_vec()))
+            .unwrap();
+        let root = write_tree(&mut db, &[(0o100644, b"root.txt", &blob)]);
+        let commit = write_test_commit(&mut db, root, Vec::new(), b"init\n");
+
+        // Missing path.
+        let missing = resolve_rev_path(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            &commit.to_hex(),
+            "nope.txt",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&missing, GitError::NotFound(msg) if msg.contains("does not exist")),
+            "unexpected error: {missing:?}"
+        );
+
+        // Descending through a blob is "not a tree" -> reported as not found.
+        let not_tree = resolve_rev_path(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            &commit.to_hex(),
+            "root.txt/x",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&not_tree, GitError::NotFound(msg) if msg.contains("does not exist")),
+            "unexpected error: {not_tree:?}"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_index_path_reads_stage_entries() {
+        let git_dir = temp_git_dir();
+        let oid_zero = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let oid_two = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let index = Index {
+            version: 2,
+            entries: vec![
+                test_index_entry(b"file.txt", &oid_zero, 0),
+                test_index_entry(b"conflict.txt", &oid_two, 2),
+            ],
+            extensions: Vec::new(),
+            checksum: None,
+        };
+        fs::write(
+            git_dir.join("index"),
+            index.write(ObjectFormat::Sha1).unwrap(),
+        )
+        .unwrap();
+
+        // `:path` defaults to stage 0.
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &ObjectDatabase::new(ObjectFormat::Sha1),
+                ":file.txt",
+            )
+            .unwrap(),
+            oid_zero
+        );
+        // `:N:path` selects a specific stage.
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &ObjectDatabase::new(ObjectFormat::Sha1),
+                ":2:conflict.txt",
+            )
+            .unwrap(),
+            oid_two
+        );
+        // Wrong stage reports a stage-specific error.
+        let wrong_stage = resolve_revision_with_reader(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &ObjectDatabase::new(ObjectFormat::Sha1),
+            ":1:conflict.txt",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&wrong_stage, GitError::NotFound(msg) if msg.contains("not at stage 1")),
+            "unexpected error: {wrong_stage:?}"
+        );
+        // Unknown path reports "not in the index".
+        let unknown = resolve_revision_with_reader(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &ObjectDatabase::new(ObjectFormat::Sha1),
+            ":missing.txt",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&unknown, GitError::NotFound(msg) if msg.contains("not in the index")),
+            "unexpected error: {unknown:?}"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn search_commit_message_all_finds_matching_commit() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .unwrap();
+        let first = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"add feature\n", 1000);
+        let second = write_dated_commit(
+            &mut db,
+            tree.clone(),
+            vec![first.clone()],
+            b"fix the widget bug\n",
+            2000,
+        );
+        let third = write_dated_commit(
+            &mut db,
+            tree,
+            vec![second.clone()],
+            b"unrelated change\n",
+            3000,
+        );
+        let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(third.clone()),
+            reflog: None,
+        });
+        tx.commit().unwrap();
+
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, ":/widget bug")
+                .unwrap(),
+            second
+        );
+        // `^{/regex}` over first-parent history finds the same commit from the tip.
+        assert_eq!(
+            resolve_revision_with_reader(
+                &git_dir,
+                ObjectFormat::Sha1,
+                &db,
+                &format!("{third}^{{/widget bug}}"),
+            )
+            .unwrap(),
+            second
+        );
+        // No match is an error.
+        let miss = resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, ":/zzznomatch")
+            .unwrap_err();
+        assert!(
+            matches!(miss, GitError::NotFound(_)),
+            "unexpected: {miss:?}"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn parse_revision_range_recognizes_dot_forms() {
+        assert_eq!(
+            parse_revision_range("a..b"),
+            Some(RevisionRange::Asymmetric {
+                start: "a".into(),
+                end: "b".into(),
+            })
+        );
+        assert_eq!(
+            parse_revision_range("a...b"),
+            Some(RevisionRange::Symmetric {
+                left: "a".into(),
+                right: "b".into(),
+            })
+        );
+        assert_eq!(
+            parse_revision_range("..b"),
+            Some(RevisionRange::Asymmetric {
+                start: "HEAD".into(),
+                end: "b".into(),
+            })
+        );
+        assert_eq!(
+            parse_revision_range("a.."),
+            Some(RevisionRange::Asymmetric {
+                start: "a".into(),
+                end: "HEAD".into(),
+            })
+        );
+        assert_eq!(parse_revision_range("plain"), None);
+    }
+
+    #[test]
+    fn resolve_revision_range_excludes_ancestors_and_symmetric_difference() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .unwrap();
+        // base -> a -> b   (left line)
+        //   \--> c -> d    (right line)
+        let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
+        let a = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"a\n");
+        let b = write_test_commit(&mut db, tree.clone(), vec![a.clone()], b"b\n");
+        let c = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"c\n");
+        let d = write_test_commit(&mut db, tree, vec![c.clone()], b"d\n");
+
+        // A..B: reachable from B (a..b line) but not from A (base only here) ->
+        // {a, b}; base and earlier are excluded.
+        let range = RevisionRange::Asymmetric {
+            start: a.to_hex(),
+            end: b.to_hex(),
+        };
+        let mut got = resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &range).unwrap();
+        got.sort_by(|x, y| x.to_hex().cmp(&y.to_hex()));
+        assert_eq!(got, vec![b.clone()]);
+        assert!(!got.contains(&a), "A itself is excluded");
+        assert!(!got.contains(&base), "A's ancestors are excluded");
+
+        // b...d: symmetric difference excludes the shared `base` while keeping
+        // both unique sides {a, b} and {c, d}.
+        let sym = RevisionRange::Symmetric {
+            left: b.to_hex(),
+            right: d.to_hex(),
+        };
+        let got_sym: HashSet<ObjectId> =
+            resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &sym)
+                .unwrap()
+                .into_iter()
+                .collect();
+        let expected: HashSet<ObjectId> = [a, b, c, d].into_iter().collect();
+        assert_eq!(got_sym, expected);
+        assert!(!got_sym.contains(&base), "shared base excluded from ...");
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn merge_bases_finds_common_ancestor() {
+        let git_dir = temp_git_dir();
+        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .unwrap();
+        let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
+        let left = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"left\n");
+        let right = write_test_commit(&mut db, tree, vec![base.clone()], b"right\n");
+        assert_eq!(
+            merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right).unwrap(),
+            vec![base]
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
     fn write_test_commit(
         db: &mut ObjectDatabase,
         tree: ObjectId,
@@ -783,6 +1636,60 @@ mod tests {
         };
         db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
             .unwrap()
+    }
+
+    fn write_dated_commit<W: ObjectWriter>(
+        db: &mut W,
+        tree: ObjectId,
+        parents: Vec<ObjectId>,
+        message: &[u8],
+        when: i64,
+    ) -> ObjectId {
+        let ident = format!("Example User <example@example.invalid> {when} +0000");
+        let commit = Commit {
+            tree,
+            parents,
+            author: ident.clone().into_bytes(),
+            committer: ident.into_bytes(),
+            encoding: None,
+            message: message.to_vec(),
+        };
+        db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
+            .unwrap()
+    }
+
+    fn write_tree(db: &mut ObjectDatabase, entries: &[(u32, &[u8], &ObjectId)]) -> ObjectId {
+        let tree = Tree {
+            entries: entries
+                .iter()
+                .map(|(mode, name, oid)| git_formats::TreeEntry {
+                    mode: *mode,
+                    name: name.to_vec(),
+                    oid: (*oid).clone(),
+                })
+                .collect(),
+        };
+        db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
+            .unwrap()
+    }
+
+    fn test_index_entry(path: &[u8], oid: &ObjectId, stage: u16) -> git_formats::IndexEntry {
+        git_formats::IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: oid.clone(),
+            flags: (stage & 0x3) << 12,
+            flags_extended: 0,
+            path: path.to_vec(),
+        }
     }
 
     fn temp_git_dir() -> std::path::PathBuf {

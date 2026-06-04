@@ -2,7 +2,7 @@ use git_core::{object_id_for_bytes, GitError, ObjectFormat, ObjectId, RepoPath, 
 use git_formats::{Commit, EncodedObject, Index, ObjectType, Tree};
 use git_odb::{FileObjectDatabase, ObjectReader};
 use git_refs::{FileRefStore, RefTarget};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -690,6 +690,67 @@ impl Default for DiffNameStatusOptions {
     }
 }
 
+/// git's default minimum similarity (as a percentage) for a pair of files to be
+/// reported as a rename or copy. Matches `git`'s built-in `-M`/`-C` threshold
+/// of 50% (`DEFAULT_RENAME_SCORE` is `MAX_SCORE / 2`).
+pub const DEFAULT_RENAME_THRESHOLD: u8 = 50;
+
+/// Options controlling inexact (similarity-based) rename and copy detection,
+/// layered additively on top of [`DiffNameStatusOptions`].
+///
+/// This is a separate struct rather than new fields on [`DiffNameStatusOptions`]
+/// so that existing callers — which build `DiffNameStatusOptions` with a struct
+/// literal — keep compiling unchanged. Code that wants inexact detection uses
+/// the `*_with_rename_options` entry points and this type instead.
+///
+/// [`Default`] preserves the existing behaviour exactly: `detect_inexact` is
+/// `false`, so unless a caller opts in, only exact-OID rename/copy detection
+/// runs (identical to the plain `*_with_options` functions). When
+/// `detect_inexact` is enabled, files added on one side are paired with the most
+/// similar deleted/modified file on the other side whose similarity meets the
+/// relevant threshold; exact-OID matches still take priority and are always
+/// scored 100.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenameDetectionOptions {
+    /// The base name-status options (rename/copy enable flags, find-copies-harder,
+    /// rename-empty). Exact detection honours these exactly as before.
+    pub base: DiffNameStatusOptions,
+    /// Enable inexact (content-similarity) detection. When `false`, only exact
+    /// OID matches are detected, matching the legacy `*_with_options` behaviour.
+    pub detect_inexact: bool,
+    /// Minimum similarity percentage (`0..=100`) for an inexact *rename*. Pairs
+    /// scoring below this are not reported as renames. Defaults to
+    /// [`DEFAULT_RENAME_THRESHOLD`].
+    pub rename_threshold: u8,
+    /// Minimum similarity percentage (`0..=100`) for an inexact *copy*. Defaults
+    /// to [`DEFAULT_RENAME_THRESHOLD`]; git uses the same default for `-C` as for
+    /// `-M` unless `-C<n>` overrides it.
+    pub copy_threshold: u8,
+}
+
+impl Default for RenameDetectionOptions {
+    fn default() -> Self {
+        Self {
+            base: DiffNameStatusOptions::default(),
+            detect_inexact: false,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        }
+    }
+}
+
+impl RenameDetectionOptions {
+    /// Build inexact-enabled options from a base [`DiffNameStatusOptions`], using
+    /// the default thresholds for both renames and copies.
+    pub fn inexact(base: DiffNameStatusOptions) -> Self {
+        Self {
+            base,
+            detect_inexact: true,
+            ..Self::default()
+        }
+    }
+}
+
 pub fn diff_name_status_head_worktree(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,
@@ -722,6 +783,34 @@ pub fn diff_name_status_head_worktree_with_options(
     ))
 }
 
+/// HEAD-vs-worktree name-status with full rename/copy options, including inexact
+/// (similarity) detection when enabled. Worktree blob content is read directly
+/// from the working tree; HEAD-side blobs come from the object database.
+pub fn diff_name_status_head_worktree_with_rename_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head = head_tree_entries(git_dir, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let cache = worktree_blob_cache(worktree_root, git_dir, format)?;
+    let changes = diff_name_status_maps_with_renames(
+        &head,
+        &worktree,
+        head.keys().chain(index.keys()),
+        options,
+        |oid| cache_or_odb_blob(&cache, &db, oid),
+    )?;
+    Ok(mark_unstaged_worktree_oids_unresolved(
+        changes, &index, &worktree,
+    ))
+}
+
 pub fn diff_name_status_head_index(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
@@ -739,6 +828,27 @@ pub fn diff_name_status_head_index_with_options(
     let head = head_tree_entries(git_dir, format, &db)?;
     let index = read_index_entries(git_dir, format)?;
     diff_name_status_maps(&head, &index, head.keys().chain(index.keys()), options)
+}
+
+/// HEAD-vs-index name-status with full rename/copy options, including inexact
+/// (similarity) detection when enabled. All blob content (both sides) comes from
+/// the object database.
+pub fn diff_name_status_head_index_with_rename_options(
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let head = head_tree_entries(git_dir, format, &db)?;
+    let index = read_index_entries(git_dir, format)?;
+    diff_name_status_maps_with_renames(
+        &head,
+        &index,
+        head.keys().chain(index.keys()),
+        options,
+        |oid| read_blob_bytes(&db, oid),
+    )
 }
 
 pub fn diff_name_status_index_worktree(
@@ -765,6 +875,26 @@ pub fn diff_name_status_index_worktree_with_options(
     let index = read_index_entries(git_dir, format)?;
     let worktree = worktree_entries(worktree_root, git_dir, format)?;
     diff_name_status_maps(&index, &worktree, index.keys(), options)
+}
+
+/// Index-vs-worktree name-status with full rename/copy options, including inexact
+/// (similarity) detection when enabled. Worktree blob content is read directly
+/// from the working tree; index-side blobs come from the object database.
+pub fn diff_name_status_index_worktree_with_rename_options(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let index = read_index_entries(git_dir, format)?;
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    let cache = worktree_blob_cache(worktree_root, git_dir, format)?;
+    diff_name_status_maps_with_renames(&index, &worktree, index.keys(), options, |oid| {
+        cache_or_odb_blob(&cache, &db, oid)
+    })
 }
 
 pub fn diff_name_status_trees_with_options(
@@ -798,12 +928,75 @@ pub fn diff_name_status_empty_tree_with_options(
     diff_name_status_maps(&left_entries, &right_entries, right_entries.keys(), options)
 }
 
-fn diff_name_status_maps<'a>(
+/// Diff two trees with full rename/copy options, including inexact (similarity)
+/// detection when [`RenameDetectionOptions::detect_inexact`] is set.
+///
+/// Blob bytes for similarity scoring are read from `db`. This is the inexact-
+/// aware counterpart of [`diff_name_status_trees_with_options`]; passing
+/// `RenameDetectionOptions::default()` (or `RenameDetectionOptions { base, ..
+/// default }` with `detect_inexact: false`) reproduces the exact-only behaviour.
+pub fn diff_name_status_trees_with_rename_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_tree: &ObjectId,
+    right_tree: &ObjectId,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut left_entries = BTreeMap::new();
+    collect_tree_entries(db, format, left_tree, Vec::new(), &mut left_entries)?;
+    let mut right_entries = BTreeMap::new();
+    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    diff_name_status_maps_with_renames(
+        &left_entries,
+        &right_entries,
+        left_entries.keys().chain(right_entries.keys()),
+        options,
+        |oid| read_blob_bytes(db, oid),
+    )
+}
+
+/// Diff the empty tree against `right_tree` with full rename/copy options.
+///
+/// As with [`diff_name_status_trees_with_rename_options`], inexact detection is
+/// gated on [`RenameDetectionOptions::detect_inexact`]; the left (empty) side
+/// has no sources, so only copies among the right-side additions can match when
+/// `find_copies_harder` is set.
+pub fn diff_name_status_empty_tree_with_rename_options(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    right_tree: &ObjectId,
+    options: RenameDetectionOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let left_entries = BTreeMap::new();
+    let mut right_entries = BTreeMap::new();
+    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    diff_name_status_maps_with_renames(
+        &left_entries,
+        &right_entries,
+        right_entries.keys(),
+        options,
+        |oid| read_blob_bytes(db, oid),
+    )
+}
+
+/// Read a blob's raw bytes from the ODB, returning `None` if the object cannot
+/// be read or is not a blob. Used as the similarity-scoring blob fetcher; a
+/// missing object simply makes a candidate pair non-similar rather than failing
+/// the whole diff.
+fn read_blob_bytes(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
+    match db.read_object(oid) {
+        Ok(object) if object.object_type == ObjectType::Blob => Some(object.body),
+        _ => None,
+    }
+}
+
+/// Build the raw per-path add/delete/modify change list (before any rename or
+/// copy detection) from the two entry maps and the candidate path set.
+fn raw_name_status_changes<'a>(
     left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
     candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
-    options: DiffNameStatusOptions,
-) -> Result<Vec<NameStatusEntry>> {
+) -> Vec<NameStatusEntry> {
     let mut paths = BTreeSet::new();
     paths.extend(candidate_paths.cloned());
 
@@ -829,6 +1022,16 @@ fn diff_name_status_maps<'a>(
             });
         }
     }
+    changes
+}
+
+fn diff_name_status_maps<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: DiffNameStatusOptions,
+) -> Result<Vec<NameStatusEntry>> {
+    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
     if options.detect_renames {
         changes = detect_exact_renames(changes, left_entries, right_entries, options.rename_empty);
     }
@@ -840,6 +1043,47 @@ fn diff_name_status_maps<'a>(
             options.find_copies_harder,
             options.rename_empty,
         );
+    }
+    Ok(changes)
+}
+
+/// Like [`diff_name_status_maps`], but additionally runs inexact (similarity)
+/// rename/copy detection when `options.detect_inexact` is set.
+///
+/// `fetch_blob` resolves an [`ObjectId`] to that blob's raw bytes; it is only
+/// consulted for the candidate pairs considered during inexact detection, and
+/// only when inexact detection is enabled. A pair whose blob bytes cannot be
+/// fetched is simply skipped (treated as not similar), so a missing object never
+/// fails the whole diff.
+fn diff_name_status_maps_with_renames<'a>(
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    right_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    candidate_paths: impl Iterator<Item = &'a Vec<u8>>,
+    options: RenameDetectionOptions,
+    fetch_blob: impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Result<Vec<NameStatusEntry>> {
+    let base = options.base;
+    let mut changes = raw_name_status_changes(left_entries, right_entries, candidate_paths);
+    if base.detect_renames {
+        changes = detect_exact_renames(changes, left_entries, right_entries, base.rename_empty);
+    }
+    // Inexact rename detection runs after exact renames so exact matches keep
+    // priority (and their score of 100). It only fires when rename detection is
+    // enabled at all, mirroring git's `-M`.
+    if base.detect_renames && options.detect_inexact {
+        changes = detect_inexact_renames(changes, &options, &fetch_blob);
+    }
+    if base.detect_copies {
+        changes = detect_exact_copies(
+            changes,
+            left_entries,
+            right_entries,
+            base.find_copies_harder,
+            base.rename_empty,
+        );
+    }
+    if base.detect_copies && options.detect_inexact {
+        changes = detect_inexact_copies(changes, left_entries, &options, &fetch_blob);
     }
     Ok(changes)
 }
@@ -954,8 +1198,402 @@ fn detect_exact_copies(
     result
 }
 
+/// Old-side metadata of a rename source, snapshotted before the source delete
+/// entry is consumed so it can be attached to the renamed destination.
+#[derive(Debug, Clone, Default)]
+struct RenameSourceMeta {
+    path: Vec<u8>,
+    mode: Option<u32>,
+    oid: Option<ObjectId>,
+}
+
+/// A scored candidate pairing of a deleted source with an added destination,
+/// used to order inexact-rename assignment best-match-first.
+struct ScoredPair {
+    /// Index into the `deleted` candidate list.
+    src: usize,
+    /// Index into the `added` candidate list.
+    dst: usize,
+    /// Similarity percentage in `0..=100`.
+    score: u8,
+}
+
+/// Inexact rename detection: pair still-unmatched deleted files with still-
+/// unmatched added files by content similarity, replacing the best matches
+/// (similarity >= `rename_threshold`) with [`NameStatus::Renamed`].
+///
+/// Exact renames have already run, so the only `Deleted`/`Added` entries left
+/// here are ones with no identical-OID partner. Assignment is greedy by
+/// descending score (then by source/destination order for determinism), and
+/// each source and destination is used at most once — matching git's
+/// `diffcore-rename` behaviour. Empty blobs are never used as a rename source
+/// when `rename_empty` is false, mirroring exact detection.
+fn detect_inexact_renames(
+    changes: Vec<NameStatusEntry>,
+    options: &RenameDetectionOptions,
+    fetch_blob: &impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Vec<NameStatusEntry> {
+    let threshold = options.rename_threshold;
+    // A threshold above 100 can never be met; nothing to do.
+    if threshold > 100 {
+        return changes;
+    }
+
+    // Collect the candidate sources (Deletes) and destinations (Adds) with their
+    // positions in `changes`, fetching blob bytes once each.
+    let mut deleted: Vec<(usize, Vec<u8>)> = Vec::new();
+    let mut added: Vec<(usize, Vec<u8>)> = Vec::new();
+    for (idx, entry) in changes.iter().enumerate() {
+        match entry.status {
+            NameStatus::Deleted => {
+                let Some(oid) = entry.old_oid.as_ref() else {
+                    continue;
+                };
+                if !options.base.rename_empty && is_empty_blob_oid(oid) {
+                    continue;
+                }
+                if let Some(bytes) = fetch_blob(oid) {
+                    deleted.push((idx, bytes));
+                }
+            }
+            NameStatus::Added => {
+                let Some(oid) = entry.new_oid.as_ref() else {
+                    continue;
+                };
+                if !options.base.rename_empty && is_empty_blob_oid(oid) {
+                    continue;
+                }
+                if let Some(bytes) = fetch_blob(oid) {
+                    added.push((idx, bytes));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if deleted.is_empty() || added.is_empty() {
+        return changes;
+    }
+
+    // Score every (delete, add) pair; keep only those meeting the threshold.
+    let mut pairs: Vec<ScoredPair> = Vec::new();
+    for (si, (_, src_bytes)) in deleted.iter().enumerate() {
+        for (di, (_, dst_bytes)) in added.iter().enumerate() {
+            let score = blob_similarity(src_bytes, dst_bytes);
+            if score >= threshold {
+                pairs.push(ScoredPair {
+                    src: si,
+                    dst: di,
+                    score,
+                });
+            }
+        }
+    }
+    // Best score first; ties broken by source then destination order so the
+    // result is deterministic regardless of input ordering.
+    pairs.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.src.cmp(&b.src))
+            .then_with(|| a.dst.cmp(&b.dst))
+    });
+
+    // Greedily assign each source/destination once.
+    let mut src_used = vec![false; deleted.len()];
+    let mut dst_used = vec![false; added.len()];
+    // destination changes-index -> (source changes-index, score).
+    let mut rename_of: BTreeMap<usize, (usize, u8)> = BTreeMap::new();
+    for pair in pairs {
+        if src_used[pair.src] || dst_used[pair.dst] {
+            continue;
+        }
+        src_used[pair.src] = true;
+        dst_used[pair.dst] = true;
+        let src_change_idx = deleted[pair.src].0;
+        let dst_change_idx = added[pair.dst].0;
+        rename_of.insert(dst_change_idx, (src_change_idx, pair.score));
+    }
+
+    if rename_of.is_empty() {
+        return changes;
+    }
+
+    // Snapshot the source (delete) entries' metadata before we consume them, so
+    // each renamed destination can carry the correct old path/mode/oid.
+    let consumed_sources: BTreeSet<usize> =
+        rename_of.values().map(|(src_idx, _)| *src_idx).collect();
+    let source_meta: BTreeMap<usize, RenameSourceMeta> = consumed_sources
+        .iter()
+        .map(|&src_idx| {
+            let src = &changes[src_idx];
+            (
+                src_idx,
+                RenameSourceMeta {
+                    path: src.path.clone(),
+                    mode: src.old_mode,
+                    oid: src.old_oid.clone(),
+                },
+            )
+        })
+        .collect();
+
+    let mut result = Vec::with_capacity(changes.len());
+    for (idx, entry) in changes.into_iter().enumerate() {
+        if consumed_sources.contains(&idx) {
+            // This delete became the source of a rename; drop it.
+            continue;
+        }
+        if let Some((src_idx, score)) = rename_of.get(&idx) {
+            // The destination becomes a rename from the matched source. Pull the
+            // old-side metadata from the snapshot; the new-side metadata stays as
+            // the destination's.
+            let meta = source_meta.get(src_idx).cloned().unwrap_or_default();
+            result.push(NameStatusEntry {
+                status: NameStatus::Renamed(*score),
+                path: entry.path,
+                old_path: Some(meta.path),
+                old_mode: meta.mode,
+                new_mode: entry.new_mode,
+                old_oid: meta.oid,
+                new_oid: entry.new_oid,
+            });
+            continue;
+        }
+        result.push(entry);
+    }
+
+    result.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    result
+}
+
+/// Inexact copy detection: for each still-`Added` file, find the most similar
+/// candidate *source* on the left side (similarity >= `copy_threshold`) and, if
+/// found, report it as a [`NameStatus::Copied`]. The source is not removed
+/// (copies leave the original in place).
+///
+/// Candidate sources follow the same rule as exact copy detection: with
+/// `find_copies_harder` every left-side path is eligible; otherwise only paths
+/// that were themselves changed (deleted or modified) on this diff. Exact copies
+/// have already run, so any remaining `Added` here had no identical-OID source.
+fn detect_inexact_copies(
+    changes: Vec<NameStatusEntry>,
+    left_entries: &BTreeMap<Vec<u8>, TrackedEntry>,
+    options: &RenameDetectionOptions,
+    fetch_blob: &impl Fn(&ObjectId) -> Option<Vec<u8>>,
+) -> Vec<NameStatusEntry> {
+    let threshold = options.copy_threshold;
+    if threshold > 100 {
+        return changes;
+    }
+
+    let changed_sources = changes
+        .iter()
+        .filter(|entry| matches!(entry.status, NameStatus::Deleted | NameStatus::Modified))
+        .map(|entry| entry.path.clone())
+        .collect::<BTreeSet<_>>();
+    // Eligible source paths, paired with their bytes (fetched lazily/once).
+    let mut sources: Vec<(Vec<u8>, &TrackedEntry, Vec<u8>)> = Vec::new();
+    for (path, tracked) in left_entries {
+        if !(options.base.find_copies_harder || changed_sources.contains(path)) {
+            continue;
+        }
+        if !options.base.rename_empty && is_empty_blob_oid(&tracked.oid) {
+            continue;
+        }
+        if let Some(bytes) = fetch_blob(&tracked.oid) {
+            sources.push((path.clone(), tracked, bytes));
+        }
+    }
+    if sources.is_empty() {
+        return changes;
+    }
+
+    let mut result = Vec::with_capacity(changes.len());
+    for entry in changes {
+        if entry.status != NameStatus::Added {
+            result.push(entry);
+            continue;
+        }
+        let Some(new_oid) = entry.new_oid.as_ref() else {
+            result.push(entry);
+            continue;
+        };
+        let Some(dst_bytes) = fetch_blob(new_oid) else {
+            result.push(entry);
+            continue;
+        };
+
+        // Pick the best-scoring source path that meets the threshold. Ties are
+        // broken by path order (BTreeMap iteration is sorted) so the choice is
+        // deterministic.
+        let mut best: Option<(usize, u8)> = None;
+        for (i, (src_path, _, src_bytes)) in sources.iter().enumerate() {
+            if src_path.as_slice() == entry.path.as_slice() {
+                continue;
+            }
+            let score = blob_similarity(src_bytes, &dst_bytes);
+            if score < threshold {
+                continue;
+            }
+            match best {
+                Some((_, best_score)) if best_score >= score => {}
+                _ => best = Some((i, score)),
+            }
+        }
+
+        if let Some((src_idx, score)) = best {
+            let (src_path, src_tracked, _) = &sources[src_idx];
+            result.push(NameStatusEntry {
+                status: NameStatus::Copied(score),
+                path: entry.path,
+                old_path: Some(src_path.clone()),
+                old_mode: Some(src_tracked.mode),
+                new_mode: entry.new_mode,
+                old_oid: Some(src_tracked.oid.clone()),
+                new_oid: entry.new_oid,
+            });
+        } else {
+            result.push(entry);
+        }
+    }
+    result.sort_by(|left, right| diff_entry_sort_path(left).cmp(diff_entry_sort_path(right)));
+    result
+}
+
 fn is_empty_blob_oid(oid: &ObjectId) -> bool {
     object_id_for_bytes(oid.format(), "blob", b"").is_ok_and(|empty| empty == *oid)
+}
+
+// ===========================================================================
+// Content similarity (the engine for inexact `-M`/`-C` rename/copy detection).
+//
+// This mirrors upstream git's similarity estimate from `diffcore-delta.c`
+// (the span-hash counting) and `diffcore-rename.c` (the score formula), so the
+// `R<score>`/`C<score>` we emit match git's percentages.
+//
+// The metric, precisely:
+//
+//   1. Each blob is broken into *spans*. Starting at a byte, we accumulate a
+//      rolling hash of the bytes and end the span at the first `\n` (inclusive)
+//      or once the span reaches `MAX_SPAN_BYTES` (64) bytes, whichever comes
+//      first. (The 64-byte cap keeps a file with no/few newlines — e.g. a
+//      binary blob or one very long line — from collapsing into a single span,
+//      so similarity still tracks shared substrings.) Each span yields a
+//      `(hash, byte_count)` pair, where `byte_count` is the span's length in
+//      bytes. This is the exact loop git uses in `hash_chars()`.
+//
+//   2. The two blobs' spans are reduced to multisets keyed by hash: for each
+//      hash we keep the total number of bytes spanned by entries with that
+//      hash, on each side. `common_bytes` is then the sum over all hashes of
+//      `min(bytes_on_src, bytes_on_dst)` — the bytes that exist on both sides.
+//      This is git's `src_copied`.
+//
+//   3. The score is `common_bytes / max(size_src, size_dst)`, scaled to a
+//      percentage and rounded to the nearest integer:
+//
+//          score% = round(common_bytes * 100 / max(size_src, size_dst))
+//
+//      git computes an internal score `src_copied * MAX_SCORE / max_size` with
+//      `MAX_SCORE == 60000` and reports `round(score * 100 / MAX_SCORE)`; that
+//      is algebraically the same rounded percentage, which we compute directly
+//      to avoid intermediate precision loss.
+//
+// Edge cases match git: two empty blobs are 100% similar (identical content);
+// an empty blob vs a non-empty one is 0%. Equal byte buffers are always 100%.
+
+/// Maximum number of bytes in a single similarity span before it is force-cut.
+///
+/// git uses 64 (`hash_chars()` breaks a span once `++chunks >= 64`).
+const MAX_SPAN_BYTES: usize = 64;
+
+/// Compute the content similarity of two blobs as an integer percentage in
+/// `0..=100`, using git's span-hash counting metric (see the module comment
+/// above for the exact definition).
+///
+/// The result is symmetric (`blob_similarity(a, b) == blob_similarity(b, a)`)
+/// because the score divides the common-byte count by the larger of the two
+/// sizes. Byte-identical blobs return `100`; a non-empty blob compared against
+/// an empty one returns `0`; two empty blobs return `100`.
+///
+/// This is the same number git prints as `similarity index N%` and uses to
+/// decide `-M`/`-C` rename and copy detection.
+pub fn blob_similarity(a: &[u8], b: &[u8]) -> u8 {
+    // Fast paths that also pin down the empty-blob conventions.
+    if a == b {
+        return 100;
+    }
+    let max_size = a.len().max(b.len());
+    if max_size == 0 {
+        // Both empty (and not caught by `a == b` only if both are empty, which
+        // they are here) -> identical.
+        return 100;
+    }
+
+    let src = span_hash_counts(a);
+    let dst = span_hash_counts(b);
+    let common = common_span_bytes(&src, &dst);
+
+    // round(common * 100 / max_size) using integer arithmetic.
+    let score = (common * 100 + max_size / 2) / max_size;
+    score.min(100) as u8
+}
+
+/// Break `data` into spans and return, per span hash, the total number of bytes
+/// covered by spans with that hash. Spans end at a newline (inclusive) or once
+/// they reach [`MAX_SPAN_BYTES`] bytes — exactly git's `hash_chars()` loop.
+///
+/// The returned map is `hash -> total_span_bytes`. Summing all values yields
+/// `data.len()`, so the byte accounting is exact.
+fn span_hash_counts(data: &[u8]) -> BTreeMap<u64, usize> {
+    let mut counts: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut idx = 0usize;
+    let len = data.len();
+    while idx < len {
+        // Roll a hash over the bytes of this span. The mixing mirrors git's
+        // two-accumulator scheme from `diffcore-delta.c`; the exact constants do
+        // not matter for correctness (any good per-span hash works), only that
+        // identical spans collide and distinct spans rarely do.
+        let mut accum1: u32 = 0;
+        let mut accum2: u32 = 0;
+        let mut span_len = 0usize;
+        loop {
+            let c = data[idx] as u32;
+            idx += 1;
+            span_len += 1;
+            accum1 = (accum1 << 7) ^ (accum2 >> 25);
+            accum2 = (accum2 << 7) ^ (accum1 >> 25);
+            accum1 = accum1.wrapping_add(c);
+            let newline = c == u32::from(b'\n');
+            if span_len >= MAX_SPAN_BYTES || newline || idx >= len {
+                break;
+            }
+        }
+        // Fold the two accumulators (and the span length) into one 64-bit key.
+        // Including the length keeps spans of different lengths from colliding
+        // when their rolling-hash states happen to coincide.
+        let hash = ((accum1 as u64) << 32) ^ (accum2 as u64) ^ ((span_len as u64) << 1);
+        *counts.entry(hash).or_insert(0) += span_len;
+    }
+    counts
+}
+
+/// Sum, over every hash present in both maps, the smaller of the two byte
+/// counts. This is git's `src_copied`: the number of bytes that appear on both
+/// sides (counting multiplicity via the per-hash byte totals).
+fn common_span_bytes(src: &BTreeMap<u64, usize>, dst: &BTreeMap<u64, usize>) -> usize {
+    let mut common = 0usize;
+    // Iterate the smaller map for a few less lookups.
+    let (small, large) = if src.len() <= dst.len() {
+        (src, dst)
+    } else {
+        (dst, src)
+    };
+    for (hash, small_bytes) in small {
+        if let Some(large_bytes) = large.get(hash) {
+            common += (*small_bytes).min(*large_bytes);
+        }
+    }
+    common
 }
 
 fn diff_entry_sort_path(entry: &NameStatusEntry) -> &[u8] {
@@ -1126,6 +1764,64 @@ fn collect_worktree_entries(
         }
     }
     Ok(())
+}
+
+/// Build an `oid -> bytes` cache of every regular file under `worktree_root`,
+/// keyed by the blob oid (so it lines up with the oids in the worktree
+/// `TrackedEntry` map). Used to supply worktree blob content to similarity
+/// scoring, since freshly-edited worktree files are generally not yet written to
+/// the object database.
+fn worktree_blob_cache(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<HashMap<ObjectId, Vec<u8>>> {
+    let mut cache = HashMap::new();
+    collect_worktree_blob_cache(git_dir, worktree_root, format, &mut cache)?;
+    Ok(cache)
+}
+
+/// Recursively read every regular file under `dir` into `cache` keyed by blob
+/// oid. The cache is oid-keyed (not path-keyed), so unlike
+/// [`collect_worktree_entries`] no worktree-root rebasing is needed.
+fn collect_worktree_blob_cache(
+    git_dir: &Path,
+    dir: &Path,
+    format: ObjectFormat,
+    cache: &mut HashMap<ObjectId, Vec<u8>>,
+) -> Result<()> {
+    if dir == git_dir {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == git_dir {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            collect_worktree_blob_cache(git_dir, &path, format, cache)?;
+        } else if metadata.is_file() {
+            let body = fs::read(&path)?;
+            let oid = EncodedObject::new(ObjectType::Blob, body.clone()).object_id(format)?;
+            cache.entry(oid).or_insert(body);
+        }
+    }
+    Ok(())
+}
+
+/// A blob fetcher that consults an in-memory `oid -> bytes` cache first (e.g.
+/// freshly-read worktree files) and falls back to the object database.
+fn cache_or_odb_blob(
+    cache: &HashMap<ObjectId, Vec<u8>>,
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+) -> Option<Vec<u8>> {
+    if let Some(bytes) = cache.get(oid) {
+        return Some(bytes.clone());
+    }
+    read_blob_bytes(db, oid)
 }
 
 #[cfg(unix)]
@@ -1895,7 +2591,7 @@ fn lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_formats::RepositoryLayout;
+    use git_formats::{RepositoryLayout, TreeEntry};
     use git_odb::ObjectWriter;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2566,5 +3262,346 @@ new mode 100755
         assert!(!terminated[0].no_newline);
         let blank_then_eof = split_blob_lines(b"x\n");
         assert_eq!(blank_then_eof.len(), 1);
+    }
+
+    // ---- content similarity & inexact rename/copy detection -----------------
+
+    #[test]
+    fn similarity_identical_and_empty_conventions() {
+        // Byte-identical blobs are always 100% similar.
+        assert_eq!(blob_similarity(b"hello\nworld\n", b"hello\nworld\n"), 100);
+        // Two empty blobs are identical -> 100.
+        assert_eq!(blob_similarity(b"", b""), 100);
+        // An empty blob vs a non-empty one shares nothing -> 0.
+        assert_eq!(blob_similarity(b"", b"hello\n"), 0);
+        assert_eq!(blob_similarity(b"hello\n", b""), 0);
+    }
+
+    #[test]
+    fn similarity_one_changed_line_is_75_and_symmetric() {
+        // A = one/two/three/four/five (bytes: 4+4+6+5+5 = 24).
+        // B changes "three\n" -> "THREE\n" (same total size 24).
+        // Common spans: one,two,four,five = 4+4+5+5 = 18 bytes.
+        // score = round(18 * 100 / max(24, 24)) = round(75) = 75.
+        // Verified against `git diff -M` which reports "similarity index 75%".
+        let a = b"one\ntwo\nthree\nfour\nfive\n";
+        let b = b"one\ntwo\nTHREE\nfour\nfive\n";
+        assert_eq!(blob_similarity(a, b), 75);
+        // The metric is symmetric.
+        assert_eq!(blob_similarity(b, a), 75);
+    }
+
+    #[test]
+    fn similarity_small_append_is_88() {
+        // A: 8 lines totalling 46 bytes. B: same 8 lines + "ADDED\n" (6 bytes) = 52.
+        // Common = the 46 original bytes; score = round(46*100/52) = 88.
+        // Verified against `git diff -M` -> "similarity index 88%".
+        let a = b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n";
+        let b = b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\nADDED\n";
+        assert_eq!(blob_similarity(a, b), 88);
+    }
+
+    #[test]
+    fn similarity_half_rewrite_is_50() {
+        // 6 lines, last 3 rewritten. Common = l1,l2,l3 = 9 bytes; total each 18.
+        // score = round(9*100/18) = 50. Verified against `git diff -M`.
+        let a = b"l1\nl2\nl3\nl4\nl5\nl6\n";
+        let b = b"l1\nl2\nl3\nX4\nX5\nX6\n";
+        assert_eq!(blob_similarity(a, b), 50);
+    }
+
+    // ---- tree-diff based inexact detection ----------------------------------
+
+    /// Write a blob and return its oid.
+    fn write_blob(db: &mut FileObjectDatabase, bytes: &[u8]) -> ObjectId {
+        db.write_object(EncodedObject::new(ObjectType::Blob, bytes.to_vec()))
+            .unwrap()
+    }
+
+    /// Write a tree from `(name, mode, oid)` entries (sorted by name as git
+    /// requires) and return its oid.
+    fn write_tree(db: &mut FileObjectDatabase, entries: &[(&[u8], u32, ObjectId)]) -> ObjectId {
+        let mut tree_entries: Vec<TreeEntry> = entries
+            .iter()
+            .map(|(name, mode, oid)| TreeEntry {
+                mode: *mode,
+                name: name.to_vec(),
+                oid: oid.clone(),
+            })
+            .collect();
+        tree_entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let tree = Tree {
+            entries: tree_entries,
+        };
+        db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
+            .unwrap()
+    }
+
+    #[test]
+    fn inexact_rename_detected_with_plausible_score() {
+        // a.txt (one changed line vs the new b.txt) should be detected as a
+        // rename with score 75 (see `similarity_one_changed_line_is_75`).
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let old = write_blob(&mut db, b"one\ntwo\nthree\nfour\nfive\n");
+        let new = write_blob(&mut db, b"one\ntwo\nTHREE\nfour\nfive\n");
+        let left = write_tree(&mut db, &[(b"a.txt", 0o100644, old)]);
+        let right = write_tree(&mut db, &[(b"b.txt", 0o100644, new)]);
+
+        let opts = RenameDetectionOptions {
+            base: DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        };
+        let entries = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1, "expected a single rename entry: {entries:?}");
+        assert_eq!(entries[0].status, NameStatus::Renamed(75));
+        assert_eq!(entries[0].old_path.as_deref(), Some(b"a.txt".as_slice()));
+        assert_eq!(entries[0].path, b"b.txt");
+        assert_eq!(entries[0].line(), "R75\ta.txt\tb.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inexact_rename_below_threshold_not_detected() {
+        // A half-rewrite scores 50%. With a 60% threshold it must NOT be paired;
+        // the change shows up as a separate Add + Delete instead.
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let old = write_blob(&mut db, b"l1\nl2\nl3\nl4\nl5\nl6\n");
+        let new = write_blob(&mut db, b"l1\nl2\nl3\nX4\nX5\nX6\n");
+        let left = write_tree(&mut db, &[(b"a.txt", 0o100644, old)]);
+        let right = write_tree(&mut db, &[(b"b.txt", 0o100644, new)]);
+
+        let opts = RenameDetectionOptions {
+            base: DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: 60,
+            copy_threshold: 60,
+        };
+        let entries = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts,
+        )
+        .unwrap();
+
+        let statuses: Vec<_> = entries.iter().map(|e| e.status).collect();
+        assert!(
+            statuses.contains(&NameStatus::Added) && statuses.contains(&NameStatus::Deleted),
+            "expected separate add/delete below threshold, got {entries:?}"
+        );
+        assert!(
+            !statuses.iter().any(|s| matches!(s, NameStatus::Renamed(_))),
+            "no rename should be reported below threshold: {entries:?}"
+        );
+
+        // Sanity: lowering the threshold to 50 *does* detect it (boundary is
+        // inclusive), and the score is exactly 50.
+        let opts_low = RenameDetectionOptions {
+            rename_threshold: 50,
+            ..opts
+        };
+        let entries_low = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts_low,
+        )
+        .unwrap();
+        assert_eq!(entries_low.len(), 1);
+        assert_eq!(entries_low[0].status, NameStatus::Renamed(50));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn exact_rename_scores_100_and_takes_priority() {
+        // Identical content moved to a new path is an exact rename: score 100,
+        // detected even with inexact disabled, and still 100 with it enabled.
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let oid = write_blob(&mut db, b"identical\ncontent\nhere\n");
+        let left = write_tree(&mut db, &[(b"old.txt", 0o100644, oid.clone())]);
+        let right = write_tree(&mut db, &[(b"new.txt", 0o100644, oid)]);
+
+        for inexact in [false, true] {
+            let opts = RenameDetectionOptions {
+                base: DiffNameStatusOptions {
+                    detect_renames: true,
+                    detect_copies: false,
+                    find_copies_harder: false,
+                    rename_empty: true,
+                },
+                detect_inexact: inexact,
+                rename_threshold: DEFAULT_RENAME_THRESHOLD,
+                copy_threshold: DEFAULT_RENAME_THRESHOLD,
+            };
+            let entries = diff_name_status_trees_with_rename_options(
+                &db,
+                ObjectFormat::Sha1,
+                &left,
+                &right,
+                opts,
+            )
+            .unwrap();
+            assert_eq!(entries.len(), 1, "inexact={inexact}: {entries:?}");
+            assert_eq!(entries[0].status, NameStatus::Renamed(100));
+            assert_eq!(entries[0].old_path.as_deref(), Some(b"old.txt".as_slice()));
+            assert_eq!(entries[0].path, b"new.txt");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inexact_copy_detected_with_score() {
+        // orig.txt is unchanged and a near-copy (one line differs, 80% similar)
+        // is added. With copy detection + find_copies_harder + inexact, the new
+        // file is reported as a copy with score 80 (matches `git diff -C
+        // --find-copies-harder`).
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let orig = write_blob(&mut db, b"aaa\nbbb\nccc\nddd\neee\n");
+        let copy = write_blob(&mut db, b"aaa\nbbb\nccc\nddd\nEEE\n");
+        let left = write_tree(&mut db, &[(b"orig.txt", 0o100644, orig.clone())]);
+        let right = write_tree(
+            &mut db,
+            &[(b"orig.txt", 0o100644, orig), (b"copy.txt", 0o100644, copy)],
+        );
+
+        let opts = RenameDetectionOptions {
+            base: DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: true,
+                find_copies_harder: true,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        };
+        let entries = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts,
+        )
+        .unwrap();
+
+        let copy_entry = entries
+            .iter()
+            .find(|e| e.path == b"copy.txt")
+            .unwrap_or_else(|| panic!("no copy.txt entry: {entries:?}"));
+        assert_eq!(copy_entry.status, NameStatus::Copied(80));
+        assert_eq!(copy_entry.old_path.as_deref(), Some(b"orig.txt".as_slice()));
+        // The source remains present (copies do not consume the original).
+        assert!(
+            entries.iter().all(|e| e.status != NameStatus::Deleted),
+            "copy must not delete the source: {entries:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inexact_rename_with_small_edit_scores_88() {
+        // A rename that also appends a single line scores 88% (see
+        // `similarity_small_append_is_88`).
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let old = write_blob(&mut db, b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n");
+        let new = write_blob(
+            &mut db,
+            b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\nADDED\n",
+        );
+        let left = write_tree(&mut db, &[(b"src.txt", 0o100644, old)]);
+        let right = write_tree(&mut db, &[(b"dst.txt", 0o100644, new)]);
+
+        let opts = RenameDetectionOptions::inexact(DiffNameStatusOptions {
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: true,
+        });
+        let entries = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            opts,
+        )
+        .unwrap();
+
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].status, NameStatus::Renamed(88));
+        assert_eq!(entries[0].old_path.as_deref(), Some(b"src.txt".as_slice()));
+        assert_eq!(entries[0].path, b"dst.txt");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inexact_disabled_default_preserves_exact_only_behavior() {
+        // With RenameDetectionOptions::default() (detect_inexact == false), a
+        // similar-but-not-identical pair is NOT a rename — identical to the
+        // legacy exact-only path. Defaults must not silently turn on inexact.
+        assert!(!RenameDetectionOptions::default().detect_inexact);
+        assert_eq!(
+            RenameDetectionOptions::default().rename_threshold,
+            DEFAULT_RENAME_THRESHOLD
+        );
+
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+
+        let old = write_blob(&mut db, b"one\ntwo\nthree\nfour\nfive\n");
+        let new = write_blob(&mut db, b"one\ntwo\nTHREE\nfour\nfive\n");
+        let left = write_tree(&mut db, &[(b"a.txt", 0o100644, old)]);
+        let right = write_tree(&mut db, &[(b"b.txt", 0o100644, new)]);
+
+        let entries = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            RenameDetectionOptions::default(),
+        )
+        .unwrap();
+        let statuses: Vec<_> = entries.iter().map(|e| e.status).collect();
+        assert!(statuses.contains(&NameStatus::Added));
+        assert!(statuses.contains(&NameStatus::Deleted));
+        assert!(!statuses.iter().any(|s| matches!(s, NameStatus::Renamed(_))));
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -2902,6 +2902,104 @@ pub fn exchange_protocol_v2_ls_refs(
     read_protocol_v2_ls_refs_response(format, reader)
 }
 
+/// Bridge a parsed protocol v2 `ls-refs` response into the shared
+/// [`RefAdvertisementSet`]/[`RefAdvertisement`] types used by the v0/v1 codecs,
+/// so callers can drive v2 clone/fetch through the same ref-advertisement
+/// machinery.
+///
+/// Each [`ProtocolV2LsRefsRecord::Ref`] becomes a [`RefAdvertisement`]. A
+/// `peeled:<oid>` attribute is emitted as an additional `<peeled-oid>
+/// <name>^{}` advertisement, matching the v0/v1 peeled-tag convention.
+/// `symref-target:<target>` attributes are collected as `symref=<name>:<target>`
+/// capabilities on the first advertised ref, mirroring how the upload-pack v0/v1
+/// advertisement carries symrefs. [`ProtocolV2LsRefsRecord::Unborn`] records have
+/// no object id, so they cannot be represented as a [`RefAdvertisement`]; an
+/// unborn record carrying a `symref-target` is preserved as a `symref` capability
+/// while otherwise being skipped. The returned set always reports
+/// [`ProtocolVersion::V2`].
+pub fn protocol_v2_ls_refs_records_to_ref_advertisement_set(
+    records: &[ProtocolV2LsRefsRecord],
+) -> Result<RefAdvertisementSet> {
+    let mut refs: Vec<RefAdvertisement> = Vec::new();
+    let mut symrefs: Vec<Capability> = Vec::new();
+    for record in records {
+        match record {
+            ProtocolV2LsRefsRecord::Ref(reference) => {
+                validate_protocol_v2_token("ls-refs ref name", &reference.name)?;
+                refs.push(RefAdvertisement {
+                    oid: reference.oid.clone(),
+                    name: reference.name.clone(),
+                    capabilities: Vec::new(),
+                });
+                if let Some(peeled) = &reference.peeled {
+                    refs.push(RefAdvertisement {
+                        oid: peeled.clone(),
+                        name: format!("{}^{{}}", reference.name),
+                        capabilities: Vec::new(),
+                    });
+                }
+                if let Some(target) = &reference.symref_target {
+                    symrefs.push(protocol_v2_symref_capability(&reference.name, target)?);
+                }
+            }
+            ProtocolV2LsRefsRecord::Unborn {
+                name,
+                symref_target,
+                ..
+            } => {
+                validate_protocol_v2_token("ls-refs ref name", name)?;
+                if let Some(target) = symref_target {
+                    symrefs.push(protocol_v2_symref_capability(name, target)?);
+                }
+            }
+        }
+    }
+    if !symrefs.is_empty() {
+        if let Some(first) = refs.first_mut() {
+            first.capabilities = symrefs;
+        } else {
+            return Err(GitError::InvalidFormat(
+                "ls-refs response advertised symrefs without any concrete refs".into(),
+            ));
+        }
+    }
+    Ok(RefAdvertisementSet {
+        protocol: ProtocolVersion::V2,
+        refs,
+        shallow: Vec::new(),
+    })
+}
+
+/// Parse a protocol v2 `ls-refs` response and bridge it into the shared
+/// [`RefAdvertisementSet`] type. Convenience wrapper combining
+/// [`parse_protocol_v2_ls_refs_response`] and
+/// [`protocol_v2_ls_refs_records_to_ref_advertisement_set`].
+pub fn parse_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+    format: ObjectFormat,
+    frames: &[PktLineFrame],
+) -> Result<RefAdvertisementSet> {
+    let records = parse_protocol_v2_ls_refs_response(format, frames)?;
+    protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)
+}
+
+/// Read a protocol v2 `ls-refs` response from `reader` and bridge it into the
+/// shared [`RefAdvertisementSet`] type.
+pub fn read_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<RefAdvertisementSet> {
+    let records = read_protocol_v2_ls_refs_response(format, reader)?;
+    protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)
+}
+
+fn protocol_v2_symref_capability(name: &str, target: &str) -> Result<Capability> {
+    validate_protocol_v2_token("ls-refs symref-target", target)?;
+    Ok(Capability {
+        name: "symref".into(),
+        value: Some(format!("{name}:{target}")),
+    })
+}
+
 pub fn read_protocol_v2_fetch_request(
     format: ObjectFormat,
     reader: &mut impl Read,
@@ -14300,6 +14398,152 @@ mod tests {
                 }
             ])])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn protocol_v2_ls_refs_response_bridges_into_ref_advertisement_set() {
+        let head = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let tag = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let tag_peeled = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "3333333333333333333333333333333333333333",
+        )
+        .unwrap();
+        let frames = vec![
+            PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 HEAD symref-target:refs/heads/main\n"
+                    .to_vec(),
+            ),
+            PktLineFrame::Data(
+                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
+            ),
+            PktLineFrame::Data(
+                b"2222222222222222222222222222222222222222 refs/tags/v1 peeled:3333333333333333333333333333333333333333\n"
+                    .to_vec(),
+            ),
+            PktLineFrame::Flush,
+        ];
+
+        let set = parse_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &frames,
+        )
+        .unwrap();
+        assert_eq!(
+            set,
+            RefAdvertisementSet {
+                protocol: ProtocolVersion::V2,
+                refs: vec![
+                    RefAdvertisement {
+                        oid: head.clone(),
+                        name: "HEAD".into(),
+                        capabilities: vec![Capability {
+                            name: "symref".into(),
+                            value: Some("HEAD:refs/heads/main".into()),
+                        }],
+                    },
+                    RefAdvertisement {
+                        oid: head,
+                        name: "refs/heads/main".into(),
+                        capabilities: Vec::new(),
+                    },
+                    RefAdvertisement {
+                        oid: tag,
+                        name: "refs/tags/v1".into(),
+                        capabilities: Vec::new(),
+                    },
+                    RefAdvertisement {
+                        oid: tag_peeled,
+                        name: "refs/tags/v1^{}".into(),
+                        capabilities: Vec::new(),
+                    },
+                ],
+                shallow: Vec::new(),
+            }
+        );
+
+        // The streaming reader path produces the same bridged set.
+        let mut encoded = Vec::new();
+        write_pkt_line_frames(&mut encoded, &frames).unwrap();
+        encoded.extend_from_slice(b"tail");
+        let mut input = encoded.as_slice();
+        assert_eq!(
+            read_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+                ObjectFormat::Sha1,
+                &mut input,
+            )
+            .unwrap(),
+            set,
+        );
+        assert_eq!(input, b"tail");
+    }
+
+    #[test]
+    fn protocol_v2_ls_refs_records_bridge_unborn_head_symref_and_empty() {
+        // An unborn HEAD pointing at an as-yet-uncreated branch carries only a
+        // symref capability and has no concrete ref to attach it to.
+        let records = vec![ProtocolV2LsRefsRecord::Unborn {
+            name: "HEAD".into(),
+            symref_target: Some("refs/heads/main".into()),
+            attributes: Vec::new(),
+        }];
+        assert!(protocol_v2_ls_refs_records_to_ref_advertisement_set(&records).is_err());
+
+        // An empty ls-refs response bridges to an empty v2 set.
+        assert_eq!(
+            protocol_v2_ls_refs_records_to_ref_advertisement_set(&[]).unwrap(),
+            RefAdvertisementSet {
+                protocol: ProtocolVersion::V2,
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            }
+        );
+
+        // An unborn HEAD alongside a concrete ref attaches the symref to the
+        // first ref, matching the v0/v1 advertisement convention.
+        let main = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4444444444444444444444444444444444444444",
+        )
+        .unwrap();
+        let records = vec![
+            ProtocolV2LsRefsRecord::Unborn {
+                name: "HEAD".into(),
+                symref_target: Some("refs/heads/main".into()),
+                attributes: Vec::new(),
+            },
+            ProtocolV2LsRefsRecord::Ref(ProtocolV2LsRefsRef {
+                oid: main.clone(),
+                name: "refs/heads/main".into(),
+                peeled: None,
+                symref_target: None,
+                attributes: Vec::new(),
+            }),
+        ];
+        let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records).unwrap();
+        assert_eq!(
+            set,
+            RefAdvertisementSet {
+                protocol: ProtocolVersion::V2,
+                refs: vec![RefAdvertisement {
+                    oid: main,
+                    name: "refs/heads/main".into(),
+                    capabilities: vec![Capability {
+                        name: "symref".into(),
+                        value: Some("HEAD:refs/heads/main".into()),
+                    }],
+                }],
+                shallow: Vec::new(),
+            }
         );
     }
 }
