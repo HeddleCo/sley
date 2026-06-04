@@ -73,11 +73,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "git"
+version = "0.1.0"
+dependencies = [
+ "git-core",
+]
+
+[[package]]
 name = "git-archive"
 version = "0.1.0"
 dependencies = [
  "git-core",
  "git-formats",
+ "git-object",
  "git-odb",
 ]
 
@@ -86,19 +94,30 @@ name = "git-cli"
 version = "0.1.0"
 dependencies = [
  "git-archive",
+ "git-config",
  "git-core",
  "git-diff-merge",
  "git-fetch",
  "git-formats",
  "git-fsck",
+ "git-index",
+ "git-object",
  "git-odb",
  "git-pack",
+ "git-protocol",
  "git-refs",
  "git-rev",
  "git-sequencer",
  "git-testkit",
  "git-transport",
  "git-worktree",
+]
+
+[[package]]
+name = "git-config"
+version = "0.1.0"
+dependencies = [
+ "git-core",
 ]
 
 [[package]]
@@ -111,6 +130,8 @@ version = "0.1.0"
 dependencies = [
  "git-core",
  "git-formats",
+ "git-index",
+ "git-object",
  "git-odb",
  "git-refs",
 ]
@@ -121,8 +142,10 @@ version = "0.1.0"
 dependencies = [
  "git-core",
  "git-formats",
+ "git-object",
  "git-odb",
  "git-pack",
+ "git-protocol",
  "git-transport",
 ]
 
@@ -130,7 +153,10 @@ dependencies = [
 name = "git-formats"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
+ "git-index",
+ "git-object",
 ]
 
 [[package]]
@@ -139,7 +165,22 @@ version = "0.1.0"
 dependencies = [
  "git-core",
  "git-formats",
+ "git-object",
  "git-odb",
+]
+
+[[package]]
+name = "git-index"
+version = "0.1.0"
+dependencies = [
+ "git-core",
+]
+
+[[package]]
+name = "git-object"
+version = "0.1.0"
+dependencies = [
+ "git-core",
 ]
 
 [[package]]
@@ -149,6 +190,7 @@ dependencies = [
  "flate2",
  "git-core",
  "git-formats",
+ "git-object",
  "git-pack",
 ]
 
@@ -160,12 +202,21 @@ dependencies = [
  "flate2",
  "git-core",
  "git-formats",
+ "git-object",
+]
+
+[[package]]
+name = "git-protocol"
+version = "0.1.0"
+dependencies = [
+ "git-core",
 ]
 
 [[package]]
 name = "git-refs"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
  "git-formats",
 ]
@@ -174,8 +225,11 @@ dependencies = [
 name = "git-rev"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
  "git-formats",
+ "git-index",
+ "git-object",
  "git-odb",
  "git-refs",
 ]
@@ -186,6 +240,7 @@ version = "0.1.0"
 dependencies = [
  "git-core",
  "git-formats",
+ "git-object",
  "git-odb",
  "git-refs",
  "git-worktree",
@@ -195,9 +250,12 @@ dependencies = [
 name = "git-testkit"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
  "git-diff-merge",
  "git-formats",
+ "git-index",
+ "git-object",
  "git-odb",
  "git-pack",
  "git-refs",
@@ -211,6 +269,7 @@ name = "git-transport"
 version = "0.1.0"
 dependencies = [
  "git-core",
+ "git-protocol",
  "ureq",
 ]
 
@@ -218,8 +277,11 @@ dependencies = [
 name = "git-worktree"
 version = "0.1.0"
 dependencies = [
+ "git-config",
  "git-core",
  "git-formats",
+ "git-index",
+ "git-object",
  "git-odb",
  "git-refs",
 ]

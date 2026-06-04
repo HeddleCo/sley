@@ -1,5 +1,5 @@
 use git_core::{ObjectFormat, ObjectId};
-use git_formats::{Commit, EncodedObject, ObjectType, Tag, Tree};
+use git_object::{Commit, EncodedObject, ObjectType, Tag, Tree};
 use git_odb::ObjectReader;
 use std::collections::{HashSet, VecDeque};
 
@@ -412,7 +412,7 @@ fn fsck_tree_entry_object_type(mode: u32) -> ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_formats::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
+    use git_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use git_odb::{ObjectDatabase, ObjectWriter};
 
     #[test]
@@ -477,11 +477,9 @@ mod tests {
 
         let report = fsck_objects(&db, format, [commit.clone()], [commit]);
         assert_eq!(report.issues.len(), 2);
-        assert!(
-            report.issues[0]
-                .message
-                .contains("broken link from  commit")
-        );
+        assert!(report.issues[0]
+            .message
+            .contains("broken link from  commit"));
         assert_eq!(
             report.issues[1].message,
             format!("missing tree {missing_tree}")

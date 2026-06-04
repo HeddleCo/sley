@@ -2,7 +2,8 @@ use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
-use git_formats::{Bundle, EncodedObject, ObjectType};
+use git_formats::Bundle;
+use git_object::{EncodedObject, ObjectType};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 

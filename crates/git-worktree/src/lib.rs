@@ -1,8 +1,7 @@
 use git_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
-use git_formats::{
-    Commit, EncodedObject, GitConfig, Index, IndexEntry, ObjectType, Tree, TreeEntry,
-    tree_entry_object_type,
-};
+use git_config::GitConfig;
+use git_index::{Index, IndexEntry};
+use git_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use git_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use git_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::cmp::Ordering;

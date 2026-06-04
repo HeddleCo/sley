@@ -2,9 +2,8 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
-use git_formats::{
-    parse_framed_object, Bundle, BundleReference, Commit, EncodedObject, ObjectType, Tag, Tree,
-};
+use git_formats::{Bundle, BundleReference};
+use git_object::{parse_framed_object, Commit, EncodedObject, ObjectType, Tag, Tree};
 use git_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
@@ -1289,7 +1288,7 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_formats::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
+    use git_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use git_pack::PackFile;
 
     #[test]

@@ -8,14 +8,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use git_core::{Capability, ObjectFormat, ObjectId};
 use git_fetch::install_upload_pack_raw_response;
 use git_odb::FileObjectDatabase;
-use git_transport::{
-    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
-    ReceivePackPushRequestOptions, ReceivePackUnpackStatus, UploadPackAcknowledgment,
-    UploadPackNegotiationRequest, UploadPackRequest, build_receive_pack_push_request,
-    demux_upload_pack_packfile_response, read_receive_pack_report_status,
-    read_ref_advertisement_set, read_upload_pack_packfile_response,
-    read_upload_pack_raw_packfile_response, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+use git_protocol::{
+    build_receive_pack_push_request, demux_upload_pack_packfile_response,
+    read_receive_pack_report_status, read_ref_advertisement_set,
+    read_upload_pack_packfile_response, read_upload_pack_raw_packfile_response,
+    write_upload_pack_negotiation_request, write_upload_pack_request, ReceivePackCommand,
+    ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequestOptions,
+    ReceivePackUnpackStatus, UploadPackAcknowledgment, UploadPackNegotiationRequest,
+    UploadPackRequest,
 };
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -336,7 +336,7 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     )
     .expect("build receive-pack request");
     let mut encoded_request = Vec::new();
-    git_transport::write_receive_pack_push_request(&mut encoded_request, &request)
+    git_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
@@ -355,12 +355,10 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     let mut stdout = output.stdout.as_slice();
     let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
         .expect("parse receive-pack advertisements");
-    assert!(
-        advertisements.refs[0]
-            .capabilities
-            .iter()
-            .any(|capability| capability.name == "report-status")
-    );
+    assert!(advertisements.refs[0]
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "report-status"));
     assert!(advertisements.refs[0].capabilities.contains(&Capability {
         name: "object-format".into(),
         value: Some("sha1".into()),
@@ -456,7 +454,7 @@ fn receive_pack_service_accepts_push_options() {
     )
     .expect("build receive-pack request with push-options");
     let mut encoded_request = Vec::new();
-    git_transport::write_receive_pack_push_request(&mut encoded_request, &request)
+    git_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
@@ -537,8 +535,8 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         &run_success("git", &work, &["rev-parse", "refs/heads/main"]),
     );
     let packfile = pack_objects(&work, &format!("{new_id}\n"));
-    let request = git_transport::ReceivePackPushRequest {
-        commands: git_transport::ReceivePackRequest {
+    let request = git_protocol::ReceivePackPushRequest {
+        commands: git_protocol::ReceivePackRequest {
             shallow: Vec::new(),
             commands: vec![ReceivePackCommand {
                 old_id,
@@ -568,7 +566,7 @@ fn receive_pack_service_accepts_empty_push_options_section() {
         packfile,
     };
     let mut encoded_request = Vec::new();
-    git_transport::write_receive_pack_push_request(&mut encoded_request, &request)
+    git_protocol::write_receive_pack_push_request(&mut encoded_request, &request)
         .expect("encode receive-pack request");
 
     let output = run_with_stdin(
@@ -638,13 +636,11 @@ fn upload_pack_service_serves_raw_pack() {
     write_upload_pack_negotiation_request(
         &mut encoded_request,
         &UploadPackNegotiationRequest {
-            haves: vec![
-                ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                )
-                .expect("parse unknown have"),
-            ],
+            haves: vec![ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .expect("parse unknown have")],
             done: true,
         },
     )
@@ -667,12 +663,10 @@ fn upload_pack_service_serves_raw_pack() {
     let mut stdout = output.stdout.as_slice();
     let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
         .expect("parse upload-pack advertisements");
-    assert!(
-        advertisements
-            .refs
-            .iter()
-            .any(|advertisement| advertisement.name == "HEAD" && advertisement.oid == head)
-    );
+    assert!(advertisements
+        .refs
+        .iter()
+        .any(|advertisement| advertisement.name == "HEAD" && advertisement.oid == head));
     assert!(advertisements.refs[0].capabilities.contains(&Capability {
         name: "object-format".into(),
         value: Some("sha1".into()),
@@ -687,11 +681,9 @@ fn upload_pack_service_serves_raw_pack() {
     let receiver_db = FileObjectDatabase::from_git_dir(&receiver, ObjectFormat::Sha1);
     install_upload_pack_raw_response(&response, &receiver_db)
         .expect("install upload-pack response pack");
-    assert!(
-        receiver_db
-            .contains(&head)
-            .expect("read receiver object db")
-    );
+    assert!(receiver_db
+        .contains(&head)
+        .expect("read receiver object db"));
     assert!(
         !loose_object_path(&receiver, &head.to_string()).exists(),
         "upload-pack response should install as pack, not loose object"
@@ -776,11 +768,9 @@ fn upload_pack_service_serves_sideband_64k_pack() {
     receiver_db
         .install_raw_pack(&demuxed.data)
         .expect("install sideband pack");
-    assert!(
-        receiver_db
-            .contains(&head)
-            .expect("read receiver object db")
-    );
+    assert!(receiver_db
+        .contains(&head)
+        .expect("read receiver object db"));
     assert!(
         !loose_object_path(&receiver, &head.to_string()).exists(),
         "upload-pack sideband response should install as pack, not loose object"

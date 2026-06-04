@@ -1,5 +1,5 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
-use git_formats::{ObjectType, Tree, tree_entry_object_type};
+use git_object::{ObjectType, Tree, tree_entry_object_type};
 use git_odb::ObjectReader;
 use std::collections::HashSet;
 use std::io::Write;
@@ -569,7 +569,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_formats::EncodedObject;
+    use git_object::EncodedObject;
     use git_odb::{ObjectDatabase, ObjectWriter};
 
     #[test]
@@ -587,17 +587,17 @@ mod tests {
             .unwrap();
         let tree = Tree {
             entries: vec![
-                git_formats::TreeEntry {
+                git_object::TreeEntry {
                     mode: 0o100644,
                     name: b"regular.txt".to_vec(),
                     oid: regular,
                 },
-                git_formats::TreeEntry {
+                git_object::TreeEntry {
                     mode: 0o100755,
                     name: b"run".to_vec(),
                     oid: executable,
                 },
-                git_formats::TreeEntry {
+                git_object::TreeEntry {
                     mode: 0o120000,
                     name: b"link".to_vec(),
                     oid: symlink,

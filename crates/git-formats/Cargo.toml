@@ -7,6 +7,9 @@ license.workspace = true
 
 [dependencies]
 git-core = { path = "../git-core" }
+git-config = { path = "../git-config" }
+git-index = { path = "../git-index" }
+git-object = { path = "../git-object" }
 
 [lints]
 workspace = true

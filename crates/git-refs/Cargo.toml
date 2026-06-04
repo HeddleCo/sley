@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+git-config = { path = "../git-config" }
 git-core = { path = "../git-core" }
 git-formats = { path = "../git-formats" }
 

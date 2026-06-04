@@ -10,6 +10,7 @@ crc32fast = "1"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 git-core = { path = "../git-core" }
 git-formats = { path = "../git-formats" }
+git-object = { path = "../git-object" }
 
 [lints]
 workspace = true

@@ -1,5 +1,6 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
-use git_formats::{GitConfig, Reftable, ReftableRefRecord, ReftableRefValue};
+use git_config::GitConfig;
+use git_formats::{Reftable, ReftableRefRecord, ReftableRefValue};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Write;

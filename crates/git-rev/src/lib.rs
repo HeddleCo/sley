@@ -1,5 +1,8 @@
+use git_config::GitConfig;
 use git_core::{GitError, ObjectId, Result};
-use git_formats::{Commit, CommitGraph, GitConfig, Index, ObjectType, Tag, Tree};
+use git_formats::CommitGraph;
+use git_index::Index;
+use git_object::{Commit, ObjectType, Tag, Tree};
 use git_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use git_refs::{FileRefStore, PackedRef, RefTarget};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -797,7 +800,7 @@ fn resolve_tree_path<R: ObjectReader>(
             return Some(entry.oid.clone());
         }
         // Intermediate component must itself be a tree to keep descending.
-        if git_formats::tree_entry_object_type(entry.mode) != ObjectType::Tree {
+        if git_object::tree_entry_object_type(entry.mode) != ObjectType::Tree {
             return None;
         }
         current = entry.oid.clone();
@@ -878,7 +881,7 @@ fn resolve_index_path(
 }
 
 /// Extract the merge stage (0-3) from an index entry's flags (bits 12-13).
-fn index_entry_stage(entry: &git_formats::IndexEntry) -> u8 {
+fn index_entry_stage(entry: &git_index::IndexEntry) -> u8 {
     ((entry.flags >> 12) & 0x3) as u8
 }
 
@@ -1233,7 +1236,7 @@ fn ancestor_depths<R: ObjectReader>(
 mod tests {
     use super::*;
     use git_core::ObjectFormat;
-    use git_formats::EncodedObject;
+    use git_object::EncodedObject;
     use git_odb::{ObjectDatabase, ObjectWriter};
     use git_refs::{RefTarget, RefUpdate, ReflogEntry};
     use std::fs;
@@ -2218,7 +2221,7 @@ mod tests {
         let tree = Tree {
             entries: entries
                 .iter()
-                .map(|(mode, name, oid)| git_formats::TreeEntry {
+                .map(|(mode, name, oid)| git_object::TreeEntry {
                     mode: *mode,
                     name: name.to_vec(),
                     oid: (*oid).clone(),
@@ -2229,8 +2232,8 @@ mod tests {
             .unwrap()
     }
 
-    fn test_index_entry(path: &[u8], oid: &ObjectId, stage: u16) -> git_formats::IndexEntry {
-        git_formats::IndexEntry {
+    fn test_index_entry(path: &[u8], oid: &ObjectId, stage: u16) -> git_index::IndexEntry {
+        git_index::IndexEntry {
             ctime_seconds: 0,
             ctime_nanoseconds: 0,
             mtime_seconds: 0,

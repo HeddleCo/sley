@@ -1,5 +1,5 @@
 use git_core::{GitError, ObjectId, Result};
-use git_formats::{Commit, EncodedObject, ObjectType, Tag};
+use git_object::{Commit, EncodedObject, ObjectType, Tag};
 use git_odb::FileObjectDatabase;
 use git_odb::ObjectReader;
 use git_odb::ObjectWriter;

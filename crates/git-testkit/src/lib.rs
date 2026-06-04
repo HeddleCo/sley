@@ -1,8 +1,8 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
-use git_formats::{
-    Bundle, BundleReference, EncodedObject, GitConfig, Index, ObjectType, Tree,
-    tree_entry_object_type,
-};
+use git_config::GitConfig;
+use git_formats::{Bundle, BundleReference};
+use git_index::Index;
+use git_object::{EncodedObject, ObjectType, Tree, tree_entry_object_type};
 use git_odb::{FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter};
 use git_pack::{DeltaStrategy, PackFile, PackIndex};
 use git_refs::{FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry};
@@ -3077,7 +3077,7 @@ fn format_ls_files(index: &Index, stage: bool, terminator: u8) -> Vec<u8> {
 }
 
 fn format_ls_files_from_entries(
-    entries: &[git_formats::IndexEntry],
+    entries: &[git_index::IndexEntry],
     stage: bool,
     terminator: u8,
 ) -> Vec<u8> {
@@ -3094,9 +3094,9 @@ fn format_ls_files_from_entries(
 }
 
 fn format_ls_files_stage_with_selected(
-    entries: &[git_formats::IndexEntry],
-    deleted_entries: &[git_formats::IndexEntry],
-    modified_entries: &[git_formats::IndexEntry],
+    entries: &[git_index::IndexEntry],
+    deleted_entries: &[git_index::IndexEntry],
+    modified_entries: &[git_index::IndexEntry],
     terminator: u8,
 ) -> Vec<u8> {
     let mut out = Vec::new();
@@ -3124,9 +3124,9 @@ fn format_ls_files_stage_with_selected(
 }
 
 fn format_ls_files_selected(
-    entries: &[git_formats::IndexEntry],
-    deleted_entries: &[git_formats::IndexEntry],
-    modified_entries: &[git_formats::IndexEntry],
+    entries: &[git_index::IndexEntry],
+    deleted_entries: &[git_index::IndexEntry],
+    modified_entries: &[git_index::IndexEntry],
     cached: bool,
     stage: bool,
     deduplicate: bool,
@@ -3152,9 +3152,9 @@ fn format_ls_files_selected(
 }
 
 fn format_ls_files_selected_entry(
-    entry: &git_formats::IndexEntry,
-    deleted_entries: &[git_formats::IndexEntry],
-    modified_entries: &[git_formats::IndexEntry],
+    entry: &git_index::IndexEntry,
+    deleted_entries: &[git_index::IndexEntry],
+    modified_entries: &[git_index::IndexEntry],
     options: LsFilesFormatOptions,
     seen: &mut Vec<Vec<u8>>,
 ) -> Vec<u8> {
@@ -3178,7 +3178,7 @@ fn format_ls_files_selected_entry(
 }
 
 fn format_ls_files_selected_single(
-    entry: &git_formats::IndexEntry,
+    entry: &git_index::IndexEntry,
     options: LsFilesFormatOptions,
     seen: &mut Vec<Vec<u8>>,
 ) -> Vec<u8> {

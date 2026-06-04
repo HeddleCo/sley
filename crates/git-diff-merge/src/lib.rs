@@ -1,5 +1,6 @@
 use git_core::{object_id_for_bytes, GitError, ObjectFormat, ObjectId, RepoPath, Result};
-use git_formats::{Commit, EncodedObject, Index, ObjectType, Tree};
+use git_index::Index;
+use git_object::{Commit, EncodedObject, ObjectType, Tree};
 use git_odb::{FileObjectDatabase, ObjectReader};
 use git_refs::{FileRefStore, RefTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -2591,7 +2592,8 @@ fn lossy(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use git_formats::{RepositoryLayout, TreeEntry};
+    use git_formats::RepositoryLayout;
+    use git_object::TreeEntry;
     use git_odb::ObjectWriter;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2608,7 +2610,7 @@ mod tests {
             .unwrap();
         let index = Index {
             version: 2,
-            entries: vec![git_formats::IndexEntry {
+            entries: vec![git_index::IndexEntry {
                 ctime_seconds: 0,
                 ctime_nanoseconds: 0,
                 mtime_seconds: 0,

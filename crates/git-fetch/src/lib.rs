@@ -1,8 +1,8 @@
 use git_core::Result;
 use git_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
-use git_transport::{
-    ProtocolV2FetchResponseSection, SideBandDemux, UploadPackRawPackfileResponse,
-    demux_protocol_v2_fetch_packfile,
+use git_protocol::{
+    demux_protocol_v2_fetch_packfile, ProtocolV2FetchResponseSection, SideBandDemux,
+    UploadPackRawPackfileResponse,
 };
 
 pub fn install_upload_pack_raw_response<I: RawPackInstaller>(
@@ -65,10 +65,10 @@ pub fn install_protocol_v2_fetch_response_promisor_packfile(
 mod tests {
     use super::*;
     use git_core::ObjectFormat;
-    use git_formats::{EncodedObject, ObjectType};
+    use git_object::{EncodedObject, ObjectType};
     use git_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use git_pack::PackFile;
-    use git_transport::{SideBandChannel, SideBandPacket, encode_sideband_packet};
+    use git_protocol::{encode_sideband_packet, SideBandChannel, SideBandPacket};
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -276,16 +276,12 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
-        assert!(
-            packs
-                .iter()
-                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pack"))
-        );
-        assert!(
-            packs
-                .iter()
-                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("idx"))
-        );
+        assert!(packs
+            .iter()
+            .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pack")));
+        assert!(packs
+            .iter()
+            .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("idx")));
         assert!(db.contains(oid).unwrap());
         assert_eq!(db.read_object(oid).unwrap(), *object);
     }

@@ -1,9 +1,13 @@
 use git_core::{GitError, ObjectFormat, ObjectId, Result};
 use git_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
+use git_config::{ConfigEntry, ConfigSection, GitConfig};
 use git_formats::{
-    Bundle, BundlePrerequisite, BundleReference, Commit, CommitGraph, CommitGraphWriteEntry,
-    ConfigEntry, ConfigSection, EncodedObject, GitConfig, Index, IndexEntry, ObjectType,
-    RepositoryLayout, Tag, Tree, TreeEntry, tree_entry_object_type,
+    Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry,
+    RepositoryLayout,
+};
+use git_index::{Index, IndexEntry};
+use git_object::{
+    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry, tree_entry_object_type,
 };
 use git_odb::{
     FileObjectDatabase, LooseObjectStore, ObjectPrefixResolution, ObjectReader, ObjectWriter,
@@ -16,30 +20,32 @@ use git_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry,
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
-use git_transport::{
+use git_protocol::{
     FetchHeadRecord, FetchRefUpdate, GitService, PKT_LINE_MAX_PAYLOAD_LEN, ProtocolVersion,
     PushSourceRef, ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest,
     ReceivePackPushRequestOptions, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
-    RefAdvertisementSet, RemoteTransport, SideBandChannel, SideBandPacket, SshCommandVariant,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackPackfileResponse,
-    UploadPackRawPackfileResponse, UploadPackRequest, apply_receive_pack_push_request,
-    build_receive_pack_push_request, build_upload_pack_raw_packfile_response, encode_fetch_head,
-    encode_receive_pack_features, encode_upload_pack_features, fetch_ref_updates_to_fetch_head,
-    parse_receive_pack_features, parse_refspec, parse_remote_url, parse_upload_pack_features,
-    plan_fetch_ref_updates, plan_push_commands, read_receive_pack_push_options,
-    read_receive_pack_report_status, read_receive_pack_request, read_ref_advertisement_set,
-    read_upload_pack_negotiation_request, read_upload_pack_raw_packfile_response,
-    read_upload_pack_request, refspec_map_source, ssh_process_command,
+    RefAdvertisementSet, SideBandChannel, SideBandPacket, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    UploadPackRequest, apply_receive_pack_push_request, build_receive_pack_push_request,
+    build_upload_pack_raw_packfile_response, encode_fetch_head, encode_receive_pack_features,
+    encode_upload_pack_features, fetch_ref_updates_to_fetch_head, parse_receive_pack_features,
+    parse_refspec, parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
+    read_receive_pack_push_options, read_receive_pack_report_status, read_receive_pack_request,
+    read_ref_advertisement_set, read_upload_pack_negotiation_request,
+    read_upload_pack_raw_packfile_response, read_upload_pack_request, refspec_map_source,
     write_receive_pack_push_request, write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_negotiation_request, write_upload_pack_packfile_response,
     write_upload_pack_raw_packfile_response, write_upload_pack_request,
+};
+use git_transport::{RemoteTransport, SshCommandVariant, parse_remote_url, ssh_process_command};
+use git_protocol::{
+    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
+    smart_http_rpc_result_content_type,
 };
 use git_transport::{
     GitCredential, HttpClient, HttpResponse, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
     encode_git_credential, git_credential_basic_authorization, http_smart_info_refs_url,
     http_smart_rpc_url, parse_git_credential, read_service_discovery_response,
-    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type,
 };
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -1524,12 +1530,12 @@ fn worktree_index_entry(
     mode: u32,
     size: u64,
     modified: Option<std::time::SystemTime>,
-) -> git_formats::IndexEntry {
+) -> git_index::IndexEntry {
     let duration = modified
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .unwrap_or_default();
     let flags = path.len().min(0x0fff) as u16;
-    git_formats::IndexEntry {
+    git_index::IndexEntry {
         ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
         ctime_nanoseconds: duration.subsec_nanos(),
         mtime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
@@ -8421,7 +8427,7 @@ fn upload_pack_from_local_repository(
     git_dir: &Path,
     format: ObjectFormat,
     features: &UploadPackFeatures,
-    request: git_transport::UploadPackRequest,
+    request: git_protocol::UploadPackRequest,
     haves: HashSet<ObjectId>,
 ) -> Result<UploadPackRawPackfileResponse> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -8830,13 +8836,13 @@ fn remote_advertisement_tips_known_to_local(
 }
 
 fn validate_receive_pack_report(report: &ReceivePackReportStatus) -> Result<()> {
-    if let git_transport::ReceivePackUnpackStatus::Error(message) = &report.unpack {
+    if let git_protocol::ReceivePackUnpackStatus::Error(message) = &report.unpack {
         return Err(GitError::Command(format!(
             "failed to push some refs: unpack failed: {message}"
         )));
     }
     for status in &report.commands {
-        if let git_transport::ReceivePackCommandStatus::Ng { name, message } = status {
+        if let git_protocol::ReceivePackCommandStatus::Ng { name, message } = status {
             return Err(GitError::Command(format!(
                 "failed to push {name}: {message}"
             )));
@@ -10236,7 +10242,7 @@ fn append_reachable_auto_follow_tags(
     advertisements: &[RefAdvertisement],
     remote_db: &FileObjectDatabase,
     format: ObjectFormat,
-    refspecs: &[git_transport::RefSpec],
+    refspecs: &[git_protocol::RefSpec],
     updates: &mut Vec<FetchRefUpdate>,
 ) -> Result<()> {
     if !updates.iter().any(|update| update.dst.is_some()) {
@@ -10270,7 +10276,7 @@ fn append_reachable_auto_follow_tags(
     Ok(())
 }
 
-fn fetch_refspec_excludes(refspecs: &[git_transport::RefSpec], name: &str) -> Result<bool> {
+fn fetch_refspec_excludes(refspecs: &[git_protocol::RefSpec], name: &str) -> Result<bool> {
     for refspec in refspecs.iter().filter(|refspec| refspec.negative) {
         if refspec.pattern {
             if refspec_map_source(refspec, name)?.is_some() {
@@ -13600,11 +13606,11 @@ fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     // this yields the same config as a plain parse, and a missing file yields an
     // empty config — preserving prior behavior.
     let git_dir_abs = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
-    let context = git_formats::ConfigIncludeContext::new(
+    let context = git_config::ConfigIncludeContext::new(
         Some(git_dir_abs),
         repo_current_branch_name(git_dir),
     );
-    git_formats::load_config_with_includes(&path, &context)
+    git_config::load_config_with_includes(&path, &context)
 }
 
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.
@@ -14624,7 +14630,7 @@ fn print_hash_object(
     body: Vec<u8>,
     store: Option<&mut LooseObjectStore>,
 ) -> Result<()> {
-    let object = git_formats::EncodedObject::new(object_type, body);
+    let object = git_object::EncodedObject::new(object_type, body);
     let oid = if let Some(store) = store {
         store.write_object(object)?
     } else {
@@ -15359,7 +15365,7 @@ fn print_tree_with_prefix(
 fn print_tree_entry_to_writer(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &git_formats::TreeEntry,
+    entry: &git_object::TreeEntry,
     path: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
@@ -15426,7 +15432,7 @@ fn write_tree_oid(
 fn write_tree_entry_format(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &git_formats::TreeEntry,
+    entry: &git_object::TreeEntry,
     path: &[u8],
     options: TreePrintOptions<'_>,
     format: &str,
@@ -15487,7 +15493,7 @@ fn write_tree_entry_format(
 fn write_tree_format_placeholder(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &git_formats::TreeEntry,
+    entry: &git_object::TreeEntry,
     object_type: ObjectType,
     path: &[u8],
     options: TreePrintOptions<'_>,
@@ -15745,7 +15751,7 @@ fn find_tree_entry(
     format: ObjectFormat,
     body: &[u8],
     components: &[&str],
-) -> Result<Option<git_formats::TreeEntry>> {
+) -> Result<Option<git_object::TreeEntry>> {
     let tree = Tree::parse(format, body)?;
     let Some((component, rest)) = components.split_first() else {
         return Ok(None);
@@ -20611,7 +20617,7 @@ fn for_each_ref_sort_contents(
 fn for_each_ref_sort_peeled_object(
     reference: &git_refs::Ref,
     context: &ForEachRefSortContext<'_>,
-) -> Result<Option<(ObjectId, git_formats::EncodedObject)>> {
+) -> Result<Option<(ObjectId, git_object::EncodedObject)>> {
     let Some(contents) = for_each_ref_sort_tag_contents(reference, context)? else {
         return Ok(None);
     };
@@ -21154,7 +21160,7 @@ struct ForEachRefContents {
 
 fn for_each_ref_contents(
     format: ObjectFormat,
-    object: &git_formats::EncodedObject,
+    object: &git_object::EncodedObject,
 ) -> Result<Option<ForEachRefContents>> {
     let contents = match object.object_type {
         ObjectType::Commit => {
@@ -22879,7 +22885,7 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
 
 fn write_ls_files_unmerged<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
     terminator: u8,
     pathspec: &LsFilesPathspec,
     oid_abbrev: Option<usize>,
@@ -22904,7 +22910,7 @@ fn write_ls_files_unmerged<'a>(
 
 fn write_ls_files_index<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
     stage: bool,
     terminator: u8,
     pathspec: &LsFilesPathspec,
@@ -22932,9 +22938,9 @@ fn write_ls_files_index<'a>(
 
 fn write_ls_files_index_with_selected<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
-    deleted_entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
-    modified_entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
+    deleted_entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
+    modified_entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
     terminator: u8,
     pathspec: &LsFilesPathspec,
     oid_abbrev: Option<usize>,
@@ -22975,9 +22981,9 @@ fn write_ls_files_index_with_selected<'a>(
 
 fn write_ls_files_selected<'a>(
     stdout: &mut io::Stdout,
-    entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
-    deleted_entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
-    modified_entries: impl IntoIterator<Item = &'a git_formats::IndexEntry>,
+    entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
+    deleted_entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
+    modified_entries: impl IntoIterator<Item = &'a git_index::IndexEntry>,
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
 ) -> Result<()> {
@@ -22994,9 +23000,9 @@ fn write_ls_files_selected<'a>(
 
 fn write_ls_files_entry_if_selected(
     stdout: &mut io::Stdout,
-    entry: &git_formats::IndexEntry,
-    deleted: &[&git_formats::IndexEntry],
-    modified: &[&git_formats::IndexEntry],
+    entry: &git_index::IndexEntry,
+    deleted: &[&git_index::IndexEntry],
+    modified: &[&git_index::IndexEntry],
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
     seen: &mut BTreeSet<Vec<u8>>,
@@ -23021,7 +23027,7 @@ fn write_ls_files_entry_if_selected(
 
 fn write_ls_files_entry(
     stdout: &mut io::Stdout,
-    entry: &git_formats::IndexEntry,
+    entry: &git_index::IndexEntry,
     pathspec: &LsFilesPathspec,
     options: LsFilesWriteOptions,
     seen: &mut BTreeSet<Vec<u8>>,
@@ -23055,7 +23061,7 @@ fn write_ls_files_path(stdout: &mut io::Stdout, path: &[u8], terminator: u8) -> 
     Ok(())
 }
 
-fn index_entry_stage(entry: &git_formats::IndexEntry) -> u16 {
+fn index_entry_stage(entry: &git_index::IndexEntry) -> u16 {
     (entry.flags >> 12) & 0x3
 }
 

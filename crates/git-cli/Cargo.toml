@@ -15,13 +15,17 @@ path = "src/main.rs"
 
 [dependencies]
 git-archive = { path = "../git-archive" }
+git-config = { path = "../git-config" }
 git-core = { path = "../git-core" }
 git-diff-merge = { path = "../git-diff-merge" }
 git-fetch = { path = "../git-fetch" }
 git-formats = { path = "../git-formats" }
 git-fsck = { path = "../git-fsck" }
+git-index = { path = "../git-index" }
+git-object = { path = "../git-object" }
 git-odb = { path = "../git-odb" }
 git-pack = { path = "../git-pack" }
+git-protocol = { path = "../git-protocol" }
 git-refs = { path = "../git-refs" }
 git-rev = { path = "../git-rev" }
 git-sequencer = { path = "../git-sequencer" }
