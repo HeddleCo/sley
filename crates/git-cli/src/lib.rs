@@ -18752,14 +18752,24 @@ fn write_diff_stat(
     };
     for row in rows.iter().take(displayed_rows) {
         match row.stats {
-            DiffStatStats::Binary { old_size, new_size } => {
-                let old_size = color_stat_deleted(&old_size.to_string(), color);
-                let new_size = color_stat_inserted(&new_size.to_string(), color);
-                writeln!(
-                    stdout,
-                    " {:path_width$} | Bin {old_size} -> {new_size} bytes",
-                    row.path
-                )?;
+            DiffStatStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
+            } => {
+                if unchanged {
+                    // git prints just `Bin` (no ` N -> M bytes`) when the binary
+                    // blob is identical on both sides -- e.g. a pure mode change.
+                    writeln!(stdout, " {:path_width$} | Bin", row.path)?;
+                } else {
+                    let old_size = color_stat_deleted(&old_size.to_string(), color);
+                    let new_size = color_stat_inserted(&new_size.to_string(), color);
+                    writeln!(
+                        stdout,
+                        " {:path_width$} | Bin {old_size} -> {new_size} bytes",
+                        row.path
+                    )?;
+                }
             }
             DiffStatStats::Text { inserted, deleted } => {
                 let count = inserted + deleted;
@@ -18804,6 +18814,7 @@ fn diff_stat_rows(
             DiffLineStats::Binary => DiffStatStats::Binary {
                 old_size: old_content.as_ref().map_or(0, Vec::len),
                 new_size: new_content.as_ref().map_or(0, Vec::len),
+                unchanged: old_content == new_content,
             },
             DiffLineStats::Text { inserted, deleted } => DiffStatStats::Text { inserted, deleted },
         };
@@ -18823,7 +18834,11 @@ struct DiffStatRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DiffStatStats {
-    Binary { old_size: usize, new_size: usize },
+    Binary {
+        old_size: usize,
+        new_size: usize,
+        unchanged: bool,
+    },
     Text { inserted: usize, deleted: usize },
 }
 

@@ -94,3 +94,59 @@ fn diff_inexact_rename_matches_git() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// One edited line of three: git reports `R066` / `similarity index 66%`, not 67.
+/// The similarity percentage must match git's MAX_SCORE integer truncation.
+#[test]
+fn diff_inexact_rename_one_edit_similarity_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("diff-rename-sim");
+    let repo = root.join("repo");
+    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    fs::write(repo.join("f.txt"), "a\nb\nc\n").unwrap();
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+    git_ok(&repo, &["mv", "f.txt", "g.txt"]);
+    fs::write(repo.join("g.txt"), "a\nB\nc\n").unwrap();
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "rename"]);
+
+    // R066 in --name-status and the `similarity index 66%` header in the patch.
+    assert_same(
+        &repo,
+        &["diff-tree", "-M", "--name-status", "HEAD~1", "HEAD"],
+    );
+    assert_same(&repo, &["diff-tree", "-M", "-p", "HEAD~1", "HEAD"]);
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A binary file whose content is unchanged (a pure mode change) renders in
+/// `--stat` as just `Bin`, with no ` N -> M bytes` suffix -- matching git.
+#[cfg(unix)]
+#[test]
+fn diff_binary_mode_change_stat_matches_git() {
+    use std::os::unix::fs::PermissionsExt;
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("diff-bin-stat");
+    let repo = root.join("repo");
+    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    fs::write(repo.join("data.bin"), b"bin\x00data\n").unwrap();
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "add"]);
+    let file = repo.join("data.bin");
+    let mut perms = fs::metadata(&file).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&file, perms).unwrap();
+    git_ok(&repo, &["add", "-A"]);
+    git_ok(&repo, &["commit", "-qm", "chmod"]);
+
+    // Content identical on both sides -> git prints " data.bin | Bin".
+    assert_same(&repo, &["diff-tree", "--stat", "--no-commit-id", "HEAD"]);
+
+    fs::remove_dir_all(&root).ok();
+}

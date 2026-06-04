@@ -2098,8 +2098,16 @@ pub fn blob_similarity(a: &[u8], b: &[u8]) -> u8 {
     let dst = span_hash_counts(b);
     let common = common_span_bytes(&src, &dst);
 
-    // round(common * 100 / max_size) using integer arithmetic.
-    let score = (common * 100 + max_size / 2) / max_size;
+    // Match git's diffcore-rename integer math exactly. git computes an internal
+    // score `src_copied * MAX_SCORE / max_size` (MAX_SCORE == 60000) with integer
+    // truncation, then reports the similarity index as `score * 100 / MAX_SCORE`,
+    // truncated again. This two-step truncation -- *not* a single rounded
+    // `common * 100 / max_size` -- is what yields git's exact percentages: e.g.
+    // common=4, max_size=6 gives 4*60000/6=40000 then 40000*100/60000=66 (git's
+    // `R066`), whereas a rounded single step would give 67.
+    const MAX_SCORE: u64 = 60000;
+    let internal = (common as u64 * MAX_SCORE) / max_size as u64;
+    let score = internal * 100 / MAX_SCORE;
     score.min(100) as u8
 }
 
@@ -3855,6 +3863,17 @@ new mode 100755
         assert_eq!(blob_similarity(a, b), 75);
         // The metric is symmetric.
         assert_eq!(blob_similarity(b, a), 75);
+    }
+
+    #[test]
+    fn similarity_one_edited_line_of_three_is_66_not_67() {
+        // "a\nb\nc\n" -> "a\nB\nc\n": one of three lines edited (4 common bytes of
+        // 6). git reports `R066` / "similarity index 66%". git's two-step integer
+        // math is `4 * 60000 / 6 = 40000`, then `40000 * 100 / 60000 = 66` (both
+        // truncated); a single rounded `4 * 100 / 6` would give 67. This pins the
+        // MAX_SCORE-based rounding so it stays aligned with diffcore-rename.
+        assert_eq!(blob_similarity(b"a\nb\nc\n", b"a\nB\nc\n"), 66);
+        assert_eq!(blob_similarity(b"a\nB\nc\n", b"a\nb\nc\n"), 66);
     }
 
     #[test]
