@@ -8,4 +8,5 @@
 pub(crate) mod attrs;
 pub(crate) mod branch;
 pub(crate) mod stash;
+pub(crate) mod tag;
 pub(crate) mod trees;
