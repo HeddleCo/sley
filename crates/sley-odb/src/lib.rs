@@ -693,52 +693,189 @@ pub struct PartialClonePolicy {
 /// [`sley_pack::read_object_at`]) without re-reading the whole file per read.
 type PackBytesCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>>;
 
-/// Bounded cache of recently decoded objects, shared across cloned handles, so
-/// hot delta bases and repeated reads during a walk aren't re-decoded. Memory is
-/// bounded regardless of repository size (unlike caching every decoded object).
-type DecodedObjectCache = Arc<Mutex<BoundedObjectCache>>;
+/// Memory-capped LRU of recently decoded objects, shared across cloned handles,
+/// so hot delta bases and repeated reads during a walk aren't re-decoded. The
+/// cache is bounded by an approximate byte budget (not a fixed object count) so
+/// it neither thrashes on bulk reads of small objects nor blows up on a few
+/// large ones.
+type DecodedObjectCache = Arc<Mutex<LruObjectCache>>;
 
-const DECODED_OBJECT_CACHE_CAPACITY: usize = 1024;
+/// Per-pack caches of objects decoded from a pack, keyed by pack path and then by
+/// the in-pack byte offset of each object's entry. Shared across cloned handles.
+/// This is the delta-base cache: resolving a delta chain by offset reuses already
+/// decoded bases instead of re-inflating the whole chain on every read.
+type PackDeltaCaches = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<LruOffsetCache>>>>>;
 
-/// A small fixed-capacity object cache with FIFO eviction (a good approximation of
-/// LRU for the delta-base / repeated-read access pattern) that bounds memory use.
-#[derive(Debug)]
-struct BoundedObjectCache {
-    capacity: usize,
-    map: HashMap<ObjectId, EncodedObject>,
-    order: VecDeque<ObjectId>,
+/// Default approximate byte budget for the decoded-object LRU. Sized to comfortably
+/// hold the working set of a history walk (commits/trees/blobs and their delta
+/// bases) without growing without bound on large repositories. Overridable via the
+/// `SLEY_OBJECT_CACHE_BYTES` environment variable; there is currently no git-config
+/// hook threaded into the object database, so this constant is the default.
+const DEFAULT_OBJECT_CACHE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Default approximate byte budget for each per-pack delta-base cache. Holds the
+/// decoded bases of the delta chains being walked so neighboring reads stay warm.
+/// Overridable via `SLEY_DELTA_BASE_CACHE_BYTES`.
+const DEFAULT_DELTA_BASE_CACHE_BYTES: usize = 96 * 1024 * 1024;
+
+/// Approximate heap cost of caching one [`EncodedObject`]: its body plus a fixed
+/// allowance for the key, enum/`Vec` headers, and per-entry map overhead. Used
+/// only to drive eviction, so an estimate is fine.
+fn cached_object_cost(object: &EncodedObject) -> usize {
+    object.body.len().saturating_add(64)
 }
 
-impl BoundedObjectCache {
-    fn new(capacity: usize) -> Self {
+/// Read an approximate byte budget from `var`, falling back to `default` when the
+/// variable is unset or unparseable. A value of `0` disables the cache.
+fn cache_budget_from_env(var: &str, default: usize) -> usize {
+    match env::var(var) {
+        Ok(value) => value.trim().parse::<usize>().unwrap_or(default),
+        Err(_) => default,
+    }
+}
+
+/// Approximate byte budget for the decoded-object LRU (see
+/// [`DEFAULT_OBJECT_CACHE_BYTES`], `SLEY_OBJECT_CACHE_BYTES`).
+fn object_cache_budget() -> usize {
+    cache_budget_from_env("SLEY_OBJECT_CACHE_BYTES", DEFAULT_OBJECT_CACHE_BYTES)
+}
+
+/// Approximate byte budget for each per-pack delta-base cache (see
+/// [`DEFAULT_DELTA_BASE_CACHE_BYTES`], `SLEY_DELTA_BASE_CACHE_BYTES`).
+fn delta_base_cache_budget() -> usize {
+    cache_budget_from_env(
+        "SLEY_DELTA_BASE_CACHE_BYTES",
+        DEFAULT_DELTA_BASE_CACHE_BYTES,
+    )
+}
+
+/// A memory-capped LRU map from a key `K` to a decoded [`EncodedObject`].
+///
+/// Eviction is by approximate byte budget (gix-style), not object count, so the
+/// cache adapts to object size. On access an entry is moved to most-recently-used;
+/// on insert, least-recently-used entries are dropped until the budget holds. A
+/// budget of `0` makes the cache inert. Generic over the key so it backs both the
+/// oid-keyed decoded-object cache and the offset-keyed delta-base cache.
+#[derive(Debug)]
+struct LruCache<K: std::hash::Hash + Eq + Clone> {
+    budget: usize,
+    used: usize,
+    map: HashMap<K, EncodedObject>,
+    order: VecDeque<K>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
+    fn new(budget: usize) -> Self {
         Self {
-            capacity: capacity.max(1),
+            budget,
+            used: 0,
             map: HashMap::new(),
             order: VecDeque::new(),
         }
     }
 
-    fn get(&self, oid: &ObjectId) -> Option<EncodedObject> {
-        self.map.get(oid).cloned()
+    fn get(&mut self, key: &K) -> Option<EncodedObject> {
+        let object = self.map.get(key)?.clone();
+        self.touch(key);
+        Some(object)
     }
 
-    fn put(&mut self, oid: ObjectId, object: EncodedObject) {
-        if !self.map.contains_key(&oid) {
-            self.order.push_back(oid.clone());
-            while self.order.len() > self.capacity {
-                if let Some(evicted) = self.order.pop_front() {
-                    self.map.remove(&evicted);
-                }
+    /// Move `key` to the most-recently-used end. Linear in the recency queue, but
+    /// the queue is bounded by the byte budget and this only runs on cache hits.
+    fn touch(&mut self, key: &K) {
+        if let Some(position) = self.order.iter().position(|existing| existing == key)
+            && let Some(found) = self.order.remove(position)
+        {
+            self.order.push_back(found);
+        }
+    }
+
+    /// Drop `key` from both the map and the recency queue, releasing its budget.
+    fn remove(&mut self, key: &K) {
+        if let Some(object) = self.map.remove(key) {
+            self.used = self.used.saturating_sub(cached_object_cost(&object));
+        }
+        if let Some(position) = self.order.iter().position(|existing| existing == key) {
+            self.order.remove(position);
+        }
+    }
+
+    fn put(&mut self, key: K, object: EncodedObject) {
+        if self.budget == 0 {
+            return;
+        }
+        let cost = cached_object_cost(&object);
+        // A single object larger than the whole budget is not worth caching; it
+        // would immediately evict everything including itself. Drop any stale
+        // smaller entry stored under the same key so accounting stays exact.
+        if cost > self.budget {
+            self.remove(&key);
+            return;
+        }
+        if let Some(previous) = self.map.insert(key.clone(), object) {
+            // Replacing an existing entry: adjust accounting and refresh recency.
+            self.used = self
+                .used
+                .saturating_sub(cached_object_cost(&previous))
+                .saturating_add(cost);
+            self.touch(&key);
+        } else {
+            self.used = self.used.saturating_add(cost);
+            self.order.push_back(key);
+        }
+        while self.used > self.budget {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(object) = self.map.remove(&evicted) {
+                self.used = self.used.saturating_sub(cached_object_cost(&object));
             }
         }
-        self.map.insert(oid, object);
+    }
+}
+
+/// Decoded-object cache keyed by object id (loose + packed reads share it).
+type LruObjectCache = LruCache<ObjectId>;
+/// Delta-base cache keyed by in-pack byte offset, scoped to one pack.
+type LruOffsetCache = LruCache<u64>;
+
+/// Bridges the offset-keyed [`LruOffsetCache`] to [`sley_pack::PackDeltaCache`]
+/// so the pack decoder can reuse decoded delta bases. Holds the shared cache
+/// behind its mutex; a poisoned lock simply behaves as a cache miss/no-op, so a
+/// decode still completes correctly (just without reuse).
+struct PackDeltaCacheAdapter<'a>(&'a Arc<Mutex<LruOffsetCache>>);
+
+impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
+    fn get(&self, offset: u64) -> Option<EncodedObject> {
+        self.0.lock().ok()?.get(&offset)
+    }
+
+    fn insert(&self, offset: u64, object: &EncodedObject) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.put(offset, object.clone());
+        }
     }
 }
 
 /// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
 /// the index parse so locating a packed object doesn't re-parse every `.idx` on
-/// each read; the pack directory is still re-scanned, so new packs are found.
+/// each read.
 type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
+
+/// A `.idx`/`.pack` pair discovered in a pack directory.
+#[derive(Debug, Clone)]
+struct DiscoveredPack {
+    idx: PathBuf,
+    pack: PathBuf,
+}
+
+/// The discovered `.idx`/`.pack` pairs in each pack directory, keyed by the pack
+/// directory and shared across cloned handles. Caches the directory scan so a
+/// bulk read (e.g. `cat-file --batch`) does not `read_dir` the pack directory on
+/// every object lookup. New packs are still found: a lookup that misses every
+/// cached pack re-scans the directory once before concluding the object is absent
+/// (see [`FileObjectDatabase::find_pack_containing`]).
+type PackListingCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<DiscoveredPack>>>>>;
 
 #[derive(Debug, Clone)]
 pub struct FileObjectDatabase {
@@ -748,7 +885,9 @@ pub struct FileObjectDatabase {
     format: ObjectFormat,
     pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
+    pack_listing: PackListingCache,
     decoded: DecodedObjectCache,
+    pack_deltas: PackDeltaCaches,
 }
 
 pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
@@ -868,9 +1007,9 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
-            decoded: Arc::new(Mutex::new(BoundedObjectCache::new(
-                DECODED_OBJECT_CACHE_CAPACITY,
-            ))),
+            pack_listing: Arc::new(Mutex::new(HashMap::new())),
+            decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
+            pack_deltas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -883,9 +1022,9 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
-            decoded: Arc::new(Mutex::new(BoundedObjectCache::new(
-                DECODED_OBJECT_CACHE_CAPACITY,
-            ))),
+            pack_listing: Arc::new(Mutex::new(HashMap::new())),
+            decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
+            pack_deltas: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1026,8 +1165,9 @@ impl FileObjectDatabase {
     }
 
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<EncodedObject>> {
-        // Bounded decoded-object cache first (delta-base reuse + repeated reads).
-        if let Ok(cache) = self.decoded.lock() {
+        // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
+        // bases that resolve back through the store + repeated whole-object reads).
+        if let Ok(mut cache) = self.decoded.lock() {
             if let Some(object) = cache.get(oid) {
                 return Ok(Some(object));
             }
@@ -1036,13 +1176,30 @@ impl FileObjectDatabase {
             return Ok(None);
         };
         let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
+        // Per-pack delta-base cache (keyed by in-pack offset). Resolving an
+        // ofs-delta chain reuses already-decoded bases instead of re-inflating the
+        // whole chain on every read. Scoped to this pack's path so an offset key is
+        // never applied to the wrong pack's bytes.
+        let delta_cache = self.pack_delta_cache(&pack_paths.pack);
+        let delta_adapter = delta_cache.as_ref().map(PackDeltaCacheAdapter);
         // Decode only this object at its offset (plus its delta-base chain). A
         // ref-delta base resolves through the full store (loose / other packs) and
-        // reuses this same cache. No cache lock is held across the decode, so the
-        // recursive resolver re-entry is safe.
-        let object = sley_pack::read_object_at(&bytes, pack_paths.offset, self.format, |base| {
-            self.read_object(base).ok()
-        })?;
+        // reuses the decoded-object cache. No cache lock is held across the decode,
+        // so the recursive resolver re-entry (which may re-enter read_object) is
+        // safe.
+        let resolve_ref_base = |base: &ObjectId| self.read_object(base).ok();
+        let object = match &delta_adapter {
+            Some(adapter) => sley_pack::read_object_at_with_cache(
+                &bytes,
+                pack_paths.offset,
+                self.format,
+                resolve_ref_base,
+                adapter,
+            )?,
+            None => {
+                sley_pack::read_object_at(&bytes, pack_paths.offset, self.format, resolve_ref_base)?
+            }
+        };
         let actual = object.object_id(self.format)?;
         if actual != *oid {
             return Err(GitError::InvalidObject(format!(
@@ -1053,6 +1210,17 @@ impl FileObjectDatabase {
             cache.put(oid.clone(), object.clone());
         }
         Ok(Some(object))
+    }
+
+    /// The per-pack delta-base cache for `pack_path`, creating it on first use.
+    /// Returns `None` only if the shared map's lock is poisoned, in which case the
+    /// caller falls back to an uncached decode (correctness preserved).
+    fn pack_delta_cache(&self, pack_path: &Path) -> Option<Arc<Mutex<LruOffsetCache>>> {
+        let mut caches = self.pack_deltas.lock().ok()?;
+        let cache = caches.entry(pack_path.to_path_buf()).or_insert_with(|| {
+            Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget())))
+        });
+        Some(Arc::clone(cache))
     }
 
     /// Raw bytes of the pack at `pack_path`, read at most once per database handle
@@ -1087,6 +1255,58 @@ impl FileObjectDatabase {
         Ok(index)
     }
 
+    /// The discovered `.idx`/`.pack` pairs in `pack_dir`, cached and shared across
+    /// clones. With `force_rescan`, the directory is re-read; the freshly scanned
+    /// listing is only stored (and returned as a new `Arc`) when its set of `.idx`
+    /// files actually differs from the cached one, so an unchanged directory keeps
+    /// the same `Arc` (letting callers detect "nothing new" cheaply). On a poisoned
+    /// lock it scans without caching, preserving correctness.
+    fn cached_pack_listing(
+        &self,
+        pack_dir: &Path,
+        force_rescan: bool,
+    ) -> Result<Arc<Vec<DiscoveredPack>>> {
+        if !force_rescan
+            && let Ok(cache) = self.pack_listing.lock()
+            && let Some(listing) = cache.get(pack_dir)
+        {
+            return Ok(Arc::clone(listing));
+        }
+        let scanned = Arc::new(scan_pack_listing(pack_dir)?);
+        if let Ok(mut cache) = self.pack_listing.lock() {
+            match cache.get(pack_dir) {
+                // Keep the existing Arc when the scan found the same set of packs,
+                // so repeated misses don't churn the cache or callers' pointers.
+                Some(existing) if same_pack_set(existing, &scanned) => {
+                    return Ok(Arc::clone(existing));
+                }
+                _ => {
+                    cache.insert(pack_dir.to_path_buf(), Arc::clone(&scanned));
+                }
+            }
+        }
+        Ok(scanned)
+    }
+
+    /// Find `oid` among a cached pack listing, returning its pack path and offset.
+    /// Uses the parsed-index cache, so this performs no directory I/O.
+    fn find_in_pack_listing(
+        &self,
+        listing: &[DiscoveredPack],
+        oid: &ObjectId,
+    ) -> Result<Option<PackPaths>> {
+        for pack in listing {
+            let index = self.cached_pack_index(&pack.idx)?;
+            if let Some(entry) = index.find(oid) {
+                return Ok(Some(PackPaths {
+                    pack: pack.pack.clone(),
+                    offset: entry.offset,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
     fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackPaths>> {
         if oid.format() != self.format {
             return Err(GitError::InvalidObjectId(format!(
@@ -1102,30 +1322,19 @@ impl FileObjectDatabase {
         if let Some(pack_paths) = self.find_midx_pack_containing(&pack_dir, oid)? {
             return Ok(Some(pack_paths));
         }
-        for entry in fs::read_dir(pack_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-                continue;
-            }
-            let index = self.cached_pack_index(&path)?;
-            if let Some(entry) = index.find(oid) {
-                let offset = entry.offset;
-                let Some(stem) = path.file_stem() else {
-                    continue;
-                };
-                let pack = path.with_file_name(format!("{}.pack", stem.to_string_lossy()));
-                if !pack.exists() {
-                    return Err(GitError::NotFound(format!(
-                        "pack file {} for index {}",
-                        pack.display(),
-                        path.display()
-                    )));
-                }
-                return Ok(Some(PackPaths { pack, offset }));
-            }
+        // Search the cached directory listing first. On a complete miss, re-scan
+        // the directory once (picking up any pack added since the listing was
+        // cached) and search again, so newly written packs are still found.
+        let listing = self.cached_pack_listing(&pack_dir, false)?;
+        if let Some(pack_paths) = self.find_in_pack_listing(&listing, oid)? {
+            return Ok(Some(pack_paths));
         }
-        Ok(None)
+        let refreshed = self.cached_pack_listing(&pack_dir, true)?;
+        if Arc::ptr_eq(&listing, &refreshed) {
+            // The re-scan produced the same listing, so nothing new appeared.
+            return Ok(None);
+        }
+        self.find_in_pack_listing(&refreshed, oid)
     }
 
     fn find_midx_pack_containing(
@@ -1188,6 +1397,41 @@ fn object_id_matches_prefix(oid: &ObjectId, prefix: &str) -> bool {
         .iter()
         .zip(prefix.as_bytes())
         .all(|(actual, expected)| actual.eq_ignore_ascii_case(expected))
+}
+
+/// Scan `pack_dir` for `.idx` files that have a matching `.pack` sibling,
+/// returning the discovered pairs. An `.idx` without its `.pack` is skipped (an
+/// orphan index cannot serve objects), matching the prior per-read behavior.
+fn scan_pack_listing(pack_dir: &Path) -> Result<Vec<DiscoveredPack>> {
+    let mut packs = Vec::new();
+    for entry in fs::read_dir(pack_dir)? {
+        let entry = entry?;
+        let idx = entry.path();
+        if idx.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let Some(stem) = idx.file_stem() else {
+            continue;
+        };
+        let pack = idx.with_file_name(format!("{}.pack", stem.to_string_lossy()));
+        if !pack.exists() {
+            continue;
+        }
+        packs.push(DiscoveredPack { idx, pack });
+    }
+    // Deterministic order so lookups and set comparison are stable.
+    packs.sort_by(|left, right| left.idx.cmp(&right.idx));
+    Ok(packs)
+}
+
+/// Whether two pack listings reference the same set of `.idx` files (order is
+/// already normalized by [`scan_pack_listing`]).
+fn same_pack_set(left: &[DiscoveredPack], right: &[DiscoveredPack]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(a, b)| a.idx == b.idx && a.pack == b.pack)
 }
 
 fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
@@ -1408,6 +1652,67 @@ mod tests {
     use super::*;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use sley_pack::PackFile;
+
+    fn blob_of(byte: u8, len: usize) -> EncodedObject {
+        EncodedObject::new(ObjectType::Blob, vec![byte; len])
+    }
+
+    #[test]
+    fn lru_cache_evicts_by_byte_budget_least_recently_used_first() {
+        // Budget holds two ~1 KiB objects but not three.
+        let one = cached_object_cost(&blob_of(0, 1000));
+        let mut cache = LruCache::<u32>::new(one * 2 + 8);
+        cache.put(1, blob_of(b'a', 1000));
+        cache.put(2, blob_of(b'b', 1000));
+        // Touch key 1 so key 2 becomes least-recently-used.
+        assert!(cache.get(&1).is_some());
+        cache.put(3, blob_of(b'c', 1000));
+        // Key 2 (LRU) is evicted; 1 and 3 remain.
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_none());
+        assert!(cache.get(&3).is_some());
+    }
+
+    #[test]
+    fn lru_cache_zero_budget_is_inert() {
+        let mut cache = LruCache::<u32>::new(0);
+        cache.put(1, blob_of(b'a', 16));
+        assert!(cache.get(&1).is_none());
+    }
+
+    #[test]
+    fn lru_cache_skips_object_larger_than_budget_and_clears_stale_entry() {
+        let mut cache = LruCache::<u32>::new(cached_object_cost(&blob_of(0, 100)));
+        cache.put(1, blob_of(b'a', 50));
+        assert!(cache.get(&1).is_some());
+        // An object that cannot fit is not cached, and it evicts the prior entry
+        // stored under the same key (so we never serve a stale value for it).
+        cache.put(1, blob_of(b'b', 10_000));
+        assert!(cache.get(&1).is_none());
+        // A subsequent fitting insert under another key still works and accounting
+        // is not corrupted by the oversized insert.
+        cache.put(2, blob_of(b'c', 50));
+        assert!(cache.get(&2).is_some());
+    }
+
+    #[test]
+    fn lru_cache_replacing_entry_updates_byte_accounting() {
+        // Budget holds two 500-byte objects (plus headroom) but not a 500 + a
+        // ~1900-byte object.
+        let small = cached_object_cost(&blob_of(0, 500));
+        let mut cache = LruCache::<u32>::new(small * 2 + 200);
+        cache.put(1, blob_of(b'a', 500));
+        cache.put(2, blob_of(b'b', 500));
+        assert!(cache.get(&1).is_some());
+        assert!(cache.get(&2).is_some());
+        // Replace key 2 (now MRU after the gets above re-ordered 1 then 2) with a
+        // bigger value that still fits the budget alone but makes the running total
+        // exceed it; the LRU (key 1) is evicted while the replaced key 2 stays.
+        // This exercises the replace-path accounting.
+        cache.put(2, blob_of(b'b', 1000));
+        assert!(cache.get(&2).is_some());
+        assert!(cache.get(&1).is_none());
+    }
 
     #[test]
     fn write_and_validate_blob() {
@@ -2018,6 +2323,44 @@ mod tests {
         );
         assert_eq!(db.read_object(&second_oid).unwrap(), second);
         assert_eq!(db.read_object(&first_oid).unwrap(), first);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_database_finds_pack_added_after_listing_was_cached() {
+        // Regression guard for the cached pack-directory listing: a pack written
+        // after the listing was first cached (via a prior read) must still be
+        // discovered by the same handle, because a miss triggers a re-scan.
+        let root = temp_root("sley-file-odb-pack-added-late");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        // First pack + object; reading it populates the listing cache.
+        let first = EncodedObject::new(ObjectType::Blob, b"first late\n".to_vec());
+        let first_oid = first.object_id(ObjectFormat::Sha1).unwrap();
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first)).unwrap();
+        db.install_pack(&first_pack).unwrap();
+        assert_eq!(db.read_object(&first_oid).unwrap(), first);
+
+        // A second object that the cached listing does not yet know about.
+        let second = EncodedObject::new(ObjectType::Blob, b"second late\n".to_vec());
+        let second_oid = second.object_id(ObjectFormat::Sha1).unwrap();
+        // It is genuinely absent right now.
+        assert!(matches!(
+            db.read_object(&second_oid),
+            Err(GitError::NotFound(_))
+        ));
+
+        // Install its pack through the same handle; the next read must find it via
+        // a re-scan, not be masked by the stale listing.
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second)).unwrap();
+        db.install_pack(&second_pack).unwrap();
+        assert!(db.contains(&second_oid).unwrap());
+        assert_eq!(db.read_object(&second_oid).unwrap(), second);
+        // The original object still resolves too.
+        assert_eq!(db.read_object(&first_oid).unwrap(), first);
+
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -1734,6 +1734,37 @@ struct EntryHeader {
     size: u64,
 }
 
+/// A cache of objects already decoded from one specific pack, keyed by the
+/// in-pack byte offset at which each object's entry begins.
+///
+/// Delta resolution within a pack walks a chain of base objects by offset; the
+/// same base is the parent of many deltas, so without a cache the entire chain
+/// is re-inflated and re-applied on every read. Implementors let
+/// [`read_object_at_with_cache`] reuse a warm base instead.
+///
+/// Correctness contract: a given `offset` within a given pack's bytes always
+/// decodes to exactly one object, so caching by offset can never serve the wrong
+/// object **provided the same cache is only ever used with one pack's bytes**.
+/// Callers must therefore scope a cache to a single pack (e.g. key it by pack
+/// path). The default [`read_object_at`] uses a no-op cache and is unaffected.
+pub trait PackDeltaCache {
+    /// Return the decoded object whose entry begins at `offset`, if cached.
+    fn get(&self, offset: u64) -> Option<EncodedObject>;
+    /// Record that the entry beginning at `offset` decodes to `object`.
+    fn insert(&self, offset: u64, object: &EncodedObject);
+}
+
+/// A [`PackDeltaCache`] that stores nothing; used by [`read_object_at`] to keep
+/// the original, allocation-free behavior for callers that do not opt in.
+struct NoopDeltaCache;
+
+impl PackDeltaCache for NoopDeltaCache {
+    fn get(&self, _offset: u64) -> Option<EncodedObject> {
+        None
+    }
+    fn insert(&self, _offset: u64, _object: &EncodedObject) {}
+}
+
 /// Decode the single object stored at byte `offset` within `pack_bytes`, reading
 /// only that object and its delta-base chain instead of parsing the whole pack.
 ///
@@ -1745,23 +1776,52 @@ pub fn read_object_at<F>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
-    mut resolve_ref_base: F,
+    resolve_ref_base: F,
 ) -> Result<EncodedObject>
 where
     F: FnMut(&ObjectId) -> Option<EncodedObject>,
 {
-    read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base)
+    read_object_at_with_cache(pack_bytes, offset, format, resolve_ref_base, &NoopDeltaCache)
 }
 
-fn read_object_at_inner<F>(
+/// Like [`read_object_at`], but reuses already-decoded objects from `cache`
+/// (keyed by in-pack offset) and records every object it decodes.
+///
+/// This turns repeated reads from the same pack — where many deltas share a base
+/// chain — from re-inflating each chain per read into resolving each base once.
+/// `cache` must be scoped to the pack `pack_bytes` belongs to (see
+/// [`PackDeltaCache`]); the decoded result is still byte-identical to
+/// [`read_object_at`].
+pub fn read_object_at_with_cache<F, C>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    mut resolve_ref_base: F,
+    cache: &C,
+) -> Result<EncodedObject>
+where
+    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+    C: PackDeltaCache + ?Sized,
+{
+    read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base, cache)
+}
+
+fn read_object_at_inner<F, C>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
     resolve_ref_base: &mut F,
+    cache: &C,
 ) -> Result<EncodedObject>
 where
     F: FnMut(&ObjectId) -> Option<EncodedObject>,
+    C: PackDeltaCache + ?Sized,
 {
+    // A warm cache entry for this exact offset is already the fully resolved
+    // object, so the whole base chain below can be skipped.
+    if let Some(object) = cache.get(offset) {
+        return Ok(object);
+    }
     let trailer_offset = pack_bytes
         .len()
         .checked_sub(format.raw_len())
@@ -1798,7 +1858,7 @@ where
             body.len()
         )));
     }
-    match base {
+    let object = match base {
         None => {
             let object_type = match header.kind {
                 PackObjectKind::Commit => ObjectType::Commit,
@@ -1811,21 +1871,27 @@ where
                     ));
                 }
             };
-            Ok(EncodedObject::new(object_type, body))
+            EncodedObject::new(object_type, body)
         }
         Some(DeltaBase::Offset(base_offset)) => {
-            let base = read_object_at_inner(pack_bytes, base_offset, format, resolve_ref_base)?;
+            let base =
+                read_object_at_inner(pack_bytes, base_offset, format, resolve_ref_base, cache)?;
             let resolved = apply_pack_delta(&base.body, &body)?;
-            Ok(EncodedObject::new(base.object_type, resolved))
+            EncodedObject::new(base.object_type, resolved)
         }
         Some(DeltaBase::Ref(base_oid)) => {
             let base = resolve_ref_base(&base_oid).ok_or_else(|| {
                 GitError::NotFound(format!("ref-delta base object {base_oid}"))
             })?;
             let resolved = apply_pack_delta(&base.body, &body)?;
-            Ok(EncodedObject::new(base.object_type, resolved))
+            EncodedObject::new(base.object_type, resolved)
         }
-    }
+    };
+    // Record the fully resolved object so any later read that walks through this
+    // offset (as a delta base or directly) reuses it. Bases are inserted as the
+    // recursion unwinds, so a chain is decoded at most once across reads.
+    cache.insert(offset, &object);
+    Ok(object)
 }
 
 fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<EntryHeader> {
@@ -3693,6 +3759,69 @@ mod tests {
             .unwrap();
             assert_eq!(got, po.object);
         }
+    }
+
+    /// A test-only [`PackDeltaCache`] that records every decode and counts hits,
+    /// used to prove the cached decode path is byte-identical to the uncached
+    /// one and that bases are reused across reads.
+    #[derive(Default)]
+    struct CountingDeltaCache {
+        map: std::cell::RefCell<HashMap<u64, EncodedObject>>,
+        hits: std::cell::Cell<usize>,
+        inserts: std::cell::Cell<usize>,
+    }
+
+    impl PackDeltaCache for CountingDeltaCache {
+        fn get(&self, offset: u64) -> Option<EncodedObject> {
+            let hit = self.map.borrow().get(&offset).cloned();
+            if hit.is_some() {
+                self.hits.set(self.hits.get() + 1);
+            }
+            hit
+        }
+        fn insert(&self, offset: u64, object: &EncodedObject) {
+            self.inserts.set(self.inserts.get() + 1);
+            self.map.borrow_mut().insert(offset, object.clone());
+        }
+    }
+
+    #[test]
+    fn read_object_at_with_cache_matches_uncached_and_reuses_bases() {
+        // A multi-object pack with a real ofs-delta chain so the cache has bases
+        // to reuse. Build several similar blobs to encourage deltification.
+        let mut objects = Vec::new();
+        for idx in 0..8u32 {
+            let mut body = vec![b'x'; 4096];
+            body.extend_from_slice(format!("\nvariant {idx}\n").as_bytes());
+            objects.push(EncodedObject::new(ObjectType::Blob, body));
+        }
+        let written = PackFile::write_with_delta_strategy(
+            &objects,
+            ObjectFormat::Sha1,
+            DeltaStrategy::OfsDelta,
+        )
+        .unwrap();
+        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+
+        let cache = CountingDeltaCache::default();
+        // Read every object twice through the cache; each result must equal the
+        // ground-truth from the full parse, byte for byte, both times.
+        for _ in 0..2 {
+            for po in &parsed.entries {
+                let got = read_object_at_with_cache(
+                    &written.pack,
+                    po.entry.offset,
+                    ObjectFormat::Sha1,
+                    |_| None,
+                    &cache,
+                )
+                .unwrap();
+                assert_eq!(got, po.object, "offset {}", po.entry.offset);
+            }
+        }
+        // The second pass reads everything straight from the cache, so there must
+        // be at least one hit (proving reuse, not just correctness).
+        assert!(cache.hits.get() > 0, "cache never served a warm object");
     }
 
     #[test]
