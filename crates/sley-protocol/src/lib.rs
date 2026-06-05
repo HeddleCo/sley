@@ -4513,6 +4513,80 @@ pub fn write_upload_pack_raw_packfile_response(
     Ok(())
 }
 
+/// Parse the smart-HTTP/SSH v0 *shallow-info* section that precedes the packfile
+/// when the upload-pack request carried `shallow`/`deepen`/`deepen-since`/
+/// `deepen-not` arguments.
+///
+/// The section is zero or more `shallow <oid>` / `unshallow <oid>` pkt-lines
+/// terminated by a flush-pkt; git always emits it (even empty, as a bare flush)
+/// when the request was a deepen request, and never emits it otherwise. Returns
+/// the parsed entries and the number of bytes consumed (through the flush) so the
+/// caller can continue parsing the trailing acknowledgments + packfile from
+/// `&input[consumed..]` (see [`parse_upload_pack_shallow_info_and_raw_packfile_response`]).
+pub fn parse_upload_pack_shallow_info_section(
+    format: ObjectFormat,
+    input: &[u8],
+) -> Result<(Vec<ProtocolV2FetchShallowInfo>, usize)> {
+    let mut entries = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let (frame, consumed) = PktLineFrame::parse(&input[offset..])?;
+        offset += consumed;
+        match frame {
+            PktLineFrame::Data(payload) => {
+                entries.push(parse_fetch_shallow_info(format, &payload)?)
+            }
+            PktLineFrame::Flush => return Ok((entries, offset)),
+            PktLineFrame::Delimiter | PktLineFrame::ResponseEnd => {
+                return Err(GitError::InvalidFormat(
+                    "upload-pack shallow-info section contains a non-flush control packet".into(),
+                ));
+            }
+        }
+    }
+}
+
+/// Parse a raw upload-pack response that begins with a *shallow-info* section,
+/// i.e. the response to a deepen request.
+///
+/// This is [`parse_upload_pack_raw_packfile_response`] preceded by the
+/// shallow-info section ([`parse_upload_pack_shallow_info_section`]): it returns
+/// the `shallow`/`unshallow` entries the server reported alongside the parsed
+/// acknowledgments + raw packfile. Use it only when the request carried a
+/// `shallow`/`deepen`/`deepen-since`/`deepen-not` argument; for a plain (non-deepen)
+/// request the response has no leading shallow-info section and
+/// [`parse_upload_pack_raw_packfile_response`] must be used instead.
+pub fn parse_upload_pack_shallow_info_and_raw_packfile_response(
+    format: ObjectFormat,
+    input: &[u8],
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
+    let (shallow, consumed) = parse_upload_pack_shallow_info_section(format, input)?;
+    let response = parse_upload_pack_raw_packfile_response(format, &input[consumed..])?;
+    Ok((shallow, response))
+}
+
+/// Read a raw upload-pack response that begins with a *shallow-info* section from
+/// `reader`, returning the `shallow`/`unshallow` entries and the parsed
+/// acknowledgments + raw packfile.
+///
+/// The reader counterpart of
+/// [`parse_upload_pack_shallow_info_and_raw_packfile_response`]; see it for when
+/// this applies.
+pub fn read_upload_pack_shallow_info_and_raw_packfile_response(
+    format: ObjectFormat,
+    reader: &mut impl Read,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
+    let mut input = Vec::new();
+    reader.read_to_end(&mut input)?;
+    parse_upload_pack_shallow_info_and_raw_packfile_response(format, &input)
+}
+
 pub fn parse_receive_pack_request(
     format: ObjectFormat,
     frames: &[PktLineFrame],
@@ -10158,6 +10232,144 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn upload_pack_request_encodes_deepen_request() {
+        // A `--depth 1` clone over smart-HTTP v1: the `want` line carries the
+        // capabilities, the client's existing shallow boundary is replayed as a
+        // `shallow` line, and `deepen 1` requests the truncation. Built as raw
+        // pkt-line bytes so the 4-hex length prefixes are exercised.
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let boundary = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let request = UploadPackRequest {
+            wants: vec![want],
+            capabilities: vec![Capability {
+                name: "shallow".into(),
+                value: None,
+            }],
+            shallow: vec![boundary],
+            deepen: Some(1),
+            ..UploadPackRequest::default()
+        };
+        let mut encoded = Vec::new();
+        write_upload_pack_request(&mut encoded, Some(&request)).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"003awant 1111111111111111111111111111111111111111 shallow\n");
+        expected.extend_from_slice(b"0035shallow 2222222222222222222222222222222222222222\n");
+        expected.extend_from_slice(b"000ddeepen 1\n");
+        expected.extend_from_slice(b"0000");
+        assert_eq!(encoded, expected);
+    }
+
+    #[test]
+    fn upload_pack_shallow_info_response_parses_shallow_unshallow_and_pack() {
+        // The smart-HTTP v1 deepen response: a shallow-info section (one
+        // `shallow` and one `unshallow` line) terminated by a flush, then the
+        // NAK and the raw packfile. Hand-built pkt-lines (mind the lengths).
+        let shallow = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .unwrap();
+        let unshallow = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .unwrap();
+        let mut input = Vec::new();
+        input.extend_from_slice(b"0035shallow 1111111111111111111111111111111111111111\n");
+        input.extend_from_slice(b"0037unshallow 2222222222222222222222222222222222222222\n");
+        input.extend_from_slice(b"0000"); // shallow-info terminator
+        input.extend_from_slice(b"0008NAK\n");
+        input.extend_from_slice(b"PACK\x00\x00\x00\x02raw-bytes");
+
+        let (entries, response) =
+            parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &input)
+                .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ProtocolV2FetchShallowInfo::Shallow(shallow),
+                ProtocolV2FetchShallowInfo::Unshallow(unshallow),
+            ]
+        );
+        assert_eq!(
+            response,
+            UploadPackRawPackfileResponse {
+                acknowledgments: vec![UploadPackAcknowledgment::Nak],
+                packfile: b"PACK\x00\x00\x00\x02raw-bytes".to_vec(),
+            }
+        );
+
+        // The reader entry point yields the same result over a stream.
+        let mut stream = input.as_slice();
+        let (read_entries, read_response) =
+            read_upload_pack_shallow_info_and_raw_packfile_response(
+                ObjectFormat::Sha1,
+                &mut stream,
+            )
+            .unwrap();
+        assert_eq!(read_entries, entries);
+        assert_eq!(read_response, response);
+    }
+
+    #[test]
+    fn upload_pack_shallow_info_response_handles_empty_shallow_section() {
+        // A deepen request that creates no boundary change still gets an empty
+        // shallow-info section (a bare flush) before the NAK + pack.
+        let mut input = Vec::new();
+        input.extend_from_slice(b"0000"); // empty shallow-info
+        input.extend_from_slice(b"0008NAK\n");
+        input.extend_from_slice(b"PACK\x00\x00\x00\x02raw-bytes");
+
+        let (entries, response) =
+            parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &input)
+                .unwrap();
+        assert!(entries.is_empty());
+        assert_eq!(
+            response.acknowledgments,
+            vec![UploadPackAcknowledgment::Nak]
+        );
+        assert!(response.packfile.starts_with(b"PACK"));
+    }
+
+    #[test]
+    fn upload_pack_shallow_info_response_rejects_malformed_sections() {
+        // Truncated section (no terminating flush before EOF).
+        let truncated = b"0035shallow 1111111111111111111111111111111111111111\n".to_vec();
+        assert!(parse_upload_pack_shallow_info_and_raw_packfile_response(
+            ObjectFormat::Sha1,
+            &truncated
+        )
+        .is_err());
+        // A non-flush control packet inside the shallow-info section.
+        let mut delimiter_section = Vec::new();
+        delimiter_section.extend_from_slice(b"0001"); // delimiter, not a flush
+        assert!(
+            parse_upload_pack_shallow_info_section(ObjectFormat::Sha1, &delimiter_section).is_err()
+        );
+        // A non-shallow data line inside the section.
+        let mut bad_line = Vec::new();
+        bad_line.extend_from_slice(b"0008NAK\n");
+        assert!(parse_upload_pack_shallow_info_section(ObjectFormat::Sha1, &bad_line).is_err());
+        // Valid shallow-info but a missing packfile afterwards.
+        let mut no_pack = Vec::new();
+        no_pack.extend_from_slice(b"0000"); // empty shallow-info
+        no_pack.extend_from_slice(b"0008NAK\n");
+        assert!(parse_upload_pack_shallow_info_and_raw_packfile_response(
+            ObjectFormat::Sha1,
+            &no_pack
+        )
+        .is_err());
     }
 
     #[test]

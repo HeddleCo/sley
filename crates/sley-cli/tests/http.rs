@@ -13,8 +13,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -417,6 +417,49 @@ fn add_upstream_commit(project_root: &Path, bare: &Path) -> String {
     trimmed_utf8(run_success("git", &bare, &["rev-parse", "refs/heads/main"]))
 }
 
+/// Creates a bare upstream repo named `repo.git` under `project_root` with a
+/// linear history of `commits` commits on `main` (and `main` set as HEAD), so
+/// shallow clones at different depths are distinguishable. Returns the path to the
+/// bare repo. Unlike [`create_upstream_repo`], no extra branches or tags are added
+/// — the shallow tests only need a deep linear `main`.
+fn create_deep_upstream_repo(project_root: &Path, commits: usize) -> PathBuf {
+    let work = project_root.join("deep-seed-work");
+    let bare = project_root.join("repo.git");
+    std::fs::create_dir_all(&work).expect("create deep seed work dir");
+    std::fs::create_dir_all(&bare).expect("create bare repo dir");
+
+    run_success("git", &bare, &["init", "-q", "--bare"]);
+    run_success("git", &work, &["init", "-q"]);
+    run_success("git", &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    for index in 0..commits {
+        std::fs::write(work.join("payload.txt"), format!("payload {index}\n"))
+            .expect("write payload");
+        run_success("git", &work, &["add", "payload.txt"]);
+        run_success(
+            "git",
+            &work,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                &format!("commit {index}"),
+                "-q",
+            ],
+        );
+    }
+    let bare_arg = bare.to_string_lossy().to_string();
+    run_success(
+        "git",
+        &work,
+        &["push", "-q", &bare_arg, "refs/heads/*:refs/heads/*"],
+    );
+    run_success("git", &bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    bare
+}
+
 /// Normalizes `git ls-remote`-style output into sorted `"<sha>\t<ref>"` lines so
 /// two implementations can be compared regardless of advertisement ordering.
 fn sorted_ref_lines(output: &[u8]) -> Vec<String> {
@@ -685,6 +728,143 @@ fn push_http_creates_ref() {
             "pushed commit object {local_head} missing from upstream\nstderr:\n{}",
             String::from_utf8_lossy(&cat.stderr)
         );
+    })();
+    let _ = std::fs::remove_dir_all(&root);
+    result
+}
+
+/// Reads `<repo>/.git/shallow` as sorted lines (empty when the file is absent), so
+/// two shallow clones can be compared regardless of how the file is laid out.
+fn shallow_file_lines(repo: &Path) -> Vec<String> {
+    let contents = match std::fs::read_to_string(repo.join(".git").join("shallow")) {
+        Ok(contents) => contents,
+        Err(_) => return Vec::new(),
+    };
+    let mut lines: Vec<String> = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// `sley clone --depth N` over smart-HTTP must produce the same shallow repository
+/// as upstream `git clone --depth N` against the same server: the `.git/shallow`
+/// boundary file must match byte-for-byte (modulo ordering), the history must be
+/// truncated to exactly N commits, and the result must pass `git fsck`/`git log`.
+#[test]
+fn clone_http_shallow_matches_upstream() {
+    let Some(http_backend) = git_http_backend() else {
+        // System git or git-http-backend unavailable: skip cleanly.
+        return;
+    };
+    let root = unique_temp_dir("http-shallow-clone");
+    let project_root = root.join("srv");
+    std::fs::create_dir_all(&project_root).expect("create project root");
+    let result = (|| {
+        // A four-commit linear `main` so depth 1 and depth 2 are distinguishable
+        // and both still leave a real (non-empty) shallow boundary.
+        create_deep_upstream_repo(&project_root, 4);
+        let server = HttpBackendServer::start(&project_root, &http_backend);
+        let url = server.url("/repo.git");
+
+        for depth in [1u32, 2u32] {
+            let depth_arg = format!("--depth={depth}");
+            let expected = root.join(format!("git-depth-{depth}"));
+            let actual = root.join(format!("sley-depth-{depth}"));
+            let expected_arg = expected.to_string_lossy().to_string();
+            let actual_arg = actual.to_string_lossy().to_string();
+
+            // Upstream git's shallow clone is the reference.
+            let upstream = run(
+                "git",
+                &root,
+                &["clone", "-q", &depth_arg, &url, &expected_arg],
+            );
+            assert!(
+                upstream.status.success(),
+                "upstream git clone {depth_arg} over http failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&upstream.stdout),
+                String::from_utf8_lossy(&upstream.stderr)
+            );
+
+            // sley's shallow clone over the same server.
+            let output = run(
+                git_rs(),
+                &root,
+                &["clone", "-q", &depth_arg, &url, &actual_arg],
+            );
+            assert!(
+                output.status.success(),
+                "sley clone {depth_arg} over http failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+
+            // (a) The shallow boundary file must exist and match upstream exactly.
+            assert!(
+                actual.join(".git").join("shallow").is_file(),
+                "sley clone {depth_arg} did not write .git/shallow"
+            );
+            let expected_shallow = shallow_file_lines(&expected);
+            let actual_shallow = shallow_file_lines(&actual);
+            assert!(
+                !expected_shallow.is_empty(),
+                "upstream git clone {depth_arg} produced an empty shallow file (test repo too shallow)"
+            );
+            assert_eq!(
+                actual_shallow, expected_shallow,
+                "sley clone {depth_arg} shallow boundary differed from upstream git"
+            );
+
+            // (a) History must be truncated to exactly `depth` commits.
+            let count = trimmed_utf8(run_success(
+                "git",
+                &actual,
+                &["rev-list", "--count", "HEAD"],
+            ));
+            assert_eq!(
+                count,
+                depth.to_string(),
+                "sley clone {depth_arg} HEAD history length mismatch"
+            );
+            // Upstream agrees on the count (sanity check on the reference).
+            let upstream_count = trimmed_utf8(run_success(
+                "git",
+                &expected,
+                &["rev-list", "--count", "HEAD"],
+            ));
+            assert_eq!(
+                upstream_count,
+                depth.to_string(),
+                "upstream git clone {depth_arg} HEAD history length mismatch"
+            );
+
+            // HEAD must point at the same commit as upstream's shallow clone.
+            let actual_head = trimmed_utf8(run_success("git", &actual, &["rev-parse", "HEAD"]));
+            let expected_head = trimmed_utf8(run_success("git", &expected, &["rev-parse", "HEAD"]));
+            assert_eq!(
+                actual_head, expected_head,
+                "sley clone {depth_arg} HEAD OID differed from upstream git"
+            );
+
+            // (b) The shallow object store must be consistent and walkable.
+            let fsck = run("git", &actual, &["fsck", "--no-progress"]);
+            assert!(
+                fsck.status.success(),
+                "git fsck on sley {depth_arg} shallow clone failed\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&fsck.stdout),
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+            let log = run("git", &actual, &["log", "--oneline"]);
+            assert!(
+                log.status.success(),
+                "git log on sley {depth_arg} shallow clone failed\nstderr:\n{}",
+                String::from_utf8_lossy(&log.stderr)
+            );
+        }
     })();
     let _ = std::fs::remove_dir_all(&root);
     result

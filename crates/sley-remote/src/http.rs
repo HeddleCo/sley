@@ -14,16 +14,16 @@
 
 use std::path::Path;
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
     parse_upload_pack_features, read_upload_pack_raw_packfile_response,
-    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, write_upload_pack_negotiation_request,
-    write_upload_pack_request, GitService, RefAdvertisement, RefAdvertisementSet,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest,
+    read_upload_pack_shallow_info_and_raw_packfile_response, smart_http_advertisement_content_type,
+    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
+    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
+    ProtocolV2FetchShallowInfo, RefAdvertisement, RefAdvertisementSet, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
 };
 use sley_transport::{
     git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
@@ -183,25 +183,26 @@ pub fn http_upload_pack_advertisements(
     Ok((set.refs, features))
 }
 
-/// Post an upload-pack RPC `request` + `haves` and read back the raw packfile
-/// response, authenticating and validating status + content type.
-pub fn http_upload_pack_fetch_response(
+/// Post an upload-pack RPC `request` + `haves` and return the validated HTTP
+/// response with its body still unread, so the caller can parse the packfile
+/// stream (with or without a leading shallow-info section). Authenticates and
+/// validates status + content type.
+fn http_upload_pack_post(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
-    format: ObjectFormat,
-    request: UploadPackRequest,
+    request: &UploadPackRequest,
     haves: Vec<ObjectId>,
     credentials: &mut dyn CredentialProvider,
-) -> Result<UploadPackRawPackfileResponse> {
+) -> Result<HttpResponse> {
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
-    write_upload_pack_request(&mut body, Some(&request))?;
+    write_upload_pack_request(&mut body, Some(request))?;
     write_upload_pack_negotiation_request(
         &mut body,
         &UploadPackNegotiationRequest { haves, done: true },
     )?;
     let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
-    let mut response = http_send_with_auth(remote, credentials, |auth| {
+    let response = http_send_with_auth(remote, credentials, |auth| {
         client.post(
             &url,
             &content_type,
@@ -214,45 +215,126 @@ pub fn http_upload_pack_fetch_response(
         &response,
         &smart_http_rpc_result_content_type(GitService::UploadPack)?,
     )?;
+    Ok(response)
+}
+
+/// Post an upload-pack RPC `request` + `haves` and read back the raw packfile
+/// response, authenticating and validating status + content type. For a plain
+/// (non-deepen) request; see [`http_upload_pack_shallow_fetch_response`] for the
+/// deepen case where the response carries a leading shallow-info section.
+pub fn http_upload_pack_fetch_response(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    request: UploadPackRequest,
+    haves: Vec<ObjectId>,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<UploadPackRawPackfileResponse> {
+    let mut response = http_upload_pack_post(client, remote, &request, haves, credentials)?;
     read_upload_pack_raw_packfile_response(format, &mut response.body)
 }
 
+/// Post a deepen upload-pack RPC `request` + `haves` and read back the shallow-info
+/// section plus the raw packfile response. Use this when `request` carries a
+/// `shallow`/`deepen`/`deepen-since`/`deepen-not` argument: git always prefixes the
+/// response with a shallow-info section (possibly empty) in that case. The returned
+/// [`ProtocolV2FetchShallowInfo`] entries are the server's `shallow`/`unshallow`
+/// updates for `$GIT_DIR/shallow`.
+pub fn http_upload_pack_shallow_fetch_response(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    request: UploadPackRequest,
+    haves: Vec<ObjectId>,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
+    let mut response = http_upload_pack_post(client, remote, &request, haves, credentials)?;
+    read_upload_pack_shallow_info_and_raw_packfile_response(format, &mut response.body)
+}
+
 /// Fetch `wants` from an HTTP upload-pack remote into the repository at `git_dir`,
-/// installing the resulting pack. Objects already present locally are skipped;
-/// `promisor` selects promisor-pack installation.
+/// installing the resulting pack. Objects already present locally are skipped (for
+/// non-shallow fetches); `promisor` selects promisor-pack installation.
+///
+/// When `deepen` is set the fetch is shallow: the request replays `shallow` (the
+/// client's current boundary, read from `$GIT_DIR/shallow`) and asks the server to
+/// truncate history to `deepen` commits. The returned [`ProtocolV2FetchShallowInfo`]
+/// entries are the server's shallow-info updates the caller must fold into
+/// `$GIT_DIR/shallow` (see [`crate::apply_shallow_info`]); they are empty for a
+/// non-deepen fetch.
+#[allow(clippy::too_many_arguments)]
 pub fn install_fetch_pack_via_http_upload_pack(
     client: &UreqHttpClient,
     git_dir: &Path,
     format: ObjectFormat,
     remote: &RemoteUrl,
     wants: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
     promisor: bool,
     credentials: &mut dyn CredentialProvider,
-) -> Result<()> {
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
+    // A deepen request must always reach the server (the shallow boundary may move
+    // even when every wanted object is already present), so only the plain fetch
+    // takes the "everything is local already" shortcut.
+    if deepen.is_none()
+        && wants
+            .iter()
+            .map(|want| local_db.contains(want))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|contains| contains)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let request = UploadPackRequest {
         wants,
+        capabilities: shallow_request_capabilities(deepen),
+        shallow,
+        deepen,
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(git_dir, format)?;
-    let response =
-        http_upload_pack_fetch_response(client, remote, format, request, haves, credentials)?;
+    let (shallow_info, response) = if deepen.is_some() {
+        http_upload_pack_shallow_fetch_response(
+            client,
+            remote,
+            format,
+            request,
+            haves,
+            credentials,
+        )?
+    } else {
+        let response =
+            http_upload_pack_fetch_response(client, remote, format, request, haves, credentials)?;
+        (Vec::new(), response)
+    };
     if promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
     } else {
         install_upload_pack_raw_response(&response, &local_db)?;
     }
-    Ok(())
+    Ok(shallow_info)
+}
+
+/// The want-line capabilities to advertise for a fetch: the `shallow` capability
+/// when a deepen is requested (git's upload-pack expects clients sending deepen to
+/// negotiate shallow), otherwise none — preserving the existing plain-fetch wire
+/// form exactly.
+fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
+    if deepen.is_some() {
+        vec![Capability {
+            name: "shallow".into(),
+            value: None,
+        }]
+    } else {
+        Vec::new()
+    }
 }

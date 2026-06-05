@@ -80,6 +80,11 @@ pub struct CloneOptions<'a> {
     /// `refs/remotes/<origin>/HEAD` is only written if the checked-out branch is
     /// the remote default.
     pub single_branch: bool,
+    /// Shallow clone depth (`--depth N`): truncate history to `N` commits per tip,
+    /// writing `$GIT_DIR/shallow`. `None` is a full clone. Honored only for the
+    /// HTTP (and SSH) transports; a depth on a local clone is ignored upstream of
+    /// `clone` by the caller (the in-process server has no shallow support).
+    pub depth: Option<u32>,
     /// The committer identity for the branch-creation and checkout reflog entries.
     pub committer: Vec<u8>,
 }
@@ -155,7 +160,7 @@ pub fn clone(
         options.origin,
         &fetch_source,
         &[],
-        &clone_fetch_options(),
+        &clone_fetch_options(options.depth),
         credentials,
         progress,
     )?;
@@ -224,9 +229,10 @@ pub fn clone(
 }
 
 /// The fixed [`FetchOptions`] a clone fetch uses: quiet, auto-follow tags, write
-/// `FETCH_HEAD`, and otherwise neutral (no prune, no `--tags`, not a dry run, not
-/// appending). Mirrors the options the CLI's clone paths passed.
-fn clone_fetch_options() -> FetchOptions {
+/// `FETCH_HEAD`, the requested shallow `depth`, and otherwise neutral (no prune, no
+/// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
+/// paths passed.
+fn clone_fetch_options(depth: Option<u32>) -> FetchOptions {
     FetchOptions {
         quiet: true,
         auto_follow_tags: true,
@@ -237,5 +243,6 @@ fn clone_fetch_options() -> FetchOptions {
         write_fetch_head: true,
         tag_option_explicit: false,
         prune_option_explicit: false,
+        depth,
     }
 }

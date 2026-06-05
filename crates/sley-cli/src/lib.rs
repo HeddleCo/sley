@@ -2158,7 +2158,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
     let mut dissociate = false;
     let mut sparse = false;
     let mut separate_git_dir = None::<String>;
-    let mut depth_ignored = false;
+    let mut depth = None::<u32>;
     let mut shallow_since_ignored = false;
     let mut shallow_exclude_ignored = false;
     let mut positional = Vec::new();
@@ -2185,17 +2185,15 @@ fn cmd_clone(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("clone --depth requires a value".into()))?;
-                validate_clone_depth(value)?;
-                depth_ignored = true;
+                depth = Some(parse_clone_depth(value)?);
             }
             value if value.starts_with("--depth=") => {
                 let value = value
                     .strip_prefix("--depth=")
                     .ok_or_else(|| GitError::Command("clone --depth requires a value".into()))?;
-                validate_clone_depth(value)?;
-                depth_ignored = true;
+                depth = Some(parse_clone_depth(value)?);
             }
-            "--no-depth" => depth_ignored = false,
+            "--no-depth" => depth = None,
             "--shallow-since" => {
                 iter.next().ok_or_else(|| {
                     GitError::Command("clone --shallow-since requires a value".into())
@@ -2548,7 +2546,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         ));
     }
     let single_branch = explicit_single_branch
-        .unwrap_or(depth_ignored || shallow_since_ignored || shallow_exclude_ignored);
+        .unwrap_or(depth.is_some() || shallow_since_ignored || shallow_exclude_ignored);
     if also_filter_submodules && partial_clone_filter.is_none() {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--filter'");
         return Err(GitError::Exit(128));
@@ -2557,7 +2555,8 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--recurse-submodules'");
         return Err(GitError::Exit(128));
     }
-    if bundle_uri.is_some() && (depth_ignored || shallow_since_ignored || shallow_exclude_ignored) {
+    if bundle_uri.is_some() && (depth.is_some() || shallow_since_ignored || shallow_exclude_ignored)
+    {
         eprintln!(
             "fatal: options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together"
         );
@@ -2630,6 +2629,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
             shared,
             reference_alternates: &reference_alternates,
             bundle_uri: bundle_uri.as_ref(),
+            depth,
         });
     }
 
@@ -2644,7 +2644,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         .transpose()?;
     let branch_explicit = branch.is_some();
     let checkout_branch = branch.unwrap_or_else(|| remote_head_branch.clone());
-    if depth_ignored {
+    if depth.is_some() {
         eprintln!("warning: --depth is ignored in local clones; use file:// instead.");
     }
     if shallow_since_ignored {
@@ -2782,6 +2782,9 @@ fn cmd_clone(args: &[String]) -> Result<()> {
             checkout_branch: &checkout_branch,
             remote_head_branch: &remote_head_branch,
             single_branch,
+            // Local clones have no shallow support; `--depth` was warned-and-ignored
+            // above, so the local clone is always a full clone.
+            depth: None,
             committer: commit_identity_from_env("COMMITTER")?,
         },
         &mut |git_dir| {
@@ -2837,6 +2840,7 @@ struct CloneHttpOptions<'a> {
     shared: bool,
     reference_alternates: &'a [CloneReferenceAlternate],
     bundle_uri: Option<&'a CloneBundleUri>,
+    depth: Option<u32>,
 }
 
 /// Derive the remote default branch name from the upload-pack advertisement:
@@ -2943,6 +2947,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
             checkout_branch: &checkout_branch,
             remote_head_branch: &remote_head_branch,
             single_branch,
+            depth: options.depth,
             committer: commit_identity_from_env("COMMITTER")?,
         },
         &mut |git_dir| {
@@ -3018,21 +3023,24 @@ fn clone_jobs_error() -> &'static str {
     "error: option `jobs' expects an integer value with an optional k/m/g suffix"
 }
 
-fn validate_clone_depth(value: &str) -> Result<()> {
+/// Parse a `--depth` value the way `git clone`/`git fetch` do: an optional `+`
+/// sign then ASCII digits, rejecting non-positive depths with git's message. The
+/// numeric value is clamped to `u32::MAX` (git stores depth as a C `int`; the
+/// protocol's `deepen` is unsigned, and any value this large already deepens past
+/// every real history).
+fn parse_clone_depth(value: &str) -> Result<u32> {
     let digits = value.strip_prefix('+').unwrap_or(value);
     if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(GitError::Command(format!(
             "fatal: depth {value} is not a positive number"
         )));
     }
-    let positive = digits.chars().any(|ch| ch != '0');
-    if positive {
-        Ok(())
-    } else {
-        Err(GitError::Command(format!(
+    if !digits.chars().any(|ch| ch != '0') {
+        return Err(GitError::Command(format!(
             "fatal: depth {value} is not a positive number"
-        )))
+        )));
     }
+    Ok(digits.parse::<u32>().unwrap_or(u32::MAX))
 }
 
 fn validate_clone_jobs(value: &str) -> Result<()> {
@@ -3208,6 +3216,7 @@ fn clone_bare_or_mirror_local_repository(
             write_fetch_head: false,
             tag_option_explicit: options.tag_opt.is_some(),
             prune_option_explicit: false,
+            depth: None,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -8134,8 +8143,10 @@ fn cmd_fetch(args: &[String]) -> Result<()> {
         write_fetch_head: true,
         tag_option_explicit: false,
         prune_option_explicit: false,
+        depth: None,
     };
-    for arg in args {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-q" | "--quiet" if source.is_none() => options.quiet = true,
             "--no-quiet" if source.is_none() => options.quiet = false,
@@ -8145,6 +8156,18 @@ fn cmd_fetch(args: &[String]) -> Result<()> {
             "--no-append" => options.append = false,
             "-n" | "--dry-run" => options.dry_run = true,
             "--no-dry-run" => options.dry_run = false,
+            "--depth" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --depth requires a value".into()))?;
+                options.depth = Some(parse_clone_depth(value)?);
+            }
+            value if value.starts_with("--depth=") => {
+                let value = value
+                    .strip_prefix("--depth=")
+                    .ok_or_else(|| GitError::Command("fetch --depth requires a value".into()))?;
+                options.depth = Some(parse_clone_depth(value)?);
+            }
             "--prune" | "-p" => {
                 options.prune = true;
                 options.prune_option_explicit = true;
@@ -8174,6 +8197,11 @@ fn cmd_fetch(args: &[String]) -> Result<()> {
     if let Ok(input) = fs::read(&source)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
+        // Bundle fetches have no shallow support, so a `--depth` is warned-and-
+        // ignored here, matching the local-clone behavior.
+        if options.depth.is_some() {
+            eprintln!("warning: --depth is ignored in bundle fetches; use file:// instead.");
+        }
         return fetch_bundle(&git_dir, format, &source, &refspecs, &bundle, options);
     }
     if fetch_source_is_http(&source)? {
@@ -8181,6 +8209,11 @@ fn cmd_fetch(args: &[String]) -> Result<()> {
     }
     if fetch_source_is_ssh(&source)? {
         return fetch_ssh_repository(&git_dir, format, &source, &refspecs, options);
+    }
+    // Local (`file://`/path) fetches have no shallow support (the in-process server
+    // cannot deepen), so a `--depth` is warned-and-ignored, matching local-clone.
+    if options.depth.is_some() {
+        eprintln!("warning: --depth is ignored in local fetches; use file:// instead.");
     }
     fetch_local_repository(&git_dir, format, &source, &refspecs, options)
 }

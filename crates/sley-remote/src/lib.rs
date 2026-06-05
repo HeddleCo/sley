@@ -35,14 +35,14 @@ mod http;
 pub use http::{
     http_advertised_refs, http_authorization_headers, http_check_status, http_send_with_auth,
     http_service_advertisements, http_upload_pack_advertisements, http_upload_pack_fetch_response,
-    http_validate_content_type, install_fetch_pack_via_http_upload_pack, new_http_client,
-    remote_url_is_http,
+    http_upload_pack_shallow_fetch_response, http_validate_content_type,
+    install_fetch_pack_via_http_upload_pack, new_http_client, remote_url_is_http,
 };
 
 mod ssh;
 pub use ssh::{
     install_fetch_pack_via_ssh_upload_pack, ssh_program, ssh_upload_pack_advertisements,
-    ssh_upload_pack_fetch_response,
+    ssh_upload_pack_fetch_response, ssh_upload_pack_shallow_fetch_response,
 };
 
 mod local;
@@ -77,6 +77,9 @@ pub use ls_remote::{ls_remote, LsRemoteFilter, LsRemoteRecord, LsRemoteSource};
 
 mod clone;
 pub use clone::{clone, CloneOptions, CloneOutcome, CloneSource};
+
+mod shallow;
+pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
 
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
 ///

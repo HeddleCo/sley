@@ -53,8 +53,6 @@ pub enum FetchSource {
 }
 
 /// Controls for a [`fetch`] run, mirroring the `git fetch` flags the CLI parses.
-///
-/// Shallow/depth is intentionally absent; it is wired in a later stage.
 #[derive(Debug, Clone, Copy)]
 pub struct FetchOptions {
     /// Suppress prune notices (deletions still happen; only the [`ProgressSink`]
@@ -78,6 +76,11 @@ pub struct FetchOptions {
     /// Whether the prune option (`--prune`/`--no-prune`) was set explicitly, so
     /// the configured `remote.<name>.prune`/`fetch.prune` must not override it.
     pub prune_option_explicit: bool,
+    /// Shallow fetch depth (`--depth N`): truncate history to `N` commits per tip.
+    /// `None` is a full fetch. Only honored for the HTTP and SSH transports; a
+    /// depth on a local (`file://`/path) fetch is ignored (the in-process server
+    /// has no shallow support), matching the CLI's local-clone behavior.
+    pub depth: Option<u32>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -172,15 +175,24 @@ pub fn fetch(
                 configured_remote_fetch,
             )?;
             let wants = updates.iter().map(|update| update.oid.clone()).collect();
-            crate::http::install_fetch_pack_via_http_upload_pack(
+            // Shallow fetch: replay the current boundary as `shallow` lines and ask
+            // the server to deepen to `depth`, then fold the server's shallow-info
+            // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
+            let existing_shallow = shallow_boundary_for_request(git_dir, format, options.depth)?;
+            let shallow_info = crate::http::install_fetch_pack_via_http_upload_pack(
                 &client,
                 git_dir,
                 format,
                 remote,
                 wants,
+                existing_shallow,
+                options.depth,
                 promisor_remote,
                 credentials,
             )?;
+            if !options.dry_run {
+                crate::shallow::apply_shallow_info(git_dir, format, &shallow_info)?;
+            }
             finalize_fetch(
                 git_dir,
                 &store,
@@ -210,14 +222,22 @@ pub fn fetch(
                 configured_remote_fetch,
             )?;
             let wants = updates.iter().map(|update| update.oid.clone()).collect();
-            crate::ssh::install_fetch_pack_via_ssh_upload_pack(
+            // Shallow fetch over SSH mirrors the HTTP path: replay the current
+            // boundary, deepen to `depth`, then apply the server's shallow-info.
+            let existing_shallow = shallow_boundary_for_request(git_dir, format, options.depth)?;
+            let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
                 git_dir,
                 format,
                 remote,
                 &features,
                 wants,
+                existing_shallow,
+                options.depth,
                 promisor_remote,
             )?;
+            if !options.dry_run {
+                crate::shallow::apply_shallow_info(git_dir, format, &shallow_info)?;
+            }
             finalize_fetch(
                 git_dir,
                 &store,
@@ -287,6 +307,21 @@ pub fn fetch(
     }
 
     Ok(outcome)
+}
+
+/// The shallow boundary to replay in a deepen request: the oids in
+/// `$GIT_DIR/shallow` when `depth` is set, otherwise empty (a full fetch sends no
+/// `shallow` lines). Reading the file only when deepening keeps the non-shallow
+/// path's wire form unchanged.
+fn shallow_boundary_for_request(
+    git_dir: &Path,
+    format: ObjectFormat,
+    depth: Option<u32>,
+) -> Result<Vec<ObjectId>> {
+    if depth.is_none() {
+        return Ok(Vec::new());
+    }
+    crate::shallow::read_shallow(git_dir, format)
 }
 
 /// Plan the ref-map and apply the auto-follow-tag / not-for-merge adjustments

@@ -26,15 +26,16 @@ use std::io::Read;
 use std::path::Path;
 use std::process::{Command as ProcessCommand, Stdio};
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::{build_reachable_pack, collect_reachable_object_ids, FileObjectDatabase};
 use sley_protocol::{
     build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
     parse_upload_pack_features, plan_push_commands, read_receive_pack_report_status,
     read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
-    write_receive_pack_push_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request, GitService, ReceivePackPushRequestOptions, RefAdvertisement,
+    read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
+    ProtocolV2FetchShallowInfo, ReceivePackPushRequestOptions, RefAdvertisement,
     UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
     UploadPackRequest,
 };
@@ -281,41 +282,80 @@ pub(crate) fn ls_remote_ssh(
 }
 
 /// Fetch `wants` from an SSH upload-pack remote into the repository at `git_dir`,
-/// installing the resulting pack. Objects already present locally are skipped;
-/// `promisor` selects promisor-pack installation.
+/// installing the resulting pack. Objects already present locally are skipped (for
+/// non-shallow fetches); `promisor` selects promisor-pack installation.
+///
+/// When `deepen` is set the fetch is shallow: the request replays `shallow` (the
+/// client's current boundary from `$GIT_DIR/shallow`) and asks the server to
+/// truncate history to `deepen` commits. The returned [`ProtocolV2FetchShallowInfo`]
+/// entries are the server's shallow-info updates the caller must fold into
+/// `$GIT_DIR/shallow` (see [`crate::apply_shallow_info`]); they are empty for a
+/// non-deepen fetch.
+#[allow(clippy::too_many_arguments)]
 pub fn install_fetch_pack_via_ssh_upload_pack(
     git_dir: &Path,
     format: ObjectFormat,
     remote: &RemoteUrl,
     features: &UploadPackFeatures,
     wants: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
     promisor: bool,
-) -> Result<()> {
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
+    // A deepen request must always reach the server (the shallow boundary may move
+    // even when every wanted object is already present), so only the plain fetch
+    // takes the "everything is local already" shortcut.
+    if deepen.is_none()
+        && wants
+            .iter()
+            .map(|want| local_db.contains(want))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|contains| contains)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let request = UploadPackRequest {
         wants,
+        capabilities: ssh_shallow_request_capabilities(deepen),
+        shallow,
+        deepen,
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(git_dir, format)?;
-    let response = ssh_upload_pack_fetch_response(remote, format, features, request, haves)?;
+    // Only a deepen request gets a leading shallow-info section in the response;
+    // a plain fetch must use the non-shallow reader (the response starts straight
+    // at the NAK/ACK), preserving the existing SSH wire handling exactly.
+    let (shallow_info, response) = if deepen.is_some() {
+        ssh_upload_pack_shallow_fetch_response(remote, format, features, request, haves)?
+    } else {
+        let response = ssh_upload_pack_fetch_response(remote, format, features, request, haves)?;
+        (Vec::new(), response)
+    };
     if promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
     } else {
         install_upload_pack_raw_response(&response, &local_db)?;
     }
-    Ok(())
+    Ok(shallow_info)
+}
+
+/// The want-line capabilities for an SSH fetch: the `shallow` capability when a
+/// deepen is requested, otherwise none (preserving the existing plain-fetch wire
+/// form exactly).
+fn ssh_shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
+    if deepen.is_some() {
+        vec![Capability {
+            name: "shallow".into(),
+            value: None,
+        }]
+    } else {
+        Vec::new()
+    }
 }
 
 /// The upload-pack ref advertisements and parsed features for SSH `remote`.
@@ -361,7 +401,8 @@ pub fn ssh_upload_pack_advertisements(
 
 /// Post an upload-pack `request` + `haves` over SSH and read back the raw packfile
 /// response. The leading re-advertised ref set in the RPC stream is read and
-/// discarded before the request is written.
+/// discarded before the request is written. For a plain (non-deepen) request; see
+/// [`ssh_upload_pack_shallow_fetch_response`] for the deepen case.
 pub fn ssh_upload_pack_fetch_response(
     remote: &RemoteUrl,
     format: ObjectFormat,
@@ -369,6 +410,43 @@ pub fn ssh_upload_pack_fetch_response(
     request: UploadPackRequest,
     haves: Vec<ObjectId>,
 ) -> Result<UploadPackRawPackfileResponse> {
+    let (_shallow, response) =
+        ssh_upload_pack_fetch_response_inner(remote, format, request, haves, false)?;
+    Ok(response)
+}
+
+/// Post a deepen upload-pack `request` + `haves` over SSH and read back the
+/// shallow-info section plus the raw packfile response. Use this when `request`
+/// carries a `shallow`/`deepen`/`deepen-since`/`deepen-not` argument: the response
+/// is then prefixed with a shallow-info section (possibly empty). The returned
+/// [`ProtocolV2FetchShallowInfo`] entries are the server's shallow-info updates.
+pub fn ssh_upload_pack_shallow_fetch_response(
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    _features: &UploadPackFeatures,
+    request: UploadPackRequest,
+    haves: Vec<ObjectId>,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
+    ssh_upload_pack_fetch_response_inner(remote, format, request, haves, true)
+}
+
+/// Drive the `ssh` upload-pack subprocess for `request` + `haves`, reading back the
+/// raw packfile response. When `expect_shallow_info` is set (the request is a
+/// deepen request) the response's leading shallow-info section is parsed and
+/// returned; otherwise no shallow-info is expected and the returned vec is empty.
+fn ssh_upload_pack_fetch_response_inner(
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    request: UploadPackRequest,
+    haves: Vec<ObjectId>,
+    expect_shallow_info: bool,
+) -> Result<(
+    Vec<ProtocolV2FetchShallowInfo>,
+    UploadPackRawPackfileResponse,
+)> {
     if remote.transport != RemoteTransport::Ssh {
         return Err(GitError::InvalidFormat(
             "SSH upload-pack requires an SSH remote".into(),
@@ -403,7 +481,14 @@ pub fn ssh_upload_pack_fetch_response(
     )?;
     drop(stdin);
 
-    let response = read_upload_pack_raw_packfile_response(format, &mut stdout)?;
+    let result = if expect_shallow_info {
+        read_upload_pack_shallow_info_and_raw_packfile_response(format, &mut stdout)?
+    } else {
+        (
+            Vec::new(),
+            read_upload_pack_raw_packfile_response(format, &mut stdout)?,
+        )
+    };
     let output = child.wait_with_output()?;
     if !output.status.success() {
         return Err(GitError::Command(format!(
@@ -412,7 +497,7 @@ pub fn ssh_upload_pack_fetch_response(
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    Ok(response)
+    Ok(result)
 }
 
 /// A human-readable rendering of an SSH `remote` for error messages. The CLI built
