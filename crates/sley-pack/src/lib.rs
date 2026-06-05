@@ -1,11 +1,11 @@
 use flate2::Compression;
-use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
+use std::cell::RefCell;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackEntry {
@@ -367,9 +367,12 @@ impl PackFile {
                     }
                     _ => None,
                 };
-            let mut decoder = ZlibDecoder::new(&bytes[offset..trailer_offset]);
-            let mut body = Vec::with_capacity(header.size.min(usize::MAX as u64) as usize);
-            decoder.read_to_end(&mut body)?;
+            let mut body = Vec::new();
+            let consumed = inflate_into(
+                &bytes[offset..trailer_offset],
+                &mut body,
+                header.size.min(usize::MAX as u64) as usize,
+            )?;
             if body.len() as u64 != header.size {
                 return Err(GitError::InvalidObject(format!(
                     "pack object declared {} bytes, decoded {}",
@@ -377,7 +380,6 @@ impl PackFile {
                     body.len()
                 )));
             }
-            let consumed = decoder.total_in() as usize;
             if consumed == 0 {
                 return Err(GitError::InvalidFormat(
                     "empty compressed pack entry".into(),
@@ -661,9 +663,12 @@ impl PackIndex {
                 }
                 _ => None,
             };
-            let mut decoder = ZlibDecoder::new(&pack_bytes[offset..trailer_offset]);
-            let mut body = Vec::with_capacity(header.size.min(usize::MAX as u64) as usize);
-            decoder.read_to_end(&mut body)?;
+            let mut body = Vec::new();
+            let consumed = inflate_into(
+                &pack_bytes[offset..trailer_offset],
+                &mut body,
+                header.size.min(usize::MAX as u64) as usize,
+            )?;
             if body.len() as u64 != header.size {
                 return Err(GitError::InvalidObject(format!(
                     "pack object declared {} bytes, decoded {}",
@@ -671,7 +676,6 @@ impl PackIndex {
                     body.len()
                 )));
             }
-            let consumed = decoder.total_in() as usize;
             if consumed == 0 {
                 return Err(GitError::InvalidFormat(
                     "empty compressed pack entry".into(),
@@ -1765,6 +1769,82 @@ impl PackDeltaCache for NoopDeltaCache {
     fn insert(&self, _offset: u64, _object: &EncodedObject) {}
 }
 
+// Reused zlib inflate state. Resetting and reusing one `Decompress` avoids
+// allocating a fresh (~10 KiB) `InflateState` for every object and delta decoded —
+// an allocation that dominated bulk reads. Borrowed only for the duration of a
+// single inflate; the recursive pack reader fully inflates each entry's data before
+// recursing to its base, so the borrow never nests.
+thread_local! {
+    static INFLATE: RefCell<flate2::Decompress> = RefCell::new(flate2::Decompress::new(true));
+}
+
+/// Inflate the entire zlib stream at the front of `compressed`, appending the
+/// decoded bytes to `out` (pre-reserving `size_hint`), reusing the thread-local
+/// inflate state. Returns the number of *compressed* bytes consumed (so callers
+/// stepping through a pack can advance to the next entry). Byte-for-byte
+/// equivalent to `ZlibDecoder::read_to_end` + `total_in`.
+fn inflate_into(compressed: &[u8], out: &mut Vec<u8>, size_hint: usize) -> Result<usize> {
+    INFLATE.with(|cell| {
+        let mut decompress = cell.borrow_mut();
+        decompress.reset(true);
+        out.reserve(size_hint.max(64));
+        let mut input = compressed;
+        let mut consumed_total = 0usize;
+        loop {
+            // Always leave output room so a zero-progress result means the input
+            // (not the buffer) is exhausted.
+            if out.len() == out.capacity() {
+                out.reserve(out.len().max(64));
+            }
+            let before_in = decompress.total_in();
+            let before_out = decompress.total_out();
+            let status = decompress
+                .decompress_vec(input, out, flate2::FlushDecompress::None)
+                .map_err(|err| GitError::InvalidObject(format!("zlib inflate failed: {err}")))?;
+            let consumed = (decompress.total_in() - before_in) as usize;
+            let produced = decompress.total_out() - before_out;
+            input = &input[consumed..];
+            consumed_total += consumed;
+            match status {
+                flate2::Status::StreamEnd => return Ok(consumed_total),
+                _ if consumed == 0 && produced == 0 => {
+                    return Err(GitError::InvalidObject("truncated zlib stream".into()));
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Inflate at least `max_out` bytes (or until the stream ends) from `compressed`
+/// into `out`, reusing the thread-local state. Used to read a delta's leading
+/// base-size / result-size varints without inflating the whole instruction stream.
+fn inflate_prefix(compressed: &[u8], max_out: usize, out: &mut Vec<u8>) -> Result<()> {
+    INFLATE.with(|cell| {
+        let mut decompress = cell.borrow_mut();
+        decompress.reset(true);
+        out.reserve(max_out.max(16));
+        let mut input = compressed;
+        while out.len() < max_out {
+            if out.len() == out.capacity() {
+                out.reserve(out.len().max(16));
+            }
+            let before_in = decompress.total_in();
+            let before_out = decompress.total_out();
+            let status = decompress
+                .decompress_vec(input, out, flate2::FlushDecompress::None)
+                .map_err(|err| GitError::InvalidObject(format!("zlib inflate failed: {err}")))?;
+            let consumed = (decompress.total_in() - before_in) as usize;
+            let produced = decompress.total_out() - before_out;
+            input = &input[consumed..];
+            if status == flate2::Status::StreamEnd || (consumed == 0 && produced == 0) {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Decode the single object stored at byte `offset` within `pack_bytes`, reading
 /// only that object and its delta-base chain instead of parsing the whole pack.
 ///
@@ -1848,9 +1928,12 @@ where
         }
         _ => None,
     };
-    let mut decoder = ZlibDecoder::new(&pack_bytes[cursor..trailer_offset]);
-    let mut body = Vec::with_capacity(header.size.min(usize::MAX as u64) as usize);
-    decoder.read_to_end(&mut body)?;
+    let mut body = Vec::new();
+    inflate_into(
+        &pack_bytes[cursor..trailer_offset],
+        &mut body,
+        header.size.min(usize::MAX as u64) as usize,
+    )?;
     if body.len() as u64 != header.size {
         return Err(GitError::InvalidObject(format!(
             "pack object declared {} bytes, decoded {}",
@@ -1969,15 +2052,13 @@ where
 /// Number of inflated delta-stream bytes to read when only the leading base-size
 /// and result-size varints are needed. Each varint is at most 10 bytes, so a short
 /// prefix always covers both without inflating the delta instructions.
-const DELTA_HEADER_PREFIX_LEN: u64 = 32;
+const DELTA_HEADER_PREFIX_LEN: usize = 32;
 
 /// Result size of a delta whose zlib-compressed stream starts at `compressed`,
 /// inflating only the short prefix that holds its two leading varints.
 fn delta_result_size_from_stream(compressed: &[u8]) -> Result<u64> {
     let mut prefix = Vec::new();
-    ZlibDecoder::new(compressed)
-        .take(DELTA_HEADER_PREFIX_LEN)
-        .read_to_end(&mut prefix)?;
+    inflate_prefix(compressed, DELTA_HEADER_PREFIX_LEN, &mut prefix)?;
     decoded_delta_result_size(&prefix)
 }
 
@@ -3639,7 +3720,9 @@ pub fn write_bitmap(
 mod tests {
     use super::*;
     use flate2::Compression;
+    use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
+    use std::io::Read;
     use std::fs;
     use std::io::Write;
     use std::path::{Path, PathBuf};
