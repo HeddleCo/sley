@@ -19,7 +19,10 @@
 //! The lift proceeds in stages (see `docs/git-remote-extraction.md`); this is
 //! the scaffold (stage A).
 
-use sley_core::Result;
+use std::path::Path;
+
+use sley_config::GitConfig;
+use sley_core::{ObjectFormat, Result};
 use sley_transport::GitCredential;
 
 mod credentials;
@@ -45,6 +48,28 @@ pub use local::{
     upload_pack_from_local_repository, upload_pack_request_uses_sideband,
     upload_pack_sideband_response,
 };
+
+mod fetch;
+pub use fetch::{
+    append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
+    apply_configured_remote_tag_option, fetch, fetch_head_source_description,
+    fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
+    order_bundle_fetch_all_tags_updates, prune_remote_tracking_refs_from_advertisements,
+    retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
+    write_fetch_head_records, FetchOptions, FetchOutcome, FetchSource, PrunedRef,
+};
+
+/// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
+///
+/// Reads `common_git_dir/config`'s `extensions.objectFormat`, defaulting to
+/// SHA-1 when the config is absent or unreadable (matching git). `common_git_dir`
+/// must already be the common git dir; this does no worktree resolution.
+pub fn object_format_for_git_dir(common_git_dir: &Path) -> Result<ObjectFormat> {
+    let Ok(config) = GitConfig::read(common_git_dir.join("config")) else {
+        return Ok(ObjectFormat::Sha1);
+    };
+    config.repository_object_format()
+}
 
 /// Supplies credentials for an authenticated remote, mirroring git's credential
 /// protocol: [`fill`](CredentialProvider::fill) is handed a partial

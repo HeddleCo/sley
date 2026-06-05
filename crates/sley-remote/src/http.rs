@@ -14,7 +14,6 @@
 
 use std::path::Path;
 
-use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
@@ -32,9 +31,8 @@ use sley_transport::{
     RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
 };
 
-use crate::credentials::{
-    credential_fill, credential_request_for_url, credential_store, http_url_credential,
-};
+use crate::credentials::{credential_request_for_url, http_url_credential};
+use crate::CredentialProvider;
 
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
@@ -53,12 +51,14 @@ pub fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
 }
 
-/// Perform an HTTP request, retrying once with credential-helper-supplied
+/// Perform an HTTP request, retrying once with credential-provider-supplied
 /// authentication if the first attempt returns 401. `perform` is invoked with an
 /// optional `Authorization` header value and must be idempotent (it may run twice).
+/// A successful retry approves the credential with `credentials`; a still-401
+/// retry rejects it.
 pub fn http_send_with_auth(
     remote: &RemoteUrl,
-    config: Option<&GitConfig>,
+    credentials: &mut dyn CredentialProvider,
     mut perform: impl FnMut(Option<&str>) -> Result<HttpResponse>,
 ) -> Result<HttpResponse> {
     let initial = http_url_credential(remote);
@@ -74,14 +74,18 @@ pub fn http_send_with_auth(
     if request.username.is_none() {
         request.username = initial.and_then(|credential| credential.username);
     }
-    let Some(filled) = credential_fill(config, request)? else {
+    let Some(filled) = credentials.fill(request)? else {
         return Ok(response);
     };
     let Some(header) = git_credential_basic_authorization(&filled)? else {
         return Ok(response);
     };
     let retry = perform(Some(&header))?;
-    credential_store(config, &filled, retry.status != 401);
+    if retry.status != 401 {
+        credentials.approve(&filled)?;
+    } else {
+        credentials.reject(&filled)?;
+    }
     Ok(retry)
 }
 
@@ -148,12 +152,12 @@ pub fn http_advertised_refs(
 pub fn http_service_advertisements(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
-    config: Option<&GitConfig>,
     format: ObjectFormat,
     service: GitService,
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<RefAdvertisementSet> {
     let url = http_smart_info_refs_url(remote, service)?;
-    let response = http_send_with_auth(remote, config, |auth| {
+    let response = http_send_with_auth(remote, credentials, |auth| {
         client.get(&url, &http_authorization_headers(auth))
     })?;
     http_check_status(&response, &url)?;
@@ -165,10 +169,11 @@ pub fn http_service_advertisements(
 pub fn http_upload_pack_advertisements(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
-    config: Option<&GitConfig>,
     format: ObjectFormat,
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let set = http_service_advertisements(client, remote, config, format, GitService::UploadPack)?;
+    let set =
+        http_service_advertisements(client, remote, format, GitService::UploadPack, credentials)?;
     let features = set
         .refs
         .first()
@@ -183,10 +188,10 @@ pub fn http_upload_pack_advertisements(
 pub fn http_upload_pack_fetch_response(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
-    config: Option<&GitConfig>,
     format: ObjectFormat,
     request: UploadPackRequest,
     haves: Vec<ObjectId>,
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<UploadPackRawPackfileResponse> {
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
@@ -196,7 +201,7 @@ pub fn http_upload_pack_fetch_response(
         &UploadPackNegotiationRequest { haves, done: true },
     )?;
     let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
-    let mut response = http_send_with_auth(remote, config, |auth| {
+    let mut response = http_send_with_auth(remote, credentials, |auth| {
         client.post(
             &url,
             &content_type,
@@ -220,9 +225,9 @@ pub fn install_fetch_pack_via_http_upload_pack(
     git_dir: &Path,
     format: ObjectFormat,
     remote: &RemoteUrl,
-    config: Option<&GitConfig>,
     wants: Vec<ObjectId>,
     promisor: bool,
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<()> {
     if wants.is_empty() {
         return Ok(());
@@ -242,7 +247,8 @@ pub fn install_fetch_pack_via_http_upload_pack(
         ..UploadPackRequest::default()
     };
     let haves = crate::local::local_have_oids(git_dir, format)?;
-    let response = http_upload_pack_fetch_response(client, remote, config, format, request, haves)?;
+    let response =
+        http_upload_pack_fetch_response(client, remote, format, request, haves, credentials)?;
     if promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
     } else {

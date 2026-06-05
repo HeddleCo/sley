@@ -25,8 +25,7 @@ use sley_protocol::{
     ReceivePackCommand, ReceivePackPushRequest, ReceivePackPushRequestOptions,
     ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement, RefAdvertisementSet,
     UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest, build_receive_pack_push_request, encode_fetch_head,
-    fetch_ref_updates_to_fetch_head, parse_receive_pack_features, parse_refspec,
+    UploadPackRequest, build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
     parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
     read_receive_pack_push_options, read_receive_pack_report_status, read_receive_pack_request,
     read_ref_advertisement_set, read_upload_pack_negotiation_request,
@@ -2943,8 +2942,13 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
 
     let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
     let client = sley_remote::new_http_client();
-    let (advertisements, features) =
-        sley_remote::http_upload_pack_advertisements(&client, &remote, None, ObjectFormat::Sha1)?;
+    let mut credentials = sley_remote::NoCredentials;
+    let (advertisements, features) = sley_remote::http_upload_pack_advertisements(
+        &client,
+        &remote,
+        ObjectFormat::Sha1,
+        &mut credentials,
+    )?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
@@ -8897,18 +8901,10 @@ fn configure_push_upstreams(
     write_repo_config(git_dir, &config)
 }
 
-#[derive(Clone, Copy)]
-struct FetchOptions {
-    quiet: bool,
-    auto_follow_tags: bool,
-    fetch_all_tags: bool,
-    prune: bool,
-    dry_run: bool,
-    append: bool,
-    write_fetch_head: bool,
-    tag_option_explicit: bool,
-    prune_option_explicit: bool,
-}
+// Fetch options live in `sley-remote` (the library owns the fetch flow); the CLI
+// constructs and threads the same struct so its `cmd_fetch`/clone/bundle/ssh
+// paths share one definition.
+use sley_remote::FetchOptions;
 
 fn fetch_bundle(
     git_dir: &Path,
@@ -8936,21 +8932,22 @@ fn fetch_bundle(
         }
         return Ok(());
     }
-    let refspecs = fetch_refspecs_for_source(Vec::new(), refspecs, options.fetch_all_tags);
+    let refspecs =
+        sley_remote::fetch_refspecs_for_source(Vec::new(), refspecs, options.fetch_all_tags);
     let mut fetched = bundle_fetch_refs(&references, &refspecs, options.auto_follow_tags)?;
     if options.fetch_all_tags {
-        mark_tag_refspec_updates_not_for_merge(&mut fetched);
-        order_bundle_fetch_all_tags_updates(&mut fetched);
+        sley_remote::mark_tag_refspec_updates_not_for_merge(&mut fetched);
+        sley_remote::order_bundle_fetch_all_tags_updates(&mut fetched);
     }
     let store = FileRefStore::new(git_dir, format);
     if !options.fetch_all_tags {
-        retain_missing_auto_follow_tags(&store, &mut fetched)?;
+        sley_remote::retain_missing_auto_follow_tags(&store, &mut fetched)?;
     }
     if options.dry_run {
         return Ok(());
     }
     if options.write_fetch_head {
-        write_fetch_head(git_dir, bundle_path, &fetched, options.append)?;
+        sley_remote::write_fetch_head(git_dir, bundle_path, &fetched, options.append)?;
     }
     let updates = fetched
         .iter()
@@ -8965,103 +8962,64 @@ fn fetch_bundle(
     Ok(())
 }
 
+/// Resolve the repository context and delegate a local (`file://`/path) fetch to
+/// [`sley_remote::fetch`]. Repository/URL resolution and output formatting stay
+/// here; the fetch orchestration (ref-map, pack install, `FETCH_HEAD`, prune)
+/// lives in the library.
 fn fetch_local_repository(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
-    mut options: FetchOptions,
+    options: FetchOptions,
 ) -> Result<()> {
     let remote_git_dir = ls_remote_git_dir(source)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-    let remote_format = repository_object_format(&remote_common_git_dir)?;
-    if remote_format != format {
-        return Err(GitError::InvalidObjectId(format!(
-            "remote repository uses {}, local repository uses {}",
-            remote_format.name(),
-            format.name()
-        )));
-    }
     let config = read_repo_config(git_dir)?;
-    apply_configured_remote_tag_option(&config, source, &mut options);
-    apply_configured_fetch_prune_option(&config, source, &mut options);
-    let promisor_remote = config
-        .get_bool("remote", Some(source), "promisor")
-        .unwrap_or(false);
-    let configured_refspecs = if refspecs.is_empty() {
-        remote_config_values(&config, source, "fetch")
-    } else {
-        Vec::new()
+    let fetch_source = sley_remote::FetchSource::Local {
+        git_dir: remote_git_dir,
+        common_git_dir: remote_common_git_dir,
     };
-    let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
-    let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
-    let fetch_head_source = fetch_head_source_description(&config, source);
-    let refspecs = fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
-    let refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(refspec))
-        .collect::<Result<Vec<_>>>()?;
-    let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
-    let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
-    let store = FileRefStore::new(git_dir, format);
-    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, format);
-    if options.fetch_all_tags {
-        mark_tag_refspec_updates_not_for_merge(&mut updates);
-    } else {
-        if options.auto_follow_tags {
-            append_reachable_auto_follow_tags(
-                &advertisements,
-                &remote_db,
-                format,
-                &refspecs,
-                &mut updates,
-            )?;
-        }
-        retain_missing_auto_follow_tags(&store, &mut updates)?;
+    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
+}
+
+/// A [`sley_remote::ProgressSink`] that prints each progress/summary line to
+/// stdout, reproducing the CLI's fetch prune output. Write errors are ignored,
+/// matching how progress output is otherwise best-effort.
+struct StdoutProgress;
+
+impl sley_remote::ProgressSink for StdoutProgress {
+    fn message(&mut self, message: &str) {
+        let _ = writeln!(io::stdout(), "{message}");
     }
-    if configured_remote_fetch {
-        for update in &mut updates {
-            update.not_for_merge = true;
-        }
-    }
-    let starts = updates
-        .iter()
-        .map(|update| update.oid.clone())
-        .collect::<Vec<_>>();
-    sley_remote::install_fetch_pack_via_local_upload_pack(
+}
+
+/// Drive [`sley_remote::fetch`] for an already-resolved `source`, wiring the
+/// credential-helper provider and the stdout progress sink, then format the
+/// outcome the way the CLI always has (prune notices are emitted through the sink
+/// during the call; nothing else is printed for fetch).
+fn run_fetch(
+    git_dir: &Path,
+    format: ObjectFormat,
+    config: &GitConfig,
+    source: &str,
+    fetch_source: &sley_remote::FetchSource,
+    refspecs: &[String],
+    options: FetchOptions,
+) -> Result<()> {
+    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
+    let mut progress = StdoutProgress;
+    sley_remote::fetch(
         git_dir,
-        &remote_git_dir,
         format,
-        starts,
-        promisor_remote,
+        config,
+        source,
+        fetch_source,
+        refspecs,
+        &options,
+        &mut credentials,
+        &mut progress,
     )?;
-    if options.dry_run {
-        return Ok(());
-    }
-    if options.write_fetch_head {
-        if default_head_fetch
-            && updates.len() == 1
-            && updates[0].src == "HEAD"
-            && updates[0].dst.is_none()
-        {
-            write_default_fetch_head(git_dir, source, updates[0].oid.clone(), options.append)?;
-        } else {
-            write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
-        }
-    }
-    let ref_updates = updates
-        .iter()
-        .filter_map(|update| {
-            update.dst.as_ref().map(|dst| BundleRefUpdate {
-                name: dst.clone(),
-                oid: update.oid.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    store.apply_bundle_ref_updates(&ref_updates, None)?;
-    if options.prune && remote_exists(&config, source) {
-        prune_fetch_remote_tracking_refs(&config, &store, git_dir, source, options.quiet)?;
-    }
     Ok(())
 }
 
@@ -9078,8 +9036,8 @@ fn fetch_ssh_repository(
     mut options: FetchOptions,
 ) -> Result<()> {
     let config = read_repo_config(git_dir)?;
-    apply_configured_remote_tag_option(&config, source, &mut options);
-    apply_configured_fetch_prune_option(&config, source, &mut options);
+    sley_remote::apply_configured_remote_tag_option(&config, source, &mut options);
+    sley_remote::apply_configured_fetch_prune_option(&config, source, &mut options);
     let promisor_remote = config
         .get_bool("remote", Some(source), "promisor")
         .unwrap_or(false);
@@ -9090,8 +9048,9 @@ fn fetch_ssh_repository(
     };
     let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
     let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
-    let fetch_head_source = fetch_head_source_description(&config, source);
-    let refspecs = fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
+    let fetch_head_source = sley_remote::fetch_head_source_description(&config, source);
+    let refspecs =
+        sley_remote::fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
     let refspecs = refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
@@ -9101,9 +9060,9 @@ fn fetch_ssh_repository(
     let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
     let store = FileRefStore::new(git_dir, format);
     if options.fetch_all_tags {
-        mark_tag_refspec_updates_not_for_merge(&mut updates);
+        sley_remote::mark_tag_refspec_updates_not_for_merge(&mut updates);
     } else {
-        retain_missing_auto_follow_tags(&store, &mut updates)?;
+        sley_remote::retain_missing_auto_follow_tags(&store, &mut updates)?;
     }
     if configured_remote_fetch {
         for update in &mut updates {
@@ -9131,9 +9090,14 @@ fn fetch_ssh_repository(
             && updates[0].src == "HEAD"
             && updates[0].dst.is_none()
         {
-            write_default_fetch_head(git_dir, source, updates[0].oid.clone(), options.append)?;
+            sley_remote::write_default_fetch_head(
+                git_dir,
+                source,
+                updates[0].oid.clone(),
+                options.append,
+            )?;
         } else {
-            write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
+            sley_remote::write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
         }
     }
     let ref_updates = updates
@@ -9147,12 +9111,14 @@ fn fetch_ssh_repository(
         .collect::<Vec<_>>();
     store.apply_bundle_ref_updates(&ref_updates, None)?;
     if options.prune && remote_exists(&config, source) {
-        prune_fetch_remote_tracking_refs_from_advertisements(
+        let mut progress = StdoutProgress;
+        sley_remote::prune_remote_tracking_refs_from_advertisements(
             &config,
             &store,
             source,
             &advertisements,
             options.quiet,
+            &mut progress,
         )?;
     }
     Ok(())
@@ -9303,95 +9269,20 @@ fn push_remote_is_http(remote: &str) -> Result<bool> {
     sley_remote::remote_url_is_http(&push_resolved_url(remote)?)
 }
 
+/// Resolve the repository context and delegate a smart-HTTP(S) fetch to
+/// [`sley_remote::fetch`]. URL resolution and output formatting stay here; the
+/// fetch orchestration lives in the library.
 fn fetch_http_repository(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
-    mut options: FetchOptions,
+    options: FetchOptions,
 ) -> Result<()> {
     let config = read_repo_config(git_dir)?;
-    apply_configured_remote_tag_option(&config, source, &mut options);
-    apply_configured_fetch_prune_option(&config, source, &mut options);
-    let promisor_remote = config
-        .get_bool("remote", Some(source), "promisor")
-        .unwrap_or(false);
-    let configured_refspecs = if refspecs.is_empty() {
-        remote_config_values(&config, source, "fetch")
-    } else {
-        Vec::new()
-    };
-    let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
-    let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
-    let fetch_head_source = fetch_head_source_description(&config, source);
-    let refspecs = fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
-    let refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(refspec))
-        .collect::<Result<Vec<_>>>()?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let client = sley_remote::new_http_client();
-    let (advertisements, _features) =
-        sley_remote::http_upload_pack_advertisements(&client, &remote, Some(&config), format)?;
-    let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
-    let store = FileRefStore::new(git_dir, format);
-    if options.fetch_all_tags {
-        mark_tag_refspec_updates_not_for_merge(&mut updates);
-    } else {
-        retain_missing_auto_follow_tags(&store, &mut updates)?;
-    }
-    if configured_remote_fetch {
-        for update in &mut updates {
-            update.not_for_merge = true;
-        }
-    }
-    let wants = updates
-        .iter()
-        .map(|update| update.oid.clone())
-        .collect::<Vec<_>>();
-    sley_remote::install_fetch_pack_via_http_upload_pack(
-        &client,
-        git_dir,
-        format,
-        &remote,
-        Some(&config),
-        wants,
-        promisor_remote,
-    )?;
-    if options.dry_run {
-        return Ok(());
-    }
-    if options.write_fetch_head {
-        if default_head_fetch
-            && updates.len() == 1
-            && updates[0].src == "HEAD"
-            && updates[0].dst.is_none()
-        {
-            write_default_fetch_head(git_dir, source, updates[0].oid.clone(), options.append)?;
-        } else {
-            write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
-        }
-    }
-    let ref_updates = updates
-        .iter()
-        .filter_map(|update| {
-            update.dst.as_ref().map(|dst| BundleRefUpdate {
-                name: dst.clone(),
-                oid: update.oid.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    store.apply_bundle_ref_updates(&ref_updates, None)?;
-    if options.prune && remote_exists(&config, source) {
-        prune_fetch_remote_tracking_refs_from_advertisements(
-            &config,
-            &store,
-            source,
-            &advertisements,
-            options.quiet,
-        )?;
-    }
-    Ok(())
+    let fetch_source = sley_remote::FetchSource::Http(remote);
+    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
 }
 
 fn push_http_repository(
@@ -9414,8 +9305,14 @@ fn push_http_repository(
     }
     let config = read_repo_config(git_dir).ok();
     let client = sley_remote::new_http_client();
-    let advertisement_set =
-        sley_remote::http_service_advertisements(&client, &parsed, config.as_ref(), format, GitService::ReceivePack)?;
+    let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
+    let advertisement_set = sley_remote::http_service_advertisements(
+        &client,
+        &parsed,
+        format,
+        GitService::ReceivePack,
+        &mut credentials,
+    )?;
     let features = advertisement_set
         .refs
         .first()
@@ -9492,7 +9389,7 @@ fn push_http_repository(
     write_receive_pack_push_request(&mut body, &request)?;
     let url = http_smart_rpc_url(&parsed, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let mut response = sley_remote::http_send_with_auth(&parsed, config.as_ref(), |auth| {
+    let mut response = sley_remote::http_send_with_auth(&parsed, &mut credentials, |auth| {
         client.post(
             &url,
             &content_type,
@@ -9541,8 +9438,13 @@ fn ls_remote_http_records(
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
     let client = sley_remote::new_http_client();
-    let (refs, features) =
-        sley_remote::http_upload_pack_advertisements(&client, &parsed, config.as_ref(), ObjectFormat::Sha1)?;
+    let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
+    let (refs, features) = sley_remote::http_upload_pack_advertisements(
+        &client,
+        &parsed,
+        ObjectFormat::Sha1,
+        &mut credentials,
+    )?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
@@ -9585,323 +9487,6 @@ fn ls_remote_http_records(
     Ok(Some((records, format)))
 }
 
-fn apply_configured_remote_tag_option(
-    config: &GitConfig,
-    source: &str,
-    options: &mut FetchOptions,
-) {
-    if options.tag_option_explicit || !remote_exists(config, source) {
-        return;
-    }
-    match remote_config_values(config, source, "tagopt")
-        .into_iter()
-        .last()
-        .as_deref()
-    {
-        Some("--tags") => {
-            options.auto_follow_tags = true;
-            options.fetch_all_tags = true;
-        }
-        Some("--no-tags") => {
-            options.auto_follow_tags = false;
-            options.fetch_all_tags = false;
-        }
-        _ => {}
-    }
-}
-
-fn apply_configured_fetch_prune_option(
-    config: &GitConfig,
-    source: &str,
-    options: &mut FetchOptions,
-) {
-    if options.prune_option_explicit || !remote_exists(config, source) {
-        return;
-    }
-    if let Some(prune) = config.get_bool("remote", Some(source), "prune") {
-        options.prune = prune;
-    } else if let Some(prune) = config.get_bool("fetch", None, "prune") {
-        options.prune = prune;
-    }
-}
-
-fn write_default_fetch_head(
-    git_dir: &Path,
-    source: &str,
-    oid: ObjectId,
-    append: bool,
-) -> Result<()> {
-    let records = [FetchHeadRecord {
-        oid,
-        not_for_merge: false,
-        description: source.to_string(),
-    }];
-    write_fetch_head_records(git_dir, &records, append)?;
-    Ok(())
-}
-
-fn write_fetch_head_records(
-    git_dir: &Path,
-    records: &[FetchHeadRecord],
-    append: bool,
-) -> Result<()> {
-    let encoded = encode_fetch_head(records)?;
-    if append {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(git_dir.join("FETCH_HEAD"))?;
-        file.write_all(&encoded)?;
-    } else {
-        fs::write(git_dir.join("FETCH_HEAD"), encoded)?;
-    }
-    Ok(())
-}
-
-fn fetch_refspecs_for_source(
-    configured: Vec<String>,
-    refspecs: &[String],
-    fetch_all_tags: bool,
-) -> Vec<String> {
-    let mut effective = if !refspecs.is_empty() {
-        refspecs.to_vec()
-    } else if configured.is_empty() {
-        vec!["HEAD".to_string()]
-    } else {
-        configured
-    };
-    if fetch_all_tags {
-        effective.push("refs/tags/*:refs/tags/*".to_string());
-    }
-    effective
-}
-
-fn mark_tag_refspec_updates_not_for_merge(updates: &mut [FetchRefUpdate]) {
-    for update in updates {
-        if update.src.starts_with("refs/tags/") && update.dst.as_deref() == Some(&update.src) {
-            update.not_for_merge = true;
-        }
-    }
-}
-
-fn retain_missing_auto_follow_tags(
-    store: &FileRefStore,
-    updates: &mut Vec<FetchRefUpdate>,
-) -> Result<()> {
-    let mut retained = Vec::with_capacity(updates.len());
-    for update in updates.drain(..) {
-        if update.not_for_merge
-            && update.src.starts_with("refs/tags/")
-            && update.dst.as_deref() == Some(&update.src)
-            && store.read_ref(&update.src)?.is_some()
-        {
-            continue;
-        }
-        retained.push(update);
-    }
-    *updates = retained;
-    Ok(())
-}
-
-fn append_reachable_auto_follow_tags(
-    advertisements: &[RefAdvertisement],
-    remote_db: &FileObjectDatabase,
-    format: ObjectFormat,
-    refspecs: &[sley_protocol::RefSpec],
-    updates: &mut Vec<FetchRefUpdate>,
-) -> Result<()> {
-    if !updates.iter().any(|update| update.dst.is_some()) {
-        return Ok(());
-    }
-    let starts = updates
-        .iter()
-        .filter(|update| update.dst.is_some() && !update.src.starts_with("refs/tags/"))
-        .map(|update| update.oid.clone());
-    let reachable = collect_reachable_object_ids(remote_db, format, starts)?;
-    let mut fetched_srcs = updates
-        .iter()
-        .map(|update| update.src.clone())
-        .collect::<HashSet<_>>();
-    for reference in advertisements {
-        if !reference.name.starts_with("refs/tags/")
-            || fetched_srcs.contains(&reference.name)
-            || !reachable.contains(&reference.oid)
-            || fetch_refspec_excludes(refspecs, &reference.name)?
-        {
-            continue;
-        }
-        fetched_srcs.insert(reference.name.clone());
-        updates.push(FetchRefUpdate {
-            src: reference.name.clone(),
-            dst: Some(reference.name.clone()),
-            oid: reference.oid.clone(),
-            not_for_merge: true,
-        });
-    }
-    Ok(())
-}
-
-fn fetch_refspec_excludes(refspecs: &[sley_protocol::RefSpec], name: &str) -> Result<bool> {
-    for refspec in refspecs.iter().filter(|refspec| refspec.negative) {
-        if refspec.pattern {
-            if refspec_map_source(refspec, name)?.is_some() {
-                return Ok(true);
-            }
-        } else if refspec.src.as_deref() == Some(name) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn order_bundle_fetch_all_tags_updates(updates: &mut Vec<FetchRefUpdate>) {
-    let followed_oids = updates
-        .iter()
-        .filter(|update| !update.src.starts_with("refs/tags/") && update.dst.is_some())
-        .map(|update| update.oid.clone())
-        .collect::<HashSet<_>>();
-    if followed_oids.is_empty() {
-        return;
-    }
-
-    let mut non_tags = Vec::new();
-    let mut followed_tags = Vec::new();
-    let mut other_tags = Vec::new();
-    for update in updates.drain(..) {
-        if update.src.starts_with("refs/tags/") {
-            if followed_oids.contains(&update.oid) {
-                followed_tags.push(update);
-            } else {
-                other_tags.push(update);
-            }
-        } else {
-            non_tags.push(update);
-        }
-    }
-    updates.extend(non_tags);
-    updates.extend(followed_tags);
-    updates.extend(other_tags);
-}
-
-fn prune_fetch_remote_tracking_refs(
-    config: &GitConfig,
-    store: &FileRefStore,
-    git_dir: &Path,
-    remote: &str,
-    quiet: bool,
-) -> Result<()> {
-    if quiet {
-        let mut sink = io::sink();
-        prune_remote_tracking_refs(&mut sink, config, store, git_dir, remote, false)
-    } else {
-        let mut stdout = io::stdout();
-        prune_remote_tracking_refs(&mut stdout, config, store, git_dir, remote, false)
-    }
-}
-
-fn prune_fetch_remote_tracking_refs_from_advertisements(
-    config: &GitConfig,
-    store: &FileRefStore,
-    remote: &str,
-    advertisements: &[RefAdvertisement],
-    quiet: bool,
-) -> Result<()> {
-    if quiet {
-        let mut sink = io::sink();
-        prune_remote_tracking_refs_from_advertisements(
-            &mut sink,
-            config,
-            store,
-            remote,
-            advertisements,
-            false,
-        )
-    } else {
-        let mut stdout = io::stdout();
-        prune_remote_tracking_refs_from_advertisements(
-            &mut stdout,
-            config,
-            store,
-            remote,
-            advertisements,
-            false,
-        )
-    }
-}
-
-fn prune_remote_tracking_refs_from_advertisements(
-    stdout: &mut impl Write,
-    config: &GitConfig,
-    store: &FileRefStore,
-    remote: &str,
-    advertisements: &[RefAdvertisement],
-    dry_run: bool,
-) -> Result<()> {
-    let remote_branches = advertisements
-        .iter()
-        .filter_map(|advertisement| advertisement.name.strip_prefix("refs/heads/"))
-        .collect::<BTreeSet<_>>();
-    let local_refs = store.list_refs()?;
-    let stale_branches = remote_tracking_branch_names(&local_refs, remote)
-        .into_iter()
-        .filter(|branch| !remote_branches.contains(branch.as_str()))
-        .collect::<Vec<_>>();
-    if stale_branches.is_empty() {
-        return Ok(());
-    }
-    let display_url = remote_config_values(config, remote, "url")
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| remote.into());
-    writeln!(stdout, "Pruning {remote}")?;
-    writeln!(stdout, "URL: {display_url}")?;
-    let remote_head = format!("refs/remotes/{remote}/HEAD");
-    let remote_prefix = format!("refs/remotes/{remote}/");
-    let head_target = match store.read_ref(&remote_head)? {
-        Some(RefTarget::Symbolic(target)) => Some(target),
-        Some(RefTarget::Direct(_)) | None => None,
-    };
-    for branch in stale_branches {
-        let refname = format!("{remote_prefix}{branch}");
-        if dry_run {
-            writeln!(stdout, " * [would prune] {remote}/{branch}")?;
-            if head_target.as_deref() == Some(refname.as_str()) {
-                writeln!(
-                    stdout,
-                    " refs/remotes/{remote}/HEAD will become dangling after {refname} is deleted"
-                )?;
-            }
-            continue;
-        }
-        match store.read_ref(&refname)? {
-            Some(RefTarget::Symbolic(_)) => {
-                let _ = store.delete_symbolic_ref(&refname)?;
-            }
-            Some(RefTarget::Direct(_)) => {
-                let _ = store.delete_ref(&refname)?;
-            }
-            None => {}
-        }
-        writeln!(stdout, " * [pruned] {remote}/{branch}")?;
-        if head_target.as_deref() == Some(refname.as_str()) {
-            let _ = store.delete_symbolic_ref(&remote_head)?;
-            writeln!(
-                stdout,
-                " refs/remotes/{remote}/HEAD has become dangling after {refname} was deleted"
-            )?;
-        }
-    }
-    Ok(())
-}
-
-fn fetch_head_source_description(config: &GitConfig, source: &str) -> String {
-    remote_config_values(config, source, "url")
-        .into_iter()
-        .next()
-        .map(|url| rewrite_url_with_config(config, &url, false))
-        .unwrap_or_else(|| rewrite_url_with_config(config, source, false))
-}
-
 fn bundle_default_fetch_reference(references: &[BundleReference]) -> Result<&BundleReference> {
     references
         .iter()
@@ -9920,7 +9505,7 @@ fn write_bundle_default_fetch_head(
         not_for_merge: false,
         description: bundle_path.to_string(),
     }];
-    write_fetch_head_records(git_dir, &records, append)?;
+    sley_remote::write_fetch_head_records(git_dir, &records, append)?;
     Ok(())
 }
 
@@ -11098,17 +10683,6 @@ fn bundle_fetch_refs(
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
     plan_fetch_ref_updates(&refs, &refspecs, auto_follow_tags)
-}
-
-fn write_fetch_head(
-    git_dir: &Path,
-    bundle_path: &str,
-    fetched: &[FetchRefUpdate],
-    append: bool,
-) -> Result<()> {
-    let records = fetch_ref_updates_to_fetch_head(fetched, bundle_path)?;
-    write_fetch_head_records(git_dir, &records, append)?;
-    Ok(())
 }
 
 fn cmd_remote(args: &[String]) -> Result<()> {
