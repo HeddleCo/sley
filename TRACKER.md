@@ -163,9 +163,37 @@ walking commands are far behind, and the gaps are **algorithmic, not parallelism
 - **#59 abbrev length** — git auto-grows short-OID width on huge repos; sley
   hardcodes 7. Cosmetic-but-real; affects diff index lines, `log --abbrev`, etc.
 
+### Code-review fixes (`015dcb1`, `a82d720`, `b7543c7`)
+
+External review of the recent diff/mmap/repack work surfaced correctness + data-
+safety issues; all fixed, full suite green (1630):
+
+- **diff `A B` content** (HIGH): patch/stat/numstat read the *worktree* for the
+  new side even for two-tree diffs; with a dirty worktree `diff HEAD~1 HEAD`
+  showed dirty bytes. New side is the worktree only when there's no second tree and
+  not `--cached`.
+- **`diff HEAD HEAD`** (HIGH): the head-shortcut consumed the leading HEAD before
+  revision splitting. Bare `diff HEAD` keeps its path; `diff HEAD <rev>` now splits
+  to two trees. `--` args kept separate (never reinterpreted as revisions).
+- **diff range parser** (MED): dropped the bogus dot guard (`HEAD~1...v1.1` now
+  works), range only when both ends resolve, omitted side → HEAD, `A...B` with no
+  merge base errors 128 (was: empty-tree substitution → missing-object later).
+- **mmap safety** (HIGH): `MappedFile::open` is now `unsafe fn`; a safe audited
+  `open_pack` (contract: immutable git pack file) is the only safe entry, so
+  sley-odb stays `unsafe_code = "forbid"`.
+- **repack/MIDX data-safety** (HIGH×2): validate the new `.idx` (parse +
+  pack-checksum) before writing/pruning so a bad `RepackResult` can't leave an
+  unusable only-pack; drop the MIDX when it references *any* removed pack.
+- **pack idx validation** (MED): v2 parse now checks oids are strictly ascending
+  and within their fanout bucket (lookup binary-searches them).
+
+Still open from the review: rev-list exclude/first-parent walks not yet on the
+graph primitive (folds into #60/#61); header-only loose read still slurps the
+whole compressed object (LOW).
+
 ## 🔄 In progress
 
-_(#57 status + #58 commit-graph walk — the remaining two parity refactors.)_
+_(#57 status + #58 log/-n walk — the remaining parity refactors.)_
 
 ---
 
