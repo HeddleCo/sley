@@ -822,6 +822,25 @@ impl PackIndex {
             let oid_start = oid_table.start + idx * hash_len;
             let crc_start = crc_table.start + idx * 4;
             let offset_start = small_offset_table.start + idx * 4;
+            let oid_bytes = &bytes[oid_start..oid_start + hash_len];
+            // Object ids must be strictly ascending: lookup binary-searches them,
+            // and the fanout must match the first byte. A malformed/forged index
+            // (e.g. from a received pack) would otherwise yield silent misses.
+            if idx > 0 && oid_bytes <= &bytes[oid_start - hash_len..oid_start] {
+                return Err(GitError::InvalidFormat(
+                    "pack index object ids are not strictly ascending".into(),
+                ));
+            }
+            let expected_min = if oid_bytes[0] == 0 {
+                0
+            } else {
+                fanout[usize::from(oid_bytes[0] - 1)]
+            };
+            if (idx as u32) < expected_min || (idx as u32) >= fanout[usize::from(oid_bytes[0])] {
+                return Err(GitError::InvalidFormat(
+                    "pack index object id is outside its fanout bucket".into(),
+                ));
+            }
             let raw_offset = u32_be(&bytes[offset_start..offset_start + 4]);
             let offset = if raw_offset & 0x8000_0000 == 0 {
                 u64::from(raw_offset)
@@ -836,7 +855,7 @@ impl PackIndex {
                 u64_be(&bytes[large_start..large_start + 8])
             };
             entries.push(PackIndexEntry {
-                oid: ObjectId::from_raw(format, &bytes[oid_start..oid_start + hash_len])?,
+                oid: ObjectId::from_raw(format, oid_bytes)?,
                 crc32: u32_be(&bytes[crc_start..crc_start + 4]),
                 offset,
             });
