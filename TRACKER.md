@@ -99,6 +99,12 @@ On top of #51, four more measured wins (all byte-identical, full suite green):
 - **Thread-local inflate state** (`d835e86`, #54): reuse one `flate2::Decompress`
   instead of boxing a ~10 KiB `InflateState` per object across the read + bulk
   index-pack decode paths.
+- **Opt-in mmap pack reads** (`c89b8c2`, #55): `mmap` feature memory-maps packs
+  instead of heap-reading them. The one unavoidable `unsafe` (`Mmap::map`) is
+  isolated in a new **`sley-mmap`** crate — the only crate not under the workspace
+  `unsafe_code = "forbid"` — behind an audited safe wrapper (invariant: packs are
+  written by atomic rename, never truncated in place → no SIGBUS). Off by default;
+  a large-repo RSS / cold-start lever, ~parity on normal packs. Byte-identical.
 
 Cumulative on the 2,561-obj / 302 MB repo: `cat-file --batch-check` **1.9s → 43ms
 (~44×, now ~3× of git)**; `--batch` content **1.9s → 198ms (now ~1.8× of git)**.
@@ -123,11 +129,9 @@ _(mmap pack reads (#55) needs an unsafe-policy decision — see backlog.)_
 3. **Dep-feature forwarding (#40)** — zlib-ng backend DONE; `fast-sha1`
    (RustCrypto, hardware SHA-1) DONE; remaining: forward ureq's TLS backend
    (rustls / native-tls / platform-verifier) as selectable.
-8. **mmap pack reads (#55)** — would lower RSS / speed cold start on large packs,
-   but `Mmap::map` is an `unsafe fn`, which `unsafe_code = "forbid"` blocks. Needs
-   a decision: isolate the only unsafe in a tiny `sley-mmap` crate (safe wrapper,
-   feature-gated, off by default) vs relax the workspace forbid vs skip. ~0 gain on
-   normal packs (read once, OS-cached); it is a large-repo memory/scaling lever.
+8. ~~mmap pack reads (#55)~~ **DONE** (`c89b8c2`) — opt-in `mmap` feature; the only
+   `unsafe` is isolated in the new `sley-mmap` crate (the lone crate not under the
+   workspace forbid). Off by default; large-repo RSS / cold-start lever.
 4. **ObjectId `Copy` + `clone_on_copy` cleanup** — deferred from export-core
    (would add ~200 clippy warnings across 15 crates); do as one scoped
    `clippy --fix` pass.
@@ -150,8 +154,8 @@ _(mmap pack reads (#55) needs an unsafe-policy decision — see backlog.)_
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
   ObjectId types.
 - **Remaining gaps:** parallelism for large repos (#50), TLS-backend forwarding
-  (TLS half of #40), pack mmap (#55, needs unsafe decision), comment-preserving
-  config round-trip, and deferred ref-name / path newtypes. cat-file is now ~3×
+  (TLS half of #40), comment-preserving config round-trip, and deferred ref-name /
+  path newtypes. (mmap landed, opt-in, #55.) cat-file is now ~3×
   (`--batch-check`) / ~1.8× (`--batch`) of git, the residual being per-object CLI
   rev-parse (the library read path bypasses it). Bulk-read re-hash + header-only
   reads + streaming/fast SHA-1 + decoder reuse all landed; network,
@@ -177,5 +181,5 @@ _(mmap pack reads (#55) needs an unsafe-policy decision — see backlog.)_
 `#19` decompose sley-cli · `#34` smudge on restore/reset/stash · `#40` dep-feature
 forwarding · `#46` strengthen domain types (signatures/dates/ref names/paths) ·
 `#50` parallelism pass · `#51` bulk-read re-hash fix + header-only reads (done) ·
-`#52`–`#54` streaming/fast SHA-1 + db-reuse + decoder-reuse (done) · `#55` mmap
-pack reads (needs unsafe decision).
+`#52`–`#54` streaming/fast SHA-1 + db-reuse + decoder-reuse (done) · `#55` opt-in
+mmap via isolated `sley-mmap` crate (done).
