@@ -149,10 +149,17 @@ walking commands are far behind, and the gaps are **algorithmic, not parallelism
   - **merge-base — DONE** (`f563de6`): 2-commit base + `--is-ancestor` now use
     graph-accelerated `sley_rev::merge_bases`/`is_ancestor`. flutter 3.65s→~0.9s
     (14×→4×), byte-identical (incl. criss-cross `--all`).
-  - **log / rev-list — remaining**: `walk_commits` reads every commit object *and*
-    walks the whole history with no `-n` early stop. Needs a graph-sourced walk
-    (oid+parents+commit-time) used for traversal/order, reading objects only for
-    displayed commits, honoring `-n`.
+  - **rev-list — DONE** (`f795aa0`): new `sley_rev::walk_commit_metadata` (graph
+    walk → id+parents+time, objects only for graph-omitted commits); `cmd_rev_list`
+    plain listing / `--count` routed through it behind a strict allowlist guard.
+    Byte-identical to sley's slow path and to git (current graph). `rev-list
+    --count` 6.5×→**1.4×** of git with a complete graph (flutter's stale graph
+    bounds it to 3.7× — git would refresh it).
+  - **log + `-n` early-stop — remaining** (#60, #61): `log --format=%H` still uses
+    the object-reading walk (27×); and `-n N` still walks all then truncates
+    (`rev-list -n5000` 31.9×→18.6× — needs a date priority-queue early-stop).
+  - Note: a pre-existing same-second-timestamp tie-break differs from git in
+    `rev-list --all` ordering (sley's slow and fast paths agree; orthogonal).
 - **#59 abbrev length** — git auto-grows short-OID width on huge repos; sley
   hardcodes 7. Cosmetic-but-real; affects diff index lines, `log --abbrev`, etc.
 
