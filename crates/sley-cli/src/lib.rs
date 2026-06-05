@@ -5630,7 +5630,9 @@ fn cmd_merge_base(args: &[String]) -> Result<()> {
         commits.push(sley_rev::peel_to_commit(&db, format, &oid)?);
     }
     if is_ancestor {
-        if ancestor_depths(&db, format, &commits[1])?.contains_key(&commits[0]) {
+        // Graph-accelerated reachability (generation-number pruning + parents from
+        // the commit-graph) instead of walking every ancestor's object.
+        if sley_rev::is_ancestor(&git_dir, format, &db, &commits[0], &commits[1])? {
             return Ok(());
         }
         return Err(GitError::Exit(1));
@@ -5646,7 +5648,9 @@ fn cmd_merge_base(args: &[String]) -> Result<()> {
     } else if commits.len() > 2 {
         merge_bases_default_many(&db, format, &commits)?
     } else {
-        merge_bases(&db, format, &commits[0], &commits[1])?
+        // Two-commit merge base via the commit-graph (parents + generation numbers
+        // from the graph) rather than the object-reading ancestor walk.
+        sley_rev::merge_bases(&git_dir, format, &db, &commits[0], &commits[1])?
     };
     if bases.is_empty() {
         return Err(GitError::Exit(1));
