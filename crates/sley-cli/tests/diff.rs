@@ -2760,3 +2760,49 @@ fn diff_between_revisions_matches_upstream_git() {
     }
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn diff_two_tree_uses_committed_content_not_dirty_worktree() {
+    // Regressions: (1) `diff A B` patch/content must come from B's blobs, not the
+    // worktree; (2) `diff HEAD HEAD` must parse as two revisions (empty), not
+    // consume the first HEAD as the head-vs-worktree shortcut.
+    let root = unique_temp_dir("diff-two-tree-dirty");
+    fs::create_dir_all(&root).expect("create repo root");
+    git(&root, &["init", "-q"]);
+    let commit = |msg: &str| {
+        git(
+            &root,
+            &[
+                "-c", "user.name=Example User", "-c", "user.email=example@example.invalid",
+                "commit", "-m", msg, "-q",
+            ],
+        );
+    };
+    fs::write(root.join("f.txt"), b"a\nb\n").expect("write f");
+    git(&root, &["add", "-A"]);
+    commit("c1");
+    git(&root, &["tag", "v1.0"]);
+    fs::write(root.join("f.txt"), b"a\nB2\n").expect("modify f");
+    git(&root, &["add", "-A"]);
+    commit("c2");
+    git(&root, &["tag", "v1.1"]);
+    // Leave the worktree dirty so a worktree-sourced "new" side would diverge.
+    fs::write(root.join("f.txt"), b"DIRTY WORKTREE CONTENT\n").expect("dirty f");
+
+    for args in [
+        vec!["diff", "HEAD~1", "HEAD"],
+        vec!["diff", "--raw", "HEAD~1", "HEAD"],
+        vec!["diff", "HEAD", "HEAD"],
+        vec!["diff", "HEAD~1..HEAD"],
+        vec!["diff", "HEAD~1...v1.1"],
+        vec!["diff", "v1.0", "v1.1"],
+        vec!["diff", "HEAD~1", "HEAD", "--", "f.txt"],
+    ] {
+        assert_eq!(
+            git_rs(&root, &args),
+            git(&root, &args),
+            "sley diff diverged from git for {args:?} (dirty worktree)",
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}

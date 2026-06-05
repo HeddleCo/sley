@@ -15404,25 +15404,38 @@ fn diff_split_revisions(
     // Range forms name exactly two trees and consume only the first token. Check
     // `...` before `..` so `A...B` is not mis-split, and require both sides so a
     // relative path like `../x` (left side empty) is never taken as a range.
+    // `A...B` (symmetric): diff merge-base(A,B)..B. An omitted side defaults to
+    // HEAD. It is only a range when *both* endpoints resolve as revisions —
+    // otherwise the token (e.g. a relative path `../x`) falls through to pathspec
+    // handling, matching git's disambiguation.
     if let Some((left, right)) = first.split_once("...") {
-        if !left.is_empty() && !right.is_empty() && !right.contains('.') {
-            let left_oid = resolve_revision(git_dir, format, left)?;
-            let right_oid = resolve_revision(git_dir, format, right)?;
-            let base_tree = match sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?
+        let left_spec = if left.is_empty() { "HEAD" } else { left };
+        let right_spec = if right.is_empty() { "HEAD" } else { right };
+        if let (Ok(left_oid), Ok(right_oid)) = (
+            resolve_revision(git_dir, format, left_spec),
+            resolve_revision(git_dir, format, right_spec),
+        ) {
+            let Some(base) = sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?
                 .into_iter()
                 .next()
-            {
-                Some(base) => sley_rev::peel_to_tree(db, format, &base)?,
-                None => ObjectId::empty_tree(format),
+            else {
+                eprintln!("fatal: {first}: no merge base");
+                return Err(GitError::Exit(128));
             };
+            let base_tree = sley_rev::peel_to_tree(db, format, &base)?;
             let right_tree = sley_rev::peel_to_tree(db, format, &right_oid)?;
             return Ok((vec![base_tree, right_tree], path_args[1..].to_vec()));
         }
     }
+    // `A..B`: diff A..B. Omitted side defaults to HEAD; only a range when both
+    // endpoints resolve.
     if let Some((left, right)) = first.split_once("..") {
-        if !left.is_empty() && !right.is_empty() {
-            let left_tree = diff_peel_rev_tree(git_dir, format, db, left)?;
-            let right_tree = diff_peel_rev_tree(git_dir, format, db, right)?;
+        let left_spec = if left.is_empty() { "HEAD" } else { left };
+        let right_spec = if right.is_empty() { "HEAD" } else { right };
+        if let (Ok(left_tree), Ok(right_tree)) = (
+            diff_peel_rev_tree(git_dir, format, db, left_spec),
+            diff_peel_rev_tree(git_dir, format, db, right_spec),
+        ) {
             return Ok((vec![left_tree, right_tree], path_args[1..].to_vec()));
         }
     }
@@ -15494,12 +15507,15 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
     let mut path_args = Vec::new();
+    // Arguments after `--` are always pathspecs, never revisions; keep them apart
+    // so the revision splitter only ever reinterprets the pre-`--` positionals.
+    let mut explicit_paths: Vec<String> = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
     while idx < args.len() {
         let arg = &args[idx];
         if positional_only {
-            path_args.push(arg.clone());
+            explicit_paths.push(arg.clone());
             idx += 1;
             continue;
         }
@@ -16071,7 +16087,15 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     // `diff A B` was treated as two paths and silently fell back to an
     // index-vs-worktree diff (wrong output, and a full-worktree rescan on big
     // repos).
-    let (diff_trees, path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
+    // A bare `diff HEAD` keeps its dedicated head-vs-worktree path, but
+    // `diff HEAD <rev>` / `diff HEAD HEAD` means the consumed HEAD is the first of
+    // several revisions — hand it back to the splitter.
+    if head && !path_args.is_empty() {
+        path_args.insert(0, "HEAD".to_string());
+        head = false;
+    }
+    let (diff_trees, mut path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
+    path_args.extend(explicit_paths);
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
     let repository_abbrev = repository_abbrev(&git_dir, format)?;
     let raw_abbrev = match raw_abbrev {
@@ -16110,6 +16134,10 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         1 => !cached,
         _ => !cached && !head,
     };
+    // The new side's *content* comes from the worktree only when there is no second
+    // tree and we're not diffing the index (`--cached`). A two-tree `diff A B` takes
+    // its new content from tree B's blobs, never the worktree.
+    let use_worktree_new = !cached && diff_trees.len() != 2;
     let rename_options = sley_diff_merge::RenameDetectionOptions {
         base: name_status_options,
         detect_inexact: true,
@@ -16244,7 +16272,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
             pickaxe_all,
             &db,
             worktree_root.as_deref(),
-            !cached,
+            use_worktree_new,
         )?
     } else if pickaxe_all || pickaxe_regex {
         sort_diff_entries_by_path(entries)
@@ -16316,7 +16344,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                     z,
                     &db,
                     worktree_root.as_deref(),
-                    !cached,
+                    use_worktree_new,
                 )?;
             }
         }
@@ -16326,7 +16354,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 &entries,
                 &db,
                 worktree_root.as_deref(),
-                !cached,
+                use_worktree_new,
                 DiffStatOptions {
                     compact_summary,
                     stat_count,
@@ -16340,7 +16368,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 &entries,
                 &db,
                 worktree_root.as_deref(),
-                !cached,
+                use_worktree_new,
             )?;
         }
         if show_summary {
@@ -16356,7 +16384,7 @@ fn cmd_diff(args: &[String]) -> Result<()> {
                 let options = DiffPatchOptions {
                     db: &db,
                     worktree_root: worktree_root.as_deref(),
-                    use_worktree_new: !cached,
+                    use_worktree_new,
                     format,
                     abbrev: patch_abbrev,
                     src_prefix: &src_prefix,
