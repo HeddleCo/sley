@@ -1,6 +1,6 @@
 use git_core::{object_id_for_bytes, GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use git_index::Index;
-use git_object::{Commit, EncodedObject, ObjectType, Tree};
+use git_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
 use git_odb::{FileObjectDatabase, ObjectReader};
 use git_refs::{FileRefStore, RefTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1469,10 +1469,16 @@ pub fn diff_name_status_trees_with_options(
     right_tree: &ObjectId,
     options: DiffNameStatusOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let mut left_entries = BTreeMap::new();
-    collect_tree_entries(db, format, left_tree, Vec::new(), &mut left_entries)?;
-    let mut right_entries = BTreeMap::new();
-    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    // `--find-copies-harder` may pair an *unchanged* left-side file as a copy
+    // source, so it needs the complete left map; every other mode only consults
+    // changed paths, so the pruned simultaneous walk (which skips identical
+    // subtrees) suffices and produces byte-identical output.
+    let needs_full_maps = options.detect_copies && options.find_copies_harder;
+    let (left_entries, right_entries) = if needs_full_maps {
+        collect_full_tree_pair(db, format, left_tree, right_tree)?
+    } else {
+        changed_tree_entries(db, format, left_tree, right_tree)?
+    };
     diff_name_status_maps(
         &left_entries,
         &right_entries,
@@ -1507,10 +1513,15 @@ pub fn diff_name_status_trees_with_rename_options(
     right_tree: &ObjectId,
     options: RenameDetectionOptions,
 ) -> Result<Vec<NameStatusEntry>> {
-    let mut left_entries = BTreeMap::new();
-    collect_tree_entries(db, format, left_tree, Vec::new(), &mut left_entries)?;
-    let mut right_entries = BTreeMap::new();
-    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right_entries)?;
+    // See `diff_name_status_trees_with_options`: only `--find-copies-harder`
+    // needs unchanged left entries as copy sources; otherwise the pruned walk
+    // (skipping identical subtrees) yields identical output far more cheaply.
+    let needs_full_maps = options.base.detect_copies && options.base.find_copies_harder;
+    let (left_entries, right_entries) = if needs_full_maps {
+        collect_full_tree_pair(db, format, left_tree, right_tree)?
+    } else {
+        changed_tree_entries(db, format, left_tree, right_tree)?
+    };
     diff_name_status_maps_with_renames(
         &left_entries,
         &right_entries,
@@ -2200,6 +2211,13 @@ struct TrackedEntry {
     oid: ObjectId,
 }
 
+/// A path-keyed map of tracked entries: one flattened side of a tree (or index/
+/// worktree) snapshot.
+type TrackedEntryMap = BTreeMap<Vec<u8>, TrackedEntry>;
+
+/// The `(left, right)` sides produced by a tree-vs-tree comparison.
+type TrackedEntryPair = (TrackedEntryMap, TrackedEntryMap);
+
 fn read_index_entries(
     git_dir: &Path,
     format: ObjectFormat,
@@ -2284,6 +2302,230 @@ fn collect_tree_entries(
                 TrackedEntry {
                     mode: entry.mode,
                     oid: entry.oid,
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Git's mode value for a subtree (directory) entry inside a tree object.
+const TREE_ENTRY_MODE: u32 = 0o040000;
+
+/// Read `tree_oid` and parse it as a tree, erroring if the object is some other
+/// type. Shared by the simultaneous tree-diff walk so both sides validate the
+/// object type identically to [`collect_tree_entries`].
+fn read_tree_object(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<Tree> {
+    let object = db.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {tree_oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Tree::parse(format, &object.body)
+}
+
+/// Append `name` to `prefix` with a `/` separator (mirroring the path
+/// construction in [`collect_tree_entries`]), returning the joined path.
+fn join_tree_path(prefix: &[u8], name: &[u8]) -> Vec<u8> {
+    let mut path = Vec::with_capacity(prefix.len() + 1 + name.len());
+    path.extend_from_slice(prefix);
+    if !path.is_empty() {
+        path.push(b'/');
+    }
+    path.extend_from_slice(name);
+    path
+}
+
+/// Fully flatten both trees into independent `left`/`right` maps (every blob on
+/// each side, no pruning). Used only on the `--find-copies-harder` path, where
+/// copy detection may reach into otherwise-unchanged subtrees for a source.
+fn collect_full_tree_pair(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_tree: &ObjectId,
+    right_tree: &ObjectId,
+) -> Result<TrackedEntryPair> {
+    let mut left = BTreeMap::new();
+    collect_tree_entries(db, format, left_tree, Vec::new(), &mut left)?;
+    let mut right = BTreeMap::new();
+    collect_tree_entries(db, format, right_tree, Vec::new(), &mut right)?;
+    Ok((left, right))
+}
+
+/// Walk two trees *simultaneously*, collecting into `left` and `right` only the
+/// blob entries that differ between the two sides — every entry that is present
+/// and byte-identical (same mode + same OID) on both sides is omitted, and any
+/// subtree whose OID is identical on both sides is skipped wholesale without
+/// being read or recursed into. This is the core optimization git relies on to
+/// make tree diffs cheap: equal subtrees are pruned in O(1).
+///
+/// The resulting `left`/`right` maps are exactly the subset of the fully
+/// flattened maps (as produced by [`collect_tree_entries`]) restricted to the
+/// paths that participate in an Added/Deleted/Modified change. Because
+/// [`raw_name_status_changes`] emits nothing for a path that is identical on both
+/// sides, diffing these pruned maps yields byte-identical name-status output to
+/// diffing the full maps. (Callers that need the *complete* left map — i.e.
+/// `--find-copies-harder`, where an unchanged file may be a copy source — must
+/// still use [`collect_tree_entries`]; see the tree-diff entry points.)
+fn changed_tree_entries(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_tree: &ObjectId,
+    right_tree: &ObjectId,
+) -> Result<TrackedEntryPair> {
+    let mut left = BTreeMap::new();
+    let mut right = BTreeMap::new();
+    // Identical root trees produce no changes at all and need not be read.
+    if left_tree != right_tree {
+        diff_tree_pair(db, format, left_tree, right_tree, &[], &mut left, &mut right)?;
+    }
+    Ok((left, right))
+}
+
+/// Recursively diff two subtrees rooted at `prefix`, appending differing blob
+/// entries to `left` / `right`. Invariant: the two OIDs are already known to
+/// differ (identical subtrees are pruned by the caller before recursing).
+fn diff_tree_pair(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    left_tree: &ObjectId,
+    right_tree: &ObjectId,
+    prefix: &[u8],
+    left: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+    right: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    let left_entries = read_tree_object(db, format, left_tree)?.entries;
+    let right_entries = read_tree_object(db, format, right_tree)?.entries;
+
+    // Index the right side by name so the union of names can be walked without
+    // relying on git's directory-aware entry ordering. (Iterating the union of
+    // names, rather than a positional merge, keeps correctness independent of
+    // entry order.)
+    let mut right_by_name: HashMap<&[u8], &TreeEntry> = HashMap::with_capacity(right_entries.len());
+    for entry in &right_entries {
+        right_by_name.insert(entry.name.as_slice(), entry);
+    }
+
+    for left_entry in &left_entries {
+        match right_by_name.remove(left_entry.name.as_slice()) {
+            Some(right_entry) => {
+                merge_tree_entry(db, format, prefix, Some(left_entry), Some(right_entry), left, right)?;
+            }
+            None => {
+                merge_tree_entry(db, format, prefix, Some(left_entry), None, left, right)?;
+            }
+        }
+    }
+    // Names only present on the right are pure additions.
+    for right_entry in &right_entries {
+        if right_by_name.contains_key(right_entry.name.as_slice()) {
+            merge_tree_entry(db, format, prefix, None, Some(right_entry), left, right)?;
+        }
+    }
+    Ok(())
+}
+
+/// Reconcile a single name that may appear on the left side, the right side, or
+/// both, recording any resulting blob change(s) into `left` / `right`. This
+/// reproduces exactly the union-of-flattened-maps semantics:
+///
+/// * tree vs tree with equal OID -> pruned (no read, no recursion);
+/// * tree vs tree with differing OID -> recurse;
+/// * blob vs blob, equal mode+OID -> unchanged, emitted nowhere;
+/// * blob vs blob, differing mode or OID -> both sides recorded (a Modify);
+/// * a tree on one side and a non-tree on the other (or a name present on only
+///   one side) -> the flattened paths differ (`name/...` vs `name`), so the two
+///   are unrelated: the tree side is flattened wholesale and the blob side is
+///   recorded independently (an Add and/or a Delete).
+fn merge_tree_entry(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    prefix: &[u8],
+    left_entry: Option<&TreeEntry>,
+    right_entry: Option<&TreeEntry>,
+    left: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+    right: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    let left_is_tree = left_entry.is_some_and(|entry| entry.mode == TREE_ENTRY_MODE);
+    let right_is_tree = right_entry.is_some_and(|entry| entry.mode == TREE_ENTRY_MODE);
+
+    if let (Some(left_entry), Some(right_entry)) = (left_entry, right_entry) {
+        if left_is_tree && right_is_tree {
+            // Two subtrees under the same name: prune if identical, else recurse.
+            if left_entry.oid == right_entry.oid {
+                return Ok(());
+            }
+            let path = join_tree_path(prefix, &left_entry.name);
+            return diff_tree_pair(
+                db,
+                format,
+                &left_entry.oid,
+                &right_entry.oid,
+                &path,
+                left,
+                right,
+            );
+        }
+        if !left_is_tree && !right_is_tree {
+            // Two blobs under the same name. Identical mode+OID means unchanged
+            // (nothing emitted); otherwise both sides are recorded so the diff
+            // sees a Modify, matching the full-map `left != right` comparison.
+            if left_entry.mode == right_entry.mode && left_entry.oid == right_entry.oid {
+                return Ok(());
+            }
+            let path = join_tree_path(prefix, &left_entry.name);
+            left.insert(
+                path.clone(),
+                TrackedEntry {
+                    mode: left_entry.mode,
+                    oid: left_entry.oid.clone(),
+                },
+            );
+            right.insert(
+                path,
+                TrackedEntry {
+                    mode: right_entry.mode,
+                    oid: right_entry.oid.clone(),
+                },
+            );
+            return Ok(());
+        }
+        // Mixed: tree on one side, blob on the other. Their flattened paths
+        // never collide, so handle each side as if the name existed only there.
+    }
+
+    // Left side (if any): record as deletions.
+    if let Some(left_entry) = left_entry {
+        let path = join_tree_path(prefix, &left_entry.name);
+        if left_is_tree {
+            collect_tree_entries(db, format, &left_entry.oid, path, left)?;
+        } else {
+            left.insert(
+                path,
+                TrackedEntry {
+                    mode: left_entry.mode,
+                    oid: left_entry.oid.clone(),
+                },
+            );
+        }
+    }
+    // Right side (if any): record as additions.
+    if let Some(right_entry) = right_entry {
+        let path = join_tree_path(prefix, &right_entry.name);
+        if right_is_tree {
+            collect_tree_entries(db, format, &right_entry.oid, path, right)?;
+        } else {
+            right.insert(
+                path,
+                TrackedEntry {
+                    mode: right_entry.mode,
+                    oid: right_entry.oid.clone(),
                 },
             );
         }
@@ -4605,5 +4847,592 @@ new mode 100755
             assert_eq!(patience_diff_lines(&old, &new), myers);
             assert_eq!(histogram_diff_lines(&old, &new), myers);
         }
+    }
+
+    // ===================================================================
+    // Subtree-skip-by-OID tree-diff optimization: the pruned simultaneous
+    // walk (`changed_tree_entries`) must produce byte-identical name-status
+    // output to the legacy "flatten both sides fully" walk
+    // (`collect_full_tree_pair`) on every representative diff shape.
+    // ===================================================================
+
+    /// Format a name-status result into stable, comparable lines.
+    fn status_lines(entries: &[NameStatusEntry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.line()).collect()
+    }
+
+    /// Assert the pruned walk and the full flatten agree, both as raw map diffs
+    /// and through the public tree-diff entry points, for the given options.
+    fn assert_tree_diff_matches_full(
+        db: &FileObjectDatabase,
+        left: &ObjectId,
+        right: &ObjectId,
+        options: DiffNameStatusOptions,
+    ) {
+        // Reference ("old") behaviour: fully flatten both trees, then diff.
+        let (full_left, full_right) =
+            collect_full_tree_pair(db, ObjectFormat::Sha1, left, right).unwrap();
+        let reference = diff_name_status_maps(
+            &full_left,
+            &full_right,
+            full_left.keys().chain(full_right.keys()),
+            options,
+        )
+        .unwrap();
+
+        // Optimized ("new") behaviour: prune identical subtrees, then diff.
+        let (pruned_left, pruned_right) =
+            changed_tree_entries(db, ObjectFormat::Sha1, left, right).unwrap();
+        let pruned = diff_name_status_maps(
+            &pruned_left,
+            &pruned_right,
+            pruned_left.keys().chain(pruned_right.keys()),
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status_lines(&reference),
+            status_lines(&pruned),
+            "pruned map diff diverged from full map diff for {options:?}"
+        );
+
+        // And the public entry point (which itself selects pruned vs full) must
+        // match the reference too.
+        let public = diff_name_status_trees_with_options(db, ObjectFormat::Sha1, left, right, options)
+            .unwrap();
+        assert_eq!(
+            status_lines(&reference),
+            status_lines(&public),
+            "public tree diff diverged from full map diff for {options:?}"
+        );
+
+        // The pruned maps must be a subset of the full maps and must contain
+        // exactly the paths that actually changed (no identical entries leak in,
+        // no changed entries get dropped).
+        for (path, tracked) in &pruned_left {
+            assert_eq!(
+                full_left.get(path),
+                Some(tracked),
+                "pruned left entry not present (or differs) in full left map: {:?}",
+                String::from_utf8_lossy(path)
+            );
+        }
+        for (path, tracked) in &pruned_right {
+            assert_eq!(
+                full_right.get(path),
+                Some(tracked),
+                "pruned right entry not present (or differs) in full right map: {:?}",
+                String::from_utf8_lossy(path)
+            );
+        }
+        // Every path the full diff reports as changed must survive pruning on
+        // whichever side(s) it lives.
+        for entry in &reference {
+            let path = &entry.path;
+            match entry.status {
+                NameStatus::Added => assert!(
+                    pruned_right.contains_key(path),
+                    "added path dropped by pruning: {:?}",
+                    String::from_utf8_lossy(path)
+                ),
+                NameStatus::Deleted => assert!(
+                    pruned_left.contains_key(path),
+                    "deleted path dropped by pruning: {:?}",
+                    String::from_utf8_lossy(path)
+                ),
+                NameStatus::Modified => {
+                    assert!(
+                        pruned_left.contains_key(path) && pruned_right.contains_key(path),
+                        "modified path dropped by pruning: {:?}",
+                        String::from_utf8_lossy(path)
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run the equivalence assertion across the option matrix that the pruned
+    /// path serves (everything except `--find-copies-harder`, which uses the
+    /// full maps and is checked separately).
+    fn assert_tree_diff_matches_full_all_modes(
+        db: &FileObjectDatabase,
+        left: &ObjectId,
+        right: &ObjectId,
+    ) {
+        for detect_renames in [false, true] {
+            for detect_copies in [false, true] {
+                let options = DiffNameStatusOptions {
+                    detect_renames,
+                    detect_copies,
+                    find_copies_harder: false,
+                    rename_empty: true,
+                };
+                assert_tree_diff_matches_full(db, left, right, options);
+            }
+        }
+    }
+
+    /// Build a DB pre-seeded with a fixed bank of blobs for the structural tests.
+    fn structural_db() -> (PathBuf, FileObjectDatabase) {
+        let root = temp_root();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+        (root, db)
+    }
+
+    #[test]
+    fn pruned_walk_skips_identical_subtree_and_matches_full() {
+        // A large shared subtree (`shared/`) is byte-identical on both sides; the
+        // only change lives in `app/`. The pruned walk must skip `shared/`
+        // entirely yet still produce the exact same diff as flattening it.
+        let (root, mut db) = structural_db();
+
+        // shared/ — identical on both sides, several nested files.
+        let s1 = write_blob(&mut db, b"shared one\n");
+        let s2 = write_blob(&mut db, b"shared two\n");
+        let s3 = write_blob(&mut db, b"deep nested\n");
+        let shared_inner = write_tree(&mut db, &[(b"c.txt", 0o100644, s3.clone())]);
+        let shared = write_tree(
+            &mut db,
+            &[
+                (b"a.txt", 0o100644, s1.clone()),
+                (b"b.txt", 0o100644, s2.clone()),
+                (b"inner", 0o040000, shared_inner.clone()),
+            ],
+        );
+
+        // app/ — one file modified between sides.
+        let app_old = write_blob(&mut db, b"version 1\n");
+        let app_new = write_blob(&mut db, b"version 2\n");
+        let app_left = write_tree(&mut db, &[(b"main.rs", 0o100644, app_old)]);
+        let app_right = write_tree(&mut db, &[(b"main.rs", 0o100644, app_new)]);
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"app", 0o040000, app_left),
+                (b"shared", 0o040000, shared.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"app", 0o040000, app_right),
+                (b"shared", 0o040000, shared),
+            ],
+        );
+
+        // Sanity: the only change is the nested app/main.rs modification.
+        let (pruned_left, pruned_right) =
+            changed_tree_entries(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+        assert_eq!(
+            pruned_left.keys().collect::<Vec<_>>(),
+            vec![&b"app/main.rs".to_vec()],
+            "pruning should leave only the changed path on the left"
+        );
+        assert_eq!(
+            pruned_right.keys().collect::<Vec<_>>(),
+            vec![&b"app/main.rs".to_vec()],
+            "pruning should leave only the changed path on the right"
+        );
+        assert!(
+            !pruned_left.contains_key(b"shared/a.txt".as_slice()),
+            "identical shared subtree must not appear in pruned maps"
+        );
+
+        assert_tree_diff_matches_full_all_modes(&db, &left, &right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_for_add_delete_modify_nested() {
+        // Mixed shape: a top-level add, a top-level delete, a nested modify, and
+        // an untouched nested subtree that must be skipped.
+        let (root, mut db) = structural_db();
+
+        let keep = write_blob(&mut db, b"unchanged\n");
+        let untouched_dir = write_tree(&mut db, &[(b"keep.txt", 0o100644, keep.clone())]);
+
+        let nested_old = write_blob(&mut db, b"nested old\n");
+        let nested_new = write_blob(&mut db, b"nested new\n");
+        let dir_left = write_tree(
+            &mut db,
+            &[
+                (b"changed.txt", 0o100644, nested_old),
+                (b"stable.txt", 0o100644, keep.clone()),
+            ],
+        );
+        let dir_right = write_tree(
+            &mut db,
+            &[
+                (b"changed.txt", 0o100644, nested_new),
+                (b"stable.txt", 0o100644, keep.clone()),
+            ],
+        );
+
+        let only_left = write_blob(&mut db, b"will be deleted\n");
+        let only_right = write_blob(&mut db, b"freshly added\n");
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"dir", 0o040000, dir_left),
+                (b"gone.txt", 0o100644, only_left),
+                (b"untouched", 0o040000, untouched_dir.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"dir", 0o040000, dir_right),
+                (b"new.txt", 0o100644, only_right),
+                (b"untouched", 0o040000, untouched_dir),
+            ],
+        );
+
+        let entries =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+                detect_renames: false,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            })
+            .unwrap();
+        assert_eq!(
+            status_lines(&entries),
+            vec![
+                "M\tdir/changed.txt".to_string(),
+                "D\tgone.txt".to_string(),
+                "A\tnew.txt".to_string(),
+            ],
+            "unexpected raw status for mixed nested diff"
+        );
+
+        assert_tree_diff_matches_full_all_modes(&db, &left, &right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_for_rename_across_dirs() {
+        // An exact rename (same blob oid) moving between directories. Rename
+        // detection runs on the pruned add/delete set and must match the full
+        // walk's result exactly.
+        let (root, mut db) = structural_db();
+
+        let moved = write_blob(&mut db, b"i get moved across directories\n");
+        let companion = write_blob(&mut db, b"i stay put\n");
+        let stable_dir = write_tree(&mut db, &[(b"keep.txt", 0o100644, companion.clone())]);
+
+        let src_dir = write_tree(&mut db, &[(b"file.txt", 0o100644, moved.clone())]);
+        let dst_dir = write_tree(&mut db, &[(b"renamed.txt", 0o100644, moved.clone())]);
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"src", 0o040000, src_dir),
+                (b"stable", 0o040000, stable_dir.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"dst", 0o040000, dst_dir),
+                (b"stable", 0o040000, stable_dir),
+            ],
+        );
+
+        let entries =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            })
+            .unwrap();
+        assert_eq!(
+            status_lines(&entries),
+            vec!["R100\tsrc/file.txt\tdst/renamed.txt".to_string()],
+            "rename across dirs should be detected on pruned set"
+        );
+
+        assert_tree_diff_matches_full_all_modes(&db, &left, &right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_for_binary_and_mode_change() {
+        // Binary blob modification plus an executable-bit (mode) change on an
+        // otherwise-identical blob. Mode-only changes must still register as a
+        // Modify (the pruned walk compares mode + oid, like the full map).
+        let (root, mut db) = structural_db();
+
+        let bin_old = write_blob(&mut db, &[0u8, 159, 146, 150, 0, 255, 1, 2, 3]);
+        let bin_new = write_blob(&mut db, &[0u8, 159, 146, 150, 0, 254, 9, 8, 7]);
+        let script = write_blob(&mut db, b"#!/bin/sh\necho hi\n");
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"image.bin", 0o100644, bin_old),
+                (b"run.sh", 0o100644, script.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"image.bin", 0o100644, bin_new),
+                // same blob oid, executable bit flipped on
+                (b"run.sh", 0o100755, script),
+            ],
+        );
+
+        let entries =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+                detect_renames: false,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            })
+            .unwrap();
+        assert_eq!(
+            status_lines(&entries),
+            vec!["M\timage.bin".to_string(), "M\trun.sh".to_string()],
+            "binary edit and mode-only change should both be Modify"
+        );
+
+        assert_tree_diff_matches_full_all_modes(&db, &left, &right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_for_dir_replaced_by_file() {
+        // A name that is a directory on the left and a regular file on the right
+        // (and vice versa). The flattened paths differ (`thing/...` vs `thing`),
+        // so the pruned walk must treat them as unrelated add/delete pairs,
+        // exactly as the full flatten does.
+        let (root, mut db) = structural_db();
+
+        let inner_a = write_blob(&mut db, b"inner a\n");
+        let inner_b = write_blob(&mut db, b"inner b\n");
+        let thing_dir = write_tree(
+            &mut db,
+            &[
+                (b"a.txt", 0o100644, inner_a),
+                (b"b.txt", 0o100644, inner_b),
+            ],
+        );
+        let thing_file = write_blob(&mut db, b"now i am a file\n");
+
+        // other/ is a file on the left, a directory on the right.
+        let other_file = write_blob(&mut db, b"i was a file\n");
+        let other_inner = write_blob(&mut db, b"now nested\n");
+        let other_dir = write_tree(&mut db, &[(b"x.txt", 0o100644, other_inner)]);
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"other", 0o100644, other_file),
+                (b"thing", 0o040000, thing_dir),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"other", 0o040000, other_dir),
+                (b"thing", 0o100644, thing_file),
+            ],
+        );
+
+        let entries =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+                detect_renames: false,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            })
+            .unwrap();
+        assert_eq!(
+            status_lines(&entries),
+            vec![
+                "D\tother".to_string(),
+                "A\tother/x.txt".to_string(),
+                "A\tthing".to_string(),
+                "D\tthing/a.txt".to_string(),
+                "D\tthing/b.txt".to_string(),
+            ],
+            "dir<->file swap should flatten to independent adds/deletes"
+        );
+
+        assert_tree_diff_matches_full_all_modes(&db, &left, &right);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_for_identical_trees() {
+        // Two identical root trees: zero changes, and the root must be skipped
+        // without reading anything below it.
+        let (root, mut db) = structural_db();
+
+        let blob = write_blob(&mut db, b"same\n");
+        let sub = write_tree(&mut db, &[(b"f.txt", 0o100644, blob.clone())]);
+        let tree = write_tree(&mut db, &[(b"sub", 0o040000, sub), (b"top.txt", 0o100644, blob)]);
+
+        let (pruned_left, pruned_right) =
+            changed_tree_entries(&db, ObjectFormat::Sha1, &tree, &tree).unwrap();
+        assert!(
+            pruned_left.is_empty() && pruned_right.is_empty(),
+            "identical trees must produce no changed entries"
+        );
+
+        let entries =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &tree, &tree, DiffNameStatusOptions::default())
+                .unwrap();
+        assert!(entries.is_empty(), "identical trees must produce no diff");
+
+        assert_tree_diff_matches_full_all_modes(&db, &tree, &tree);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn find_copies_harder_uses_full_left_map_and_finds_unchanged_source() {
+        // `--find-copies-harder` must still see an *unchanged* file as a copy
+        // source. This is the case where the public entry point deliberately
+        // falls back to the full flatten; verify the full-map fallback both
+        // behaves correctly and matches a direct full-map computation.
+        let (root, mut db) = structural_db();
+
+        // `template.txt` is unchanged between sides (lives in an untouched
+        // subtree), and `copy.txt` is added on the right with the same content.
+        let template = write_blob(&mut db, b"reusable boilerplate content\n");
+        let lib_dir = write_tree(&mut db, &[(b"template.txt", 0o100644, template.clone())]);
+
+        let trigger_old = write_blob(&mut db, b"trigger old\n");
+        let trigger_new = write_blob(&mut db, b"trigger new\n");
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"lib", 0o040000, lib_dir.clone()),
+                (b"trigger.txt", 0o100644, trigger_old),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"copy.txt", 0o100644, template.clone()),
+                (b"lib", 0o040000, lib_dir),
+                (b"trigger.txt", 0o100644, trigger_new),
+            ],
+        );
+
+        let options = DiffNameStatusOptions {
+            detect_renames: true,
+            detect_copies: true,
+            find_copies_harder: true,
+            rename_empty: true,
+        };
+
+        // Reference via the full flatten (the old algorithm).
+        let (full_left, full_right) =
+            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+        let reference = diff_name_status_maps(
+            &full_left,
+            &full_right,
+            full_left.keys().chain(full_right.keys()),
+            options,
+        )
+        .unwrap();
+
+        let public =
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, options).unwrap();
+        assert_eq!(
+            status_lines(&reference),
+            status_lines(&public),
+            "find-copies-harder public diff must match full-map reference"
+        );
+        // The copy must be detected from the unchanged template source.
+        assert!(
+            public.iter().any(|entry| matches!(entry.status, NameStatus::Copied(_))
+                && entry.old_path.as_deref() == Some(b"lib/template.txt".as_slice())
+                && entry.path == b"copy.txt"),
+            "copy from unchanged source must be found with find_copies_harder: {public:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pruned_walk_matches_full_with_inexact_rename_options() {
+        // Exercise the rename-options entry point (which also selects pruned vs
+        // full) with inexact detection enabled, across an untouched subtree.
+        let (root, mut db) = structural_db();
+
+        let untouched = write_blob(&mut db, b"untouched file\n");
+        let untouched_dir = write_tree(&mut db, &[(b"u.txt", 0o100644, untouched.clone())]);
+
+        // a.txt -> b.txt with one changed line (a 75% inexact rename).
+        let old = write_blob(&mut db, b"one\ntwo\nthree\nfour\nfive\n");
+        let new = write_blob(&mut db, b"one\ntwo\nTHREE\nfour\nfive\n");
+
+        let left = write_tree(
+            &mut db,
+            &[
+                (b"a.txt", 0o100644, old),
+                (b"keep", 0o040000, untouched_dir.clone()),
+            ],
+        );
+        let right = write_tree(
+            &mut db,
+            &[
+                (b"b.txt", 0o100644, new),
+                (b"keep", 0o040000, untouched_dir),
+            ],
+        );
+
+        let options = RenameDetectionOptions {
+            base: DiffNameStatusOptions {
+                detect_renames: true,
+                detect_copies: false,
+                find_copies_harder: false,
+                rename_empty: true,
+            },
+            detect_inexact: true,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+            copy_threshold: DEFAULT_RENAME_THRESHOLD,
+        };
+
+        // Reference: full flatten + same detection.
+        let (full_left, full_right) =
+            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+        let reference = diff_name_status_maps_with_renames(
+            &full_left,
+            &full_right,
+            full_left.keys().chain(full_right.keys()),
+            options,
+            |oid| read_blob_bytes(&db, oid),
+        )
+        .unwrap();
+
+        let public = diff_name_status_trees_with_rename_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            options,
+        )
+        .unwrap();
+
+        assert_eq!(
+            status_lines(&reference),
+            status_lines(&public),
+            "inexact rename via pruned walk must match full-map reference"
+        );
+        assert_eq!(
+            status_lines(&public),
+            vec!["R075\ta.txt\tb.txt".to_string()],
+            "expected a 75% inexact rename"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
