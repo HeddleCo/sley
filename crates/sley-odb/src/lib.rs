@@ -382,6 +382,17 @@ pub fn install_repack_result(
     // the caller-provided name; this keeps the on-disk file name canonical and
     // lets us re-derive the object set the new pack actually contains.
     let parsed_pack = PackFile::parse(&result.pack, format)?;
+    // Validate the caller-supplied index against the pack *before* writing anything
+    // or pruning. `install_repack_result` is public, so a bad `RepackResult` could
+    // otherwise leave the repo with a new pack whose only index is unparseable —
+    // and the old packs already deleted. A parse failure or checksum mismatch aborts
+    // with the repo untouched.
+    let parsed_index = PackIndex::parse(&result.idx, format)?;
+    if parsed_index.pack_checksum != parsed_pack.checksum {
+        return Err(GitError::InvalidFormat(
+            "repack index checksum does not match the new pack".into(),
+        ));
+    }
     let pack_name = format!("pack-{}", parsed_pack.checksum.to_hex());
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
@@ -392,11 +403,13 @@ pub fn install_repack_result(
         return Ok(());
     }
 
-    // The authoritative set of object ids that are now safely packed.
-    let present: HashSet<ObjectId> = parsed_pack
+    // Prune based on the objects the new pack's *index* can resolve (what reads use
+    // once the old packs are gone), not just what the pack contains — so a stale
+    // pack is never removed for an object the new index cannot serve.
+    let present: HashSet<ObjectId> = parsed_index
         .entries
         .iter()
-        .map(|entry| entry.entry.oid.clone())
+        .map(|entry| entry.oid.clone())
         .collect();
 
     prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
@@ -522,9 +535,12 @@ fn prune_packs_contained_in(
     Ok(())
 }
 
-/// Remove a `multi-pack-index` if every pack it names was removed (its stems
-/// are all in `removed_stems`), preventing readers from following it to a
-/// deleted pack.
+/// Remove a `multi-pack-index` if it names *any* pack that was removed.
+///
+/// A MIDX that still references a deleted pack makes reads fail (the lookup
+/// resolves to a pack that is gone) before any fallback. Removing the whole MIDX
+/// when even one of its packs is pruned forces readers back to the individual pack
+/// indexes, which are correct; `multi-pack-index write` can rebuild it later.
 fn prune_stale_multi_pack_index(
     pack_dir: &Path,
     format: ObjectFormat,
@@ -538,11 +554,11 @@ fn prune_stale_multi_pack_index(
         return Ok(());
     }
     let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
-    let all_referenced_removed = midx.pack_names.iter().all(|name| {
+    let references_removed_pack = midx.pack_names.iter().any(|name| {
         let stem = name.strip_suffix(".idx").unwrap_or(name);
         removed_stems.contains(stem)
     });
-    if all_referenced_removed {
+    if references_removed_pack {
         remove_file_if_exists(&midx_path)?;
     }
     Ok(())
@@ -718,7 +734,7 @@ impl std::ops::Deref for PackData {
 /// back to a heap read if the map fails), otherwise read into the heap.
 #[cfg(feature = "mmap")]
 fn load_pack_data(pack_path: &Path) -> Result<PackData> {
-    match sley_mmap::MappedFile::open(pack_path) {
+    match sley_mmap::MappedFile::open_pack(pack_path) {
         Ok(mapped) => Ok(PackData::Mapped(mapped)),
         Err(_) => Ok(PackData::Heap(fs::read(pack_path)?)),
     }

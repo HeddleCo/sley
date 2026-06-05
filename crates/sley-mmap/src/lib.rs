@@ -35,18 +35,41 @@ pub struct MappedFile {
 impl MappedFile {
     /// Open `path` read-only and memory-map its entire contents.
     ///
+    /// # Safety
+    ///
+    /// A memory map aliases a file whose bytes another process could change. The
+    /// caller must guarantee `path` is **not modified or truncated** for the
+    /// lifetime of the returned [`MappedFile`]; otherwise reading the map is
+    /// undefined behavior (`SIGBUS` on truncation). For sley's pack files this
+    /// invariant holds because they are written by atomic rename and never
+    /// rewritten in place — prefer [`MappedFile::open_pack`], which documents that.
+    ///
     /// # Errors
     ///
     /// Returns any I/O error from opening the file or creating the mapping.
-    pub fn open(path: &Path) -> io::Result<Self> {
+    pub unsafe fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        // SAFETY: `file` is opened read-only, and sley only maps pack files, which
-        // are produced by atomic rename and never truncated in place (see the
-        // module-level "Safety invariant" docs). The backing bytes therefore stay
-        // valid and unchanged for the lifetime of the returned map. This is the
-        // sole `unsafe` in the workspace.
+        // SAFETY: the caller upholds the immutability contract documented above.
         let mmap = unsafe { Mmap::map(&file)? };
         Ok(Self { mmap })
+    }
+
+    /// Memory-map a git **pack file** (`*.pack` / `*.idx`) read-only.
+    ///
+    /// This is the safe, audited entry point for sley: pack files are created by
+    /// writing a temporary and atomically renaming it into place, and are never
+    /// truncated or rewritten in place (a repack writes a new file and renames;
+    /// unlinking a still-mapped pack keeps the inode valid on Unix). That immutability
+    /// is exactly the precondition [`MappedFile::open`] requires, so mapping a pack is
+    /// sound. Callers must only pass paths to such pack files.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error from opening the file or creating the mapping.
+    pub fn open_pack(path: &Path) -> io::Result<Self> {
+        // SAFETY: `path` is a git pack file, which sley writes atomically and never
+        // mutates in place (see the doc comment), so the mapped bytes stay valid.
+        unsafe { Self::open(path) }
     }
 
     /// The mapped bytes.
@@ -85,7 +108,7 @@ mod tests {
             file.write_all(payload).expect("write payload");
             file.sync_all().expect("sync");
         }
-        let mapped = MappedFile::open(&path).expect("map file");
+        let mapped = MappedFile::open_pack(&path).expect("map file");
         assert_eq!(&*mapped, payload);
         assert_eq!(mapped.as_bytes(), payload);
         let _ = std::fs::remove_file(&path);
