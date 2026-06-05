@@ -15369,6 +15369,77 @@ fn parse_similarity_threshold(spec: &str) -> u8 {
     }
 }
 
+/// Peel a single revision string to the tree it names (commit/tag/tree all work).
+fn diff_peel_rev_tree(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    rev: &str,
+) -> Result<ObjectId> {
+    let oid = resolve_revision(git_dir, format, rev)?;
+    sley_rev::peel_to_tree(db, format, &oid)
+}
+
+/// Split `git diff`'s positional arguments into leading revisions (resolved to
+/// tree oids) and the remaining pathspec arguments.
+///
+/// Accepts `diff <rev>`, `diff <rev> <rev>`, `diff <rev>..<rev>`, and
+/// `diff <rev>...<rev>` (symmetric, from the merge base) before any `-- <path>`
+/// separator. A leading argument is treated as a revision only while it resolves
+/// as one; the first argument that fails to resolve — and everything after it — is
+/// a pathspec, so ordinary file paths keep working without an explicit `--`.
+fn diff_split_revisions(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    path_args: Vec<String>,
+) -> Result<(Vec<ObjectId>, Vec<String>)> {
+    let Some(first) = path_args.first() else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    // Range forms name exactly two trees and consume only the first token. Check
+    // `...` before `..` so `A...B` is not mis-split, and require both sides so a
+    // relative path like `../x` (left side empty) is never taken as a range.
+    if let Some((left, right)) = first.split_once("...") {
+        if !left.is_empty() && !right.is_empty() && !right.contains('.') {
+            let left_oid = resolve_revision(git_dir, format, left)?;
+            let right_oid = resolve_revision(git_dir, format, right)?;
+            let base_tree = match sley_rev::merge_bases(git_dir, format, db, &left_oid, &right_oid)?
+                .into_iter()
+                .next()
+            {
+                Some(base) => sley_rev::peel_to_tree(db, format, &base)?,
+                None => ObjectId::empty_tree(format),
+            };
+            let right_tree = sley_rev::peel_to_tree(db, format, &right_oid)?;
+            return Ok((vec![base_tree, right_tree], path_args[1..].to_vec()));
+        }
+    }
+    if let Some((left, right)) = first.split_once("..") {
+        if !left.is_empty() && !right.is_empty() {
+            let left_tree = diff_peel_rev_tree(git_dir, format, db, left)?;
+            let right_tree = diff_peel_rev_tree(git_dir, format, db, right)?;
+            return Ok((vec![left_tree, right_tree], path_args[1..].to_vec()));
+        }
+    }
+    // Otherwise peel up to two leading args that each resolve as a revision.
+    let mut trees = Vec::new();
+    let mut rest = Vec::new();
+    let mut iter = path_args.into_iter();
+    for token in iter.by_ref() {
+        if trees.len() < 2 {
+            if let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token) {
+                trees.push(tree);
+                continue;
+            }
+        }
+        rest.push(token);
+        break;
+    }
+    rest.extend(iter);
+    Ok((trees, rest))
+}
+
 fn cmd_diff(args: &[String]) -> Result<()> {
     let mut name_status = false;
     let mut name_only = false;
@@ -15991,6 +16062,12 @@ fn cmd_diff(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
+    // out of the positional arguments; the remainder are pathspecs. Without this,
+    // `diff A B` was treated as two paths and silently fell back to an
+    // index-vs-worktree diff (wrong output, and a full-worktree rescan on big
+    // repos).
+    let (diff_trees, path_args) = diff_split_revisions(&git_dir, format, &db, path_args)?;
     let find_objects = resolve_diff_find_objects(&git_dir, format, &find_object_values)?;
     let repository_abbrev = repository_abbrev(&git_dir, format)?;
     let raw_abbrev = match raw_abbrev {
@@ -16022,14 +16099,89 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         find_copies_harder,
         rename_empty,
     };
-    let zero_worktree_oids = !cached && !head;
+    // The new-side oid is real (shown, not zeroed) when it comes from a tree or the
+    // index; it is zeroed only when the new side is the worktree.
+    let zero_worktree_oids = match diff_trees.len() {
+        2 => false,
+        1 => !cached,
+        _ => !cached && !head,
+    };
     let rename_options = sley_diff_merge::RenameDetectionOptions {
         base: name_status_options,
         detect_inexact: true,
         rename_threshold,
         copy_threshold,
     };
-    let entries = if cached {
+    let entries = if !diff_trees.is_empty() {
+        match diff_trees.as_slice() {
+            // `diff <rev>`: that tree vs the worktree (or the index with --cached).
+            [tree] => {
+                if cached {
+                    if inexact_renames {
+                        sley_diff_merge::diff_name_status_tree_index_with_rename_options(
+                            &git_dir,
+                            format,
+                            tree,
+                            rename_options,
+                        )?
+                    } else {
+                        sley_diff_merge::diff_name_status_tree_index_with_options(
+                            &git_dir,
+                            format,
+                            tree,
+                            name_status_options,
+                        )?
+                    }
+                } else {
+                    let worktree_root = worktree_root
+                        .as_ref()
+                        .expect("worktree root set for diff <rev>");
+                    if inexact_renames {
+                        sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
+                            worktree_root,
+                            &git_dir,
+                            format,
+                            tree,
+                            rename_options,
+                        )?
+                    } else {
+                        sley_diff_merge::diff_name_status_tree_worktree_with_options(
+                            worktree_root,
+                            &git_dir,
+                            format,
+                            tree,
+                            name_status_options,
+                        )?
+                    }
+                }
+            }
+            // `diff <rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`: tree vs tree.
+            [left, right] => {
+                if inexact_renames {
+                    sley_diff_merge::diff_name_status_trees_with_rename_options(
+                        &db,
+                        format,
+                        left,
+                        right,
+                        rename_options,
+                    )?
+                } else {
+                    sley_diff_merge::diff_name_status_trees_with_options(
+                        &db,
+                        format,
+                        left,
+                        right,
+                        name_status_options,
+                    )?
+                }
+            }
+            _ => {
+                return Err(GitError::Unsupported(
+                    "diff accepts at most two revisions".into(),
+                ));
+            }
+        }
+    } else if cached {
         if inexact_renames {
             sley_diff_merge::diff_name_status_head_index_with_rename_options(
                 &git_dir,

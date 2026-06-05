@@ -2702,3 +2702,61 @@ fn diff_exit_code_and_quiet_match_upstream_git() {
     let _ = fs::remove_dir_all(&root);
     result
 }
+
+#[test]
+fn diff_between_revisions_matches_upstream_git() {
+    // Regression: `diff <rev> <rev>` (and the single-rev / range forms) used to be
+    // mis-parsed as pathspecs and silently fell back to an index-vs-worktree diff.
+    let root = unique_temp_dir("diff-between-revisions");
+    fs::create_dir_all(&root).expect("create repo root");
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("a.txt"), b"line1\nline2\n").expect("write a");
+    fs::create_dir_all(root.join("sub")).expect("mkdir sub");
+    fs::write(root.join("sub/b.txt"), b"x\n").expect("write b");
+    git(&root, &["add", "-A"]);
+    let commit = |msg: &str| {
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                msg,
+                "-q",
+            ],
+        );
+    };
+    commit("c1");
+    fs::write(root.join("a.txt"), b"line1\nCHANGED\nline2\n").expect("modify a");
+    fs::write(root.join("sub/b.txt"), b"y\n").expect("modify b");
+    fs::write(root.join("c.txt"), b"added\n").expect("write c");
+    git(&root, &["add", "-A"]);
+    commit("c2");
+
+    // Worktree is clean (everything committed), so a bare `diff` is empty while the
+    // revision forms must report the c1->c2 changes — exactly git's behavior.
+    for args in [
+        vec!["diff", "--name-status", "HEAD~1", "HEAD"],
+        vec!["diff", "HEAD~1", "HEAD"],
+        vec!["diff", "HEAD~1..HEAD"],
+        vec!["diff", "HEAD~1...HEAD"],
+        vec!["diff", "--name-status", "HEAD~1"],
+        vec!["diff", "--cached", "HEAD~1"],
+        vec!["diff", "--stat", "HEAD~1", "HEAD"],
+        vec!["diff", "--raw", "HEAD~1", "HEAD"],
+        vec!["diff", "--numstat", "HEAD~1", "HEAD"],
+        vec!["diff", "HEAD~1", "HEAD", "--", "a.txt"],
+        vec!["diff", "--name-status", "HEAD~1", "HEAD", "--", "sub"],
+        vec!["diff"],
+    ] {
+        assert_eq!(
+            git_rs(&root, &args),
+            git(&root, &args),
+            "sley diff output diverged from git for {args:?}",
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
