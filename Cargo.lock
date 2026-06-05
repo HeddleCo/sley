@@ -231,6 +231,7 @@ dependencies = [
  "sley-pack",
  "sley-protocol",
  "sley-refs",
+ "sley-remote",
  "sley-rev",
  "sley-sequencer",
  "sley-testkit",

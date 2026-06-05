@@ -22,6 +22,12 @@
 use sley_core::Result;
 use sley_transport::GitCredential;
 
+mod credentials;
+pub use credentials::{
+    credential_fill, credential_request_for_url, credential_store, http_credential_host,
+    http_protocol_name, http_url_credential, CredentialHelperProvider,
+};
+
 /// Supplies credentials for an authenticated remote, mirroring git's credential
 /// protocol: [`fill`](CredentialProvider::fill) is handed a partial
 /// [`GitCredential`] describing the request (protocol/host/path) and returns a

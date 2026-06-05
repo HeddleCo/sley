@@ -1,33 +1,33 @@
-# Extraction plan: `git-cli` network orchestration → `git-remote`
+# Extraction plan: `sley-cli` network orchestration → `sley-remote`
 
-Guide for lifting fetch/push/clone/ls-remote out of the `git-cli` monolith
-(`crates/git-cli/src/lib.rs`, ~34k lines) into a callable `git-remote` library
+Guide for lifting fetch/push/clone/ls-remote out of the `sley-cli` monolith
+(`crates/sley-cli/src/lib.rs`, ~34k lines) into a callable `sley-remote` library
 crate. Heddle's biggest blocker; first extraction of the decomposition (#19).
 
 ## Key facts
 
-- All wire codecs (`git-protocol`), the v2 pack encoder (`git-pack`), pack build
-  + reachability (`git-odb`), ref-update/push-command planning (`git-protocol`),
+- All wire codecs (`sley-protocol`), the v2 pack encoder (`sley-pack`), pack build
+  + reachability (`sley-odb`), ref-update/push-command planning (`sley-protocol`),
   and report-status parsing are **already public library APIs**. The lift is
   orchestration glue, not algorithms.
-- All transport orchestration is in `git-cli/src/lib.rs` (none in `commands/*`).
+- All transport orchestration is in `sley-cli/src/lib.rs` (none in `commands/*`).
 - **Shallow/deepen is NOT implemented**: `UploadPackRequest`/`Features` support
-  `deepen`/`shallow` (`git-protocol/src/lib.rs:1485`, `:1247`) with a full v2
+  `deepen`/`shallow` (`sley-protocol/src/lib.rs:1485`, `:1247`) with a full v2
   parser, but every fetch builder uses `{ wants, ..default() }`
-  (`git-cli/src/lib.rs:9845`, `:9394`, `:9338`) and `cmd_clone` validates then
+  (`sley-cli/src/lib.rs:9845`, `:9394`, `:9338`) and `cmd_clone` validates then
   discards `--depth` (`:2207`). Wiring it is new behavior in this slice.
 
 ## What moves vs. stays
 
-**(A) Already in libs — call from `git-remote`:** git-protocol (UploadPack/
+**(A) Already in libs — call from `sley-remote`:** sley-protocol (UploadPack/
 ReceivePack types + codecs, `plan_fetch_ref_updates`, `plan_push_commands`,
-`build_receive_pack_push_request`), git-transport (`RemoteUrl`, `parse_remote_url`,
+`build_receive_pack_push_request`), sley-transport (`RemoteUrl`, `parse_remote_url`,
 `GitCredential`, `HttpClient`/`UreqHttpClient`, `http_smart_*_url`,
-`ssh_process_command`), git-fetch (`install_upload_pack_raw_response`), git-odb
+`ssh_process_command`), sley-fetch (`install_upload_pack_raw_response`), sley-odb
 (`build_reachable_pack`, `collect_reachable_object_ids`, `install_raw_pack`),
-git-refs, git-config, git-rev, git-core.
+sley-refs, sley-config, sley-rev, sley-core.
 
-**(B) git-cli-internal pure logic — MOVE into `git-remote`** (all take explicit
+**(B) sley-cli-internal pure logic — MOVE into `sley-remote`** (all take explicit
 args; no globals; strip trailing `eprintln!`):
 - HTTP: `fetch_http_repository` (:9859), `push_http_repository` (:9950),
   `clone_http_repository` (:2928), `ls_remote_http_records` (:10076),
@@ -74,9 +74,9 @@ mapping (`main.rs`); arg parsing (`cmd_*`, `parse_ls_remote_*`, `GitArgCursor`);
    calls; default impl = the moved subprocess helper; `NoCredentials` no-op
    (what heddle uses). Anticipate interactive askpass (not present today).
 2. **`ProgressSink` trait** — replaces the trailing `eprintln!`/`println!` and
-   the `&mut impl Write` prune sink; `git-remote` returns structured
-   `FetchOutcome`/`PushOutcome`, git-cli formats them.
-3. **Hoist repo/URL resolution into git-cli** — `git-remote` takes `git_dir`,
+   the `&mut impl Write` prune sink; `sley-remote` returns structured
+   `FetchOutcome`/`PushOutcome`, sley-cli formats them.
+3. **Hoist repo/URL resolution into sley-cli** — `sley-remote` takes `git_dir`,
    `common_git_dir`, `format`, `&GitConfig`, and the already-resolved URL as
    params. Kills the `set_current_dir` clone hack and the global-state reads.
 4. **In-process local server** — expose reader/writer `serve_upload_pack`/

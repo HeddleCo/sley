@@ -1,15 +1,15 @@
-# git-rs — Work Tracker
+# sley — Work Tracker
 
-> Living tracker for the git-rs effort: enabling **heddle** to drop-in replace
-> `gix`, decomposing the `git-cli` monolith, strengthening domain types, and
+> Living tracker for the sley effort: enabling **heddle** to drop-in replace
+> `gix`, decomposing the `sley-cli` monolith, strengthening domain types, and
 > performance. **Last updated: 2026-06-05.**
 
 ## Context
 
-- **git-rs** — pure-Rust, minimal-dependency reimplementation of Git (target
+- **sley** — pure-Rust, minimal-dependency reimplementation of Git (target
   upstream 2.54.0), meant to be *used as a library and injected downstream*.
 - **heddle** — a git-overlay VCS that wants to replace `gix` (gitoxide) with
-  git-rs. It needs **byte-identical** git objects/refs/index and smart-HTTP
+  sley. It needs **byte-identical** git objects/refs/index and smart-HTTP
   transport, all callable as libraries. A non-`gix`-shaped API is fine (heddle
   adapts); "many smaller crates" is welcome. Its spec drives the gap list below.
 - **Guiding type principle** — lossless newtypes + typed views; strict enums only
@@ -20,7 +20,7 @@
 ## ✅ Done
 
 ### Performance — git parity (committed: `0dcd291`..`1095004`)
-All five perf levers landed; on a fresh packed repo git-rs beats git on
+All five perf levers landed; on a fresh packed repo sley beats git on
 cat-file (~3.8×), log/rev-list (~2.6×), merge-base (~2.6×); status closed via
 the stat-cache.
 
@@ -33,9 +33,9 @@ the stat-cache.
 | 5 | Cut per-read object clones | (perf series) |
 
 ### Heddle gix-replacement audit
-Five-cluster audit mapping heddle's required `gix` surface to git-rs. **Verdict:**
+Five-cluster audit mapping heddle's required `gix` surface to sley. **Verdict:**
 the byte-exact engine is present and interop-verified; the gap was the *library
-facade* — much orchestration was locked inside the `git-cli` monolith. Drives
+facade* — much orchestration was locked inside the `sley-cli` monolith. Drives
 the backlog below.
 
 ### Export round-trip core (heddle Flow 2) — `baab4d2`
@@ -44,25 +44,25 @@ workspace test suite green (123 test binaries).
 
 | Item | Crate(s) | New public API | Verified vs |
 |---|---|---|---|
-| Tree-editor | git-object (+ facade) | `TreeBuilder`, `EntryKind`, `tree_entry_cmp`; `Repository::{edit_tree,write_tree,write_blob,write_object}` | `git write-tree` |
-| Intent-to-add | git-index | `IndexEntry::intent_to_add`/`is_/set_intent_to_add`/`stage()`, `Stage`, `INDEX_EXTENDED_FLAG_*`, `Index::upgrade_version_for_flags` | `git add -N` (byte-for-byte) |
-| index_from_tree | git-worktree (+ facade) | `index_from_tree(db,fmt,tree)`; `Repository::{index_from_tree,open_index}` | `git read-tree` + `ls-files --stage` |
-| Ref CAS | git-refs | `RefPrecondition` (Any/MustExist/MustNotExist/MustExistAndMatch/ExistingMustMatch), `FileRefTransaction::update_to` | unit (under-lock CAS, atomic batch) |
-| ObjectId types | git-core | `Ord`/`PartialOrd`, `FromStr`, `null`/`empty_tree`/`empty_blob`/`is_null` | known hashes |
+| Tree-editor | sley-object (+ facade) | `TreeBuilder`, `EntryKind`, `tree_entry_cmp`; `Repository::{edit_tree,write_tree,write_blob,write_object}` | `git write-tree` |
+| Intent-to-add | sley-index | `IndexEntry::intent_to_add`/`is_/set_intent_to_add`/`stage()`, `Stage`, `INDEX_EXTENDED_FLAG_*`, `Index::upgrade_version_for_flags` | `git add -N` (byte-for-byte) |
+| index_from_tree | sley-worktree (+ facade) | `index_from_tree(db,fmt,tree)`; `Repository::{index_from_tree,open_index}` | `git read-tree` + `ls-files --stage` |
+| Ref CAS | sley-refs | `RefPrecondition` (Any/MustExist/MustNotExist/MustExistAndMatch/ExistingMustMatch), `FileRefTransaction::update_to` | unit (under-lock CAS, atomic batch) |
+| ObjectId types | sley-core | `Ord`/`PartialOrd`, `FromStr`, `null`/`empty_tree`/`empty_blob`/`is_null` | known hashes |
 
 ---
 
 ## 🔄 In progress
 
-### Network driver → new `git-remote` crate  *(heddle's biggest remaining blocker)*
-Lift fetch / push / clone / ls-remote **orchestration** out of the `git-cli`
-monolith into a callable library crate. The wire codecs (`git-protocol`) and the
-v2 pack encoder (`git-pack`) are already public; what must move is the glue:
+### Network driver → new `sley-remote` crate  *(heddle's biggest remaining blocker)*
+Lift fetch / push / clone / ls-remote **orchestration** out of the `sley-cli`
+monolith into a callable library crate. The wire codecs (`sley-protocol`) and the
+v2 pack encoder (`sley-pack`) are already public; what must move is the glue:
 info/refs → advertisement parse → RPC, ref-map building, HEAD-symref resolution,
 report-status validation, the credential hook, and the `file://`/local-path
 object copy. Also: verify shallow `deepen <n>` is honored on HTTP fetch; wire the
 TLS backend feature choice. This is also the first big extraction of the
-`git-cli` decomposition (#19).
+`sley-cli` decomposition (#19).
 
 ---
 
@@ -82,20 +82,20 @@ TLS backend feature choice. This is also the first big extraction of the
 4. **ObjectId `Copy` + `clone_on_copy` cleanup** — deferred from export-core
    (would add ~200 clippy warnings across 15 crates); do as one scoped
    `clippy --fix` pass.
-5. **git-cli monolith decomposition (#19)** — umbrella effort; the network
+5. **sley-cli monolith decomposition (#19)** — umbrella effort; the network
    driver is the first extraction. Then diff/log/commit/remote command families.
 6. **Protocol v2 over HTTP** — deferred; v1 + `deepen` covers heddle.
 7. **Smudge on restore/reset --hard/stash (#34)**; clean up 2 pre-existing
-   `git-cli` dead-code warnings (will fall out in decomposition).
+   `sley-cli` dead-code warnings (will fall out in decomposition).
 
 ---
 
 ## Heddle gap scorecard (condensed)
 
 - **Byte-exactness: PROVEN** — live-oracle interop (real `git verify-pack` /
-  `cat-file` / `ls-files` read git-rs output; upstream `t/*.sh` suite runs).
+  `cat-file` / `ls-files` read sley output; upstream `t/*.sh` suite runs).
 - **Ready (callable lib):** object read + transparent pack/delta decode; commit
-  minting (`git-sequencer`); blob write; index r/w v2/v3/v4; packed-refs; atomic
+  minting (`sley-sequencer`); blob write; index r/w v2/v3/v4; packed-refs; atomic
   ref txn + reflog; smart-HTTP codecs (v1+v2) + pack encoder; discover/open/init;
   ahead/behind revwalk; config include/includeIf.
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
@@ -120,5 +120,5 @@ TLS backend feature choice. This is also the first big extraction of the
 
 ## Open task IDs
 
-`#19` decompose git-cli · `#34` smudge on restore/reset/stash · `#40` dep-feature
+`#19` decompose sley-cli · `#34` smudge on restore/reset/stash · `#40` dep-feature
 forwarding · `#46` strengthen domain types (signatures/dates/ref names/paths).

@@ -43,9 +43,9 @@ use sley_protocol::{
     smart_http_rpc_result_content_type,
 };
 use sley_transport::{
-    GitCredential, HttpClient, HttpResponse, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
-    encode_git_credential, git_credential_basic_authorization, http_smart_info_refs_url,
-    http_smart_rpc_url, parse_git_credential, read_service_discovery_response,
+    HttpClient, HttpResponse, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
+    git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
+    read_service_discovery_response,
 };
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -57,6 +57,10 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Mutex;
+
+use sley_remote::{
+    credential_fill, credential_request_for_url, credential_store, http_url_credential,
+};
 
 static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Vec::new());
 static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -9526,158 +9530,6 @@ fn new_http_client() -> UreqHttpClient {
     UreqHttpClient::new()
 }
 
-fn http_protocol_name(remote: &RemoteUrl) -> Option<String> {
-    match remote.transport {
-        RemoteTransport::Https => Some("https".to_string()),
-        RemoteTransport::Http => Some("http".to_string()),
-        _ => None,
-    }
-}
-
-fn http_credential_host(remote: &RemoteUrl) -> Option<String> {
-    remote.host.clone().map(|host| match remote.port {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
-    })
-}
-
-/// Credential implied by `user[:password]@` userinfo in the remote URL.
-fn http_url_credential(remote: &RemoteUrl) -> Option<GitCredential> {
-    let username = remote.user.clone()?;
-    Some(GitCredential {
-        protocol: http_protocol_name(remote),
-        host: http_credential_host(remote),
-        username: Some(username),
-        password: remote.password.clone(),
-        ..GitCredential::default()
-    })
-}
-
-/// The lookup key a credential helper is asked to fill for this remote.
-fn credential_request_for_url(remote: &RemoteUrl) -> GitCredential {
-    GitCredential {
-        protocol: http_protocol_name(remote),
-        host: http_credential_host(remote),
-        username: remote.user.clone(),
-        ..GitCredential::default()
-    }
-}
-
-/// Ordered `credential.helper` values from config. An empty value resets the
-/// accumulated list, matching upstream git semantics.
-fn credential_helper_specs(config: Option<&GitConfig>) -> Vec<String> {
-    let Some(config) = config else {
-        return Vec::new();
-    };
-    let mut specs = Vec::new();
-    for section in &config.sections {
-        if section.name != "credential" || section.subsection.is_some() {
-            continue;
-        }
-        for entry in &section.entries {
-            if !entry.key.eq_ignore_ascii_case("helper") {
-                continue;
-            }
-            match entry.value.as_deref() {
-                Some("") | None => specs.clear(),
-                Some(value) => specs.push(value.to_string()),
-            }
-        }
-    }
-    specs
-}
-
-/// Resolve a `credential.helper` spec into a runnable command, appending the
-/// operation (`get`/`store`/`erase`). Supports `!shell`, absolute paths, and
-/// bare names (mapped to `git-credential-<name>`), each with optional arguments.
-fn credential_helper_command(spec: &str, op: &str) -> Option<ProcessCommand> {
-    let spec = spec.trim();
-    if spec.is_empty() {
-        return None;
-    }
-    if let Some(shell) = spec.strip_prefix('!') {
-        let mut command = ProcessCommand::new("sh");
-        command
-            .arg("-c")
-            .arg(format!("{shell} \"$@\""))
-            .arg("sh")
-            .arg(op);
-        return Some(command);
-    }
-    let mut tokens = spec.split_whitespace();
-    let head = tokens.next()?;
-    let program = if head.contains('/') {
-        head.to_string()
-    } else {
-        format!("git-credential-{head}")
-    };
-    let mut command = ProcessCommand::new(program);
-    for arg in tokens {
-        command.arg(arg);
-    }
-    command.arg(op);
-    Some(command)
-}
-
-/// Run a credential helper, feeding `input` on stdin. Best-effort: a missing or
-/// failing helper yields `None` rather than aborting the transfer.
-fn run_credential_helper(spec: &str, op: &str, input: &[u8]) -> Result<Option<Vec<u8>>> {
-    let Some(mut command) = credential_helper_command(spec, op) else {
-        return Ok(None);
-    };
-    command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(_) => return Ok(None),
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input)?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(output.stdout))
-}
-
-fn credential_fill(
-    config: Option<&GitConfig>,
-    mut request: GitCredential,
-) -> Result<Option<GitCredential>> {
-    for spec in credential_helper_specs(config) {
-        if request.username.is_some() && request.password.is_some() {
-            break;
-        }
-        let input = encode_git_credential(&request)?;
-        if let Some(stdout) = run_credential_helper(&spec, "get", &input)? {
-            let filled = parse_git_credential(&stdout)?;
-            if filled.username.is_some() {
-                request.username = filled.username;
-            }
-            if filled.password.is_some() {
-                request.password = filled.password;
-            }
-        }
-    }
-    if request.username.is_some() && request.password.is_some() {
-        Ok(Some(request))
-    } else {
-        Ok(None)
-    }
-}
-
-fn credential_store(config: Option<&GitConfig>, credential: &GitCredential, approve: bool) {
-    let Ok(input) = encode_git_credential(credential) else {
-        return;
-    };
-    let op = if approve { "store" } else { "erase" };
-    for spec in credential_helper_specs(config) {
-        let _ = run_credential_helper(&spec, op, &input);
-    }
-}
 
 /// Perform an HTTP request, retrying once with credential-helper-supplied
 /// authentication if the first attempt returns 401. `perform` is invoked with an
