@@ -5104,6 +5104,12 @@ impl IndexStatCache {
         index_mtime <= entry_mtime
     }
 
+    /// Whether the index has a stage-0 entry for `git_path` (i.e. the path is
+    /// tracked). Used to skip hashing untracked worktree files.
+    fn contains(&self, git_path: &[u8]) -> bool {
+        self.entries.contains_key(git_path)
+    }
+
     /// Returns the cached [`TrackedEntry`] for `git_path` (reusing its stored
     /// oid, so the caller can SKIP reading, filtering, and hashing the file) only
     /// when the worktree file is provably unchanged since it was staged: a
@@ -5333,6 +5339,22 @@ fn collect_worktree_entries(
                 stat_cache.and_then(|cache| cache.reuse_tracked_entry(&git_path, &metadata))
             {
                 entries.insert(git_path, tracked);
+                continue;
+            }
+            // A file absent from the index is untracked: status and the
+            // index-vs-worktree diff report it by *presence* (`??` / nothing), never
+            // by content, so computing its oid is wasted work — git never hashes
+            // untracked files. Record presence with a null oid and skip the
+            // read+filter+hash. Without a stat cache we cannot tell tracked from
+            // untracked, so fall through and hash as before.
+            if stat_cache.is_some_and(|cache| !cache.contains(&git_path)) {
+                entries.insert(
+                    git_path,
+                    TrackedEntry {
+                        mode: file_mode(&metadata),
+                        oid: ObjectId::null(format),
+                    },
+                );
                 continue;
             }
             let body = fs::read(&path)?;
