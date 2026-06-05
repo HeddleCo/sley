@@ -14,7 +14,7 @@ sley-pack = { path = "../sley-pack" }
 sley-protocol = { path = "../sley-protocol" }
 sley-refs = { path = "../sley-refs" }
 sley-rev = { path = "../sley-rev" }
-sley-transport = { path = "../sley-transport" }
+sley-transport = { path = "../sley-transport", features = ["http-client"] }
 sley-worktree = { path = "../sley-worktree" }
 
 [lints]

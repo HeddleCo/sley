@@ -28,6 +28,14 @@ pub use credentials::{
     http_protocol_name, http_url_credential, CredentialHelperProvider,
 };
 
+mod http;
+pub use http::{
+    http_advertised_refs, http_authorization_headers, http_check_status, http_send_with_auth,
+    http_service_advertisements, http_upload_pack_advertisements, http_upload_pack_fetch_response,
+    http_validate_content_type, install_fetch_pack_via_http_upload_pack, new_http_client,
+    remote_url_is_http,
+};
+
 mod local;
 pub use local::{
     attach_receive_pack_capabilities, attach_upload_pack_capabilities,

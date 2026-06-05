@@ -36,15 +36,8 @@ use sley_protocol::{
     write_upload_pack_raw_packfile_response, write_upload_pack_request,
 };
 use sley_transport::{RemoteTransport, SshCommandVariant, parse_remote_url, ssh_process_command};
-use sley_protocol::{
-    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type,
-};
-use sley_transport::{
-    HttpClient, HttpResponse, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
-    git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
-    read_service_discovery_response,
-};
+use sley_protocol::{smart_http_rpc_request_content_type, smart_http_rpc_result_content_type};
+use sley_transport::{HttpClient, http_smart_rpc_url};
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -55,10 +48,6 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Mutex;
-
-use sley_remote::{
-    credential_fill, credential_request_for_url, credential_store, http_url_credential,
-};
 
 static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Vec::new());
 static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -2629,7 +2618,7 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    if remote_url_is_http(&repository).unwrap_or(false) {
+    if sley_remote::remote_url_is_http(&repository).unwrap_or(false) {
         return clone_http_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
@@ -2953,9 +2942,9 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     }
 
     let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
-    let client = new_http_client();
+    let client = sley_remote::new_http_client();
     let (advertisements, features) =
-        http_upload_pack_advertisements(&client, &remote, None, ObjectFormat::Sha1)?;
+        sley_remote::http_upload_pack_advertisements(&client, &remote, None, ObjectFormat::Sha1)?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
@@ -9306,201 +9295,12 @@ fn ssh_upload_pack_fetch_response(
 // and the RPC POST response goes straight to the packfile/report (no re-advertised
 // refs to skip).
 
-fn remote_url_is_http(url: &str) -> Result<bool> {
-    Ok(matches!(
-        parse_remote_url(url)?.transport,
-        RemoteTransport::Http | RemoteTransport::Https
-    ))
-}
-
 fn fetch_source_is_http(source: &str) -> Result<bool> {
-    remote_url_is_http(&ls_remote_resolved_url(source)?)
+    sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
 }
 
 fn push_remote_is_http(remote: &str) -> Result<bool> {
-    remote_url_is_http(&push_resolved_url(remote)?)
-}
-
-fn new_http_client() -> UreqHttpClient {
-    UreqHttpClient::new()
-}
-
-
-/// Perform an HTTP request, retrying once with credential-helper-supplied
-/// authentication if the first attempt returns 401. `perform` is invoked with an
-/// optional `Authorization` header value and must be idempotent (it may run twice).
-fn http_send_with_auth(
-    remote: &RemoteUrl,
-    config: Option<&GitConfig>,
-    mut perform: impl FnMut(Option<&str>) -> Result<HttpResponse>,
-) -> Result<HttpResponse> {
-    let initial = http_url_credential(remote);
-    let initial_header = match &initial {
-        Some(credential) => git_credential_basic_authorization(credential)?,
-        None => None,
-    };
-    let response = perform(initial_header.as_deref())?;
-    if response.status != 401 {
-        return Ok(response);
-    }
-    let mut request = credential_request_for_url(remote);
-    if request.username.is_none() {
-        request.username = initial.and_then(|credential| credential.username);
-    }
-    let Some(filled) = credential_fill(config, request)? else {
-        return Ok(response);
-    };
-    let Some(header) = git_credential_basic_authorization(&filled)? else {
-        return Ok(response);
-    };
-    let retry = perform(Some(&header))?;
-    credential_store(config, &filled, retry.status != 401);
-    Ok(retry)
-}
-
-fn http_authorization_headers(auth: Option<&str>) -> Vec<(&str, &str)> {
-    match auth {
-        Some(value) => vec![("Authorization", value)],
-        None => Vec::new(),
-    }
-}
-
-fn http_check_status(response: &HttpResponse, url: &str) -> Result<()> {
-    if (200..300).contains(&response.status) {
-        Ok(())
-    } else if response.status == 401 {
-        Err(GitError::Command(format!(
-            "authentication failed for {url}"
-        )))
-    } else {
-        Err(GitError::Command(format!(
-            "unexpected HTTP status {} for {url}",
-            response.status
-        )))
-    }
-}
-
-fn http_validate_content_type(response: &HttpResponse, expected: &str) -> Result<()> {
-    let actual = response
-        .content_type
-        .as_deref()
-        .unwrap_or("")
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim();
-    if actual.eq_ignore_ascii_case(expected) {
-        Ok(())
-    } else {
-        Err(GitError::InvalidFormat(format!(
-            "unexpected content type {actual:?}, expected {expected:?}"
-        )))
-    }
-}
-
-fn http_advertised_refs(format: ObjectFormat, mut response: HttpResponse) -> Result<RefAdvertisementSet> {
-    let discovery = read_service_discovery_response(format, &mut response.body)?;
-    match discovery.payload {
-        ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
-        ServiceDiscoveryPayload::ProtocolV2(_) => Err(GitError::Unsupported(
-            "protocol v2 advertisements over HTTP are not supported yet".into(),
-        )),
-    }
-}
-
-fn http_service_advertisements(
-    client: &UreqHttpClient,
-    remote: &RemoteUrl,
-    config: Option<&GitConfig>,
-    format: ObjectFormat,
-    service: GitService,
-) -> Result<RefAdvertisementSet> {
-    let url = http_smart_info_refs_url(remote, service)?;
-    let response = http_send_with_auth(remote, config, |auth| {
-        client.get(&url, &http_authorization_headers(auth))
-    })?;
-    http_check_status(&response, &url)?;
-    http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
-    http_advertised_refs(format, response)
-}
-
-fn http_upload_pack_advertisements(
-    client: &UreqHttpClient,
-    remote: &RemoteUrl,
-    config: Option<&GitConfig>,
-    format: ObjectFormat,
-) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let set = http_service_advertisements(client, remote, config, format, GitService::UploadPack)?;
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    Ok((set.refs, features))
-}
-
-fn http_upload_pack_fetch_response(
-    client: &UreqHttpClient,
-    remote: &RemoteUrl,
-    config: Option<&GitConfig>,
-    format: ObjectFormat,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-) -> Result<UploadPackRawPackfileResponse> {
-    let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
-    let mut body = Vec::new();
-    write_upload_pack_request(&mut body, Some(&request))?;
-    write_upload_pack_negotiation_request(
-        &mut body,
-        &UploadPackNegotiationRequest { haves, done: true },
-    )?;
-    let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
-    let mut response = http_send_with_auth(remote, config, |auth| {
-        client.post(&url, &content_type, &http_authorization_headers(auth), body.clone())
-    })?;
-    http_check_status(&response, &url)?;
-    http_validate_content_type(
-        &response,
-        &smart_http_rpc_result_content_type(GitService::UploadPack)?,
-    )?;
-    read_upload_pack_raw_packfile_response(format, &mut response.body)
-}
-
-fn install_fetch_pack_via_http_upload_pack(
-    client: &UreqHttpClient,
-    git_dir: &Path,
-    format: ObjectFormat,
-    remote: &RemoteUrl,
-    config: Option<&GitConfig>,
-    wants: Vec<ObjectId>,
-    promisor: bool,
-) -> Result<()> {
-    if wants.is_empty() {
-        return Ok(());
-    }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
-    {
-        return Ok(());
-    }
-    let request = UploadPackRequest {
-        wants,
-        ..UploadPackRequest::default()
-    };
-    let haves = sley_remote::local_have_oids(git_dir, format)?;
-    let response = http_upload_pack_fetch_response(client, remote, config, format, request, haves)?;
-    if promisor {
-        install_upload_pack_raw_promisor_response(&response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&response, &local_db)?;
-    }
-    Ok(())
+    sley_remote::remote_url_is_http(&push_resolved_url(remote)?)
 }
 
 fn fetch_http_repository(
@@ -9530,9 +9330,9 @@ fn fetch_http_repository(
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
-    let client = new_http_client();
+    let client = sley_remote::new_http_client();
     let (advertisements, _features) =
-        http_upload_pack_advertisements(&client, &remote, Some(&config), format)?;
+        sley_remote::http_upload_pack_advertisements(&client, &remote, Some(&config), format)?;
     let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
     let store = FileRefStore::new(git_dir, format);
     if options.fetch_all_tags {
@@ -9549,7 +9349,7 @@ fn fetch_http_repository(
         .iter()
         .map(|update| update.oid.clone())
         .collect::<Vec<_>>();
-    install_fetch_pack_via_http_upload_pack(
+    sley_remote::install_fetch_pack_via_http_upload_pack(
         &client,
         git_dir,
         format,
@@ -9613,9 +9413,9 @@ fn push_http_repository(
         ));
     }
     let config = read_repo_config(git_dir).ok();
-    let client = new_http_client();
+    let client = sley_remote::new_http_client();
     let advertisement_set =
-        http_service_advertisements(&client, &parsed, config.as_ref(), format, GitService::ReceivePack)?;
+        sley_remote::http_service_advertisements(&client, &parsed, config.as_ref(), format, GitService::ReceivePack)?;
     let features = advertisement_set
         .refs
         .first()
@@ -9692,11 +9492,16 @@ fn push_http_repository(
     write_receive_pack_push_request(&mut body, &request)?;
     let url = http_smart_rpc_url(&parsed, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let mut response = http_send_with_auth(&parsed, config.as_ref(), |auth| {
-        client.post(&url, &content_type, &http_authorization_headers(auth), body.clone())
+    let mut response = sley_remote::http_send_with_auth(&parsed, config.as_ref(), |auth| {
+        client.post(
+            &url,
+            &content_type,
+            &sley_remote::http_authorization_headers(auth),
+            body.clone(),
+        )
     })?;
-    http_check_status(&response, &url)?;
-    http_validate_content_type(
+    sley_remote::http_check_status(&response, &url)?;
+    sley_remote::http_validate_content_type(
         &response,
         &smart_http_rpc_result_content_type(GitService::ReceivePack)?,
     )?;
@@ -9735,9 +9540,9 @@ fn ls_remote_http_records(
     let config = discover_git_dir(env::current_dir()?)
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let client = new_http_client();
+    let client = sley_remote::new_http_client();
     let (refs, features) =
-        http_upload_pack_advertisements(&client, &parsed, config.as_ref(), ObjectFormat::Sha1)?;
+        sley_remote::http_upload_pack_advertisements(&client, &parsed, config.as_ref(), ObjectFormat::Sha1)?;
     let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
     if format != ObjectFormat::Sha1 {
         return Err(GitError::Unsupported(format!(
