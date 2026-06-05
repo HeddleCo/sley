@@ -31,6 +31,22 @@ pub struct CommitRecord {
     pub commit: Commit,
 }
 
+/// Lightweight commit-walk record: id, parents, and committer time only.
+///
+/// Unlike [`CommitRecord`] (which carries the whole parsed [`Commit`] and so
+/// forces a read+inflate of every commit object), this is sourced from the
+/// commit-graph when present — no object read — and falls back to the commit
+/// object only for commits the graph does not cover. Use it for traversals that
+/// need ancestry + date ordering but not the full commit (rev-list, log).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMetadata {
+    pub oid: ObjectId,
+    pub parents: Vec<ObjectId>,
+    /// Committer time in seconds since the epoch (the value the commit-graph
+    /// records, identical to the object's committer line).
+    pub commit_time: i64,
+}
+
 pub fn resolve_revision(
     git_dir: impl AsRef<Path>,
     format: sley_core::ObjectFormat,
@@ -655,6 +671,17 @@ impl<'a> CommitGraphContext<'a> {
         }
         commit_parents(reader, self.format, oid)
     }
+
+    /// `oid`'s parents and committer time from the graph in one lookup, or `None`
+    /// when the commit is not represented (the caller then reads the object).
+    fn metadata(&mut self, oid: &ObjectId) -> Option<(Vec<ObjectId>, i64)> {
+        self.lookup(oid).map(|commit| {
+            (
+                commit.parents.clone(),
+                i64::try_from(commit.commit_time).unwrap_or(i64::MAX),
+            )
+        })
+    }
 }
 
 /// Read and parse the commit-graph for `git_dir`, returning an oid-keyed map of
@@ -878,6 +905,70 @@ pub fn parse_commit_parents(format: sley_core::ObjectFormat, body: &[u8]) -> Res
         }
     }
     Ok(parents)
+}
+
+/// Walk history from `starts`, returning [`CommitMetadata`] (id + parents +
+/// committer time) for every reachable commit, in discovery order.
+///
+/// Parents and time come from the commit-graph when it covers a commit (no object
+/// read); commits the graph omits fall back to a read+parse. This is the
+/// commit-graph-accelerated counterpart of [`walk_commits`] for callers that only
+/// need ancestry and ordering (rev-list, log traversal) and not the full commit.
+pub fn walk_commit_metadata<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+) -> Result<Vec<CommitMetadata>> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
+    let mut out = Vec::new();
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid.clone()) {
+            continue;
+        }
+        let (parents, commit_time) = match graph.metadata(&oid) {
+            Some(metadata) => metadata,
+            None => commit_metadata_from_object(reader, format, &oid)?,
+        };
+        // `--first-parent` follows only the first parent of each commit; otherwise
+        // every parent is enqueued (matching `walk_commits`).
+        if first_parent {
+            pending.extend(parents.first().cloned());
+        } else {
+            pending.extend(parents.iter().cloned());
+        }
+        out.push(CommitMetadata {
+            oid,
+            parents,
+            commit_time,
+        });
+    }
+    Ok(out)
+}
+
+/// Parents and committer time of `oid` read from its commit object (the fallback
+/// for commits absent from the commit-graph).
+fn commit_metadata_from_object<R: ObjectReader>(
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+) -> Result<(Vec<ObjectId>, i64)> {
+    let object = reader.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    let commit = Commit::parse(format, &object.body)?;
+    let commit_time = commit
+        .committer_signature()
+        .map(|signature| signature.time.seconds)
+        .unwrap_or(0);
+    Ok((commit.parents.clone(), commit_time))
 }
 
 pub fn walk_commits<R: ObjectReader>(

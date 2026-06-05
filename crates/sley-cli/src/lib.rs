@@ -23861,6 +23861,78 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             excluded.insert(record.oid);
         }
     }
+    // Commit-graph fast path: a plain commit listing (no flag that needs the parsed
+    // commit object) walks via the commit-graph and reads zero commit objects. Any
+    // commit-body-dependent mode falls through to the full walk below. The guard is
+    // a strict allowlist — only flags whose handling needs solely oid+parents+time.
+    if walk_mode == RevListWalkMode::Walk
+        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && matches!(pretty, RevListPretty::Default)
+        && matches!(object_filter, RevListObjectFilter::None)
+        && !objects
+        && !objects_edge
+        && disk_usage.is_none()
+        && !boundary
+        && !header
+        && !children
+        && !left_right
+        && side_filter.is_none()
+        && !timestamp
+        && author_filters.is_empty()
+        && committer_filters.is_empty()
+        && grep_filters.is_empty()
+        && max_age.is_none()
+        && min_age.is_none()
+    {
+        let metadata = sley_rev::walk_commit_metadata(
+            &git_dir,
+            format,
+            &db,
+            include_commits.clone(),
+            first_parent,
+        )?;
+        let mut selected = metadata
+            .into_iter()
+            .filter(|record| !excluded.contains(&record.oid))
+            .filter(|record| {
+                !(min_parents.is_some_and(|min| record.parents.len() < min)
+                    || max_parents.is_some_and(|max| record.parents.len() > max))
+            })
+            .collect::<Vec<_>>();
+        selected = rev_list_metadata_date_order(selected);
+        if skip_count > 0 {
+            selected = selected.into_iter().skip(skip_count).collect();
+        }
+        if let Some(max_count) = max_count {
+            selected.truncate(max_count);
+        }
+        if reverse {
+            selected.reverse();
+        }
+        if count {
+            println!("{}", if quiet { 0 } else { selected.len() });
+            return Ok(());
+        }
+        if quiet {
+            return Ok(());
+        }
+        let mut stdout = io::stdout();
+        for record in &selected {
+            write!(
+                stdout,
+                "{}",
+                format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+            )?;
+            if parents {
+                for parent in &record.parents {
+                    write!(stdout, " {parent}")?;
+                }
+            }
+            stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
     let commits = match walk_mode {
         RevListWalkMode::Walk => rev_list_walk_commits(&db, format, include_commits, first_parent)?,
         RevListWalkMode::NoWalkSorted | RevListWalkMode::NoWalkUnsorted => {
@@ -24703,6 +24775,68 @@ fn rev_list_ready_order<K: Ord>(
         }
     }
     out
+}
+
+/// Date-order a metadata-only commit list. Mirrors [`rev_list_date_order`] /
+/// [`rev_list_ready_order`] exactly (topological readiness + a
+/// `(commit_time, Reverse(idx))` key), but on [`sley_rev::CommitMetadata`] whose
+/// committer time came from the commit-graph — so the order is byte-identical to
+/// the full-record path without reading any commit object.
+fn rev_list_metadata_date_order(
+    records: Vec<sley_rev::CommitMetadata>,
+) -> Vec<sley_rev::CommitMetadata> {
+    let index_by_oid = records
+        .iter()
+        .enumerate()
+        .map(|(idx, record)| (record.oid.clone(), idx))
+        .collect::<HashMap<_, _>>();
+    let mut remaining_children = vec![0usize; records.len()];
+    for record in &records {
+        for parent in &record.parents {
+            if let Some(parent_idx) = index_by_oid.get(parent).copied() {
+                remaining_children[parent_idx] += 1;
+            }
+        }
+    }
+    let mut ready = remaining_children
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, child_count)| (*child_count == 0).then_some(idx))
+        .collect::<Vec<_>>();
+    let mut emitted = vec![false; records.len()];
+    let mut order = Vec::with_capacity(records.len());
+    while !ready.is_empty() {
+        let ready_pos = ready
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, idx)| (records[**idx].commit_time, Reverse(**idx)))
+            .map(|(pos, _)| pos)
+            .expect("ready is not empty");
+        let idx = ready.swap_remove(ready_pos);
+        if emitted[idx] {
+            continue;
+        }
+        emitted[idx] = true;
+        order.push(idx);
+        for parent in &records[idx].parents {
+            if let Some(parent_idx) = index_by_oid.get(parent).copied() {
+                remaining_children[parent_idx] = remaining_children[parent_idx].saturating_sub(1);
+                if remaining_children[parent_idx] == 0 && !emitted[parent_idx] {
+                    ready.push(parent_idx);
+                }
+            }
+        }
+    }
+    for (idx, was_emitted) in emitted.iter().enumerate() {
+        if !was_emitted {
+            order.push(idx);
+        }
+    }
+    let mut slots = records.into_iter().map(Some).collect::<Vec<_>>();
+    order
+        .into_iter()
+        .filter_map(|idx| slots[idx].take())
+        .collect()
 }
 
 fn rev_list_walk_commits(
