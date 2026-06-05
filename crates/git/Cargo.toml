@@ -10,6 +10,7 @@ git-core = { path = "../git-core" }
 git-object = { path = "../git-object" }
 git-config = { path = "../git-config" }
 git-formats = { path = "../git-formats" }
+git-index = { path = "../git-index" }
 git-odb = { path = "../git-odb" }
 git-refs = { path = "../git-refs" }
 git-rev = { path = "../git-rev" }

@@ -148,6 +148,199 @@ pub fn tree_entry_object_type(mode: u32) -> ObjectType {
     }
 }
 
+/// The five entry kinds Git allows inside a tree, each mapping to a fixed mode.
+///
+/// This is a *closed* domain used when *writing* trees; for reading arbitrary
+/// trees, keep the raw [`TreeEntry::mode`] and classify with
+/// [`EntryKind::from_mode`] (which returns `None` for non-canonical modes so
+/// they round-trip rather than being silently coerced).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EntryKind {
+    /// A subtree (`040000`).
+    Tree,
+    /// A non-executable regular file (`100644`).
+    Blob,
+    /// An executable regular file (`100755`).
+    BlobExecutable,
+    /// A symbolic link (`120000`); the blob bytes are the link target and must
+    /// never be dereferenced.
+    Symlink,
+    /// A gitlink / submodule commit pointer (`160000`).
+    Commit,
+}
+
+impl EntryKind {
+    /// The octal tree-entry mode for this kind.
+    pub const fn mode(self) -> u32 {
+        match self {
+            Self::Tree => 0o040000,
+            Self::Blob => 0o100644,
+            Self::BlobExecutable => 0o100755,
+            Self::Symlink => 0o120000,
+            Self::Commit => 0o160000,
+        }
+    }
+
+    /// Classify a raw tree-entry mode, returning `None` for anything that is
+    /// not one of Git's canonical five.
+    pub const fn from_mode(mode: u32) -> Option<Self> {
+        match mode {
+            0o040000 => Some(Self::Tree),
+            0o100644 => Some(Self::Blob),
+            0o100755 => Some(Self::BlobExecutable),
+            0o120000 => Some(Self::Symlink),
+            0o160000 => Some(Self::Commit),
+            _ => None,
+        }
+    }
+
+    /// The object type an entry of this kind points at (a gitlink points at a
+    /// commit that lives in another repository).
+    pub const fn object_type(self) -> ObjectType {
+        match self {
+            Self::Tree => ObjectType::Tree,
+            Self::Commit => ObjectType::Commit,
+            _ => ObjectType::Blob,
+        }
+    }
+}
+
+impl From<EntryKind> for u32 {
+    fn from(kind: EntryKind) -> Self {
+        kind.mode()
+    }
+}
+
+impl TreeEntry {
+    /// Classify this entry's mode, if it is one of Git's canonical kinds.
+    pub fn kind(&self) -> Option<EntryKind> {
+        EntryKind::from_mode(self.mode)
+    }
+
+    pub fn is_tree(&self) -> bool {
+        self.mode == EntryKind::Tree.mode()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode == EntryKind::Symlink.mode()
+    }
+
+    pub fn is_gitlink(&self) -> bool {
+        self.mode == EntryKind::Commit.mode()
+    }
+
+    pub fn is_executable(&self) -> bool {
+        self.mode == EntryKind::BlobExecutable.mode()
+    }
+}
+
+/// Order two tree entries the way Git canonically sorts them: by name bytes,
+/// except that a subtree sorts as though its name ended in `/`. Writing a tree
+/// whose entries are in any other order produces a different (wrong) OID.
+pub fn tree_entry_cmp(
+    left_name: &[u8],
+    left_mode: u32,
+    right_name: &[u8],
+    right_mode: u32,
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let shared = left_name.len().min(right_name.len());
+    let name_order = left_name[..shared].cmp(&right_name[..shared]);
+    if name_order != Ordering::Equal {
+        return name_order;
+    }
+    let left_end = left_name.len() == shared;
+    let right_end = right_name.len() == shared;
+    match (left_end, right_end) {
+        (true, true) => Ordering::Equal,
+        (true, false) => tree_name_terminator(left_mode).cmp(&right_name[shared]),
+        (false, true) => left_name[shared].cmp(&tree_name_terminator(right_mode)),
+        (false, false) => Ordering::Equal,
+    }
+}
+
+fn tree_name_terminator(mode: u32) -> u8 {
+    if mode == 0o040000 {
+        b'/'
+    } else {
+        0
+    }
+}
+
+/// Builds a single tree level: deduplicates entries by name and emits them in
+/// Git's canonical order so the written object is byte-identical to Git's.
+///
+/// Start from [`TreeBuilder::new`] (empty) or [`TreeBuilder::from_tree`] (edit
+/// an existing level), [`upsert`](TreeBuilder::upsert) entries, then
+/// [`build`](TreeBuilder::build) / [`write`](TreeBuilder::write).
+#[derive(Debug, Clone, Default)]
+pub struct TreeBuilder {
+    entries: std::collections::HashMap<Vec<u8>, TreeEntry>,
+}
+
+impl TreeBuilder {
+    pub fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Seed the builder with an existing tree level's entries.
+    pub fn from_tree(tree: Tree) -> Self {
+        let entries = tree
+            .entries
+            .into_iter()
+            .map(|entry| (entry.name.clone(), entry))
+            .collect();
+        Self { entries }
+    }
+
+    /// Insert or replace the entry named `name` with one of Git's canonical
+    /// kinds.
+    pub fn upsert(&mut self, name: impl Into<Vec<u8>>, kind: EntryKind, oid: ObjectId) {
+        self.upsert_raw(name, kind.mode(), oid);
+    }
+
+    /// Insert or replace using a raw mode (for round-tripping non-canonical
+    /// modes); prefer [`upsert`](TreeBuilder::upsert) for normal entries.
+    pub fn upsert_raw(&mut self, name: impl Into<Vec<u8>>, mode: u32, oid: ObjectId) {
+        let name = name.into();
+        self.entries
+            .insert(name.clone(), TreeEntry { mode, name, oid });
+    }
+
+    /// Remove the entry named `name`, returning whether one was present.
+    pub fn remove(&mut self, name: &[u8]) -> bool {
+        self.entries.remove(name).is_some()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Collect into a [`Tree`] with entries in Git's canonical order.
+    pub fn build(self) -> Tree {
+        let mut entries: Vec<TreeEntry> = self.entries.into_values().collect();
+        entries
+            .sort_by(|left, right| tree_entry_cmp(&left.name, left.mode, &right.name, right.mode));
+        Tree { entries }
+    }
+
+    /// The canonical serialized tree body.
+    pub fn write(self) -> Vec<u8> {
+        self.build().write()
+    }
+
+    /// The OID this tree will have once written.
+    pub fn object_id(self, format: ObjectFormat) -> Result<ObjectId> {
+        EncodedObject::new(ObjectType::Tree, self.write()).object_id(format)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub tree: ObjectId,
@@ -303,6 +496,46 @@ pub fn parse_framed_object(bytes: &[u8]) -> Result<EncodedObject> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_builder_sorts_canonically_and_dedups() {
+        let format = ObjectFormat::Sha1;
+        let blob = ObjectId::empty_blob(format);
+        let subtree = ObjectId::empty_tree(format);
+        // Validate the infallible well-known constants while we're here.
+        assert_eq!(subtree.to_hex(), "4b825dc642cb6eb9a060e54bf8d69288fbee4904");
+        assert_eq!(blob.to_hex(), "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391");
+
+        let mut builder = TreeBuilder::new();
+        // Inserted out of order. The directory-suffix rule means "foo.txt"
+        // (blob) sorts before the "foo" subtree, because '.' (0x2e) < '/' (0x2f)
+        // — a plain byte sort of the names would (wrongly) put "foo" first.
+        builder.upsert("foo", EntryKind::Tree, subtree);
+        builder.upsert("a.txt", EntryKind::Blob, blob.clone());
+        builder.upsert("foo.txt", EntryKind::Blob, blob.clone());
+        // Last upsert for a name wins.
+        builder.upsert("a.txt", EntryKind::BlobExecutable, blob);
+
+        let tree = builder.build();
+        let names: Vec<&[u8]> = tree.entries.iter().map(|e| e.name.as_slice()).collect();
+        assert_eq!(names, vec![&b"a.txt"[..], &b"foo.txt"[..], &b"foo"[..]]);
+        assert_eq!(tree.entries[0].mode, EntryKind::BlobExecutable.mode());
+        assert!(tree.entries[2].is_tree());
+    }
+
+    #[test]
+    fn entry_kind_round_trips_modes() {
+        for kind in [
+            EntryKind::Tree,
+            EntryKind::Blob,
+            EntryKind::BlobExecutable,
+            EntryKind::Symlink,
+            EntryKind::Commit,
+        ] {
+            assert_eq!(EntryKind::from_mode(kind.mode()), Some(kind));
+        }
+        assert_eq!(EntryKind::from_mode(0o100600), None);
+    }
 
     #[test]
     fn framed_object_round_trips() {

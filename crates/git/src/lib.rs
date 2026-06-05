@@ -28,8 +28,8 @@
 
 use std::path::{Path, PathBuf};
 
-use git_object::{Commit, EncodedObject, ObjectType, Tree};
-use git_odb::{FileObjectDatabase, ObjectReader};
+use git_object::{Commit, EncodedObject, ObjectType, Tree, TreeBuilder};
+use git_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use git_refs::{FileRefStore, RefTarget};
 
 /// Re-exports of the underlying plumbing crates for callers that need direct
@@ -40,6 +40,7 @@ pub mod plumbing {
     pub use git_config;
     pub use git_core;
     pub use git_formats;
+    pub use git_index;
     pub use git_object;
     pub use git_odb;
     pub use git_refs;
@@ -52,8 +53,10 @@ pub mod plumbing {
 pub use git_config::GitConfig;
 pub use git_core::{GitError, ObjectFormat, ObjectId, Result};
 pub use git_object::{Commit as CommitObject, ObjectType as GitObjectType, Tree as TreeObject};
+pub use git_object::{EntryKind, TreeBuilder as TreeEditor};
+pub use git_index::{Index, IndexEntry, Stage as IndexStage};
 pub use git_odb::FileObjectDatabase as ObjectDatabase;
-pub use git_refs::{FileRefStore as RefStore, RefTarget as ReferenceTarget};
+pub use git_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -300,6 +303,48 @@ impl Repository {
             )));
         }
         Tree::parse(self.format, &object.body)
+    }
+
+    /// Write a raw object (any type) to the object database as a loose object,
+    /// returning its id. The bytes are stored verbatim, so writing an object
+    /// that originated from another repository preserves its id exactly.
+    pub fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
+        let mut odb = self.objects();
+        odb.write_object(object)
+    }
+
+    /// Write `bytes` as a blob, returning its id.
+    pub fn write_blob(&self, bytes: impl Into<Vec<u8>>) -> Result<ObjectId> {
+        self.write_object(EncodedObject::new(ObjectType::Blob, bytes))
+    }
+
+    /// Start editing the tree `base` one level deep: returns a [`TreeBuilder`]
+    /// seeded with `base`'s entries (empty when `base` is the null or empty
+    /// tree). `upsert` entries on it, then write it with
+    /// [`Repository::write_tree`].
+    pub fn edit_tree(&self, base: &ObjectId) -> Result<TreeBuilder> {
+        if base.is_null() || *base == ObjectId::empty_tree(self.format) {
+            return Ok(TreeBuilder::new());
+        }
+        Ok(TreeBuilder::from_tree(self.read_tree(base)?))
+    }
+
+    /// Write the tree assembled in `builder` — entries emitted in Git's
+    /// canonical order — and return its id.
+    pub fn write_tree(&self, builder: TreeBuilder) -> Result<ObjectId> {
+        self.write_object(EncodedObject::new(ObjectType::Tree, builder.write()))
+    }
+
+    /// Read this repository's index (`.git/index`), returning `None` when the
+    /// index file does not exist yet.
+    pub fn open_index(&self) -> Result<Option<Index>> {
+        git_worktree::read_repository_index(&self.git_dir, self.format)
+    }
+
+    /// Build a fresh index mirroring `tree_oid` (stage-0 entries with a zeroed
+    /// stat), the way `git read-tree <tree>` would. Does not touch `.git/index`.
+    pub fn index_from_tree(&self, tree_oid: &ObjectId) -> Result<Index> {
+        git_worktree::index_from_tree(&self.objects(), self.format, tree_oid)
     }
 
     /// Follow a symbolic ref chain (e.g. `HEAD` -> `refs/heads/main`) to the

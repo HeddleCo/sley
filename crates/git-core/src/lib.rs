@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ObjectFormat {
     Sha1,
     Sha256,
@@ -43,7 +43,7 @@ impl FromStr for ObjectFormat {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId {
     format: ObjectFormat,
     bytes: [u8; 32],
@@ -91,6 +91,47 @@ impl ObjectId {
     pub fn to_hex(&self) -> String {
         to_hex(self.as_bytes())
     }
+
+    /// The all-zero ("null") object id for `format`.
+    pub fn null(format: ObjectFormat) -> Self {
+        Self {
+            format,
+            bytes: [0; 32],
+        }
+    }
+
+    /// True when every byte is zero (the null oid).
+    pub fn is_null(&self) -> bool {
+        self.as_bytes().iter().all(|byte| *byte == 0)
+    }
+
+    /// The id of the canonical empty tree for `format` (`4b825dc6…` for SHA-1).
+    pub fn empty_tree(format: ObjectFormat) -> Self {
+        Self::digest_object(format, "tree", b"")
+    }
+
+    /// The id of the canonical empty blob for `format` (`e69de29b…` for SHA-1).
+    pub fn empty_blob(format: ObjectFormat) -> Self {
+        Self::digest_object(format, "blob", b"")
+    }
+
+    /// Hash `"<type> <len>\0<body>"` straight into an id, bypassing the
+    /// fallible length check in [`ObjectId::from_raw`] (our own digests are
+    /// always the right length) so the well-known constants stay infallible.
+    fn digest_object(format: ObjectFormat, object_type: &str, body: &[u8]) -> Self {
+        let mut framed = Vec::with_capacity(object_type.len() + body.len() + 32);
+        framed.extend_from_slice(object_type.as_bytes());
+        framed.push(b' ');
+        framed.extend_from_slice(body.len().to_string().as_bytes());
+        framed.push(0);
+        framed.extend_from_slice(body);
+        let mut bytes = [0u8; 32];
+        match format {
+            ObjectFormat::Sha1 => bytes[..20].copy_from_slice(&sha1(&framed)),
+            ObjectFormat::Sha256 => bytes[..32].copy_from_slice(&sha256(&framed)),
+        }
+        Self { format, bytes }
+    }
 }
 
 impl fmt::Debug for ObjectId {
@@ -102,6 +143,25 @@ impl fmt::Debug for ObjectId {
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.to_hex())
+    }
+}
+
+impl FromStr for ObjectId {
+    type Err = GitError;
+
+    /// Parse a full hex id, inferring the hash from its length (40 hex digits =
+    /// SHA-1, 64 = SHA-256).
+    fn from_str(text: &str) -> Result<Self> {
+        let format = match text.len() {
+            40 => ObjectFormat::Sha1,
+            64 => ObjectFormat::Sha256,
+            other => {
+                return Err(GitError::InvalidObjectId(format!(
+                    "expected 40 or 64 hex digits, got {other}"
+                )));
+            }
+        };
+        Self::from_hex(format, text)
     }
 }
 

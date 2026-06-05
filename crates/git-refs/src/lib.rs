@@ -263,6 +263,66 @@ pub struct RefUpdate {
     pub reflog: Option<ReflogEntry>,
 }
 
+/// The compare-and-swap precondition a ref update is checked against (re-verified
+/// while the ref is locked, so it is a true CAS, not a check-then-write).
+///
+/// [`RefUpdate::expected`] can express [`Any`](RefPrecondition::Any) (`None`) and
+/// [`MustExistAndMatch`](RefPrecondition::MustExistAndMatch) (`Some`); the
+/// create-only and match-or-create modes are reachable via
+/// [`FileRefTransaction::update_to`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefPrecondition {
+    /// No precondition: create or overwrite unconditionally.
+    Any,
+    /// The ref must currently exist (with any value).
+    MustExist,
+    /// The ref must currently not exist (create-only).
+    MustNotExist,
+    /// The ref must currently exist and point exactly at this target.
+    MustExistAndMatch(RefTarget),
+    /// If the ref exists it must point exactly at this target; if it is absent,
+    /// the update is still allowed (match-or-create).
+    ExistingMustMatch(RefTarget),
+}
+
+impl RefPrecondition {
+    /// The precondition implied by a [`RefUpdate::expected`] value.
+    fn from_expected(expected: Option<RefTarget>) -> Self {
+        match expected {
+            None => Self::Any,
+            Some(target) => Self::MustExistAndMatch(target),
+        }
+    }
+
+    /// Whether `current` — the ref's value right now, or `None` if absent —
+    /// satisfies this precondition.
+    fn is_satisfied_by(&self, current: Option<&RefTarget>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::MustExist => current.is_some(),
+            Self::MustNotExist => current.is_none(),
+            Self::MustExistAndMatch(target) => current == Some(target),
+            Self::ExistingMustMatch(target) => match current {
+                None => true,
+                Some(current) => current == target,
+            },
+        }
+    }
+
+    /// A human-readable description of an unmet precondition, for errors.
+    fn describe(&self, name: &str) -> String {
+        match self {
+            Self::Any => format!("ref {name} precondition not met"),
+            Self::MustExist => format!("expected ref {name} to exist"),
+            Self::MustNotExist => format!("expected ref {name} to not already exist"),
+            Self::MustExistAndMatch(_) => format!("expected ref {name} to match"),
+            Self::ExistingMustMatch(_) => {
+                format!("expected ref {name} to match its current value")
+            }
+        }
+    }
+}
+
 pub struct RefTransaction<'a> {
     store: &'a mut RefStore,
     updates: Vec<RefUpdate>,
@@ -1100,12 +1160,50 @@ fn repository_common_dir(git_dir: &Path) -> PathBuf {
 
 pub struct FileRefTransaction<'a> {
     store: &'a FileRefStore,
-    updates: Vec<RefUpdate>,
+    updates: Vec<QueuedUpdate>,
+}
+
+/// One queued change inside a [`FileRefTransaction`], carrying the
+/// compare-and-swap precondition to enforce under lock.
+struct QueuedUpdate {
+    name: String,
+    precondition: RefPrecondition,
+    new: RefTarget,
+    reflog: Option<ReflogEntry>,
 }
 
 impl<'a> FileRefTransaction<'a> {
+    /// Queue a ref update whose precondition comes from [`RefUpdate::expected`]
+    /// (`None` = no check; `Some(target)` = the ref must currently match
+    /// `target`). For create-only or match-or-create semantics use
+    /// [`update_to`](FileRefTransaction::update_to).
     pub fn update(&mut self, update: RefUpdate) {
-        self.updates.push(update);
+        self.updates.push(QueuedUpdate {
+            name: update.name,
+            precondition: RefPrecondition::from_expected(update.expected),
+            new: update.new,
+            reflog: update.reflog,
+        });
+    }
+
+    /// Queue a ref update with an explicit compare-and-swap [`RefPrecondition`]
+    /// (e.g. [`MustNotExist`](RefPrecondition::MustNotExist) for create-only, or
+    /// [`ExistingMustMatch`](RefPrecondition::ExistingMustMatch) for
+    /// match-or-create). The precondition is re-verified while the ref is
+    /// locked.
+    pub fn update_to(
+        &mut self,
+        name: impl Into<String>,
+        new: RefTarget,
+        precondition: RefPrecondition,
+        reflog: Option<ReflogEntry>,
+    ) {
+        self.updates.push(QueuedUpdate {
+            name: name.into(),
+            precondition,
+            new,
+            reflog,
+        });
     }
 
     /// Commit all queued updates atomically and durably.
@@ -1115,10 +1213,10 @@ impl<'a> FileRefTransaction<'a> {
     ///
     /// 1. Coalesce updates that target the same ref so each ref is touched once
     ///    (the final `new` value wins, reflog entries accumulate in order, and
-    ///    the `expected` precondition from the first queued update is enforced).
+    ///    the precondition from the first queued update is enforced).
     /// 2. Take an exclusive `<ref>.lock` file for every ref up front. Acquiring a
     ///    lock fails if another writer already holds it, guaranteeing isolation.
-    /// 3. Re-verify every `expected` old value *while holding the locks*, closing
+    /// 3. Re-verify every precondition *while holding the locks*, closing
     ///    the check-then-write race that a pre-lock verification would leave open.
     /// 4. Write each new value into its lock file and `fsync` it.
     /// 5. Atomically `rename` each lock file over the real ref.
@@ -1132,13 +1230,13 @@ impl<'a> FileRefTransaction<'a> {
         let FileRefTransaction { store, updates } = self;
         let updates = coalesce_ref_updates(updates)?;
         for update in &updates {
-            if let Some(expected) = &update.expected
-                && store.read_ref(&update.name)?.as_ref() != Some(expected)
-            {
-                return Err(GitError::Transaction(format!(
-                    "expected ref {} to match",
-                    update.name
-                )));
+            if !matches!(update.precondition, RefPrecondition::Any) {
+                let current = store.read_ref(&update.name)?;
+                if !update.precondition.is_satisfied_by(current.as_ref()) {
+                    return Err(GitError::Transaction(
+                        update.precondition.describe(&update.name),
+                    ));
+                }
             }
         }
         if store.uses_reftable()? {
@@ -1212,15 +1310,14 @@ impl FileRefStore {
         // pre-lock check, so a concurrent change is caught here.
         let mut originals = Vec::with_capacity(updates.len());
         for (update, write) in updates.iter().zip(&pending) {
-            if let Some(expected) = &update.expected {
+            if !matches!(update.precondition, RefPrecondition::Any) {
                 match self.read_ref(&update.name) {
-                    Ok(current) if current.as_ref() == Some(expected) => {}
+                    Ok(current) if update.precondition.is_satisfied_by(current.as_ref()) => {}
                     Ok(_) => {
                         release_pending_locks(&pending);
-                        return Err(GitError::Transaction(format!(
-                            "expected ref {} to match",
-                            update.name
-                        )));
+                        return Err(GitError::Transaction(
+                            update.precondition.describe(&update.name),
+                        ));
                     }
                     Err(err) => {
                         release_pending_locks(&pending);
@@ -1268,16 +1365,16 @@ impl FileRefStore {
 /// A ref update with all writes that targeted the same name folded together.
 struct CoalescedRefUpdate {
     name: String,
-    expected: Option<RefTarget>,
+    precondition: RefPrecondition,
     new: RefTarget,
     reflog: Vec<ReflogEntry>,
 }
 
 /// Fold repeated updates to the same ref into one, preserving first-seen order.
 /// The last queued value wins, reflog entries accumulate in order, and the
-/// `expected` precondition is taken from the first update (the state the caller
+/// precondition is taken from the first update (the state the caller
 /// asserted before any change in this transaction).
-fn coalesce_ref_updates(updates: Vec<RefUpdate>) -> Result<Vec<CoalescedRefUpdate>> {
+fn coalesce_ref_updates(updates: Vec<QueuedUpdate>) -> Result<Vec<CoalescedRefUpdate>> {
     let mut order: Vec<String> = Vec::new();
     let mut by_name: HashMap<String, CoalescedRefUpdate> = HashMap::new();
     for update in updates {
@@ -1295,7 +1392,7 @@ fn coalesce_ref_updates(updates: Vec<RefUpdate>) -> Result<Vec<CoalescedRefUpdat
                     update.name.clone(),
                     CoalescedRefUpdate {
                         name: update.name,
-                        expected: update.expected,
+                        precondition: update.precondition,
                         new: update.new,
                         reflog: update.reflog.into_iter().collect(),
                     },

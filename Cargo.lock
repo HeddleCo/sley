@@ -79,6 +79,7 @@ dependencies = [
  "git-config",
  "git-core",
  "git-formats",
+ "git-index",
  "git-object",
  "git-odb",
  "git-refs",

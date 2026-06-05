@@ -4007,6 +4007,56 @@ pub fn reset_index_to_commit(
     })
 }
 
+/// Build a fresh in-memory index that mirrors the tree `tree_oid`, the way
+/// `git read-tree <tree>` does: every blob, symlink, and gitlink leaf (found by
+/// recursing subtrees) becomes a stage-0 entry carrying the tree mode and oid,
+/// with a fully zeroed stat (so nothing is treated as stat-clean) and size 0.
+/// Entries are sorted by path; the index is version 2 with no extensions.
+///
+/// This does not touch the worktree or write anything to disk — serialize the
+/// result with [`Index::write`] (and persist it) when you want to replace
+/// `.git/index`.
+pub fn index_from_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<Index> {
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    if *tree_oid != ObjectId::empty_tree(format) {
+        let mut tree_entries = BTreeMap::new();
+        collect_tree_entries(db, format, tree_oid, Vec::new(), &mut tree_entries)?;
+        entries.reserve(tree_entries.len());
+        for (path, entry) in tree_entries {
+            let name_len = (path.len().min(0x0fff)) as u16;
+            entries.push(IndexEntry {
+                ctime_seconds: 0,
+                ctime_nanoseconds: 0,
+                mtime_seconds: 0,
+                mtime_nanoseconds: 0,
+                dev: 0,
+                ino: 0,
+                mode: entry.mode,
+                uid: 0,
+                gid: 0,
+                size: 0,
+                oid: entry.oid,
+                flags: name_len,
+                flags_extended: 0,
+                path,
+            });
+        }
+    }
+    // git orders index entries by path bytes; BTreeMap already yields that, but
+    // sort explicitly so the contract holds regardless of how entries arrive.
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    })
+}
+
 /// Enforces a [`SparseCheckout`] against the current index and worktree.
 ///
 /// Every stage-0 index entry is classified with the sparse patterns (see

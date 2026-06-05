@@ -34,6 +34,69 @@ pub struct IndexEntry {
     pub path: Vec<u8>,
 }
 
+impl IndexEntry {
+    /// Build an intent-to-add placeholder entry for `path` (the shape `git add
+    /// -N` writes): zeroed stat, the canonical empty-blob id, mode `100644`,
+    /// the intent-to-add + extended flags set, and the name length encoded. The
+    /// containing [`Index`] must be version 3+ (see
+    /// [`Index::upgrade_version_for_flags`]).
+    pub fn intent_to_add(format: ObjectFormat, path: Vec<u8>) -> Self {
+        let name_len = (path.len().min(INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
+        Self {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: 0o100644,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: ObjectId::empty_blob(format),
+            flags: name_len | INDEX_FLAG_EXTENDED,
+            flags_extended: INDEX_EXTENDED_FLAG_INTENT_TO_ADD,
+            path,
+        }
+    }
+
+    /// The merge stage encoded in this entry's flags.
+    pub fn stage(&self) -> Stage {
+        Stage::from_flags(self.flags)
+    }
+
+    /// Whether this is an intent-to-add (`git add -N`) placeholder.
+    pub fn is_intent_to_add(&self) -> bool {
+        self.flags_extended & INDEX_EXTENDED_FLAG_INTENT_TO_ADD != 0
+    }
+
+    /// Whether this entry is marked skip-worktree (sparse checkout).
+    pub fn is_skip_worktree(&self) -> bool {
+        self.flags_extended & INDEX_EXTENDED_FLAG_SKIP_WORKTREE != 0
+    }
+
+    /// Set or clear the intent-to-add bit, keeping the `extended` flag in sync.
+    /// (The writer only emits extended entries for index version 3+.)
+    pub fn set_intent_to_add(&mut self, intent: bool) {
+        if intent {
+            self.flags_extended |= INDEX_EXTENDED_FLAG_INTENT_TO_ADD;
+            self.flags |= INDEX_FLAG_EXTENDED;
+        } else {
+            self.flags_extended &= !INDEX_EXTENDED_FLAG_INTENT_TO_ADD;
+            if self.flags_extended == 0 {
+                self.flags &= !INDEX_FLAG_EXTENDED;
+            }
+        }
+    }
+
+    /// Re-encode the name-length bits (low 12 bits of `flags`, capped at
+    /// `0xfff`) from `path`, matching what git stores.
+    pub fn refresh_name_length(&mut self) {
+        let len = (self.path.len().min(INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
+        self.flags = (self.flags & !INDEX_FLAG_NAME_LENGTH_MASK) | len;
+    }
+}
+
 impl Index {
     pub fn parse(bytes: &[u8], format: ObjectFormat) -> Result<Self> {
         let hash_len = format.raw_len();
@@ -240,6 +303,20 @@ impl Index {
         Ok(out)
     }
 
+    /// Raise `version` to the minimum the current entries require: version 3
+    /// when any entry carries extended flags (intent-to-add or skip-worktree),
+    /// which cannot be represented in v2.
+    pub fn upgrade_version_for_flags(&mut self) {
+        if self.version < 3
+            && self
+                .entries
+                .iter()
+                .any(|entry| entry.flags & INDEX_FLAG_EXTENDED != 0 || entry.flags_extended != 0)
+        {
+            self.version = 3;
+        }
+    }
+
     /// Iterate the optional/required extension chunks stored in `self.extensions`.
     ///
     /// The extension area of an index is a flat sequence of
@@ -304,7 +381,55 @@ impl Index {
     }
 }
 
-const INDEX_FLAG_EXTENDED: u16 = 0x4000;
+/// The `extended` bit in [`IndexEntry::flags`]: when set, a second
+/// [`IndexEntry::flags_extended`] `u16` follows on disk (index v3+).
+pub const INDEX_FLAG_EXTENDED: u16 = 0x4000;
+
+/// Mask for the 2-bit merge stage stored in [`IndexEntry::flags`].
+pub const INDEX_FLAG_STAGE_MASK: u16 = 0x3000;
+const INDEX_FLAG_STAGE_SHIFT: u16 = 12;
+/// Mask for the encoded name length in the low bits of [`IndexEntry::flags`].
+pub const INDEX_FLAG_NAME_LENGTH_MASK: u16 = 0x0fff;
+
+/// Intent-to-add (`git add -N`) bit in [`IndexEntry::flags_extended`].
+pub const INDEX_EXTENDED_FLAG_INTENT_TO_ADD: u16 = 0x2000;
+/// Skip-worktree (sparse checkout) bit in [`IndexEntry::flags_extended`].
+pub const INDEX_EXTENDED_FLAG_SKIP_WORKTREE: u16 = 0x4000;
+
+/// The merge stage encoded in an index entry's flags (a closed 0..=3 domain).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Stage {
+    /// Stage 0: a normal, non-conflicted entry.
+    Normal,
+    /// Stage 1: the common ancestor ("base") side of a conflict.
+    Base,
+    /// Stage 2: "our" side of a conflict.
+    Ours,
+    /// Stage 3: "their" side of a conflict.
+    Theirs,
+}
+
+impl Stage {
+    /// Extract the stage from a raw `flags` value.
+    pub const fn from_flags(flags: u16) -> Self {
+        match (flags & INDEX_FLAG_STAGE_MASK) >> INDEX_FLAG_STAGE_SHIFT {
+            1 => Self::Base,
+            2 => Self::Ours,
+            3 => Self::Theirs,
+            _ => Self::Normal,
+        }
+    }
+
+    /// The numeric stage (0..=3).
+    pub const fn as_u16(self) -> u16 {
+        match self {
+            Self::Normal => 0,
+            Self::Base => 1,
+            Self::Ours => 2,
+            Self::Theirs => 3,
+        }
+    }
+}
 
 /// The cache-tree (`TREE`) extension: a recursive cache of the tree object ids
 /// that a fully-staged index would write, mirroring `struct cache_tree` in git.
