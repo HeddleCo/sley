@@ -15,6 +15,8 @@ sley-pack = { path = "../sley-pack" }
 [features]
 # Forward the zlib-ng C backend to flate2 and sley-pack (see sley-pack).
 zlib-ng = ["flate2/zlib-ng", "sley-pack/zlib-ng"]
+# Forward the hardware-accelerated SHA-1 backend (see sley-core).
+fast-sha1 = ["sley-core/fast-sha1", "sley-pack/fast-sha1"]
 
 [lints]
 workspace = true

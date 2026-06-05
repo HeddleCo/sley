@@ -5,6 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[dependencies]
+# Only pulled in under `fast-sha1`; the default build stays dependency-free and
+# pure-Rust. RustCrypto's sha1 dispatches to ARMv8-SHA1 / x86 SHA-NI at runtime
+# and produces byte-identical digests, so OIDs are unchanged.
+sha1 = { version = "0.10", optional = true }
+
+[features]
+# Hardware-accelerated SHA-1 backend (see src/lib.rs). Opt-in so downstream
+# consumers that want object-write / index-pack throughput can enable it without
+# forcing the dependency on everyone.
+fast-sha1 = ["dep:sha1"]
+
 [lints]
 workspace = true
 

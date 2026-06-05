@@ -486,13 +486,21 @@ pub fn object_id_for_bytes(
     object_type: &str,
     body: &[u8],
 ) -> Result<ObjectId> {
-    let mut framed = Vec::with_capacity(object_type.len() + body.len() + 32);
-    framed.extend_from_slice(object_type.as_bytes());
-    framed.push(b' ');
-    framed.extend_from_slice(body.len().to_string().as_bytes());
-    framed.push(0);
-    framed.extend_from_slice(body);
-    digest_bytes(format, &framed)
+    match format {
+        // Hash the `"<type> <len>\0"` header and the body as separate updates so
+        // the (potentially large) body is never copied into a combined buffer just
+        // to feed the digest.
+        ObjectFormat::Sha1 => ObjectId::from_raw(format, &sha1_object_digest(object_type, body)),
+        ObjectFormat::Sha256 => {
+            let mut framed = Vec::with_capacity(object_type.len() + body.len() + 32);
+            framed.extend_from_slice(object_type.as_bytes());
+            framed.push(b' ');
+            framed.extend_from_slice(body.len().to_string().as_bytes());
+            framed.push(0);
+            framed.extend_from_slice(body);
+            ObjectId::from_raw(format, &sha256(&framed))
+        }
+    }
 }
 
 pub fn digest_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
@@ -524,76 +532,174 @@ fn hex_nibble(byte: u8) -> Result<u8> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// SHA-1
+//
+// The default is a pure-Rust streaming implementation that hashes 64-byte blocks
+// straight from the caller's slices, so neither the body nor the framed object is
+// copied just to be digested. Enabling the `fast-sha1` feature swaps in the
+// RustCrypto `sha1` crate, which dispatches to ARMv8-SHA1 / x86 SHA-NI at runtime;
+// the digests are byte-identical, so OIDs are unchanged either way.
+// ---------------------------------------------------------------------------
+
+/// SHA-1 of a raw byte slice (already-framed object, bundle prerequisite, etc.).
+#[cfg(not(feature = "fast-sha1"))]
 fn sha1(input: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xefcdab89;
-    let mut h2: u32 = 0x98badcfe;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xc3d2e1f0;
+    let mut hasher = Sha1Hasher::new();
+    hasher.update(input);
+    hasher.finalize()
+}
 
-    let bit_len = (input.len() as u64) * 8;
-    let mut msg = input.to_vec();
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// SHA-1 of a raw byte slice using the hardware-accelerated backend.
+#[cfg(feature = "fast-sha1")]
+fn sha1(input: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(input);
+    hasher.finalize().into()
+}
+
+/// SHA-1 of a git object framed as `"<type> <len>\0<body>"`, fed as separate
+/// updates so the body is never copied into a combined buffer.
+#[cfg(not(feature = "fast-sha1"))]
+fn sha1_object_digest(object_type: &str, body: &[u8]) -> [u8; 20] {
+    let mut hasher = Sha1Hasher::new();
+    hasher.update(object_type.as_bytes());
+    hasher.update(b" ");
+    hasher.update(body.len().to_string().as_bytes());
+    hasher.update(&[0u8]);
+    hasher.update(body);
+    hasher.finalize()
+}
+
+#[cfg(feature = "fast-sha1")]
+fn sha1_object_digest(object_type: &str, body: &[u8]) -> [u8; 20] {
+    use sha1::{Digest, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(object_type.as_bytes());
+    hasher.update(b" ");
+    hasher.update(body.len().to_string().as_bytes());
+    hasher.update([0u8]);
+    hasher.update(body);
+    hasher.finalize().into()
+}
+
+/// Streaming pure-Rust SHA-1: feeds full 64-byte blocks directly from each
+/// `update` slice and buffers only the sub-block remainder, so large inputs are
+/// hashed without an intermediate copy.
+#[cfg(not(feature = "fast-sha1"))]
+struct Sha1Hasher {
+    state: [u32; 5],
+    block: [u8; 64],
+    block_len: usize,
+    total_len: u64,
+}
+
+#[cfg(not(feature = "fast-sha1"))]
+impl Sha1Hasher {
+    fn new() -> Self {
+        Self {
+            state: [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0],
+            block: [0u8; 64],
+            block_len: 0,
+            total_len: 0,
+        }
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            let offset = i * 4;
-            *word = u32::from_be_bytes([
-                chunk[offset],
-                chunk[offset + 1],
-                chunk[offset + 2],
-                chunk[offset + 3],
-            ]);
+    fn update(&mut self, mut data: &[u8]) {
+        self.total_len = self.total_len.wrapping_add(data.len() as u64);
+        if self.block_len > 0 {
+            let take = (64 - self.block_len).min(data.len());
+            self.block[self.block_len..self.block_len + take].copy_from_slice(&data[..take]);
+            self.block_len += take;
+            data = &data[take..];
+            if self.block_len == 64 {
+                let block = self.block;
+                sha1_compress(&mut self.state, &block);
+                self.block_len = 0;
+            }
         }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        while data.len() >= 64 {
+            sha1_compress(&mut self.state, &data[..64]);
+            data = &data[64..];
         }
-
-        let mut a = h0;
-        let mut b = h1;
-        let mut c = h2;
-        let mut d = h3;
-        let mut e = h4;
-
-        for (i, word) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a827999),
-                20..=39 => (b ^ c ^ d, 0x6ed9eba1),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
-                _ => (b ^ c ^ d, 0xca62c1d6),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(*word);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
+        if !data.is_empty() {
+            self.block[..data.len()].copy_from_slice(data);
+            self.block_len = data.len();
         }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
     }
 
-    let mut out = [0; 20];
-    out[..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
+    fn finalize(mut self) -> [u8; 20] {
+        let bit_len = self.total_len.wrapping_mul(8);
+        // 0x80, zero pad to a 56 mod 64 boundary, then the 64-bit big-endian length.
+        // From a sub-block remainder this is at most two more blocks (128 bytes).
+        let mut tail = [0u8; 128];
+        tail[..self.block_len].copy_from_slice(&self.block[..self.block_len]);
+        tail[self.block_len] = 0x80;
+        let total = if self.block_len < 56 { 64 } else { 128 };
+        tail[total - 8..total].copy_from_slice(&bit_len.to_be_bytes());
+        sha1_compress(&mut self.state, &tail[..64]);
+        if total == 128 {
+            sha1_compress(&mut self.state, &tail[64..128]);
+        }
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&self.state[0].to_be_bytes());
+        out[4..8].copy_from_slice(&self.state[1].to_be_bytes());
+        out[8..12].copy_from_slice(&self.state[2].to_be_bytes());
+        out[12..16].copy_from_slice(&self.state[3].to_be_bytes());
+        out[16..20].copy_from_slice(&self.state[4].to_be_bytes());
+        out
+    }
+}
+
+/// Mix one 64-byte block into the SHA-1 state. `block` must be at least 64 bytes.
+#[cfg(not(feature = "fast-sha1"))]
+fn sha1_compress(state: &mut [u32; 5], block: &[u8]) {
+    let mut w = [0u32; 80];
+    for (i, word) in w.iter_mut().take(16).enumerate() {
+        let offset = i * 4;
+        *word = u32::from_be_bytes([
+            block[offset],
+            block[offset + 1],
+            block[offset + 2],
+            block[offset + 3],
+        ]);
+    }
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+    }
+
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+    let mut e = state[4];
+
+    for (i, word) in w.iter().enumerate() {
+        let (f, k) = match i {
+            0..=19 => ((b & c) | ((!b) & d), 0x5a827999u32),
+            20..=39 => (b ^ c ^ d, 0x6ed9eba1),
+            40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1bbcdc),
+            _ => (b ^ c ^ d, 0xca62c1d6),
+        };
+        let temp = a
+            .rotate_left(5)
+            .wrapping_add(f)
+            .wrapping_add(e)
+            .wrapping_add(k)
+            .wrapping_add(*word);
+        e = d;
+        d = c;
+        c = b.rotate_left(30);
+        b = a;
+        a = temp;
+    }
+
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
 }
 
 fn sha256(input: &[u8]) -> [u8; 32] {

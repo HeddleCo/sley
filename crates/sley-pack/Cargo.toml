@@ -17,6 +17,8 @@ sley-object = { path = "../sley-object" }
 # pure-Rust miniz_oxide. Faster on large objects but needs a C toolchain, so it
 # is opt-in for downstream consumers that want the perf.
 zlib-ng = ["flate2/zlib-ng"]
+# Forward the hardware-accelerated SHA-1 backend (see sley-core).
+fast-sha1 = ["sley-core/fast-sha1"]
 
 [lints]
 workspace = true

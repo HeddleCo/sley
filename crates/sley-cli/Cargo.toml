@@ -38,6 +38,9 @@ sley-worktree = { path = "../sley-worktree" }
 # Build the sley binary with the zlib-ng C backend (forwarded to sley-odb /
 # sley-pack). Default builds stay pure-Rust (miniz_oxide).
 zlib-ng = ["sley-odb/zlib-ng", "sley-pack/zlib-ng"]
+# Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
+# sley-core). Default builds stay pure-Rust; OIDs are byte-identical either way.
+fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
 
 [lints]
 workspace = true
