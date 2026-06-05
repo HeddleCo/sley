@@ -13,6 +13,7 @@ members = [
     "crates/sley-diff-merge",
     "crates/sley-sequencer",
     "crates/sley-pack",
+    "crates/sley-mmap",
     "crates/sley-transport",
     "crates/sley-fetch",
     "crates/sley-remote",

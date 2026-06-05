@@ -691,7 +691,43 @@ pub struct PartialClonePolicy {
 /// Raw pack-file bytes keyed by pack path, shared across cloned handles. Loaded
 /// once so individual objects can be decoded at their offsets (see
 /// [`sley_pack::read_object_at`]) without re-reading the whole file per read.
-type PackBytesCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>>;
+type PackBytesCache = Arc<Mutex<HashMap<PathBuf, Arc<PackData>>>>;
+
+/// Backing bytes of a pack file: either memory-mapped (under the `mmap` feature)
+/// or read into the heap. Both deref to `&[u8]`, so the decode path is identical.
+#[derive(Debug)]
+enum PackData {
+    #[cfg(feature = "mmap")]
+    Mapped(sley_mmap::MappedFile),
+    Heap(Vec<u8>),
+}
+
+impl std::ops::Deref for PackData {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "mmap")]
+            Self::Mapped(mapped) => mapped,
+            Self::Heap(bytes) => bytes,
+        }
+    }
+}
+
+/// Load a pack file's bytes: memory-mapped when the `mmap` feature is on (falling
+/// back to a heap read if the map fails), otherwise read into the heap.
+#[cfg(feature = "mmap")]
+fn load_pack_data(pack_path: &Path) -> Result<PackData> {
+    match sley_mmap::MappedFile::open(pack_path) {
+        Ok(mapped) => Ok(PackData::Mapped(mapped)),
+        Err(_) => Ok(PackData::Heap(fs::read(pack_path)?)),
+    }
+}
+
+#[cfg(not(feature = "mmap"))]
+fn load_pack_data(pack_path: &Path) -> Result<PackData> {
+    Ok(PackData::Heap(fs::read(pack_path)?))
+}
 
 /// Memory-capped LRU of recently decoded objects, shared across cloned handles,
 /// so hot delta bases and repeated reads during a walk aren't re-decoded. The
@@ -1291,16 +1327,17 @@ impl FileObjectDatabase {
         Some(Arc::clone(cache))
     }
 
-    /// Raw bytes of the pack at `pack_path`, read at most once per database handle
-    /// (cached, shared across clones). On a poisoned lock it falls back to reading
+    /// Backing bytes of the pack at `pack_path`, loaded at most once per database
+    /// handle (cached, shared across clones). Memory-mapped under the `mmap` feature,
+    /// otherwise read into the heap. On a poisoned lock it falls back to loading
     /// without caching, preserving correctness.
-    fn cached_pack_bytes(&self, pack_path: &Path) -> Result<Arc<Vec<u8>>> {
+    fn cached_pack_bytes(&self, pack_path: &Path) -> Result<Arc<PackData>> {
         if let Ok(cache) = self.pack_bytes.lock() {
             if let Some(bytes) = cache.get(pack_path) {
                 return Ok(Arc::clone(bytes));
             }
         }
-        let bytes = Arc::new(fs::read(pack_path)?);
+        let bytes = Arc::new(load_pack_data(pack_path)?);
         if let Ok(mut cache) = self.pack_bytes.lock() {
             cache.insert(pack_path.to_path_buf(), Arc::clone(&bytes));
         }

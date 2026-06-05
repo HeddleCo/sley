@@ -41,6 +41,9 @@ zlib-ng = ["sley-odb/zlib-ng", "sley-pack/zlib-ng"]
 # Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
 # sley-core). Default builds stay pure-Rust; OIDs are byte-identical either way.
 fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
+# Build the sley binary with memory-mapped pack reads (forwarded to sley-odb).
+# Pulls in sley-mmap (the only unsafe); off by default.
+mmap = ["sley-odb/mmap"]
 
 [lints]
 workspace = true

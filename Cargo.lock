@@ -175,6 +175,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "113b30b4cd05f7c06868fdb2854f66a7b9fece9a48425351cd532e810d74024f"
 
 [[package]]
+name = "memmap2"
+version = "0.9.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -385,6 +394,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-mmap"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+]
+
+[[package]]
 name = "sley-object"
 version = "0.1.0"
 dependencies = [
@@ -398,6 +414,7 @@ dependencies = [
  "flate2",
  "sley-core",
  "sley-formats",
+ "sley-mmap",
  "sley-object",
  "sley-pack",
 ]

@@ -9,6 +9,7 @@ license.workspace = true
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
+sley-mmap = { path = "../sley-mmap", optional = true }
 sley-object = { path = "../sley-object" }
 sley-pack = { path = "../sley-pack" }
 
@@ -17,6 +18,9 @@ sley-pack = { path = "../sley-pack" }
 zlib-ng = ["flate2/zlib-ng", "sley-pack/zlib-ng"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1", "sley-pack/fast-sha1"]
+# Memory-map pack files instead of reading them into the heap. Pulls in sley-mmap
+# (the workspace's only unsafe). Off by default; the gain is on large repos.
+mmap = ["dep:sley-mmap"]
 
 [lints]
 workspace = true
