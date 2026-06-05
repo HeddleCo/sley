@@ -1116,6 +1116,126 @@ fn eq_ignore_ascii_case(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+/// Load the *effective* configuration for a repository, merging the system,
+/// global, and repository config files in git's precedence order.
+///
+/// The returned [`GitConfig`] concatenates the sections of each file, lowest
+/// precedence first (system, then global, then repository), so the existing
+/// last-one-wins semantics of [`GitConfig::get`]/[`GitConfig::get_bool`] yield
+/// the correct effective value and [`GitConfig::get_all`] returns every value in
+/// git's order. `include`/`includeIf` directives are resolved per file via
+/// [`load_config_with_includes`] using `context`.
+///
+/// File discovery mirrors git exactly:
+/// * **system**: `$GIT_CONFIG_SYSTEM` when set, otherwise `/etc/gitconfig`. The
+///   system file is skipped entirely when `GIT_CONFIG_NOSYSTEM` is set to a
+///   git-true boolean (e.g. `1`).
+/// * **global**: `$GIT_CONFIG_GLOBAL` when set (used on its own), otherwise both
+///   `$XDG_CONFIG_HOME/git/config` (falling back to `~/.config/git/config`) and
+///   then `~/.gitconfig` — the latter taking precedence.
+/// * **repository**: `<common_git_dir>/config`.
+///
+/// `~` is expanded using `$HOME`. Missing files are skipped silently, matching
+/// git's behaviour. This does **not** include `-c`/`GIT_CONFIG_COUNT`
+/// command-line overrides, which are higher precedence and layered on by the
+/// caller (the CLI) on top of this result.
+pub fn load_effective_config(
+    common_git_dir: &Path,
+    context: &ConfigIncludeContext,
+) -> Result<GitConfig> {
+    let mut sections = Vec::new();
+    for path in effective_config_paths(common_git_dir) {
+        load_config_file(&path, context, 0, &mut sections)?;
+    }
+    Ok(GitConfig { sections })
+}
+
+/// Compute the ordered list of config files that make up the effective config,
+/// lowest precedence (system) first and highest (repository) last.
+fn effective_config_paths(common_git_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(system) = system_config_path() {
+        paths.push(system);
+    }
+    paths.extend(global_config_paths());
+    paths.push(common_git_dir.join("config"));
+    paths
+}
+
+/// The system config file, or `None` when `GIT_CONFIG_NOSYSTEM` disables it.
+fn system_config_path() -> Option<PathBuf> {
+    if env_bool("GIT_CONFIG_NOSYSTEM") {
+        return None;
+    }
+    match non_empty_env("GIT_CONFIG_SYSTEM") {
+        Some(path) => Some(PathBuf::from(path)),
+        None => Some(PathBuf::from("/etc/gitconfig")),
+    }
+}
+
+/// The global config file(s), in precedence order (XDG first, `~/.gitconfig`
+/// last so it wins). When `$GIT_CONFIG_GLOBAL` is set it replaces both.
+fn global_config_paths() -> Vec<PathBuf> {
+    if let Some(global) = non_empty_env("GIT_CONFIG_GLOBAL") {
+        return vec![PathBuf::from(global)];
+    }
+    let mut paths = Vec::new();
+    if let Some(xdg) = xdg_config_path() {
+        paths.push(xdg);
+    }
+    if let Some(home) = home_dir() {
+        paths.push(PathBuf::from(home).join(".gitconfig"));
+    }
+    paths
+}
+
+/// `$XDG_CONFIG_HOME/git/config`, falling back to `~/.config/git/config`.
+fn xdg_config_path() -> Option<PathBuf> {
+    if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(xdg).join("git").join("config"));
+    }
+    home_dir().map(|home| {
+        PathBuf::from(home)
+            .join(".config")
+            .join("git")
+            .join("config")
+    })
+}
+
+/// Look up a string value with proper effective-config precedence.
+///
+/// A thin wrapper over [`GitConfig::get`] returning an owned `String`, provided
+/// so callers (e.g. the facade) can read any key without depending on the
+/// borrow lifetime of the underlying config.
+pub fn config_string(
+    config: &GitConfig,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Option<String> {
+    config.get(section, subsection, key).map(str::to_string)
+}
+
+/// Read an environment variable, treating unset and empty as absent (git's
+/// convention for path-valued environment variables).
+fn non_empty_env(name: &str) -> Option<String> {
+    match std::env::var(name) {
+        Ok(value) if !value.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
+/// Evaluate an environment variable as a git boolean (`git_env_bool` with a
+/// default of false): unset is false, and a set value is parsed with
+/// [`parse_config_bool`] (an unrecognised value is treated as true, matching
+/// git's `git_config_bool_or_int` fallback for non-empty strings).
+fn env_bool(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(value) => parse_config_bool(&value).unwrap_or(!value.is_empty()),
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1875,5 +1995,105 @@ mod tests {
         let config = load_config_with_includes(&main, &ctx).unwrap();
         assert_eq!(config.get("deep", None, "value"), Some("ok"));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // NOTE: `load_effective_config`'s file discovery reads process-global
+    // environment variables (`HOME`, `GIT_CONFIG_*`). The workspace forbids
+    // `unsafe_code`, so these tests cannot mutate the environment in-process
+    // without racing the parallel test runner. End-to-end discovery (HOME-based
+    // global fallback, `GIT_CONFIG_NOSYSTEM`, repo/`-c` overrides) is therefore
+    // covered hermetically by the CLI's subprocess interop test
+    // (`commit_identity_falls_back_to_global_gitconfig_like_upstream_git`),
+    // which sets the environment only on the child process. Here we cover the
+    // merge/precedence *semantics* that the loader relies on, plus the
+    // `config_string` helper, without touching the environment.
+
+    /// Concatenate config layers the way `load_effective_config` does (lowest
+    /// precedence first) so the document below mirrors a system+global+repo
+    /// merge without performing any environment-dependent file discovery.
+    fn merge_layers(layers: &[&str]) -> GitConfig {
+        let mut sections = Vec::new();
+        for layer in layers {
+            sections.extend(GitConfig::parse(layer.as_bytes()).unwrap().sections);
+        }
+        GitConfig { sections }
+    }
+
+    #[test]
+    fn effective_config_paths_are_ordered_system_global_repo() {
+        // Independent of the environment, the repository config is always last
+        // (highest precedence) and the system file, when present, is first.
+        let repo = Path::new("/tmp/sley-effective-paths/repo");
+        let paths = effective_config_paths(repo);
+        assert_eq!(
+            paths.last(),
+            Some(&repo.join("config")),
+            "repository config must be the highest-precedence (last) layer"
+        );
+        // The repository layer is always present; system/global depend on the
+        // environment and machine, so we only assert relative ordering here.
+        let repo_index = paths
+            .iter()
+            .position(|path| path == &repo.join("config"))
+            .expect("repo config present");
+        assert_eq!(repo_index, paths.len() - 1);
+    }
+
+    #[test]
+    fn effective_merge_semantics_are_last_layer_wins() {
+        // system -> global -> repo, mirroring the loader's concatenation order.
+        let config = merge_layers(&[
+            "[user]\n\tname = System\n[layer]\n\tsystem = yes\n",
+            "[user]\n\tname = Global\n[layer]\n\tglobal = yes\n",
+            "[user]\n\tname = Repo\n[layer]\n\trepo = yes\n",
+        ]);
+        // Repository (last) layer wins for a single-valued get.
+        assert_eq!(config.get("user", None, "name"), Some("Repo"));
+        // get_all preserves lowest-precedence-first ordering.
+        assert_eq!(
+            config.get_all("user", None, "name"),
+            vec![Some("System"), Some("Global"), Some("Repo")]
+        );
+        // Each layer's distinct keys all survive the merge.
+        assert_eq!(config.get("layer", None, "system"), Some("yes"));
+        assert_eq!(config.get("layer", None, "global"), Some("yes"));
+        assert_eq!(config.get("layer", None, "repo"), Some("yes"));
+    }
+
+    #[test]
+    fn config_string_returns_owned_effective_value() {
+        let config = merge_layers(&[
+            "[user]\n\temail = system@example.invalid\n",
+            "[user]\n\temail = global@example.invalid\n",
+        ]);
+        assert_eq!(
+            config_string(&config, "user", None, "email"),
+            Some("global@example.invalid".to_string())
+        );
+        // Subsections are honoured.
+        let with_sub =
+            GitConfig::parse(b"[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n")
+                .unwrap();
+        assert_eq!(
+            config_string(&with_sub, "remote", Some("origin"), "url"),
+            Some("https://example.invalid/repo.git".to_string())
+        );
+        assert_eq!(
+            config_string(&with_sub, "remote", Some("origin"), "missing"),
+            None
+        );
+    }
+
+    #[test]
+    fn env_bool_matches_git_env_bool_semantics() {
+        // parse_config_bool drives env_bool; verify the boolean keywords git
+        // accepts for `GIT_CONFIG_NOSYSTEM` map as expected.
+        assert_eq!(parse_config_bool("1"), Some(true));
+        assert_eq!(parse_config_bool("true"), Some(true));
+        assert_eq!(parse_config_bool("yes"), Some(true));
+        assert_eq!(parse_config_bool("0"), Some(false));
+        assert_eq!(parse_config_bool("false"), Some(false));
+        // An empty value is false (git treats `key =` as false).
+        assert_eq!(parse_config_bool(""), Some(false));
     }
 }

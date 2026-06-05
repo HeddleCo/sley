@@ -237,6 +237,65 @@ impl Repository {
         }
     }
 
+    /// The *effective* configuration, merging the system, global, and repository
+    /// config files in git's precedence order (repository wins, then global,
+    /// then system) with `include`/`includeIf` directives resolved.
+    ///
+    /// Unlike [`Repository::config`] (repository file only), this is what a
+    /// caller wanting git-equivalent lookups — e.g. resolving `user.name` from
+    /// `~/.gitconfig` — should use. File discovery honours `$GIT_CONFIG_SYSTEM`,
+    /// `$GIT_CONFIG_GLOBAL`, `$XDG_CONFIG_HOME`, `$HOME`, and
+    /// `$GIT_CONFIG_NOSYSTEM` exactly as git does; missing files are skipped.
+    ///
+    /// This does not layer in `-c`/`GIT_CONFIG_COUNT` command-line overrides,
+    /// which are process-level and higher precedence than any file.
+    pub fn config_snapshot(&self) -> Result<GitConfig> {
+        let context = sley_config::ConfigIncludeContext::new(
+            Some(self.config_include_git_dir()),
+            self.config_include_branch(),
+        );
+        sley_config::load_effective_config(&self.common_dir, &context)
+    }
+
+    /// Look up `section.key` in the effective config (see
+    /// [`Repository::config_snapshot`]), returning the highest-precedence value
+    /// or `None` if unset. For a subsectioned key use
+    /// [`Repository::config_string_subsection`].
+    pub fn config_string(&self, section: &str, key: &str) -> Result<Option<String>> {
+        self.config_string_subsection(section, None, key)
+    }
+
+    /// Look up `section.subsection.key` in the effective config, honouring
+    /// subsections (e.g. `remote.origin.url`). `subsection` of `None` reads the
+    /// bare section.
+    pub fn config_string_subsection(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Result<Option<String>> {
+        let config = self.config_snapshot()?;
+        Ok(sley_config::config_string(&config, section, subsection, key))
+    }
+
+    /// Absolute common git directory used as the `gitdir:` context for
+    /// `includeIf` evaluation, falling back to the unmodified path when it
+    /// cannot be canonicalised (e.g. it does not yet exist).
+    fn config_include_git_dir(&self) -> PathBuf {
+        std::fs::canonicalize(&self.common_dir).unwrap_or_else(|_| self.common_dir.clone())
+    }
+
+    /// Short branch name from `HEAD` for `includeIf "onbranch:"` evaluation, or
+    /// `None` when detached/unborn. Errors are swallowed: a config snapshot must
+    /// not fail just because `HEAD` is unreadable.
+    fn config_include_branch(&self) -> Option<String> {
+        let head = self.head().ok()?;
+        head.symbolic_target
+            .as_deref()
+            .and_then(|target| target.strip_prefix("refs/heads/"))
+            .map(str::to_string)
+    }
+
     /// Resolve `HEAD`: its symbolic branch target (if any) and the commit it
     /// points at (if the branch exists).
     pub fn head(&self) -> Result<Head> {
@@ -732,6 +791,46 @@ mod tests {
         let commit_oid = seed_commit(&repo);
         assert_eq!(commit_oid.format(), ObjectFormat::Sha256);
         assert_eq!(repo.rev_parse("HEAD").expect("HEAD"), commit_oid);
+    }
+
+    #[test]
+    fn config_snapshot_reads_repository_layer_via_helpers() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        // Append identity + a subsectioned remote to the repository config. The
+        // repository layer is the highest-precedence file layer, so these win
+        // over any global/system config the test machine might have, keeping the
+        // assertions hermetic. (End-to-end global fallback is covered by the
+        // CLI's subprocess interop test.)
+        let config_path = repo.common_dir().join("config");
+        let mut contents = fs::read(&config_path).expect("read config");
+        contents.extend_from_slice(
+            b"[user]\n\tname = Snapshot Person\n\temail = snap@example.invalid\n\
+              [remote \"origin\"]\n\turl = https://example.invalid/x.git\n",
+        );
+        fs::write(&config_path, contents).expect("write config");
+
+        // config_snapshot returns the merged effective config.
+        let snapshot = repo.config_snapshot().expect("snapshot");
+        assert_eq!(snapshot.get("user", None, "name"), Some("Snapshot Person"));
+
+        // config_string is the convenience wrapper.
+        assert_eq!(
+            repo.config_string("user", "name").expect("name"),
+            Some("Snapshot Person".to_string())
+        );
+        assert_eq!(
+            repo.config_string("user", "email").expect("email"),
+            Some("snap@example.invalid".to_string())
+        );
+        assert_eq!(repo.config_string("user", "missing").expect("missing"), None);
+
+        // Subsections are honoured.
+        assert_eq!(
+            repo.config_string_subsection("remote", Some("origin"), "url")
+                .expect("url"),
+            Some("https://example.invalid/x.git".to_string())
+        );
     }
 
     #[test]

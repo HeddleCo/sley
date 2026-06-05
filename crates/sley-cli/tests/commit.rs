@@ -155,8 +155,7 @@ fn commit_empty_message_errors_match_upstream_git() {
             prepare_commit_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     })();
@@ -192,8 +191,7 @@ fn commit_clean_index_requires_allow_empty_like_upstream_git() {
             remove_message_fixtures(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     })();
@@ -899,8 +897,7 @@ fn commit_file_messages_match_upstream_git_objects() {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert!(
                 actual.status.success(),
                 "sley {args:?} failed: {}",
@@ -1050,8 +1047,7 @@ fn commit_status_preview_modes_match_upstream_git() {
             prepare_commit_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
 
             for (program, repo) in [
@@ -1085,8 +1081,7 @@ fn commit_status_preview_modes_match_upstream_git() {
             run_success("git", &actual_root, &["init", "-q"]);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
     })();
@@ -1134,8 +1129,7 @@ fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert!(
                 actual.status.success(),
                 "sley {args:?} failed: {}",
@@ -1243,8 +1237,7 @@ fn commit_reuse_message_matches_upstream_git_objects() {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert!(
                 actual.status.success(),
                 "sley {args:?} failed: {}",
@@ -1633,8 +1626,7 @@ fn commit_allow_empty_matches_upstream_git_objects() {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert!(
                 actual.status.success(),
                 "sley {args:?} failed: {}",
@@ -1722,8 +1714,7 @@ fn commit_author_and_date_options_match_upstream_git_objects() {
                 "git {args:?} failed: {}",
                 String::from_utf8_lossy(&expected.stderr)
             );
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert!(
                 actual.status.success(),
                 "sley {args:?} failed: {}",
@@ -1823,4 +1814,170 @@ fn commit_tree_file_messages_match_upstream_git() {
     })();
     let _ = fs::remove_dir_all(&root);
     result
+}
+
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// Run a commit with the global config (`$HOME/.gitconfig`) as the *only* source
+/// of identity: no `GIT_AUTHOR_*`/`GIT_COMMITTER_*` name/email env vars, no
+/// repo-level `user.*`, and `GIT_CONFIG_NOSYSTEM=1` so the machine's
+/// `/etc/gitconfig` cannot interfere. Author/committer dates are pinned so the
+/// resulting commit is byte-for-byte comparable with upstream git. `extra_args`
+/// are inserted before the commit subcommand (used here to exercise `-c`).
+fn commit_with_global_identity(
+    program: &str,
+    repo: &Path,
+    home: &Path,
+    extra_args: &[&str],
+) -> Output {
+    let mut args: Vec<&str> = extra_args.to_vec();
+    args.extend_from_slice(&["commit", "-m", "from-global"]);
+    Command::new(program)
+        .current_dir(repo)
+        .args(&args)
+        .env("HOME", home)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_DATE", "@1000 +0000")
+        .env("GIT_COMMITTER_DATE", "@1000 +0000")
+        // Ensure nothing from the test runner's environment supplies identity or
+        // redirects the global/system config lookups.
+        .env_remove("GIT_AUTHOR_NAME")
+        .env_remove("GIT_AUTHOR_EMAIL")
+        .env_remove("GIT_COMMITTER_NAME")
+        .env_remove("GIT_COMMITTER_EMAIL")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("XDG_CONFIG_HOME")
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+/// sley must resolve `user.name`/`user.email` from the global `~/.gitconfig`
+/// when neither identity env vars nor repo-level config provide them — matching
+/// upstream git — and repo config and `-c` overrides must still win over global.
+#[test]
+fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("commit-global-identity");
+    let home = root.join("home");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    let result = std::panic::catch_unwind(|| {
+        fs::create_dir_all(&home).expect("create temp home");
+        fs::write(
+            home.join(".gitconfig"),
+            b"[user]\n\tname = Global Person\n\temail = global@example.invalid\n",
+        )
+        .expect("write global gitconfig");
+
+        for repo in [&upstream, &rust] {
+            fs::create_dir_all(repo).expect("create repo dir");
+            run_success("git", repo, &["init", "-q"]);
+            fs::write(repo.join("tracked.txt"), b"tracked\n").expect("write tracked file");
+            run_success("git", repo, &["add", "tracked.txt"]);
+        }
+
+        // (1) Pure global fallback: identity comes only from ~/.gitconfig.
+        // `git commit` and sley `commit` print different success summaries, so we
+        // compare the resulting commit objects (via cat-file) rather than stdout.
+        let expected = commit_with_global_identity("git", &upstream, &home, &[]);
+        assert!(
+            expected.status.success(),
+            "git commit with global-only identity failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = commit_with_global_identity(env!("CARGO_BIN_EXE_sley"), &rust, &home, &[]);
+        assert!(
+            actual.status.success(),
+            "sley commit with global-only identity failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let upstream_head = cat_head("git", &upstream);
+        let rust_head = cat_head("git", &rust);
+        assert_eq!(
+            rust_head, upstream_head,
+            "sley HEAD differs from git when identity comes from global config"
+        );
+        let head_text = String::from_utf8_lossy(&rust_head);
+        assert!(
+            head_text.contains("Global Person <global@example.invalid>"),
+            "expected global identity in commit, got:\n{head_text}"
+        );
+
+        // (2) Repo-level user.* must override the global config (git parity).
+        for repo in [&upstream, &rust] {
+            run_success("git", repo, &["config", "user.name", "Repo Person"]);
+            run_success(
+                "git",
+                repo,
+                &["config", "user.email", "repo@example.invalid"],
+            );
+            fs::write(repo.join("tracked.txt"), b"tracked 2\n").expect("update tracked file");
+            run_success("git", repo, &["add", "tracked.txt"]);
+        }
+        let expected = commit_with_global_identity("git", &upstream, &home, &[]);
+        assert!(
+            expected.status.success(),
+            "git commit with repo identity failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = commit_with_global_identity(env!("CARGO_BIN_EXE_sley"), &rust, &home, &[]);
+        assert!(
+            actual.status.success(),
+            "sley commit with repo identity failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let rust_head = cat_head("git", &rust);
+        let head_text = String::from_utf8_lossy(&rust_head);
+        assert!(
+            head_text.contains("Repo Person <repo@example.invalid>"),
+            "expected repo identity to override global, got:\n{head_text}"
+        );
+        assert_eq!(rust_head, cat_head("git", &upstream));
+
+        // (3) `-c user.*` must override both repo and global config (git parity).
+        for repo in [&upstream, &rust] {
+            fs::write(repo.join("tracked.txt"), b"tracked 3\n").expect("update tracked file");
+            run_success("git", repo, &["add", "tracked.txt"]);
+        }
+        let overrides = [
+            "-c",
+            "user.name=Cli Person",
+            "-c",
+            "user.email=cli@example.invalid",
+        ];
+        let expected = commit_with_global_identity("git", &upstream, &home, &overrides);
+        assert!(
+            expected.status.success(),
+            "git commit with -c identity failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            commit_with_global_identity(env!("CARGO_BIN_EXE_sley"), &rust, &home, &overrides);
+        assert!(
+            actual.status.success(),
+            "sley commit with -c identity failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        let rust_head = cat_head("git", &rust);
+        let head_text = String::from_utf8_lossy(&rust_head);
+        assert!(
+            head_text.contains("Cli Person <cli@example.invalid>"),
+            "expected -c identity to override repo and global, got:\n{head_text}"
+        );
+        assert_eq!(rust_head, cat_head("git", &upstream));
+    });
+    let _ = fs::remove_dir_all(&root);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
 }

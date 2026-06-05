@@ -32236,21 +32236,95 @@ fn parse_repository_abbrev_value(format: ObjectFormat, value: &str) -> Result<Op
 }
 
 fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
-    let name = env::var(format!("GIT_{role}_NAME")).unwrap_or_else(|_| "Git Rs".into());
-    let email =
-        env::var(format!("GIT_{role}_EMAIL")).unwrap_or_else(|_| "sley@example.invalid".into());
+    // git's identity precedence for the name/email of an author or committer:
+    //   GIT_{role}_NAME/EMAIL env var
+    //     -> `-c user.name=` / GIT_CONFIG_* command-line overrides
+    //       -> effective config user.name (repo, then global, then system)
+    //         -> sley's built-in default identity
+    // Higher-precedence env/`-c`/repo sources are evaluated exactly as before;
+    // the global+system config layer is the new fallback below repo config.
+    // The effective config is loaded at most once, and only when the env vars do
+    // not already supply both fields, so the common env-driven path is unchanged.
+    let env_name = env::var(format!("GIT_{role}_NAME")).ok();
+    let env_email = env::var(format!("GIT_{role}_EMAIL")).ok();
+    let mut config = if env_name.is_none() || env_email.is_none() {
+        IdentityConfig::Lazy(None)
+    } else {
+        IdentityConfig::Skip
+    };
+    let name = env_name
+        .or_else(|| identity_config_value("user.name", &mut config))
+        .unwrap_or_else(|| "Git Rs".into());
+    let email = env_email
+        .or_else(|| identity_config_value("user.email", &mut config))
+        .unwrap_or_else(|| "sley@example.invalid".into());
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
     sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+/// Lazily-loaded effective config used as the identity fallback. `Skip` means
+/// the caller already has both fields from the environment and the config files
+/// must not be touched; `Lazy` caches the (optional) loaded config so multiple
+/// key lookups share a single load.
+enum IdentityConfig {
+    Skip,
+    Lazy(Option<Option<GitConfig>>),
+}
+
+/// Resolve an identity config key (`user.name`/`user.email`) following git's
+/// precedence below the environment: `-c`/`GIT_CONFIG_*` command-line overrides
+/// first, then the effective config (repository, then global, then system).
+fn identity_config_value(key: &str, config: &mut IdentityConfig) -> Option<String> {
+    if let Ok(Some(value)) = global_config_value(key) {
+        return Some(value);
+    }
+    let (section, name) = key.split_once('.')?;
+    let loaded = match config {
+        IdentityConfig::Skip => return None,
+        IdentityConfig::Lazy(slot) => slot.get_or_insert_with(identity_effective_config),
+    };
+    loaded
+        .as_ref()
+        .and_then(|config| config.get(section, None, name).map(str::to_string))
+}
+
+/// Load the effective config (repository + global + system, with includes) for
+/// identity fallback, or `None` when there is no repository in scope. Failures
+/// degrade to `None` so identity resolution can still fall through to env/`-c`
+/// values or the built-in default rather than aborting.
+fn identity_effective_config() -> Option<GitConfig> {
+    // `discover_git_dir` already honours `--git-dir`/`GIT_DIR` (via
+    // `explicit_git_dir`) before walking up from the current directory.
+    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir).ok()?;
+    let context = sley_config::ConfigIncludeContext::new(
+        Some(common_git_dir.clone()),
+        repo_current_branch_name(&git_dir),
+    );
+    sley_config::load_effective_config(&common_git_dir, &context).ok()
 }
 
 fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Result<Vec<u8>> {
     let (name, email) = if let Some(author) = author {
         parse_commit_author(author)?
     } else {
-        (
-            env::var("GIT_AUTHOR_NAME").unwrap_or_else(|_| "Git Rs".into()),
-            env::var("GIT_AUTHOR_EMAIL").unwrap_or_else(|_| "sley@example.invalid".into()),
-        )
+        // Same precedence as `commit_identity_from_env`: env var, then
+        // `-c`/`GIT_CONFIG_*`, then effective config (repo > global > system),
+        // then the built-in default.
+        let env_name = env::var("GIT_AUTHOR_NAME").ok();
+        let env_email = env::var("GIT_AUTHOR_EMAIL").ok();
+        let mut config = if env_name.is_none() || env_email.is_none() {
+            IdentityConfig::Lazy(None)
+        } else {
+            IdentityConfig::Skip
+        };
+        let name = env_name
+            .or_else(|| identity_config_value("user.name", &mut config))
+            .unwrap_or_else(|| "Git Rs".into());
+        let email = env_email
+            .or_else(|| identity_config_value("user.email", &mut config))
+            .unwrap_or_else(|| "sley@example.invalid".into());
+        (name, email)
     };
     let date = date
         .map(str::to_string)
@@ -32278,8 +32352,21 @@ fn commit_invalid_author_error(author: &str) -> Result<(String, String)> {
 }
 
 fn commit_signoff_from_env() -> Result<Vec<u8>> {
-    let name = env::var("GIT_COMMITTER_NAME").unwrap_or_else(|_| "Git Rs".into());
-    let email = env::var("GIT_COMMITTER_EMAIL").unwrap_or_else(|_| "sley@example.invalid".into());
+    // git's `--signoff` uses the committer identity, so resolve it with the same
+    // precedence as `commit_identity_from_env("COMMITTER")`.
+    let env_name = env::var("GIT_COMMITTER_NAME").ok();
+    let env_email = env::var("GIT_COMMITTER_EMAIL").ok();
+    let mut config = if env_name.is_none() || env_email.is_none() {
+        IdentityConfig::Lazy(None)
+    } else {
+        IdentityConfig::Skip
+    };
+    let name = env_name
+        .or_else(|| identity_config_value("user.name", &mut config))
+        .unwrap_or_else(|| "Git Rs".into());
+    let email = env_email
+        .or_else(|| identity_config_value("user.email", &mut config))
+        .unwrap_or_else(|| "sley@example.invalid".into());
     let date = env::var("GIT_COMMITTER_DATE").unwrap_or_else(|_| "@0 +0000".into());
     sley_sequencer::format_commit_identity(&name, &email, &date)?;
     Ok(format!("Signed-off-by: {name} <{email}>").into_bytes())
