@@ -40,6 +40,9 @@ use crate::{CredentialProvider, ProgressSink};
 pub enum FetchSource {
     /// A smart-HTTP(S) remote at the given already-resolved URL.
     Http(RemoteUrl),
+    /// An SSH remote at the given already-resolved URL. Fetched by spawning `ssh`
+    /// (the credential seam is unused — the `ssh` program owns authentication).
+    Ssh(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -177,6 +180,43 @@ pub fn fetch(
                 wants,
                 promisor_remote,
                 credentials,
+            )?;
+            finalize_fetch(
+                git_dir,
+                &store,
+                &mut updates,
+                &options,
+                remote_name,
+                &fetch_head_source,
+                default_head_fetch,
+                &mut outcome,
+            )?;
+            advertisements
+        }
+        FetchSource::Ssh(remote) => {
+            // SSH advertises and pulls the pack by spawning `ssh` (no credential
+            // seam — the `ssh` program authenticates), but the ref-map planning
+            // and ref bookkeeping are the same shared flow as HTTP.
+            let (advertisements, features) =
+                crate::ssh::ssh_upload_pack_advertisements(remote, format)?;
+            outcome.head_symref = head_symref_from_features(&features.symrefs);
+            let mut updates = plan_and_adjust_updates(
+                &advertisements,
+                &parsed_refspecs,
+                &options,
+                &store,
+                None,
+                format,
+                configured_remote_fetch,
+            )?;
+            let wants = updates.iter().map(|update| update.oid.clone()).collect();
+            crate::ssh::install_fetch_pack_via_ssh_upload_pack(
+                git_dir,
+                format,
+                remote,
+                &features,
+                wants,
+                promisor_remote,
             )?;
             finalize_fetch(
                 git_dir,

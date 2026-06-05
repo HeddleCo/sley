@@ -39,6 +39,12 @@ pub use http::{
     remote_url_is_http,
 };
 
+mod ssh;
+pub use ssh::{
+    install_fetch_pack_via_ssh_upload_pack, ssh_program, ssh_upload_pack_advertisements,
+    ssh_upload_pack_fetch_response,
+};
+
 mod local;
 pub use local::{
     attach_receive_pack_capabilities, attach_upload_pack_capabilities,

@@ -34,6 +34,9 @@ use crate::CredentialProvider;
 pub enum LsRemoteSource {
     /// A smart-HTTP(S) remote at the given already-resolved URL.
     Http(RemoteUrl),
+    /// An SSH remote at the given already-resolved URL, listed by spawning `ssh`
+    /// (the credential seam is unused — the `ssh` program owns authentication).
+    Ssh(RemoteUrl),
     /// A local repository read directly from `git_dir` (refs and the object
     /// database used to peel annotated tags both resolve from this `$GIT_DIR`,
     /// matching `git ls-remote` against a local path).
@@ -93,6 +96,7 @@ pub fn ls_remote(
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     match source {
         LsRemoteSource::Http(remote) => ls_remote_http(remote, format, filter, matches, credentials),
+        LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
     }
 }

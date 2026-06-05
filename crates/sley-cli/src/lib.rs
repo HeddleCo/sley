@@ -1,5 +1,4 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_formats::{
     Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry,
@@ -21,19 +20,14 @@ use sley_refs::{
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, GitService, ProtocolVersion, ReceivePackCommand,
-    ReceivePackPushRequest, ReceivePackPushRequestOptions, RefAdvertisement, RefAdvertisementSet,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest, build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
-    parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
-    read_receive_pack_push_options, read_receive_pack_report_status, read_receive_pack_request,
-    read_ref_advertisement_set, read_upload_pack_negotiation_request,
-    read_upload_pack_raw_packfile_response, read_upload_pack_request, refspec_map_source,
-    write_receive_pack_push_request, write_receive_pack_report_status, write_ref_advertisement_set,
-    write_upload_pack_negotiation_request, write_upload_pack_packfile_response,
-    write_upload_pack_raw_packfile_response, write_upload_pack_request,
+    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
+    RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, plan_fetch_ref_updates,
+    read_receive_pack_push_options, read_receive_pack_request, read_upload_pack_negotiation_request,
+    read_upload_pack_request, refspec_map_source, write_receive_pack_report_status,
+    write_ref_advertisement_set, write_upload_pack_packfile_response,
+    write_upload_pack_raw_packfile_response,
 };
-use sley_transport::{RemoteTransport, SshCommandVariant, parse_remote_url, ssh_process_command};
+use sley_transport::{RemoteTransport, parse_remote_url};
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -42,7 +36,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 use std::sync::Mutex;
 
 static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Vec::new());
@@ -8368,41 +8362,33 @@ fn cmd_push(args: &[String]) -> Result<()> {
         set_upstream,
         force,
     };
-    if push_remote_is_ssh(&remote)? {
-        // SSH push still lives here (a later extraction stage); HTTP and local
-        // delegate the git work to `sley_remote::push` while this command keeps
-        // owning URL/repo resolution, set-upstream config, and the "To <remote>"
-        // summary so the user-visible output stays byte-for-byte identical.
-        push_ssh_repository(
-            &git_dir,
-            &common_git_dir,
-            format,
-            &remote,
-            &refspecs,
-            options,
-        )
+    // All transports delegate the git work to `sley_remote::push`, picked purely
+    // by the resolved `PushDestination`; this command keeps owning URL/repo
+    // resolution, set-upstream config, and the "To <remote>" summary so the
+    // user-visible output stays byte-for-byte identical.
+    let destination = if push_remote_is_ssh(&remote)? {
+        let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
+        sley_remote::PushDestination::Ssh(remote_url)
+    } else if push_remote_is_http(&remote)? {
+        let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
+        sley_remote::PushDestination::Http(remote_url)
     } else {
-        let destination = if push_remote_is_http(&remote)? {
-            let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
-            sley_remote::PushDestination::Http(remote_url)
-        } else {
-            let remote_git_dir = ls_remote_git_dir(&remote)?;
-            let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-            sley_remote::PushDestination::Local {
-                git_dir: remote_git_dir,
-                common_git_dir: remote_common_git_dir,
-            }
-        };
-        run_push(
-            &git_dir,
-            &common_git_dir,
-            format,
-            &remote,
-            &destination,
-            &refspecs,
-            options,
-        )
-    }
+        let remote_git_dir = ls_remote_git_dir(&remote)?;
+        let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+        sley_remote::PushDestination::Local {
+            git_dir: remote_git_dir,
+            common_git_dir: remote_common_git_dir,
+        }
+    };
+    run_push(
+        &git_dir,
+        &common_git_dir,
+        format,
+        &remote,
+        &destination,
+        &refspecs,
+        options,
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -8504,151 +8490,6 @@ fn push_remote_and_refspecs(
         }
         [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
     }
-}
-
-fn push_ssh_repository(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    remote: &str,
-    refspecs: &[String],
-    options: PushOptions,
-) -> Result<()> {
-    let remote_url = push_resolved_url(remote)?;
-    let parsed = parse_remote_url(&remote_url)?;
-    if parsed.transport != RemoteTransport::Ssh {
-        return Err(GitError::InvalidFormat(
-            "SSH receive-pack requires an SSH remote".into(),
-        ));
-    }
-    let ssh = ssh_process_command(
-        &parsed,
-        GitService::ReceivePack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
-    let mut child = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
-
-    let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
-    let features = advertisement_set
-        .refs
-        .first()
-        .map(|advertisement| parse_receive_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(remote_format) = features.object_format {
-        if remote_format != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "remote repository uses {}, local repository uses {}",
-                remote_format.name(),
-                format.name()
-            )));
-        }
-    } else if format != ObjectFormat::Sha1 {
-        return Err(GitError::InvalidObjectId(format!(
-            "remote repository did not advertise object-format for {} push",
-            format.name()
-        )));
-    }
-
-    let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = sley_remote::local_push_source_refs(&local_store, format)?;
-    let parsed_refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(&sley_remote::normalize_push_refspec(refspec)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut command_forces = Vec::new();
-    for refspec in &parsed_refspecs {
-        for command in plan_push_commands(
-            format,
-            &local_refs,
-            &advertisement_set.refs,
-            std::slice::from_ref(refspec),
-        )? {
-            command_forces.push((command, options.force || refspec.force));
-        }
-    }
-    let commands = command_forces
-        .iter()
-        .map(|(command, _)| command.clone())
-        .collect::<Vec<_>>();
-    if commands.is_empty() {
-        drop(stdin);
-        let _ = child.wait_with_output()?;
-        return Ok(());
-    }
-
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    sley_remote::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
-    let remote_excluded_tips =
-        sley_remote::remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
-    let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
-    let starts = commands
-        .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
-        .map(|command| command.new_id.clone());
-    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
-    let request = build_receive_pack_push_request(
-        &features,
-        commands.clone(),
-        packfile,
-        ReceivePackPushRequestOptions {
-            report_status: features.report_status,
-            ofs_delta: features.ofs_delta,
-            quiet: options.quiet && features.quiet,
-            object_format: features
-                .object_format
-                .filter(|_| format != ObjectFormat::Sha1),
-            ..ReceivePackPushRequestOptions::default()
-        },
-    )?;
-    write_receive_pack_push_request(&mut stdin, &request)?;
-    drop(stdin);
-
-    if features.report_status {
-        let report = read_receive_pack_report_status(&mut stdout)?;
-        sley_remote::validate_receive_pack_report(&report)?;
-    } else {
-        let mut sink = Vec::new();
-        stdout.read_to_end(&mut sink)?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(GitError::Command(format!(
-            "ssh receive-pack failed for {remote_url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    if options.set_upstream {
-        configure_push_upstreams(git_dir, remote, &commands)?;
-    }
-    if !options.quiet {
-        eprintln!("To {remote}");
-        for command in &commands {
-            eprintln!("   {}  {}", command.new_id, command.name);
-        }
-    }
-    Ok(())
-}
-
-fn is_zero_object_id(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 fn configure_push_upstreams(
@@ -8804,238 +8645,31 @@ fn fetch_source_is_ssh(source: &str) -> Result<bool> {
     Ok(parse_remote_url(&resolved)?.transport == RemoteTransport::Ssh)
 }
 
+/// Resolve the repository context and delegate an SSH fetch to
+/// [`sley_remote::fetch`] via the unified [`sley_remote::FetchSource::Ssh`]
+/// dispatch. URL resolution and output formatting stay here; the fetch
+/// orchestration (ref-map, pack install over `ssh`, `FETCH_HEAD`, prune) lives in
+/// the library, shared with the HTTP and local transports.
 fn fetch_ssh_repository(
     git_dir: &Path,
     format: ObjectFormat,
     source: &str,
     refspecs: &[String],
-    mut options: FetchOptions,
+    options: FetchOptions,
 ) -> Result<()> {
     let config = read_repo_config(git_dir)?;
-    sley_remote::apply_configured_remote_tag_option(&config, source, &mut options);
-    sley_remote::apply_configured_fetch_prune_option(&config, source, &mut options);
-    let promisor_remote = config
-        .get_bool("remote", Some(source), "promisor")
-        .unwrap_or(false);
-    let configured_refspecs = if refspecs.is_empty() {
-        remote_config_values(&config, source, "fetch")
-    } else {
-        Vec::new()
-    };
-    let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
-    let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
-    let fetch_head_source = sley_remote::fetch_head_source_description(&config, source);
-    let refspecs =
-        sley_remote::fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
-    let refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(refspec))
-        .collect::<Result<Vec<_>>>()?;
-    let resolved = ls_remote_resolved_url(source)?;
-    let (advertisements, features) = ssh_upload_pack_advertisements(&resolved, format)?;
-    let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
-    let store = FileRefStore::new(git_dir, format);
-    if options.fetch_all_tags {
-        sley_remote::mark_tag_refspec_updates_not_for_merge(&mut updates);
-    } else {
-        sley_remote::retain_missing_auto_follow_tags(&store, &mut updates)?;
-    }
-    if configured_remote_fetch {
-        for update in &mut updates {
-            update.not_for_merge = true;
-        }
-    }
-    let wants = updates
-        .iter()
-        .map(|update| update.oid.clone())
-        .collect::<Vec<_>>();
-    install_fetch_pack_via_ssh_upload_pack(
-        git_dir,
-        format,
-        &resolved,
-        &features,
-        wants,
-        promisor_remote,
-    )?;
-    if options.dry_run {
-        return Ok(());
-    }
-    if options.write_fetch_head {
-        if default_head_fetch
-            && updates.len() == 1
-            && updates[0].src == "HEAD"
-            && updates[0].dst.is_none()
-        {
-            sley_remote::write_default_fetch_head(
-                git_dir,
-                source,
-                updates[0].oid.clone(),
-                options.append,
-            )?;
-        } else {
-            sley_remote::write_fetch_head(git_dir, &fetch_head_source, &updates, options.append)?;
-        }
-    }
-    let ref_updates = updates
-        .iter()
-        .filter_map(|update| {
-            update.dst.as_ref().map(|dst| BundleRefUpdate {
-                name: dst.clone(),
-                oid: update.oid.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    store.apply_bundle_ref_updates(&ref_updates, None)?;
-    if options.prune && remote_exists(&config, source) {
-        let mut progress = StdoutProgress;
-        sley_remote::prune_remote_tracking_refs_from_advertisements(
-            &config,
-            &store,
-            source,
-            &advertisements,
-            options.quiet,
-            &mut progress,
-        )?;
-    }
-    Ok(())
+    let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
+    let fetch_source = sley_remote::FetchSource::Ssh(remote);
+    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
 }
 
-fn install_fetch_pack_via_ssh_upload_pack(
-    git_dir: &Path,
-    format: ObjectFormat,
-    remote_url: &str,
-    features: &UploadPackFeatures,
-    wants: Vec<ObjectId>,
-    promisor: bool,
-) -> Result<()> {
-    if wants.is_empty() {
-        return Ok(());
-    }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
-    {
-        return Ok(());
-    }
-    let request = UploadPackRequest {
-        wants,
-        ..UploadPackRequest::default()
-    };
-    let haves = sley_remote::local_have_oids(git_dir, format)?;
-    let response = ssh_upload_pack_fetch_response(remote_url, format, features, request, haves)?;
-    if promisor {
-        install_upload_pack_raw_promisor_response(&response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&response, &local_db)?;
-    }
-    Ok(())
-}
-
-fn ssh_upload_pack_advertisements(
-    remote_url: &str,
-    format: ObjectFormat,
-) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let parsed = parse_remote_url(remote_url)?;
-    if parsed.transport != RemoteTransport::Ssh {
-        return Err(GitError::InvalidFormat(
-            "SSH upload-pack requires an SSH remote".into(),
-        ));
-    }
-    let ssh = ssh_process_command(
-        &parsed,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
-    let output = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::null())
-        .output()?;
-    let mut stdout = output.stdout.as_slice();
-    let set = match read_ref_advertisement_set(format, &mut stdout) {
-        Ok(set) => set,
-        Err(_) if !output.status.success() => {
-            return Err(GitError::Command(format!(
-                "ssh upload-pack failed for {remote_url}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Err(err) => return Err(err),
-    };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    Ok((set.refs, features))
-}
-
-fn ssh_upload_pack_fetch_response(
-    remote_url: &str,
-    format: ObjectFormat,
-    _features: &UploadPackFeatures,
-    request: UploadPackRequest,
-    haves: Vec<ObjectId>,
-) -> Result<UploadPackRawPackfileResponse> {
-    let parsed = parse_remote_url(remote_url)?;
-    if parsed.transport != RemoteTransport::Ssh {
-        return Err(GitError::InvalidFormat(
-            "SSH upload-pack requires an SSH remote".into(),
-        ));
-    }
-    let ssh = ssh_process_command(
-        &parsed,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
-    )?;
-    let mut child = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| GitError::Command("ssh upload-pack stdout was not piped".into()))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| GitError::Command("ssh upload-pack stdin was not piped".into()))?;
-
-    read_ref_advertisement_set(format, &mut stdout)?;
-    write_upload_pack_request(&mut stdin, Some(&request))?;
-    write_upload_pack_negotiation_request(
-        &mut stdin,
-        &UploadPackNegotiationRequest { haves, done: true },
-    )?;
-    drop(stdin);
-
-    let response = read_upload_pack_raw_packfile_response(format, &mut stdout)?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(GitError::Command(format!(
-            "ssh upload-pack failed for {remote_url}: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-    Ok(response)
-}
-
-// ===== Smart HTTP(S) transport =====
+// ===== Transport dispatch =====
 //
-// HTTP mirrors the SSH path (`fetch_ssh_repository` / `push_ssh_repository`),
-// driving the same transport-agnostic protocol codecs over an HTTP client from
-// `git-transport`. Two differences vs SSH: the info/refs GET carries a
-// `# service=` announcement preamble (handled by `read_service_discovery_response`),
-// and the RPC POST response goes straight to the packfile/report (no re-advertised
-// refs to skip).
+// The fetch/push/ls-remote git work for every transport (HTTP, SSH, local) lives
+// in `sley_remote`, picked by the source enum (`FetchSource`/`PushDestination`/
+// `LsRemoteSource`). These sniffers classify the resolved URL so the commands can
+// build the right variant; URL/repo resolution, output formatting, and exit codes
+// stay here.
 
 fn fetch_source_is_http(source: &str) -> Result<bool> {
     sley_remote::remote_url_is_http(&ls_remote_resolved_url(source)?)
@@ -9370,86 +9004,27 @@ fn validate_ls_remote_sort_context(sort: Option<LsRemoteSort>) -> Result<Option<
     Err(GitError::Exit(128))
 }
 
+/// Resolve `repository` to an SSH remote and list its advertisements via
+/// [`sley_remote::ls_remote`], returning `None` for non-SSH transports. URL/config
+/// resolution and the ref-name pattern matching stay here; the advertisement
+/// listing and class filtering live in the library, shared with the HTTP path. SSH
+/// does not authenticate at this layer, so no credential provider is supplied.
 fn ls_remote_ssh_records(
     repository: &str,
     options: &LsRemoteOptions,
 ) -> Result<Option<(Vec<LsRemoteRecord>, ObjectFormat)>> {
-    let remote_url = ls_remote_resolved_url(repository)?;
-    let parsed = parse_remote_url(&remote_url)?;
+    let parsed = parse_remote_url(&ls_remote_resolved_url(repository)?)?;
     if parsed.transport != RemoteTransport::Ssh {
         return Ok(None);
     }
-    let ssh = ssh_process_command(
-        &parsed,
-        GitService::UploadPack,
-        ssh_program(),
-        SshCommandVariant::OpenSsh,
+    let records = sley_remote::ls_remote(
+        &sley_remote::LsRemoteSource::Ssh(parsed),
+        ObjectFormat::Sha1,
+        &ls_remote_filter(options),
+        &|name| ls_remote_ref_matches(name, &options.patterns),
+        &mut sley_remote::NoCredentials,
     )?;
-    let output = ProcessCommand::new(&ssh.program)
-        .args(&ssh.args)
-        .stdin(Stdio::null())
-        .output()?;
-    let mut stdout = output.stdout.as_slice();
-    let set = match read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout) {
-        Ok(set) => set,
-        Err(_) if !output.status.success() => {
-            return Err(GitError::Command(format!(
-                "ssh upload-pack failed for {remote_url}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )));
-        }
-        Err(err) => return Err(err),
-    };
-    let features = set
-        .refs
-        .first()
-        .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(format!(
-            "ssh ls-remote currently supports SHA-1 advertisements, got {}",
-            format.name()
-        )));
-    }
-    let symrefs = features
-        .symrefs
-        .iter()
-        .filter_map(|symref| symref.split_once(':'))
-        .map(|(name, target)| (name.to_string(), target.to_string()))
-        .collect::<HashMap<_, _>>();
-    let mut records = Vec::new();
-    for advertisement in set.refs {
-        if is_zero_object_id(&advertisement.oid) {
-            continue;
-        }
-        if options.refs_only
-            && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
-        {
-            continue;
-        }
-        let is_head = advertisement.name.starts_with("refs/heads/");
-        let is_tag = advertisement.name.starts_with("refs/tags/");
-        if (options.heads || options.tags)
-            && !((options.heads && is_head) || (options.tags && is_tag))
-        {
-            continue;
-        }
-        if !ls_remote_ref_matches(&advertisement.name, &options.patterns) {
-            continue;
-        }
-        records.push(LsRemoteRecord {
-            oid: advertisement.oid,
-            symref: symrefs.get(&advertisement.name).cloned(),
-            name: advertisement.name,
-        });
-    }
-    Ok(Some((records, format)))
-}
-
-fn ssh_program() -> String {
-    env::var("GIT_SSH").unwrap_or_else(|_| "ssh".into())
+    Ok(Some(records))
 }
 
 fn ls_remote_resolved_url(repository: &str) -> Result<String> {

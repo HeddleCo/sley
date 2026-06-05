@@ -49,6 +49,9 @@ use crate::{CredentialProvider, ProgressSink};
 pub enum PushDestination {
     /// A smart-HTTP(S) remote at the given already-resolved URL.
     Http(RemoteUrl),
+    /// An SSH remote at the given already-resolved URL. Pushed by spawning `ssh`
+    /// (the credential seam is unused — the `ssh` program owns authentication).
+    Ssh(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -133,6 +136,16 @@ pub fn push(
             remote_url,
             refspecs,
             options,
+            credentials,
+        ),
+        PushDestination::Ssh(remote_url) => crate::ssh::push_ssh(
+            git_dir,
+            common_git_dir,
+            format,
+            remote_url,
+            refspecs,
+            options.quiet,
+            options.force,
             credentials,
         ),
         PushDestination::Local {
