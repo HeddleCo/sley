@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::{env, fs};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -749,6 +749,24 @@ fn delta_base_cache_budget() -> usize {
     )
 }
 
+/// Whether to re-hash every object on read and compare it to the requested id.
+///
+/// Off by default, matching git: reads trust the pack index → offset mapping and
+/// the loose object's on-disk name, and object ids are verified where git verifies
+/// them — when a pack is received (the index build re-hashes every object) and on
+/// demand via [`FileObjectDatabase`]'s `validate`/fsck. Re-hashing on *every* read
+/// dominated bulk-read cost (a scalar pure-Rust SHA-1 over each object's full
+/// body), so it is opt-in via `SLEY_VERIFY_READS` (any value other than unset, ``,
+/// or `0`) for callers that want the paranoid check back. Read once and cached, so
+/// the default path pays only a single relaxed atomic load per read.
+fn verify_reads_enabled() -> bool {
+    static VERIFY: OnceLock<bool> = OnceLock::new();
+    *VERIFY.get_or_init(|| match env::var("SLEY_VERIFY_READS") {
+        Ok(value) => !matches!(value.trim(), "" | "0"),
+        Err(_) => false,
+    })
+}
+
 /// A memory-capped LRU map from a key `K` to a decoded [`EncodedObject`].
 ///
 /// Eviction is by approximate byte budget (gix-style), not object count, so the
@@ -1200,11 +1218,16 @@ impl FileObjectDatabase {
                 sley_pack::read_object_at(&bytes, pack_paths.offset, self.format, resolve_ref_base)?
             }
         };
-        let actual = object.object_id(self.format)?;
-        if actual != *oid {
-            return Err(GitError::InvalidObject(format!(
-                "pack object id mismatch: index says {oid}, decoded {actual}"
-            )));
+        // Trust the index → offset mapping rather than re-hashing every decoded
+        // object on read (see `verify_reads_enabled`); this re-hash dominated
+        // bulk-read cost. Opt back in with `SLEY_VERIFY_READS` for a paranoid check.
+        if verify_reads_enabled() {
+            let actual = object.object_id(self.format)?;
+            if actual != *oid {
+                return Err(GitError::InvalidObject(format!(
+                    "pack object id mismatch: index says {oid}, decoded {actual}"
+                )));
+            }
         }
         if let Ok(mut cache) = self.decoded.lock() {
             cache.put(oid.clone(), object.clone());
@@ -1590,12 +1613,17 @@ impl ObjectReader for LooseObjectStore {
         let mut framed = Vec::new();
         decoder.read_to_end(&mut framed)?;
         let object = parse_framed_object(&framed)?;
-        let actual = object.object_id(self.format)?;
-        if &actual != oid {
-            return Err(GitError::InvalidObject(format!(
-                "loose object {} hashes to {actual}",
-                path.display()
-            )));
+        // Trust the loose object's on-disk name rather than re-hashing its full body
+        // on every read (see `verify_reads_enabled`); use `validate`/fsck or
+        // `SLEY_VERIFY_READS` for an explicit integrity check.
+        if verify_reads_enabled() {
+            let actual = object.object_id(self.format)?;
+            if &actual != oid {
+                return Err(GitError::InvalidObject(format!(
+                    "loose object {} hashes to {actual}",
+                    path.display()
+                )));
+            }
         }
         Ok(object)
     }
