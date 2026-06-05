@@ -1894,6 +1894,93 @@ where
     Ok(object)
 }
 
+/// The object type and final (inflated) size of the entry at `offset`, *without*
+/// materializing the object body — git's `cat-file --batch-check` fast path.
+///
+/// A base object's size is already in its pack entry header, and a delta's result
+/// size is the second varint at the front of its (small) delta stream, so neither
+/// inflates the full content. The reported type is the type at the end of the
+/// delta chain (deltas inherit their base's type). `resolve_ref_base_type` supplies
+/// the type of a ref-delta base that lives outside this pack (resolved through the
+/// wider object store); ofs-delta bases are followed within `pack_bytes` directly.
+pub fn read_object_header_at<F>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    mut resolve_ref_base_type: F,
+) -> Result<(ObjectType, u64)>
+where
+    F: FnMut(&ObjectId) -> Option<ObjectType>,
+{
+    read_object_header_at_inner(pack_bytes, offset, format, &mut resolve_ref_base_type)
+}
+
+fn read_object_header_at_inner<F>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    resolve_ref_base_type: &mut F,
+) -> Result<(ObjectType, u64)>
+where
+    F: FnMut(&ObjectId) -> Option<ObjectType>,
+{
+    let trailer_offset = pack_bytes
+        .len()
+        .checked_sub(format.raw_len())
+        .ok_or_else(|| GitError::InvalidFormat("pack smaller than its trailer".into()))?;
+    let mut cursor = usize::try_from(offset)
+        .ok()
+        .filter(|&value| value < trailer_offset)
+        .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
+    let header = parse_entry_header(pack_bytes, &mut cursor)?;
+    match header.kind {
+        PackObjectKind::Commit => Ok((ObjectType::Commit, header.size)),
+        PackObjectKind::Tree => Ok((ObjectType::Tree, header.size)),
+        PackObjectKind::Blob => Ok((ObjectType::Blob, header.size)),
+        PackObjectKind::Tag => Ok((ObjectType::Tag, header.size)),
+        PackObjectKind::OfsDelta => {
+            let base_offset = parse_ofs_delta_base_offset(pack_bytes, &mut cursor, offset)?;
+            let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
+            let (base_type, _) = read_object_header_at_inner(
+                pack_bytes,
+                base_offset,
+                format,
+                resolve_ref_base_type,
+            )?;
+            Ok((base_type, size))
+        }
+        PackObjectKind::RefDelta => {
+            let hash_len = format.raw_len();
+            if cursor + hash_len > trailer_offset {
+                return Err(GitError::InvalidFormat(
+                    "truncated ref-delta base object id".into(),
+                ));
+            }
+            let oid = ObjectId::from_raw(format, &pack_bytes[cursor..cursor + hash_len])?;
+            cursor += hash_len;
+            let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
+            let base_type = resolve_ref_base_type(&oid)
+                .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {oid}")))?;
+            Ok((base_type, size))
+        }
+    }
+}
+
+/// Number of inflated delta-stream bytes to read when only the leading base-size
+/// and result-size varints are needed. Each varint is at most 10 bytes, so a short
+/// prefix always covers both without inflating the delta instructions.
+const DELTA_HEADER_PREFIX_LEN: u64 = 32;
+
+/// Result size of a delta whose zlib-compressed stream starts at `compressed`,
+/// inflating only the short prefix that holds its two leading varints.
+fn delta_result_size_from_stream(compressed: &[u8]) -> Result<u64> {
+    let mut prefix = Vec::new();
+    ZlibDecoder::new(compressed)
+        .take(DELTA_HEADER_PREFIX_LEN)
+        .read_to_end(&mut prefix)?;
+    decoded_delta_result_size(&prefix)
+}
+
 fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<EntryHeader> {
     let first = next_byte(bytes, offset)?;
     let mut size = u64::from(first & 0x0f);

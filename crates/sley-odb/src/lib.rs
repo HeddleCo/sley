@@ -1182,6 +1182,44 @@ impl FileObjectDatabase {
         })
     }
 
+    /// The object type and content size of `oid` without decoding its full body —
+    /// git's `cat-file --batch-check` fast path. Tries the decoded-object cache,
+    /// then loose storage (inflating only the framing header), then packs (reading
+    /// the entry header and, for deltas, only the delta's leading varints), then
+    /// alternates. Returns `Ok(None)` if the object is not present.
+    ///
+    /// Unlike [`ObjectReader::read_object`], this never materializes the body, so it
+    /// stays cheap on huge blobs and deep delta chains. It does not populate the
+    /// decoded-object cache (nothing is decoded).
+    pub fn read_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+        if let Ok(mut cache) = self.decoded.lock() {
+            if let Some(object) = cache.get(oid) {
+                return Ok(Some((object.object_type, object.body.len() as u64)));
+            }
+        }
+        if let Some(header) = self.loose.read_header(oid)? {
+            return Ok(Some(header));
+        }
+        if let Some(pack_paths) = self.find_pack_containing(oid)? {
+            let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
+            let header = sley_pack::read_object_header_at(
+                &bytes,
+                pack_paths.offset,
+                self.format,
+                |base| self.read_object_header(base).ok().flatten().map(|(t, _)| t),
+            )?;
+            return Ok(Some(header));
+        }
+        for alternate in &self.alternates {
+            if let Some(header) =
+                Self::without_alternates(alternate, self.format).read_object_header(oid)?
+            {
+                return Ok(Some(header));
+            }
+        }
+        Ok(None)
+    }
+
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<EncodedObject>> {
         // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
         // bases that resolve back through the store + repeated whole-object reads).
@@ -1600,6 +1638,47 @@ impl LooseObjectStore {
     pub fn exists(&self, oid: &ObjectId) -> Result<bool> {
         Ok(self.object_path(oid)?.exists())
     }
+
+    /// The object type and content size of `oid` from loose storage, inflating only
+    /// the framing header (`"<type> <size>\0"`) and not the body. Output-limited
+    /// reads keep miniz from inflating past the header even for large objects.
+    /// Returns `Ok(None)` when the loose object is absent.
+    pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
+        let path = self.object_path(oid)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let compressed = fs::read(&path)?;
+        let mut decoder = ZlibDecoder::new(compressed.as_slice());
+        let mut header = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            if decoder.read(&mut byte)? == 0 {
+                return Err(GitError::InvalidObject(format!(
+                    "loose object {oid} header is not terminated"
+                )));
+            }
+            if byte[0] == 0 {
+                break;
+            }
+            header.push(byte[0]);
+            if header.len() > 64 {
+                return Err(GitError::InvalidObject(format!(
+                    "loose object {oid} header is too long"
+                )));
+            }
+        }
+        let header = std::str::from_utf8(&header)
+            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+        let (kind, size) = header
+            .split_once(' ')
+            .ok_or_else(|| GitError::InvalidObject("missing object size".into()))?;
+        let object_type = kind.parse::<ObjectType>()?;
+        let size = size
+            .parse::<u64>()
+            .map_err(|_| GitError::InvalidObject("invalid object size".into()))?;
+        Ok(Some((object_type, size)))
+    }
 }
 
 impl ObjectReader for LooseObjectStore {
@@ -1791,6 +1870,63 @@ mod tests {
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         assert!(db.contains(&oid).unwrap());
         assert_eq!(db.read_object(&oid).unwrap(), object);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_object_header_matches_full_read_for_loose_and_packed_and_delta() {
+        let root = temp_root("sley-read-object-header");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        // Loose object: the header read inflates only the framing, not the body.
+        let loose = EncodedObject::new(ObjectType::Blob, b"loose header object\n".to_vec());
+        let loose_oid = db.write_object(loose.clone()).unwrap();
+
+        // Packed objects, including an ofs-delta whose *result* size lives in the
+        // delta stream (not the pack entry header) and whose type is inherited from
+        // its base at the end of the chain.
+        let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 4096]);
+        let mut child_body = vec![b'a'; 4096];
+        child_body.extend_from_slice(b" plus a deltified tail\n");
+        let child = EncodedObject::new(ObjectType::Blob, child_body);
+        let commitish = EncodedObject::new(ObjectType::Commit, b"header-only type probe\n".to_vec());
+        let base_oid = base.object_id(format).unwrap();
+        let child_oid = child.object_id(format).unwrap();
+        let commit_oid = commitish.object_id(format).unwrap();
+        let pack = PackFile::write_with_delta_strategy(
+            &[base.clone(), child.clone(), commitish.clone()],
+            format,
+            sley_pack::DeltaStrategy::OfsDelta,
+        )
+        .unwrap();
+        db.install_pack(&pack).unwrap();
+
+        // The header read agrees with a full decode for every object and storage
+        // class, without ever materializing the body.
+        for (oid, want_type, want_len) in [
+            (&loose_oid, ObjectType::Blob, loose.body.len()),
+            (&base_oid, ObjectType::Blob, base.body.len()),
+            (&child_oid, ObjectType::Blob, child.body.len()),
+            (&commit_oid, ObjectType::Commit, commitish.body.len()),
+        ] {
+            assert_eq!(
+                db.read_object_header(oid).unwrap(),
+                Some((want_type, want_len as u64)),
+                "header for {oid}"
+            );
+            let full = db.read_object(oid).unwrap();
+            assert_eq!(
+                db.read_object_header(oid).unwrap(),
+                Some((full.object_type, full.body.len() as u64))
+            );
+        }
+
+        let missing =
+            ObjectId::from_hex(format, "0000000000000000000000000000000000000001").unwrap();
+        assert_eq!(db.read_object_header(&missing).unwrap(), None);
         fs::remove_dir_all(root).unwrap();
     }
 

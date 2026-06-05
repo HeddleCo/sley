@@ -12947,45 +12947,62 @@ fn print_cat_file_batch_record(
         stdout.write_all(&[record.terminator])?;
         return Ok(());
     };
+    if record.check_only {
+        // Metadata-only: report type + size via the header fast path, which never
+        // decodes the object body (git's --batch-check behavior).
+        let Ok(Some((object_type, size))) = record.db.read_object_header(&oid) else {
+            write!(stdout, "{} missing", record.object_name)?;
+            stdout.write_all(&[record.terminator])?;
+            return Ok(());
+        };
+        return print_cat_file_batch_header(stdout, &record, &oid, object_type, size);
+    }
     let Ok(object) = record.db.read_object(&oid) else {
         write!(stdout, "{} missing", record.object_name)?;
         stdout.write_all(&[record.terminator])?;
         return Ok(());
     };
+    print_cat_file_batch_header(
+        stdout,
+        &record,
+        &oid,
+        object.object_type,
+        object.body.len() as u64,
+    )?;
+    stdout.write_all(&object.body)?;
+    stdout.write_all(&[record.terminator])?;
+    Ok(())
+}
+
+/// Write the `<oid> <type> <size>` (or custom-format) header line for one cat-file
+/// batch record, shared by the metadata-only (`--batch-check`) and full-content
+/// (`--batch`) paths so both emit byte-identical headers.
+fn print_cat_file_batch_header(
+    stdout: &mut io::Stdout,
+    record: &CatFileBatchRecord<'_>,
+    oid: &ObjectId,
+    object_type: ObjectType,
+    size: u64,
+) -> Result<()> {
     if let Some(batch_format) = record.batch_format {
         let storage = if cat_file_batch_format_needs_storage(batch_format) {
-            Some(cat_file_object_storage(
-                record.git_dir,
-                record.format,
-                &oid,
-            )?)
+            Some(cat_file_object_storage(record.git_dir, record.format, oid)?)
         } else {
             None
         };
         print_cat_file_batch_format(
             stdout,
             batch_format,
-            &oid,
-            object.object_type,
-            object.body.len(),
+            oid,
+            object_type,
+            size as usize,
             storage.as_ref(),
             record.rest,
         )?;
-        stdout.write_all(&[record.terminator])?;
     } else {
-        write!(
-            stdout,
-            "{} {} {}",
-            oid,
-            object.object_type.as_str(),
-            object.body.len()
-        )?;
-        stdout.write_all(&[record.terminator])?;
+        write!(stdout, "{} {} {}", oid, object_type.as_str(), size)?;
     }
-    if !record.check_only {
-        stdout.write_all(&object.body)?;
-        stdout.write_all(&[record.terminator])?;
-    }
+    stdout.write_all(&[record.terminator])?;
     Ok(())
 }
 
