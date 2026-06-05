@@ -103,10 +103,11 @@ _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
   ahead/behind revwalk; config include/includeIf.
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
   ObjectId types.
-- **Remaining gaps:** bulk object-read throughput (#49), TLS-backend forwarding
-  (the TLS half of #40), comment-preserving config round-trip, and the deferred
-  ref-name / path newtypes. (Network, config/identity, and signature typing are
-  all done.)
+- **Remaining gaps:** parallelism for large repos (#50), TLS-backend forwarding
+  (TLS half of #40), comment-preserving config round-trip, deferred ref-name /
+  path newtypes, and pack mmap. (#49 bulk-read landed — `cat-file --batch` 5.5x
+  -> 2.3x slower than git; the library read path heddle uses benefits in full.
+  Network, config/identity, and signature typing are all done.)
 
 ---
 
