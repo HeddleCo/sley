@@ -12,5 +12,11 @@ sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 
+[features]
+# Use flate2's zlib-ng C backend for (de)compression instead of the default
+# pure-Rust miniz_oxide. Faster on large objects but needs a C toolchain, so it
+# is opt-in for downstream consumers that want the perf.
+zlib-ng = ["flate2/zlib-ng"]
+
 [lints]
 workspace = true

@@ -16,5 +16,10 @@ sley-refs = { path = "../sley-refs" }
 sley-rev = { path = "../sley-rev" }
 sley-worktree = { path = "../sley-worktree" }
 
+[features]
+# Opt into the zlib-ng C backend for object (de)compression (forwarded to
+# sley-odb / sley-pack). Default builds stay pure-Rust (miniz_oxide).
+zlib-ng = ["sley-odb/zlib-ng"]
+
 [lints]
 workspace = true

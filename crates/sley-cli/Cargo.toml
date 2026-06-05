@@ -34,5 +34,10 @@ sley-testkit = { path = "../sley-testkit" }
 sley-transport = { path = "../sley-transport", features = ["http-client"] }
 sley-worktree = { path = "../sley-worktree" }
 
+[features]
+# Build the sley binary with the zlib-ng C backend (forwarded to sley-odb /
+# sley-pack). Default builds stay pure-Rust (miniz_oxide).
+zlib-ng = ["sley-odb/zlib-ng", "sley-pack/zlib-ng"]
+
 [lints]
 workspace = true

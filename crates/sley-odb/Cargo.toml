@@ -12,5 +12,9 @@ sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 sley-pack = { path = "../sley-pack" }
 
+[features]
+# Forward the zlib-ng C backend to flate2 and sley-pack (see sley-pack).
+zlib-ng = ["flate2/zlib-ng", "sley-pack/zlib-ng"]
+
 [lints]
 workspace = true
