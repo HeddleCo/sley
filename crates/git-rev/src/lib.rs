@@ -524,15 +524,19 @@ fn apply_revision_suffix<R: ObjectReader>(
                     "invalid zero parent in {raw_rev}"
                 )));
             }
-            commit_parents_with_graph(git_dir, reader, format, base)?
+            let mut graph = CommitGraphContext::load(git_dir, format);
+            graph
+                .commit_parents(reader, base)?
                 .get(parent - 1)
                 .cloned()
                 .ok_or_else(|| GitError::NotFound(format!("parent {parent} of {base}")))
         }
         RevisionSuffix::FirstParent(count) => {
+            let mut graph = CommitGraphContext::load(git_dir, format);
             let mut current = base.clone();
             for _ in 0..count {
-                current = commit_parents_with_graph(git_dir, reader, format, &current)?
+                current = graph
+                    .commit_parents(reader, &current)?
                     .first()
                     .cloned()
                     .ok_or_else(|| GitError::NotFound(format!("first parent of {current}")))?;
@@ -546,43 +550,207 @@ fn apply_revision_suffix<R: ObjectReader>(
     }
 }
 
-fn commit_parents_with_graph<R: ObjectReader>(
-    git_dir: &Path,
-    reader: &R,
-    format: git_core::ObjectFormat,
-    oid: &ObjectId,
-) -> Result<Vec<ObjectId>> {
-    if let Some(parents) = commit_graph_parents_for_oid(git_dir, format, oid)? {
-        return Ok(parents);
-    }
-    commit_parents(reader, format, oid)
+// ---------------------------------------------------------------------------
+// Commit-graph acceleration
+// ---------------------------------------------------------------------------
+//
+// History walks (ancestry for `A..B`/`A...B`, `merge_bases`, `is_ancestor`, the
+// `^`/`~` navigation suffixes, and `^{/text}` first-parent search) read a
+// commit's parents, commit date, and generation number from the commit-graph
+// when one is present, avoiding a read+inflate of every commit object from the
+// odb. The graph is loaded once per walk (lazily, on first lookup) and lookups
+// are keyed by oid. Any commit absent from the graph -- or the absence of a
+// graph entirely -- falls back to reading the commit object, so results are
+// always identical to the object-only walk.
+//
+// Generation numbers (topological "height", where a commit's generation is one
+// greater than the maximum of its parents') let merge-base and ancestor queries
+// prune branches that cannot contribute: an ancestor's generation is strictly
+// smaller than its descendant's, so a candidate whose generation is already
+// below a target can never reach that target and its parents need not be
+// visited. A graph written without generation numbers stores generation 0 for
+// every commit (GENERATION_NUMBER_ZERO); pruning is disabled in that case to
+// stay correct.
+
+/// Generation number used by git when a commit-graph has no usable generation
+/// data; treated as "unknown" so it never drives pruning.
+const GENERATION_NUMBER_ZERO: u32 = 0;
+
+/// Commit metadata resolved from the commit-graph: parents (already mapped from
+/// graph indices to object ids), generation number, and committer date.
+#[derive(Debug, Clone)]
+struct GraphCommit {
+    parents: Vec<ObjectId>,
+    generation: u32,
+    commit_time: u64,
 }
 
-fn commit_graph_parents_for_oid(
+/// A walk's view of the commit-graph.
+///
+/// Construction is cheap and infallible (`load` only records the git dir and
+/// object format); the graph file is read and parsed on the first lookup and
+/// cached for the remainder of the walk. Lookups return resolved [`GraphCommit`]
+/// metadata keyed by oid, or `None` when the commit is not represented (so the
+/// caller falls back to the odb). If the graph file is missing, empty, or fails
+/// to parse, the context degrades to "no graph" and every lookup misses, which
+/// keeps walk results identical to the pure object-reading path.
+struct CommitGraphContext<'a> {
+    git_dir: &'a Path,
+    format: git_core::ObjectFormat,
+    /// `None` until the first lookup forces a load; afterwards `Some(map)` where
+    /// the map is empty iff no usable graph exists.
+    commits: Option<HashMap<ObjectId, GraphCommit>>,
+}
+
+impl<'a> CommitGraphContext<'a> {
+    fn load(git_dir: &'a Path, format: git_core::ObjectFormat) -> Self {
+        Self {
+            git_dir,
+            format,
+            commits: None,
+        }
+    }
+
+    /// Resolve `oid`'s graph metadata, loading and parsing the graph on first
+    /// use. Returns `None` when the commit is not in the graph.
+    fn lookup(&mut self, oid: &ObjectId) -> Option<&GraphCommit> {
+        if self.commits.is_none() {
+            self.commits = Some(load_commit_graph_map(self.git_dir, self.format));
+        }
+        self.commits.as_ref().and_then(|map| map.get(oid))
+    }
+
+    /// Parents of `oid` from the graph, or `None` when it is not present.
+    fn parents(&mut self, oid: &ObjectId) -> Option<Vec<ObjectId>> {
+        self.lookup(oid).map(|commit| commit.parents.clone())
+    }
+
+    /// Generation number of `oid`, or `None` when it is not present in the graph
+    /// or the graph carries no generation numbers (generation 0). A `None`
+    /// result disables generation-based pruning for that commit.
+    fn generation(&mut self, oid: &ObjectId) -> Option<u32> {
+        match self.lookup(oid) {
+            Some(commit) if commit.generation != GENERATION_NUMBER_ZERO => Some(commit.generation),
+            _ => None,
+        }
+    }
+
+    /// Committer date (seconds since the epoch) recorded for `oid` in the graph,
+    /// or `None` when the commit is not present. Used to order candidates
+    /// without re-parsing the commit object's committer line.
+    fn commit_time(&mut self, oid: &ObjectId) -> Option<i64> {
+        self.lookup(oid)
+            .map(|commit| i64::try_from(commit.commit_time).unwrap_or(i64::MAX))
+    }
+
+    /// Parents of `oid`: from the graph when present, otherwise read+parsed from
+    /// the commit object via `reader`.
+    fn commit_parents<R: ObjectReader>(
+        &mut self,
+        reader: &R,
+        oid: &ObjectId,
+    ) -> Result<Vec<ObjectId>> {
+        if let Some(parents) = self.parents(oid) {
+            return Ok(parents);
+        }
+        commit_parents(reader, self.format, oid)
+    }
+}
+
+/// Read and parse the commit-graph for `git_dir`, returning an oid-keyed map of
+/// commit metadata with parent indices resolved to object ids.
+///
+/// A missing graph, an unparseable graph, or a graph with internally
+/// inconsistent parent indices all yield an empty map; callers then fall back to
+/// reading commit objects, so a damaged or unsupported graph can never change a
+/// walk's result, only its speed. Both the monolithic
+/// `objects/info/commit-graph` file and a split-graph chain under
+/// `objects/info/commit-graphs/` are honored; chain layers are merged into a
+/// single map, and any layer that cannot be parsed standalone (e.g. one whose
+/// parent edges cross into a base layer, which this reader does not resolve)
+/// causes the chain to be ignored in favor of the object-reading path.
+fn load_commit_graph_map(
     git_dir: &Path,
     format: git_core::ObjectFormat,
-    oid: &ObjectId,
-) -> Result<Option<Vec<ObjectId>>> {
-    let path = git_dir.join("objects").join("info").join("commit-graph");
-    if !path.exists() {
-        return Ok(None);
+) -> HashMap<ObjectId, GraphCommit> {
+    let info = git_dir.join("objects").join("info");
+    let single = info.join("commit-graph");
+    if single.exists() {
+        // A read/parse failure degrades to "no graph" (empty map) so callers
+        // fall back to object reads; correctness never depends on the graph.
+        return fs::read(&single)
+            .map_err(|err| GitError::Io(err.to_string()))
+            .and_then(|bytes| CommitGraph::parse(&bytes, format))
+            .and_then(|graph| graph_to_map(&graph))
+            .unwrap_or_default();
     }
-    let graph = CommitGraph::parse(&fs::read(path)?, format)?;
-    let Some(entry) = graph.find(oid) else {
-        return Ok(None);
+
+    let chain = info.join("commit-graphs").join("commit-graph-chain");
+    load_commit_graph_chain(&info, &chain, format).unwrap_or_default()
+}
+
+/// Load every layer named in a split-graph chain file and merge them.
+///
+/// The chain file lists one layer hash per line, base layers first. Each layer
+/// lives at `commit-graphs/graph-<hash>.graph`. Layers are merged tip-last so a
+/// commit rewritten in a newer layer wins; any layer that fails to parse
+/// standalone aborts the whole chain (returning an error that the caller turns
+/// into "no graph").
+fn load_commit_graph_chain(
+    info: &Path,
+    chain: &Path,
+    format: git_core::ObjectFormat,
+) -> Result<HashMap<ObjectId, GraphCommit>> {
+    let contents = match fs::read_to_string(chain) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashMap::new());
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
     };
-    let mut parents = Vec::with_capacity(entry.parents.len());
-    for parent in &entry.parents {
-        let parent = usize::try_from(*parent)
-            .map_err(|_| GitError::InvalidFormat("commit-graph parent index overflow".into()))?;
-        let Some(parent_entry) = graph.commits.get(parent) else {
-            return Err(GitError::InvalidFormat(
-                "commit-graph parent points past commit table".into(),
-            ));
-        };
-        parents.push(parent_entry.oid.clone());
+    let mut merged: HashMap<ObjectId, GraphCommit> = HashMap::new();
+    for line in contents.lines() {
+        let hash = line.trim();
+        if hash.is_empty() {
+            continue;
+        }
+        let layer = info
+            .join("commit-graphs")
+            .join(format!("graph-{hash}.graph"));
+        let bytes = fs::read(&layer).map_err(|err| GitError::Io(err.to_string()))?;
+        let graph = CommitGraph::parse(&bytes, format)?;
+        for (oid, commit) in graph_to_map(&graph)? {
+            merged.insert(oid, commit);
+        }
     }
-    Ok(Some(parents))
+    Ok(merged)
+}
+
+/// Turn a parsed [`CommitGraph`] into an oid-keyed metadata map, resolving each
+/// entry's parent indices into the parents' object ids.
+fn graph_to_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphCommit>> {
+    let mut map = HashMap::with_capacity(graph.commits.len());
+    for entry in &graph.commits {
+        let mut parents = Vec::with_capacity(entry.parents.len());
+        for parent in &entry.parents {
+            let parent = usize::try_from(*parent).map_err(|_| {
+                GitError::InvalidFormat("commit-graph parent index overflow".into())
+            })?;
+            let parent_entry = graph.commits.get(parent).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph parent points past commit table".into())
+            })?;
+            parents.push(parent_entry.oid.clone());
+        }
+        map.insert(
+            entry.oid.clone(),
+            GraphCommit {
+                parents,
+                generation: entry.generation,
+                commit_time: entry.commit_time,
+            },
+        );
+    }
+    Ok(map)
 }
 
 fn commit_parents<R: ObjectReader>(
@@ -906,7 +1074,10 @@ fn repository_index_path(git_dir: &Path) -> PathBuf {
 ///
 /// "Newest" is approximated by committer timestamp, falling back to the order
 /// commits are discovered when timestamps are unavailable, which matches git's
-/// observable behavior for the common case.
+/// observable behavior for the common case. The committer date is taken from the
+/// commit-graph when available (it equals the value on the object's committer
+/// line, so the chosen commit is unchanged) and parsed from the commit body
+/// otherwise.
 fn search_commit_message_all<R: ObjectReader>(
     git_dir: &Path,
     format: git_core::ObjectFormat,
@@ -914,12 +1085,16 @@ fn search_commit_message_all<R: ObjectReader>(
     text: &str,
 ) -> Result<ObjectId> {
     let starts = all_ref_commit_starts(git_dir, format, reader)?;
+    let mut graph = CommitGraphContext::load(git_dir, format);
     let mut best: Option<(i64, ObjectId)> = None;
     for record in walk_commits(reader, format, starts)? {
         if !commit_message_contains(&record.commit, text) {
             continue;
         }
-        let when = commit_committer_time(&record.commit).unwrap_or(i64::MIN);
+        let when = graph
+            .commit_time(&record.oid)
+            .or_else(|| commit_committer_time(&record.commit))
+            .unwrap_or(i64::MIN);
         if best
             .as_ref()
             .is_none_or(|(best_when, _)| when >= *best_when)
@@ -941,6 +1116,10 @@ fn search_commit_message_first_parent<R: ObjectReader>(
     text: &str,
 ) -> Result<ObjectId> {
     let start = peel_to_commit(reader, format, base)?;
+    // Commit *messages* are not stored in the commit-graph, so each candidate's
+    // body is still read; the graph is only consulted to follow the first-parent
+    // edge, avoiding a second parse of the same object for the linkage.
+    let mut graph = CommitGraphContext::load(git_dir, format);
     let mut current = Some(start);
     let mut seen = HashSet::new();
     while let Some(oid) = current {
@@ -958,9 +1137,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         if commit_message_contains(&commit, text) {
             return Ok(oid);
         }
-        current = commit_parents_with_graph(git_dir, reader, format, &oid)?
-            .into_iter()
-            .next();
+        current = graph.commit_parents(reader, &oid)?.into_iter().next();
     }
     Err(GitError::NotFound(format!(
         "no commit matching '^{{/{text}}}' in first-parent history"
@@ -1128,13 +1305,27 @@ fn ancestor_set<R: ObjectReader>(
     format: git_core::ObjectFormat,
     start: &ObjectId,
 ) -> Result<HashSet<ObjectId>> {
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    ancestor_set_with_graph(&mut graph, reader, start)
+}
+
+/// Reachability set of `start` (inclusive) over all parent edges, using a
+/// pre-loaded graph context for parent lookups. A full reachability query
+/// admits no generation-based pruning -- every reachable commit is part of the
+/// answer -- so this is a plain BFS that simply reads parents from the graph
+/// when available.
+fn ancestor_set_with_graph<R: ObjectReader>(
+    graph: &mut CommitGraphContext<'_>,
+    reader: &R,
+    start: &ObjectId,
+) -> Result<HashSet<ObjectId>> {
     let mut seen = HashSet::new();
     let mut pending = VecDeque::from([start.clone()]);
     while let Some(oid) = pending.pop_front() {
         if !seen.insert(oid.clone()) {
             continue;
         }
-        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+        for parent in graph.commit_parents(reader, &oid)? {
             pending.push_back(parent);
         }
     }
@@ -1153,13 +1344,36 @@ pub fn is_ancestor<R: ObjectReader>(
     if ancestor == descendant {
         return Ok(true);
     }
+    let mut graph = CommitGraphContext::load(git_dir, format);
+
+    // Generation-based shortcut: a commit's generation is strictly greater than
+    // any of its ancestors', so if `ancestor` sits at or above `descendant` in
+    // the generation order it cannot be a (proper) ancestor of it. This only
+    // fires when both generations are known; otherwise we fall through to the
+    // walk. (`min_generation` doubles as the pruning floor below.)
+    let min_generation = graph.generation(ancestor);
+    if let (Some(anc_gen), Some(desc_gen)) = (min_generation, graph.generation(descendant))
+        && anc_gen >= desc_gen
+    {
+        return Ok(false);
+    }
+
     let mut seen = HashSet::new();
     let mut pending = VecDeque::from([descendant.clone()]);
     while let Some(oid) = pending.pop_front() {
         if !seen.insert(oid.clone()) {
             continue;
         }
-        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+        // Prune: if `oid`'s generation is below `ancestor`'s, then `oid` and all
+        // of its own ancestors have a generation strictly smaller than
+        // `ancestor`'s, so none of them can be `ancestor`. Stop descending here.
+        // Only applies when both generations are known.
+        if let (Some(floor), Some(here)) = (min_generation, graph.generation(&oid))
+            && here < floor
+        {
+            continue;
+        }
+        for parent in graph.commit_parents(reader, &oid)? {
             if &parent == ancestor {
                 return Ok(true);
             }
@@ -1179,8 +1393,15 @@ pub fn merge_bases<R: ObjectReader>(
     left: &ObjectId,
     right: &ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    let left_depths = ancestor_depths(git_dir, reader, format, left)?;
-    let right_depths = ancestor_depths(git_dir, reader, format, right)?;
+    // One graph context is shared by both ancestry walks so the commit-graph is
+    // read and parsed at most once for the whole merge-base computation; parents
+    // and commit dates come from the graph when present and fall back to object
+    // reads otherwise. The depth-based lowest-common-ancestor reduction below is
+    // left unchanged so the selected bases are bit-for-bit identical to the
+    // pure object-reading walk.
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    let left_depths = ancestor_depths_with_graph(&mut graph, reader, left)?;
+    let right_depths = ancestor_depths_with_graph(&mut graph, reader, right)?;
     let candidates: Vec<ObjectId> = left_depths
         .keys()
         .filter(|oid| right_depths.contains_key(*oid))
@@ -1211,11 +1432,15 @@ fn depth_lt(depths: &HashMap<ObjectId, usize>, a: &ObjectId, b: &ObjectId) -> bo
     }
 }
 
-/// BFS the ancestry of `start`, recording the shortest distance to each commit.
-fn ancestor_depths<R: ObjectReader>(
-    git_dir: &Path,
+/// BFS the ancestry of `start`, recording the shortest distance to each commit,
+/// using a pre-loaded graph context for parent lookups so several walks can
+/// share one parsed commit-graph. The traversal is an unpruned BFS by design:
+/// the recorded depths feed the merge-base lowest-common-ancestor reduction,
+/// which depends on every reachable commit's shortest distance, so dropping
+/// nodes would change the result.
+fn ancestor_depths_with_graph<R: ObjectReader>(
+    graph: &mut CommitGraphContext<'_>,
     reader: &R,
-    format: git_core::ObjectFormat,
     start: &ObjectId,
 ) -> Result<HashMap<ObjectId, usize>> {
     let mut depths = HashMap::new();
@@ -1225,7 +1450,7 @@ fn ancestor_depths<R: ObjectReader>(
             continue;
         }
         depths.insert(oid.clone(), depth);
-        for parent in commit_parents_with_graph(git_dir, reader, format, &oid)? {
+        for parent in graph.commit_parents(reader, &oid)? {
             pending.push_back((parent, depth + 1));
         }
     }
@@ -2259,6 +2484,413 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// An object reader that refuses every read, used to prove a query was
+    /// answered entirely from the commit-graph (parent/ancestry lookups never
+    /// touched the odb).
+    struct PanicReader;
+    impl ObjectReader for PanicReader {
+        fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+            Err(GitError::NotFound(format!(
+                "object reader must not be used for {oid}; graph should cover it"
+            )))
+        }
+    }
+
+    /// Compute topological generation numbers for `parents` (a child -> parents
+    /// map). A root commit has generation 1; every other commit is one greater
+    /// than the maximum generation among its parents -- exactly git's definition.
+    fn generation_numbers(
+        parents: &HashMap<ObjectId, Vec<ObjectId>>,
+    ) -> HashMap<ObjectId, u32> {
+        let mut generations: HashMap<ObjectId, u32> = HashMap::new();
+        // Repeatedly relax until a fixpoint; histories here are tiny so a simple
+        // loop is plenty and avoids an explicit topological sort.
+        loop {
+            let mut changed = false;
+            for (oid, oid_parents) in parents {
+                let candidate = oid_parents
+                    .iter()
+                    .map(|parent| generations.get(parent).copied().unwrap_or(0))
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                if generations.get(oid).copied() != Some(candidate) {
+                    // Only advance upward so the fixpoint is monotone.
+                    let current = generations.get(oid).copied().unwrap_or(0);
+                    if candidate > current {
+                        generations.insert(oid.clone(), candidate);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        generations
+    }
+
+    /// Write a real commit-graph (via `git_formats::CommitGraph::write`) covering
+    /// `commits` into `<git_dir>/objects/info/commit-graph`, with correct
+    /// topological generation numbers and committer dates pulled from each
+    /// commit object.
+    fn write_commit_graph_file(
+        git_dir: &Path,
+        format: ObjectFormat,
+        reader: &impl ObjectReader,
+        commits: &[ObjectId],
+    ) {
+        let mut parents_map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+        for oid in commits {
+            parents_map.insert(oid.clone(), commit_parents(reader, format, oid).unwrap());
+        }
+        let generations = generation_numbers(&parents_map);
+        let entries: Vec<git_formats::CommitGraphWriteEntry> = commits
+            .iter()
+            .map(|oid| {
+                let object = reader.read_object(oid).unwrap();
+                let commit = Commit::parse(format, &object.body).unwrap();
+                let commit_time = commit_committer_time(&commit).unwrap_or(0).max(0) as u64;
+                git_formats::CommitGraphWriteEntry {
+                    oid: oid.clone(),
+                    tree: commit.tree.clone(),
+                    parents: commit.parents.clone(),
+                    generation: generations.get(oid).copied().unwrap_or(1),
+                    commit_time,
+                }
+            })
+            .collect();
+        let bytes = CommitGraph::write(format, &entries).unwrap();
+        let info = git_dir.join("objects").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("commit-graph"), bytes).unwrap();
+    }
+
+    fn remove_commit_graph(git_dir: &Path) {
+        let path = git_dir.join("objects").join("info").join("commit-graph");
+        if path.exists() {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    /// Build a fixed multi-shape history and return the database plus the named
+    /// commits. Shape (arrows point child -> parent):
+    ///
+    /// ```text
+    ///   root
+    ///   /  \
+    ///  a    b
+    ///  |    |\
+    ///  c    d e
+    ///   \  / \|
+    ///    m1   f      m1 = merge(c, d)   (two-parent merge)
+    ///     \   |
+    ///      \  g
+    ///       \ |
+    ///        oct = merge(m1, g, f)      (octopus, three parents)
+    /// ```
+    ///
+    /// plus a criss-cross pair `x1 = merge(a, b)` and `x2 = merge(b, a)` whose
+    /// two merge bases are `a`'s and `b`'s shared ancestor structure (root).
+    fn build_history(git_dir: &Path, format: ObjectFormat) -> (FileObjectDatabase, Vec<ObjectId>) {
+        let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .unwrap();
+        let mut t = 1000i64;
+        let mut commit = |db: &mut FileObjectDatabase, parents: Vec<ObjectId>, msg: &[u8]| {
+            t += 1;
+            write_dated_commit(db, tree.clone(), parents, msg, t)
+        };
+        let root = commit(&mut db, vec![], b"root\n");
+        let a = commit(&mut db, vec![root.clone()], b"a\n");
+        let b = commit(&mut db, vec![root.clone()], b"b\n");
+        let c = commit(&mut db, vec![a.clone()], b"c\n");
+        let d = commit(&mut db, vec![b.clone()], b"d\n");
+        let e = commit(&mut db, vec![b.clone()], b"e\n");
+        let m1 = commit(&mut db, vec![c.clone(), d.clone()], b"m1\n");
+        let f = commit(&mut db, vec![d.clone(), e.clone()], b"f\n");
+        let g = commit(&mut db, vec![f.clone()], b"g\n");
+        let oct = commit(&mut db, vec![m1.clone(), g.clone(), f.clone()], b"oct\n");
+        let x1 = commit(&mut db, vec![a.clone(), b.clone()], b"x1\n");
+        let x2 = commit(&mut db, vec![b.clone(), a.clone()], b"x2\n");
+        let all = vec![root, a, b, c, d, e, m1, f, g, oct, x1, x2];
+        (db, all)
+    }
+
+    #[test]
+    fn graph_backed_walks_match_object_only_walks() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+
+        // Exercise every ordered pair of commits across is_ancestor, merge_bases
+        // (both orders), and both range forms; capture the object-only baseline
+        // (no graph file), then the graph-backed result, and require equality.
+        remove_commit_graph(&git_dir);
+        let baseline = collect_walk_results(&git_dir, format, &db, &all);
+
+        write_commit_graph_file(&git_dir, format, &db, &all);
+        let with_graph = collect_walk_results(&git_dir, format, &db, &all);
+
+        assert_eq!(
+            baseline, with_graph,
+            "graph-backed walk diverged from object-only walk"
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    /// Run is_ancestor, merge_bases (both orders), and the `A..B`/`A...B` ranges
+    /// over all pairs, returning a deterministic snapshot for comparison.
+    fn collect_walk_results(
+        git_dir: &Path,
+        format: ObjectFormat,
+        reader: &impl ObjectReader,
+        all: &[ObjectId],
+    ) -> Vec<(String, String, bool, Vec<String>, Vec<String>, Vec<String>)> {
+        let mut out = Vec::new();
+        for left in all {
+            for right in all {
+                let anc = is_ancestor(git_dir, format, reader, left, right).unwrap();
+                let mut bases: Vec<String> = merge_bases(git_dir, format, reader, left, right)
+                    .unwrap()
+                    .iter()
+                    .map(|oid| oid.to_hex())
+                    .collect();
+                bases.sort();
+                let asym = RevisionRange::Asymmetric {
+                    start: left.to_hex(),
+                    end: right.to_hex(),
+                };
+                let mut asym_set: Vec<String> =
+                    resolve_revision_range(git_dir, format, reader, &asym)
+                        .unwrap()
+                        .iter()
+                        .map(|oid| oid.to_hex())
+                        .collect();
+                asym_set.sort();
+                let sym = RevisionRange::Symmetric {
+                    left: left.to_hex(),
+                    right: right.to_hex(),
+                };
+                let mut sym_set: Vec<String> = resolve_revision_range(git_dir, format, reader, &sym)
+                    .unwrap()
+                    .iter()
+                    .map(|oid| oid.to_hex())
+                    .collect();
+                sym_set.sort();
+                out.push((left.to_hex(), right.to_hex(), anc, bases, asym_set, sym_set));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn graph_backed_merge_base_handles_octopus_and_criss_cross() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        // Names in build order: [root,a,b,c,d,e,m1,f,g,oct,x1,x2].
+        let (a, b) = (all[1].clone(), all[2].clone());
+        let (m1, oct) = (all[6].clone(), all[9].clone());
+        let (x1, x2) = (all[10].clone(), all[11].clone());
+
+        write_commit_graph_file(&git_dir, format, &db, &all);
+
+        // Criss-cross: x1 = merge(a,b), x2 = merge(b,a) -> two merge bases {a,b}.
+        let mut xbases = merge_bases(&git_dir, format, &db, &x1, &x2).unwrap();
+        xbases.sort_by_key(|oid| oid.to_hex());
+        let mut expected = vec![a.clone(), b.clone()];
+        expected.sort_by_key(|oid| oid.to_hex());
+        assert_eq!(xbases, expected, "criss-cross must yield two merge bases");
+
+        // Octopus child reaches m1 along its first parent edge.
+        assert!(is_ancestor(&git_dir, format, &db, &m1, &oct).unwrap());
+        // m1 is a merge base of itself and the octopus.
+        assert_eq!(
+            merge_bases(&git_dir, format, &db, &m1, &oct).unwrap(),
+            vec![m1.clone()]
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn graph_backed_queries_avoid_object_reads() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        write_commit_graph_file(&git_dir, format, &db, &all);
+        let (root, a, oct, x1, x2) =
+            (all[0].clone(), all[1].clone(), all[9].clone(), all[10].clone(), all[11].clone());
+
+        // With a complete graph, ancestry/merge-base queries must be answerable
+        // without ever reading a commit object: PanicReader errors on any read.
+        assert!(is_ancestor(&git_dir, format, &PanicReader, &root, &oct).unwrap());
+        assert!(!is_ancestor(&git_dir, format, &PanicReader, &oct, &root).unwrap());
+        assert!(is_ancestor(&git_dir, format, &PanicReader, &a, &oct).unwrap());
+
+        let bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2).unwrap();
+        assert_eq!(bases.len(), 2, "criss-cross bases via graph only");
+
+        // Range resolution peels its two endpoints from the odb (the graph does
+        // not record object types), but the ancestry *walk* between them is
+        // graph-backed. Verify the result matches the object-only walk.
+        let range = RevisionRange::Asymmetric {
+            start: a.to_hex(),
+            end: oct.to_hex(),
+        };
+        let mut included: Vec<String> = resolve_revision_range(&git_dir, format, &db, &range)
+            .unwrap()
+            .iter()
+            .map(|oid| oid.to_hex())
+            .collect();
+        included.sort();
+        assert!(included.contains(&oct.to_hex()));
+        assert!(
+            !included.contains(&root.to_hex()),
+            "root is an ancestor of A, excluded"
+        );
+
+        // Merge-base and range results via the graph still equal the object-only
+        // walk for the same queries.
+        remove_commit_graph(&git_dir);
+        let object_bases = merge_bases(&git_dir, format, &db, &x1, &x2).unwrap();
+        let mut object_range: Vec<String> = resolve_revision_range(&git_dir, format, &db, &range)
+            .unwrap()
+            .iter()
+            .map(|oid| oid.to_hex())
+            .collect();
+        object_range.sort();
+        write_commit_graph_file(&git_dir, format, &db, &all);
+        let graph_bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2).unwrap();
+        assert_eq!(object_bases, graph_bases);
+        assert_eq!(object_range, included, "range walk diverged with graph");
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn graph_backed_parent_suffix_matches_object_walk() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let oct = all[9].clone();
+        let (m1, g, f) = (all[6].clone(), all[8].clone(), all[7].clone());
+
+        // Object-only baseline for the octopus merge's parent navigation.
+        remove_commit_graph(&git_dir);
+        let base_p1 =
+            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^1")).unwrap();
+        let base_p2 =
+            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^2")).unwrap();
+        let base_p3 =
+            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^3")).unwrap();
+        let base_first =
+            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}~1")).unwrap();
+        assert_eq!((&base_p1, &base_p2, &base_p3), (&m1, &g, &f));
+        assert_eq!(base_first, m1);
+
+        // With the graph present, the same suffixes resolve without object reads.
+        write_commit_graph_file(&git_dir, format, &db, &all);
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, format, &PanicReader, &format!("{oct}^2"))
+                .unwrap(),
+            base_p2
+        );
+        assert_eq!(
+            resolve_revision_with_reader(&git_dir, format, &PanicReader, &format!("{oct}~1"))
+                .unwrap(),
+            base_first
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn missing_or_unparseable_graph_falls_back_to_objects() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let (a, oct) = (all[1].clone(), all[9].clone());
+        let object_answer = is_ancestor(&git_dir, format, &db, &a, &oct).unwrap();
+
+        // A corrupt graph file must be ignored (not error), falling back to the
+        // odb so the answer is unchanged.
+        let info = git_dir.join("objects").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("commit-graph"), b"not a real commit graph").unwrap();
+        assert_eq!(
+            is_ancestor(&git_dir, format, &db, &a, &oct).unwrap(),
+            object_answer
+        );
+        // A graph that omits some commits must also fall back per-missing-commit.
+        write_commit_graph_file(&git_dir, format, &db, &all[..3]);
+        assert_eq!(
+            is_ancestor(&git_dir, format, &db, &a, &oct).unwrap(),
+            object_answer
+        );
+        assert_eq!(
+            merge_bases(&git_dir, format, &db, &all[10], &all[11]).unwrap(),
+            {
+                remove_commit_graph(&git_dir);
+                merge_bases(&git_dir, format, &db, &all[10], &all[11]).unwrap()
+            }
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn commit_graph_chain_is_consulted() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        // A short linear history whose single chain layer is self-contained
+        // (no cross-layer parent edges), so the chain reader can resolve it.
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .unwrap();
+        let root = write_dated_commit(&mut db, tree.clone(), vec![], b"root\n", 1000);
+        let mid = write_dated_commit(&mut db, tree.clone(), vec![root.clone()], b"mid\n", 1001);
+        let tip = write_dated_commit(&mut db, tree.clone(), vec![mid.clone()], b"tip\n", 1002);
+        let commits = vec![root.clone(), mid.clone(), tip.clone()];
+
+        let parents_map: HashMap<ObjectId, Vec<ObjectId>> = commits
+            .iter()
+            .map(|oid| (oid.clone(), commit_parents(&db, format, oid).unwrap()))
+            .collect();
+        let generations = generation_numbers(&parents_map);
+        let entries: Vec<git_formats::CommitGraphWriteEntry> = commits
+            .iter()
+            .map(|oid| git_formats::CommitGraphWriteEntry {
+                oid: oid.clone(),
+                tree: tree.clone(),
+                parents: parents_map[oid].clone(),
+                generation: generations[oid],
+                commit_time: 0,
+            })
+            .collect();
+        let bytes = CommitGraph::write(format, &entries).unwrap();
+
+        // Lay the bytes out as a one-layer chain.
+        let graphs = git_dir.join("objects").join("info").join("commit-graphs");
+        fs::create_dir_all(&graphs).unwrap();
+        let hash = git_core::digest_bytes(format, &bytes).unwrap().to_hex();
+        fs::write(graphs.join(format!("graph-{hash}.graph")), &bytes).unwrap();
+        fs::write(graphs.join("commit-graph-chain"), format!("{hash}\n")).unwrap();
+
+        // No monolithic commit-graph present, only the chain: queries must be
+        // answerable from the chain without reading objects.
+        assert!(!git_dir
+            .join("objects")
+            .join("info")
+            .join("commit-graph")
+            .exists());
+        assert!(is_ancestor(&git_dir, format, &PanicReader, &root, &tip).unwrap());
+        assert_eq!(
+            merge_bases(&git_dir, format, &PanicReader, &mid, &tip).unwrap(),
+            vec![mid.clone()]
+        );
+        fs::remove_dir_all(git_dir).unwrap();
     }
 
     fn test_commit_graph(format: ObjectFormat, parent: &ObjectId, child: &ObjectId) -> Vec<u8> {
