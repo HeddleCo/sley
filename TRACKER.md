@@ -71,14 +71,15 @@ _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
 
 ## 📋 Backlog (prioritized)
 
-1. **Config + facade polish** — global/system config read (`~/.gitconfig`,
-   `/etc/gitconfig`) for `user.name`/`user.email` fallback; structured
-   `[remote]` section edit (`remote add/remove/set-url`); `workdir()` /
-   shallow-detect / `remote_names()` on the facade.
-2. **Signatures & dates typing (#46)** — lossless `Signature` parse-*view* for
-   commit/tag author/committer/tagger (raw bytes stay the source of truth for
-   re-serialization); wire `GitTime`, **preserving git's `-0000` (tz-unknown)
-   vs `+0000`** distinction.
+1. ~~Config + facade polish~~ **DONE** — global/system config read + identity
+   fallback (env → -c → repo → global → system), callable `[remote]`
+   add/remove/set-url + `remote_names`, and `workdir()`/`is_shallow()`/
+   `remote_names()` on the facade. (Comment-preserving config round-trip still
+   pending — writes reformat via `to_canonical_bytes`.) Commits `42d5db9`,`7135dde`.
+2. ~~Signatures & dates typing (#46)~~ **DONE** — lossless `Signature` parse-view
+   (raw bytes preserved, byte-exact round-trip; malformed → None) +
+   `GitTime.negative_utc` for git's `-0000`. Commit `ff843b9`. Remaining
+   (deferred): `FullName` ref-name newtype + path BString unification.
 3. **Dep-feature forwarding (#40)** — zlib-ng backend DONE; remaining: forward
    ureq's TLS backend (rustls / native-tls / platform-verifier) as selectable.
 4. **ObjectId `Copy` + `clone_on_copy` cleanup** — deferred from export-core
@@ -102,9 +103,10 @@ _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
   ahead/behind revwalk; config include/includeIf.
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
   ObjectId types.
-- **Remaining gaps:** global/system config + identity, structured remote edit,
-  signatures/dates typing (#46), bulk object-read throughput (#49), TLS-backend
-  forwarding (the TLS half of #40).
+- **Remaining gaps:** bulk object-read throughput (#49), TLS-backend forwarding
+  (the TLS half of #40), comment-preserving config round-trip, and the deferred
+  ref-name / path newtypes. (Network, config/identity, and signature typing are
+  all done.)
 
 ---
 
