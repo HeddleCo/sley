@@ -109,9 +109,47 @@ On top of #51, four more measured wins (all byte-identical, full suite green):
 Cumulative on the 2,561-obj / 302 MB repo: `cat-file --batch-check` **1.9s → 43ms
 (~44×, now ~3× of git)**; `--batch` content **1.9s → 198ms (now ~1.8× of git)**.
 
+### Large-repo parity profiling (vs git, on flutter — 93,729 commits)
+
+Profiled `sley` against system git on a *real large repo* (small-repo benchmarks
+had hidden these). Single-object/startup paths beat git; history- and worktree-
+walking commands are far behind, and the gaps are **algorithmic, not parallelism**.
+
+| command | sley vs git | cause |
+|---|---|---|
+| `rev-parse` | 4× faster ✓ | startup |
+| `cat-file -p` (1 obj) | 2.4× faster ✓ | — |
+| `cat-file --batch` | 1.8× slower | miniz inflate |
+| `cat-file --batch-check` | 3× slower | per-object CLI rev-parse |
+| `ls-files` | 2× slower | index format |
+| `rev-list --count` | 7× slower | walk reads every commit object |
+| `merge-base` | 14× slower | same walk |
+| `log --format=%H` | 27× slower | `walk_commits` decompresses every commit |
+| `status` | 135× slower | dup attr walk + full HEAD-tree read + re-hash |
+| `diff <rev> <rev>` | **>750× (hung)** | **mis-parsed as pathspecs → whole-worktree rescan** |
+
+**Fixes (filed #56–#59):**
+- **#56 diff `<rev> [<rev>]` / ranges — DONE** (`bc671e9`): positional revisions
+  were dropped (treated as paths), so `diff A B` silently did an index-vs-worktree
+  diff (wrong output + full-worktree rehash). Now routes to tree-vs-tree /
+  tree-vs-worktree / tree-vs-index. flutter `diff HEAD~1 HEAD`: >15s → 174ms,
+  byte-identical to git. New regression test.
+- **#57 status (135×)** — multi-part: status does *two* full worktree walks (one
+  for entries, one to build the attribute matcher across 3,871 dirs for 4
+  `.gitattributes`, no filters configured) + a full HEAD-tree read (no cache-tree)
+  + per-file hashing where the stat-cache misses. Fold attributes into the single
+  traversal; use the index cache-tree for index-vs-HEAD; confirm the stat-cache
+  shortcut engages on a git-written index.
+- **#58 log/rev-list/merge-base (7–27×)** — `walk_commits` reads+parses every
+  commit object; the commit-graph (`CommitGraphContext`, already parses flutter's
+  graph) is wired only into `^`/`~` nav, not the main walk. Source parents +
+  commit-time from the graph; read objects only when full commit data is needed.
+- **#59 abbrev length** — git auto-grows short-OID width on huge repos; sley
+  hardcodes 7. Cosmetic-but-real; affects diff index lines, `log --abbrev`, etc.
+
 ## 🔄 In progress
 
-_(mmap pack reads (#55) needs an unsafe-policy decision — see backlog.)_
+_(#57 status + #58 commit-graph walk — the remaining two parity refactors.)_
 
 ---
 
