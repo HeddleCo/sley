@@ -10640,13 +10640,8 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
-    if config
-        .sections
-        .iter()
-        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
-    {
-        return Err(GitError::Command(format!("remote {name} already exists")));
-    }
+    // Build the section body from the parsed options, then let the shared editor
+    // append it (and reject a duplicate remote).
     let mut entries = vec![ConfigEntry {
         key: "url".into(),
         value: Some(url.to_string()),
@@ -10668,7 +10663,7 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
             if branches.is_empty() {
                 entries.push(ConfigEntry {
                     key: "fetch".into(),
-                    value: Some(format!("+refs/heads/*:refs/remotes/{name}/*")),
+                    value: Some(sley_config::remotes::default_fetch_refspec(name)),
                 });
             } else {
                 for branch in &branches {
@@ -10692,11 +10687,15 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
             value: Some("true".into()),
         });
     }
-    config.sections.push(ConfigSection {
-        name: "remote".into(),
-        subsection: Some(name.to_string()),
-        entries,
-    });
+    match sley_config::remotes::add_remote(&mut config, name, entries) {
+        Ok(()) => {}
+        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
+            return Err(GitError::Command(format!("remote {name} already exists")));
+        }
+        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+            return Err(GitError::NotFound(format!("remote {name}")));
+        }
+    }
     write_repo_config(&git_dir, &config)?;
     if let Some(master) = master {
         let format = repository_object_format(&git_dir)?;
@@ -10787,14 +10786,15 @@ fn cmd_remote_remove(args: &[String]) -> Result<()> {
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
-    let before = config.sections.len();
-    config.sections.retain(|section| {
-        !(section.name == "remote" && section.subsection.as_deref() == Some(name))
-    });
-    if config.sections.len() == before {
-        return Err(GitError::NotFound(format!("remote {name}")));
+    match sley_config::remotes::remove_remote(&mut config, name) {
+        Ok(()) => {}
+        Err(sley_config::remotes::RemoteEditError::NotFound) => {
+            return Err(GitError::NotFound(format!("remote {name}")));
+        }
+        Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
+            return Err(GitError::Command(format!("remote {name} already exists")));
+        }
     }
-    remove_remote_dependent_config(&mut config, name);
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
     remove_remote_tracking_refs(&git_dir, format, name)
@@ -10909,32 +10909,6 @@ fn move_remote_fetch_entries_to_end(section: &mut ConfigSection) {
         }
     }
     section.entries.extend(fetch_entries);
-}
-
-fn remove_remote_dependent_config(config: &mut GitConfig, remote: &str) {
-    for section in &mut config.sections {
-        if section.name == "branch" {
-            let remote_matches = section.entries.iter().any(|entry| {
-                entry.key.eq_ignore_ascii_case("remote") && entry.value.as_deref() == Some(remote)
-            });
-            section.entries.retain(|entry| {
-                let key = entry.key.to_ascii_lowercase();
-                if remote_matches && (key == "remote" || key == "merge") {
-                    return false;
-                }
-                !(key == "pushremote" && entry.value.as_deref() == Some(remote))
-            });
-        } else if section.name == "remote" && section.subsection.is_none() {
-            section.entries.retain(|entry| {
-                !(entry.key.eq_ignore_ascii_case("pushDefault")
-                    && entry.value.as_deref() == Some(remote))
-            });
-        }
-    }
-    config.sections.retain(|section| {
-        !((section.name == "branch" || (section.name == "remote" && section.subsection.is_none()))
-            && section.entries.is_empty())
-    });
 }
 
 fn remove_remote_tracking_refs(git_dir: &Path, format: ObjectFormat, remote: &str) -> Result<()> {
@@ -11324,109 +11298,49 @@ fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     validate_remote_name(name)?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let mut config = read_repo_config(&git_dir)?;
-    let key = if push { "pushurl" } else { "url" };
-    let Some(section) =
-        config.sections.iter_mut().rev().find(|section| {
-            section.name == "remote" && section.subsection.as_deref() == Some(name)
-        })
-    else {
-        return Err(GitError::NotFound(format!("remote {name}")));
-    };
-    if add {
-        section.entries.push(ConfigEntry {
-            key: key.into(),
-            value: Some(url.to_string()),
-        });
-        return write_repo_config(&git_dir, &config);
-    }
-    if delete {
-        let matcher = SimpleConfigRegex::parse(url);
-        let matches = section
-            .entries
-            .iter()
-            .filter(|entry| entry.key.eq_ignore_ascii_case(key))
-            .filter(|entry| {
-                entry
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| matcher.is_match(value))
-            })
-            .count();
-        if matches == 0 {
-            return remote_set_url_delete_no_match(name, key);
-        }
-        if !push {
-            let remaining = section
-                .entries
-                .iter()
-                .filter(|entry| entry.key.eq_ignore_ascii_case(key))
-                .filter(|entry| {
-                    entry
-                        .value
-                        .as_deref()
-                        .is_none_or(|value| !matcher.is_match(value))
-                })
-                .count();
-            if remaining == 0 {
-                return remote_set_url_delete_all_fetch_urls();
-            }
-        }
-        section.entries.retain(|entry| {
-            !(entry.key.eq_ignore_ascii_case(key)
-                && entry
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| matcher.is_match(value)))
-        });
-        return write_repo_config(&git_dir, &config);
-    }
-    if let Some(old_url) = old_url {
-        let matcher = SimpleConfigRegex::parse(old_url);
-        let matches = section
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| entry.key.eq_ignore_ascii_case(key))
-            .filter(|(_, entry)| {
-                entry
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| matcher.is_match(value))
-            })
-            .map(|(idx, _)| idx)
-            .collect::<Vec<_>>();
-        match matches.as_slice() {
-            [idx] => {
-                section.entries[*idx].value = Some(url.to_string());
-            }
-            [] => return remote_set_url_no_match(old_url),
-            _ => return remote_set_url_multiple_values(name, key, url),
-        }
-        return write_repo_config(&git_dir, &config);
-    }
-    let matches = section
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.key.eq_ignore_ascii_case(key))
-        .map(|(idx, _)| idx)
-        .collect::<Vec<_>>();
-    if matches.len() > 1 {
-        return remote_set_url_multiple_values(name, key, url);
-    }
-    if let Some(idx) = matches.first().copied() {
-        let entry = &mut section.entries[idx];
-        entry.value = Some(url.to_string());
+    let kind = if push {
+        sley_config::remotes::SetUrlKind::Push
     } else {
-        section.entries.insert(
-            0,
-            ConfigEntry {
-                key: key.into(),
-                value: Some(url.to_string()),
-            },
-        );
+        sley_config::remotes::SetUrlKind::Fetch
+    };
+    let key = kind.key();
+    // `--delete`/`<oldurl>` select URLs with git's value-pattern matcher; build
+    // it here (the regex lives in the CLI) and hand the predicate to the editor.
+    let delete_matcher = delete.then(|| SimpleConfigRegex::parse(url));
+    let old_url_matcher = old_url.map(SimpleConfigRegex::parse);
+    let op = if add {
+        sley_config::remotes::SetUrlOp::Add { url }
+    } else if let Some(matcher) = &delete_matcher {
+        sley_config::remotes::SetUrlOp::Delete {
+            matches: &|value| matcher.is_match(value),
+        }
+    } else if let Some(matcher) = &old_url_matcher {
+        sley_config::remotes::SetUrlOp::Replace {
+            url,
+            matches: &|value| matcher.is_match(value),
+        }
+    } else {
+        sley_config::remotes::SetUrlOp::Set { url }
+    };
+    match sley_config::remotes::set_url(&mut config, name, kind, op) {
+        Ok(()) => write_repo_config(&git_dir, &config),
+        Err(sley_config::remotes::SetUrlError::RemoteNotFound) => {
+            Err(GitError::NotFound(format!("remote {name}")))
+        }
+        Err(sley_config::remotes::SetUrlError::NoMatch) => {
+            // Only reachable for the `<oldurl>` (replace) form.
+            remote_set_url_no_match(old_url.unwrap_or(url))
+        }
+        Err(sley_config::remotes::SetUrlError::DeleteNoMatch) => {
+            remote_set_url_delete_no_match(name, key)
+        }
+        Err(sley_config::remotes::SetUrlError::DeleteAllFetchUrls) => {
+            remote_set_url_delete_all_fetch_urls()
+        }
+        Err(sley_config::remotes::SetUrlError::MultipleValues) => {
+            remote_set_url_multiple_values(name, key, url)
+        }
     }
-    write_repo_config(&git_dir, &config)
 }
 
 fn remote_set_url_no_match(url: &str) -> Result<()> {
@@ -11788,21 +11702,11 @@ fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
 }
 
 fn remote_names(config: &GitConfig) -> Vec<String> {
-    config
-        .sections
-        .iter()
-        .filter(|section| section.name == "remote")
-        .filter_map(|section| section.subsection.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+    sley_config::remotes::remote_names(config)
 }
 
 fn remote_exists(config: &GitConfig, name: &str) -> bool {
-    config
-        .sections
-        .iter()
-        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
+    sley_config::remotes::remote_exists(config, name)
 }
 
 fn remote_config_values(config: &GitConfig, name: &str, key: &str) -> Vec<String> {
@@ -28689,7 +28593,7 @@ fn is_bare_repository(git_dir: &Path) -> Result<bool> {
 }
 
 fn is_shallow_repository(git_dir: &Path) -> bool {
-    git_dir.join("shallow").exists()
+    sley_worktree::is_shallow_repository(git_dir)
 }
 
 fn cmd_show_ref(args: &[String]) -> Result<()> {
@@ -32409,6 +32313,8 @@ fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
 }
 
 fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
+    // CLI/process-level overrides take precedence over anything recorded in the
+    // repository (these are not part of the repository-intrinsic resolution).
     if let Some(work_tree) = explicit_work_tree() {
         let work_tree =
             resolve_cli_path(&env::current_dir()?, work_tree.to_string_lossy().as_ref());
@@ -32417,36 +32323,14 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     if explicit_git_dir().is_some() {
         return env::current_dir().map_err(|err| GitError::Io(err.to_string()));
     }
-    if let Ok(config) = GitConfig::read(git_dir.join("config"))
-        && let Some(worktree) = config.get("core", None, "worktree")
-    {
-        let worktree = PathBuf::from(worktree);
-        let worktree = if worktree.is_absolute() {
-            worktree
-        } else {
-            git_dir.join(worktree)
-        };
-        return fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()));
-    }
-    if git_dir.join("commondir").is_file() {
-        let gitdir_file = git_dir.join("gitdir");
-        if gitdir_file.is_file() {
-            let value = fs::read_to_string(&gitdir_file)?;
-            let worktree_git_file = resolve_admin_path(git_dir, value.trim());
-            if let Some(worktree) = worktree_git_file.parent() {
-                return fs::canonicalize(worktree).map_err(|err| GitError::Io(err.to_string()));
-            }
-        }
-    }
-    if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
-        return Err(GitError::Unsupported(
+    // The rest (core.worktree, linked worktrees, parent-of-.git) is shared with
+    // the library; a bare repository (None) is unsupported here.
+    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
+        Some(root) => Ok(root),
+        None => Err(GitError::Unsupported(
             "update-index currently requires a non-bare worktree".into(),
-        ));
+        )),
     }
-    git_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()))
 }
 
 fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {

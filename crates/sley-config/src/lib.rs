@@ -12,6 +12,10 @@ use sley_core::{GitError, ObjectFormat, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Structured editing of `[remote "<name>"]` configuration (the document
+/// half of `git remote add`/`remove`/`set-url`).
+pub mod remotes;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GitConfig {
     pub sections: Vec<ConfigSection>,

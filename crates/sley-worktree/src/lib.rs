@@ -181,6 +181,79 @@ pub fn read_repository_index(
     Ok(Some(Index::parse(&fs::read(index_path)?, format)?))
 }
 
+/// Resolve the working-tree root for a repository identified by its git
+/// directory, returning `Ok(None)` for a bare repository.
+///
+/// This is the repository-intrinsic worktree resolution (it does *not* consult
+/// `GIT_WORK_TREE`/`GIT_DIR` or CLI overrides — those are the caller's job):
+///
+/// 1. a `core.worktree` setting in `<git_dir>/config` (absolute, or relative to
+///    the git directory), canonicalised;
+/// 2. otherwise, for a linked worktree (a git directory that has both a
+///    `commondir` and a `gitdir` administrative file), the directory containing
+///    the worktree's `.git` link, canonicalised;
+/// 3. otherwise, when the git directory is a `.git` directory, its parent (the
+///    ordinary non-bare layout) — returned verbatim, not canonicalised;
+/// 4. otherwise the repository is bare and `Ok(None)` is returned.
+///
+/// `Ok(None)` means specifically "bare" (case 4). A [`GitError::Io`] is
+/// returned if a path that should exist cannot be canonicalised, and a
+/// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
+/// layout).
+pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
+    if let Ok(config) = GitConfig::read(git_dir.join("config"))
+        && let Some(worktree) = config.get("core", None, "worktree")
+    {
+        let worktree = PathBuf::from(worktree);
+        let worktree = if worktree.is_absolute() {
+            worktree
+        } else {
+            git_dir.join(worktree)
+        };
+        return fs::canonicalize(worktree)
+            .map(Some)
+            .map_err(|err| GitError::Io(err.to_string()));
+    }
+    if git_dir.join("commondir").is_file() {
+        let gitdir_file = git_dir.join("gitdir");
+        if gitdir_file.is_file() {
+            let value = fs::read_to_string(&gitdir_file)?;
+            let worktree_git_file = resolve_worktree_admin_path(git_dir, value.trim());
+            if let Some(worktree) = worktree_git_file.parent() {
+                return fs::canonicalize(worktree)
+                    .map(Some)
+                    .map_err(|err| GitError::Io(err.to_string()));
+            }
+        }
+    }
+    if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
+        return Ok(None);
+    }
+    git_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .map(Some)
+        .ok_or_else(|| GitError::InvalidPath("git dir has no parent worktree".into()))
+}
+
+/// Resolve a path read from a git-directory administrative file (e.g. the
+/// `gitdir` link of a linked worktree): absolute paths are kept as-is, relative
+/// paths are joined onto the administrative directory.
+fn resolve_worktree_admin_path(admin_dir: &Path, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else {
+        admin_dir.join(path)
+    }
+}
+
+/// Whether the repository at `git_dir` is shallow — i.e. it has a `shallow`
+/// file recording grafted commit boundaries (`git clone --depth`).
+pub fn is_shallow_repository(git_dir: &Path) -> bool {
+    git_dir.join("shallow").exists()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RemoveOptions {
     pub recursive: bool,

@@ -206,6 +206,38 @@ impl Repository {
         &self.common_dir
     }
 
+    /// The working-tree root, or `None` for a bare repository.
+    ///
+    /// Resolution follows git's repository-intrinsic rules: a `core.worktree`
+    /// override, then a linked worktree's recorded location, then the parent of
+    /// the `.git` directory for an ordinary checkout. It does *not* consult the
+    /// process-level `GIT_WORK_TREE`/`GIT_DIR` overrides (those belong to a CLI
+    /// front-end, not a library handle). A working tree that is configured but
+    /// cannot be resolved on disk (e.g. a `core.worktree` pointing at a missing
+    /// path) is reported as `None` rather than erroring.
+    pub fn workdir(&self) -> Option<PathBuf> {
+        sley_worktree::worktree_root_for_git_dir(&self.git_dir)
+            .ok()
+            .flatten()
+    }
+
+    /// Whether this repository is shallow — created or fetched with a depth
+    /// limit, so a `shallow` file records its grafted history boundaries.
+    pub fn is_shallow(&self) -> bool {
+        sley_worktree::is_shallow_repository(&self.git_dir)
+    }
+
+    /// The names of the configured remotes (`[remote "<name>"]` sections),
+    /// sorted alphabetically with duplicates collapsed — the order `git remote`
+    /// lists them in.
+    ///
+    /// Remotes are read from the *effective* configuration (see
+    /// [`Repository::config_snapshot`]), so a remote defined in an included file
+    /// is included.
+    pub fn remote_names(&self) -> Result<Vec<String>> {
+        Ok(sley_config::remotes::remote_names(&self.config_snapshot()?))
+    }
+
     /// The repository's object format (`sha1` or `sha256`), read from
     /// `extensions.objectformat`.
     pub fn object_format(&self) -> ObjectFormat {
@@ -830,6 +862,74 @@ mod tests {
             repo.config_string_subsection("remote", Some("origin"), "url")
                 .expect("url"),
             Some("https://example.invalid/x.git".to_string())
+        );
+    }
+
+    #[test]
+    fn workdir_is_parent_for_non_bare_repo() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        // The non-bare layout's working tree is the parent of `.git`, returned
+        // verbatim (so it matches the path init was handed).
+        assert_eq!(repo.workdir(), Some(temp.path().to_path_buf()));
+    }
+
+    #[test]
+    fn workdir_is_none_for_bare_repo() {
+        let temp = TempDir::new();
+        let repo = Repository::init_bare(temp.path()).expect("init bare");
+        assert_eq!(repo.workdir(), None);
+    }
+
+    #[test]
+    fn workdir_honours_core_worktree_override() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        // Point core.worktree at a real sibling directory.
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).expect("create worktree dir");
+        let config_path = repo.git_dir().join("config");
+        let mut contents = fs::read(&config_path).expect("read config");
+        contents.extend_from_slice(
+            format!("[core]\n\tworktree = {}\n", elsewhere.display()).as_bytes(),
+        );
+        fs::write(&config_path, contents).expect("write config");
+
+        // The override wins and is canonicalised.
+        assert_eq!(
+            repo.workdir(),
+            Some(fs::canonicalize(&elsewhere).expect("canon worktree"))
+        );
+    }
+
+    #[test]
+    fn is_shallow_tracks_shallow_file() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        assert!(!repo.is_shallow());
+        fs::write(repo.git_dir().join("shallow"), b"").expect("write shallow");
+        assert!(repo.is_shallow());
+    }
+
+    #[test]
+    fn remote_names_lists_configured_remotes_sorted() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        assert_eq!(repo.remote_names().expect("names"), Vec::<String>::new());
+
+        let config_path = repo.common_dir().join("config");
+        let mut contents = fs::read(&config_path).expect("read config");
+        // Define remotes out of alphabetical order and with a duplicate section.
+        contents.extend_from_slice(
+            b"[remote \"upstream\"]\n\turl = https://example.invalid/up.git\n\
+              [remote \"origin\"]\n\turl = https://example.invalid/o.git\n\
+              [remote \"origin\"]\n\tpushurl = https://example.invalid/o-push.git\n",
+        );
+        fs::write(&config_path, contents).expect("write config");
+
+        assert_eq!(
+            repo.remote_names().expect("names"),
+            vec!["origin".to_string(), "upstream".to_string()]
         );
     }
 
