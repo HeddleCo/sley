@@ -5,7 +5,7 @@ use git_core::{GitError, ObjectFormat, ObjectId, Result};
 use git_formats::{Bundle, BundleReference};
 use git_object::{parse_framed_object, Commit, EncodedObject, ObjectType, Tag, Tree};
 use git_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -688,11 +688,52 @@ pub struct PartialClonePolicy {
     pub allow_missing_promised_objects: bool,
 }
 
-/// Per-pack decoded-object caches keyed by pack-file path, shared across cloned
-/// database handles (`Arc`). Parsing a pack decodes every object in it, so this
-/// cache avoids re-parsing the whole pack on every packed read (which made any
-/// object walk O(reads * pack size)).
-type PackObjectCache = Arc<Mutex<HashMap<PathBuf, Arc<HashMap<ObjectId, EncodedObject>>>>>;
+/// Raw pack-file bytes keyed by pack path, shared across cloned handles. Loaded
+/// once so individual objects can be decoded at their offsets (see
+/// [`git_pack::read_object_at`]) without re-reading the whole file per read.
+type PackBytesCache = Arc<Mutex<HashMap<PathBuf, Arc<Vec<u8>>>>>;
+
+/// Bounded cache of recently decoded objects, shared across cloned handles, so
+/// hot delta bases and repeated reads during a walk aren't re-decoded. Memory is
+/// bounded regardless of repository size (unlike caching every decoded object).
+type DecodedObjectCache = Arc<Mutex<BoundedObjectCache>>;
+
+const DECODED_OBJECT_CACHE_CAPACITY: usize = 1024;
+
+/// A small fixed-capacity object cache with FIFO eviction (a good approximation of
+/// LRU for the delta-base / repeated-read access pattern) that bounds memory use.
+#[derive(Debug)]
+struct BoundedObjectCache {
+    capacity: usize,
+    map: HashMap<ObjectId, EncodedObject>,
+    order: VecDeque<ObjectId>,
+}
+
+impl BoundedObjectCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            map: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&self, oid: &ObjectId) -> Option<EncodedObject> {
+        self.map.get(oid).cloned()
+    }
+
+    fn put(&mut self, oid: ObjectId, object: EncodedObject) {
+        if !self.map.contains_key(&oid) {
+            self.order.push_back(oid.clone());
+            while self.order.len() > self.capacity {
+                if let Some(evicted) = self.order.pop_front() {
+                    self.map.remove(&evicted);
+                }
+            }
+        }
+        self.map.insert(oid, object);
+    }
+}
 
 /// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
 /// the index parse so locating a packed object doesn't re-parse every `.idx` on
@@ -705,8 +746,9 @@ pub struct FileObjectDatabase {
     objects_dir: PathBuf,
     alternates: Vec<PathBuf>,
     format: ObjectFormat,
-    pack_objects: PackObjectCache,
+    pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
+    decoded: DecodedObjectCache,
 }
 
 pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
@@ -824,8 +866,11 @@ impl FileObjectDatabase {
             alternates: alternate_object_dirs(&objects_dir),
             objects_dir,
             format,
-            pack_objects: Arc::new(Mutex::new(HashMap::new())),
+            pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            decoded: Arc::new(Mutex::new(BoundedObjectCache::new(
+                DECODED_OBJECT_CACHE_CAPACITY,
+            ))),
         }
     }
 
@@ -836,8 +881,11 @@ impl FileObjectDatabase {
             alternates: Vec::new(),
             objects_dir,
             format,
-            pack_objects: Arc::new(Mutex::new(HashMap::new())),
+            pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            decoded: Arc::new(Mutex::new(BoundedObjectCache::new(
+                DECODED_OBJECT_CACHE_CAPACITY,
+            ))),
         }
     }
 
@@ -978,43 +1026,49 @@ impl FileObjectDatabase {
     }
 
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<EncodedObject>> {
+        // Bounded decoded-object cache first (delta-base reuse + repeated reads).
+        if let Ok(cache) = self.decoded.lock() {
+            if let Some(object) = cache.get(oid) {
+                return Ok(Some(object));
+            }
+        }
         let Some(pack_paths) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        let objects = self.cached_pack_objects(&pack_paths.pack)?;
-        match objects.get(oid) {
-            Some(object) => Ok(Some(object.clone())),
-            None => Err(GitError::InvalidFormat(format!(
-                "pack index listed object {oid}, but pack did not contain it"
-            ))),
+        let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
+        // Decode only this object at its offset (plus its delta-base chain). A
+        // ref-delta base resolves through the full store (loose / other packs) and
+        // reuses this same cache. No cache lock is held across the decode, so the
+        // recursive resolver re-entry is safe.
+        let object = git_pack::read_object_at(&bytes, pack_paths.offset, self.format, |base| {
+            self.read_object(base).ok()
+        })?;
+        let actual = object.object_id(self.format)?;
+        if actual != *oid {
+            return Err(GitError::InvalidObject(format!(
+                "pack object id mismatch: index says {oid}, decoded {actual}"
+            )));
         }
+        if let Ok(mut cache) = self.decoded.lock() {
+            cache.put(oid.clone(), object.clone());
+        }
+        Ok(Some(object))
     }
 
-    /// Decoded objects of the pack at `pack_path`, parsed at most once per
-    /// database handle (cached and shared across clones). Parsing a pack
-    /// materializes every object, so reusing this turns a walk that touches many
-    /// packed objects from O(reads * pack size) into a single parse plus O(1)
-    /// hash lookups. On a poisoned cache lock it falls back to parsing without
-    /// caching, preserving correctness.
-    fn cached_pack_objects(
-        &self,
-        pack_path: &Path,
-    ) -> Result<Arc<HashMap<ObjectId, EncodedObject>>> {
-        if let Ok(cache) = self.pack_objects.lock() {
-            if let Some(objects) = cache.get(pack_path) {
-                return Ok(Arc::clone(objects));
+    /// Raw bytes of the pack at `pack_path`, read at most once per database handle
+    /// (cached, shared across clones). On a poisoned lock it falls back to reading
+    /// without caching, preserving correctness.
+    fn cached_pack_bytes(&self, pack_path: &Path) -> Result<Arc<Vec<u8>>> {
+        if let Ok(cache) = self.pack_bytes.lock() {
+            if let Some(bytes) = cache.get(pack_path) {
+                return Ok(Arc::clone(bytes));
             }
         }
-        let pack = PackFile::parse(&fs::read(pack_path)?, self.format)?;
-        let mut objects = HashMap::with_capacity(pack.entries.len());
-        for entry in pack.entries {
-            objects.insert(entry.entry.oid, entry.object);
+        let bytes = Arc::new(fs::read(pack_path)?);
+        if let Ok(mut cache) = self.pack_bytes.lock() {
+            cache.insert(pack_path.to_path_buf(), Arc::clone(&bytes));
         }
-        let objects = Arc::new(objects);
-        if let Ok(mut cache) = self.pack_objects.lock() {
-            cache.insert(pack_path.to_path_buf(), Arc::clone(&objects));
-        }
-        Ok(objects)
+        Ok(bytes)
     }
 
     /// Parsed index for the `.idx` at `index_path`, parsed at most once per
@@ -1055,7 +1109,8 @@ impl FileObjectDatabase {
                 continue;
             }
             let index = self.cached_pack_index(&path)?;
-            if index.find(oid).is_some() {
+            if let Some(entry) = index.find(oid) {
+                let offset = entry.offset;
                 let Some(stem) = path.file_stem() else {
                     continue;
                 };
@@ -1067,7 +1122,7 @@ impl FileObjectDatabase {
                         path.display()
                     )));
                 }
-                return Ok(Some(PackPaths { pack }));
+                return Ok(Some(PackPaths { pack, offset }));
             }
         }
         Ok(None)
@@ -1103,7 +1158,10 @@ impl FileObjectDatabase {
                 midx_path.display()
             )));
         }
-        Ok(Some(PackPaths { pack }))
+        Ok(Some(PackPaths {
+            pack,
+            offset: entry.offset,
+        }))
     }
 }
 
@@ -1193,6 +1251,7 @@ impl ObjectWriter for FileObjectDatabase {
 #[derive(Debug, Clone)]
 struct PackPaths {
     pack: PathBuf,
+    offset: u64,
 }
 
 fn write_pack_component(path: &Path, bytes: &[u8]) -> Result<()> {

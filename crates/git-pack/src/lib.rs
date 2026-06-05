@@ -1734,6 +1734,100 @@ struct EntryHeader {
     size: u64,
 }
 
+/// Decode the single object stored at byte `offset` within `pack_bytes`, reading
+/// only that object and its delta-base chain instead of parsing the whole pack.
+///
+/// Ofs-delta bases are followed by offset (recursively, within this pack);
+/// ref-delta bases are obtained from `resolve_ref_base`, which the caller backs
+/// with the surrounding object store (so a base in another pack or loose still
+/// resolves). The pack trailer checksum is the final `format.raw_len()` bytes.
+pub fn read_object_at<F>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    mut resolve_ref_base: F,
+) -> Result<EncodedObject>
+where
+    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+{
+    read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base)
+}
+
+fn read_object_at_inner<F>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    resolve_ref_base: &mut F,
+) -> Result<EncodedObject>
+where
+    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+{
+    let trailer_offset = pack_bytes
+        .len()
+        .checked_sub(format.raw_len())
+        .ok_or_else(|| GitError::InvalidFormat("pack smaller than its trailer".into()))?;
+    let mut cursor = usize::try_from(offset)
+        .ok()
+        .filter(|&value| value < trailer_offset)
+        .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
+    let header = parse_entry_header(pack_bytes, &mut cursor)?;
+    let base = match header.kind {
+        PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
+            pack_bytes, &mut cursor, offset,
+        )?)),
+        PackObjectKind::RefDelta => {
+            let hash_len = format.raw_len();
+            if cursor + hash_len > trailer_offset {
+                return Err(GitError::InvalidFormat(
+                    "truncated ref-delta base object id".into(),
+                ));
+            }
+            let oid = ObjectId::from_raw(format, &pack_bytes[cursor..cursor + hash_len])?;
+            cursor += hash_len;
+            Some(DeltaBase::Ref(oid))
+        }
+        _ => None,
+    };
+    let mut decoder = ZlibDecoder::new(&pack_bytes[cursor..trailer_offset]);
+    let mut body = Vec::with_capacity(header.size.min(usize::MAX as u64) as usize);
+    decoder.read_to_end(&mut body)?;
+    if body.len() as u64 != header.size {
+        return Err(GitError::InvalidObject(format!(
+            "pack object declared {} bytes, decoded {}",
+            header.size,
+            body.len()
+        )));
+    }
+    match base {
+        None => {
+            let object_type = match header.kind {
+                PackObjectKind::Commit => ObjectType::Commit,
+                PackObjectKind::Tree => ObjectType::Tree,
+                PackObjectKind::Blob => ObjectType::Blob,
+                PackObjectKind::Tag => ObjectType::Tag,
+                PackObjectKind::OfsDelta | PackObjectKind::RefDelta => {
+                    return Err(GitError::InvalidFormat(
+                        "delta pack entry decoded without a base".into(),
+                    ));
+                }
+            };
+            Ok(EncodedObject::new(object_type, body))
+        }
+        Some(DeltaBase::Offset(base_offset)) => {
+            let base = read_object_at_inner(pack_bytes, base_offset, format, resolve_ref_base)?;
+            let resolved = apply_pack_delta(&base.body, &body)?;
+            Ok(EncodedObject::new(base.object_type, resolved))
+        }
+        Some(DeltaBase::Ref(base_oid)) => {
+            let base = resolve_ref_base(&base_oid).ok_or_else(|| {
+                GitError::NotFound(format!("ref-delta base object {base_oid}"))
+            })?;
+            let resolved = apply_pack_delta(&base.body, &body)?;
+            Ok(EncodedObject::new(base.object_type, resolved))
+        }
+    }
+}
+
 fn parse_entry_header(bytes: &[u8], offset: &mut usize) -> Result<EntryHeader> {
     let first = next_byte(bytes, offset)?;
     let mut size = u64::from(first & 0x0f);
@@ -3551,6 +3645,54 @@ mod tests {
         assert_eq!(pack.entries[1].object, changed);
         assert_eq!(index.pack_checksum, pack.checksum);
         assert_eq!(index.find(&oid).unwrap().offset, written.entries[1].offset);
+    }
+
+    #[test]
+    fn read_object_at_matches_full_parse_for_ofs_delta_pack() {
+        let (base, changed) = similar_blob_objects();
+        let written = PackFile::write_with_delta_strategy(
+            &[base.clone(), changed.clone()],
+            ObjectFormat::Sha1,
+            DeltaStrategy::OfsDelta,
+        )
+        .unwrap();
+        // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
+        let mut second = written.entries[1].offset as usize;
+        assert_eq!(
+            parse_entry_header(&written.pack, &mut second).unwrap().kind,
+            PackObjectKind::OfsDelta
+        );
+        // Ground truth from a full parse; single-object decode must match at every offset.
+        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+        for po in &parsed.entries {
+            let got =
+                read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| None).unwrap();
+            assert_eq!(got, po.object, "offset {}", po.entry.offset);
+        }
+    }
+
+    #[test]
+    fn read_object_at_matches_full_parse_for_ref_delta_pack() {
+        let (base, changed) = similar_blob_objects();
+        let written = PackFile::write_with_delta_strategy(
+            &[base.clone(), changed.clone()],
+            ObjectFormat::Sha1,
+            DeltaStrategy::RefDelta,
+        )
+        .unwrap();
+        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+        let by_oid: HashMap<ObjectId, EncodedObject> = parsed
+            .entries
+            .iter()
+            .map(|po| (po.entry.oid.clone(), po.object.clone()))
+            .collect();
+        for po in &parsed.entries {
+            let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
+                by_oid.get(oid).cloned()
+            })
+            .unwrap();
+            assert_eq!(got, po.object);
+        }
     }
 
     #[test]
