@@ -213,17 +213,225 @@ impl RepoPath {
     }
 }
 
+/// A typed *parse-view* of a git identity line (`Name <email> <secs> <tz>`) as
+/// found on a commit's `author`/`committer` or a tag's `tagger` header.
+///
+/// This is a read-only lens over bytes that are stored and re-serialized
+/// verbatim elsewhere (see [`Signature::raw`]). It exists so callers can read
+/// the typed `name`/`email`/`time` of an identity without re-implementing git's
+/// ident-splitting rules, *not* as a storage format: the object model keeps the
+/// original raw bytes as its source of truth, and round-tripping through this
+/// view is byte-exact precisely because the raw line is retained alongside the
+/// parsed fields (see [`Signature::to_ident_bytes`]).
+///
+/// Parse one with [`Signature::from_ident_line`]. The `time`'s timezone
+/// preserves git's distinction between `+0000` (UTC) and `-0000` (a sentinel git
+/// writes to mean "timezone unknown"); see [`GitTime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Signature {
+    /// The identity's name: the bytes before the ` <` that opens the email,
+    /// with one trailing space (the separator) removed. May be empty.
     pub name: ByteString,
+    /// The identity's email: the bytes between the `<` and `>` delimiters. May
+    /// be empty.
     pub email: ByteString,
+    /// The commit/authorship time and its timezone offset.
     pub time: GitTime,
+    /// The exact original ident-line bytes this view was parsed from, retained
+    /// so [`Signature::to_ident_bytes`] can reproduce the input byte-for-byte
+    /// regardless of any non-canonical whitespace or formatting it contained.
+    pub raw: Vec<u8>,
 }
 
+impl Signature {
+    /// Parse a raw git identity line (`Name <email> <unix-secs> <tz>`) into a
+    /// typed view, returning `None` when the bytes do not form a well-formed
+    /// identity.
+    ///
+    /// The splitting mirrors git's own `split_ident_line`: the email is the run
+    /// of bytes between the last `<` and the first following `>`; the name is
+    /// everything before that `<` (one separating space is dropped); after the
+    /// `>` come a space, the decimal Unix timestamp, a space, and the timezone
+    /// token. The name and email may legitimately be empty, but a missing
+    /// `<`/`>` pair, a non-numeric timestamp, or a malformed timezone token all
+    /// yield `None` rather than a lossy guess — this is a *best-effort* parse
+    /// that never panics. The original bytes are retained in
+    /// [`Signature::raw`] so the parsed view re-serializes byte-identically.
+    pub fn from_ident_line(line: &[u8]) -> Option<Self> {
+        // Email is delimited by the last '<' whose matching '>' follows it, the
+        // way git scans an ident from the right. Find the last '>' first, then
+        // the last '<' before it.
+        let mail_end = line.iter().rposition(|byte| *byte == b'>')?;
+        let mail_begin = line[..mail_end].iter().rposition(|byte| *byte == b'<')? + 1;
+        let email = &line[mail_begin..mail_end];
+
+        // The name is everything before the '<', with a single trailing space
+        // (the separator git inserts) trimmed if present.
+        let mut name_end = mail_begin.saturating_sub(1);
+        if name_end > 0 && line[name_end - 1] == b' ' {
+            name_end -= 1;
+        }
+        let name = &line[..name_end];
+
+        // After '>' git expects "<space><secs><space><tz>". Trim the single
+        // separating space, then split the timestamp from the timezone token.
+        let rest = line.get(mail_end + 1..)?;
+        let rest = rest.strip_prefix(b" ")?;
+        let time = GitTime::from_time_fields(rest)?;
+
+        Some(Self {
+            name: ByteString::new(name.to_vec()),
+            email: ByteString::new(email.to_vec()),
+            time,
+            raw: line.to_vec(),
+        })
+    }
+
+    /// Reproduce the original identity-line bytes.
+    ///
+    /// This returns [`Signature::raw`] verbatim, so for any line that
+    /// [`Signature::from_ident_line`] accepted, `from_ident_line(line)?
+    /// .to_ident_bytes() == line` holds byte-for-byte — including the `-0000`
+    /// timezone and any non-canonical spacing the source contained.
+    pub fn to_ident_bytes(&self) -> Vec<u8> {
+        self.raw.clone()
+    }
+
+    /// Re-derive the canonical ident line from the parsed fields alone
+    /// (`name <email> secs tz`), ignoring [`Signature::raw`].
+    ///
+    /// For an identity in git's canonical form this equals
+    /// [`Signature::to_ident_bytes`]; it differs only when the source line
+    /// carried non-canonical whitespace. Callers wanting byte-exact
+    /// reproduction should use [`Signature::to_ident_bytes`]; this is provided
+    /// for constructing a normalized line from typed parts.
+    pub fn to_canonical_ident_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.raw.len());
+        out.extend_from_slice(self.name.as_bytes());
+        out.extend_from_slice(b" <");
+        out.extend_from_slice(self.email.as_bytes());
+        out.extend_from_slice(b"> ");
+        out.extend_from_slice(self.time.to_ident_suffix().as_bytes());
+        out
+    }
+}
+
+impl fmt::Display for Signature {
+    /// Renders the original ident line (lossy only for bytes that are not valid
+    /// UTF-8, which are replaced with `U+FFFD`). Use
+    /// [`Signature::to_ident_bytes`] for the exact bytes.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", String::from_utf8_lossy(&self.raw))
+    }
+}
+
+/// A git timestamp: a Unix time plus the committer's timezone offset.
+///
+/// The offset is stored as signed minutes east of UTC ([`timezone_offset_minutes`])
+/// *and* a separate [`negative_utc`] flag. The flag exists because git
+/// distinguishes the timezone token `-0000` from `+0000`: both are zero minutes
+/// from UTC, but git writes `-0000` as a sentinel meaning "timezone unknown"
+/// (e.g. for dates parsed without zone information), and that distinction is
+/// part of a commit's byte-exact identity. `timezone_offset_minutes` alone
+/// cannot represent it, so `negative_utc` carries the sign of a zero offset.
+///
+/// [`timezone_offset_minutes`]: GitTime::timezone_offset_minutes
+/// [`negative_utc`]: GitTime::negative_utc
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GitTime {
+    /// Seconds since the Unix epoch.
     pub seconds: i64,
+    /// Timezone offset east of UTC, in minutes (e.g. `+0530` -> `330`,
+    /// `-0500` -> `-300`). Zero for both `+0000` and `-0000`; consult
+    /// [`GitTime::negative_utc`] to tell those apart.
     pub timezone_offset_minutes: i16,
+    /// `true` only when the timezone token had a negative sign with a zero
+    /// magnitude (`-0000`), git's "timezone unknown" sentinel. Always `false`
+    /// for any non-zero offset.
+    pub negative_utc: bool,
+}
+
+impl GitTime {
+    /// A `GitTime` with the given seconds and minute offset, treating a zero
+    /// offset as the ordinary `+0000` (not the `-0000` sentinel). Use
+    /// [`GitTime::with_negative_utc`] to construct the `-0000` case.
+    pub const fn new(seconds: i64, timezone_offset_minutes: i16) -> Self {
+        Self {
+            seconds,
+            timezone_offset_minutes,
+            negative_utc: false,
+        }
+    }
+
+    /// A `GitTime` whose timezone is the `-0000` sentinel ("timezone unknown").
+    /// The minute offset is zero; `negative_utc` is `true`.
+    pub const fn with_negative_utc(seconds: i64) -> Self {
+        Self {
+            seconds,
+            timezone_offset_minutes: 0,
+            negative_utc: true,
+        }
+    }
+
+    /// Parse the `<secs> <tz>` tail of an ident line (the bytes after the
+    /// `"> "` separating the email from the time), returning `None` if either
+    /// field is malformed.
+    fn from_time_fields(bytes: &[u8]) -> Option<Self> {
+        let text = std::str::from_utf8(bytes).ok()?;
+        let (seconds_text, tz_text) = text.split_once(' ')?;
+        let seconds = seconds_text.parse::<i64>().ok()?;
+        let (timezone_offset_minutes, negative_utc) = parse_timezone_token(tz_text)?;
+        Some(Self {
+            seconds,
+            timezone_offset_minutes,
+            negative_utc,
+        })
+    }
+
+    /// The canonical `<secs> <±HHMM>` rendering of this time, as git writes it.
+    /// Preserves the `-0000` sentinel.
+    fn to_ident_suffix(self) -> String {
+        format!("{} {}", self.seconds, self.offset_token())
+    }
+
+    /// The canonical 5-character timezone token for this offset (sign plus four
+    /// digits), e.g. `+0000`, `-0500`, `+0530`. Returns `-0000` when
+    /// [`GitTime::negative_utc`] is set.
+    pub fn offset_token(self) -> String {
+        let sign = if self.negative_utc || self.timezone_offset_minutes < 0 {
+            '-'
+        } else {
+            '+'
+        };
+        let magnitude = self.timezone_offset_minutes.unsigned_abs();
+        format!("{sign}{:02}{:02}", magnitude / 60, magnitude % 60)
+    }
+}
+
+/// Parse a git timezone token (`±HHMM`) into `(minutes east of UTC, negative_utc)`.
+///
+/// Git accepts a leading `+`/`-` followed by four digits where the last two are
+/// minutes. A negative sign with a zero magnitude (`-0000`) sets `negative_utc`.
+/// Returns `None` for anything that is not a well-formed token.
+fn parse_timezone_token(token: &str) -> Option<(i16, bool)> {
+    let bytes = token.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    let negative = match bytes[0] {
+        b'+' => false,
+        b'-' => true,
+        _ => return None,
+    };
+    if !bytes[1..].iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let hours = i16::from(bytes[1] - b'0') * 10 + i16::from(bytes[2] - b'0');
+    let minutes = i16::from(bytes[3] - b'0') * 10 + i16::from(bytes[4] - b'0');
+    let total = hours * 60 + minutes;
+    let negative_utc = negative && total == 0;
+    let signed = if negative { -total } else { total };
+    Some((signed, negative_utc))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -516,5 +724,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(oid.to_hex(), "ce013625030ba8dba906f756967f9e9ca394464a");
+    }
+
+    #[test]
+    fn signature_parses_a_normal_ident_and_round_trips() {
+        let line = b"A U Thor <author@example.com> 1700000000 +0000";
+        let sig = Signature::from_ident_line(line).expect("well-formed ident parses");
+        assert_eq!(sig.name.as_bytes(), b"A U Thor");
+        assert_eq!(sig.email.as_bytes(), b"author@example.com");
+        assert_eq!(sig.time.seconds, 1_700_000_000);
+        assert_eq!(sig.time.timezone_offset_minutes, 0);
+        assert!(!sig.time.negative_utc);
+        // Byte-exact round-trip, and the canonical form matches here too.
+        assert_eq!(sig.to_ident_bytes(), line);
+        assert_eq!(sig.to_canonical_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_parses_positive_half_hour_offset() {
+        let line = b"Half Hour <hh@example.com> 1500000000 +0530";
+        let sig = Signature::from_ident_line(line).expect("offset ident parses");
+        assert_eq!(sig.time.timezone_offset_minutes, 330);
+        assert!(!sig.time.negative_utc);
+        assert_eq!(sig.time.offset_token(), "+0530");
+        assert_eq!(sig.to_ident_bytes(), line);
+        assert_eq!(sig.to_canonical_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_parses_negative_offset() {
+        let line = b"Western <w@example.com> 1500000000 -0500";
+        let sig = Signature::from_ident_line(line).expect("negative offset parses");
+        assert_eq!(sig.time.timezone_offset_minutes, -300);
+        assert!(!sig.time.negative_utc);
+        assert_eq!(sig.time.offset_token(), "-0500");
+        assert_eq!(sig.to_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_preserves_negative_zero_timezone_distinct_from_positive_zero() {
+        let negative = b"Unknown Zone <uz@example.com> 1500000000 -0000";
+        let positive = b"Known Zone <kz@example.com> 1500000000 +0000";
+
+        let neg = Signature::from_ident_line(negative).expect("-0000 parses");
+        let pos = Signature::from_ident_line(positive).expect("+0000 parses");
+
+        // Both are zero minutes from UTC...
+        assert_eq!(neg.time.timezone_offset_minutes, 0);
+        assert_eq!(pos.time.timezone_offset_minutes, 0);
+        // ...but the sentinel flag distinguishes them, so the times differ.
+        assert!(neg.time.negative_utc);
+        assert!(!pos.time.negative_utc);
+        assert_ne!(neg.time, pos.time);
+
+        // And the distinction survives re-serialization, byte-for-byte.
+        assert_eq!(neg.time.offset_token(), "-0000");
+        assert_eq!(pos.time.offset_token(), "+0000");
+        assert_eq!(neg.to_ident_bytes(), negative);
+        assert_eq!(pos.to_ident_bytes(), positive);
+        assert_eq!(neg.to_canonical_ident_bytes(), negative);
+        assert_eq!(pos.to_canonical_ident_bytes(), positive);
+        assert_ne!(neg.to_ident_bytes(), pos.to_ident_bytes());
+    }
+
+    #[test]
+    fn signature_handles_empty_name_and_email() {
+        // git permits an empty name and/or empty email; the delimiters still
+        // anchor the parse.
+        let line = b" <> 0 +0000";
+        let sig = Signature::from_ident_line(line).expect("empty name/email parses");
+        assert_eq!(sig.name.as_bytes(), b"");
+        assert_eq!(sig.email.as_bytes(), b"");
+        assert_eq!(sig.time.seconds, 0);
+        assert_eq!(sig.to_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_keeps_angle_brackets_inside_the_name() {
+        // The email is delimited by the *last* '<'/'>' pair, so a name that
+        // itself contains angle brackets parses with the trailing pair as the
+        // email and round-trips exactly.
+        let line = b"Weird <Name> <weird@example.com> 1 +0000";
+        let sig = Signature::from_ident_line(line).expect("bracketed name parses");
+        assert_eq!(sig.name.as_bytes(), b"Weird <Name>");
+        assert_eq!(sig.email.as_bytes(), b"weird@example.com");
+        assert_eq!(sig.to_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_round_trips_non_canonical_whitespace_via_raw() {
+        // An ident with two spaces before the email is not git's canonical form,
+        // but the parse-view must still reproduce it byte-for-byte from `raw`.
+        // (Only the canonical renderer normalizes the spacing.)
+        let line = b"Spaced  <spaced@example.com> 5 +0000";
+        let sig = Signature::from_ident_line(line).expect("non-canonical ident parses");
+        // The name keeps the extra space (only one separator space is trimmed).
+        assert_eq!(sig.name.as_bytes(), b"Spaced ");
+        assert_eq!(sig.to_ident_bytes(), line);
+    }
+
+    #[test]
+    fn signature_rejects_malformed_idents() {
+        // No email delimiters.
+        assert!(Signature::from_ident_line(b"No Email Here 0 +0000").is_none());
+        // Missing the time tail entirely.
+        assert!(Signature::from_ident_line(b"A U Thor <a@example.com>").is_none());
+        // Non-numeric timestamp.
+        assert!(Signature::from_ident_line(b"A U Thor <a@example.com> later +0000").is_none());
+        // Malformed timezone token (wrong width).
+        assert!(Signature::from_ident_line(b"A U Thor <a@example.com> 0 +00").is_none());
+        // Timezone token missing a sign.
+        assert!(Signature::from_ident_line(b"A U Thor <a@example.com> 0 0000").is_none());
+    }
+
+    #[test]
+    fn git_time_constructors_set_the_sentinel() {
+        assert!(!GitTime::new(0, 0).negative_utc);
+        assert_eq!(GitTime::new(0, 330).offset_token(), "+0530");
+        let unknown = GitTime::with_negative_utc(42);
+        assert!(unknown.negative_utc);
+        assert_eq!(unknown.seconds, 42);
+        assert_eq!(unknown.offset_token(), "-0000");
     }
 }

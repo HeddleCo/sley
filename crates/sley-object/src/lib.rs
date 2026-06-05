@@ -7,7 +7,7 @@
 //! [`parse_framed_object`] helper that decodes the `"<type> <len>\0<body>"`
 //! loose-object frame.
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result, Signature};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -408,6 +408,26 @@ impl Commit {
         out.extend_from_slice(&self.message);
         out
     }
+
+    /// Parse the raw [`author`](Commit::author) line into a typed
+    /// [`Signature`] parse-view, or `None` if the stored bytes are not a
+    /// well-formed git identity.
+    ///
+    /// This is a read-only lens: it does not touch the raw `author` bytes, which
+    /// remain the source of truth for [`Commit::write`]. The returned signature
+    /// re-serializes byte-identically to `author` (see
+    /// [`Signature::to_ident_bytes`]).
+    pub fn author_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(&self.author)
+    }
+
+    /// Parse the raw [`committer`](Commit::committer) line into a typed
+    /// [`Signature`] parse-view, or `None` if the stored bytes are not a
+    /// well-formed git identity. Read-only over the raw bytes, exactly like
+    /// [`Commit::author_signature`].
+    pub fn committer_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(&self.committer)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +487,19 @@ impl Tag {
         out.push(b'\n');
         out.extend_from_slice(&self.message);
         out
+    }
+
+    /// Parse the raw [`tagger`](Tag::tagger) line into a typed [`Signature`]
+    /// parse-view.
+    ///
+    /// Returns `None` when the tag has no tagger header *or* when the stored
+    /// bytes are not a well-formed git identity — callers that need to tell
+    /// those apart should inspect [`Tag::tagger`] directly. This is a read-only
+    /// lens over the raw bytes, which stay the source of truth for
+    /// [`Tag::write`]; the returned signature re-serializes byte-identically to
+    /// the stored `tagger` line.
+    pub fn tagger_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(self.tagger.as_deref()?)
     }
 }
 
@@ -599,5 +632,98 @@ mod tests {
             message: b"release\n".to_vec(),
         };
         assert_eq!(Tag::parse(ObjectFormat::Sha1, &tag.write()).unwrap(), tag);
+    }
+
+    #[test]
+    fn commit_signature_accessors_parse_raw_idents_without_changing_storage() {
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .unwrap();
+        let author_raw = b"A U Thor <a@example.invalid> 1700000000 +0530".to_vec();
+        let committer_raw = b"C O Mitter <c@example.invalid> 1700000001 -0000".to_vec();
+        let commit = Commit {
+            tree,
+            parents: Vec::new(),
+            author: author_raw.clone(),
+            committer: committer_raw.clone(),
+            encoding: None,
+            message: b"subject\n".to_vec(),
+        };
+
+        let author = commit.author_signature().expect("author parses");
+        assert_eq!(author.name.as_bytes(), b"A U Thor");
+        assert_eq!(author.email.as_bytes(), b"a@example.invalid");
+        assert_eq!(author.time.seconds, 1_700_000_000);
+        assert_eq!(author.time.timezone_offset_minutes, 330);
+        assert!(!author.time.negative_utc);
+        // The parse-view re-serializes to exactly the stored bytes.
+        assert_eq!(author.to_ident_bytes(), author_raw);
+
+        let committer = commit.committer_signature().expect("committer parses");
+        assert_eq!(committer.time.seconds, 1_700_000_001);
+        // The committer used the -0000 sentinel; it must be preserved.
+        assert!(committer.time.negative_utc);
+        assert_eq!(committer.to_ident_bytes(), committer_raw);
+
+        // The accessors did not mutate the raw fields, and write() still emits
+        // them verbatim.
+        assert_eq!(commit.author, author_raw);
+        assert_eq!(commit.committer, committer_raw);
+        let written = commit.write();
+        assert_eq!(Commit::parse(ObjectFormat::Sha1, &written).unwrap(), commit);
+    }
+
+    #[test]
+    fn commit_signature_accessor_is_none_for_malformed_ident() {
+        let tree = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        )
+        .unwrap();
+        let commit = Commit {
+            tree,
+            parents: Vec::new(),
+            author: b"garbage without an email or time".to_vec(),
+            committer: b"C O Mitter <c@example.invalid> 0 +0000".to_vec(),
+            encoding: None,
+            message: b"x\n".to_vec(),
+        };
+        assert!(commit.author_signature().is_none());
+        assert!(commit.committer_signature().is_some());
+    }
+
+    #[test]
+    fn tag_signature_accessor_parses_tagger_and_handles_absence() {
+        let object = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15",
+        )
+        .unwrap();
+        let tagger_raw = b"Example User <example@example.invalid> 1700000000 -0000".to_vec();
+        let tag = Tag {
+            object: object.clone(),
+            object_type: ObjectType::Commit,
+            name: b"v1.0".to_vec(),
+            tagger: Some(tagger_raw.clone()),
+            message: b"release\n".to_vec(),
+        };
+        let tagger = tag.tagger_signature().expect("tagger parses");
+        assert_eq!(tagger.name.as_bytes(), b"Example User");
+        assert!(tagger.time.negative_utc);
+        assert_eq!(tagger.to_ident_bytes(), tagger_raw);
+        // Raw field and serialization unaffected.
+        assert_eq!(tag.tagger.as_deref(), Some(tagger_raw.as_slice()));
+
+        // A tag with no tagger header yields None.
+        let lightweight = Tag {
+            object,
+            object_type: ObjectType::Commit,
+            name: b"v1.0".to_vec(),
+            tagger: None,
+            message: b"x\n".to_vec(),
+        };
+        assert!(lightweight.tagger_signature().is_none());
     }
 }

@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeBuilder};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
 
@@ -51,8 +51,10 @@ pub mod plumbing {
 // The most frequently used plumbing types are also re-exported at the crate root
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
-pub use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-pub use sley_object::{Commit as CommitObject, ObjectType as GitObjectType, Tree as TreeObject};
+pub use sley_core::{GitError, GitTime, ObjectFormat, ObjectId, Result, Signature};
+pub use sley_object::{
+    Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
+};
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
@@ -394,6 +396,44 @@ impl Repository {
             )));
         }
         Tree::parse(self.format, &object.body)
+    }
+
+    /// Read an annotated tag object, parsing it into a [`Tag`]. Returns an error
+    /// if `oid` does not name a tag.
+    pub fn read_tag(&self, oid: &ObjectId) -> Result<Tag> {
+        let object = self.read_object(oid)?;
+        if object.object_type != ObjectType::Tag {
+            return Err(GitError::InvalidObject(format!(
+                "object {oid} is a {}, not a tag",
+                object.object_type.as_str()
+            )));
+        }
+        Tag::parse(self.format, &object.body)
+    }
+
+    /// Read a commit and return the typed [`Signature`] parse-view of its
+    /// `author` line, or `None` if the stored ident is malformed.
+    ///
+    /// Convenience for `repo.read_commit(oid)?.author_signature()`: the raw
+    /// `author` bytes are unchanged, and the returned signature re-serializes
+    /// byte-identically to them (see [`Signature::to_ident_bytes`]).
+    pub fn read_commit_author(&self, oid: &ObjectId) -> Result<Option<Signature>> {
+        Ok(self.read_commit(oid)?.author_signature())
+    }
+
+    /// Read a commit and return the typed [`Signature`] parse-view of its
+    /// `committer` line, or `None` if the stored ident is malformed. The raw
+    /// bytes are untouched; see [`Repository::read_commit_author`].
+    pub fn read_commit_committer(&self, oid: &ObjectId) -> Result<Option<Signature>> {
+        Ok(self.read_commit(oid)?.committer_signature())
+    }
+
+    /// Read an annotated tag and return the typed [`Signature`] parse-view of
+    /// its `tagger` line, or `None` if the tag has no tagger or the stored ident
+    /// is malformed. The raw bytes are untouched; see
+    /// [`Repository::read_commit_author`].
+    pub fn read_tag_tagger(&self, oid: &ObjectId) -> Result<Option<Signature>> {
+        Ok(self.read_tag(oid)?.tagger_signature())
     }
 
     /// Write a raw object (any type) to the object database as a loose object,
