@@ -2,7 +2,7 @@
 
 > Living tracker for the sley effort: enabling **heddle** to drop-in replace
 > `gix`, decomposing the `sley-cli` monolith, strengthening domain types, and
-> performance. **Last updated: 2026-06-05.**
+> performance. **Last updated: 2026-06-05 (bulk-read profiled + fixed, #51).**
 
 ## Context
 
@@ -63,6 +63,28 @@ big slice of decomposition #19. Commits `a5e0d94`..`6c2f9f2`.
 Opt-in `zlib-ng` feature on sley-pack/sley-odb, forwarded through sley + sley-cli;
 default stays pure-Rust (miniz_oxide). Commit `fcf2ebd`.
 
+### Bulk object-read: profiled + fixed (#51) — `7bffad8`, `d40e5ba`
+**Correction to the earlier #49 note:** the bulk-read gap was *not* rev-parse /
+stdout formatting (that was an unprofiled guess). Profiling `cat-file --batch`
+with macOS `sample` showed **~87% of read time in `sley_core::sha1`**:
+`FileObjectDatabase` re-hashed every decoded object on *every* read to verify it
+against the requested id — work git does only at index-pack/fsck. Two fixes:
+
+- **Stop re-hashing on read** (`7bffad8`): trust the pack index / loose name;
+  re-verification is opt-in via `SLEY_VERIFY_READS`, `validate`/fsck still hash,
+  incoming packs still verified at index build. Byte-identical output.
+- **Header-only `--batch-check`** (`d40e5ba`): `read_object_header_at` /
+  `FileObjectDatabase::read_object_header` report type+size without inflating the
+  body (base size from the pack header; delta result size from the delta stream's
+  leading varint; loose framing only). Reusable cheap type/size primitive.
+
+Measured (2,561-object / 302 MB packed repo, Apple Silicon, release):
+`cat-file --batch` content 1.90s→0.27s (**14x→1.98x** of git); `--batch-check`
+1.91s→0.081s (**~23x faster**, now ~4x of git, the residual being per-object CLI
+rev-parse). With SHA-1 off the read path, `zlib-ng` now also helps (~13% content).
+The win lives in the shared `read_object` path, so all read-heavy ops benefit —
+including heddle's import/read path. Full workspace 1627 passed.
+
 ## 🔄 In progress
 
 _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
@@ -105,9 +127,9 @@ _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
   ObjectId types.
 - **Remaining gaps:** parallelism for large repos (#50), TLS-backend forwarding
   (TLS half of #40), comment-preserving config round-trip, deferred ref-name /
-  path newtypes, and pack mmap. (#49 bulk-read landed — `cat-file --batch` 5.5x
-  -> 2.3x slower than git; the library read path heddle uses benefits in full.
-  Network, config/identity, and signature typing are all done.)
+  path newtypes, pack mmap, and the per-object CLI rev-parse overhead that now
+  bounds `cat-file --batch-check` (~4x of git after the read fixes; the library
+  read path bypasses it). Network, config/identity, and signature typing done.
 
 ---
 
@@ -127,4 +149,5 @@ _(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
 ## Open task IDs
 
 `#19` decompose sley-cli · `#34` smudge on restore/reset/stash · `#40` dep-feature
-forwarding · `#46` strengthen domain types (signatures/dates/ref names/paths).
+forwarding · `#46` strengthen domain types (signatures/dates/ref names/paths) ·
+`#50` parallelism pass · `#51` bulk-read re-hash fix + header-only reads (done).
