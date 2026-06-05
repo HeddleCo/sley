@@ -140,10 +140,19 @@ walking commands are far behind, and the gaps are **algorithmic, not parallelism
   + per-file hashing where the stat-cache misses. Fold attributes into the single
   traversal; use the index cache-tree for index-vs-HEAD; confirm the stat-cache
   shortcut engages on a git-written index.
-- **#58 log/rev-list/merge-base (7–27×)** — `walk_commits` reads+parses every
-  commit object; the commit-graph (`CommitGraphContext`, already parses flutter's
-  graph) is wired only into `^`/`~` nav, not the main walk. Source parents +
-  commit-time from the graph; read objects only when full commit data is needed.
+- **#58 log/rev-list/merge-base (7–27×) — unifying root cause found by profiling.**
+  The commit-graph loads fine (44,499 entries on flutter; `graph_to_map` works) —
+  but the *CLI commands bypass it*: each has a naive object-reading walk
+  (`merge_bases_many`→`ancestor_depths`, `walk_commits`) that never consults the
+  graph, which was wired only into `^`/`~` nav. So it's "command uses the slow
+  path," not a graph bug.
+  - **merge-base — DONE** (`f563de6`): 2-commit base + `--is-ancestor` now use
+    graph-accelerated `sley_rev::merge_bases`/`is_ancestor`. flutter 3.65s→~0.9s
+    (14×→4×), byte-identical (incl. criss-cross `--all`).
+  - **log / rev-list — remaining**: `walk_commits` reads every commit object *and*
+    walks the whole history with no `-n` early stop. Needs a graph-sourced walk
+    (oid+parents+commit-time) used for traversal/order, reading objects only for
+    displayed commits, honoring `-n`.
 - **#59 abbrev length** — git auto-grows short-OID width on huge repos; sley
   hardcodes 7. Cosmetic-but-real; affects diff index lines, `log --abbrev`, etc.
 
