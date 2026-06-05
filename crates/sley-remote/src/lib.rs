@@ -28,6 +28,16 @@ pub use credentials::{
     http_protocol_name, http_url_credential, CredentialHelperProvider,
 };
 
+mod local;
+pub use local::{
+    attach_receive_pack_capabilities, attach_upload_pack_capabilities,
+    install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
+    receive_pack_features, receive_pack_into_local_repository,
+    receive_pack_request_uses_push_options, upload_pack_features,
+    upload_pack_from_local_repository, upload_pack_request_uses_sideband,
+    upload_pack_sideband_response,
+};
+
 /// Supplies credentials for an authenticated remote, mirroring git's credential
 /// protocol: [`fill`](CredentialProvider::fill) is handed a partial
 /// [`GitCredential`] describing the request (protocol/host/path) and returns a

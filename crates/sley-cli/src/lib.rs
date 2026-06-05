@@ -21,15 +21,13 @@ use sley_refs::{
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, GitService, PKT_LINE_MAX_PAYLOAD_LEN, ProtocolVersion,
-    PushSourceRef, ReceivePackCommand, ReceivePackFeatures, ReceivePackPushRequest,
-    ReceivePackPushRequestOptions, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
-    RefAdvertisementSet, SideBandChannel, SideBandPacket, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
-    UploadPackRequest, apply_receive_pack_push_request, build_receive_pack_push_request,
-    build_upload_pack_raw_packfile_response, encode_fetch_head, encode_receive_pack_features,
-    encode_upload_pack_features, fetch_ref_updates_to_fetch_head, parse_receive_pack_features,
-    parse_refspec, parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
+    FetchHeadRecord, FetchRefUpdate, GitService, ProtocolVersion, PushSourceRef,
+    ReceivePackCommand, ReceivePackPushRequest, ReceivePackPushRequestOptions,
+    ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement, RefAdvertisementSet,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
+    UploadPackRequest, build_receive_pack_push_request, encode_fetch_head,
+    fetch_ref_updates_to_fetch_head, parse_receive_pack_features, parse_refspec,
+    parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
     read_receive_pack_push_options, read_receive_pack_report_status, read_receive_pack_request,
     read_ref_advertisement_set, read_upload_pack_negotiation_request,
     read_upload_pack_raw_packfile_response, read_upload_pack_request, refspec_map_source,
@@ -8273,9 +8271,9 @@ fn cmd_receive_pack(args: &[String]) -> Result<()> {
     };
     let git_dir = common_git_dir_for_git_dir(&ls_remote_git_dir(repository)?)?;
     let format = repository_object_format(&git_dir)?;
-    let features = receive_pack_features(format);
-    let mut advertisements = local_fetch_advertisements(&git_dir, format)?;
-    attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
+    let features = sley_remote::receive_pack_features(format);
+    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    sley_remote::attach_receive_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
         let stdout = io::stdout();
@@ -8294,7 +8292,7 @@ fn cmd_receive_pack(args: &[String]) -> Result<()> {
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
     let commands = read_receive_pack_request(format, &mut stdin)?;
-    let push_options = receive_pack_request_uses_push_options(&commands)
+    let push_options = sley_remote::receive_pack_request_uses_push_options(&commands)
         .then(|| read_receive_pack_push_options(&mut stdin))
         .transpose()?;
     let mut packfile = Vec::new();
@@ -8304,36 +8302,11 @@ fn cmd_receive_pack(args: &[String]) -> Result<()> {
         push_options,
         packfile,
     };
-    let report = receive_pack_into_local_repository(&git_dir, format, &request)?;
+    let report = sley_remote::receive_pack_into_local_repository(&git_dir, format, &request)?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     write_receive_pack_report_status(&mut stdout, &report)?;
     stdout.flush()?;
-    Ok(())
-}
-
-fn receive_pack_request_uses_push_options(request: &ReceivePackRequest) -> bool {
-    request
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "push-options")
-}
-
-fn attach_receive_pack_capabilities(
-    advertisements: &mut Vec<RefAdvertisement>,
-    format: ObjectFormat,
-    features: &ReceivePackFeatures,
-) -> Result<()> {
-    let capabilities = encode_receive_pack_features(features)?;
-    if let Some(first) = advertisements.first_mut() {
-        first.capabilities = capabilities;
-    } else {
-        advertisements.push(RefAdvertisement {
-            oid: zero_oid(format)?,
-            name: "capabilities^{}".into(),
-            capabilities,
-        });
-    }
     Ok(())
 }
 
@@ -8349,9 +8322,9 @@ fn cmd_upload_pack(args: &[String]) -> Result<()> {
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let features = upload_pack_features(&git_dir, format)?;
-    let mut advertisements = local_fetch_advertisements(&git_dir, format)?;
-    attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
+    let features = sley_remote::upload_pack_features(&git_dir, format)?;
+    let mut advertisements = sley_remote::local_fetch_advertisements(&git_dir, format)?;
+    sley_remote::attach_upload_pack_capabilities(&mut advertisements, format, &features)?;
 
     {
         let stdout = io::stdout();
@@ -8381,95 +8354,19 @@ fn cmd_upload_pack(args: &[String]) -> Result<()> {
         }
     }
 
-    let sideband = upload_pack_request_uses_sideband(&request);
-    let response = upload_pack_from_local_repository(&git_dir, format, &features, request, haves)?;
+    let sideband = sley_remote::upload_pack_request_uses_sideband(&request);
+    let response =
+        sley_remote::upload_pack_from_local_repository(&git_dir, format, &features, request, haves)?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if sideband {
-        let response = upload_pack_sideband_response(response);
+        let response = sley_remote::upload_pack_sideband_response(response);
         write_upload_pack_packfile_response(&mut stdout, &response)?;
     } else {
         write_upload_pack_raw_packfile_response(&mut stdout, &response)?;
     }
     stdout.flush()?;
     Ok(())
-}
-
-fn upload_pack_features(git_dir: &Path, format: ObjectFormat) -> Result<UploadPackFeatures> {
-    let store = FileRefStore::new(git_dir, format);
-    let mut symrefs = Vec::new();
-    if let Some(RefTarget::Symbolic(target)) = store.read_ref("HEAD")? {
-        symrefs.push(format!("HEAD:{target}"));
-    }
-    Ok(UploadPackFeatures {
-        object_format: Some(format),
-        side_band_64k: true,
-        symrefs,
-        ..UploadPackFeatures::default()
-    })
-}
-
-fn upload_pack_request_uses_sideband(request: &UploadPackRequest) -> bool {
-    request
-        .capabilities
-        .iter()
-        .any(|capability| matches!(capability.name.as_str(), "side-band" | "side-band-64k"))
-}
-
-fn upload_pack_sideband_response(
-    response: UploadPackRawPackfileResponse,
-) -> UploadPackPackfileResponse {
-    let mut sideband = Vec::new();
-    let chunk_len = PKT_LINE_MAX_PAYLOAD_LEN - 1;
-    for chunk in response.packfile.chunks(chunk_len) {
-        sideband.push(SideBandPacket {
-            channel: SideBandChannel::Data,
-            data: chunk.to_vec(),
-        });
-    }
-    UploadPackPackfileResponse {
-        acknowledgments: response.acknowledgments,
-        sideband,
-    }
-}
-
-fn attach_upload_pack_capabilities(
-    advertisements: &mut Vec<RefAdvertisement>,
-    format: ObjectFormat,
-    features: &UploadPackFeatures,
-) -> Result<()> {
-    let capabilities = encode_upload_pack_features(features)?;
-    if let Some(first) = advertisements.first_mut() {
-        first.capabilities = capabilities;
-    } else {
-        advertisements.push(RefAdvertisement {
-            oid: zero_oid(format)?,
-            name: "capabilities^{}".into(),
-            capabilities,
-        });
-    }
-    Ok(())
-}
-
-fn upload_pack_from_local_repository(
-    git_dir: &Path,
-    format: ObjectFormat,
-    features: &UploadPackFeatures,
-    request: sley_protocol::UploadPackRequest,
-    haves: HashSet<ObjectId>,
-) -> Result<UploadPackRawPackfileResponse> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    build_upload_pack_raw_packfile_response(
-        features,
-        request,
-        haves,
-        |oid| db.contains(oid),
-        |wants, known_haves| {
-            let excluded = collect_reachable_object_ids(&db, format, known_haves)?;
-            build_reachable_pack(&db, format, wants, &excluded)
-                .map(|pack| pack.map(|pack| pack.pack))
-        },
-    )
 }
 
 fn cmd_push(args: &[String]) -> Result<()> {
@@ -8643,7 +8540,7 @@ fn push_local_repository(
 
     let local_store = FileRefStore::new(git_dir, format);
     let local_refs = local_push_source_refs(&local_store, format)?;
-    let remote_refs = local_fetch_advertisements(&remote_common_git_dir, format)?;
+    let remote_refs = sley_remote::local_fetch_advertisements(&remote_common_git_dir, format)?;
     let refspecs = refspecs
         .iter()
         .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
@@ -8691,7 +8588,7 @@ fn push_local_repository(
         push_options: None,
         packfile,
     };
-    receive_pack_into_local_repository(&remote_git_dir, format, &request)?;
+    sley_remote::receive_pack_into_local_repository(&remote_git_dir, format, &request)?;
 
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &commands)?;
@@ -8877,51 +8774,6 @@ fn validate_receive_pack_report(report: &ReceivePackReportStatus) -> Result<()> 
         }
     }
     Ok(())
-}
-
-fn receive_pack_into_local_repository(
-    remote_git_dir: &Path,
-    format: ObjectFormat,
-    request: &ReceivePackPushRequest,
-) -> Result<ReceivePackReportStatus> {
-    let remote_store = FileRefStore::new(remote_git_dir, format);
-    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
-    apply_receive_pack_push_request(
-        &receive_pack_features(format),
-        request,
-        |name| match remote_store.read_ref(name)? {
-            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
-            Some(RefTarget::Symbolic(_)) | None => Ok(None),
-        },
-        |packfile| remote_db.install_raw_pack(packfile).map(|_| ()),
-        |oid| remote_db.contains(oid),
-        |commands| {
-            let mut tx = remote_store.transaction();
-            for command in commands {
-                tx.update(RefUpdate {
-                    name: command.name.clone(),
-                    expected: (!is_zero_object_id(&command.old_id))
-                        .then(|| RefTarget::Direct(command.old_id.clone())),
-                    new: RefTarget::Direct(command.new_id.clone()),
-                    reflog: None,
-                });
-            }
-            tx.commit()
-        },
-        |name| remote_store.delete_ref(name).map(|_| ()),
-    )
-}
-
-fn receive_pack_features(format: ObjectFormat) -> ReceivePackFeatures {
-    ReceivePackFeatures {
-        report_status: true,
-        delete_refs: true,
-        ofs_delta: true,
-        push_options: true,
-        quiet: true,
-        object_format: Some(format),
-        ..ReceivePackFeatures::default()
-    }
 }
 
 fn local_push_source_refs(
@@ -9160,7 +9012,7 @@ fn fetch_local_repository(
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
-    let advertisements = local_fetch_advertisements(&remote_git_dir, format)?;
+    let advertisements = sley_remote::local_fetch_advertisements(&remote_git_dir, format)?;
     let mut updates = plan_fetch_ref_updates(&advertisements, &refspecs, options.auto_follow_tags)?;
     let store = FileRefStore::new(git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, format);
@@ -9187,7 +9039,7 @@ fn fetch_local_repository(
         .iter()
         .map(|update| update.oid.clone())
         .collect::<Vec<_>>();
-    install_fetch_pack_via_local_upload_pack(
+    sley_remote::install_fetch_pack_via_local_upload_pack(
         git_dir,
         &remote_git_dir,
         format,
@@ -9317,63 +9169,6 @@ fn fetch_ssh_repository(
     Ok(())
 }
 
-fn install_fetch_pack_via_local_upload_pack(
-    git_dir: &Path,
-    remote_git_dir: &Path,
-    format: ObjectFormat,
-    wants: Vec<ObjectId>,
-    promisor: bool,
-) -> Result<()> {
-    if wants.is_empty() {
-        return Ok(());
-    }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
-    {
-        return Ok(());
-    }
-
-    let features = upload_pack_features(remote_git_dir, format)?;
-    let request = UploadPackRequest {
-        wants,
-        ..UploadPackRequest::default()
-    };
-    let mut encoded_request = Vec::new();
-    write_upload_pack_request(&mut encoded_request, Some(&request))?;
-    let decoded_request = read_upload_pack_request(format, &mut encoded_request.as_slice())?
-        .ok_or_else(|| GitError::InvalidFormat("encoded upload-pack request was empty".into()))?;
-
-    let haves = local_have_oids(git_dir, format)?;
-    let negotiation = UploadPackNegotiationRequest { haves, done: true };
-    let mut encoded_negotiation = Vec::new();
-    write_upload_pack_negotiation_request(&mut encoded_negotiation, &negotiation)?;
-    let decoded_negotiation =
-        read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
-
-    let response = upload_pack_from_local_repository(
-        remote_git_dir,
-        format,
-        &features,
-        decoded_request,
-        decoded_negotiation.haves.into_iter().collect(),
-    )?;
-    let mut encoded_response = Vec::new();
-    write_upload_pack_raw_packfile_response(&mut encoded_response, &response)?;
-    let decoded_response =
-        read_upload_pack_raw_packfile_response(format, &mut encoded_response.as_slice())?;
-    if promisor {
-        install_upload_pack_raw_promisor_response(&decoded_response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&decoded_response, &local_db)?;
-    }
-    Ok(())
-}
-
 fn install_fetch_pack_via_ssh_upload_pack(
     git_dir: &Path,
     format: ObjectFormat,
@@ -9399,7 +9194,7 @@ fn install_fetch_pack_via_ssh_upload_pack(
         wants,
         ..UploadPackRequest::default()
     };
-    let haves = local_have_oids(git_dir, format)?;
+    let haves = sley_remote::local_have_oids(git_dir, format)?;
     let response = ssh_upload_pack_fetch_response(remote_url, format, features, request, haves)?;
     if promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
@@ -9698,7 +9493,7 @@ fn install_fetch_pack_via_http_upload_pack(
         wants,
         ..UploadPackRequest::default()
     };
-    let haves = local_have_oids(git_dir, format)?;
+    let haves = sley_remote::local_have_oids(git_dir, format)?;
     let response = http_upload_pack_fetch_response(client, remote, config, format, request, haves)?;
     if promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
@@ -9983,17 +9778,6 @@ fn ls_remote_http_records(
         });
     }
     Ok(Some((records, format)))
-}
-
-fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
-    let mut seen = HashSet::new();
-    let mut haves = Vec::new();
-    for advertisement in local_fetch_advertisements(git_dir, format)? {
-        if seen.insert(advertisement.oid.clone()) {
-            haves.push(advertisement.oid);
-        }
-    }
-    Ok(haves)
 }
 
 fn apply_configured_remote_tag_option(
@@ -10311,38 +10095,6 @@ fn fetch_head_source_description(config: &GitConfig, source: &str) -> String {
         .next()
         .map(|url| rewrite_url_with_config(config, &url, false))
         .unwrap_or_else(|| rewrite_url_with_config(config, source, false))
-}
-
-fn local_fetch_advertisements(
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<Vec<RefAdvertisement>> {
-    let store = FileRefStore::new(git_dir, format);
-    let mut advertisements = Vec::new();
-    if let Some(target) = store.read_ref("HEAD")? {
-        let reference = Ref {
-            name: "HEAD".to_string(),
-            target,
-        };
-        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? {
-            advertisements.push(RefAdvertisement {
-                oid,
-                name: reference.name,
-                capabilities: Vec::new(),
-            });
-        }
-    }
-    for reference in store.list_refs()? {
-        let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)? else {
-            continue;
-        };
-        advertisements.push(RefAdvertisement {
-            oid,
-            name: reference.name,
-            capabilities: Vec::new(),
-        });
-    }
-    Ok(advertisements)
 }
 
 fn bundle_default_fetch_reference(references: &[BundleReference]) -> Result<&BundleReference> {
