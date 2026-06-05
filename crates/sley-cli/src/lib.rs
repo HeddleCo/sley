@@ -2707,66 +2707,42 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         }
         return Ok(());
     }
-    let layout = RepositoryLayout::init_at_with_initial_branch(
-        &destination,
-        format,
-        false,
-        "__git_rs_clone_unborn__",
-    )?;
-    let git_dir = layout.git_dir;
-    apply_clone_template(&git_dir, template.as_deref(), template_config)?;
-    apply_clone_alternates(&git_dir, &alternates, dissociate)?;
-    let fetch_refspec = if revision_oid.is_some() {
-        None
-    } else if single_branch {
-        Some(format!(
-            "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
-        ))
-    } else {
-        Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
-    };
-    configure_clone_remote(
-        &git_dir,
-        &origin,
-        &repository,
-        fetch_refspec,
-        false,
-        tag_opt.as_deref(),
-        partial_clone_filter.as_deref(),
-    )?;
-    apply_clone_config_overrides(&git_dir, &config_overrides)?;
-    apply_clone_submodule_active(&git_dir, &submodule_active)?;
-    if let Some(bundle_uri) = bundle_uri.as_ref() {
-        apply_clone_bundle_uri(&git_dir, format, bundle_uri)?;
-    }
-
-    if let Some(revision_oid) = revision_oid.as_ref() {
-        copy_local_revision_objects(&remote_common_git_dir, &git_dir, format, revision_oid)?;
-    } else {
-        let previous_cwd = env::current_dir()?;
-        env::set_current_dir(&destination)?;
-        let fetch_result = fetch_local_repository(
-            &git_dir,
-            format,
+    // Apply the post-init repository config common to both the revision and the
+    // branch-tracking local clone: template, alternates, the origin remote (with
+    // the given fetch refspec — `None` for `--revision`), `-c` overrides,
+    // `submodule.active`, and any `--bundle-uri`. Returns the resulting config.
+    let configure_local_clone = |git_dir: &Path, fetch_refspec: Option<String>| -> Result<GitConfig> {
+        apply_clone_template(git_dir, template.as_deref(), template_config)?;
+        apply_clone_alternates(git_dir, &alternates, dissociate)?;
+        configure_clone_remote(
+            git_dir,
             &origin,
-            &[],
-            FetchOptions {
-                quiet: true,
-                auto_follow_tags: true,
-                fetch_all_tags: false,
-                prune: false,
-                dry_run: false,
-                append: false,
-                write_fetch_head: true,
-                tag_option_explicit: false,
-                prune_option_explicit: false,
-            },
-        );
-        env::set_current_dir(previous_cwd)?;
-        fetch_result?;
-    }
+            &repository,
+            fetch_refspec,
+            false,
+            tag_opt.as_deref(),
+            partial_clone_filter.as_deref(),
+        )?;
+        apply_clone_config_overrides(git_dir, &config_overrides)?;
+        apply_clone_submodule_active(git_dir, &submodule_active)?;
+        if let Some(bundle_uri) = bundle_uri.as_ref() {
+            apply_clone_bundle_uri(git_dir, format, bundle_uri)?;
+        }
+        read_repo_config(git_dir)
+    };
 
     if let Some(revision_oid) = revision_oid.as_ref() {
+        // `--revision` copies the object closure directly and checks out detached;
+        // it never fetches or creates a branch, so it keeps its own init here.
+        let layout = RepositoryLayout::init_at_with_initial_branch(
+            &destination,
+            format,
+            false,
+            "__git_rs_clone_unborn__",
+        )?;
+        let git_dir = layout.git_dir;
+        configure_local_clone(&git_dir, None)?;
+        copy_local_revision_objects(&remote_common_git_dir, &git_dir, format, revision_oid)?;
         if checkout {
             let config = read_repo_config(&git_dir)?;
             sley_worktree::checkout_detached_filtered(
@@ -2799,47 +2775,39 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let store = FileRefStore::new(&git_dir, format);
-    let remote_branch_ref = format!("refs/remotes/{origin}/{checkout_branch}");
-    let remote_oid = match store.read_ref(&remote_branch_ref)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) => {
-            return Err(GitError::Unsupported(
-                "clone remote-tracking branch must be direct".into(),
-            ));
-        }
-        None => {
-            return Err(GitError::NotFound(format!(
-                "remote ref {remote_branch_ref}"
-            )));
-        }
+    let remote_source = sley_remote::CloneSource::Local {
+        git_dir: remote_git_dir,
+        common_git_dir: remote_common_git_dir,
     };
-    store.create_branch(
-        &checkout_branch,
-        remote_oid,
-        commit_identity_from_env("COMMITTER")?,
-        format!("branch: Created from {origin}/{checkout_branch}").into_bytes(),
-    )?;
-    configure_clone_branch(&git_dir, &checkout_branch, &origin)?;
-    if !single_branch || checkout_branch == remote_head_branch {
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: format!("refs/remotes/{origin}/HEAD"),
-            expected: None,
-            new: RefTarget::Symbolic(format!("refs/remotes/{origin}/{remote_head_branch}")),
-            reflog: None,
-        });
-        tx.commit()?;
-    }
-    let config = read_repo_config(&git_dir)?;
-    sley_worktree::checkout_branch_filtered(
+    let outcome = sley_remote::clone(
         &destination,
-        &git_dir,
         format,
-        &checkout_branch,
-        commit_identity_from_env("COMMITTER")?,
-        &config,
+        &remote_source,
+        &sley_remote::CloneOptions {
+            origin: &origin,
+            checkout_branch: &checkout_branch,
+            remote_head_branch: &remote_head_branch,
+            single_branch,
+            committer: commit_identity_from_env("COMMITTER")?,
+        },
+        &mut |git_dir| {
+            let fetch_refspec = if single_branch {
+                Some(format!(
+                    "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                ))
+            } else {
+                Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+            };
+            configure_local_clone(git_dir, fetch_refspec)
+        },
+        &mut |git_dir, branch| {
+            configure_clone_branch(git_dir, branch, &origin)?;
+            read_repo_config(git_dir)
+        },
+        &mut sley_remote::NoCredentials,
+        &mut StdoutProgress,
     )?;
+    let git_dir = outcome.git_dir;
     if !checkout {
         remove_clone_worktree_files(&destination, &git_dir, format)?;
     } else if sparse {
@@ -2964,107 +2932,57 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         eprintln!("Cloning into '{}'...", options.destination.display());
     }
 
-    let layout = RepositoryLayout::init_at_with_initial_branch(
+    let single_branch = options.single_branch;
+    let origin = options.origin;
+    let repository = options.repository;
+    let template = options.template;
+    let template_config = options.template_config;
+    let tag_opt = options.tag_opt;
+    let config_overrides = options.config_overrides;
+    let submodule_active = options.submodule_active;
+    let outcome = sley_remote::clone(
         options.destination,
         format,
-        false,
-        "__git_rs_clone_unborn__",
-    )?;
-    let git_dir = layout.git_dir;
-    apply_clone_template(&git_dir, options.template, options.template_config)?;
-    let fetch_refspec = if options.single_branch {
-        Some(format!(
-            "+refs/heads/{checkout_branch}:refs/remotes/{}/{checkout_branch}",
-            options.origin
-        ))
-    } else {
-        Some(format!("+refs/heads/*:refs/remotes/{}/*", options.origin))
-    };
-    configure_clone_remote(
-        &git_dir,
-        options.origin,
-        options.repository,
-        fetch_refspec,
-        false,
-        options.tag_opt,
-        None,
-    )?;
-    apply_clone_config_overrides(&git_dir, options.config_overrides)?;
-    apply_clone_submodule_active(&git_dir, options.submodule_active)?;
-
-    let previous_cwd = env::current_dir()?;
-    env::set_current_dir(options.destination)?;
-    let fetch_result = fetch_http_repository(
-        &git_dir,
-        format,
-        options.origin,
-        &[],
-        FetchOptions {
-            quiet: true,
-            auto_follow_tags: true,
-            fetch_all_tags: false,
-            prune: false,
-            dry_run: false,
-            append: false,
-            write_fetch_head: true,
-            tag_option_explicit: false,
-            prune_option_explicit: false,
+        &sley_remote::CloneSource::Http(remote),
+        &sley_remote::CloneOptions {
+            origin,
+            checkout_branch: &checkout_branch,
+            remote_head_branch: &remote_head_branch,
+            single_branch,
+            committer: commit_identity_from_env("COMMITTER")?,
         },
+        &mut |git_dir| {
+            apply_clone_template(git_dir, template, template_config)?;
+            let fetch_refspec = if single_branch {
+                Some(format!(
+                    "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                ))
+            } else {
+                Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+            };
+            configure_clone_remote(
+                git_dir,
+                origin,
+                repository,
+                fetch_refspec,
+                false,
+                tag_opt,
+                None,
+            )?;
+            apply_clone_config_overrides(git_dir, config_overrides)?;
+            apply_clone_submodule_active(git_dir, submodule_active)?;
+            read_repo_config(git_dir)
+        },
+        &mut |git_dir, branch| {
+            configure_clone_branch(git_dir, branch, origin)?;
+            read_repo_config(git_dir)
+        },
+        &mut sley_remote::NoCredentials,
+        &mut StdoutProgress,
     );
-    env::set_current_dir(previous_cwd)?;
-    fetch_result?;
+    let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
+    let git_dir = outcome.git_dir;
 
-    let store = FileRefStore::new(&git_dir, format);
-    let remote_branch_ref = format!("refs/remotes/{}/{checkout_branch}", options.origin);
-    let remote_oid = match store.read_ref(&remote_branch_ref)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) => {
-            return Err(GitError::Unsupported(
-                "clone remote-tracking branch must be direct".into(),
-            ));
-        }
-        None => {
-            if branch_explicit {
-                eprintln!(
-                    "fatal: Remote branch {checkout_branch} not found in upstream {}",
-                    options.origin
-                );
-                return Err(GitError::Exit(128));
-            }
-            return Err(GitError::NotFound(format!(
-                "remote ref {remote_branch_ref}"
-            )));
-        }
-    };
-    store.create_branch(
-        &checkout_branch,
-        remote_oid,
-        commit_identity_from_env("COMMITTER")?,
-        format!("branch: Created from {}/{checkout_branch}", options.origin).into_bytes(),
-    )?;
-    configure_clone_branch(&git_dir, &checkout_branch, options.origin)?;
-    if !options.single_branch || checkout_branch == remote_head_branch {
-        let mut tx = store.transaction();
-        tx.update(RefUpdate {
-            name: format!("refs/remotes/{}/HEAD", options.origin),
-            expected: None,
-            new: RefTarget::Symbolic(format!(
-                "refs/remotes/{}/{remote_head_branch}",
-                options.origin
-            )),
-            reflog: None,
-        });
-        tx.commit()?;
-    }
-    let config = read_repo_config(&git_dir)?;
-    sley_worktree::checkout_branch_filtered(
-        options.destination,
-        &git_dir,
-        format,
-        &checkout_branch,
-        commit_identity_from_env("COMMITTER")?,
-        &config,
-    )?;
     if !options.checkout {
         remove_clone_worktree_files(options.destination, &git_dir, format)?;
     } else if options.sparse {
@@ -3077,6 +2995,29 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         eprintln!("done.");
     }
     Ok(())
+}
+
+/// Map a [`sley_remote::clone`] result that failed because the requested branch
+/// was absent from the remote into the CLI's explicit-`--branch` message, leaving
+/// every other result untouched. `git clone -b <missing>` prints a dedicated
+/// "Remote branch … not found" line and exits 128; without an explicit branch the
+/// generic not-found error propagates.
+fn map_clone_missing_branch(
+    outcome: Result<sley_remote::CloneOutcome>,
+    branch_explicit: bool,
+    checkout_branch: &str,
+    origin: &str,
+) -> Result<sley_remote::CloneOutcome> {
+    match outcome {
+        Err(GitError::NotFound(message))
+            if branch_explicit
+                && message == format!("remote ref refs/remotes/{origin}/{checkout_branch}") =>
+        {
+            eprintln!("fatal: Remote branch {checkout_branch} not found in upstream {origin}");
+            Err(GitError::Exit(128))
+        }
+        other => other,
+    }
 }
 
 fn clone_jobs_error() -> &'static str {
@@ -9120,6 +9061,10 @@ fn fetch_http_repository(
     run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
 }
 
+/// Resolve `repository` to an HTTP(S) remote and list its advertisements via
+/// [`sley_remote::ls_remote`], returning `None` for non-HTTP transports. URL/
+/// config resolution and the ref-name pattern matching stay here; the
+/// advertisement listing and class filtering live in the library.
 fn ls_remote_http_records(
     repository: &str,
     options: &LsRemoteOptions,
@@ -9135,54 +9080,24 @@ fn ls_remote_http_records(
     let config = discover_git_dir(env::current_dir()?)
         .ok()
         .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let client = sley_remote::new_http_client();
     let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
-    let (refs, features) = sley_remote::http_upload_pack_advertisements(
-        &client,
-        &parsed,
+    let records = sley_remote::ls_remote(
+        &sley_remote::LsRemoteSource::Http(parsed),
         ObjectFormat::Sha1,
+        &ls_remote_filter(options),
+        &|name| ls_remote_ref_matches(name, &options.patterns),
         &mut credentials,
     )?;
-    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
-    if format != ObjectFormat::Sha1 {
-        return Err(GitError::Unsupported(format!(
-            "http ls-remote currently supports SHA-1 advertisements, got {}",
-            format.name()
-        )));
+    Ok(Some(records))
+}
+
+/// The library ref-class filter for the parsed ls-remote `options`.
+fn ls_remote_filter(options: &LsRemoteOptions) -> sley_remote::LsRemoteFilter {
+    sley_remote::LsRemoteFilter {
+        heads: options.heads,
+        tags: options.tags,
+        refs_only: options.refs_only,
     }
-    let symrefs = features
-        .symrefs
-        .iter()
-        .filter_map(|symref| symref.split_once(':'))
-        .map(|(name, target)| (name.to_string(), target.to_string()))
-        .collect::<HashMap<_, _>>();
-    let mut records = Vec::new();
-    for advertisement in refs {
-        if is_zero_object_id(&advertisement.oid) {
-            continue;
-        }
-        if options.refs_only
-            && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
-        {
-            continue;
-        }
-        let is_head = advertisement.name.starts_with("refs/heads/");
-        let is_tag = advertisement.name.starts_with("refs/tags/");
-        if (options.heads || options.tags)
-            && !((options.heads && is_head) || (options.tags && is_tag))
-        {
-            continue;
-        }
-        if !ls_remote_ref_matches(&advertisement.name, &options.patterns) {
-            continue;
-        }
-        records.push(LsRemoteRecord {
-            oid: advertisement.oid,
-            symref: symrefs.get(&advertisement.name).cloned(),
-            name: advertisement.name,
-        });
-    }
-    Ok(Some((records, format)))
 }
 
 fn bundle_default_fetch_reference(references: &[BundleReference]) -> Result<&BundleReference> {
@@ -9244,12 +9159,11 @@ enum LsRemoteSort {
     CreatorDateDescending,
 }
 
-#[derive(Debug, Clone)]
-struct LsRemoteRecord {
-    oid: ObjectId,
-    name: String,
-    symref: Option<String>,
-}
+/// The SSH ls-remote path and the local/HTTP sorting + printing all operate on
+/// the library's advertised-ref record type ([`sley_remote::ls_remote`] returns
+/// it for the HTTP/local transports); aliased here so the SSH path can build the
+/// same shape.
+use sley_remote::LsRemoteRecord;
 
 fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let options = parse_ls_remote_options(args)?;
@@ -9299,61 +9213,15 @@ fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let git_dir = ls_remote_git_dir(repository)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let mut matched = false;
-    let mut records = Vec::new();
+    let (mut records, format) = sley_remote::ls_remote(
+        &sley_remote::LsRemoteSource::Local { git_dir },
+        format,
+        &ls_remote_filter(&options),
+        &|name| ls_remote_ref_matches(name, &options.patterns),
+        &mut sley_remote::NoCredentials,
+    )?;
 
-    if !options.refs_only
-        && !options.heads
-        && !options.tags
-        && let Some(target) = store.read_ref("HEAD")?
-    {
-        let reference = sley_refs::Ref {
-            name: "HEAD".to_string(),
-            target,
-        };
-        if ls_remote_ref_matches(&reference.name, &options.patterns)
-            && let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)?
-        {
-            matched = true;
-            records.push(LsRemoteRecord {
-                oid,
-                name: reference.name,
-                symref,
-            });
-        }
-    }
-
-    for reference in store.list_refs()? {
-        let is_head = reference.name.starts_with("refs/heads/");
-        let is_tag = reference.name.starts_with("refs/tags/");
-        if (options.heads || options.tags)
-            && !((options.heads && is_head) || (options.tags && is_tag))
-        {
-            continue;
-        }
-        if !ls_remote_ref_matches(&reference.name, &options.patterns) {
-            continue;
-        }
-        let Some((oid, symref)) = resolve_for_each_ref_target(&store, &reference)? else {
-            continue;
-        };
-        matched = true;
-        records.push(LsRemoteRecord {
-            oid: oid.clone(),
-            name: reference.name.clone(),
-            symref,
-        });
-        if !options.refs_only
-            && let Some(record) =
-                ls_remote_peeled_tag_record(&db, format, &oid, &reference.name, &options.patterns)?
-        {
-            records.push(record);
-        }
-    }
-
-    if options.exit_code && !matched {
+    if options.exit_code && records.is_empty() {
         return Err(GitError::Exit(2));
     }
     sort_ls_remote_records(
@@ -9912,29 +9780,6 @@ fn print_ls_remote_ref(record: &LsRemoteRecord, show_symref: bool) {
         println!("ref: {symref}\t{}", record.name);
     }
     println!("{}\t{}", record.oid, record.name);
-}
-
-fn ls_remote_peeled_tag_record(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: &ObjectId,
-    name: &str,
-    patterns: &[String],
-) -> Result<Option<LsRemoteRecord>> {
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Tag {
-        return Ok(None);
-    }
-    let peeled_name = format!("{name}^{{}}");
-    if !ls_remote_ref_matches(&peeled_name, patterns) {
-        return Ok(None);
-    }
-    let peeled = sley_rev::peel_tags(db, format, oid)?;
-    Ok(Some(LsRemoteRecord {
-        oid: peeled,
-        name: peeled_name,
-        symref: None,
-    }))
 }
 
 fn ls_remote_usage<T>() -> Result<T> {

@@ -354,6 +354,7 @@ dependencies = [
  "sley-config",
  "sley-core",
  "sley-fetch",
+ "sley-formats",
  "sley-object",
  "sley-odb",
  "sley-pack",

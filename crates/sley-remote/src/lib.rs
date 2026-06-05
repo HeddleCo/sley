@@ -66,6 +66,12 @@ pub use push::{
     validate_receive_pack_report, PushDestination, PushOptions, PushOutcome,
 };
 
+mod ls_remote;
+pub use ls_remote::{ls_remote, LsRemoteFilter, LsRemoteRecord, LsRemoteSource};
+
+mod clone;
+pub use clone::{clone, CloneOptions, CloneOutcome, CloneSource};
+
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
 ///
 /// Reads `common_git_dir/config`'s `extensions.objectFormat`, defaulting to
