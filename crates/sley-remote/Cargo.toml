@@ -1,0 +1,21 @@
+[package]
+name = "sley-remote"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-config = { path = "../sley-config" }
+sley-core = { path = "../sley-core" }
+sley-fetch = { path = "../sley-fetch" }
+sley-odb = { path = "../sley-odb" }
+sley-pack = { path = "../sley-pack" }
+sley-protocol = { path = "../sley-protocol" }
+sley-refs = { path = "../sley-refs" }
+sley-rev = { path = "../sley-rev" }
+sley-transport = { path = "../sley-transport" }
+sley-worktree = { path = "../sley-worktree" }
+
+[lints]
+workspace = true

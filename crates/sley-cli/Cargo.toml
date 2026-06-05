@@ -1,0 +1,37 @@
+[package]
+name = "sley-cli"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "sley_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sley"
+path = "src/main.rs"
+
+[dependencies]
+sley-archive = { path = "../sley-archive" }
+sley-config = { path = "../sley-config" }
+sley-core = { path = "../sley-core" }
+sley-diff-merge = { path = "../sley-diff-merge" }
+sley-fetch = { path = "../sley-fetch" }
+sley-formats = { path = "../sley-formats" }
+sley-fsck = { path = "../sley-fsck" }
+sley-index = { path = "../sley-index" }
+sley-object = { path = "../sley-object" }
+sley-odb = { path = "../sley-odb" }
+sley-pack = { path = "../sley-pack" }
+sley-protocol = { path = "../sley-protocol" }
+sley-refs = { path = "../sley-refs" }
+sley-rev = { path = "../sley-rev" }
+sley-sequencer = { path = "../sley-sequencer" }
+sley-testkit = { path = "../sley-testkit" }
+sley-transport = { path = "../sley-transport", features = ["http-client"] }
+sley-worktree = { path = "../sley-worktree" }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+[package]
+name = "sley-formats"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-core = { path = "../sley-core" }
+sley-config = { path = "../sley-config" }
+sley-index = { path = "../sley-index" }
+sley-object = { path = "../sley-object" }
+
+[lints]
+workspace = true
+

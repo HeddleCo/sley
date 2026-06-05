@@ -1,0 +1,1879 @@
+//! git-config — Git's configuration system: parsing, serialization, value
+//! typing, and conditional includes.
+//!
+//! This crate owns the [`GitConfig`] document model ([`ConfigSection`] /
+//! [`ConfigEntry`]), the character-level parser that mirrors git's
+//! `git_parse_source`, the canonical writer, the typed value accessors
+//! ([`parse_config_bool`], [`parse_config_int`], [`parse_config_bool_or_int`]),
+//! and the `include`/`includeIf` resolution machinery
+//! ([`load_config_with_includes`], [`ConfigIncludeContext`]).
+
+use sley_core::{GitError, ObjectFormat, Result};
+use std::fs;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct GitConfig {
+    pub sections: Vec<ConfigSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSection {
+    pub name: String,
+    pub subsection: Option<String>,
+    pub entries: Vec<ConfigEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+impl GitConfig {
+    pub fn parse(bytes: &[u8]) -> Result<Self> {
+        let text =
+            std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+        ConfigParser::new(text).parse()
+    }
+
+    pub fn read(path: impl AsRef<Path>) -> Result<Self> {
+        Self::parse(&fs::read(path)?)
+    }
+
+    /// Return the last value set for `section[.subsection].key`, or `None` if the
+    /// key is unset.
+    ///
+    /// Matches git's "last one wins" precedence: later definitions in the file (and
+    /// later files, once includes are spliced) override earlier ones. Section names
+    /// and variable names are compared case-insensitively, while subsection names
+    /// are matched exactly (case-sensitive), as required by the gitconfig format.
+    ///
+    /// A bare key with no `=` (a boolean-true variable) has `value == None`, so this
+    /// returns `None` for it just as it does for an unset key; use
+    /// [`GitConfig::get_bool`] to distinguish those cases.
+    pub fn get(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<&str> {
+        self.sections
+            .iter()
+            .rev()
+            .filter(|candidate| {
+                eq_ignore_ascii_case(&candidate.name, section)
+                    && candidate.subsection.as_deref() == subsection
+            })
+            .flat_map(|candidate| candidate.entries.iter().rev())
+            .find(|entry| eq_ignore_ascii_case(&entry.key, key))
+            .and_then(|entry| entry.value.as_deref())
+    }
+
+    /// Return every value set for `section[.subsection].key`, in file order.
+    ///
+    /// Multi-valued keys (the same key set several times) are preserved with their
+    /// duplicates and original ordering, mirroring git's `--get-all`. Matching
+    /// follows the same case rules as [`GitConfig::get`]. A bare boolean-true key
+    /// contributes a `None` entry, so callers can tell `key` (present, no value)
+    /// apart from `key = value`.
+    pub fn get_all(&self, section: &str, subsection: Option<&str>, key: &str) -> Vec<Option<&str>> {
+        self.sections
+            .iter()
+            .filter(|candidate| {
+                eq_ignore_ascii_case(&candidate.name, section)
+                    && candidate.subsection.as_deref() == subsection
+            })
+            .flat_map(|candidate| candidate.entries.iter())
+            .filter(|entry| eq_ignore_ascii_case(&entry.key, key))
+            .map(|entry| entry.value.as_deref())
+            .collect()
+    }
+
+    /// Interpret the last value of `section[.subsection].key` as a git boolean.
+    ///
+    /// Returns `None` when the key is unset, and otherwise applies git's
+    /// `git_config_bool` rules:
+    /// * a bare key with no `=` is `true`;
+    /// * `true`/`yes`/`on`/`1` are `true` and `false`/`no`/`off`/`0` are `false`,
+    ///   compared case-insensitively;
+    /// * an empty value (`key =`) is `false`;
+    /// * any other value that parses as an integer is `true` when non-zero and
+    ///   `false` when zero.
+    ///
+    /// A value that is neither a recognised keyword nor an integer yields `None`
+    /// (git reports this as a "bad boolean config value" error).
+    pub fn get_bool(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<bool> {
+        let entry = self
+            .sections
+            .iter()
+            .rev()
+            .filter(|candidate| {
+                eq_ignore_ascii_case(&candidate.name, section)
+                    && candidate.subsection.as_deref() == subsection
+            })
+            .flat_map(|candidate| candidate.entries.iter().rev())
+            .find(|entry| eq_ignore_ascii_case(&entry.key, key))?;
+        match &entry.value {
+            // A bare key (no `=`) is boolean true.
+            None => Some(true),
+            Some(value) => parse_config_bool(value),
+        }
+    }
+
+    pub fn repository_object_format(&self) -> Result<ObjectFormat> {
+        self.get("extensions", None, "objectformat")
+            .unwrap_or("sha1")
+            .parse()
+    }
+
+    /// Serialise the config in git's canonical on-disk form.
+    ///
+    /// Section headers sit at column 0 as `[section]` or `[section "subsection"]`
+    /// (subsections are quoted, with `"` and `\` backslash-escaped). Each entry is
+    /// indented with a single tab and written as `key = value`, with the value
+    /// quoted/escaped exactly as git would (see [`quote_config_value`]) so the
+    /// result round-trips through [`GitConfig::parse`] and matches git's own output
+    /// for the common cases. Bare boolean-true keys (value `None`) are written as
+    /// just the key.
+    pub fn to_canonical_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for section in &self.sections {
+            out.extend_from_slice(b"[");
+            out.extend_from_slice(section.name.as_bytes());
+            if let Some(subsection) = &section.subsection {
+                out.extend_from_slice(b" \"");
+                out.extend_from_slice(escape_config_subsection(subsection).as_bytes());
+                out.extend_from_slice(b"\"");
+            }
+            out.extend_from_slice(b"]\n");
+            for entry in &section.entries {
+                out.extend_from_slice(b"\t");
+                out.extend_from_slice(entry.key.as_bytes());
+                if let Some(value) = &entry.value {
+                    out.extend_from_slice(b" = ");
+                    out.extend_from_slice(quote_config_value(value).as_bytes());
+                }
+                out.extend_from_slice(b"\n");
+            }
+        }
+        out
+    }
+
+    /// Resolve `include`/`includeIf` directives in this already-parsed config.
+    ///
+    /// `base_dir` is the directory of the file these sections were parsed from;
+    /// relative include paths are resolved against it. The returned config has
+    /// every include directive replaced (in place, preserving order) by the
+    /// parsed-and-resolved contents of the referenced file, so the existing
+    /// [`GitConfig::get`]/[`GitConfig::get_bool`] precedence (last value wins)
+    /// matches upstream git.
+    pub fn resolve_includes(
+        &self,
+        base_dir: &Path,
+        context: &ConfigIncludeContext,
+    ) -> Result<GitConfig> {
+        let mut resolved = GitConfig::default();
+        splice_includes(self, base_dir, context, 0, &mut resolved.sections)?;
+        Ok(resolved)
+    }
+}
+
+/// Maximum depth of nested `include`/`includeIf` directives, matching git's
+/// `MAX_INCLUDE_DEPTH`.
+pub const CONFIG_MAX_INCLUDE_DEPTH: usize = 10;
+
+/// Context used to evaluate conditional `includeIf` directives.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigIncludeContext {
+    /// Absolute path to the repository's git directory, used by `gitdir:` conditions.
+    pub git_dir: Option<PathBuf>,
+    /// Name of the currently checked-out branch, used by `onbranch:` conditions.
+    pub current_branch: Option<String>,
+}
+
+impl ConfigIncludeContext {
+    pub fn new(git_dir: Option<PathBuf>, current_branch: Option<String>) -> Self {
+        Self {
+            git_dir,
+            current_branch,
+        }
+    }
+}
+
+/// Read a config file from disk and resolve its `include`/`includeIf` directives.
+///
+/// Missing files (including missing *included* files) are treated as empty, which
+/// matches git's behaviour of silently ignoring includes that do not exist.
+pub fn load_config_with_includes(path: &Path, context: &ConfigIncludeContext) -> Result<GitConfig> {
+    let mut sections = Vec::new();
+    load_config_file(path, context, 0, &mut sections)?;
+    Ok(GitConfig { sections })
+}
+
+/// Read and parse a single config file, then splice its includes into `out`.
+///
+/// A non-existent file contributes nothing (git silently ignores it).
+fn load_config_file(
+    path: &Path,
+    context: &ConfigIncludeContext,
+    depth: usize,
+    out: &mut Vec<ConfigSection>,
+) -> Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let parsed = GitConfig::parse(&bytes)?;
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    splice_includes(&parsed, base_dir, context, depth, out)
+}
+
+/// Walk the parsed sections in order, copying ordinary sections through and
+/// expanding `include`/`includeIf` directives in place.
+fn splice_includes(
+    parsed: &GitConfig,
+    base_dir: &Path,
+    context: &ConfigIncludeContext,
+    depth: usize,
+    out: &mut Vec<ConfigSection>,
+) -> Result<()> {
+    if depth >= CONFIG_MAX_INCLUDE_DEPTH {
+        return Err(GitError::InvalidFormat(format!(
+            "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
+        )));
+    }
+    for section in &parsed.sections {
+        match include_section_kind(section) {
+            Some(IncludeKind::Unconditional) => {
+                expand_include_paths(section, base_dir, context, depth, out)?;
+            }
+            Some(IncludeKind::Conditional(condition)) => {
+                if include_condition_matches(condition, base_dir, context) {
+                    expand_include_paths(section, base_dir, context, depth, out)?;
+                }
+            }
+            None => out.push(section.clone()),
+        }
+    }
+    Ok(())
+}
+
+/// For an include section, load every `path = <p>` entry in order.
+fn expand_include_paths(
+    section: &ConfigSection,
+    base_dir: &Path,
+    context: &ConfigIncludeContext,
+    depth: usize,
+    out: &mut Vec<ConfigSection>,
+) -> Result<()> {
+    for entry in &section.entries {
+        if !eq_ignore_ascii_case(&entry.key, "path") {
+            continue;
+        }
+        let Some(raw) = entry.value.as_deref() else {
+            continue;
+        };
+        if raw.is_empty() {
+            continue;
+        }
+        let resolved = resolve_include_path(raw, base_dir);
+        load_config_file(&resolved, context, depth + 1, out)?;
+    }
+    Ok(())
+}
+
+enum IncludeKind<'a> {
+    Unconditional,
+    Conditional(&'a str),
+}
+
+/// Classify a section as an `[include]`, `[includeIf "<cond>"]`, or neither.
+fn include_section_kind(section: &ConfigSection) -> Option<IncludeKind<'_>> {
+    if !eq_ignore_ascii_case(&section.name, "include")
+        && !eq_ignore_ascii_case(&section.name, "includeif")
+    {
+        return None;
+    }
+    // `[include]` is unconditional; `[includeIf "..."]` carries the condition in
+    // its subsection. An `include` section with a subsection, or an `includeIf`
+    // without one, is not a real include directive.
+    match (
+        eq_ignore_ascii_case(&section.name, "include"),
+        &section.subsection,
+    ) {
+        (true, None) => Some(IncludeKind::Unconditional),
+        (false, Some(condition)) => Some(IncludeKind::Conditional(condition)),
+        _ => None,
+    }
+}
+
+/// Resolve an include path string against `~`, the including file's directory,
+/// or treat it as absolute.
+fn resolve_include_path(raw: &str, base_dir: &Path) -> PathBuf {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return PathBuf::from(home).join(rest);
+        }
+        // No usable HOME: fall back to a relative interpretation so the lookup
+        // simply misses rather than panicking.
+        return base_dir.join(rest);
+    }
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        base_dir.join(candidate)
+    }
+}
+
+/// Evaluate an `includeIf` condition against the context.
+fn include_condition_matches(
+    condition: &str,
+    base_dir: &Path,
+    context: &ConfigIncludeContext,
+) -> bool {
+    if let Some(pattern) = condition.strip_prefix("gitdir:") {
+        return gitdir_condition_matches(pattern, base_dir, context, false);
+    }
+    if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
+        return gitdir_condition_matches(pattern, base_dir, context, true);
+    }
+    if let Some(pattern) = condition.strip_prefix("onbranch:") {
+        return match &context.current_branch {
+            Some(branch) => onbranch_pattern_matches(pattern, branch),
+            None => false,
+        };
+    }
+    // `hasconfig:remote.*.url:` requires inspecting already-loaded config values
+    // and is not yet implemented; treat as non-matching for now.
+    false
+}
+
+/// Match a `gitdir:`/`gitdir/i:` pattern against the absolute git directory.
+fn gitdir_condition_matches(
+    pattern: &str,
+    base_dir: &Path,
+    context: &ConfigIncludeContext,
+    case_insensitive: bool,
+) -> bool {
+    let Some(git_dir) = &context.git_dir else {
+        return false;
+    };
+    let target = normalize_path_for_match(git_dir);
+
+    // Expand the pattern's own prefixes, then normalise separators.
+    let expanded = expand_gitdir_pattern(pattern, base_dir);
+    let mut pattern = normalize_separators(&expanded);
+
+    // A trailing slash means "match this directory and everything under it",
+    // i.e. an implicit `/**` suffix.
+    if pattern.ends_with('/') {
+        pattern.push_str("**");
+    }
+    // A pattern that does not contain a `/` (after expansion) is anchored to the
+    // path tail in git; for our supported prefixes the pattern is always rooted,
+    // so no extra handling is required here.
+
+    glob_match(&pattern, &target, case_insensitive)
+}
+
+/// Look up `$HOME`, returning `None` when it is unset or empty.
+fn home_dir() -> Option<String> {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => Some(home),
+        _ => None,
+    }
+}
+
+/// Expand the `~/`, `./`, and bare-`**` leading forms of a `gitdir` pattern.
+fn expand_gitdir_pattern(pattern: &str, base_dir: &Path) -> String {
+    if let Some(rest) = pattern.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return format!("{home}/{rest}");
+        }
+        return pattern.to_string();
+    }
+    if let Some(rest) = pattern.strip_prefix("./") {
+        let base = normalize_path_for_match(base_dir);
+        let base = base.trim_end_matches('/');
+        return format!("{base}/{rest}");
+    }
+    // A pattern beginning with `**` matches anywhere; leave it as-is.
+    pattern.to_string()
+}
+
+/// Normalise a path to a forward-slash string for glob comparison.
+fn normalize_path_for_match(path: &Path) -> String {
+    normalize_separators(&path.to_string_lossy())
+}
+
+/// Convert backslashes to forward slashes so matching is separator-agnostic.
+fn normalize_separators(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+/// Match an `onbranch:` glob against a branch name. A trailing `/` means
+/// "everything under this hierarchy" (implicit `/**`), as in git.
+fn onbranch_pattern_matches(pattern: &str, branch: &str) -> bool {
+    let mut pattern = pattern.to_string();
+    if pattern.ends_with('/') {
+        pattern.push_str("**");
+    }
+    glob_match(&pattern, branch, false)
+}
+
+/// One token of a compiled glob pattern.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GlobToken {
+    /// A literal character that must match exactly.
+    Literal(char),
+    /// `?` — matches exactly one character that is not `/`.
+    AnyChar,
+    /// `*` — matches zero or more characters, none of which is `/`.
+    Star,
+    /// `**` — matches zero or more characters, including `/`.
+    DoubleStar,
+    /// A `[...]` character class.
+    Class {
+        negated: bool,
+        items: Vec<ClassItem>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClassItem {
+    Single(char),
+    Range(char, char),
+}
+
+/// Glob matcher supporting `*`, `?`, `[...]` character classes, and `**`.
+///
+/// `*` matches any run of non-`/` characters; `**` matches across `/`
+/// boundaries (including none); `?` matches a single non-`/` character.
+fn glob_match(pattern: &str, text: &str, case_insensitive: bool) -> bool {
+    let (pattern, text) = if case_insensitive {
+        (pattern.to_lowercase(), text.to_lowercase())
+    } else {
+        (pattern.to_string(), text.to_string())
+    };
+    let tokens = compile_glob(&pattern);
+    let text_chars: Vec<char> = text.chars().collect();
+    glob_match_tokens(&tokens, &text_chars)
+}
+
+/// Compile a glob string into tokens, handling `\` escapes and `[...]` classes.
+fn compile_glob(pattern: &str) -> Vec<GlobToken> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut tokens = Vec::new();
+    let mut idx = 0;
+    while idx < chars.len() {
+        match chars[idx] {
+            '*' => {
+                if chars.get(idx + 1) == Some(&'*') {
+                    tokens.push(GlobToken::DoubleStar);
+                    idx += 2;
+                } else {
+                    tokens.push(GlobToken::Star);
+                    idx += 1;
+                }
+            }
+            '?' => {
+                tokens.push(GlobToken::AnyChar);
+                idx += 1;
+            }
+            '\\' => {
+                if let Some(&next) = chars.get(idx + 1) {
+                    tokens.push(GlobToken::Literal(next));
+                    idx += 2;
+                } else {
+                    tokens.push(GlobToken::Literal('\\'));
+                    idx += 1;
+                }
+            }
+            '[' => {
+                if let Some((token, next)) = compile_char_class(&chars, idx) {
+                    tokens.push(token);
+                    idx = next;
+                } else {
+                    // Unterminated class: treat `[` as a literal.
+                    tokens.push(GlobToken::Literal('['));
+                    idx += 1;
+                }
+            }
+            other => {
+                tokens.push(GlobToken::Literal(other));
+                idx += 1;
+            }
+        }
+    }
+    tokens
+}
+
+/// Parse a `[...]` class beginning at `chars[start]`.
+///
+/// Returns the token and the index just past the closing `]`, or `None` if the
+/// class is unterminated.
+fn compile_char_class(chars: &[char], start: usize) -> Option<(GlobToken, usize)> {
+    let mut idx = start + 1;
+    let mut negated = false;
+    if chars.get(idx) == Some(&'!') || chars.get(idx) == Some(&'^') {
+        negated = true;
+        idx += 1;
+    }
+    let mut items = Vec::new();
+    let mut first = true;
+    while idx < chars.len() {
+        let current = chars[idx];
+        if current == ']' && !first {
+            return Some((GlobToken::Class { negated, items }, idx + 1));
+        }
+        first = false;
+        if chars.get(idx + 1) == Some(&'-')
+            && chars.get(idx + 2).is_some()
+            && chars.get(idx + 2) != Some(&']')
+        {
+            items.push(ClassItem::Range(current, chars[idx + 2]));
+            idx += 3;
+        } else {
+            items.push(ClassItem::Single(current));
+            idx += 1;
+        }
+    }
+    None
+}
+
+/// Recursively match compiled glob tokens against the remaining text.
+fn glob_match_tokens(tokens: &[GlobToken], text: &[char]) -> bool {
+    let Some((token, rest)) = tokens.split_first() else {
+        return text.is_empty();
+    };
+    match token {
+        GlobToken::Literal('/') => {
+            // A trailing `/**` also matches the directory itself, so `foo/**`
+            // matches `foo` (text already exhausted) as well as its contents.
+            if text.is_empty() && rest == [GlobToken::DoubleStar] {
+                return true;
+            }
+            matches!(text.split_first(), Some((&ch, tail)) if ch == '/' && glob_match_tokens(rest, tail))
+        }
+        GlobToken::Literal(expected) => {
+            matches!(text.split_first(), Some((&ch, tail)) if ch == *expected && glob_match_tokens(rest, tail))
+        }
+        GlobToken::AnyChar => {
+            matches!(text.split_first(), Some((&ch, tail)) if ch != '/' && glob_match_tokens(rest, tail))
+        }
+        GlobToken::Class { negated, items } => {
+            matches!(text.split_first(), Some((&ch, tail))
+                if ch != '/' && class_matches(items, ch) != *negated && glob_match_tokens(rest, tail))
+        }
+        GlobToken::Star => {
+            // Match zero-or-more non-`/` characters, trying shortest first.
+            if glob_match_tokens(rest, text) {
+                return true;
+            }
+            let mut consumed = 0;
+            while consumed < text.len() && text[consumed] != '/' {
+                consumed += 1;
+                if glob_match_tokens(rest, &text[consumed..]) {
+                    return true;
+                }
+            }
+            false
+        }
+        GlobToken::DoubleStar => {
+            match rest.split_first() {
+                // `**/<rest>` (a full path-component wildcard): match zero or
+                // more complete `component/` units. So `a/**/b` matches `a/b`,
+                // `a/x/b`, `a/x/y/b`, and a leading `**/foo` matches `foo` at
+                // any depth.
+                Some((GlobToken::Literal('/'), after_slash)) => {
+                    // Zero directories: the `**/` collapses away entirely.
+                    if glob_match_tokens(after_slash, text) {
+                        return true;
+                    }
+                    // One or more directories: consume up to and including the
+                    // next `/`, then retry the whole `**/...` against the rest.
+                    let mut consumed = 0;
+                    while consumed < text.len() {
+                        let ch = text[consumed];
+                        consumed += 1;
+                        if ch == '/' && glob_match_tokens(tokens, &text[consumed..]) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+                // Trailing `**` or `**` before a non-slash: match any run of
+                // characters, including `/` and including none.
+                _ => {
+                    if glob_match_tokens(rest, text) {
+                        return true;
+                    }
+                    for consumed in 1..=text.len() {
+                        if glob_match_tokens(rest, &text[consumed..]) {
+                            return true;
+                        }
+                    }
+                    false
+                }
+            }
+        }
+    }
+}
+
+fn class_matches(items: &[ClassItem], ch: char) -> bool {
+    items.iter().any(|item| match item {
+        ClassItem::Single(value) => *value == ch,
+        ClassItem::Range(lo, hi) => *lo <= ch && ch <= *hi,
+    })
+}
+
+/// Character-level parser for the gitconfig file format.
+///
+/// This mirrors git's own `git_parse_source`: it scans the input as a stream of
+/// characters rather than independent lines, because both line continuations
+/// (a trailing `\`) and quoted strings (in values *and* subsection headers) may
+/// span physical lines. Section/variable names are lower-cased (they are
+/// case-insensitive); subsection names in the quoted form keep their case, while
+/// the deprecated dotted form lower-cases the subsection.
+struct ConfigParser<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+    /// 1-based physical line number, advanced on every consumed `\n`.
+    line: usize,
+}
+
+impl<'a> ConfigParser<'a> {
+    fn new(text: &'a str) -> Self {
+        Self {
+            chars: text.chars().peekable(),
+            line: 1,
+        }
+    }
+
+    fn peek(&mut self) -> Option<char> {
+        self.chars.peek().copied()
+    }
+
+    /// Consume and return the next character, tracking line numbers.
+    fn bump(&mut self) -> Option<char> {
+        let ch = self.chars.next();
+        if ch == Some('\n') {
+            self.line += 1;
+        }
+        ch
+    }
+
+    fn err(&self, message: impl std::fmt::Display) -> GitError {
+        GitError::InvalidFormat(format!("config line {}: {message}", self.line))
+    }
+
+    /// Skip spaces and tabs (but never newlines), returning the next char if any.
+    fn skip_blanks(&mut self) {
+        while matches!(self.peek(), Some(' ') | Some('\t') | Some('\r')) {
+            self.bump();
+        }
+    }
+
+    fn parse(mut self) -> Result<GitConfig> {
+        let mut config = GitConfig::default();
+        let mut current: Option<usize> = None;
+        loop {
+            self.skip_blanks();
+            match self.peek() {
+                None => break,
+                Some('\n') => {
+                    self.bump();
+                }
+                Some('#') | Some(';') => self.skip_to_eol(),
+                Some('[') => {
+                    let section = self.parse_section_header()?;
+                    config.sections.push(section);
+                    current = Some(config.sections.len() - 1);
+                }
+                Some(ch) if ch.is_ascii_alphabetic() => {
+                    let entry = self.parse_entry()?;
+                    let Some(idx) = current else {
+                        return Err(self.err("variable definition appears before a section"));
+                    };
+                    config.sections[idx].entries.push(entry);
+                }
+                Some(ch) => {
+                    return Err(self.err(format!("unexpected character {ch:?}")));
+                }
+            }
+        }
+        Ok(config)
+    }
+
+    /// Consume the rest of the current physical line, including its terminator.
+    fn skip_to_eol(&mut self) {
+        while let Some(ch) = self.peek() {
+            if ch == '\n' {
+                self.bump();
+                break;
+            }
+            self.bump();
+        }
+    }
+
+    /// Parse a `[section]`, `[section "subsection"]`, or deprecated
+    /// `[section.subsection]` header. The leading `[` is the next character.
+    fn parse_section_header(&mut self) -> Result<ConfigSection> {
+        self.bump(); // consume '['
+                     // Section name: alphanumeric, '-', and '.' (the dotted-subsection form).
+        let mut name = String::new();
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
+                name.push(ch);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        // Deprecated dotted form: `[section.subsection]`. The subsection runs to
+        // the first '.', everything after is the (case-insensitive) subsection.
+        if let Some((head, rest)) = name.split_once('.') {
+            let subsection = rest.to_string();
+            let head = head.to_string();
+            self.skip_blanks();
+            match self.bump() {
+                Some(']') => {}
+                _ => return Err(self.err("missing ']' after dotted section header")),
+            }
+            if !is_config_name(&head) {
+                return Err(self.err(format!("invalid section name {head}")));
+            }
+            // Subsection in the dotted form is lower-cased by git.
+            return Ok(ConfigSection {
+                name: head.to_ascii_lowercase(),
+                subsection: Some(subsection.to_ascii_lowercase()),
+                entries: Vec::new(),
+            });
+        }
+        if !is_config_name(&name) {
+            return Err(self.err(format!("invalid section name {name}")));
+        }
+        // Either a closing ']' or whitespace followed by a quoted subsection.
+        match self.peek() {
+            Some(']') => {
+                self.bump();
+                Ok(ConfigSection {
+                    name: name.to_ascii_lowercase(),
+                    subsection: None,
+                    entries: Vec::new(),
+                })
+            }
+            Some(' ') | Some('\t') => {
+                self.skip_blanks();
+                if self.peek() != Some('"') {
+                    return Err(self.err("expected quoted subsection name"));
+                }
+                let subsection = self.parse_subsection_name()?;
+                self.skip_blanks();
+                match self.bump() {
+                    Some(']') => {}
+                    _ => return Err(self.err("missing ']' after subsection name")),
+                }
+                Ok(ConfigSection {
+                    name: name.to_ascii_lowercase(),
+                    // Subsection names are case-sensitive in the quoted form.
+                    subsection: Some(subsection),
+                    entries: Vec::new(),
+                })
+            }
+            _ => Err(self.err("malformed section header")),
+        }
+    }
+
+    /// Parse the contents of a quoted subsection name (the opening `"` is next).
+    ///
+    /// Only `\\` and `\"` are escapes here; any other `\<char>` keeps the literal
+    /// character (dropping the backslash), and `\n`/`\t` are NOT interpreted.
+    fn parse_subsection_name(&mut self) -> Result<String> {
+        self.bump(); // consume opening '"'
+        let mut out = String::new();
+        loop {
+            match self.bump() {
+                None | Some('\n') => return Err(self.err("unterminated subsection name")),
+                Some('"') => return Ok(out),
+                Some('\\') => match self.bump() {
+                    None | Some('\n') => {
+                        return Err(self.err("unterminated subsection name"));
+                    }
+                    Some(other) => out.push(other),
+                },
+                Some(other) => out.push(other),
+            }
+        }
+    }
+
+    /// Parse a `name` or `name = value` entry. The first character of the name is
+    /// the next character.
+    fn parse_entry(&mut self) -> Result<ConfigEntry> {
+        let mut key = String::new();
+        while let Some(ch) = self.peek() {
+            if ch.is_ascii_alphanumeric() || ch == '-' {
+                key.push(ch);
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        if !is_config_name(&key) {
+            return Err(self.err(format!("invalid variable name {key}")));
+        }
+        self.skip_blanks();
+        match self.peek() {
+            // Bare variable: boolean true. Nothing but a comment or EOL may follow.
+            None => Ok(ConfigEntry {
+                key: key.to_ascii_lowercase(),
+                value: None,
+            }),
+            Some('\n') => {
+                self.bump();
+                Ok(ConfigEntry {
+                    key: key.to_ascii_lowercase(),
+                    value: None,
+                })
+            }
+            Some('=') => {
+                self.bump();
+                let value = self.parse_value()?;
+                Ok(ConfigEntry {
+                    key: key.to_ascii_lowercase(),
+                    value: Some(value),
+                })
+            }
+            Some(ch) => Err(self.err(format!("expected '=' after variable name, found {ch:?}"))),
+        }
+    }
+
+    /// Parse a variable value after the `=`.
+    ///
+    /// Handles: leading/trailing whitespace trimming (outside quotes), double
+    /// quotes that preserve spaces, the escapes `\n \t \b \" \\`, line
+    /// continuation via a trailing `\`, and inline `#`/`;` comments (outside
+    /// quotes). Quoted runs and unquoted runs may be mixed within one value.
+    fn parse_value(&mut self) -> Result<String> {
+        let mut out = String::new();
+        // Number of trailing whitespace chars currently buffered in `out` that
+        // should be dropped if the value ends here (outside quotes).
+        let mut trailing_ws = 0usize;
+        let mut leading = true;
+        let mut in_quotes = false;
+        loop {
+            match self.peek() {
+                None => break,
+                Some('\n') if !in_quotes => {
+                    self.bump();
+                    break;
+                }
+                Some('\n') => return Err(self.err("newline inside quoted value")),
+                Some('"') => {
+                    self.bump();
+                    in_quotes = !in_quotes;
+                    leading = false;
+                }
+                Some('\\') => {
+                    self.bump();
+                    match self.bump() {
+                        // Line continuation: backslash immediately before a newline.
+                        Some('\n') => {}
+                        Some('\r') if self.peek() == Some('\n') => {
+                            self.bump();
+                        }
+                        Some('n') => {
+                            out.push('\n');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        Some('t') => {
+                            out.push('\t');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        Some('b') => {
+                            out.push('\u{0008}');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        Some('"') => {
+                            out.push('"');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        Some('\\') => {
+                            out.push('\\');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        Some(other) => {
+                            return Err(self.err(format!("invalid escape sequence \\{other}")));
+                        }
+                        // A backslash right at end-of-input is a continuation with
+                        // nothing to continue onto; git tolerates this.
+                        None => break,
+                    }
+                }
+                // Comments terminate an unquoted value.
+                Some('#') | Some(';') if !in_quotes => {
+                    self.skip_to_eol();
+                    break;
+                }
+                Some(ch @ (' ' | '\t' | '\r')) if !in_quotes => {
+                    self.bump();
+                    if leading {
+                        // Drop leading whitespace entirely.
+                    } else {
+                        out.push(ch);
+                        trailing_ws += 1;
+                    }
+                }
+                Some(ch) => {
+                    self.bump();
+                    out.push(ch);
+                    trailing_ws = 0;
+                    leading = false;
+                }
+            }
+        }
+        if in_quotes {
+            return Err(self.err("unterminated quoted value"));
+        }
+        // Trim trailing unquoted whitespace that was buffered.
+        out.truncate(out.len() - trailing_ws);
+        Ok(out)
+    }
+}
+
+/// Quote and escape a config value the way git's writer does.
+///
+/// The value is wrapped in double quotes only when it begins or ends with a space
+/// or contains a `#` or `;` (which would otherwise start a comment). Independently
+/// of quoting, `\` becomes `\\`, `"` becomes `\"`, tab becomes `\t`, and newline
+/// becomes `\n`; other characters (including backspace) are emitted verbatim, just
+/// as git does. The result always round-trips back through the parser to the
+/// original value.
+fn quote_config_value(value: &str) -> String {
+    let needs_quotes = value.starts_with(' ')
+        || value.ends_with(' ')
+        || value.bytes().any(|byte| matches!(byte, b'#' | b';'));
+    let mut out = String::new();
+    if needs_quotes {
+        out.push('"');
+    }
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            other => out.push(other),
+        }
+    }
+    if needs_quotes {
+        out.push('"');
+    }
+    out
+}
+
+/// Escape a subsection name for a `[section "subsection"]` header.
+///
+/// Only `\` and `"` are escaped (to `\\` and `\"`); all other characters are
+/// emitted verbatim, matching git's section-header writer. (Newlines and tabs
+/// cannot legally appear in a subsection name.)
+fn escape_config_subsection(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Parse a string as a git boolean, returning `None` if it is not a valid boolean.
+///
+/// Implements git's `git_config_bool` rules so the CLI can share one source of
+/// truth. The keywords `true`/`yes`/`on`/`1` are `true` and `false`/`no`/`off`/`0`
+/// are `false` (case-insensitive). An empty string is `false`. Any other value
+/// that parses as an integer (see [`parse_config_int`]) is `true` when non-zero
+/// and `false` when zero; everything else returns `None`.
+///
+/// Note: a *bare* key with no `=` is boolean `true`, but that is represented as a
+/// `None` value at the [`ConfigEntry`] level and handled by [`GitConfig::get_bool`];
+/// this function only classifies an explicit value string.
+pub fn parse_config_bool(value: &str) -> Option<bool> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+        || trimmed == "1"
+    {
+        return Some(true);
+    }
+    if trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed == "0"
+        || trimmed.is_empty()
+    {
+        return Some(false);
+    }
+    // Fall back to git's bool-from-int behaviour: any integer is true unless zero.
+    parse_config_int(trimmed).map(|number| number != 0)
+}
+
+/// Parse a string as a git integer, returning `None` if it is not a valid integer.
+///
+/// Implements git's `git_parse_long`/unit handling so the CLI can share one source
+/// of truth. A single trailing `k`/`m`/`g` suffix (case-insensitive) multiplies by
+/// 1024, 1024², or 1024³ respectively. Decimal (optionally signed), hexadecimal
+/// (`0x`), and octal (`0`-prefixed) bases are accepted, just like `strtol`.
+/// Overflow on the multiplication or the base parse yields `None`.
+pub fn parse_config_int(value: &str) -> Option<i64> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match trimmed.as_bytes().last().copied() {
+        Some(b'k' | b'K') => (&trimmed[..trimmed.len() - 1], 1024_i64),
+        Some(b'm' | b'M') => (&trimmed[..trimmed.len() - 1], 1024_i64 * 1024),
+        Some(b'g' | b'G') => (&trimmed[..trimmed.len() - 1], 1024_i64 * 1024 * 1024),
+        _ => (trimmed, 1_i64),
+    };
+    // git requires the unit suffix to immediately follow the digits (no space),
+    // so `digits` is parsed as-is rather than re-trimmed.
+    parse_c_long(digits)?.checked_mul(multiplier)
+}
+
+/// Parse an optionally-signed integer in decimal, hex (`0x`), or octal (`0`)
+/// notation, mirroring C's `strtol` with base 0 as git uses for config integers.
+fn parse_c_long(text: &str) -> Option<i64> {
+    let (negative, rest) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text.strip_prefix('+').unwrap_or(text)),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    let magnitude = if let Some(hex) = rest.strip_prefix("0x").or_else(|| rest.strip_prefix("0X")) {
+        i64::from_str_radix(hex, 16).ok()?
+    } else if rest.len() > 1 && rest.starts_with('0') {
+        i64::from_str_radix(rest, 8).ok()?
+    } else {
+        rest.parse::<i64>().ok()?
+    };
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
+/// The result of interpreting a config value with git's `--bool-or-int` typing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigBoolOrInt {
+    /// The value is a recognised boolean keyword (`true`/`false`/`yes`/...).
+    Bool(bool),
+    /// The value is an integer (possibly with a `k`/`m`/`g` unit suffix).
+    Int(i64),
+}
+
+/// Parse a string with git's `--bool-or-int` typing rules.
+///
+/// A value that is a boolean *keyword* (`true`/`false`/`yes`/`no`/`on`/`off`, or an
+/// empty string) is returned as [`ConfigBoolOrInt::Bool`]; otherwise an integer
+/// value (see [`parse_config_int`]) is returned as [`ConfigBoolOrInt::Int`]. The
+/// bare numbers `0` and `1` are treated as integers, matching git. An empty string
+/// is `Bool(false)` (as git treats `key =`). Anything that is neither a boolean
+/// keyword nor an integer returns `None`.
+pub fn parse_config_bool_or_int(value: &str) -> Option<ConfigBoolOrInt> {
+    let trimmed = value.trim();
+    if trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+    {
+        return Some(ConfigBoolOrInt::Bool(true));
+    }
+    if trimmed.eq_ignore_ascii_case("false")
+        || trimmed.eq_ignore_ascii_case("no")
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.is_empty()
+    {
+        return Some(ConfigBoolOrInt::Bool(false));
+    }
+    parse_config_int(trimmed).map(ConfigBoolOrInt::Int)
+}
+
+fn is_config_name(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn eq_ignore_ascii_case(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn config_parses_sections_values_and_comments() {
+        let config = GitConfig::parse(
+            br#"
+[core]
+    filemode = true
+    bare = false ; comment
+[remote "origin"]
+    url = "https://example.invalid/repo.git"
+    fetch = +refs/heads/*:refs/remotes/origin/*
+[feature]
+    enabled
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
+        assert_eq!(config.get_bool("core", None, "bare"), Some(false));
+        assert_eq!(
+            config.get("remote", Some("origin"), "url"),
+            Some("https://example.invalid/repo.git")
+        );
+        assert_eq!(config.get_bool("feature", None, "enabled"), Some(true));
+    }
+
+    #[test]
+    fn config_reports_repository_object_format() {
+        let config = GitConfig::parse(b"[extensions]\n\tobjectformat = sha256\n").unwrap();
+        assert_eq!(
+            config.repository_object_format().unwrap(),
+            ObjectFormat::Sha256
+        );
+    }
+
+    #[test]
+    fn config_canonical_writer_round_trips() {
+        let config = GitConfig {
+            sections: vec![ConfigSection {
+                name: "remote".into(),
+                subsection: Some("origin repo".into()),
+                entries: vec![ConfigEntry {
+                    key: "url".into(),
+                    value: Some("https://example.invalid/repo.git".into()),
+                }],
+            }],
+        };
+        let parsed = GitConfig::parse(&config.to_canonical_bytes()).unwrap();
+        assert_eq!(parsed, config);
+    }
+
+    // ----- gitconfig format compliance tests -----
+
+    /// Convenience: parse and fetch the single `core.x` value (panicking on parse
+    /// errors is fine here because each input is a known-good fixture).
+    fn parse_core_x(input: &str) -> Option<String> {
+        GitConfig::parse(input.as_bytes())
+            .unwrap()
+            .get("core", None, "x")
+            .map(str::to_string)
+    }
+
+    #[test]
+    fn config_section_name_is_case_insensitive() {
+        let config = GitConfig::parse(b"[Core]\n\tBar = value\n").unwrap();
+        assert_eq!(config.get("core", None, "bar"), Some("value"));
+        assert_eq!(config.get("CORE", None, "BAR"), Some("value"));
+        // Stored names are lower-cased.
+        assert_eq!(config.sections[0].name, "core");
+        assert_eq!(config.sections[0].entries[0].key, "bar");
+    }
+
+    #[test]
+    fn config_subsection_name_is_case_sensitive() {
+        let config = GitConfig::parse(b"[remote \"Origin\"]\n\turl = x\n").unwrap();
+        assert_eq!(config.get("remote", Some("Origin"), "url"), Some("x"));
+        // Case-mismatched subsection must not match.
+        assert_eq!(config.get("remote", Some("origin"), "url"), None);
+    }
+
+    #[test]
+    fn config_subsection_accepts_escaped_quote_and_backslash() {
+        // [remote "with\"quote"] -> subsection is with"quote
+        let config = GitConfig::parse(b"[remote \"with\\\"quote\"]\n\turl = x\n").unwrap();
+        assert_eq!(
+            config.sections[0].subsection.as_deref(),
+            Some("with\"quote")
+        );
+        assert_eq!(config.get("remote", Some("with\"quote"), "url"), Some("x"));
+
+        // [remote "a\\b"] -> subsection is a\b
+        let config = GitConfig::parse(b"[remote \"a\\\\b\"]\n\turl = y\n").unwrap();
+        assert_eq!(config.sections[0].subsection.as_deref(), Some("a\\b"));
+    }
+
+    #[test]
+    fn config_subsection_unknown_escape_keeps_literal_char() {
+        // In a subsection only \\ and \" are real escapes; \n is a literal "n",
+        // NOT a newline (unlike a value).
+        let config = GitConfig::parse(b"[remote \"a\\nb\"]\n\turl = x\n").unwrap();
+        assert_eq!(config.sections[0].subsection.as_deref(), Some("anb"));
+    }
+
+    #[test]
+    fn config_dotted_subsection_is_case_insensitive() {
+        // Deprecated [section.subsection] form: subsection is lower-cased.
+        let config = GitConfig::parse(b"[core.Sub]\n\tbar = x\n").unwrap();
+        assert_eq!(config.sections[0].name, "core");
+        assert_eq!(config.sections[0].subsection.as_deref(), Some("sub"));
+        assert_eq!(config.get("core", Some("sub"), "bar"), Some("x"));
+        // The original (mixed) case must not match.
+        assert_eq!(config.get("core", Some("Sub"), "bar"), None);
+    }
+
+    #[test]
+    fn config_dotted_subsection_keeps_inner_dots() {
+        // Everything after the first dot is the subsection, dots and all.
+        let config = GitConfig::parse(b"[a.b.c]\n\tk = v\n").unwrap();
+        assert_eq!(config.sections[0].name, "a");
+        assert_eq!(config.sections[0].subsection.as_deref(), Some("b.c"));
+    }
+
+    #[test]
+    fn config_bare_variable_is_boolean_true() {
+        let config = GitConfig::parse(b"[core]\n\tflag\n").unwrap();
+        assert_eq!(config.sections[0].entries[0].value, None);
+        assert_eq!(config.get_bool("core", None, "flag"), Some(true));
+        // A bare key has no string value.
+        assert_eq!(config.get("core", None, "flag"), None);
+    }
+
+    #[test]
+    fn config_explicit_empty_value_is_boolean_false() {
+        // `x =` (with the equals) is an empty value, which git treats as false,
+        // distinct from a bare key with no equals (true).
+        let config = GitConfig::parse(b"[core]\n\tx =\n").unwrap();
+        assert_eq!(config.sections[0].entries[0].value.as_deref(), Some(""));
+        assert_eq!(config.get_bool("core", None, "x"), Some(false));
+    }
+
+    #[test]
+    fn config_value_unquoted_trims_surrounding_whitespace() {
+        assert_eq!(
+            parse_core_x("[core]\n\tx =    hello world   \n").as_deref(),
+            Some("hello world")
+        );
+    }
+
+    #[test]
+    fn config_value_quotes_preserve_spaces() {
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"  spaced  \"\n").as_deref(),
+            Some("  spaced  ")
+        );
+    }
+
+    #[test]
+    fn config_value_mixes_quoted_and_unquoted_runs() {
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\" b \"c\n").as_deref(),
+            Some("a b c")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"ab\"   cd\n").as_deref(),
+            Some("ab   cd")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\"\"b\n").as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn config_value_processes_escapes_in_unquoted_and_quoted() {
+        // Escapes are processed in both unquoted and quoted values.
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\\tb\\nc\n").as_deref(),
+            Some("a\tb\nc")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"a\\tb\"\n").as_deref(),
+            Some("a\tb")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\\bb\n").as_deref(),
+            Some("a\u{8}b")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\\\"b\n").as_deref(),
+            Some("a\"b")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\\\\b\n").as_deref(),
+            Some("a\\b")
+        );
+    }
+
+    #[test]
+    fn config_value_rejects_unknown_escape() {
+        // \z is not a valid escape, in either quoted or unquoted values.
+        assert!(GitConfig::parse(b"[core]\n\tx = a\\zb\n").is_err());
+        assert!(GitConfig::parse(b"[core]\n\tx = \"a\\zb\"\n").is_err());
+    }
+
+    #[test]
+    fn config_value_line_continuation_joins_lines() {
+        // A trailing backslash continues the value onto the next physical line.
+        assert_eq!(
+            parse_core_x("[core]\n\tx = a\\\n b\n").as_deref(),
+            Some("a b")
+        );
+    }
+
+    #[test]
+    fn config_value_continuation_inside_quotes() {
+        // The continuation also works inside a quoted span.
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"a\\\n b\"\n").as_deref(),
+            Some("a b")
+        );
+    }
+
+    #[test]
+    fn config_value_inline_comments_stripped_outside_quotes() {
+        assert_eq!(
+            parse_core_x("[core]\n\tx = val ; comment\n").as_deref(),
+            Some("val")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = val # comment\n").as_deref(),
+            Some("val")
+        );
+        // Comment characters inside quotes are literal.
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"a#b\"\n").as_deref(),
+            Some("a#b")
+        );
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"ab\" ; c\n").as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn config_bare_key_with_inline_comment_is_error() {
+        // git rejects a comment after a value-less key.
+        assert!(GitConfig::parse(b"[core]\n\tflag ; comment\n").is_err());
+        assert!(GitConfig::parse(b"[core]\n\tflag # comment\n").is_err());
+    }
+
+    #[test]
+    fn config_unterminated_quote_is_error() {
+        assert!(GitConfig::parse(b"[core]\n\tx = \"ab\n").is_err());
+    }
+
+    #[test]
+    fn config_trailing_backslash_at_eof_is_tolerated() {
+        // A trailing backslash with no following line just ends the value.
+        assert_eq!(parse_core_x("[core]\n\tx = a\\").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn config_handles_crlf_line_endings() {
+        assert_eq!(parse_core_x("[core]\r\n\tx = y\r\n").as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn config_no_spaces_around_equals() {
+        assert_eq!(parse_core_x("[core]\n\tx=y\n").as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn config_multi_valued_keys_preserve_order_and_duplicates() {
+        let config = GitConfig::parse(b"[core]\n\tx = 1\n\tx = 2\n\tx = 1\n").unwrap();
+        assert_eq!(
+            config.get_all("core", None, "x"),
+            vec![Some("1"), Some("2"), Some("1")]
+        );
+        // Last value wins for the scalar getter.
+        assert_eq!(config.get("core", None, "x"), Some("1"));
+    }
+
+    #[test]
+    fn config_get_all_spans_multiple_sections_in_order() {
+        let config =
+            GitConfig::parse(b"[core]\n\tx = a\n[other]\n\ty = z\n[core]\n\tx = b\n").unwrap();
+        assert_eq!(
+            config.get_all("core", None, "x"),
+            vec![Some("a"), Some("b")]
+        );
+    }
+
+    #[test]
+    fn config_rejects_value_before_section() {
+        assert!(GitConfig::parse(b"\tx = y\n").is_err());
+    }
+
+    #[test]
+    fn config_rejects_invalid_names() {
+        // An underscore is not allowed in section or variable names.
+        assert!(GitConfig::parse(b"[core]\n\tx_y = 1\n").is_err());
+        assert!(GitConfig::parse(b"[a_b]\n\tx = 1\n").is_err());
+    }
+
+    #[test]
+    fn config_variable_name_must_start_with_letter() {
+        // git requires variable names to begin with an alphabetic character.
+        assert!(GitConfig::parse(b"[core]\n\t1x = y\n").is_err());
+        assert!(GitConfig::parse(b"[core]\n\t-x = y\n").is_err());
+        // ...but a letter followed by digits/hyphens is fine.
+        assert_eq!(parse_core_x("[core]\n\tx = ok\n").as_deref(), Some("ok"));
+        let config = GitConfig::parse(b"[core]\n\tx1-y = z\n").unwrap();
+        assert_eq!(config.get("core", None, "x1-y"), Some("z"));
+    }
+
+    #[test]
+    fn config_section_name_may_start_with_digit() {
+        // Unlike variable names, section names may begin with a digit.
+        let config = GitConfig::parse(b"[1core]\n\tx = y\n").unwrap();
+        assert_eq!(config.get("1core", None, "x"), Some("y"));
+    }
+
+    #[test]
+    fn config_comments_and_blank_lines_are_skipped() {
+        let config = GitConfig::parse(b"# top\n; also\n\n[core]\n\n\tx = y\n# trailing\n").unwrap();
+        assert_eq!(config.get("core", None, "x"), Some("y"));
+    }
+
+    // ----- bool / int / bool-or-int coercion -----
+
+    #[test]
+    fn parse_config_bool_keywords() {
+        for truthy in ["true", "TRUE", "yes", "Yes", "on", "ON", "1"] {
+            assert_eq!(parse_config_bool(truthy), Some(true), "{truthy}");
+        }
+        for falsy in ["false", "FALSE", "no", "No", "off", "OFF", "0", ""] {
+            assert_eq!(parse_config_bool(falsy), Some(false), "{falsy}");
+        }
+    }
+
+    #[test]
+    fn parse_config_bool_accepts_integers() {
+        // Non-zero integers are true, zero is false (git's bool-from-int rule).
+        assert_eq!(parse_config_bool("5"), Some(true));
+        assert_eq!(parse_config_bool("-3"), Some(true));
+        assert_eq!(parse_config_bool("0"), Some(false));
+        assert_eq!(parse_config_bool("0x10"), Some(true));
+        // Non-numeric, non-keyword strings are not booleans.
+        assert_eq!(parse_config_bool("foo"), None);
+    }
+
+    #[test]
+    fn parse_config_int_units_and_bases() {
+        assert_eq!(parse_config_int("1k"), Some(1024));
+        assert_eq!(parse_config_int("1K"), Some(1024));
+        assert_eq!(parse_config_int("1m"), Some(1024 * 1024));
+        assert_eq!(parse_config_int("1M"), Some(1024 * 1024));
+        assert_eq!(parse_config_int("2g"), Some(2 * 1024 * 1024 * 1024));
+        assert_eq!(parse_config_int("1G"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_config_int("5"), Some(5));
+        assert_eq!(parse_config_int("-5"), Some(-5));
+        assert_eq!(parse_config_int("0x10"), Some(16));
+        assert_eq!(parse_config_int("010"), Some(8));
+    }
+
+    #[test]
+    fn parse_config_int_rejects_invalid() {
+        assert_eq!(parse_config_int(""), None);
+        assert_eq!(parse_config_int("foo"), None);
+        assert_eq!(parse_config_int("1 k"), None);
+        assert_eq!(parse_config_int("1.5"), None);
+        // Overflow on the unit multiplication is rejected rather than wrapping.
+        assert_eq!(parse_config_int("9999999999999999999g"), None);
+    }
+
+    #[test]
+    fn parse_config_bool_or_int_typing() {
+        assert_eq!(
+            parse_config_bool_or_int("yes"),
+            Some(ConfigBoolOrInt::Bool(true))
+        );
+        assert_eq!(
+            parse_config_bool_or_int("off"),
+            Some(ConfigBoolOrInt::Bool(false))
+        );
+        // git treats a bare empty value as false here too.
+        assert_eq!(
+            parse_config_bool_or_int(""),
+            Some(ConfigBoolOrInt::Bool(false))
+        );
+        // Bare numbers (including 0 and 1) are integers, not booleans.
+        assert_eq!(parse_config_bool_or_int("5"), Some(ConfigBoolOrInt::Int(5)));
+        assert_eq!(parse_config_bool_or_int("0"), Some(ConfigBoolOrInt::Int(0)));
+        assert_eq!(parse_config_bool_or_int("1"), Some(ConfigBoolOrInt::Int(1)));
+        assert_eq!(
+            parse_config_bool_or_int("1k"),
+            Some(ConfigBoolOrInt::Int(1024))
+        );
+        assert_eq!(parse_config_bool_or_int("foo"), None);
+    }
+
+    // ----- serialization / round-trip -----
+
+    #[test]
+    fn config_canonical_value_quoting_matches_git() {
+        // (value, expected serialized form of the value portion)
+        let cases = [
+            ("simple", "simple"),
+            ("a b c", "a b c"),         // internal spaces: no quotes
+            ("  lead", "\"  lead\""),   // leading space: quote
+            ("trail  ", "\"trail  \""), // trailing space: quote
+            ("a#b", "\"a#b\""),         // '#' forces quotes
+            ("a;b", "\"a;b\""),         // ';' forces quotes
+            ("a\"b", "a\\\"b"),         // embedded quote: escape, no surrounding quotes
+            ("a\\b", "a\\\\b"),         // backslash escaped
+            ("a\tb", "a\\tb"),          // tab escaped, no surrounding quotes
+            ("a\nb", "a\\nb"),          // newline escaped
+        ];
+        for (value, expected) in cases {
+            let config = GitConfig {
+                sections: vec![ConfigSection {
+                    name: "core".into(),
+                    subsection: None,
+                    entries: vec![ConfigEntry {
+                        key: "x".into(),
+                        value: Some(value.to_string()),
+                    }],
+                }],
+            };
+            let bytes = config.to_canonical_bytes();
+            let text = String::from_utf8(bytes).unwrap();
+            let expected_line = format!("\tx = {expected}\n");
+            assert!(
+                text.contains(&expected_line),
+                "value {value:?} serialized to {text:?}, expected to contain {expected_line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_subsection_header_only_escapes_quote_and_backslash() {
+        let config = GitConfig {
+            sections: vec![ConfigSection {
+                name: "remote".into(),
+                subsection: Some("a\"b\\c".into()),
+                entries: vec![ConfigEntry {
+                    key: "url".into(),
+                    value: Some("x".into()),
+                }],
+            }],
+        };
+        let text = String::from_utf8(config.to_canonical_bytes()).unwrap();
+        assert!(
+            text.starts_with("[remote \"a\\\"b\\\\c\"]\n"),
+            "unexpected header: {text:?}"
+        );
+    }
+
+    #[test]
+    fn config_round_trip_is_stable_for_tricky_values() {
+        // parse -> serialize -> parse must be a fixpoint and preserve the value.
+        let values = [
+            "simple",
+            "a b c",
+            "  leading and trailing  ",
+            "with#hash",
+            "with;semi",
+            "with\"quote",
+            "with\\backslash",
+            "with\ttab",
+            "with\nnewline",
+            "  # ; \" \\ \t mixed  ",
+            "",
+        ];
+        for value in values {
+            let original = GitConfig {
+                sections: vec![ConfigSection {
+                    name: "core".into(),
+                    subsection: Some("a b\"c".into()),
+                    entries: vec![
+                        ConfigEntry {
+                            key: "x".into(),
+                            value: Some(value.to_string()),
+                        },
+                        // A bare boolean-true key should survive the round trip.
+                        ConfigEntry {
+                            key: "flag".into(),
+                            value: None,
+                        },
+                    ],
+                }],
+            };
+            let serialized = original.to_canonical_bytes();
+            let reparsed = GitConfig::parse(&serialized).unwrap();
+            assert_eq!(reparsed, original, "value {value:?} did not round-trip");
+            // Serializing again must be byte-identical (stable fixpoint).
+            assert_eq!(
+                reparsed.to_canonical_bytes(),
+                serialized,
+                "value {value:?} is not a serialization fixpoint"
+            );
+        }
+    }
+
+    #[test]
+    fn config_round_trip_preserves_multi_value_order() {
+        let original = GitConfig {
+            sections: vec![ConfigSection {
+                name: "core".into(),
+                subsection: None,
+                entries: vec![
+                    ConfigEntry {
+                        key: "x".into(),
+                        value: Some("first".into()),
+                    },
+                    ConfigEntry {
+                        key: "x".into(),
+                        value: Some("second".into()),
+                    },
+                    ConfigEntry {
+                        key: "x".into(),
+                        value: Some("first".into()),
+                    },
+                ],
+            }],
+        };
+        let reparsed = GitConfig::parse(&original.to_canonical_bytes()).unwrap();
+        assert_eq!(reparsed, original);
+        assert_eq!(
+            reparsed.get_all("core", None, "x"),
+            vec![Some("first"), Some("second"), Some("first")]
+        );
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    /// Build a unique scratch directory under the system temp dir and create it.
+    fn unique_include_dir(tag: &str) -> PathBuf {
+        let dir = unique_temp_dir(tag);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn glob_matcher_handles_stars_classes_and_double_star() {
+        // Single star does not cross path separators.
+        assert!(glob_match("foo*", "foobar", false));
+        assert!(glob_match("*bar", "foobar", false));
+        assert!(!glob_match("foo*", "foo/bar", false));
+        // `?` matches one non-slash char.
+        assert!(glob_match("f?o", "foo", false));
+        assert!(!glob_match("f?o", "f/o", false));
+        // Character classes and ranges.
+        assert!(glob_match("[a-c]oo", "boo", false));
+        assert!(!glob_match("[a-c]oo", "zoo", false));
+        assert!(glob_match("[!a-c]oo", "zoo", false));
+        // `**` crosses separators, including zero directories.
+        assert!(glob_match("/home/**", "/home/user/work/.git", false));
+        assert!(glob_match("/home/**", "/home", false));
+        assert!(glob_match("**/foo/.git", "/a/b/foo/.git", false));
+        assert!(glob_match("**/foo/.git", "/foo/.git", false));
+        assert!(glob_match("a/**/b", "a/b", false));
+        assert!(glob_match("a/**/b", "a/x/y/b", false));
+        assert!(!glob_match("a/**/b", "a/xb", false));
+        // Case-insensitive matching.
+        assert!(glob_match("/Home/**", "/home/user/.git", true));
+        assert!(!glob_match("/Home/**", "/home/user/.git", false));
+    }
+
+    #[test]
+    fn config_include_unconditional_merges_and_overrides() {
+        let dir = unique_include_dir("inc-uncond");
+        let main = dir.join("config");
+        let extra = dir.join("extra.cfg");
+        fs::write(
+            &main,
+            format!(
+                "[core]\n\tfilemode = false\n[include]\n\tpath = {}\n",
+                extra.display()
+            ),
+        )
+        .unwrap();
+        // The included file overrides filemode and adds a new value.
+        fs::write(&extra, "[core]\n\tfilemode = true\n\tbig = yes\n").unwrap();
+
+        let ctx = ConfigIncludeContext::default();
+        let config = load_config_with_includes(&main, &ctx).unwrap();
+        assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
+        assert_eq!(config.get_bool("core", None, "big"), Some(true));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_relative_path_resolves_against_including_file() {
+        let dir = unique_include_dir("inc-rel");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let main = dir.join("config");
+        // Relative path is resolved against the including file's directory.
+        fs::write(&main, "[include]\n\tpath = sub/child.cfg\n").unwrap();
+        fs::write(sub.join("child.cfg"), "[user]\n\temail = a@b.c\n").unwrap();
+
+        let ctx = ConfigIncludeContext::default();
+        let config = load_config_with_includes(&main, &ctx).unwrap();
+        assert_eq!(config.get("user", None, "email"), Some("a@b.c"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_missing_file_is_ignored() {
+        let dir = unique_include_dir("inc-missing");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            "[core]\n\tfilemode = true\n[include]\n\tpath = does-not-exist.cfg\n",
+        )
+        .unwrap();
+
+        let ctx = ConfigIncludeContext::default();
+        let config = load_config_with_includes(&main, &ctx).unwrap();
+        // No error, and the existing value is preserved.
+        assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_gitdir_match_and_non_match() {
+        let dir = unique_include_dir("inc-gitdir");
+        let work = dir.join("work");
+        fs::create_dir_all(&work).unwrap();
+        let main = dir.join("config");
+        let work_git = work.join(".git");
+        fs::write(
+            &main,
+            format!(
+                "[includeIf \"gitdir:{}/\"]\n\tpath = matched.cfg\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("matched.cfg"), "[user]\n\tname = work\n").unwrap();
+
+        // git_dir under the pattern: condition matches.
+        let matching = ConfigIncludeContext::new(Some(work_git.clone()), None);
+        let config = load_config_with_includes(&main, &matching).unwrap();
+        assert_eq!(config.get("user", None, "name"), Some("work"));
+
+        // git_dir elsewhere: condition does not match, nothing is spliced.
+        let other = ConfigIncludeContext::new(Some(dir.join("other/.git")), None);
+        let config = load_config_with_includes(&main, &other).unwrap();
+        assert_eq!(config.get("user", None, "name"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_gitdir_case_insensitive() {
+        let dir = unique_include_dir("inc-gitdir-i");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            "[includeIf \"gitdir/i:/SOME/Path/**\"]\n\tpath = ci.cfg\n",
+        )
+        .unwrap();
+        fs::write(dir.join("ci.cfg"), "[user]\n\tname = ci\n").unwrap();
+
+        let ctx = ConfigIncludeContext::new(Some(PathBuf::from("/some/path/repo/.git")), None);
+        let config = load_config_with_includes(&main, &ctx).unwrap();
+        assert_eq!(config.get("user", None, "name"), Some("ci"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_onbranch_match() {
+        let dir = unique_include_dir("inc-onbranch");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            "[includeIf \"onbranch:feature/*\"]\n\tpath = feat.cfg\n",
+        )
+        .unwrap();
+        fs::write(dir.join("feat.cfg"), "[user]\n\tname = feature\n").unwrap();
+
+        // Matching branch.
+        let on = ConfigIncludeContext::new(None, Some("feature/login".into()));
+        let config = load_config_with_includes(&main, &on).unwrap();
+        assert_eq!(config.get("user", None, "name"), Some("feature"));
+
+        // Non-matching branch (slash boundary: `*` does not cross `/`).
+        let off = ConfigIncludeContext::new(None, Some("main".into()));
+        let config = load_config_with_includes(&main, &off).unwrap();
+        assert_eq!(config.get("user", None, "name"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_recursion_depth_limit() {
+        let dir = unique_include_dir("inc-depth");
+        // Build a chain longer than the depth limit; each file includes the next.
+        let total = CONFIG_MAX_INCLUDE_DEPTH + 3;
+        for i in 0..total {
+            let path = dir.join(format!("c{i}.cfg"));
+            let next = dir.join(format!("c{}.cfg", i + 1));
+            fs::write(
+                &path,
+                format!(
+                    "[s{i}]\n\tk = v{i}\n[include]\n\tpath = {}\n",
+                    next.display()
+                ),
+            )
+            .unwrap();
+        }
+        let entry = dir.join("c0.cfg");
+        let ctx = ConfigIncludeContext::default();
+        let err = load_config_with_includes(&entry, &ctx).unwrap_err();
+        assert!(matches!(err, GitError::InvalidFormat(_)), "got {err:?}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_resolve_includes_on_parsed_value() {
+        let dir = unique_include_dir("inc-parsed");
+        let extra = dir.join("extra.cfg");
+        fs::write(&extra, "[user]\n\temail = parsed@x.y\n").unwrap();
+        let parsed =
+            GitConfig::parse(format!("[include]\n\tpath = {}\n", extra.display()).as_bytes())
+                .unwrap();
+        // The parser leaves the include unresolved.
+        assert_eq!(parsed.get("user", None, "email"), None);
+        // Resolving against the base dir splices it in.
+        let resolved = parsed
+            .resolve_includes(&dir, &ConfigIncludeContext::default())
+            .unwrap();
+        assert_eq!(resolved.get("user", None, "email"), Some("parsed@x.y"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_nested_include_resolves_within_depth() {
+        let dir = unique_include_dir("inc-nested");
+        let main = dir.join("config");
+        let mid = dir.join("mid.cfg");
+        let leaf = dir.join("leaf.cfg");
+        fs::write(&main, format!("[include]\n\tpath = {}\n", mid.display())).unwrap();
+        fs::write(&mid, format!("[include]\n\tpath = {}\n", leaf.display())).unwrap();
+        fs::write(&leaf, "[deep]\n\tvalue = ok\n").unwrap();
+
+        let ctx = ConfigIncludeContext::default();
+        let config = load_config_with_includes(&main, &ctx).unwrap();
+        assert_eq!(config.get("deep", None, "value"), Some("ok"));
+        fs::remove_dir_all(&dir).ok();
+    }
+}

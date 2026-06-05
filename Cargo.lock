@@ -73,244 +73,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "git"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-formats",
- "git-index",
- "git-object",
- "git-odb",
- "git-refs",
- "git-rev",
- "git-worktree",
-]
-
-[[package]]
-name = "git-archive"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-formats",
- "git-object",
- "git-odb",
-]
-
-[[package]]
-name = "git-cli"
-version = "0.1.0"
-dependencies = [
- "git-archive",
- "git-config",
- "git-core",
- "git-diff-merge",
- "git-fetch",
- "git-formats",
- "git-fsck",
- "git-index",
- "git-object",
- "git-odb",
- "git-pack",
- "git-protocol",
- "git-refs",
- "git-rev",
- "git-sequencer",
- "git-testkit",
- "git-transport",
- "git-worktree",
-]
-
-[[package]]
-name = "git-config"
-version = "0.1.0"
-dependencies = [
- "git-core",
-]
-
-[[package]]
-name = "git-core"
-version = "0.1.0"
-
-[[package]]
-name = "git-diff-merge"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-formats",
- "git-index",
- "git-object",
- "git-odb",
- "git-refs",
-]
-
-[[package]]
-name = "git-fetch"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-formats",
- "git-object",
- "git-odb",
- "git-pack",
- "git-protocol",
- "git-transport",
-]
-
-[[package]]
-name = "git-formats"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-index",
- "git-object",
-]
-
-[[package]]
-name = "git-fsck"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-formats",
- "git-object",
- "git-odb",
-]
-
-[[package]]
-name = "git-index"
-version = "0.1.0"
-dependencies = [
- "git-core",
-]
-
-[[package]]
-name = "git-object"
-version = "0.1.0"
-dependencies = [
- "git-core",
-]
-
-[[package]]
-name = "git-odb"
-version = "0.1.0"
-dependencies = [
- "flate2",
- "git-core",
- "git-formats",
- "git-object",
- "git-pack",
-]
-
-[[package]]
-name = "git-pack"
-version = "0.1.0"
-dependencies = [
- "crc32fast",
- "flate2",
- "git-core",
- "git-formats",
- "git-object",
-]
-
-[[package]]
-name = "git-protocol"
-version = "0.1.0"
-dependencies = [
- "git-core",
-]
-
-[[package]]
-name = "git-refs"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-formats",
-]
-
-[[package]]
-name = "git-remote"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-fetch",
- "git-odb",
- "git-pack",
- "git-protocol",
- "git-refs",
- "git-rev",
- "git-transport",
- "git-worktree",
-]
-
-[[package]]
-name = "git-rev"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-formats",
- "git-index",
- "git-object",
- "git-odb",
- "git-refs",
-]
-
-[[package]]
-name = "git-sequencer"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-formats",
- "git-object",
- "git-odb",
- "git-refs",
- "git-worktree",
-]
-
-[[package]]
-name = "git-testkit"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-diff-merge",
- "git-formats",
- "git-index",
- "git-object",
- "git-odb",
- "git-pack",
- "git-refs",
- "git-rev",
- "git-sequencer",
- "git-worktree",
-]
-
-[[package]]
-name = "git-transport"
-version = "0.1.0"
-dependencies = [
- "git-core",
- "git-protocol",
- "ureq",
-]
-
-[[package]]
-name = "git-worktree"
-version = "0.1.0"
-dependencies = [
- "git-config",
- "git-core",
- "git-formats",
- "git-index",
- "git-object",
- "git-odb",
- "git-refs",
-]
-
-[[package]]
 name = "http"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,6 +188,244 @@ name = "simd-adler32"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
+
+[[package]]
+name = "sley"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+ "sley-rev",
+ "sley-worktree",
+]
+
+[[package]]
+name = "sley-archive"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+ "sley-odb",
+]
+
+[[package]]
+name = "sley-cli"
+version = "0.1.0"
+dependencies = [
+ "sley-archive",
+ "sley-config",
+ "sley-core",
+ "sley-diff-merge",
+ "sley-fetch",
+ "sley-formats",
+ "sley-fsck",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-pack",
+ "sley-protocol",
+ "sley-refs",
+ "sley-rev",
+ "sley-sequencer",
+ "sley-testkit",
+ "sley-transport",
+ "sley-worktree",
+]
+
+[[package]]
+name = "sley-config"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-core"
+version = "0.1.0"
+
+[[package]]
+name = "sley-diff-merge"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+]
+
+[[package]]
+name = "sley-fetch"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+ "sley-odb",
+ "sley-pack",
+ "sley-protocol",
+ "sley-transport",
+]
+
+[[package]]
+name = "sley-formats"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-index",
+ "sley-object",
+]
+
+[[package]]
+name = "sley-fsck"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+ "sley-odb",
+]
+
+[[package]]
+name = "sley-index"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-object"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-odb"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+ "sley-pack",
+]
+
+[[package]]
+name = "sley-pack"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "flate2",
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+]
+
+[[package]]
+name = "sley-protocol"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-refs"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+]
+
+[[package]]
+name = "sley-remote"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-fetch",
+ "sley-odb",
+ "sley-pack",
+ "sley-protocol",
+ "sley-refs",
+ "sley-rev",
+ "sley-transport",
+ "sley-worktree",
+]
+
+[[package]]
+name = "sley-rev"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+]
+
+[[package]]
+name = "sley-sequencer"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-formats",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+ "sley-worktree",
+]
+
+[[package]]
+name = "sley-testkit"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-diff-merge",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-pack",
+ "sley-refs",
+ "sley-rev",
+ "sley-sequencer",
+ "sley-worktree",
+]
+
+[[package]]
+name = "sley-transport"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+ "sley-protocol",
+ "ureq",
+]
+
+[[package]]
+name = "sley-worktree"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-formats",
+ "sley-index",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+]
 
 [[package]]
 name = "subtle"

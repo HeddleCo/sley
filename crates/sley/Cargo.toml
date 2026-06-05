@@ -1,0 +1,20 @@
+[package]
+name = "sley"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-core = { path = "../sley-core" }
+sley-object = { path = "../sley-object" }
+sley-config = { path = "../sley-config" }
+sley-formats = { path = "../sley-formats" }
+sley-index = { path = "../sley-index" }
+sley-odb = { path = "../sley-odb" }
+sley-refs = { path = "../sley-refs" }
+sley-rev = { path = "../sley-rev" }
+sley-worktree = { path = "../sley-worktree" }
+
+[lints]
+workspace = true

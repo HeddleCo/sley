@@ -1,0 +1,21 @@
+[package]
+name = "sley-fetch"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-core = { path = "../sley-core" }
+sley-odb = { path = "../sley-odb" }
+sley-protocol = { path = "../sley-protocol" }
+sley-transport = { path = "../sley-transport" }
+
+[dev-dependencies]
+sley-formats = { path = "../sley-formats" }
+sley-object = { path = "../sley-object" }
+sley-pack = { path = "../sley-pack" }
+sley-protocol = { path = "../sley-protocol" }
+
+[lints]
+workspace = true
