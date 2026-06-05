@@ -1065,8 +1065,12 @@ pub fn short_status_with_options(
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let head = head_tree_entries(git_dir, format, &db)?;
-    let index = read_index_entries(git_dir, format)?;
-    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    // Parse the index once: the tracked map drives status comparisons and the
+    // stat cache lets the worktree walk skip re-hashing files whose stat proves
+    // they are unchanged since staging (git's racy-git shortcut).
+    let (index, stat_cache) = read_index_entries_with_stat_cache(git_dir, format)?;
+    let worktree =
+        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache))?;
     let ignores = IgnoreMatcher::from_worktree_root(worktree_root)?;
     let mut paths = BTreeSet::new();
     paths.extend(head.keys().cloned());
@@ -3171,8 +3175,14 @@ pub fn modified_index_entries(
     if !index_path.exists() {
         return Ok(Vec::new());
     }
-    let worktree = worktree_entries(worktree_root, git_dir, format)?;
-    let index = Index::parse(&fs::read(index_path)?, format)?;
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    // Reuse the same racy-git stat shortcut here: build the cache from the index
+    // we just parsed (no second parse) so the worktree walk can skip re-hashing
+    // unchanged files. A cached oid is only trusted on a non-racy stat match, so
+    // genuinely modified files still fall through to a hash and are reported.
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
+    let worktree =
+        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache))?;
     let mut modified = Vec::new();
     for entry in index.entries {
         let Some(worktree_entry) = worktree.get(&entry.path) else {
@@ -4903,16 +4913,124 @@ struct TrackedEntry {
     oid: ObjectId,
 }
 
+/// git's racy-git stat cache: the stage-0 index entries keyed by path (so the
+/// worktree walk can reuse a cached oid when a file's stat shows it is unchanged
+/// since it was staged) plus the index *file's* own mtime, which git uses as the
+/// racy-clean reference timestamp.
+///
+/// SAFETY INVARIANT: trusting a cached oid by stat alone is only sound because
+/// every code path that stamps a worktree stat onto an index entry also hashed
+/// that exact file content (see `index_entry_from_metadata`), while tree-sourced
+/// restores (reset --mixed / stash / sparse) leave the stat zeroed
+/// (`restored_head_index_entry`). So a non-zero, non-racy stat match implies the
+/// cached oid is the file's true content. When that does not hold we fall through
+/// to a full read+filter+hash, so a modified file is never reported clean.
+#[derive(Debug, Clone, Default)]
+struct IndexStatCache {
+    entries: BTreeMap<Vec<u8>, IndexEntry>,
+    /// The index file's modification time as `(seconds, nanoseconds)`, or `None`
+    /// when it could not be determined. Used as git's racy-clean reference.
+    index_mtime: Option<(u64, u64)>,
+}
+
+impl IndexStatCache {
+    /// Builds the cache from an already-parsed index plus the path of the index
+    /// file on disk (whose mtime becomes the racy-clean reference). Only stage-0
+    /// entries are retained; higher merge stages never describe a worktree file.
+    fn from_index(index: &Index, index_path: &Path) -> Self {
+        let mut entries = BTreeMap::new();
+        for entry in &index.entries {
+            if index_entry_stage(entry) != 0 {
+                continue;
+            }
+            entries.insert(entry.path.clone(), entry.clone());
+        }
+        let index_mtime = fs::metadata(index_path)
+            .ok()
+            .and_then(|metadata| file_mtime_parts(&metadata));
+        IndexStatCache {
+            entries,
+            index_mtime,
+        }
+    }
+
+    /// Whether `entry` is "racily clean" in git's sense: its cached mtime is not
+    /// strictly older than the index file's mtime, so a same-timestamp write
+    /// could have changed the content without moving the stat. Such entries must
+    /// always be re-hashed.
+    ///
+    /// Conservative by construction: if the index mtime is unknown, or either
+    /// side's mtime is zero (e.g. a tree-sourced entry whose stat was left
+    /// zeroed), this returns `true` so the caller re-hashes rather than trusting
+    /// a stat we cannot prove safe.
+    fn is_racily_clean(&self, entry: &IndexEntry) -> bool {
+        let Some(index_mtime) = self.index_mtime else {
+            return true;
+        };
+        if index_mtime == (0, 0) {
+            return true;
+        }
+        let entry_mtime = (
+            u64::from(entry.mtime_seconds),
+            u64::from(entry.mtime_nanoseconds),
+        );
+        if entry_mtime == (0, 0) {
+            return true;
+        }
+        // Racy unless the index was written strictly after the entry's mtime.
+        index_mtime <= entry_mtime
+    }
+
+    /// Returns the cached [`TrackedEntry`] for `git_path` (reusing its stored
+    /// oid, so the caller can SKIP reading, filtering, and hashing the file) only
+    /// when the worktree file is provably unchanged since it was staged: a
+    /// stage-0 entry exists, its recorded mode matches the file's current mode
+    /// (catching pure `chmod`s that do not move mtime), the size+mtime stat
+    /// check passes, and the entry is not racily clean. Otherwise returns `None`
+    /// and the caller hashes the file as usual.
+    fn reuse_tracked_entry(
+        &self,
+        git_path: &[u8],
+        worktree_metadata: &fs::Metadata,
+    ) -> Option<TrackedEntry> {
+        let entry = self.entries.get(git_path)?;
+        if entry.mode != file_mode(worktree_metadata) {
+            return None;
+        }
+        if !worktree_entry_is_uptodate(entry, worktree_metadata) {
+            return None;
+        }
+        if self.is_racily_clean(entry) {
+            return None;
+        }
+        Some(TrackedEntry {
+            mode: entry.mode,
+            oid: entry.oid.clone(),
+        })
+    }
+}
+
 fn read_index_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    Ok(read_index_entries_with_stat_cache(git_dir, format)?.0)
+}
+
+/// Parses the index a single time and returns both the path -> [`TrackedEntry`]
+/// map used for status comparisons AND the [`IndexStatCache`] used to short-cut
+/// the worktree walk, avoiding a second parse of the same file.
+fn read_index_entries_with_stat_cache(
+    git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<(BTreeMap<Vec<u8>, TrackedEntry>, IndexStatCache)> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Ok(BTreeMap::new());
+        return Ok((BTreeMap::new(), IndexStatCache::default()));
     }
-    let index = Index::parse(&fs::read(index_path)?, format)?;
-    Ok(index
+    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
+    let tracked = index
         .entries
         .into_iter()
         .map(|entry| {
@@ -4924,7 +5042,8 @@ fn read_index_entries(
                 },
             )
         })
-        .collect())
+        .collect();
+    Ok((tracked, stat_cache))
 }
 
 fn head_tree_entries(
@@ -5009,6 +5128,19 @@ fn worktree_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None)
+}
+
+/// Like [`worktree_entries`], but accepts the index's [`IndexStatCache`] so the
+/// walk can reuse a cached oid for files that are provably unchanged since they
+/// were staged, skipping the read+filter+hash for those paths. Passing `None`
+/// hashes every file (the behaviour of plain [`worktree_entries`]).
+fn worktree_entries_with_stat_cache(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    stat_cache: Option<&IndexStatCache>,
+) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
     // Worktree blobs are compared to the index by OID, so they must be passed
     // through the clean filter (core.autocrlf / .gitattributes) first -- exactly
@@ -5028,11 +5160,13 @@ fn worktree_entries(
         &config,
         &attr_matcher,
         &attr_requested,
+        stat_cache,
         &mut entries,
     )?;
     Ok(entries)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_worktree_entries(
     root: &Path,
     git_dir: &Path,
@@ -5041,6 +5175,7 @@ fn collect_worktree_entries(
     config: &GitConfig,
     matcher: &AttributeMatcher,
     requested: &[Vec<u8>],
+    stat_cache: Option<&IndexStatCache>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     if is_same_path(dir, git_dir) {
@@ -5057,12 +5192,26 @@ fn collect_worktree_entries(
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_worktree_entries(root, git_dir, &path, format, config, matcher, requested, entries)?;
+            collect_worktree_entries(
+                root, git_dir, &path, format, config, matcher, requested, stat_cache, entries,
+            )?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
             let git_path = git_path_bytes(relative)?;
+            // git's racy-git stat shortcut: when the index's cached stat proves
+            // this file is unchanged since it was staged, reuse the staged oid
+            // and skip the read+filter+hash entirely. `reuse_tracked_entry`
+            // returns `Some` ONLY for a non-racy size+mtime+mode match, so a
+            // modified file always falls through to the full hash below and is
+            // never silently reported clean.
+            if let Some(tracked) =
+                stat_cache.and_then(|cache| cache.reuse_tracked_entry(&git_path, &metadata))
+            {
+                entries.insert(git_path, tracked);
+                continue;
+            }
             let body = fs::read(&path)?;
             // Resolve this path's attributes against the prebuilt matcher (a cheap
             // pattern match) and apply the clean filter -- no per-file matcher
@@ -6040,6 +6189,197 @@ mod tests {
         let bin = attrs(&root, b"a.bin");
         assert!(bin.iter().any(|c| c.attribute == b"text"
             && c.state == Some(AttributeState::Unset)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Builds a stat cache holding a single stage-0 entry whose size+mtime match
+    /// `file`'s real metadata, with the index-file mtime placed strictly after
+    /// the entry mtime so the entry reads as non-racy by default. The entry's oid
+    /// is `oid` and its mode is `mode`.
+    fn stat_cache_for(file: &Path, oid: ObjectId, mode: u32) -> (IndexStatCache, IndexEntry) {
+        let metadata = fs::metadata(file).unwrap();
+        let mut entry =
+            index_entry_from_metadata(b"f.txt".to_vec(), oid, &metadata);
+        entry.mode = mode;
+        let index_mtime = Some((u64::from(entry.mtime_seconds) + 10, 0));
+        let mut entries = BTreeMap::new();
+        entries.insert(entry.path.clone(), entry.clone());
+        (
+            IndexStatCache {
+                entries,
+                index_mtime,
+            },
+            entry,
+        )
+    }
+
+    #[test]
+    fn reuse_tracked_entry_only_reuses_clean_non_racy_match() {
+        let root = temp_root();
+        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        let file = root.join("f.txt");
+        let metadata = fs::metadata(&file).unwrap();
+        let real_mode = file_mode(&metadata);
+        let oid = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec())
+            .object_id(ObjectFormat::Sha1)
+            .unwrap();
+
+        // Clean, non-racy, matching stat + mode -> reuse the cached oid.
+        let (cache, _) = stat_cache_for(&file, oid.clone(), real_mode);
+        let reused = cache.reuse_tracked_entry(b"f.txt", &metadata);
+        assert_eq!(
+            reused,
+            Some(TrackedEntry {
+                mode: real_mode,
+                oid: oid.clone(),
+            }),
+            "a clean non-racy stat+mode match must reuse the staged oid"
+        );
+
+        // No stage-0 entry for the path -> must hash.
+        assert_eq!(
+            cache.reuse_tracked_entry(b"other.txt", &metadata),
+            None,
+            "a path with no cached entry must fall through to hashing"
+        );
+
+        // Size differs from the file -> must hash.
+        let (mut size_cache, mut shrunk) = stat_cache_for(&file, oid.clone(), real_mode);
+        shrunk.size = shrunk.size.saturating_sub(1);
+        size_cache.entries.insert(shrunk.path.clone(), shrunk);
+        assert_eq!(
+            size_cache.reuse_tracked_entry(b"f.txt", &metadata),
+            None,
+            "a size mismatch must fall through to hashing"
+        );
+
+        // Mode differs (e.g. a chmod that did not move mtime) -> must hash.
+        let (mode_cache, _) = stat_cache_for(&file, oid.clone(), 0o100755);
+        assert_eq!(
+            mode_cache.reuse_tracked_entry(b"f.txt", &metadata),
+            None,
+            "a mode mismatch must fall through to hashing"
+        );
+
+        // Racily clean (index mtime not strictly after the entry mtime) -> hash.
+        let (mut racy_cache, entry) = stat_cache_for(&file, oid, real_mode);
+        racy_cache.index_mtime = Some((
+            u64::from(entry.mtime_seconds),
+            u64::from(entry.mtime_nanoseconds),
+        ));
+        assert_eq!(
+            racy_cache.reuse_tracked_entry(b"f.txt", &metadata),
+            None,
+            "a racily-clean entry must always be re-hashed"
+        );
+
+        // Unknown index mtime is treated as racy -> hash.
+        let (mut unknown_cache, _) = stat_cache_for(&file, EncodedObject::new(
+            ObjectType::Blob,
+            b"hello\n".to_vec(),
+        )
+        .object_id(ObjectFormat::Sha1)
+        .unwrap(), real_mode);
+        unknown_cache.index_mtime = None;
+        assert_eq!(
+            unknown_cache.reuse_tracked_entry(b"f.txt", &metadata),
+            None,
+            "an unknown index mtime must be treated conservatively as racy"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_status_detects_same_length_content_change() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("f.txt"), b"aaaa\n").unwrap();
+        build_commit(&root, &git_dir, &["f.txt"]);
+        // Overwrite with the SAME byte length but different content. Right after
+        // staging the entry is racily clean (index mtime >= entry mtime), so the
+        // stat shortcut must not be trusted and the change must surface as M.
+        fs::write(root.join("f.txt"), b"bbbb\n").unwrap();
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        assert_eq!(
+            status.iter().map(ShortStatusEntry::line).collect::<Vec<_>>(),
+            vec![" M f.txt"],
+            "a same-length content change must be reported modified"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_status_clean_after_byte_identical_rewrite() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        build_commit(&root, &git_dir, &["f.txt"]);
+        // Rewrite with byte-identical content; the mtime moves so the stat
+        // shortcut declines to reuse and the fallback hash proves it clean.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        assert!(
+            status.is_empty(),
+            "a byte-identical rewrite must be clean via the fallback hash, got {status:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn short_status_trusts_stat_cache_and_skips_rehash() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        build_commit(&root, &git_dir, &["f.txt"]);
+
+        // Plant a BOGUS oid in the stage-0 entry while preserving its size+mtime,
+        // so a real re-hash of the (unchanged) worktree file would NOT match it.
+        let index_path = repository_index_path(&git_dir);
+        let mut index = read_index(&git_dir);
+        let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap();
+        let real_oid = index_entry_for(&index, b"f.txt").oid.clone();
+        assert_ne!(real_oid, bogus, "fixture oid should differ from the bogus oid");
+        index
+            .entries
+            .iter_mut()
+            .find(|entry| entry.path == b"f.txt")
+            .unwrap()
+            .oid = bogus.clone();
+        fs::write(&index_path, index.write(ObjectFormat::Sha1).unwrap()).unwrap();
+
+        // Make the index file STRICTLY newer than the entry mtime (non-racy) by
+        // waiting past one-second filesystem granularity and rewriting it, so the
+        // racy-clean guard does not force a re-hash.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        fs::write(&index_path, fs::read(&index_path).unwrap()).unwrap();
+
+        // The file is unchanged on disk, so a trusted stat reuses the bogus index
+        // oid for the worktree entry: worktree-oid == index-oid == bogus, so the
+        // WORKTREE column is clean. Had status re-hashed the file, the real oid
+        // would differ from the bogus index oid and the worktree column would be
+        // 'M'. (The index-vs-HEAD column is 'M' because we corrupted the index
+        // oid away from HEAD; that is expected and not what this test asserts.)
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        let entry = status
+            .iter()
+            .find(|entry| entry.path == b"f.txt")
+            .expect("f.txt should appear (its index oid now differs from HEAD)");
+        assert_eq!(
+            entry.worktree, b' ',
+            "non-racy stat match must trust the cached oid (no re-hash); worktree column was {}",
+            entry.worktree as char
+        );
+        assert_eq!(
+            entry.index_oid.as_ref(),
+            Some(&bogus),
+            "the worktree entry must have reused the planted bogus index oid, not the real hash"
+        );
+
         fs::remove_dir_all(root).unwrap();
     }
 }
