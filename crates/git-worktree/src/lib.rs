@@ -4758,20 +4758,28 @@ fn restored_head_index_entry(
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
     let file_path = worktree_path(worktree_root, path)?;
-    if let Ok(metadata) = fs::metadata(&file_path) {
-        let mut index_entry =
-            index_entry_from_metadata(path.to_vec(), entry.oid.clone(), &metadata);
-        index_entry.mode = entry.mode;
-        return Ok(index_entry);
-    }
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    // This restores the index from a tree (reset --mixed / stash / sparse) WITHOUT
+    // rewriting the worktree file, so the file on disk may hold different content
+    // than `entry.oid`. Crucially we must NOT copy the worktree file's stat onto
+    // this entry: that would make the cached stat match a file whose real content
+    // hashes to a DIFFERENT oid, breaking git's "stat-match implies oid-match"
+    // invariant that the status stat-cache relies on. Leave the stat zeroed so
+    // status always re-hashes this path and detects any modification -- exactly
+    // git's behavior for tree-sourced entries until a later refresh validates them.
+    let size = match fs::metadata(&file_path) {
+        Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
+        Err(_) => {
+            let object = db.read_object(&entry.oid)?;
+            if object.object_type != ObjectType::Blob {
+                return Err(GitError::InvalidObject(format!(
+                    "expected blob {}, found {}",
+                    entry.oid,
+                    object.object_type.as_str()
+                )));
+            }
+            object.body.len().min(u32::MAX as usize) as u32
+        }
+    };
     Ok(IndexEntry {
         ctime_seconds: 0,
         ctime_nanoseconds: 0,
@@ -4782,7 +4790,7 @@ fn restored_head_index_entry(
         mode: entry.mode,
         uid: 0,
         gid: 0,
-        size: object.body.len().min(u32::MAX as usize) as u32,
+        size,
         oid: entry.oid.clone(),
         flags: path.len().min(0x0fff) as u16,
         flags_extended: 0,
