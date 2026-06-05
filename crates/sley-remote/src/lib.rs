@@ -59,6 +59,13 @@ pub use fetch::{
     write_fetch_head_records, FetchOptions, FetchOutcome, FetchSource, PrunedRef,
 };
 
+mod push;
+pub use push::{
+    local_push_source_refs, normalize_push_refname, normalize_push_refspec, push,
+    reject_non_fast_forward_pushes, remote_advertisement_tips_known_to_local,
+    validate_receive_pack_report, PushDestination, PushOptions, PushOutcome,
+};
+
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
 ///
 /// Reads `common_git_dir/config`'s `extensions.objectFormat`, defaulting to

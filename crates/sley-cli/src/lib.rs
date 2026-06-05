@@ -21,9 +21,8 @@ use sley_refs::{
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, GitService, ProtocolVersion, PushSourceRef,
-    ReceivePackCommand, ReceivePackPushRequest, ReceivePackPushRequestOptions,
-    ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement, RefAdvertisementSet,
+    FetchHeadRecord, FetchRefUpdate, GitService, ProtocolVersion, ReceivePackCommand,
+    ReceivePackPushRequest, ReceivePackPushRequestOptions, RefAdvertisement, RefAdvertisementSet,
     UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
     UploadPackRequest, build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
     parse_upload_pack_features, plan_fetch_ref_updates, plan_push_commands,
@@ -35,8 +34,6 @@ use sley_protocol::{
     write_upload_pack_raw_packfile_response, write_upload_pack_request,
 };
 use sley_transport::{RemoteTransport, SshCommandVariant, parse_remote_url, ssh_process_command};
-use sley_protocol::{smart_http_rpc_request_content_type, smart_http_rpc_result_content_type};
-use sley_transport::{HttpClient, http_smart_rpc_url};
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -8431,6 +8428,10 @@ fn cmd_push(args: &[String]) -> Result<()> {
         force,
     };
     if push_remote_is_ssh(&remote)? {
+        // SSH push still lives here (a later extraction stage); HTTP and local
+        // delegate the git work to `sley_remote::push` while this command keeps
+        // owning URL/repo resolution, set-upstream config, and the "To <remote>"
+        // summary so the user-visible output stays byte-for-byte identical.
         push_ssh_repository(
             &git_dir,
             &common_git_dir,
@@ -8439,21 +8440,24 @@ fn cmd_push(args: &[String]) -> Result<()> {
             &refspecs,
             options,
         )
-    } else if push_remote_is_http(&remote)? {
-        push_http_repository(
-            &git_dir,
-            &common_git_dir,
-            format,
-            &remote,
-            &refspecs,
-            options,
-        )
     } else {
-        push_local_repository(
+        let destination = if push_remote_is_http(&remote)? {
+            let remote_url = parse_remote_url(&push_resolved_url(&remote)?)?;
+            sley_remote::PushDestination::Http(remote_url)
+        } else {
+            let remote_git_dir = ls_remote_git_dir(&remote)?;
+            let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
+            sley_remote::PushDestination::Local {
+                git_dir: remote_git_dir,
+                common_git_dir: remote_common_git_dir,
+            }
+        };
+        run_push(
             &git_dir,
             &common_git_dir,
             format,
             &remote,
+            &destination,
             &refspecs,
             options,
         )
@@ -8465,6 +8469,55 @@ struct PushOptions {
     quiet: bool,
     set_upstream: bool,
     force: bool,
+}
+
+/// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
+/// local), wiring the credential-helper provider and the stdout progress sink,
+/// then reproduce the CLI's behavior from the structured outcome: nothing on a
+/// no-op push, otherwise the optional set-upstream config write followed by the
+/// "To <remote>" summary on stderr. Repository/URL resolution, the set-upstream
+/// config, and output formatting stay here; the push orchestration lives in the
+/// library.
+fn run_push(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    remote: &str,
+    destination: &sley_remote::PushDestination,
+    refspecs: &[String],
+    options: PushOptions,
+) -> Result<()> {
+    let config = read_repo_config(git_dir).unwrap_or_default();
+    let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
+    let mut progress = StdoutProgress;
+    let outcome = sley_remote::push(
+        git_dir,
+        common_git_dir,
+        format,
+        &config,
+        remote,
+        destination,
+        refspecs,
+        &sley_remote::PushOptions {
+            quiet: options.quiet,
+            force: options.force,
+        },
+        &mut credentials,
+        &mut progress,
+    )?;
+    if outcome.commands.is_empty() {
+        return Ok(());
+    }
+    if options.set_upstream {
+        configure_push_upstreams(git_dir, remote, &outcome.commands)?;
+    }
+    if !options.quiet {
+        eprintln!("To {remote}");
+        for command in &outcome.commands {
+            eprintln!("   {}  {}", command.new_id, command.name);
+        }
+    }
+    Ok(())
 }
 
 fn push_remote_is_ssh(remote: &str) -> Result<bool> {
@@ -8510,89 +8563,6 @@ fn push_remote_and_refspecs(
         }
         [remote, refspecs @ ..] => Ok((remote.clone(), refspecs.to_vec())),
     }
-}
-
-fn push_local_repository(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    remote: &str,
-    refspecs: &[String],
-    options: PushOptions,
-) -> Result<()> {
-    let remote_git_dir = ls_remote_git_dir(remote)?;
-    let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
-    let remote_format = repository_object_format(&remote_common_git_dir)?;
-    if remote_format != format {
-        return Err(GitError::InvalidObjectId(format!(
-            "remote repository uses {}, local repository uses {}",
-            remote_format.name(),
-            format.name()
-        )));
-    }
-
-    let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = local_push_source_refs(&local_store, format)?;
-    let remote_refs = sley_remote::local_fetch_advertisements(&remote_common_git_dir, format)?;
-    let refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut command_forces = Vec::new();
-    for refspec in &refspecs {
-        for command in plan_push_commands(
-            format,
-            &local_refs,
-            &remote_refs,
-            std::slice::from_ref(refspec),
-        )? {
-            command_forces.push((command, options.force || refspec.force));
-        }
-    }
-    let commands = command_forces
-        .iter()
-        .map(|(command, _)| command.clone())
-        .collect::<Vec<_>>();
-    if commands.is_empty() {
-        return Ok(());
-    }
-
-    let remote_excluded_tips = remote_refs
-        .iter()
-        .map(|reference| reference.oid.clone())
-        .collect::<Vec<_>>();
-    let starts = commands
-        .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
-        .map(|command| command.new_id.clone());
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
-    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
-    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
-    let request = ReceivePackPushRequest {
-        commands: ReceivePackRequest {
-            shallow: Vec::new(),
-            commands: commands.clone(),
-            capabilities: Vec::new(),
-        },
-        push_options: None,
-        packfile,
-    };
-    sley_remote::receive_pack_into_local_repository(&remote_git_dir, format, &request)?;
-
-    if options.set_upstream {
-        configure_push_upstreams(git_dir, remote, &commands)?;
-    }
-    if !options.quiet {
-        eprintln!("To {remote}");
-        for command in &commands {
-            eprintln!("   {}  {}", command.new_id, command.name);
-        }
-    }
-    Ok(())
 }
 
 fn push_ssh_repository(
@@ -8654,10 +8624,10 @@ fn push_ssh_repository(
     }
 
     let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = local_push_source_refs(&local_store, format)?;
+    let local_refs = sley_remote::local_push_source_refs(&local_store, format)?;
     let parsed_refspecs = refspecs
         .iter()
-        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
+        .map(|refspec| parse_refspec(&sley_remote::normalize_push_refspec(refspec)))
         .collect::<Result<Vec<_>>>()?;
     let mut command_forces = Vec::new();
     for refspec in &parsed_refspecs {
@@ -8681,9 +8651,9 @@ fn push_ssh_repository(
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    sley_remote::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     let remote_excluded_tips =
-        remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
+        sley_remote::remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
     let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
     let starts = commands
         .iter()
@@ -8711,7 +8681,7 @@ fn push_ssh_repository(
 
     if features.report_status {
         let report = read_receive_pack_report_status(&mut stdout)?;
-        validate_receive_pack_report(&report)?;
+        sley_remote::validate_receive_pack_report(&report)?;
     } else {
         let mut sink = Vec::new();
         stdout.read_to_end(&mut sink)?;
@@ -8736,143 +8706,8 @@ fn push_ssh_repository(
     Ok(())
 }
 
-fn remote_advertisement_tips_known_to_local(
-    local_db: &FileObjectDatabase,
-    advertisements: &[RefAdvertisement],
-) -> Result<Vec<ObjectId>> {
-    let mut tips = Vec::new();
-    let mut seen = HashSet::new();
-    for advertisement in advertisements {
-        if is_zero_object_id(&advertisement.oid) || !seen.insert(advertisement.oid.clone()) {
-            continue;
-        }
-        if local_db.contains(&advertisement.oid)? {
-            tips.push(advertisement.oid.clone());
-        }
-    }
-    Ok(tips)
-}
-
-fn validate_receive_pack_report(report: &ReceivePackReportStatus) -> Result<()> {
-    if let sley_protocol::ReceivePackUnpackStatus::Error(message) = &report.unpack {
-        return Err(GitError::Command(format!(
-            "failed to push some refs: unpack failed: {message}"
-        )));
-    }
-    for status in &report.commands {
-        if let sley_protocol::ReceivePackCommandStatus::Ng { name, message } = status {
-            return Err(GitError::Command(format!(
-                "failed to push {name}: {message}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn local_push_source_refs(
-    store: &FileRefStore,
-    format: ObjectFormat,
-) -> Result<Vec<PushSourceRef>> {
-    let mut refs = Vec::new();
-    for reference in store.list_refs()? {
-        let Some((oid, _)) = resolve_for_each_ref_target(store, &reference)? else {
-            continue;
-        };
-        if oid.format() != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "local ref {} has {} object id for {} repository",
-                reference.name,
-                oid.format().name(),
-                format.name()
-            )));
-        }
-        refs.push(PushSourceRef {
-            name: reference.name.clone(),
-            oid: oid.clone(),
-        });
-        if let Some(short) = reference.name.strip_prefix("refs/heads/") {
-            refs.push(PushSourceRef {
-                name: short.to_string(),
-                oid: oid.clone(),
-            });
-        }
-        if let Some(short) = reference.name.strip_prefix("refs/tags/") {
-            refs.push(PushSourceRef {
-                name: short.to_string(),
-                oid,
-            });
-        }
-    }
-    if let Some(target) = store.read_ref("HEAD")? {
-        let head = Ref {
-            name: "HEAD".to_string(),
-            target,
-        };
-        if let Some((oid, _)) = resolve_for_each_ref_target(store, &head)?
-            && oid.format() == format
-        {
-            refs.push(PushSourceRef {
-                name: "HEAD".to_string(),
-                oid,
-            });
-        }
-    }
-    Ok(refs)
-}
-
-fn normalize_push_refspec(refspec: &str) -> String {
-    let (force, refspec) = refspec
-        .strip_prefix('+')
-        .map_or((false, refspec), |refspec| (true, refspec));
-    let normalized = if let Some((src, dst)) = refspec.split_once(':') {
-        let src = normalize_push_refname(src);
-        let dst = normalize_push_refname(dst);
-        format!("{src}:{dst}")
-    } else {
-        let name = normalize_push_refname(refspec);
-        format!("{name}:{name}")
-    };
-    if force {
-        format!("+{normalized}")
-    } else {
-        normalized
-    }
-}
-
-fn normalize_push_refname(name: &str) -> String {
-    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
-        name.to_string()
-    } else {
-        format!("refs/heads/{name}")
-    }
-}
-
 fn is_zero_object_id(oid: &ObjectId) -> bool {
     oid.as_bytes().iter().all(|byte| *byte == 0)
-}
-
-fn reject_non_fast_forward_pushes(
-    local_db: &FileObjectDatabase,
-    format: ObjectFormat,
-    command_forces: &[(ReceivePackCommand, bool)],
-) -> Result<()> {
-    for (command, force) in command_forces {
-        if *force
-            || !command.name.starts_with("refs/heads/")
-            || is_zero_object_id(&command.old_id)
-            || is_zero_object_id(&command.new_id)
-        {
-            continue;
-        }
-        let ancestors = ancestor_depths(local_db, format, &command.new_id)?;
-        if !ancestors.contains_key(&command.old_id) {
-            let short = command.name.trim_start_matches("refs/heads/");
-            return Err(GitError::Command(format!(
-                "failed to push some refs: non-fast-forward update to {short}"
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn configure_push_upstreams(
@@ -9283,143 +9118,6 @@ fn fetch_http_repository(
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Http(remote);
     run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
-}
-
-fn push_http_repository(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    remote: &str,
-    refspecs: &[String],
-    options: PushOptions,
-) -> Result<()> {
-    let remote_url = push_resolved_url(remote)?;
-    let parsed = parse_remote_url(&remote_url)?;
-    if !matches!(
-        parsed.transport,
-        RemoteTransport::Http | RemoteTransport::Https
-    ) {
-        return Err(GitError::InvalidFormat(
-            "HTTP receive-pack requires an HTTP remote".into(),
-        ));
-    }
-    let config = read_repo_config(git_dir).ok();
-    let client = sley_remote::new_http_client();
-    let mut credentials = sley_remote::CredentialHelperProvider::new(config.as_ref());
-    let advertisement_set = sley_remote::http_service_advertisements(
-        &client,
-        &parsed,
-        format,
-        GitService::ReceivePack,
-        &mut credentials,
-    )?;
-    let features = advertisement_set
-        .refs
-        .first()
-        .map(|advertisement| parse_receive_pack_features(&advertisement.capabilities))
-        .transpose()?
-        .unwrap_or_default();
-    if let Some(remote_format) = features.object_format {
-        if remote_format != format {
-            return Err(GitError::InvalidObjectId(format!(
-                "remote repository uses {}, local repository uses {}",
-                remote_format.name(),
-                format.name()
-            )));
-        }
-    } else if format != ObjectFormat::Sha1 {
-        return Err(GitError::InvalidObjectId(format!(
-            "remote repository did not advertise object-format for {} push",
-            format.name()
-        )));
-    }
-
-    let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = local_push_source_refs(&local_store, format)?;
-    let parsed_refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
-        .collect::<Result<Vec<_>>>()?;
-    let mut command_forces = Vec::new();
-    for refspec in &parsed_refspecs {
-        for command in plan_push_commands(
-            format,
-            &local_refs,
-            &advertisement_set.refs,
-            std::slice::from_ref(refspec),
-        )? {
-            command_forces.push((command, options.force || refspec.force));
-        }
-    }
-    let commands = command_forces
-        .iter()
-        .map(|(command, _)| command.clone())
-        .collect::<Vec<_>>();
-    if commands.is_empty() {
-        return Ok(());
-    }
-
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
-    let remote_excluded_tips =
-        remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
-    let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
-    let starts = commands
-        .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
-        .map(|command| command.new_id.clone());
-    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
-    let request = build_receive_pack_push_request(
-        &features,
-        commands.clone(),
-        packfile,
-        ReceivePackPushRequestOptions {
-            report_status: features.report_status,
-            ofs_delta: features.ofs_delta,
-            quiet: options.quiet && features.quiet,
-            object_format: features
-                .object_format
-                .filter(|_| format != ObjectFormat::Sha1),
-            ..ReceivePackPushRequestOptions::default()
-        },
-    )?;
-    let mut body = Vec::new();
-    write_receive_pack_push_request(&mut body, &request)?;
-    let url = http_smart_rpc_url(&parsed, GitService::ReceivePack)?;
-    let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let mut response = sley_remote::http_send_with_auth(&parsed, &mut credentials, |auth| {
-        client.post(
-            &url,
-            &content_type,
-            &sley_remote::http_authorization_headers(auth),
-            body.clone(),
-        )
-    })?;
-    sley_remote::http_check_status(&response, &url)?;
-    sley_remote::http_validate_content_type(
-        &response,
-        &smart_http_rpc_result_content_type(GitService::ReceivePack)?,
-    )?;
-    if features.report_status {
-        let report = read_receive_pack_report_status(&mut response.body)?;
-        validate_receive_pack_report(&report)?;
-    } else {
-        let mut sink = Vec::new();
-        response.body.read_to_end(&mut sink)?;
-    }
-
-    if options.set_upstream {
-        configure_push_upstreams(git_dir, remote, &commands)?;
-    }
-    if !options.quiet {
-        eprintln!("To {remote}");
-        for command in &commands {
-            eprintln!("   {}  {}", command.new_id, command.name);
-        }
-    }
-    Ok(())
 }
 
 fn ls_remote_http_records(

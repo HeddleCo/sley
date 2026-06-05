@@ -9,6 +9,7 @@ license.workspace = true
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
 sley-fetch = { path = "../sley-fetch" }
+sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
 sley-pack = { path = "../sley-pack" }
 sley-protocol = { path = "../sley-protocol" }
