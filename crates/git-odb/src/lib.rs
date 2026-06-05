@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{env, fs};
 
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -687,12 +688,25 @@ pub struct PartialClonePolicy {
     pub allow_missing_promised_objects: bool,
 }
 
+/// Per-pack decoded-object caches keyed by pack-file path, shared across cloned
+/// database handles (`Arc`). Parsing a pack decodes every object in it, so this
+/// cache avoids re-parsing the whole pack on every packed read (which made any
+/// object walk O(reads * pack size)).
+type PackObjectCache = Arc<Mutex<HashMap<PathBuf, Arc<HashMap<ObjectId, EncodedObject>>>>>;
+
+/// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
+/// the index parse so locating a packed object doesn't re-parse every `.idx` on
+/// each read; the pack directory is still re-scanned, so new packs are found.
+type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
+
 #[derive(Debug, Clone)]
 pub struct FileObjectDatabase {
     loose: LooseObjectStore,
     objects_dir: PathBuf,
     alternates: Vec<PathBuf>,
     format: ObjectFormat,
+    pack_objects: PackObjectCache,
+    pack_indexes: PackIndexCache,
 }
 
 pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
@@ -810,6 +824,8 @@ impl FileObjectDatabase {
             alternates: alternate_object_dirs(&objects_dir),
             objects_dir,
             format,
+            pack_objects: Arc::new(Mutex::new(HashMap::new())),
+            pack_indexes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -820,6 +836,8 @@ impl FileObjectDatabase {
             alternates: Vec::new(),
             objects_dir,
             format,
+            pack_objects: Arc::new(Mutex::new(HashMap::new())),
+            pack_indexes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -963,15 +981,56 @@ impl FileObjectDatabase {
         let Some(pack_paths) = self.find_pack_containing(oid)? else {
             return Ok(None);
         };
-        let pack = PackFile::parse(&fs::read(pack_paths.pack)?, self.format)?;
-        for entry in pack.entries {
-            if &entry.entry.oid == oid {
-                return Ok(Some(entry.object));
+        let objects = self.cached_pack_objects(&pack_paths.pack)?;
+        match objects.get(oid) {
+            Some(object) => Ok(Some(object.clone())),
+            None => Err(GitError::InvalidFormat(format!(
+                "pack index listed object {oid}, but pack did not contain it"
+            ))),
+        }
+    }
+
+    /// Decoded objects of the pack at `pack_path`, parsed at most once per
+    /// database handle (cached and shared across clones). Parsing a pack
+    /// materializes every object, so reusing this turns a walk that touches many
+    /// packed objects from O(reads * pack size) into a single parse plus O(1)
+    /// hash lookups. On a poisoned cache lock it falls back to parsing without
+    /// caching, preserving correctness.
+    fn cached_pack_objects(
+        &self,
+        pack_path: &Path,
+    ) -> Result<Arc<HashMap<ObjectId, EncodedObject>>> {
+        if let Ok(cache) = self.pack_objects.lock() {
+            if let Some(objects) = cache.get(pack_path) {
+                return Ok(Arc::clone(objects));
             }
         }
-        Err(GitError::InvalidFormat(format!(
-            "pack index listed object {oid}, but pack did not contain it"
-        )))
+        let pack = PackFile::parse(&fs::read(pack_path)?, self.format)?;
+        let mut objects = HashMap::with_capacity(pack.entries.len());
+        for entry in pack.entries {
+            objects.insert(entry.entry.oid, entry.object);
+        }
+        let objects = Arc::new(objects);
+        if let Ok(mut cache) = self.pack_objects.lock() {
+            cache.insert(pack_path.to_path_buf(), Arc::clone(&objects));
+        }
+        Ok(objects)
+    }
+
+    /// Parsed index for the `.idx` at `index_path`, parsed at most once per
+    /// database handle. On a poisoned lock it falls back to parsing without
+    /// caching, preserving correctness.
+    fn cached_pack_index(&self, index_path: &Path) -> Result<Arc<PackIndex>> {
+        if let Ok(cache) = self.pack_indexes.lock() {
+            if let Some(index) = cache.get(index_path) {
+                return Ok(Arc::clone(index));
+            }
+        }
+        let index = Arc::new(PackIndex::parse(&fs::read(index_path)?, self.format)?);
+        if let Ok(mut cache) = self.pack_indexes.lock() {
+            cache.insert(index_path.to_path_buf(), Arc::clone(&index));
+        }
+        Ok(index)
     }
 
     fn find_pack_containing(&self, oid: &ObjectId) -> Result<Option<PackPaths>> {
@@ -995,7 +1054,7 @@ impl FileObjectDatabase {
             if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
                 continue;
             }
-            let index = PackIndex::parse(&fs::read(&path)?, self.format)?;
+            let index = self.cached_pack_index(&path)?;
             if index.find(oid).is_some() {
                 let Some(stem) = path.file_stem() else {
                     continue;
