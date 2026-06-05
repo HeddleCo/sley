@@ -52,17 +52,20 @@ workspace test suite green (123 test binaries).
 
 ---
 
+### Network driver → `sley-remote` (Stages A–G)
+fetch / push / clone / ls-remote are now callable `sley-remote` library APIs for
+http / local / ssh, behind the `CredentialProvider` + `ProgressSink` seams;
+shallow `--depth` clone/fetch is implemented and verified byte-for-byte vs system
+git. Transport orchestration is fully out of the `sley-cli` monolith — the first
+big slice of decomposition #19. Commits `a5e0d94`..`6c2f9f2`.
+
+### zlib-ng backend (zlib half of #40)
+Opt-in `zlib-ng` feature on sley-pack/sley-odb, forwarded through sley + sley-cli;
+default stays pure-Rust (miniz_oxide). Commit `fcf2ebd`.
+
 ## 🔄 In progress
 
-### Network driver → new `sley-remote` crate  *(heddle's biggest remaining blocker)*
-Lift fetch / push / clone / ls-remote **orchestration** out of the `sley-cli`
-monolith into a callable library crate. The wire codecs (`sley-protocol`) and the
-v2 pack encoder (`sley-pack`) are already public; what must move is the glue:
-info/refs → advertisement parse → RPC, ref-map building, HEAD-symref resolution,
-report-status validation, the credential hook, and the `file://`/local-path
-object copy. Also: verify shallow `deepen <n>` is honored on HTTP fetch; wire the
-TLS backend feature choice. This is also the first big extraction of the
-`sley-cli` decomposition (#19).
+_(Awaiting the next slice — remaining heddle gaps in the scorecard below.)_
 
 ---
 
@@ -76,9 +79,8 @@ TLS backend feature choice. This is also the first big extraction of the
    commit/tag author/committer/tagger (raw bytes stay the source of truth for
    re-serialization); wire `GitTime`, **preserving git's `-0000` (tz-unknown)
    vs `+0000`** distinction.
-3. **Dep-feature forwarding (#40)** — make ureq's TLS backend
-   (rustls / native-tls / platform-verifier) and flate2's zlib backend
-   downstream-selectable.
+3. **Dep-feature forwarding (#40)** — zlib-ng backend DONE; remaining: forward
+   ureq's TLS backend (rustls / native-tls / platform-verifier) as selectable.
 4. **ObjectId `Copy` + `clone_on_copy` cleanup** — deferred from export-core
    (would add ~200 clippy warnings across 15 crates); do as one scoped
    `clippy --fix` pass.
@@ -100,8 +102,9 @@ TLS backend feature choice. This is also the first big extraction of the
   ahead/behind revwalk; config include/includeIf.
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
   ObjectId types.
-- **Remaining gaps:** network driver (lift), global/system config, structured
-  remote edit, signatures/dates typing.
+- **Remaining gaps:** global/system config + identity, structured remote edit,
+  signatures/dates typing (#46), bulk object-read throughput (#49), TLS-backend
+  forwarding (the TLS half of #40).
 
 ---
 
