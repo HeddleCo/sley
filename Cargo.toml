@@ -15,6 +15,7 @@ members = [
     "crates/git-pack",
     "crates/git-transport",
     "crates/git-fetch",
+    "crates/git-remote",
     "crates/git-fsck",
     "crates/git-archive",
     "crates/git",

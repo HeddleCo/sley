@@ -230,6 +230,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-remote"
+version = "0.1.0"
+dependencies = [
+ "git-config",
+ "git-core",
+ "git-fetch",
+ "git-odb",
+ "git-pack",
+ "git-protocol",
+ "git-refs",
+ "git-rev",
+ "git-transport",
+ "git-worktree",
+]
+
+[[package]]
 name = "git-rev"
 version = "0.1.0"
 dependencies = [
