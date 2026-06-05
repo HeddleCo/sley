@@ -12942,7 +12942,9 @@ fn print_cat_file_batch_record(
     stdout: &mut io::Stdout,
     record: CatFileBatchRecord<'_>,
 ) -> Result<()> {
-    let Ok(oid) = resolve_revision(record.git_dir, record.format, record.object_name) else {
+    let Ok(oid) =
+        resolve_revision_with_reader(record.git_dir, record.format, record.db, record.object_name)
+    else {
         write!(stdout, "{} missing", record.object_name)?;
         stdout.write_all(&[record.terminator])?;
         return Ok(());
@@ -32389,6 +32391,20 @@ fn superproject_working_tree(git_dir: &Path) -> Result<Option<PathBuf>> {
 fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     sley_rev::resolve_revision(git_dir, format, rev)
+}
+
+/// Like [`resolve_revision`], but resolves through an already-open object reader
+/// instead of constructing a fresh `FileObjectDatabase` per call. Used by the
+/// cat-file batch loop, where building (and dropping) a database for every input
+/// line was measurable per-object overhead.
+fn resolve_revision_with_reader<R: sley_odb::ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+) -> Result<ObjectId> {
+    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
+    sley_rev::resolve_revision_with_reader(git_dir, format, reader, rev)
 }
 
 fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {

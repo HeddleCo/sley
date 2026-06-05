@@ -736,17 +736,24 @@ fn cache_budget_from_env(var: &str, default: usize) -> usize {
 
 /// Approximate byte budget for the decoded-object LRU (see
 /// [`DEFAULT_OBJECT_CACHE_BYTES`], `SLEY_OBJECT_CACHE_BYTES`).
+///
+/// Resolved once per process: the environment does not change under us, and a new
+/// `FileObjectDatabase` is built often enough (e.g. once per revision resolved)
+/// that re-reading the variable each time showed up as per-object overhead.
 fn object_cache_budget() -> usize {
-    cache_budget_from_env("SLEY_OBJECT_CACHE_BYTES", DEFAULT_OBJECT_CACHE_BYTES)
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET
+        .get_or_init(|| cache_budget_from_env("SLEY_OBJECT_CACHE_BYTES", DEFAULT_OBJECT_CACHE_BYTES))
 }
 
 /// Approximate byte budget for each per-pack delta-base cache (see
-/// [`DEFAULT_DELTA_BASE_CACHE_BYTES`], `SLEY_DELTA_BASE_CACHE_BYTES`).
+/// [`DEFAULT_DELTA_BASE_CACHE_BYTES`], `SLEY_DELTA_BASE_CACHE_BYTES`). Resolved
+/// once per process for the same reason as [`object_cache_budget`].
 fn delta_base_cache_budget() -> usize {
-    cache_budget_from_env(
-        "SLEY_DELTA_BASE_CACHE_BYTES",
-        DEFAULT_DELTA_BASE_CACHE_BYTES,
-    )
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        cache_budget_from_env("SLEY_DELTA_BASE_CACHE_BYTES", DEFAULT_DELTA_BASE_CACHE_BYTES)
+    })
 }
 
 /// Whether to re-hash every object on read and compare it to the requested id.
