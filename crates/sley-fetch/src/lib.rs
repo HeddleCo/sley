@@ -279,8 +279,9 @@ mod tests {
             destination
                 .borrow()
                 .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
+                .expect("test operation should succeed")
+                .as_ref(),
+            &object
         );
     }
 
@@ -323,8 +324,10 @@ mod tests {
         );
         assert!(db.contains(oid).expect("test operation should succeed"));
         assert_eq!(
-            db.read_object(oid).expect("test operation should succeed"),
-            *object
+            db.read_object(oid)
+                .expect("test operation should succeed")
+                .as_ref(),
+            object
         );
     }
 

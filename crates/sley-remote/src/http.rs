@@ -207,7 +207,7 @@ fn http_upload_pack_post(
             &url,
             &content_type,
             &http_authorization_headers(auth),
-            body.clone(),
+            &body,
         )
     })?;
     http_check_status(&response, &url)?;

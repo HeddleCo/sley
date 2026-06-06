@@ -1383,7 +1383,7 @@ fn lookup_patch_base_blob(
     {
         let object = db.read_object(&oid)?;
         if object.object_type == ObjectType::Blob {
-            return Ok(Some(object.body));
+            return Ok(Some(object.body.clone()));
         }
     }
     if let Some((_, oid)) = ours_map.get(old_path).or_else(|| ours_map.get(path)) {

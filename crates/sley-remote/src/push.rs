@@ -250,7 +250,7 @@ fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
             &url,
             &content_type,
             &crate::http::http_authorization_headers(auth),
-            body.clone(),
+            &body,
         )
     })?;
     crate::http::http_check_status(&response, &url)?;

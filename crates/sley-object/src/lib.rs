@@ -371,24 +371,21 @@ fn tree_name_terminator(mode: u32) -> u8 {
 /// [`build`](TreeBuilder::build) / [`write`](TreeBuilder::write).
 #[derive(Debug, Clone, Default)]
 pub struct TreeBuilder {
-    entries: std::collections::HashMap<Vec<u8>, TreeEntry>,
+    entries: Vec<TreeEntry>,
 }
 
 impl TreeBuilder {
     pub fn new() -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: Vec::new(),
         }
     }
 
     /// Seed the builder with an existing tree level's entries.
     pub fn from_tree(tree: Tree) -> Self {
-        let entries = tree
-            .entries
-            .into_iter()
-            .map(|entry| (entry.name.clone(), entry))
-            .collect();
-        Self { entries }
+        Self {
+            entries: tree.entries,
+        }
     }
 
     /// Insert or replace the entry named `name` with one of Git's canonical
@@ -401,13 +398,22 @@ impl TreeBuilder {
     /// modes); prefer [`upsert`](TreeBuilder::upsert) for normal entries.
     pub fn upsert_raw(&mut self, name: impl Into<Vec<u8>>, mode: u32, oid: ObjectId) {
         let name = name.into();
-        self.entries
-            .insert(name.clone(), TreeEntry { mode, name, oid });
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.name == name) {
+            entry.mode = mode;
+            entry.oid = oid;
+        } else {
+            self.entries.push(TreeEntry { mode, name, oid });
+        }
     }
 
     /// Remove the entry named `name`, returning whether one was present.
     pub fn remove(&mut self, name: &[u8]) -> bool {
-        self.entries.remove(name).is_some()
+        if let Some(position) = self.entries.iter().position(|entry| entry.name == name) {
+            self.entries.swap_remove(position);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -420,7 +426,7 @@ impl TreeBuilder {
 
     /// Collect into a [`Tree`] with entries in Git's canonical order.
     pub fn build(self) -> Tree {
-        let mut entries: Vec<TreeEntry> = self.entries.into_values().collect();
+        let mut entries = self.entries;
         entries
             .sort_by(|left, right| tree_entry_cmp(&left.name, left.mode, &right.name, right.mode));
         Tree { entries }

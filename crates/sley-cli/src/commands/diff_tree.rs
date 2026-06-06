@@ -1133,7 +1133,7 @@ struct CopySource {
 /// is missing or is not a blob (so a bad candidate just fails to match).
 fn read_blob_for_similarity(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
     match db.read_object(oid) {
-        Ok(object) if object.object_type == ObjectType::Blob => Some(object.body),
+        Ok(object) if object.object_type == ObjectType::Blob => Some(object.body.clone()),
         _ => None,
     }
 }

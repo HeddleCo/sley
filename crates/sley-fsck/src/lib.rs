@@ -126,7 +126,7 @@ where
                 ),
             });
         }
-        self.check_loaded_object(link.oid, object);
+        self.check_loaded_object(link.oid, &object);
     }
 
     fn check_object(&mut self, oid: ObjectId) {
@@ -139,10 +139,10 @@ where
                 return;
             }
         };
-        self.check_loaded_object(oid, object);
+        self.check_loaded_object(oid, &object);
     }
 
-    fn check_loaded_object(&mut self, oid: ObjectId, object: EncodedObject) {
+    fn check_loaded_object(&mut self, oid: ObjectId, object: &EncodedObject) {
         if !self.checked.insert(oid.clone()) {
             return;
         }

@@ -15,7 +15,7 @@ use std::{env, fs};
 static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub trait ObjectReader {
-    fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject>;
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
 }
 
 pub trait ObjectWriter {
@@ -207,7 +207,7 @@ where
 {
     let mut objects = Vec::new();
     walk_reachable_objects(reader, format, starts, excluded, |object| {
-        objects.push(object);
+        objects.push(arc_into_encoded_object(Arc::clone(object)));
     })?;
     Ok(objects)
 }
@@ -312,7 +312,7 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
     // `FileObjectDatabase::read_object`, but both decode to the same bytes.
     let mut objects = Vec::with_capacity(all_oids.len());
     for oid in &all_oids {
-        objects.push(database.read_object(oid)?);
+        objects.push(arc_into_encoded_object(database.read_object(oid)?));
     }
 
     let written = PackFile::write_packed(&objects, format)?;
@@ -738,7 +738,7 @@ fn walk_reachable_objects<R, I, F>(
 where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
-    F: FnMut(EncodedObject),
+    F: FnMut(&Arc<EncodedObject>),
 {
     let mut seen = HashSet::new();
     let mut pending = Vec::new();
@@ -758,7 +758,7 @@ where
                         let commit = Commit::parse_ref(format, &object.body)?;
                         (commit.tree, commit.parents)
                     };
-                    visit(object);
+                    visit(&object);
                     for parent in parents.into_iter().rev() {
                         pending.push(parent);
                     }
@@ -773,7 +773,7 @@ where
                         }
                         child_oids.push(entry.oid);
                     }
-                    visit(object);
+                    visit(&object);
                     pending.extend(child_oids.into_iter().rev());
                 }
                 ObjectType::Tag => {
@@ -781,10 +781,10 @@ where
                         let tag = Tag::parse_ref(format, &object.body)?;
                         tag.object
                     };
-                    visit(object);
+                    visit(&object);
                     pending.push(target);
                 }
-                ObjectType::Blob => visit(object),
+                ObjectType::Blob => visit(&object),
             }
         }
     }
@@ -794,7 +794,7 @@ where
 #[derive(Debug, Clone)]
 pub struct ObjectDatabase {
     format: ObjectFormat,
-    objects: HashMap<ObjectId, EncodedObject>,
+    objects: HashMap<ObjectId, Arc<EncodedObject>>,
     promisor: bool,
 }
 
@@ -830,10 +830,10 @@ impl ObjectDatabase {
 }
 
 impl ObjectReader for ObjectDatabase {
-    fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects
             .get(oid)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| GitError::NotFound(format!("object {oid}")))
     }
 }
@@ -841,7 +841,9 @@ impl ObjectReader for ObjectDatabase {
 impl ObjectWriter for ObjectDatabase {
     fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
-        self.objects.entry(oid.clone()).or_insert(object);
+        self.objects
+            .entry(oid.clone())
+            .or_insert_with(|| Arc::new(object));
         Ok(oid)
     }
 }
@@ -994,7 +996,7 @@ fn verify_reads_enabled() -> bool {
 struct LruCache<K: std::hash::Hash + Eq + Clone> {
     budget: usize,
     used: usize,
-    map: HashMap<K, EncodedObject>,
+    map: HashMap<K, Arc<EncodedObject>>,
     order: VecDeque<K>,
 }
 
@@ -1008,8 +1010,8 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
         }
     }
 
-    fn get(&mut self, key: &K) -> Option<EncodedObject> {
-        let object = self.map.get(key)?.clone();
+    fn get(&mut self, key: &K) -> Option<Arc<EncodedObject>> {
+        let object = Arc::clone(self.map.get(key)?);
         self.touch(key);
         Some(object)
     }
@@ -1034,7 +1036,7 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
         }
     }
 
-    fn put(&mut self, key: K, object: EncodedObject) {
+    fn put(&mut self, key: K, object: Arc<EncodedObject>) {
         if self.budget == 0 {
             return;
         }
@@ -1080,14 +1082,21 @@ type LruOffsetCache = LruCache<u64>;
 struct PackDeltaCacheAdapter<'a>(&'a Arc<Mutex<LruOffsetCache>>);
 
 impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
-    fn get(&self, offset: u64) -> Option<EncodedObject> {
+    fn get(&self, offset: u64) -> Option<Arc<EncodedObject>> {
         self.0.lock().ok()?.get(&offset)
     }
 
-    fn insert(&self, offset: u64, object: &EncodedObject) {
+    fn insert(&self, offset: u64, object: Arc<EncodedObject>) {
         if let Ok(mut cache) = self.0.lock() {
-            cache.put(offset, object.clone());
+            cache.put(offset, object);
         }
+    }
+}
+
+fn arc_into_encoded_object(object: Arc<EncodedObject>) -> EncodedObject {
+    match Arc::try_unwrap(object) {
+        Ok(object) => object,
+        Err(object) => (*object).clone(),
     }
 }
 
@@ -1474,7 +1483,7 @@ impl FileObjectDatabase {
         Ok(None)
     }
 
-    fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<EncodedObject>> {
+    fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<Arc<EncodedObject>>> {
         // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
         // bases that resolve back through the store + repeated whole-object reads).
         if let Ok(mut cache) = self.decoded.lock()
@@ -1499,16 +1508,19 @@ impl FileObjectDatabase {
         // safe.
         let resolve_ref_base = |base: &ObjectId| self.read_object(base).map(Some);
         let object = match &delta_adapter {
-            Some(adapter) => sley_pack::read_object_at_with_cache(
+            Some(adapter) => sley_pack::read_object_at_with_cache_arc(
                 &bytes,
                 pack_paths.offset,
                 self.format,
                 resolve_ref_base,
                 adapter,
             )?,
-            None => {
-                sley_pack::read_object_at(&bytes, pack_paths.offset, self.format, resolve_ref_base)?
-            }
+            None => Arc::new(sley_pack::read_object_at(
+                &bytes,
+                pack_paths.offset,
+                self.format,
+                resolve_ref_base,
+            )?),
         };
         // Trust the index → offset mapping rather than re-hashing every decoded
         // object on read (see `verify_reads_enabled`); this re-hash dominated
@@ -1522,7 +1534,7 @@ impl FileObjectDatabase {
             }
         }
         if let Ok(mut cache) = self.decoded.lock() {
-            cache.put(oid.clone(), object.clone());
+            cache.put(oid.clone(), Arc::clone(&object));
         }
         Ok(Some(object))
     }
@@ -1835,7 +1847,7 @@ fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl ObjectReader for FileObjectDatabase {
-    fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
             Err(GitError::NotFound(_)) => {}
@@ -1999,7 +2011,7 @@ impl LooseObjectStore {
 }
 
 impl ObjectReader for LooseObjectStore {
-    fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+    fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         let path = self.object_path(oid)?;
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
@@ -2024,7 +2036,7 @@ impl ObjectReader for LooseObjectStore {
                 )));
             }
         }
-        Ok(object)
+        Ok(Arc::new(object))
     }
 }
 
@@ -2084,16 +2096,28 @@ mod tests {
         EncodedObject::new(ObjectType::Blob, vec![byte; len])
     }
 
+    fn cached_blob_of(byte: u8, len: usize) -> Arc<EncodedObject> {
+        Arc::new(blob_of(byte, len))
+    }
+
+    fn read_object_for_assert(reader: &impl ObjectReader, oid: &ObjectId) -> EncodedObject {
+        reader
+            .read_object(oid)
+            .expect("test operation should succeed")
+            .as_ref()
+            .clone()
+    }
+
     #[test]
     fn lru_cache_evicts_by_byte_budget_least_recently_used_first() {
         // Budget holds two ~1 KiB objects but not three.
         let one = cached_object_cost(&blob_of(0, 1000));
         let mut cache = LruCache::<u32>::new(one * 2 + 8);
-        cache.put(1, blob_of(b'a', 1000));
-        cache.put(2, blob_of(b'b', 1000));
+        cache.put(1, cached_blob_of(b'a', 1000));
+        cache.put(2, cached_blob_of(b'b', 1000));
         // Touch key 1 so key 2 becomes least-recently-used.
         assert!(cache.get(&1).is_some());
-        cache.put(3, blob_of(b'c', 1000));
+        cache.put(3, cached_blob_of(b'c', 1000));
         // Key 2 (LRU) is evicted; 1 and 3 remain.
         assert!(cache.get(&1).is_some());
         assert!(cache.get(&2).is_none());
@@ -2103,22 +2127,22 @@ mod tests {
     #[test]
     fn lru_cache_zero_budget_is_inert() {
         let mut cache = LruCache::<u32>::new(0);
-        cache.put(1, blob_of(b'a', 16));
+        cache.put(1, cached_blob_of(b'a', 16));
         assert!(cache.get(&1).is_none());
     }
 
     #[test]
     fn lru_cache_skips_object_larger_than_budget_and_clears_stale_entry() {
         let mut cache = LruCache::<u32>::new(cached_object_cost(&blob_of(0, 100)));
-        cache.put(1, blob_of(b'a', 50));
+        cache.put(1, cached_blob_of(b'a', 50));
         assert!(cache.get(&1).is_some());
         // An object that cannot fit is not cached, and it evicts the prior entry
         // stored under the same key (so we never serve a stale value for it).
-        cache.put(1, blob_of(b'b', 10_000));
+        cache.put(1, cached_blob_of(b'b', 10_000));
         assert!(cache.get(&1).is_none());
         // A subsequent fitting insert under another key still works and accounting
         // is not corrupted by the oversized insert.
-        cache.put(2, blob_of(b'c', 50));
+        cache.put(2, cached_blob_of(b'c', 50));
         assert!(cache.get(&2).is_some());
     }
 
@@ -2128,15 +2152,15 @@ mod tests {
         // ~1900-byte object.
         let small = cached_object_cost(&blob_of(0, 500));
         let mut cache = LruCache::<u32>::new(small * 2 + 200);
-        cache.put(1, blob_of(b'a', 500));
-        cache.put(2, blob_of(b'b', 500));
+        cache.put(1, cached_blob_of(b'a', 500));
+        cache.put(2, cached_blob_of(b'b', 500));
         assert!(cache.get(&1).is_some());
         assert!(cache.get(&2).is_some());
         // Replace key 2 (now MRU after the gets above re-ordered 1 then 2) with a
         // bigger value that still fits the budget alone but makes the running total
         // exceed it; the LRU (key 1) is evicted while the replaced key 2 stays.
         // This exercises the replace-path accounting.
-        cache.put(2, blob_of(b'b', 1000));
+        cache.put(2, cached_blob_of(b'b', 1000));
         assert!(cache.get(&2).is_some());
         assert!(cache.get(&1).is_none());
     }
@@ -2163,12 +2187,7 @@ mod tests {
         let oid = store
             .write_object(object.clone())
             .expect("test operation should succeed");
-        assert_eq!(
-            store
-                .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&store, &oid), object);
         assert!(
             store
                 .object_path(&oid)
@@ -2204,10 +2223,7 @@ mod tests {
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         assert!(db.contains(&oid).expect("test operation should succeed"));
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -2482,10 +2498,7 @@ mod tests {
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
         assert!(db.contains(&oid).expect("test operation should succeed"));
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -2518,10 +2531,7 @@ mod tests {
                 .exists()
         );
         assert!(db.contains(&oid).expect("test operation should succeed"));
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -2554,10 +2564,7 @@ mod tests {
                 .exists()
         );
         assert!(db.contains(&oid).expect("test operation should succeed"));
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -2617,10 +2624,7 @@ mod tests {
                 .expect("test operation should succeed")
                 .exists()
         );
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -2719,12 +2723,7 @@ mod tests {
                     .contains(oid)
                     .expect("test operation should succeed")
             );
-            assert_eq!(
-                destination
-                    .read_object(oid)
-                    .expect("test operation should succeed"),
-                *object
-            );
+            assert_eq!(read_object_for_assert(&destination, oid), *object);
         }
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -2954,12 +2953,7 @@ mod tests {
                 .expect("test operation should succeed")
                 .exists()
         );
-        assert_eq!(
-            destination
-                .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&destination, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -3058,16 +3052,8 @@ mod tests {
                 .expect("test operation should succeed"),
             ObjectPrefixResolution::Unique(second_oid.clone())
         );
-        assert_eq!(
-            db.read_object(&second_oid)
-                .expect("test operation should succeed"),
-            second
-        );
-        assert_eq!(
-            db.read_object(&first_oid)
-                .expect("test operation should succeed"),
-            first
-        );
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -3090,11 +3076,7 @@ mod tests {
             .expect("test operation should succeed");
         db.install_pack(&first_pack)
             .expect("test operation should succeed");
-        assert_eq!(
-            db.read_object(&first_oid)
-                .expect("test operation should succeed"),
-            first
-        );
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
 
         // A second object that the cached listing does not yet know about.
         let second = EncodedObject::new(ObjectType::Blob, b"second late\n".to_vec());
@@ -3117,17 +3099,9 @@ mod tests {
             db.contains(&second_oid)
                 .expect("test operation should succeed")
         );
-        assert_eq!(
-            db.read_object(&second_oid)
-                .expect("test operation should succeed"),
-            second
-        );
+        assert_eq!(read_object_for_assert(&db, &second_oid), second);
         // The original object still resolves too.
-        assert_eq!(
-            db.read_object(&first_oid)
-                .expect("test operation should succeed"),
-            first
-        );
+        assert_eq!(read_object_for_assert(&db, &first_oid), first);
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -3157,10 +3131,7 @@ mod tests {
         let oid = db
             .write_object(object.clone())
             .expect("test operation should succeed");
-        assert_eq!(
-            db.read_object(&oid).expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&db, &oid), object);
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
@@ -3211,12 +3182,7 @@ mod tests {
             .expect("test operation should succeed");
         assert_eq!(result.written_objects, vec![oid.clone()]);
         assert_eq!(result.references, bundle.references);
-        assert_eq!(
-            writer
-                .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&writer, &oid), object);
     }
 
     #[test]
@@ -3250,12 +3216,7 @@ mod tests {
                 .contains(&oid)
                 .expect("test operation should succeed")
         );
-        assert_eq!(
-            database
-                .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&database, &oid), object);
         assert!(
             !database
                 .loose()
@@ -3280,12 +3241,7 @@ mod tests {
             .expect("test operation should succeed");
 
         assert_eq!(result.written_objects, vec![oid.clone()]);
-        assert_eq!(
-            writer
-                .read_object(&oid)
-                .expect("test operation should succeed"),
-            object
-        );
+        assert_eq!(read_object_for_assert(&writer, &oid), object);
     }
 
     #[test]
@@ -3470,10 +3426,7 @@ mod tests {
                     .expect("test operation should succeed")
                     .exists()
             );
-            assert_eq!(
-                db.read_object(oid).expect("test operation should succeed"),
-                *object
-            );
+            assert_eq!(read_object_for_assert(&db, oid), *object);
         }
 
         fs::remove_dir_all(root).expect("test operation should succeed");
@@ -3530,22 +3483,12 @@ mod tests {
                     .contains(oid)
                     .expect("test operation should succeed")
             );
-            assert_eq!(
-                reopened
-                    .read_object(oid)
-                    .expect("test operation should succeed"),
-                *object
-            );
+            assert_eq!(read_object_for_assert(&reopened, oid), *object);
         }
         let packed_oid = packed_blob
             .object_id(format)
             .expect("test operation should succeed");
-        assert_eq!(
-            reopened
-                .read_object(&packed_oid)
-                .expect("test operation should succeed"),
-            packed_blob
-        );
+        assert_eq!(read_object_for_assert(&reopened, &packed_oid), packed_blob);
 
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -3644,11 +3587,7 @@ mod tests {
                 .expect("test operation should succeed")
                 .exists()
         );
-        assert_eq!(
-            db.read_object(&stray_oid)
-                .expect("test operation should succeed"),
-            stray
-        );
+        assert_eq!(read_object_for_assert(&db, &stray_oid), stray);
         // Genuinely packed loose objects were still removed.
         for (oid, _) in &graph {
             assert!(
@@ -3706,10 +3645,7 @@ mod tests {
                     .expect("test operation should succeed")
                     .exists()
             );
-            assert_eq!(
-                db.read_object(oid).expect("test operation should succeed"),
-                *object
-            );
+            assert_eq!(read_object_for_assert(&db, oid), *object);
         }
 
         fs::remove_dir_all(root).expect("test operation should succeed");

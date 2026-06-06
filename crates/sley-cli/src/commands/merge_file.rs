@@ -424,7 +424,9 @@ fn read_object_id_blob(
 ) -> Result<(Vec<u8>, String)> {
     let oid = resolve_object_id(db, format, spec)?;
     match db.read_object(&oid) {
-        Ok(object) if object.object_type == ObjectType::Blob => Ok((object.body, oid.to_hex())),
+        Ok(object) if object.object_type == ObjectType::Blob => {
+            Ok((object.body.clone(), oid.to_hex()))
+        }
         _ => {
             print_merge_file_usage();
             Err(GitError::Exit(129))

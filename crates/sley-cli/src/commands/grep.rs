@@ -12,6 +12,7 @@
 
 use crate::*;
 use sley_object::TreeEntries;
+use std::borrow::Cow;
 
 /// How the regular expression text is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,12 +377,17 @@ fn grep_index_source(
         if !pathspec.matches(path) {
             continue;
         }
-        let content = if opts.cached {
-            source.db.read_object(&entry.oid)?.body
+        let cached_object = if opts.cached {
+            Some(source.db.read_object(&entry.oid)?)
+        } else {
+            None
+        };
+        let content: Cow<'_, [u8]> = if let Some(object) = &cached_object {
+            Cow::Borrowed(&object.body)
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(path));
             match fs::read(&absolute) {
-                Ok(bytes) => bytes,
+                Ok(bytes) => Cow::Owned(bytes),
                 Err(_) => continue,
             }
         };
@@ -421,8 +427,9 @@ fn grep_tree_source(
             continue;
         }
         let display = pathspec.display(&path);
-        let content = source.db.read_object(&oid)?.body;
-        let matched = grep_buffer(&content, &display, Some(source.rev), matcher, opts, out)?;
+        let object = source.db.read_object(&oid)?;
+        let content = &object.body;
+        let matched = grep_buffer(content, &display, Some(source.rev), matcher, opts, out)?;
         any = any || matched;
     }
     Ok(any)

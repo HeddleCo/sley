@@ -1176,7 +1176,7 @@ pub trait HttpClient {
         url: &str,
         content_type: &str,
         headers: &[(&str, &str)],
-        body: Vec<u8>,
+        body: &[u8],
     ) -> Result<HttpResponse>;
 }
 
@@ -1227,7 +1227,7 @@ impl HttpClient for UreqHttpClient {
         url: &str,
         content_type: &str,
         headers: &[(&str, &str)],
-        body: Vec<u8>,
+        body: &[u8],
     ) -> Result<HttpResponse> {
         let mut request = self.agent.post(url).header("Content-Type", content_type);
         for (name, value) in headers {

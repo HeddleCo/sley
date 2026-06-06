@@ -1839,7 +1839,7 @@ fn tag_format_peeled_object(
         object_type: peeled_object.object_type,
         object_size: peeled_object.body.len(),
         object_disk_size,
-        object_body: Cow::Owned(peeled_object.body),
+        object_body: Cow::Owned(peeled_object.body.clone()),
         tree,
         parents,
         message,

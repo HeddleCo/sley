@@ -410,7 +410,7 @@ fn read_path_blob(
     if object.object_type != ObjectType::Blob {
         return Ok(None);
     }
-    Ok(Some(object.body))
+    Ok(Some(object.body.clone()))
 }
 
 /// Walk `repo_path` component-by-component through `tree_oid`, returning the

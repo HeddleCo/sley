@@ -38,10 +38,8 @@ fn unique_temp_dir(name: &str) -> PathBuf {
         .expect("system time before unix epoch")
         .as_nanos();
     let seq = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "sley-{name}-{}-{nanos}-{seq}",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}-{seq}", std::process::id()));
     fs::create_dir_all(&path).expect("create temp root");
     path
 }

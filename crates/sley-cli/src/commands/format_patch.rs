@@ -1353,7 +1353,7 @@ fn read_patch_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
             "format-patch expected blob object {oid}"
         )));
     }
-    Ok(object.body)
+    Ok(object.body.clone())
 }
 
 /// Render the `<prefix><path>` token for a `diff --git` line / `Binary files`

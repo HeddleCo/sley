@@ -290,11 +290,7 @@ impl FsckFindings {
     /// value varies, but callers driving a CLI typically only need
     /// success-vs-failure.)
     pub fn exit_code(&self) -> i32 {
-        if self.is_ok() {
-            0
-        } else {
-            1
-        }
+        if self.is_ok() { 0 } else { 1 }
     }
 }
 
@@ -384,7 +380,7 @@ where
     /// matching `git fsck <oid>` which expects a committish tip.
     fn check_root(&mut self, oid: ObjectId) {
         match self.reader.read_object(&oid) {
-            Ok(object) => self.check_loaded(oid, object),
+            Ok(object) => self.check_loaded(oid, &object),
             Err(_) => self.findings.push(FsckFinding::MissingObject {
                 object_type: ObjectType::Commit,
                 oid,
@@ -416,10 +412,10 @@ where
                 expected: link.object_type,
             });
         }
-        self.check_loaded(link.oid, object);
+        self.check_loaded(link.oid, &object);
     }
 
-    fn check_loaded(&mut self, oid: ObjectId, object: EncodedObject) {
+    fn check_loaded(&mut self, oid: ObjectId, object: &EncodedObject) {
         if !self.checked.insert(oid.clone()) {
             return;
         }
@@ -603,7 +599,7 @@ fn resolve_ref_target(
                     return RefResolution::Broken {
                         refname: refname.to_string(),
                         target: next,
-                    }
+                    };
                 }
             },
         }
@@ -958,9 +954,12 @@ mod tests {
             payload: EncodedObject,
         }
         impl ObjectReader for LyingReader {
-            fn read_object(&self, oid: &ObjectId) -> sley_core::Result<EncodedObject> {
+            fn read_object(
+                &self,
+                oid: &ObjectId,
+            ) -> sley_core::Result<std::sync::Arc<EncodedObject>> {
                 if oid == &self.claimed {
-                    Ok(self.payload.clone())
+                    Ok(std::sync::Arc::new(self.payload.clone()))
                 } else {
                     self.real.read_object(oid)
                 }
@@ -1324,10 +1323,12 @@ mod tests {
         let findings = check_refs(&db, fmt(), &refs);
         // Both refs participate in the cycle and are reported as broken.
         assert_eq!(findings.findings.len(), 2);
-        assert!(findings
-            .findings
-            .iter()
-            .all(|f| matches!(f, FsckFinding::BrokenSymref { .. })));
+        assert!(
+            findings
+                .findings
+                .iter()
+                .all(|f| matches!(f, FsckFinding::BrokenSymref { .. }))
+        );
     }
 
     /// The broken-link message reproduces git's exact two-line, width-7-aligned
@@ -1365,22 +1366,28 @@ mod tests {
     #[test]
     fn severity_classification() {
         let id = oid("7777777777777777777777777777777777777777");
-        assert!(FsckFinding::MissingObject {
-            object_type: ObjectType::Blob,
-            oid: id.clone(),
-        }
-        .is_error());
-        assert!(FsckFinding::CorruptObject {
-            oid: id.clone(),
-            reason: "x".to_string(),
-        }
-        .is_error());
-        assert!(FsckFinding::BadRefTarget {
-            refname: "r".to_string(),
-            oid: id.clone(),
-            hash: "sha1",
-        }
-        .is_error());
+        assert!(
+            FsckFinding::MissingObject {
+                object_type: ObjectType::Blob,
+                oid: id.clone(),
+            }
+            .is_error()
+        );
+        assert!(
+            FsckFinding::CorruptObject {
+                oid: id.clone(),
+                reason: "x".to_string(),
+            }
+            .is_error()
+        );
+        assert!(
+            FsckFinding::BadRefTarget {
+                refname: "r".to_string(),
+                oid: id.clone(),
+                hash: "sha1",
+            }
+            .is_error()
+        );
         assert_eq!(
             FsckFinding::Dangling {
                 object_type: ObjectType::Blob,

@@ -5,6 +5,7 @@ use sley_object::TreeEntries;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -3290,13 +3291,22 @@ pub fn apply_clean_filter_with_attributes(
     path: &[u8],
     content: &[u8],
 ) -> Result<Vec<u8>> {
+    Ok(apply_clean_filter_with_attributes_cow(config, attributes, path, content)?.into_owned())
+}
+
+fn apply_clean_filter_with_attributes_cow<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
-    let mut data = content.to_vec();
+    let mut data = Cow::Borrowed(content);
     if let Some(driver) = &plan.driver {
-        data = run_driver(driver, driver.clean.as_deref(), path, &data)?;
+        data = run_driver(driver, driver.clean.as_deref(), path, data)?;
     }
     if plan.convert_eol(&data) {
-        data = convert_crlf_to_lf(&data);
+        data = Cow::Owned(convert_crlf_to_lf(&data));
     }
     Ok(data)
 }
@@ -3330,24 +3340,33 @@ pub fn apply_smudge_filter_with_attributes(
     path: &[u8],
     content: &[u8],
 ) -> Result<Vec<u8>> {
+    Ok(apply_smudge_filter_with_attributes_cow(config, attributes, path, content)?.into_owned())
+}
+
+fn apply_smudge_filter_with_attributes_cow<'a>(
+    config: &GitConfig,
+    attributes: &[AttributeCheck],
+    path: &[u8],
+    content: &'a [u8],
+) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
-    let mut data = content.to_vec();
+    let mut data = Cow::Borrowed(content);
     if plan.eol == EolConversion::Crlf && plan.convert_eol(&data) {
-        data = convert_lf_to_crlf(&data);
+        data = Cow::Owned(convert_lf_to_crlf(&data));
     }
     if let Some(driver) = &plan.driver {
-        data = run_driver(driver, driver.smudge.as_deref(), path, &data)?;
+        data = run_driver(driver, driver.smudge.as_deref(), path, data)?;
     }
     Ok(data)
 }
 
 /// Execute one direction of a driver filter, honouring the `required` flag.
-fn run_driver(
+fn run_driver<'a>(
     driver: &FilterDriver,
     command: Option<&str>,
     path: &[u8],
-    content: &[u8],
-) -> Result<Vec<u8>> {
+    content: Cow<'a, [u8]>,
+) -> Result<Cow<'a, [u8]>> {
     let Some(command) = command else {
         // No command in this direction. Required filters must error; optional
         // ones pass content through unchanged.
@@ -3357,17 +3376,17 @@ fn run_driver(
                 String::from_utf8_lossy(&driver.name)
             )));
         }
-        return Ok(content.to_vec());
+        return Ok(content);
     };
-    match run_filter_command(command, path, content) {
-        Ok(output) => Ok(output),
+    match run_filter_command(command, path, &content) {
+        Ok(output) => Ok(Cow::Owned(output)),
         Err(err) => {
             if driver.required {
                 Err(err)
             } else {
                 // Non-required filter failure: fall back to the unfiltered
                 // content, matching git's behaviour.
-                Ok(content.to_vec())
+                Ok(content)
             }
         }
     }
@@ -3669,12 +3688,12 @@ fn checkout_commit_to_index_and_worktree_filtered(
                 object.object_type.as_str()
             )));
         }
-        let body = match (smudge_config, &attributes) {
+        let body: Cow<'_, [u8]> = match (smudge_config, &attributes) {
             (Some(config), Some(matcher)) => {
                 let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
-                apply_smudge_filter_with_attributes(config, &checks, path, &object.body)?
+                apply_smudge_filter_with_attributes_cow(config, &checks, path, &object.body)?
             }
-            _ => object.body,
+            _ => Cow::Borrowed(&object.body),
         };
         let file_path = worktree_path(worktree_root, path)?;
         if let Some(parent) = file_path.parent() {
@@ -4501,7 +4520,7 @@ fn materialize_index_entry_file(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, object.body)?;
+    fs::write(file_path, &object.body)?;
     Ok(())
 }
 
@@ -5061,7 +5080,7 @@ fn restore_index_entry(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, object.body)?;
+    fs::write(file_path, &object.body)?;
     Ok(())
 }
 
@@ -5130,7 +5149,7 @@ fn restore_head_entry_to_worktree(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, object.body)?;
+    fs::write(file_path, &object.body)?;
     Ok(())
 }
 
@@ -5152,7 +5171,7 @@ fn restore_head_entry_to_worktree_and_index(
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&file_path, object.body)?;
+    fs::write(&file_path, &object.body)?;
     let metadata = fs::metadata(&file_path)?;
     let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid.clone(), &metadata);
     index_entry.mode = entry.mode;

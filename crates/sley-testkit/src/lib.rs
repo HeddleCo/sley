@@ -818,7 +818,7 @@ pub fn thin_pack_read_parity_for_format(format: ObjectFormat) -> Result<ThinPack
         let object_db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
         let parsed = PackFile::parse_thin(&pack_bytes, format, |oid| {
             match object_db.read_object(oid) {
-                Ok(object) => Ok(Some(object)),
+                Ok(object) => Ok(Some((*object).clone())),
                 Err(GitError::NotFound(_)) => Ok(None),
                 Err(err) => Err(err),
             }
@@ -1796,7 +1796,7 @@ fn packed_odb_read_interop_parity_for_format(
         Ok(PackedOdbInteropParity {
             oid: oid.to_hex(),
             format,
-            body: object.body,
+            body: object.body.clone(),
         })
     })();
     let _ = fs::remove_dir_all(&root);
@@ -2680,7 +2680,7 @@ fn rust_cat_file(root: &Path, format: ObjectFormat, mode: &str, rev: &str) -> Re
         "-p" if object.object_type == ObjectType::Tree => {
             Ok(format_tree_entries(format, &object.body)?.into_bytes())
         }
-        "-p" => Ok(object.body),
+        "-p" => Ok(object.body.clone()),
         _ => Err(GitError::Command(format!(
             "unsupported cat-file mode {mode}"
         ))),
@@ -4242,7 +4242,7 @@ pub fn annotated_tag_create_parity_for_format(format: ObjectFormat) -> Result<An
             )));
         }
         let upstream_body = run_git(&root, ["cat-file", "-p", "refs/tags/v2.0"], &[])?;
-        let expected_body = db.read_object(&tag_oid)?.body;
+        let expected_body = db.read_object(&tag_oid)?.body.clone();
         if upstream_body != expected_body {
             return Err(GitError::Command(format!(
                 "annotated tag body mismatch: expected {:?}, got {:?}",

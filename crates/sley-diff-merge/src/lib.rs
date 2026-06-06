@@ -1550,7 +1550,7 @@ pub fn diff_name_status_empty_tree_with_rename_options(
 /// the whole diff.
 fn read_blob_bytes(db: &FileObjectDatabase, oid: &ObjectId) -> Option<Vec<u8>> {
     match db.read_object(oid) {
-        Ok(object) if object.object_type == ObjectType::Blob => Some(object.body),
+        Ok(object) if object.object_type == ObjectType::Blob => Some(object.body.clone()),
         _ => None,
     }
 }

@@ -368,7 +368,7 @@ fn read_note_blob_content(git_dir: &Path, format: ObjectFormat, spec: &str) -> R
         eprintln!("fatal: cannot read note data from non-blob object '{spec}'.");
         return Err(GitError::Exit(128));
     }
-    Ok(object.body)
+    Ok(object.body.clone())
 }
 
 /// Parsed flags shared by `add` and `append`.

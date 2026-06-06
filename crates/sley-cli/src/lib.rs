@@ -4595,7 +4595,7 @@ fn merge_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
             object.object_type.as_str()
         )));
     }
-    Ok(object.body)
+    Ok(object.body.clone())
 }
 
 fn merge_is_regular_file(mode: u32) -> bool {
@@ -16568,7 +16568,7 @@ fn read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result<Vec<u8>> {
             "diff expected blob object {oid}"
         )));
     }
-    Ok(object.body)
+    Ok(object.body.clone())
 }
 
 fn repo_path_to_path(path: &[u8]) -> PathBuf {
@@ -18108,7 +18108,7 @@ fn for_each_ref_sort_peeled_object(
         return Ok(None);
     };
     let object = context.db.read_object(&oid)?;
-    Ok(Some((oid, object)))
+    Ok(Some((oid, (*object).clone())))
 }
 
 fn for_each_ref_sort_peeled_contents(

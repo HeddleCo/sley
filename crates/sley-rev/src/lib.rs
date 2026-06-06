@@ -2010,7 +2010,7 @@ mod tests {
 
         struct MissingReader;
         impl ObjectReader for MissingReader {
-            fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+            fn read_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<EncodedObject>> {
                 Err(GitError::NotFound(format!(
                     "object reader should not be used for {oid}"
                 )))
@@ -3118,7 +3118,7 @@ mod tests {
     /// touched the odb).
     struct PanicReader;
     impl ObjectReader for PanicReader {
-        fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+        fn read_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<EncodedObject>> {
             Err(GitError::NotFound(format!(
                 "object reader must not be used for {oid}; graph should cover it"
             )))

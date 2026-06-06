@@ -27,6 +27,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -52,11 +53,11 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{GitError, GitTime, ObjectFormat, ObjectId, Result, Signature};
+pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
-pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
 pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
 
@@ -309,7 +310,9 @@ impl Repository {
         key: &str,
     ) -> Result<Option<String>> {
         let config = self.config_snapshot()?;
-        Ok(sley_config::config_string(&config, section, subsection, key))
+        Ok(sley_config::config_string(
+            &config, section, subsection, key,
+        ))
     }
 
     /// Absolute common git directory used as the `gitdir:` context for
@@ -368,7 +371,7 @@ impl Repository {
     }
 
     /// Read a raw object (any type) from the object database.
-    pub fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
+    pub fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects().read_object(oid)
     }
 
@@ -733,9 +736,7 @@ mod tests {
         assert_eq!(tree.entries[0].name, b"hello.txt");
 
         // The blob under the tree is readable as a raw object.
-        let blob = repo
-            .read_object(&tree.entries[0].oid)
-            .expect("read blob");
+        let blob = repo.read_object(&tree.entries[0].oid).expect("read blob");
         assert_eq!(blob.object_type, ObjectType::Blob);
         assert_eq!(blob.body, b"hello\n");
     }
@@ -826,16 +827,15 @@ mod tests {
         let temp = TempDir::new();
         // temp dir is not inside a repo (it lives directly under the system tmp
         // dir, which is not a git working tree).
-        let err = Repository::discover(temp.path())
-            .expect_err("discovering outside any repo must fail");
+        let err =
+            Repository::discover(temp.path()).expect_err("discovering outside any repo must fail");
         assert!(matches!(err, GitError::NotFound(_)));
     }
 
     #[test]
     fn open_rejects_non_git_directory() {
         let temp = TempDir::new();
-        let err = Repository::open(temp.path())
-            .expect_err("opening a non-git directory must fail");
+        let err = Repository::open(temp.path()).expect_err("opening a non-git directory must fail");
         assert!(matches!(err, GitError::NotFound(_)));
     }
 
@@ -846,7 +846,10 @@ mod tests {
         let config = repo.config().expect("config");
         // init writes core.repositoryformatversion and core.bare.
         assert_eq!(config.get("core", None, "bare"), Some("false"));
-        assert_eq!(config.repository_object_format().expect("format"), ObjectFormat::Sha1);
+        assert_eq!(
+            config.repository_object_format().expect("format"),
+            ObjectFormat::Sha1
+        );
     }
 
     #[test]
@@ -895,7 +898,10 @@ mod tests {
             repo.config_string("user", "email").expect("email"),
             Some("snap@example.invalid".to_string())
         );
-        assert_eq!(repo.config_string("user", "missing").expect("missing"), None);
+        assert_eq!(
+            repo.config_string("user", "missing").expect("missing"),
+            None
+        );
 
         // Subsections are honoured.
         assert_eq!(
@@ -977,6 +983,7 @@ mod tests {
     fn plumbing_reexports_are_reachable() {
         // Smoke test that the re-exports compile and resolve to the right types.
         let _format: plumbing::sley_core::ObjectFormat = ObjectFormat::Sha1;
-        let _: fn(&[u8]) -> Result<plumbing::sley_config::GitConfig> = plumbing::sley_config::GitConfig::parse;
+        let _: fn(&[u8]) -> Result<plumbing::sley_config::GitConfig> =
+            plumbing::sley_config::GitConfig::parse;
     }
 }

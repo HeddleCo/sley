@@ -17,18 +17,11 @@ pub struct PktLine(pub Vec<u8>);
 
 impl PktLine {
     pub fn encode(&self) -> Vec<u8> {
-        let len = self.0.len() + 4;
-        let mut out = format!("{len:04x}").into_bytes();
-        out.extend_from_slice(&self.0);
-        out
+        encode_pkt_line_payload(&self.0)
     }
 
     pub fn try_encode(&self) -> Result<Vec<u8>> {
-        if self.0.len() > PKT_LINE_MAX_PAYLOAD_LEN {
-            return Err(GitError::InvalidFormat(format!(
-                "pkt-line payload exceeds {PKT_LINE_MAX_PAYLOAD_LEN} bytes"
-            )));
-        }
+        validate_pkt_line_payload(&self.0)?;
         Ok(self.encode())
     }
 }
@@ -126,17 +119,13 @@ pub enum UploadArchiveResponse {
 impl PktLineFrame {
     pub fn data(payload: impl Into<Vec<u8>>) -> Result<Self> {
         let payload = payload.into();
-        if payload.len() > PKT_LINE_MAX_PAYLOAD_LEN {
-            return Err(GitError::InvalidFormat(format!(
-                "pkt-line payload exceeds {PKT_LINE_MAX_PAYLOAD_LEN} bytes"
-            )));
-        }
+        validate_pkt_line_payload(&payload)?;
         Ok(Self::Data(payload))
     }
 
     pub fn encode(&self) -> Vec<u8> {
         match self {
-            Self::Data(payload) => PktLine(payload.clone()).encode(),
+            Self::Data(payload) => encode_pkt_line_payload(payload),
             Self::Flush => b"0000".to_vec(),
             Self::Delimiter => b"0001".to_vec(),
             Self::ResponseEnd => b"0002".to_vec(),
@@ -145,7 +134,7 @@ impl PktLineFrame {
 
     pub fn try_encode(&self) -> Result<Vec<u8>> {
         match self {
-            Self::Data(payload) => PktLine(payload.clone()).try_encode(),
+            Self::Data(payload) => try_encode_pkt_line_payload(payload),
             Self::Flush | Self::Delimiter | Self::ResponseEnd => Ok(self.encode()),
         }
     }
@@ -177,6 +166,38 @@ impl PktLineFrame {
             ))),
         }
     }
+}
+
+fn validate_pkt_line_payload(payload: &[u8]) -> Result<()> {
+    if payload.len() > PKT_LINE_MAX_PAYLOAD_LEN {
+        return Err(GitError::InvalidFormat(format!(
+            "pkt-line payload exceeds {PKT_LINE_MAX_PAYLOAD_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn pkt_line_header(len: usize) -> [u8; 4] {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    [
+        HEX[(len >> 12) & 0xf],
+        HEX[(len >> 8) & 0xf],
+        HEX[(len >> 4) & 0xf],
+        HEX[len & 0xf],
+    ]
+}
+
+fn encode_pkt_line_payload(payload: &[u8]) -> Vec<u8> {
+    let len = payload.len() + 4;
+    let mut out = Vec::with_capacity(len);
+    out.extend_from_slice(&pkt_line_header(len));
+    out.extend_from_slice(payload);
+    out
+}
+
+fn try_encode_pkt_line_payload(payload: &[u8]) -> Result<Vec<u8>> {
+    validate_pkt_line_payload(payload)?;
+    Ok(encode_pkt_line_payload(payload))
 }
 
 pub fn parse_pkt_line_stream(mut input: &[u8]) -> Result<Vec<PktLineFrame>> {
@@ -281,7 +302,20 @@ fn read_pkt_line_frames_until_control(
 }
 
 pub fn write_pkt_line_frame(writer: &mut impl Write, frame: &PktLineFrame) -> Result<()> {
-    writer.write_all(&frame.try_encode()?)?;
+    match frame {
+        PktLineFrame::Data(payload) => write_pkt_line_payload(writer, payload)?,
+        PktLineFrame::Flush => writer.write_all(b"0000")?,
+        PktLineFrame::Delimiter => writer.write_all(b"0001")?,
+        PktLineFrame::ResponseEnd => writer.write_all(b"0002")?,
+    }
+    Ok(())
+}
+
+pub fn write_pkt_line_payload(writer: &mut impl Write, payload: &[u8]) -> Result<()> {
+    validate_pkt_line_payload(payload)?;
+    let len = payload.len() + 4;
+    writer.write_all(&pkt_line_header(len))?;
+    writer.write_all(payload)?;
     Ok(())
 }
 
@@ -4487,10 +4521,10 @@ pub fn encode_upload_pack_raw_packfile_response(
     }
     let mut out = Vec::new();
     for acknowledgment in &response.acknowledgments {
-        out.extend_from_slice(
-            &PktLineFrame::data(encode_upload_pack_acknowledgment(acknowledgment)?)?
-                .try_encode()?,
-        );
+        write_pkt_line_payload(
+            &mut out,
+            &encode_upload_pack_acknowledgment(acknowledgment)?,
+        )?;
     }
     out.extend_from_slice(&response.packfile);
     Ok(out)
@@ -4735,15 +4769,9 @@ pub fn parse_receive_pack_push_request(
 
 pub fn encode_receive_pack_push_request(request: &ReceivePackPushRequest) -> Result<Vec<u8>> {
     let mut out = Vec::new();
-    let command_frames = encode_receive_pack_request(&request.commands)?;
-    for frame in &command_frames {
-        out.extend_from_slice(&frame.try_encode()?);
-    }
+    write_receive_pack_request(&mut out, &request.commands)?;
     if let Some(push_options) = &request.push_options {
-        let option_frames = encode_receive_pack_push_options(push_options)?;
-        for frame in &option_frames {
-            out.extend_from_slice(&frame.try_encode()?);
-        }
+        write_receive_pack_push_options(&mut out, push_options)?;
     }
     out.extend_from_slice(&request.packfile);
     Ok(out)
@@ -4773,7 +4801,11 @@ pub fn write_receive_pack_push_request(
     writer: &mut impl Write,
     request: &ReceivePackPushRequest,
 ) -> Result<()> {
-    writer.write_all(&encode_receive_pack_push_request(request)?)?;
+    write_receive_pack_request(writer, &request.commands)?;
+    if let Some(push_options) = &request.push_options {
+        write_receive_pack_push_options(writer, push_options)?;
+    }
+    writer.write_all(&request.packfile)?;
     Ok(())
 }
 

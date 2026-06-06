@@ -6,6 +6,7 @@ use sley_object::{EncodedObject, ObjectType};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackEntry {
@@ -1788,9 +1789,9 @@ struct EntryHeader {
 /// path). The default [`read_object_at`] uses a no-op cache and is unaffected.
 pub trait PackDeltaCache {
     /// Return the decoded object whose entry begins at `offset`, if cached.
-    fn get(&self, offset: u64) -> Option<EncodedObject>;
+    fn get(&self, offset: u64) -> Option<Arc<EncodedObject>>;
     /// Record that the entry beginning at `offset` decodes to `object`.
-    fn insert(&self, offset: u64, object: &EncodedObject);
+    fn insert(&self, offset: u64, object: Arc<EncodedObject>);
 }
 
 /// A [`PackDeltaCache`] that stores nothing; used by [`read_object_at`] to keep
@@ -1798,10 +1799,10 @@ pub trait PackDeltaCache {
 struct NoopDeltaCache;
 
 impl PackDeltaCache for NoopDeltaCache {
-    fn get(&self, _offset: u64) -> Option<EncodedObject> {
+    fn get(&self, _offset: u64) -> Option<Arc<EncodedObject>> {
         None
     }
-    fn insert(&self, _offset: u64, _object: &EncodedObject) {}
+    fn insert(&self, _offset: u64, _object: Arc<EncodedObject>) {}
 }
 
 // Reused zlib inflate state. Resetting and reusing one `Decompress` avoids
@@ -1894,7 +1895,7 @@ pub fn read_object_at<F>(
     resolve_ref_base: F,
 ) -> Result<EncodedObject>
 where
-    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
 {
     read_object_at_with_cache(
         pack_bytes,
@@ -1921,10 +1922,35 @@ pub fn read_object_at_with_cache<F, C>(
     cache: &C,
 ) -> Result<EncodedObject>
 where
-    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
+    C: PackDeltaCache + ?Sized,
+{
+    read_object_at_with_cache_arc(pack_bytes, offset, format, &mut resolve_ref_base, cache)
+        .map(arc_into_encoded_object)
+}
+
+/// Like [`read_object_at_with_cache`], but returns the decoded object behind an
+/// [`Arc`]. Callers that keep cache handles can reuse decoded delta bases without
+/// cloning full object bodies.
+pub fn read_object_at_with_cache_arc<F, C>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    mut resolve_ref_base: F,
+    cache: &C,
+) -> Result<Arc<EncodedObject>>
+where
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
     C: PackDeltaCache + ?Sized,
 {
     read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base, cache)
+}
+
+fn arc_into_encoded_object(object: Arc<EncodedObject>) -> EncodedObject {
+    match Arc::try_unwrap(object) {
+        Ok(object) => object,
+        Err(object) => (*object).clone(),
+    }
 }
 
 fn read_object_at_inner<F, C>(
@@ -1933,9 +1959,9 @@ fn read_object_at_inner<F, C>(
     format: ObjectFormat,
     resolve_ref_base: &mut F,
     cache: &C,
-) -> Result<EncodedObject>
+) -> Result<Arc<EncodedObject>>
 where
-    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
+    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
     C: PackDeltaCache + ?Sized,
 {
     // A warm cache entry for this exact offset is already the fully resolved
@@ -1997,25 +2023,25 @@ where
                     ));
                 }
             };
-            EncodedObject::new(object_type, body)
+            Arc::new(EncodedObject::new(object_type, body))
         }
         Some(DeltaBase::Offset(base_offset)) => {
             let base =
                 read_object_at_inner(pack_bytes, base_offset, format, resolve_ref_base, cache)?;
             let resolved = apply_pack_delta(&base.body, &body)?;
-            EncodedObject::new(base.object_type, resolved)
+            Arc::new(EncodedObject::new(base.object_type, resolved))
         }
         Some(DeltaBase::Ref(base_oid)) => {
             let base = resolve_ref_base(&base_oid)?
                 .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {base_oid}")))?;
             let resolved = apply_pack_delta(&base.body, &body)?;
-            EncodedObject::new(base.object_type, resolved)
+            Arc::new(EncodedObject::new(base.object_type, resolved))
         }
     };
     // Record the fully resolved object so any later read that walks through this
     // offset (as a delta base or directly) reuses it. Bases are inserted as the
     // recursion unwinds, so a chain is decoded at most once across reads.
-    cache.insert(offset, &object);
+    cache.insert(offset, Arc::clone(&object));
     Ok(object)
 }
 
@@ -4038,10 +4064,10 @@ mod tests {
         )
         .expect("test operation should succeed");
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
-        let by_oid: HashMap<ObjectId, EncodedObject> = parsed
+        let by_oid: HashMap<ObjectId, Arc<EncodedObject>> = parsed
             .entries
             .iter()
-            .map(|po| (po.entry.oid.clone(), po.object.clone()))
+            .map(|po| (po.entry.oid.clone(), Arc::new(po.object.clone())))
             .collect();
         for po in &parsed.entries {
             let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
@@ -4057,22 +4083,22 @@ mod tests {
     /// one and that bases are reused across reads.
     #[derive(Default)]
     struct CountingDeltaCache {
-        map: std::cell::RefCell<HashMap<u64, EncodedObject>>,
+        map: std::cell::RefCell<HashMap<u64, Arc<EncodedObject>>>,
         hits: std::cell::Cell<usize>,
         inserts: std::cell::Cell<usize>,
     }
 
     impl PackDeltaCache for CountingDeltaCache {
-        fn get(&self, offset: u64) -> Option<EncodedObject> {
+        fn get(&self, offset: u64) -> Option<Arc<EncodedObject>> {
             let hit = self.map.borrow().get(&offset).cloned();
             if hit.is_some() {
                 self.hits.set(self.hits.get() + 1);
             }
             hit
         }
-        fn insert(&self, offset: u64, object: &EncodedObject) {
+        fn insert(&self, offset: u64, object: Arc<EncodedObject>) {
             self.inserts.set(self.inserts.get() + 1);
-            self.map.borrow_mut().insert(offset, object.clone());
+            self.map.borrow_mut().insert(offset, object);
         }
     }
 
