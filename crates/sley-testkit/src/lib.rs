@@ -4,7 +4,7 @@ use sley_formats::{Bundle, BundleReference};
 use sley_index::Index;
 use sley_object::{EncodedObject, ObjectType, TreeEntries, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter};
-use sley_pack::{DeltaStrategy, PackFile, PackIndex};
+use sley_pack::{PackFile, PackIndex, PackWriteOptions};
 use sley_refs::{FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry};
 use std::fs;
 use std::io::Write;
@@ -1657,8 +1657,10 @@ fn rust_delta_pack_write_interop_parity_for_format(
         let changed = EncodedObject::new(ObjectType::Blob, changed_body.clone());
         let base_oid = base.object_id(format)?;
         let changed_oid = changed.object_id(format)?;
-        let written =
-            PackFile::write_with_delta_strategy(&[base, changed], format, DeltaStrategy::RefDelta)?;
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(false)
+            .with_reorder(false);
+        let written = PackFile::write_packed_with_options(&[base, changed], format, &options)?;
         let pack_name = written.checksum.to_hex();
         let pack_dir = root.join(".git").join("objects").join("pack");
         fs::create_dir_all(&pack_dir)?;

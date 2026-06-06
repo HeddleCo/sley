@@ -200,14 +200,14 @@ pub fn collect_reachable_objects<R, I>(
     format: ObjectFormat,
     starts: I,
     excluded: &HashSet<ObjectId>,
-) -> Result<Vec<EncodedObject>>
+) -> Result<Vec<Arc<EncodedObject>>>
 where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
     let mut objects = Vec::new();
     walk_reachable_objects(reader, format, starts, excluded, |object| {
-        objects.push(arc_into_encoded_object(Arc::clone(object)));
+        objects.push(Arc::clone(object));
     })?;
     Ok(objects)
 }
@@ -312,7 +312,7 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
     // `FileObjectDatabase::read_object`, but both decode to the same bytes.
     let mut objects = Vec::with_capacity(all_oids.len());
     for oid in &all_oids {
-        objects.push(arc_into_encoded_object(database.read_object(oid)?));
+        objects.push(database.read_object(oid)?);
     }
 
     let written = PackFile::write_packed(&objects, format)?;
@@ -1093,13 +1093,6 @@ impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
     }
 }
 
-fn arc_into_encoded_object(object: Arc<EncodedObject>) -> EncodedObject {
-    match Arc::try_unwrap(object) {
-        Ok(object) => object,
-        Err(object) => (*object).clone(),
-    }
-}
-
 /// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
 /// the index parse so locating a packed object doesn't re-parse every `.idx` on
 /// each read.
@@ -1515,12 +1508,12 @@ impl FileObjectDatabase {
                 resolve_ref_base,
                 adapter,
             )?,
-            None => Arc::new(sley_pack::read_object_at(
+            None => sley_pack::read_object_at_arc(
                 &bytes,
                 pack_paths.offset,
                 self.format,
                 resolve_ref_base,
-            )?),
+            )?,
         };
         // Trust the index → offset mapping rather than re-hashing every decoded
         // object on read (see `verify_reads_enabled`); this re-hash dominated
@@ -2090,7 +2083,7 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
-    use sley_pack::PackFile;
+    use sley_pack::{PackFile, PackWriteOptions};
 
     fn blob_of(byte: u8, len: usize) -> EncodedObject {
         EncodedObject::new(ObjectType::Blob, vec![byte; len])
@@ -2259,10 +2252,13 @@ mod tests {
         let commit_oid = commitish
             .object_id(format)
             .expect("test operation should succeed");
-        let pack = PackFile::write_with_delta_strategy(
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let pack = PackFile::write_packed_with_options(
             &[base.clone(), child.clone(), commitish.clone()],
             format,
-            sley_pack::DeltaStrategy::OfsDelta,
+            &options,
         )
         .expect("test operation should succeed");
         db.install_pack(&pack)
@@ -2339,12 +2335,11 @@ mod tests {
         let child_oid = child
             .object_id(format)
             .expect("test operation should succeed");
-        let pack = PackFile::write_with_delta_strategy(
-            &[base, child],
-            format,
-            sley_pack::DeltaStrategy::OfsDelta,
-        )
-        .expect("test operation should succeed");
+        let options = PackWriteOptions::new()
+            .with_prefer_ofs_delta(true)
+            .with_reorder(false);
+        let pack = PackFile::write_packed_with_options(&[base, child], format, &options)
+            .expect("test operation should succeed");
         db.install_pack(&pack)
             .expect("test operation should succeed");
 

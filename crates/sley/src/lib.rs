@@ -310,9 +310,7 @@ impl Repository {
         key: &str,
     ) -> Result<Option<String>> {
         let config = self.config_snapshot()?;
-        Ok(sley_config::config_string(
-            &config, section, subsection, key,
-        ))
+        Ok(config.get(section, subsection, key).map(str::to_owned))
     }
 
     /// Absolute common git directory used as the `gitdir:` context for

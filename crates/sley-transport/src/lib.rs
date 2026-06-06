@@ -220,10 +220,7 @@ pub fn read_service_request(reader: &mut impl Read) -> Result<ServiceRequest> {
 }
 
 pub fn write_service_request(writer: &mut impl Write, request: &ServiceRequest) -> Result<()> {
-    write_pkt_line_frame(
-        writer,
-        &PktLineFrame::data(encode_service_request(request)?)?,
-    )
+    write_pkt_line_payload(writer, &encode_service_request(request)?)
 }
 
 pub fn parse_service_announcement(payload: &[u8]) -> Result<ServiceAnnouncement> {
@@ -276,8 +273,9 @@ pub fn write_service_announcement(
     writer: &mut impl Write,
     announcement: &ServiceAnnouncement,
 ) -> Result<()> {
-    let frames = encode_service_announcement_stream(announcement)?;
-    write_pkt_line_frames(writer, &frames)
+    write_pkt_line_payload(writer, &encode_service_announcement(announcement)?)?;
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_service_discovery_response(
@@ -341,8 +339,13 @@ pub fn write_service_discovery_response(
     writer: &mut impl Write,
     response: &ServiceDiscoveryResponse,
 ) -> Result<()> {
-    let frames = encode_service_discovery_response(response)?;
-    write_pkt_line_frames(writer, &frames)
+    write_service_announcement(writer, &response.announcement)?;
+    match &response.payload {
+        ServiceDiscoveryPayload::AdvertisedRefs(refs) => write_ref_advertisement_set(writer, refs),
+        ServiceDiscoveryPayload::ProtocolV2(handshake) => {
+            write_protocol_v2_advertisement(writer, handshake)
+        }
+    }
 }
 
 pub fn parse_remote_url(value: &str) -> Result<RemoteUrl> {
@@ -474,7 +477,43 @@ pub fn read_git_credential(reader: &mut impl Read) -> Result<GitCredential> {
 }
 
 pub fn write_git_credential(writer: &mut impl Write, credential: &GitCredential) -> Result<()> {
-    writer.write_all(&encode_git_credential(credential)?)?;
+    encode_credential_field(writer, "protocol", credential.protocol.as_deref())?;
+    encode_credential_field(writer, "host", credential.host.as_deref())?;
+    encode_credential_field(writer, "path", credential.path.as_deref())?;
+    encode_credential_field(writer, "username", credential.username.as_deref())?;
+    encode_credential_field(writer, "password", credential.password.as_deref())?;
+    encode_credential_field(
+        writer,
+        "password_expiry_utc",
+        credential.password_expiry_utc.as_deref(),
+    )?;
+    encode_credential_field(
+        writer,
+        "oauth_refresh_token",
+        credential.oauth_refresh_token.as_deref(),
+    )?;
+    encode_credential_field(writer, "url", credential.url.as_deref())?;
+    for value in &credential.wwwauth {
+        validate_credential_value("credential wwwauth[] value", value)?;
+        writer.write_all(b"wwwauth[]=")?;
+        writer.write_all(value.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    encode_credential_field(writer, "quit", credential.quit.as_deref())?;
+    for (key, value) in &credential.extra {
+        validate_credential_key(key)?;
+        if is_known_credential_key(key) {
+            return Err(GitError::InvalidFormat(format!(
+                "credential extra key duplicates known key {key}"
+            )));
+        }
+        validate_credential_value("credential extra value", value)?;
+        writer.write_all(key.as_bytes())?;
+        writer.write_all(b"=")?;
+        writer.write_all(value.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
+    writer.write_all(b"\n")?;
     Ok(())
 }
 
@@ -714,16 +753,16 @@ fn set_credential_field(slot: &mut Option<String>, key: &str, value: &str) -> Re
     Ok(())
 }
 
-fn encode_credential_field(out: &mut Vec<u8>, key: &str, value: Option<&str>) -> Result<()> {
+fn encode_credential_field(out: &mut impl Write, key: &str, value: Option<&str>) -> Result<()> {
     let Some(value) = value else {
         return Ok(());
     };
     validate_credential_key(key)?;
     validate_credential_value("credential value", value)?;
-    out.extend_from_slice(key.as_bytes());
-    out.push(b'=');
-    out.extend_from_slice(value.as_bytes());
-    out.push(b'\n');
+    out.write_all(key.as_bytes())?;
+    out.write_all(b"=")?;
+    out.write_all(value.as_bytes())?;
+    out.write_all(b"\n")?;
     Ok(())
 }
 

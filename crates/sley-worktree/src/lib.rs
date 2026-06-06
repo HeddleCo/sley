@@ -3294,7 +3294,12 @@ pub fn apply_clean_filter_with_attributes(
     Ok(apply_clean_filter_with_attributes_cow(config, attributes, path, content)?.into_owned())
 }
 
-fn apply_clean_filter_with_attributes_cow<'a>(
+/// Borrow-first variant of [`apply_clean_filter_with_attributes`].
+///
+/// When no filter or EOL conversion changes the content, the returned value
+/// borrows `content`; callers that can consume a [`Cow`] avoid allocating for
+/// the common pass-through case.
+pub fn apply_clean_filter_with_attributes_cow<'a>(
     config: &GitConfig,
     attributes: &[AttributeCheck],
     path: &[u8],
@@ -3343,7 +3348,12 @@ pub fn apply_smudge_filter_with_attributes(
     Ok(apply_smudge_filter_with_attributes_cow(config, attributes, path, content)?.into_owned())
 }
 
-fn apply_smudge_filter_with_attributes_cow<'a>(
+/// Borrow-first variant of [`apply_smudge_filter_with_attributes`].
+///
+/// When no filter or EOL conversion changes the content, the returned value
+/// borrows `content`; callers that can consume a [`Cow`] avoid allocating for
+/// the common pass-through case.
+pub fn apply_smudge_filter_with_attributes_cow<'a>(
     config: &GitConfig,
     attributes: &[AttributeCheck],
     path: &[u8],

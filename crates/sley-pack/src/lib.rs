@@ -3,6 +3,7 @@ use flate2::write::ZlibEncoder;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
+use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -14,13 +15,6 @@ pub struct PackEntry {
     pub compressed_size: u64,
     pub uncompressed_size: u64,
     pub offset: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeltaStrategy {
-    None,
-    RefDelta,
-    OfsDelta,
 }
 
 /// Default sliding-window size used by [`PackFile::write_packed`].
@@ -436,7 +430,10 @@ impl PackFile {
         })
     }
 
-    pub fn write_undeltified_sha1(objects: &[EncodedObject]) -> Result<PackWrite> {
+    pub fn write_undeltified_sha1<T>(objects: &[T]) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         Self::write_undeltified(objects, ObjectFormat::Sha1)
     }
 
@@ -445,35 +442,11 @@ impl PackFile {
     /// This is the simple, self-contained encoding; objects appear in the given
     /// order. For smaller output that exploits similarity between objects, use
     /// [`PackFile::write_packed`].
-    pub fn write_undeltified(objects: &[EncodedObject], format: ObjectFormat) -> Result<PackWrite> {
+    pub fn write_undeltified<T>(objects: &[T], format: ObjectFormat) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         let options = PackWriteOptions::new().with_depth(0).with_reorder(false);
-        Self::write_packed_impl(objects, format, &options)
-    }
-
-    /// Write a pack, deltifying adjacent same-type objects per `delta_strategy`.
-    ///
-    /// Retained for API compatibility. [`DeltaStrategy::None`] produces an
-    /// undeltified pack; [`DeltaStrategy::OfsDelta`]/[`DeltaStrategy::RefDelta`]
-    /// run sliding-window delta selection (see [`PackFile::write_packed`])
-    /// emitting the requested in-pack base-reference style. Prefer
-    /// [`PackFile::write_packed`]/[`PackFile::write_packed_with_options`] for
-    /// new code.
-    pub fn write_with_delta_strategy(
-        objects: &[EncodedObject],
-        format: ObjectFormat,
-        delta_strategy: DeltaStrategy,
-    ) -> Result<PackWrite> {
-        // Preserve input order to match the historical behavior of this
-        // function (deltas only ever reference earlier input objects).
-        let options = match delta_strategy {
-            DeltaStrategy::None => PackWriteOptions::new().with_depth(0).with_reorder(false),
-            DeltaStrategy::OfsDelta => PackWriteOptions::new()
-                .with_prefer_ofs_delta(true)
-                .with_reorder(false),
-            DeltaStrategy::RefDelta => PackWriteOptions::new()
-                .with_prefer_ofs_delta(false)
-                .with_reorder(false),
-        };
         Self::write_packed_impl(objects, format, &options)
     }
 
@@ -485,18 +458,24 @@ impl PackFile {
     /// compared against a window of previously emitted candidates; the smallest
     /// acceptable delta is kept, otherwise the object is stored undeltified. The
     /// result round-trips through [`PackFile::parse`].
-    pub fn write_packed(objects: &[EncodedObject], format: ObjectFormat) -> Result<PackWrite> {
+    pub fn write_packed<T>(objects: &[T], format: ObjectFormat) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         Self::write_packed_with_options(objects, format, &PackWriteOptions::new())
     }
 
     /// Like [`PackFile::write_packed`] but with caller-supplied
     /// [`PackWriteOptions`] (window, depth, base-reference style, and optional
     /// external thin bases).
-    pub fn write_packed_with_options(
-        objects: &[EncodedObject],
+    pub fn write_packed_with_options<T>(
+        objects: &[T],
         format: ObjectFormat,
         options: &PackWriteOptions,
-    ) -> Result<PackWrite> {
+    ) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         Self::write_packed_impl(objects, format, options)
     }
 
@@ -508,28 +487,35 @@ impl PackFile {
     /// and resolve the pack with [`PackFile::parse_thin`]. Window and depth use
     /// the defaults; pass options via [`PackFile::write_packed_with_options`]
     /// with [`PackWriteOptions::with_thin_bases`] for finer control.
-    pub fn write_thin(
-        objects: &[EncodedObject],
+    pub fn write_thin<T>(
+        objects: &[T],
         format: ObjectFormat,
         external_bases: HashMap<ObjectId, EncodedObject>,
-    ) -> Result<PackWrite> {
+    ) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         let options = PackWriteOptions::new().with_thin_bases(external_bases);
         Self::write_packed_impl(objects, format, &options)
     }
 
-    fn write_packed_impl(
-        objects: &[EncodedObject],
+    fn write_packed_impl<T>(
+        objects: &[T],
         format: ObjectFormat,
         options: &PackWriteOptions,
-    ) -> Result<PackWrite> {
+    ) -> Result<PackWrite>
+    where
+        T: Borrow<EncodedObject>,
+    {
         if objects.len() > u32::MAX as usize {
             return Err(GitError::InvalidFormat("too many pack objects".into()));
         }
+        let objects: Vec<&EncodedObject> = objects.iter().map(Borrow::borrow).collect();
 
         // Compute object ids up front; they are needed both for the index and,
         // for ref-deltas, inside the pack entries themselves.
         let mut object_ids: Vec<ObjectId> = Vec::with_capacity(objects.len());
-        for object in objects {
+        for object in &objects {
             object_ids.push(object.object_id(format)?);
         }
         let mut seen = HashSet::with_capacity(object_ids.len());
@@ -555,7 +541,7 @@ impl PackFile {
         // obtain the emit order. In-pack deltas only ever reference candidates
         // that appear earlier in `order`, so emitting in `order` guarantees a
         // base is always written before any object that deltas against it.
-        let (plan, order) = plan_pack_deltas(objects, &object_ids, options)?;
+        let (plan, order) = plan_pack_deltas(&objects, &object_ids, options)?;
 
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
@@ -572,7 +558,7 @@ impl PackFile {
             let mut entry_bytes = Vec::new();
             match &plan[idx].base {
                 PlannedBase::None => {
-                    write_undeltified_entry(&mut entry_bytes, &objects[idx])?;
+                    write_undeltified_entry(&mut entry_bytes, objects[idx])?;
                 }
                 PlannedBase::InPack { base_idx, delta } => {
                     let base_offset = written_offsets[*base_idx].ok_or_else(|| {
@@ -970,7 +956,7 @@ impl PackIndex {
                 "pack checksum format does not match index format".into(),
             ));
         }
-        let mut entries = entries.to_vec();
+        let mut entries = entries.iter().collect::<Vec<_>>();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
         for pair in entries.windows(2) {
             if pair[0].oid.as_bytes() == pair[1].oid.as_bytes() {
@@ -1462,16 +1448,16 @@ impl MultiPackIndex {
             ));
         }
 
-        let mut objects = objects.to_vec();
+        let mut objects = objects.iter().collect::<Vec<_>>();
         objects.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
-        let mut previous_oid: Option<ObjectId> = None;
+        let mut previous_oid: Option<&ObjectId> = None;
         for object in &objects {
             if object.oid.format() != format {
                 return Err(GitError::InvalidObjectId(
                     "multi-pack-index object format does not match index format".into(),
                 ));
             }
-            if let Some(previous) = &previous_oid
+            if let Some(previous) = previous_oid
                 && previous.as_bytes() == object.oid.as_bytes()
             {
                 return Err(GitError::InvalidFormat(
@@ -1483,15 +1469,14 @@ impl MultiPackIndex {
                     "multi-pack-index object points past pack table".into(),
                 ));
             }
-            previous_oid = Some(object.oid.clone());
+            previous_oid = Some(&object.oid);
         }
 
-        let object_ids: Vec<ObjectId> = objects.iter().map(|entry| entry.oid.clone()).collect();
         let mut large_offsets = Vec::new();
         let mut chunks = vec![
             (*b"PNAM", write_midx_pack_names(pack_names)),
-            (*b"OIDF", write_midx_oid_fanout(&object_ids)?),
-            (*b"OIDL", write_midx_oid_lookup(&object_ids)),
+            (*b"OIDF", write_midx_oid_fanout(&objects)?),
+            (*b"OIDL", write_midx_oid_lookup(&objects)),
             (
                 *b"OOFF",
                 write_midx_object_offsets(&objects, &mut large_offsets)?,
@@ -1676,10 +1661,10 @@ fn write_midx_pack_names(pack_names: &[String]) -> Vec<u8> {
     out
 }
 
-fn write_midx_oid_fanout(object_ids: &[ObjectId]) -> Result<Vec<u8>> {
+fn write_midx_oid_fanout(objects: &[&MultiPackIndexEntry]) -> Result<Vec<u8>> {
     let mut counts = [0u32; 256];
-    for oid in object_ids {
-        let first = oid.as_bytes()[0] as usize;
+    for object in objects {
+        let first = object.oid.as_bytes()[0] as usize;
         counts[first] = counts[first]
             .checked_add(1)
             .ok_or_else(|| GitError::InvalidFormat("multi-pack-index fanout overflow".into()))?;
@@ -1695,16 +1680,16 @@ fn write_midx_oid_fanout(object_ids: &[ObjectId]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn write_midx_oid_lookup(object_ids: &[ObjectId]) -> Vec<u8> {
+fn write_midx_oid_lookup(objects: &[&MultiPackIndexEntry]) -> Vec<u8> {
     let mut out = Vec::new();
-    for oid in object_ids {
-        out.extend_from_slice(oid.as_bytes());
+    for object in objects {
+        out.extend_from_slice(object.oid.as_bytes());
     }
     out
 }
 
 fn write_midx_object_offsets(
-    objects: &[MultiPackIndexEntry],
+    objects: &[&MultiPackIndexEntry],
     large_offsets: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -1888,16 +1873,16 @@ fn inflate_prefix(compressed: &[u8], max_out: usize, out: &mut Vec<u8>) -> Resul
 /// ref-delta bases are obtained from `resolve_ref_base`, which the caller backs
 /// with the surrounding object store (so a base in another pack or loose still
 /// resolves). The pack trailer checksum is the final `format.raw_len()` bytes.
-pub fn read_object_at<F>(
+pub fn read_object_at_arc<F>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
     resolve_ref_base: F,
-) -> Result<EncodedObject>
+) -> Result<Arc<EncodedObject>>
 where
     F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
 {
-    read_object_at_with_cache(
+    read_object_at_with_cache_arc(
         pack_bytes,
         offset,
         format,
@@ -1906,32 +1891,14 @@ where
     )
 }
 
-/// Like [`read_object_at`], but reuses already-decoded objects from `cache`
+/// Like [`read_object_at_arc`], but reuses already-decoded objects from `cache`
 /// (keyed by in-pack offset) and records every object it decodes.
 ///
 /// This turns repeated reads from the same pack — where many deltas share a base
 /// chain — from re-inflating each chain per read into resolving each base once.
 /// `cache` must be scoped to the pack `pack_bytes` belongs to (see
-/// [`PackDeltaCache`]); the decoded result is still byte-identical to
-/// [`read_object_at`].
-pub fn read_object_at_with_cache<F, C>(
-    pack_bytes: &[u8],
-    offset: u64,
-    format: ObjectFormat,
-    mut resolve_ref_base: F,
-    cache: &C,
-) -> Result<EncodedObject>
-where
-    F: FnMut(&ObjectId) -> Result<Option<Arc<EncodedObject>>>,
-    C: PackDeltaCache + ?Sized,
-{
-    read_object_at_with_cache_arc(pack_bytes, offset, format, &mut resolve_ref_base, cache)
-        .map(arc_into_encoded_object)
-}
-
-/// Like [`read_object_at_with_cache`], but returns the decoded object behind an
-/// [`Arc`]. Callers that keep cache handles can reuse decoded delta bases without
-/// cloning full object bodies.
+/// [`PackDeltaCache`]). The decoded object is returned behind an [`Arc`] so
+/// callers can reuse cache handles without cloning full object bodies.
 pub fn read_object_at_with_cache_arc<F, C>(
     pack_bytes: &[u8],
     offset: u64,
@@ -1944,13 +1911,6 @@ where
     C: PackDeltaCache + ?Sized,
 {
     read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base, cache)
-}
-
-fn arc_into_encoded_object(object: Arc<EncodedObject>) -> EncodedObject {
-    match Arc::try_unwrap(object) {
-        Ok(object) => object,
-        Err(object) => (*object).clone(),
-    }
 }
 
 fn read_object_at_inner<F, C>(
@@ -2572,7 +2532,7 @@ fn delta_type_rank(object_type: ObjectType) -> u8 {
 /// the emit order, so emitting in that order writes each base before any object
 /// that depends on it.
 fn plan_pack_deltas(
-    objects: &[EncodedObject],
+    objects: &[&EncodedObject],
     object_ids: &[ObjectId],
     options: &PackWriteOptions,
 ) -> Result<(Vec<PlannedEntry>, Vec<usize>)> {
@@ -3823,6 +3783,12 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn delta_pack_options(prefer_ofs_delta: bool) -> PackWriteOptions {
+        PackWriteOptions::new()
+            .with_prefer_ofs_delta(prefer_ofs_delta)
+            .with_reorder(false)
+    }
+
     #[test]
     fn parses_single_blob_pack() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"hello\n");
@@ -3961,10 +3927,11 @@ mod tests {
     #[test]
     fn indexes_existing_delta_pack_bytes() {
         let (base, changed) = similar_blob_objects();
-        let written = PackFile::write_with_delta_strategy(
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(
             &[base.clone(), changed.clone()],
             ObjectFormat::Sha1,
-            DeltaStrategy::OfsDelta,
+            &options,
         )
         .expect("test operation should succeed");
 
@@ -3997,10 +3964,11 @@ mod tests {
     #[test]
     fn writes_ref_delta_pack_and_index_that_round_trip() {
         let (base, changed) = similar_blob_objects();
-        let written = PackFile::write_with_delta_strategy(
+        let options = delta_pack_options(false);
+        let written = PackFile::write_packed_with_options(
             &[base.clone(), changed.clone()],
             ObjectFormat::Sha1,
-            DeltaStrategy::RefDelta,
+            &options,
         )
         .expect("test operation should succeed");
         let mut second_offset = written.entries[1].offset as usize;
@@ -4029,10 +3997,11 @@ mod tests {
     #[test]
     fn read_object_at_matches_full_parse_for_ofs_delta_pack() {
         let (base, changed) = similar_blob_objects();
-        let written = PackFile::write_with_delta_strategy(
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(
             &[base.clone(), changed.clone()],
             ObjectFormat::Sha1,
-            DeltaStrategy::OfsDelta,
+            &options,
         )
         .expect("test operation should succeed");
         // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
@@ -4046,21 +4015,23 @@ mod tests {
         // Ground truth from a full parse; single-object decode must match at every offset.
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
         for po in &parsed.entries {
-            let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
-                Ok(None)
-            })
-            .expect("test operation should succeed");
-            assert_eq!(got, po.object, "offset {}", po.entry.offset);
+            let got =
+                read_object_at_arc(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
+                    Ok(None)
+                })
+                .expect("test operation should succeed");
+            assert_eq!(*got, po.object, "offset {}", po.entry.offset);
         }
     }
 
     #[test]
     fn read_object_at_matches_full_parse_for_ref_delta_pack() {
         let (base, changed) = similar_blob_objects();
-        let written = PackFile::write_with_delta_strategy(
+        let options = delta_pack_options(false);
+        let written = PackFile::write_packed_with_options(
             &[base.clone(), changed.clone()],
             ObjectFormat::Sha1,
-            DeltaStrategy::RefDelta,
+            &options,
         )
         .expect("test operation should succeed");
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
@@ -4070,11 +4041,12 @@ mod tests {
             .map(|po| (po.entry.oid.clone(), Arc::new(po.object.clone())))
             .collect();
         for po in &parsed.entries {
-            let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
-                Ok(by_oid.get(oid).cloned())
-            })
-            .expect("test operation should succeed");
-            assert_eq!(got, po.object);
+            let got =
+                read_object_at_arc(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
+                    Ok(by_oid.get(oid).cloned())
+                })
+                .expect("test operation should succeed");
+            assert_eq!(*got, po.object);
         }
     }
 
@@ -4112,12 +4084,9 @@ mod tests {
             body.extend_from_slice(format!("\nvariant {idx}\n").as_bytes());
             objects.push(EncodedObject::new(ObjectType::Blob, body));
         }
-        let written = PackFile::write_with_delta_strategy(
-            &objects,
-            ObjectFormat::Sha1,
-            DeltaStrategy::OfsDelta,
-        )
-        .expect("test operation should succeed");
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options)
+            .expect("test operation should succeed");
         let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
 
         let cache = CountingDeltaCache::default();
@@ -4125,7 +4094,7 @@ mod tests {
         // ground-truth from the full parse, byte for byte, both times.
         for _ in 0..2 {
             for po in &parsed.entries {
-                let got = read_object_at_with_cache(
+                let got = read_object_at_with_cache_arc(
                     &written.pack,
                     po.entry.offset,
                     ObjectFormat::Sha1,
@@ -4133,7 +4102,7 @@ mod tests {
                     &cache,
                 )
                 .expect("test operation should succeed");
-                assert_eq!(got, po.object, "offset {}", po.entry.offset);
+                assert_eq!(*got, po.object, "offset {}", po.entry.offset);
             }
         }
         // The second pass reads everything straight from the cache, so there must
@@ -4144,10 +4113,11 @@ mod tests {
     #[test]
     fn writes_ofs_delta_pack_and_index_that_round_trip() {
         let (base, changed) = similar_blob_objects();
-        let written = PackFile::write_with_delta_strategy(
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(
             &[base.clone(), changed.clone()],
             ObjectFormat::Sha1,
-            DeltaStrategy::OfsDelta,
+            &options,
         )
         .expect("test operation should succeed");
         let mut second_offset = written.entries[1].offset as usize;

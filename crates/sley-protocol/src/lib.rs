@@ -561,7 +561,17 @@ pub fn read_fetch_head(
 }
 
 pub fn write_fetch_head(writer: &mut impl Write, records: &[FetchHeadRecord]) -> Result<()> {
-    writer.write_all(&encode_fetch_head(records)?)?;
+    for record in records {
+        validate_fetch_head_description_field(&record.description)?;
+        writer.write_all(record.oid.to_string().as_bytes())?;
+        writer.write_all(b"\t")?;
+        if record.not_for_merge {
+            writer.write_all(b"not-for-merge")?;
+        }
+        writer.write_all(b"\t")?;
+        writer.write_all(record.description.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -958,6 +968,34 @@ pub fn encode_sideband_packet(packet: &SideBandPacket) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+pub fn write_sideband_packet(writer: &mut impl Write, packet: &SideBandPacket) -> Result<()> {
+    write_sideband_payload(writer, packet.channel, &packet.data)
+}
+
+fn write_sideband_payload(
+    writer: &mut impl Write,
+    channel: SideBandChannel,
+    data: &[u8],
+) -> Result<()> {
+    let payload_len = data
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| GitError::InvalidFormat("sideband packet length overflow".into()))?;
+    if payload_len > PKT_LINE_MAX_PAYLOAD_LEN {
+        return Err(GitError::InvalidFormat(format!(
+            "sideband packet exceeds {PKT_LINE_MAX_PAYLOAD_LEN} bytes"
+        )));
+    }
+    writer.write_all(&pkt_line_header(payload_len + 4))?;
+    writer.write_all(&[match channel {
+        SideBandChannel::Data => 1,
+        SideBandChannel::Progress => 2,
+        SideBandChannel::Fatal => 3,
+    }])?;
+    writer.write_all(data)?;
+    Ok(())
+}
+
 pub fn parse_sideband_packets(payloads: &[Vec<u8>]) -> Result<Vec<SideBandPacket>> {
     payloads
         .iter()
@@ -1020,8 +1058,11 @@ pub fn read_sideband_stream(reader: &mut impl Read) -> Result<Vec<SideBandPacket
 }
 
 pub fn write_sideband_stream(writer: &mut impl Write, packets: &[SideBandPacket]) -> Result<()> {
-    let frames = encode_sideband_stream(packets)?;
-    write_pkt_line_frames(writer, &frames)
+    for packet in packets {
+        write_sideband_packet(writer, packet)?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn demux_sideband_packets(packets: &[SideBandPacket]) -> Result<SideBandDemux> {
@@ -1128,8 +1169,17 @@ pub fn write_upload_archive_request(
     writer: &mut impl Write,
     request: &UploadArchiveRequest,
 ) -> Result<()> {
-    let frames = encode_upload_archive_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    if request.arguments.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "upload-archive request is missing arguments".into(),
+        ));
+    }
+    for argument in &request.arguments {
+        validate_upload_archive_argument(argument)?;
+        write_pkt_line_payload(writer, &line_from_str(&format!("argument {argument}")))?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_upload_archive_response(frames: &[PktLineFrame]) -> Result<UploadArchiveResponse> {
@@ -1194,8 +1244,18 @@ pub fn write_upload_archive_response(
     writer: &mut impl Write,
     response: &UploadArchiveResponse,
 ) -> Result<()> {
-    let frames = encode_upload_archive_response(response)?;
-    write_pkt_line_frames(writer, &frames)
+    match response {
+        UploadArchiveResponse::Ack { sideband } => {
+            write_pkt_line_payload(writer, b"ACK\n")?;
+            write_sideband_stream(writer, sideband)?;
+        }
+        UploadArchiveResponse::Nack { message } => {
+            validate_upload_archive_status_message(message)?;
+            write_pkt_line_payload(writer, &line_from_str(&format!("NACK {message}")))?;
+            writer.write_all(b"0000")?;
+        }
+    }
+    Ok(())
 }
 
 pub fn demux_upload_archive_response(response: &UploadArchiveResponse) -> Result<SideBandDemux> {
@@ -1982,8 +2042,17 @@ pub fn write_protocol_v2_advertisement(
     writer: &mut impl Write,
     handshake: &TransportHandshake,
 ) -> Result<()> {
-    let frames = encode_protocol_v2_advertisement(handshake)?;
-    write_pkt_line_frames(writer, &frames)
+    if handshake.protocol != ProtocolVersion::V2 {
+        return Err(GitError::InvalidFormat(
+            "protocol v2 advertisement requires a v2 handshake".into(),
+        ));
+    }
+    write_pkt_line_payload(writer, b"version 2\n")?;
+    for capability in &handshake.capabilities {
+        write_pkt_line_payload(writer, &line(encode_protocol_v2_capability(capability)?))?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_protocol_v2_command_request(
@@ -2130,8 +2199,13 @@ pub fn write_protocol_v2_request(
     writer: &mut impl Write,
     request: &ProtocolV2Request,
 ) -> Result<()> {
-    let frames = encode_protocol_v2_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    match request {
+        ProtocolV2Request::Command(command) => write_protocol_v2_command_request(writer, command),
+        ProtocolV2Request::Done => {
+            writer.write_all(b"0000")?;
+            Ok(())
+        }
+    }
 }
 
 pub fn read_protocol_v2_command_request(
@@ -2145,8 +2219,25 @@ pub fn write_protocol_v2_command_request(
     writer: &mut impl Write,
     request: &ProtocolV2CommandRequest,
 ) -> Result<()> {
-    let frames = encode_protocol_v2_command_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    validate_capability_name(&request.command)?;
+    write_pkt_line_payload(
+        writer,
+        &line_from_str(&format!("command={}", request.command)),
+    )?;
+    for capability in &request.capabilities {
+        write_pkt_line_payload(writer, &line(encode_protocol_v2_capability(capability)?))?;
+    }
+    if !request.arguments.is_empty() {
+        write_pkt_line_frame(writer, &PktLineFrame::Delimiter)?;
+        for argument in &request.arguments {
+            validate_protocol_v2_argument(argument)?;
+            let mut payload = argument.clone();
+            payload.push(b'\n');
+            write_pkt_line_payload(writer, &payload)?;
+        }
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn read_protocol_v2_ls_refs_request(reader: &mut impl Read) -> Result<ProtocolV2LsRefsRequest> {
@@ -2227,8 +2318,14 @@ pub fn write_protocol_v2_ls_refs_response(
     writer: &mut impl Write,
     records: &[ProtocolV2LsRefsRecord],
 ) -> Result<()> {
-    let frames = encode_protocol_v2_ls_refs_response(records)?;
-    write_pkt_line_frames(writer, &frames)
+    for record in records {
+        write_pkt_line_payload(
+            writer,
+            &line_from_str(&format_protocol_v2_ls_refs_record(record)?),
+        )?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn read_protocol_v2_ls_refs_response_until_response_end(
@@ -2243,9 +2340,9 @@ pub fn write_protocol_v2_ls_refs_response_with_response_end(
     writer: &mut impl Write,
     records: &[ProtocolV2LsRefsRecord],
 ) -> Result<()> {
-    let mut frames = encode_protocol_v2_ls_refs_response(records)?;
-    frames.push(PktLineFrame::ResponseEnd);
-    write_pkt_line_frames(writer, &frames)
+    write_protocol_v2_ls_refs_response(writer, records)?;
+    writer.write_all(b"0002")?;
+    Ok(())
 }
 
 pub fn exchange_protocol_v2_ls_refs(
@@ -2571,8 +2668,7 @@ pub fn write_protocol_v2_fetch_response(
     writer: &mut impl Write,
     sections: &[ProtocolV2FetchResponseSection],
 ) -> Result<()> {
-    let frames = encode_protocol_v2_fetch_response(sections)?;
-    write_pkt_line_frames(writer, &frames)
+    write_protocol_v2_fetch_response_inner(writer, sections, false, false)
 }
 
 pub fn read_protocol_v2_fetch_sideband_all_response(
@@ -2587,8 +2683,7 @@ pub fn write_protocol_v2_fetch_sideband_all_response(
     writer: &mut impl Write,
     sections: &[ProtocolV2FetchResponseSection],
 ) -> Result<()> {
-    let frames = encode_protocol_v2_fetch_sideband_all_response(sections)?;
-    write_pkt_line_frames(writer, &frames)
+    write_protocol_v2_fetch_response_inner(writer, sections, true, false)
 }
 
 pub fn read_protocol_v2_fetch_response_until_response_end(
@@ -2603,9 +2698,7 @@ pub fn write_protocol_v2_fetch_response_with_response_end(
     writer: &mut impl Write,
     sections: &[ProtocolV2FetchResponseSection],
 ) -> Result<()> {
-    let mut frames = encode_protocol_v2_fetch_response(sections)?;
-    frames.push(PktLineFrame::ResponseEnd);
-    write_pkt_line_frames(writer, &frames)
+    write_protocol_v2_fetch_response_inner(writer, sections, false, true)
 }
 
 pub fn read_protocol_v2_fetch_sideband_all_response_until_response_end(
@@ -2620,9 +2713,52 @@ pub fn write_protocol_v2_fetch_sideband_all_response_with_response_end(
     writer: &mut impl Write,
     sections: &[ProtocolV2FetchResponseSection],
 ) -> Result<()> {
-    let mut frames = encode_protocol_v2_fetch_sideband_all_response(sections)?;
-    frames.push(PktLineFrame::ResponseEnd);
-    write_pkt_line_frames(writer, &frames)
+    write_protocol_v2_fetch_response_inner(writer, sections, true, true)
+}
+
+fn write_protocol_v2_fetch_response_inner(
+    writer: &mut impl Write,
+    sections: &[ProtocolV2FetchResponseSection],
+    sideband_all: bool,
+    response_end: bool,
+) -> Result<()> {
+    let mut in_packfile = false;
+    for (idx, section) in sections.iter().enumerate() {
+        if idx != 0 {
+            in_packfile = false;
+            write_pkt_line_frame(writer, &PktLineFrame::Delimiter)?;
+        }
+        write_protocol_v2_fetch_payload(
+            writer,
+            &line_from_str(protocol_v2_fetch_section_name(section)),
+            sideband_all,
+            &mut in_packfile,
+        )?;
+        for payload in format_protocol_v2_fetch_section_lines(section)? {
+            write_protocol_v2_fetch_payload(writer, &payload, sideband_all, &mut in_packfile)?;
+        }
+    }
+    writer.write_all(b"0000")?;
+    if response_end {
+        writer.write_all(b"0002")?;
+    }
+    Ok(())
+}
+
+fn write_protocol_v2_fetch_payload(
+    writer: &mut impl Write,
+    payload: &[u8],
+    sideband_all: bool,
+    in_packfile: &mut bool,
+) -> Result<()> {
+    if sideband_all && !*in_packfile {
+        if trim_trailing_lf(payload) == b"packfile" {
+            *in_packfile = true;
+        }
+        write_sideband_payload(writer, SideBandChannel::Data, payload)
+    } else {
+        write_pkt_line_payload(writer, payload)
+    }
 }
 
 pub fn exchange_protocol_v2_fetch(
@@ -2744,8 +2880,20 @@ pub fn write_protocol_v2_object_info_response(
     writer: &mut impl Write,
     response: &ProtocolV2ObjectInfoResponse,
 ) -> Result<()> {
-    let frames = encode_protocol_v2_object_info_response(response)?;
-    write_pkt_line_frames(writer, &frames)
+    if !response.size {
+        return Err(GitError::InvalidFormat(
+            "object-info response is missing size attribute".into(),
+        ));
+    }
+    write_pkt_line_payload(writer, b"size\n")?;
+    for record in &response.records {
+        write_pkt_line_payload(
+            writer,
+            &line_from_str(&format!("{} {}", record.oid, record.size)),
+        )?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn exchange_protocol_v2_object_info(
@@ -3462,16 +3610,49 @@ pub fn write_ref_advertisements(
     writer: &mut impl Write,
     advertisements: &[RefAdvertisement],
 ) -> Result<()> {
-    let frames = encode_ref_advertisements(advertisements)?;
-    write_pkt_line_frames(writer, &frames)
+    write_ref_advertisement_stream(writer, ProtocolVersion::V0, advertisements, &[])
 }
 
 pub fn write_ref_advertisement_set(
     writer: &mut impl Write,
     set: &RefAdvertisementSet,
 ) -> Result<()> {
-    let frames = encode_ref_advertisement_set(set)?;
-    write_pkt_line_frames(writer, &frames)
+    write_ref_advertisement_stream(writer, set.protocol, &set.refs, &set.shallow)
+}
+
+fn write_ref_advertisement_stream(
+    writer: &mut impl Write,
+    protocol: ProtocolVersion,
+    refs: &[RefAdvertisement],
+    shallow: &[ObjectId],
+) -> Result<()> {
+    match protocol {
+        ProtocolVersion::V0 => {}
+        ProtocolVersion::V1 => write_pkt_line_payload(writer, b"version 1\n")?,
+        ProtocolVersion::V2 => {
+            return Err(GitError::InvalidFormat(
+                "protocol v2 does not use v0/v1 advertised-ref streams".into(),
+            ));
+        }
+    }
+    if refs.is_empty() && !shallow.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "advertised shallow refs require advertised refs".into(),
+        ));
+    }
+    for (idx, advertisement) in refs.iter().enumerate() {
+        if idx != 0 && !advertisement.capabilities.is_empty() {
+            return Err(GitError::InvalidFormat(
+                "advertised ref capabilities must appear on the first ref".into(),
+            ));
+        }
+        write_pkt_line_payload(writer, &encode_ref_advertisement(advertisement)?)?;
+    }
+    for oid in shallow {
+        write_pkt_line_payload(writer, &line_from_str(&format!("shallow {oid}")))?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_dumb_http_info_refs(
@@ -3515,7 +3696,16 @@ pub fn write_dumb_http_info_refs(
     writer: &mut impl Write,
     records: &[DumbHttpRefRecord],
 ) -> Result<()> {
-    writer.write_all(&encode_dumb_http_info_refs(records)?)?;
+    for record in records {
+        validate_dumb_http_ref_name(&record.name)?;
+        writer.write_all(record.oid.to_string().as_bytes())?;
+        writer.write_all(b"\t")?;
+        writer.write_all(record.name.as_bytes())?;
+        if record.peeled {
+            writer.write_all(b"^{}")?;
+        }
+        writer.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -3546,7 +3736,11 @@ pub fn read_dumb_http_alternates(reader: &mut impl Read) -> Result<Vec<String>> 
 }
 
 pub fn write_dumb_http_alternates(writer: &mut impl Write, alternates: &[String]) -> Result<()> {
-    writer.write_all(&encode_dumb_http_alternates(alternates)?)?;
+    for alternate in alternates {
+        validate_dumb_http_alternate(alternate)?;
+        writer.write_all(alternate.as_bytes())?;
+        writer.write_all(b"\n")?;
+    }
     Ok(())
 }
 
@@ -3584,7 +3778,9 @@ pub fn write_dumb_http_packs(
     writer: &mut impl Write,
     records: &[DumbHttpPackRecord],
 ) -> Result<()> {
-    writer.write_all(&encode_dumb_http_packs(records)?)?;
+    for record in records {
+        writer.write_all(format!("P pack-{}.pack\n", record.hash).as_bytes())?;
+    }
     Ok(())
 }
 
@@ -3783,8 +3979,54 @@ pub fn write_upload_pack_request(
     writer: &mut impl Write,
     request: Option<&UploadPackRequest>,
 ) -> Result<()> {
-    let frames = encode_upload_pack_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    let Some(request) = request else {
+        writer.write_all(b"0000")?;
+        return Ok(());
+    };
+    if request.wants.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "upload-pack request missing want".into(),
+        ));
+    }
+
+    for (idx, oid) in request.wants.iter().enumerate() {
+        let mut line = format!("want {oid}");
+        if idx == 0 && !request.capabilities.is_empty() {
+            line.push(' ');
+            line.push_str(
+                &String::from_utf8(encode_capabilities(&request.capabilities)?)
+                    .map_err(|err| GitError::InvalidFormat(err.to_string()))?,
+            );
+        }
+        write_pkt_line_payload(writer, &line_from_str(&line))?;
+    }
+    for oid in &request.shallow {
+        write_pkt_line_payload(writer, &line_from_str(&format!("shallow {oid}")))?;
+    }
+    if let Some(deepen) = request.deepen {
+        if deepen == 0 {
+            return Err(GitError::InvalidFormat(
+                "upload-pack deepen must be positive".into(),
+            ));
+        }
+        write_pkt_line_payload(writer, &line_from_str(&format!("deepen {deepen}")))?;
+    }
+    if let Some(deepen_since) = request.deepen_since {
+        write_pkt_line_payload(
+            writer,
+            &line_from_str(&format!("deepen-since {deepen_since}")),
+        )?;
+    }
+    for name in &request.deepen_not {
+        validate_protocol_v2_token("upload-pack deepen-not", name)?;
+        write_pkt_line_payload(writer, &line_from_str(&format!("deepen-not {name}")))?;
+    }
+    if let Some(filter) = &request.filter {
+        validate_protocol_v2_token("upload-pack filter", filter)?;
+        write_pkt_line_payload(writer, &line_from_str(&format!("filter {filter}")))?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_upload_pack_features(capabilities: &[Capability]) -> Result<UploadPackFeatures> {
@@ -4178,8 +4420,15 @@ pub fn write_upload_pack_shallow_update(
     writer: &mut impl Write,
     entries: &[ProtocolV2FetchShallowInfo],
 ) -> Result<()> {
-    let frames = encode_upload_pack_shallow_update(entries)?;
-    write_pkt_line_frames(writer, &frames)
+    for entry in entries {
+        let line = match entry {
+            ProtocolV2FetchShallowInfo::Shallow(oid) => format!("shallow {oid}"),
+            ProtocolV2FetchShallowInfo::Unshallow(oid) => format!("unshallow {oid}"),
+        };
+        write_pkt_line_payload(writer, &line_from_str(&line))?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_upload_pack_negotiation_request(
@@ -4283,8 +4532,15 @@ pub fn write_upload_pack_negotiation_request(
     writer: &mut impl Write,
     request: &UploadPackNegotiationRequest,
 ) -> Result<()> {
-    let frames = encode_upload_pack_negotiation_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    for oid in &request.haves {
+        write_pkt_line_payload(writer, &line_from_str(&format!("have {oid}")))?;
+    }
+    if request.done {
+        write_pkt_line_payload(writer, b"done\n")?;
+    } else {
+        writer.write_all(b"0000")?;
+    }
+    Ok(())
 }
 
 pub fn parse_upload_pack_acknowledgment(
@@ -4369,10 +4625,7 @@ pub fn write_upload_pack_acknowledgment(
     writer: &mut impl Write,
     acknowledgment: &UploadPackAcknowledgment,
 ) -> Result<()> {
-    write_pkt_line_frame(
-        writer,
-        &PktLineFrame::data(encode_upload_pack_acknowledgment(acknowledgment)?)?,
-    )
+    write_pkt_line_payload(writer, &encode_upload_pack_acknowledgment(acknowledgment)?)
 }
 
 pub fn parse_upload_pack_packfile_response(
@@ -4452,8 +4705,14 @@ pub fn write_upload_pack_packfile_response(
     writer: &mut impl Write,
     response: &UploadPackPackfileResponse,
 ) -> Result<()> {
-    let frames = encode_upload_pack_packfile_response(response)?;
-    write_pkt_line_frames(writer, &frames)
+    for acknowledgment in &response.acknowledgments {
+        write_upload_pack_acknowledgment(writer, acknowledgment)?;
+    }
+    for packet in &response.sideband {
+        write_sideband_packet(writer, packet)?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn demux_upload_pack_packfile_response(
@@ -4543,7 +4802,20 @@ pub fn write_upload_pack_raw_packfile_response(
     writer: &mut impl Write,
     response: &UploadPackRawPackfileResponse,
 ) -> Result<()> {
-    writer.write_all(&encode_upload_pack_raw_packfile_response(response)?)?;
+    if response.packfile.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "upload-pack raw packfile response missing packfile".into(),
+        ));
+    }
+    if !response.packfile.starts_with(b"PACK") {
+        return Err(GitError::InvalidFormat(
+            "upload-pack raw packfile response packfile must start with PACK".into(),
+        ));
+    }
+    for acknowledgment in &response.acknowledgments {
+        write_upload_pack_acknowledgment(writer, acknowledgment)?;
+    }
+    writer.write_all(&response.packfile)?;
     Ok(())
 }
 
@@ -4740,8 +5012,26 @@ pub fn write_receive_pack_request(
     writer: &mut impl Write,
     request: &ReceivePackRequest,
 ) -> Result<()> {
-    let frames = encode_receive_pack_request(request)?;
-    write_pkt_line_frames(writer, &frames)
+    if !request.shallow.is_empty() && request.commands.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "receive-pack request has shallow lines without commands".into(),
+        ));
+    }
+
+    for oid in &request.shallow {
+        write_pkt_line_payload(writer, &line_from_str(&format!("shallow {oid}")))?;
+    }
+    for (idx, command) in request.commands.iter().enumerate() {
+        let mut payload = format_receive_pack_command(command)?;
+        if idx == 0 && !request.capabilities.is_empty() {
+            payload.push(0);
+            payload.extend_from_slice(&encode_capabilities(&request.capabilities)?);
+        }
+        payload.push(b'\n');
+        write_pkt_line_payload(writer, &payload)?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_receive_pack_push_request(
@@ -5322,8 +5612,18 @@ pub fn write_receive_pack_report_status(
     writer: &mut impl Write,
     report: &ReceivePackReportStatus,
 ) -> Result<()> {
-    let frames = encode_receive_pack_report_status(report)?;
-    write_pkt_line_frames(writer, &frames)
+    write_pkt_line_payload(
+        writer,
+        &line_from_str(&format_receive_pack_unpack_status(&report.unpack)?),
+    )?;
+    for command in &report.commands {
+        write_pkt_line_payload(
+            writer,
+            &line_from_str(&format_receive_pack_command_status(command)?),
+        )?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_receive_pack_report_status_v2(
@@ -5422,8 +5722,23 @@ pub fn write_receive_pack_report_status_v2(
     writer: &mut impl Write,
     report: &ReceivePackReportStatusV2,
 ) -> Result<()> {
-    let frames = encode_receive_pack_report_status_v2(report)?;
-    write_pkt_line_frames(writer, &frames)
+    write_pkt_line_payload(
+        writer,
+        &line_from_str(&format_receive_pack_unpack_status(&report.unpack)?),
+    )?;
+    for command in &report.commands {
+        write_pkt_line_payload(
+            writer,
+            &line_from_str(&format_receive_pack_command_status_v2(command)?),
+        )?;
+        if let ReceivePackCommandStatusV2::Ok { options, .. } = command {
+            for option in format_receive_pack_report_status_v2_options(options)? {
+                write_pkt_line_payload(writer, &line_from_str(&option))?;
+            }
+        }
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 pub fn parse_receive_pack_push_options(frames: &[PktLineFrame]) -> Result<Vec<String>> {
@@ -5486,8 +5801,14 @@ pub fn read_receive_pack_push_options(reader: &mut impl Read) -> Result<Vec<Stri
 }
 
 pub fn write_receive_pack_push_options(writer: &mut impl Write, options: &[String]) -> Result<()> {
-    let frames = encode_receive_pack_push_options(options)?;
-    write_pkt_line_frames(writer, &frames)
+    for option in options {
+        validate_receive_pack_push_option(option.as_bytes())?;
+        let mut payload = option.as_bytes().to_vec();
+        payload.push(b'\n');
+        write_pkt_line_payload(writer, &payload)?;
+    }
+    writer.write_all(b"0000")?;
+    Ok(())
 }
 
 fn parse_receive_pack_command(format: ObjectFormat, payload: &[u8]) -> Result<ReceivePackCommand> {

@@ -1206,20 +1206,6 @@ fn xdg_config_path() -> Option<PathBuf> {
     })
 }
 
-/// Look up a string value with proper effective-config precedence.
-///
-/// A thin wrapper over [`GitConfig::get`] returning an owned `String`, provided
-/// so callers (e.g. the facade) can read any key without depending on the
-/// borrow lifetime of the underlying config.
-pub fn config_string(
-    config: &GitConfig,
-    section: &str,
-    subsection: Option<&str>,
-    key: &str,
-) -> Option<String> {
-    config.get(section, subsection, key).map(str::to_string)
-}
-
 /// Read an environment variable, treating unset and empty as absent (git's
 /// convention for path-valued environment variables).
 fn non_empty_env(name: &str) -> Option<String> {
@@ -2036,8 +2022,8 @@ mod tests {
     // covered hermetically by the CLI's subprocess interop test
     // (`commit_identity_falls_back_to_global_gitconfig_like_upstream_git`),
     // which sets the environment only on the child process. Here we cover the
-    // merge/precedence *semantics* that the loader relies on, plus the
-    // `config_string` helper, without touching the environment.
+    // merge/precedence *semantics* that the loader relies on without touching
+    // the environment.
 
     /// Concatenate config layers the way `load_effective_config` does (lowest
     /// precedence first) so the document below mirrors a system+global+repo
@@ -2093,30 +2079,6 @@ mod tests {
         assert_eq!(config.get("layer", None, "system"), Some("yes"));
         assert_eq!(config.get("layer", None, "global"), Some("yes"));
         assert_eq!(config.get("layer", None, "repo"), Some("yes"));
-    }
-
-    #[test]
-    fn config_string_returns_owned_effective_value() {
-        let config = merge_layers(&[
-            "[user]\n\temail = system@example.invalid\n",
-            "[user]\n\temail = global@example.invalid\n",
-        ]);
-        assert_eq!(
-            config_string(&config, "user", None, "email"),
-            Some("global@example.invalid".to_string())
-        );
-        // Subsections are honoured.
-        let with_sub =
-            GitConfig::parse(b"[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n")
-                .expect("test operation should succeed");
-        assert_eq!(
-            config_string(&with_sub, "remote", Some("origin"), "url"),
-            Some("https://example.invalid/repo.git".to_string())
-        );
-        assert_eq!(
-            config_string(&with_sub, "remote", Some("origin"), "missing"),
-            None
-        );
     }
 
     #[test]
