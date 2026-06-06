@@ -4,6 +4,7 @@ use sley_index::{Index, IndexEntry};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -1719,6 +1720,56 @@ struct IgnorePattern {
     directory_only: bool,
     anchored: bool,
     has_slash: bool,
+    /// How `pattern` should be matched against a slash-free segment. Most
+    /// `.gitignore` entries are literals or simple `*.ext` / `prefix*` globs, all
+    /// of which match without the allocating wildcard DP engine; only genuinely
+    /// complex globs fall through to [`wildcard_path_matches`].
+    match_kind: MatchKind,
+}
+
+/// Classification of an [`IgnorePattern`] that lets common shapes skip the
+/// general wildcard matcher. Every variant matches a *slash-free* segment
+/// (basename or path component); patterns containing `/` are always
+/// [`MatchKind::Glob`] so they only ever reach the full engine.
+#[derive(Debug)]
+enum MatchKind {
+    /// No metacharacters: matches by byte equality.
+    Literal,
+    /// `*X` with `X` literal: matches a segment ending in `X`.
+    Suffix,
+    /// `X*` with `X` literal: matches a segment starting with `X`.
+    Prefix,
+    /// Anything else: defer to [`wildcard_path_matches`].
+    Glob,
+}
+
+/// Classify `pattern` for [`MatchKind`]. `*X`/`X*` fast paths require the literal
+/// part to be slash-free so that `ends_with`/`starts_with` on a single segment is
+/// exactly equivalent to the glob (`*` never crosses `/`).
+fn classify_ignore_pattern(pattern: &[u8]) -> MatchKind {
+    let stars = pattern.iter().filter(|byte| **byte == b'*').count();
+    let other_meta = pattern
+        .iter()
+        .any(|byte| matches!(byte, b'?' | b'[' | b'\\'));
+    if stars == 0 && !other_meta {
+        return MatchKind::Literal;
+    }
+    if stars == 1 && !other_meta {
+        let literal = if pattern.first() == Some(&b'*') {
+            Some((&pattern[1..], MatchKind::Suffix))
+        } else if pattern.last() == Some(&b'*') {
+            Some((&pattern[..pattern.len() - 1], MatchKind::Prefix))
+        } else {
+            None
+        };
+        if let Some((literal, kind)) = literal
+            && !literal.is_empty()
+            && !literal.contains(&b'/')
+        {
+            return kind;
+        }
+    }
+    MatchKind::Glob
 }
 
 impl IgnoreMatcher {
@@ -2098,6 +2149,15 @@ fn push_ignore_pattern(
     } else {
         (false, pattern)
     };
+    // A leading `**/` followed by a slash-free segment is, per gitignore,
+    // identical to the bare segment ("match in all directories"): `**/Pods` ≡
+    // `Pods`, `**/*.jks` ≡ `*.jks`. Collapse it so the pattern matches the
+    // basename directly (a literal/suffix compare) instead of paying for the
+    // `**` wildcard engine on the full path — verified against `git check-ignore`.
+    let pattern = match pattern.strip_prefix(b"**/") {
+        Some(rest) if !rest.is_empty() && !rest.contains(&b'/') => rest,
+        _ => pattern,
+    };
     if pattern.is_empty() {
         return;
     }
@@ -2111,6 +2171,7 @@ fn push_ignore_pattern(
         directory_only,
         anchored,
         has_slash: pattern.contains(&b'/'),
+        match_kind: classify_ignore_pattern(pattern),
     });
 }
 
@@ -2156,11 +2217,11 @@ impl IgnorePattern {
             return self.matches_directory(path, is_dir);
         }
         if self.anchored || self.has_slash {
-            return wildcard_path_matches(&self.pattern, path);
+            return self.match_segment(path);
         }
         path.rsplit(|byte| *byte == b'/')
             .next()
-            .is_some_and(|basename| wildcard_path_matches(&self.pattern, basename))
+            .is_some_and(|basename| self.match_segment(basename))
     }
 
     fn matches_directory(&self, path: &[u8], is_dir: bool) -> bool {
@@ -2174,15 +2235,46 @@ impl IgnorePattern {
         path.split(|byte| *byte == b'/')
             .enumerate()
             .any(|(index, component)| {
-                wildcard_path_matches(&self.pattern, component)
+                self.match_segment(component)
                     && (is_dir || index + 1 < path.split(|byte| *byte == b'/').count())
             })
     }
+
+    /// Match a slash-free `value` (a basename or path component) against this
+    /// pattern. Literal and simple `*X`/`X*` patterns resolve with a direct
+    /// comparison; only complex globs pay for the allocating wildcard engine.
+    fn match_segment(&self, value: &[u8]) -> bool {
+        match self.match_kind {
+            MatchKind::Literal => self.pattern == value,
+            // `*X` ≡ ends_with(X) and `X*` ≡ starts_with(X), but only on a
+            // slash-free segment: `*` never crosses `/`, so an anchored `/*.log`
+            // applied to a multi-segment path must not match (the slash guard
+            // rejects it). Basename/component call sites are slash-free already.
+            MatchKind::Suffix => !value.contains(&b'/') && value.ends_with(&self.pattern[1..]),
+            MatchKind::Prefix => {
+                !value.contains(&b'/') && value.starts_with(&self.pattern[..self.pattern.len() - 1])
+            }
+            MatchKind::Glob => wildcard_path_matches(&self.pattern, value),
+        }
+    }
+}
+
+thread_local! {
+    /// Reused dynamic-programming scratch for [`wildcard_path_matches`]. Flat
+    /// `(pattern.len()+1) * (value.len()+1)` grid of memoised results, kept across
+    /// calls so the hot ignore/attribute matching loop never reallocates.
+    static WILDCARD_MEMO: RefCell<Vec<Option<bool>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn wildcard_path_matches(pattern: &[u8], value: &[u8]) -> bool {
-    let mut memo = vec![vec![None; value.len() + 1]; pattern.len() + 1];
-    wildcard_path_matches_from(pattern, value, 0, 0, &mut memo)
+    let stride = value.len() + 1;
+    let cells = (pattern.len() + 1) * stride;
+    WILDCARD_MEMO.with_borrow_mut(|memo| {
+        // One reused allocation; clearing then resizing fills the grid with `None`.
+        memo.clear();
+        memo.resize(cells, None);
+        wildcard_path_matches_from(pattern, value, 0, 0, memo, stride)
+    })
 }
 
 fn wildcard_path_matches_from(
@@ -2190,9 +2282,11 @@ fn wildcard_path_matches_from(
     value: &[u8],
     pattern_index: usize,
     value_index: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
+    stride: usize,
 ) -> bool {
-    if let Some(cached) = memo[pattern_index][value_index] {
+    let cell = pattern_index * stride + value_index;
+    if let Some(cached) = memo[cell] {
         return cached;
     }
     let matched = if pattern_index == pattern.len() {
@@ -2200,18 +2294,30 @@ fn wildcard_path_matches_from(
     } else {
         match pattern[pattern_index] {
             b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => {
-                wildcard_double_star_matches(pattern, value, pattern_index, value_index, memo)
+                wildcard_double_star_matches(pattern, value, pattern_index, value_index, memo, stride)
             }
             b'*' => {
-                if wildcard_path_matches_from(pattern, value, pattern_index + 1, value_index, memo)
-                {
+                if wildcard_path_matches_from(
+                    pattern,
+                    value,
+                    pattern_index + 1,
+                    value_index,
+                    memo,
+                    stride,
+                ) {
                     true
                 } else {
                     let mut next = value_index;
                     while next < value.len() && value[next] != b'/' {
                         next += 1;
-                        if wildcard_path_matches_from(pattern, value, pattern_index + 1, next, memo)
-                        {
+                        if wildcard_path_matches_from(
+                            pattern,
+                            value,
+                            pattern_index + 1,
+                            next,
+                            memo,
+                            stride,
+                        ) {
                             return true;
                         }
                     }
@@ -2227,6 +2333,7 @@ fn wildcard_path_matches_from(
                         pattern_index + 1,
                         value_index + 1,
                         memo,
+                        stride,
                     )
             }
             b'[' => {
@@ -2241,6 +2348,7 @@ fn wildcard_path_matches_from(
                                 next_pattern_index,
                                 value_index + 1,
                                 memo,
+                                stride,
                             )
                     } else {
                         value[value_index] == b'['
@@ -2250,6 +2358,7 @@ fn wildcard_path_matches_from(
                                 pattern_index + 1,
                                 value_index + 1,
                                 memo,
+                                stride,
                             )
                     }
                 } else {
@@ -2265,6 +2374,7 @@ fn wildcard_path_matches_from(
                         pattern_index + 2,
                         value_index + 1,
                         memo,
+                        stride,
                     )
             }
             literal => {
@@ -2276,11 +2386,12 @@ fn wildcard_path_matches_from(
                         pattern_index + 1,
                         value_index + 1,
                         memo,
+                        stride,
                     )
             }
         }
     };
-    memo[pattern_index][value_index] = Some(matched);
+    memo[cell] = Some(matched);
     matched
 }
 
@@ -2289,16 +2400,17 @@ fn wildcard_double_star_matches(
     value: &[u8],
     pattern_index: usize,
     value_index: usize,
-    memo: &mut [Vec<Option<bool>>],
+    memo: &mut [Option<bool>],
+    stride: usize,
 ) -> bool {
     let after_stars = pattern_index + 2;
     if pattern.get(after_stars) == Some(&b'/') {
-        if wildcard_path_matches_from(pattern, value, after_stars + 1, value_index, memo) {
+        if wildcard_path_matches_from(pattern, value, after_stars + 1, value_index, memo, stride) {
             return true;
         }
         for next in value_index..value.len() {
             if value[next] == b'/'
-                && wildcard_path_matches_from(pattern, value, after_stars + 1, next + 1, memo)
+                && wildcard_path_matches_from(pattern, value, after_stars + 1, next + 1, memo, stride)
             {
                 return true;
             }
@@ -2306,7 +2418,7 @@ fn wildcard_double_star_matches(
         return false;
     }
     for next in value_index..=value.len() {
-        if wildcard_path_matches_from(pattern, value, after_stars, next, memo) {
+        if wildcard_path_matches_from(pattern, value, after_stars, next, memo, stride) {
             return true;
         }
     }
@@ -5631,6 +5743,100 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Build an in-memory ignore matcher from raw `.gitignore` lines (no disk).
+    fn ignore_matcher(patterns: &[&[u8]]) -> IgnoreMatcher {
+        let mut matcher = IgnoreMatcher::default();
+        let owned: Vec<Vec<u8>> = patterns.iter().map(|p| p.to_vec()).collect();
+        matcher.extend_patterns(&owned);
+        matcher
+    }
+
+    #[test]
+    fn ignore_match_kind_fast_paths_match_the_wildcard_engine() {
+        // Literal: exact basename anywhere; not a superstring.
+        let matcher = ignore_matcher(&[b"Pods"]);
+        assert!(matcher.is_ignored(b"a/b/Pods", true));
+        assert!(matcher.is_ignored(b"Pods", false));
+        assert!(!matcher.is_ignored(b"Pods_not", false));
+        assert!(matches!(classify_ignore_pattern(b"Pods"), MatchKind::Literal));
+
+        // Suffix `*.log`: basename ending in `.log` at any depth.
+        let matcher = ignore_matcher(&[b"*.log"]);
+        assert!(matcher.is_ignored(b"x.log", false));
+        assert!(matcher.is_ignored(b"a/b/x.log", false));
+        assert!(matcher.is_ignored(b".log", false));
+        assert!(!matcher.is_ignored(b"x.logx", false));
+        assert!(matches!(classify_ignore_pattern(b"*.log"), MatchKind::Suffix));
+
+        // Prefix `build*`: basename starting with `build`.
+        let matcher = ignore_matcher(&[b"build*"]);
+        assert!(matcher.is_ignored(b"buildfoo", false));
+        assert!(matcher.is_ignored(b"a/build", false));
+        assert!(!matcher.is_ignored(b"xbuild", false));
+        assert!(matches!(classify_ignore_pattern(b"build*"), MatchKind::Prefix));
+    }
+
+    #[test]
+    fn ignore_anchored_suffix_does_not_cross_slash() {
+        // `/*.log` is anchored: matches `.log` files only at the matcher base,
+        // never in a subdirectory — the slash guard in `match_segment`.
+        let matcher = ignore_matcher(&[b"/*.log"]);
+        assert!(matcher.is_ignored(b"x.log", false));
+        assert!(!matcher.is_ignored(b"sub/x.log", false));
+
+        // Anchored literal likewise only matches at root.
+        let matcher = ignore_matcher(&[b"/foo"]);
+        assert!(matcher.is_ignored(b"foo", false));
+        assert!(!matcher.is_ignored(b"a/foo", false));
+    }
+
+    #[test]
+    fn ignore_double_star_prefix_collapses_to_basename() {
+        // `**/X` ≡ `X` for slash-free X (verified against `git check-ignore`).
+        let matcher = ignore_matcher(&[b"**/Pods"]);
+        assert!(matcher.is_ignored(b"a/b/Pods", true));
+        assert!(matcher.is_ignored(b"Pods", true));
+        assert!(!matcher.is_ignored(b"Pods_not", false));
+
+        let matcher = ignore_matcher(&[b"**/*.jks"]);
+        assert!(matcher.is_ignored(b"x.jks", false));
+        assert!(matcher.is_ignored(b"a/deep/y.jks", false));
+        assert!(!matcher.is_ignored(b"x.jksx", false));
+
+        // `**/A/B` keeps a slash in the tail, so it stays a real glob and must
+        // match the trailing path at any depth.
+        let matcher = ignore_matcher(&[b"**/Flutter/ephemeral"]);
+        assert!(matcher.is_ignored(b"Flutter/ephemeral", true));
+        assert!(matcher.is_ignored(b"a/Flutter/ephemeral", true));
+        assert!(!matcher.is_ignored(b"Flutter/other", true));
+    }
+
+    #[test]
+    fn ignore_complex_globs_still_use_the_engine() {
+        let matcher = ignore_matcher(&[b"*.[Cc]ache"]);
+        assert!(matcher.is_ignored(b"x.cache", false));
+        assert!(matcher.is_ignored(b"x.Cache", false));
+        assert!(!matcher.is_ignored(b"x.xache", false));
+        assert!(matches!(classify_ignore_pattern(b"*.[Cc]ache"), MatchKind::Glob));
+
+        let matcher = ignore_matcher(&[b"Icon?"]);
+        assert!(matcher.is_ignored(b"IconA", false));
+        assert!(!matcher.is_ignored(b"Icon", false));
+        assert!(!matcher.is_ignored(b"IconAB", false));
+
+        // Multi-star is not a simple prefix/suffix.
+        assert!(matches!(classify_ignore_pattern(b"app.*.symbols"), MatchKind::Glob));
+        assert!(matches!(classify_ignore_pattern(b"a*b*c"), MatchKind::Glob));
+    }
+
+    #[test]
+    fn ignore_negation_still_applies_after_fast_paths() {
+        // Last match wins: a negated literal un-ignores a suffix-matched file.
+        let matcher = ignore_matcher(&[b"*.log", b"!keep.log"]);
+        assert!(matcher.is_ignored(b"a/x.log", false));
+        assert!(!matcher.is_ignored(b"a/keep.log", false));
+    }
 
     #[test]
     fn update_index_adds_file_entry_and_blob() {
