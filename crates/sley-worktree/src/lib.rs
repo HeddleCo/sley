@@ -3647,7 +3647,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
-    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+    collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
 
     let attributes = smudge_config
         .map(|_| build_tree_attribute_matcher(worktree_root, &db, format, &commit.tree))
@@ -3755,7 +3755,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
-    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+    collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
 
     let matcher = sparse.map(|(spec, mode)| SparseMatcher::new(spec, mode));
 
@@ -4185,7 +4185,7 @@ pub fn reset_index_and_worktree_to_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
-    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+    collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
 
     for path in read_index_entries(git_dir, format)?.keys() {
         if !target_entries.contains_key(path) {
@@ -4240,7 +4240,7 @@ pub fn reset_index_to_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, commit_oid)?;
     let mut target_entries = BTreeMap::new();
-    collect_tree_entries(&db, format, &commit.tree, Vec::new(), &mut target_entries)?;
+    collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
         index_entries.push(restored_head_index_entry(worktree_root, &db, path, entry)?);
@@ -4278,7 +4278,7 @@ pub fn index_from_tree(
     let mut entries: Vec<IndexEntry> = Vec::new();
     if *tree_oid != ObjectId::empty_tree(format) {
         let mut tree_entries = BTreeMap::new();
-        collect_tree_entries(db, format, tree_oid, Vec::new(), &mut tree_entries)?;
+        collect_tree_entries(db, format, tree_oid, &mut tree_entries)?;
         entries.reserve(tree_entries.len());
         for (path, entry) in tree_entries {
             let name_len = (path.len().min(0x0fff)) as u16;
@@ -5383,7 +5383,7 @@ fn head_tree_entries(
     }
     let commit = Commit::parse_ref(format, &object.body)?;
     let mut entries = BTreeMap::new();
-    collect_tree_entries(db, format, &commit.tree, Vec::new(), &mut entries)?;
+    collect_tree_entries(db, format, &commit.tree, &mut entries)?;
     Ok(entries)
 }
 
@@ -5393,7 +5393,7 @@ fn tree_entries(
     tree_oid: &ObjectId,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
-    collect_tree_entries(db, format, tree_oid, Vec::new(), &mut entries)?;
+    collect_tree_entries(db, format, tree_oid, &mut entries)?;
     Ok(entries)
 }
 
@@ -5401,7 +5401,17 @@ fn collect_tree_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
-    prefix: Vec<u8>,
+    entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
+) -> Result<()> {
+    let mut path = Vec::new();
+    collect_tree_entries_into(db, format, tree_oid, &mut path, entries)
+}
+
+fn collect_tree_entries_into(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    path: &mut Vec<u8>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     let object = db.read_object(tree_oid)?;
@@ -5413,22 +5423,23 @@ fn collect_tree_entries(
     }
     for entry in TreeEntries::new(format, &object.body) {
         let entry = entry?;
-        let mut path = prefix.clone();
-        if !path.is_empty() {
+        let original_len = path.len();
+        if original_len != 0 {
             path.push(b'/');
         }
         path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
-            collect_tree_entries(db, format, &entry.oid, path, entries)?;
+            collect_tree_entries_into(db, format, &entry.oid, path, entries)?;
         } else {
             entries.insert(
-                path,
+                path.clone(),
                 TrackedEntry {
                     mode: entry.mode,
                     oid: entry.oid,
                 },
             );
         }
+        path.truncate(original_len);
     }
     Ok(())
 }

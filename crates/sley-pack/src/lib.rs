@@ -2204,8 +2204,8 @@ where
             else {
                 continue;
             };
-            let body = apply_pack_delta(&base_object.body, delta)?;
-            let object = EncodedObject::new(base_object.object_type, body);
+            let body = apply_pack_delta(base_object.body(), delta)?;
+            let object = EncodedObject::new(base_object.object_type(), body);
             let oid = object.object_id(format)?;
             let pack_object = PackObject {
                 entry: PackEntry {
@@ -2250,13 +2250,34 @@ fn parsed_entry_offset(entry: &ParsedPackEntry) -> u64 {
     }
 }
 
-fn delta_base_object<F>(
+enum DeltaBaseObject<'a> {
+    Borrowed(&'a EncodedObject),
+    Owned(EncodedObject),
+}
+
+impl DeltaBaseObject<'_> {
+    fn object_type(&self) -> ObjectType {
+        match self {
+            Self::Borrowed(object) => object.object_type,
+            Self::Owned(object) => object.object_type,
+        }
+    }
+
+    fn body(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(object) => &object.body,
+            Self::Owned(object) => &object.body,
+        }
+    }
+}
+
+fn delta_base_object<'a, F>(
     base: &DeltaBase,
     offset_to_index: &HashMap<u64, usize>,
     oid_to_index: &HashMap<ObjectId, usize>,
-    resolved: &[Option<PackObject>],
+    resolved: &'a [Option<PackObject>],
     external_base: &mut F,
-) -> Result<Option<EncodedObject>>
+) -> Result<Option<DeltaBaseObject<'a>>>
 where
     F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
 {
@@ -2267,13 +2288,17 @@ where
                     "ofs-delta base offset {offset} not found"
                 )));
             };
-            Ok(resolved[index].as_ref().map(|object| object.object.clone()))
+            Ok(resolved[index]
+                .as_ref()
+                .map(|object| DeltaBaseObject::Borrowed(&object.object)))
         }
         DeltaBase::Ref(oid) => {
             if let Some(index) = oid_to_index.get(oid).copied() {
-                return Ok(resolved[index].as_ref().map(|object| object.object.clone()));
+                return Ok(resolved[index]
+                    .as_ref()
+                    .map(|object| DeltaBaseObject::Borrowed(&object.object)));
             }
-            external_base(oid)
+            external_base(oid).map(|object| object.map(DeltaBaseObject::Owned))
         }
     }
 }
@@ -2453,15 +2478,6 @@ fn block_hash(block: &[u8]) -> u32 {
     hash
 }
 
-/// Generate a delta encoding that reconstructs `target` from `base`.
-///
-/// Kept as a free function for the existing adjacent-object delta path and for
-/// callers/tests that only deltify a single pair. For batch pack generation the
-/// sliding window reuses a [`DeltaIndex`] across many targets instead.
-fn create_pack_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
-    DeltaIndex::new(base).delta(target)
-}
-
 /// The chosen storage form for a single object during pack generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlannedBase {
@@ -2483,6 +2499,11 @@ struct PlannedEntry {
 /// Maximum number of external thin-pack bases compared against any single
 /// object. Bounds the work of the thin path when a large base set is supplied.
 const DELTA_MAX_EXTERNAL_BASES: usize = 64;
+
+struct DeltaWindowEntry<'a> {
+    idx: usize,
+    index: DeltaIndex<'a>,
+}
 
 /// Rank object types for delta grouping. Objects of the same type are far more
 /// likely to delta well, so the sort groups by this rank first.
@@ -2573,7 +2594,8 @@ fn plan_pack_deltas(
     // chains within `options.depth`.
     let mut depth = vec![0usize; count];
     // Sliding window of recently processed original indices, most recent last.
-    let mut window: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+    let mut window: std::collections::VecDeque<DeltaWindowEntry<'_>> =
+        std::collections::VecDeque::new();
 
     for &idx in &order {
         let target = &objects[idx].body;
@@ -2583,7 +2605,8 @@ fn plan_pack_deltas(
         let mut best_base = PlannedBase::None;
 
         // Try in-pack candidates from the window (same type only).
-        for &base_idx in window.iter().rev() {
+        for base_entry in window.iter().rev() {
+            let base_idx = base_entry.idx;
             if objects[base_idx].object_type != target_type {
                 continue;
             }
@@ -2592,7 +2615,7 @@ fn plan_pack_deltas(
             if depth[base_idx] + 1 > options.depth {
                 continue;
             }
-            let delta = create_pack_delta(&objects[base_idx].body, target);
+            let delta = base_entry.index.delta(target);
             if !delta_is_acceptable(&delta, target.len()) {
                 continue;
             }
@@ -2647,7 +2670,10 @@ fn plan_pack_deltas(
         }
 
         // Add this object to the window for subsequent candidates.
-        window.push_back(idx);
+        window.push_back(DeltaWindowEntry {
+            idx,
+            index: DeltaIndex::new(&objects[idx].body),
+        });
         while window.len() > options.window {
             window.pop_front();
         }

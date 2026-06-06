@@ -591,9 +591,7 @@ fn apply_revision_suffix<R: ObjectReader>(
             let mut current = base.clone();
             for _ in 0..count {
                 current = graph
-                    .commit_parents(reader, &current)?
-                    .first()
-                    .cloned()
+                    .commit_first_parent(reader, &current)?
                     .ok_or_else(|| GitError::NotFound(format!("first parent of {current}")))?;
             }
             Ok(current)
@@ -680,6 +678,14 @@ impl<'a> CommitGraphContext<'a> {
         self.lookup(oid).map(|commit| commit.parents.clone())
     }
 
+    /// First parent of `oid` from the graph. The outer `None` means the commit is
+    /// not present in the graph; the inner `None` means the commit is present but
+    /// root/unborn with no parents.
+    fn first_parent(&mut self, oid: &ObjectId) -> Option<Option<ObjectId>> {
+        self.lookup(oid)
+            .map(|commit| commit.parents.first().cloned())
+    }
+
     /// Generation number of `oid`, or `None` when it is not present in the graph
     /// or the graph carries no generation numbers (generation 0). A `None`
     /// result disables generation-based pruning for that commit.
@@ -709,6 +715,19 @@ impl<'a> CommitGraphContext<'a> {
             return Ok(parents);
         }
         commit_parents(reader, self.format, oid)
+    }
+
+    /// First parent of `oid`: from the graph when present, otherwise read+parsed
+    /// from the commit object via `reader`.
+    fn commit_first_parent<R: ObjectReader>(
+        &mut self,
+        reader: &R,
+        oid: &ObjectId,
+    ) -> Result<Option<ObjectId>> {
+        if let Some(parent) = self.first_parent(oid) {
+            return Ok(parent);
+        }
+        Ok(commit_parents(reader, self.format, oid)?.into_iter().next())
     }
 
     /// `oid`'s parents and committer time from the graph in one lookup, or `None`
@@ -1316,11 +1335,10 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         if commit_message_contains(commit.message, text) {
             return Ok(oid);
         }
-        current = graph
-            .parents(&oid)
-            .unwrap_or_else(|| commit.parents.clone())
-            .into_iter()
-            .next();
+        current = match graph.first_parent(&oid) {
+            Some(parent) => parent,
+            None => commit.parents.into_iter().next(),
+        };
     }
     Err(GitError::NotFound(format!(
         "no commit matching '^{{/{text}}}' in first-parent history"
@@ -1564,15 +1582,16 @@ impl ResolvedRevisionSelection {
             if !seen.insert(oid.clone()) || self.excluded.contains(&oid) {
                 continue;
             }
+            if first_parent {
+                pending.extend(graph.commit_first_parent(reader, &oid)?);
+                out.push(oid);
+                continue;
+            }
             let (parents, _) = match graph.metadata(&oid) {
                 Some(metadata) => metadata,
                 None => commit_metadata_from_object(reader, format, &oid)?,
             };
-            if first_parent {
-                pending.extend(parents.first().cloned());
-            } else {
-                pending.extend(parents);
-            }
+            pending.extend(parents);
             out.push(oid);
         }
         Ok(out)
