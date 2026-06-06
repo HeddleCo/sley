@@ -17,6 +17,7 @@ members = [
     "crates/sley-transport",
     "crates/sley-fetch",
     "crates/sley-remote",
+    "crates/sley-ref-filter",
     "crates/sley-fsck",
     "crates/sley-archive",
     "crates/sley",

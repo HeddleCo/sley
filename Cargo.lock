@@ -318,6 +318,7 @@ dependencies = [
  "sley-odb",
  "sley-pack",
  "sley-protocol",
+ "sley-ref-filter",
  "sley-refs",
  "sley-remote",
  "sley-rev",
@@ -432,6 +433,13 @@ dependencies = [
 
 [[package]]
 name = "sley-protocol"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
+name = "sley-ref-filter"
 version = "0.1.0"
 dependencies = [
  "sley-core",

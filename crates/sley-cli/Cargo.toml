@@ -26,6 +26,7 @@ sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
 sley-pack = { path = "../sley-pack" }
 sley-protocol = { path = "../sley-protocol" }
+sley-ref-filter = { path = "../sley-ref-filter" }
 sley-refs = { path = "../sley-refs" }
 sley-remote = { path = "../sley-remote" }
 sley-rev = { path = "../sley-rev" }
