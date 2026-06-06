@@ -721,7 +721,7 @@ impl<'a> ConfigParser<'a> {
     /// `[section.subsection]` header. The leading `[` is the next character.
     fn parse_section_header(&mut self) -> Result<ConfigSection> {
         self.bump(); // consume '['
-                     // Section name: alphanumeric, '-', and '.' (the dotted-subsection form).
+        // Section name: alphanumeric, '-', and '.' (the dotted-subsection form).
         let mut name = String::new();
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '.' {
@@ -1259,7 +1259,7 @@ mod tests {
     enabled
 "#,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
         assert_eq!(config.get_bool("core", None, "bare"), Some(false));
         assert_eq!(
@@ -1271,9 +1271,12 @@ mod tests {
 
     #[test]
     fn config_reports_repository_object_format() {
-        let config = GitConfig::parse(b"[extensions]\n\tobjectformat = sha256\n").unwrap();
+        let config = GitConfig::parse(b"[extensions]\n\tobjectformat = sha256\n")
+            .expect("test operation should succeed");
         assert_eq!(
-            config.repository_object_format().unwrap(),
+            config
+                .repository_object_format()
+                .expect("test operation should succeed"),
             ObjectFormat::Sha256
         );
     }
@@ -1290,7 +1293,8 @@ mod tests {
                 }],
             }],
         };
-        let parsed = GitConfig::parse(&config.to_canonical_bytes()).unwrap();
+        let parsed =
+            GitConfig::parse(&config.to_canonical_bytes()).expect("test operation should succeed");
         assert_eq!(parsed, config);
     }
 
@@ -1300,14 +1304,15 @@ mod tests {
     /// errors is fine here because each input is a known-good fixture).
     fn parse_core_x(input: &str) -> Option<String> {
         GitConfig::parse(input.as_bytes())
-            .unwrap()
+            .expect("test operation should succeed")
             .get("core", None, "x")
             .map(str::to_string)
     }
 
     #[test]
     fn config_section_name_is_case_insensitive() {
-        let config = GitConfig::parse(b"[Core]\n\tBar = value\n").unwrap();
+        let config =
+            GitConfig::parse(b"[Core]\n\tBar = value\n").expect("test operation should succeed");
         assert_eq!(config.get("core", None, "bar"), Some("value"));
         assert_eq!(config.get("CORE", None, "BAR"), Some("value"));
         // Stored names are lower-cased.
@@ -1317,7 +1322,8 @@ mod tests {
 
     #[test]
     fn config_subsection_name_is_case_sensitive() {
-        let config = GitConfig::parse(b"[remote \"Origin\"]\n\turl = x\n").unwrap();
+        let config = GitConfig::parse(b"[remote \"Origin\"]\n\turl = x\n")
+            .expect("test operation should succeed");
         assert_eq!(config.get("remote", Some("Origin"), "url"), Some("x"));
         // Case-mismatched subsection must not match.
         assert_eq!(config.get("remote", Some("origin"), "url"), None);
@@ -1326,7 +1332,8 @@ mod tests {
     #[test]
     fn config_subsection_accepts_escaped_quote_and_backslash() {
         // [remote "with\"quote"] -> subsection is with"quote
-        let config = GitConfig::parse(b"[remote \"with\\\"quote\"]\n\turl = x\n").unwrap();
+        let config = GitConfig::parse(b"[remote \"with\\\"quote\"]\n\turl = x\n")
+            .expect("test operation should succeed");
         assert_eq!(
             config.sections[0].subsection.as_deref(),
             Some("with\"quote")
@@ -1334,7 +1341,8 @@ mod tests {
         assert_eq!(config.get("remote", Some("with\"quote"), "url"), Some("x"));
 
         // [remote "a\\b"] -> subsection is a\b
-        let config = GitConfig::parse(b"[remote \"a\\\\b\"]\n\turl = y\n").unwrap();
+        let config = GitConfig::parse(b"[remote \"a\\\\b\"]\n\turl = y\n")
+            .expect("test operation should succeed");
         assert_eq!(config.sections[0].subsection.as_deref(), Some("a\\b"));
     }
 
@@ -1342,14 +1350,16 @@ mod tests {
     fn config_subsection_unknown_escape_keeps_literal_char() {
         // In a subsection only \\ and \" are real escapes; \n is a literal "n",
         // NOT a newline (unlike a value).
-        let config = GitConfig::parse(b"[remote \"a\\nb\"]\n\turl = x\n").unwrap();
+        let config = GitConfig::parse(b"[remote \"a\\nb\"]\n\turl = x\n")
+            .expect("test operation should succeed");
         assert_eq!(config.sections[0].subsection.as_deref(), Some("anb"));
     }
 
     #[test]
     fn config_dotted_subsection_is_case_insensitive() {
         // Deprecated [section.subsection] form: subsection is lower-cased.
-        let config = GitConfig::parse(b"[core.Sub]\n\tbar = x\n").unwrap();
+        let config =
+            GitConfig::parse(b"[core.Sub]\n\tbar = x\n").expect("test operation should succeed");
         assert_eq!(config.sections[0].name, "core");
         assert_eq!(config.sections[0].subsection.as_deref(), Some("sub"));
         assert_eq!(config.get("core", Some("sub"), "bar"), Some("x"));
@@ -1360,14 +1370,15 @@ mod tests {
     #[test]
     fn config_dotted_subsection_keeps_inner_dots() {
         // Everything after the first dot is the subsection, dots and all.
-        let config = GitConfig::parse(b"[a.b.c]\n\tk = v\n").unwrap();
+        let config =
+            GitConfig::parse(b"[a.b.c]\n\tk = v\n").expect("test operation should succeed");
         assert_eq!(config.sections[0].name, "a");
         assert_eq!(config.sections[0].subsection.as_deref(), Some("b.c"));
     }
 
     #[test]
     fn config_bare_variable_is_boolean_true() {
-        let config = GitConfig::parse(b"[core]\n\tflag\n").unwrap();
+        let config = GitConfig::parse(b"[core]\n\tflag\n").expect("test operation should succeed");
         assert_eq!(config.sections[0].entries[0].value, None);
         assert_eq!(config.get_bool("core", None, "flag"), Some(true));
         // A bare key has no string value.
@@ -1378,7 +1389,7 @@ mod tests {
     fn config_explicit_empty_value_is_boolean_false() {
         // `x =` (with the equals) is an empty value, which git treats as false,
         // distinct from a bare key with no equals (true).
-        let config = GitConfig::parse(b"[core]\n\tx =\n").unwrap();
+        let config = GitConfig::parse(b"[core]\n\tx =\n").expect("test operation should succeed");
         assert_eq!(config.sections[0].entries[0].value.as_deref(), Some(""));
         assert_eq!(config.get_bool("core", None, "x"), Some(false));
     }
@@ -1516,7 +1527,8 @@ mod tests {
 
     #[test]
     fn config_multi_valued_keys_preserve_order_and_duplicates() {
-        let config = GitConfig::parse(b"[core]\n\tx = 1\n\tx = 2\n\tx = 1\n").unwrap();
+        let config = GitConfig::parse(b"[core]\n\tx = 1\n\tx = 2\n\tx = 1\n")
+            .expect("test operation should succeed");
         assert_eq!(
             config.get_all("core", None, "x"),
             vec![Some("1"), Some("2"), Some("1")]
@@ -1527,8 +1539,8 @@ mod tests {
 
     #[test]
     fn config_get_all_spans_multiple_sections_in_order() {
-        let config =
-            GitConfig::parse(b"[core]\n\tx = a\n[other]\n\ty = z\n[core]\n\tx = b\n").unwrap();
+        let config = GitConfig::parse(b"[core]\n\tx = a\n[other]\n\ty = z\n[core]\n\tx = b\n")
+            .expect("test operation should succeed");
         assert_eq!(
             config.get_all("core", None, "x"),
             vec![Some("a"), Some("b")]
@@ -1554,20 +1566,23 @@ mod tests {
         assert!(GitConfig::parse(b"[core]\n\t-x = y\n").is_err());
         // ...but a letter followed by digits/hyphens is fine.
         assert_eq!(parse_core_x("[core]\n\tx = ok\n").as_deref(), Some("ok"));
-        let config = GitConfig::parse(b"[core]\n\tx1-y = z\n").unwrap();
+        let config =
+            GitConfig::parse(b"[core]\n\tx1-y = z\n").expect("test operation should succeed");
         assert_eq!(config.get("core", None, "x1-y"), Some("z"));
     }
 
     #[test]
     fn config_section_name_may_start_with_digit() {
         // Unlike variable names, section names may begin with a digit.
-        let config = GitConfig::parse(b"[1core]\n\tx = y\n").unwrap();
+        let config =
+            GitConfig::parse(b"[1core]\n\tx = y\n").expect("test operation should succeed");
         assert_eq!(config.get("1core", None, "x"), Some("y"));
     }
 
     #[test]
     fn config_comments_and_blank_lines_are_skipped() {
-        let config = GitConfig::parse(b"# top\n; also\n\n[core]\n\n\tx = y\n# trailing\n").unwrap();
+        let config = GitConfig::parse(b"# top\n; also\n\n[core]\n\n\tx = y\n# trailing\n")
+            .expect("test operation should succeed");
         assert_eq!(config.get("core", None, "x"), Some("y"));
     }
 
@@ -1673,7 +1688,7 @@ mod tests {
                 }],
             };
             let bytes = config.to_canonical_bytes();
-            let text = String::from_utf8(bytes).unwrap();
+            let text = String::from_utf8(bytes).expect("test operation should succeed");
             let expected_line = format!("\tx = {expected}\n");
             assert!(
                 text.contains(&expected_line),
@@ -1694,7 +1709,8 @@ mod tests {
                 }],
             }],
         };
-        let text = String::from_utf8(config.to_canonical_bytes()).unwrap();
+        let text =
+            String::from_utf8(config.to_canonical_bytes()).expect("test operation should succeed");
         assert!(
             text.starts_with("[remote \"a\\\"b\\\\c\"]\n"),
             "unexpected header: {text:?}"
@@ -1736,7 +1752,7 @@ mod tests {
                 }],
             };
             let serialized = original.to_canonical_bytes();
-            let reparsed = GitConfig::parse(&serialized).unwrap();
+            let reparsed = GitConfig::parse(&serialized).expect("test operation should succeed");
             assert_eq!(reparsed, original, "value {value:?} did not round-trip");
             // Serializing again must be byte-identical (stable fixpoint).
             assert_eq!(
@@ -1769,7 +1785,8 @@ mod tests {
                 ],
             }],
         };
-        let reparsed = GitConfig::parse(&original.to_canonical_bytes()).unwrap();
+        let reparsed = GitConfig::parse(&original.to_canonical_bytes())
+            .expect("test operation should succeed");
         assert_eq!(reparsed, original);
         assert_eq!(
             reparsed.get_all("core", None, "x"),
@@ -1830,12 +1847,13 @@ mod tests {
                 extra.display()
             ),
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // The included file overrides filemode and adds a new value.
-        fs::write(&extra, "[core]\n\tfilemode = true\n\tbig = yes\n").unwrap();
+        fs::write(&extra, "[core]\n\tfilemode = true\n\tbig = yes\n")
+            .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config = load_config_with_includes(&main, &ctx).unwrap();
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
         assert_eq!(config.get_bool("core", None, "big"), Some(true));
         fs::remove_dir_all(&dir).ok();
@@ -1845,14 +1863,16 @@ mod tests {
     fn config_include_relative_path_resolves_against_including_file() {
         let dir = unique_include_dir("inc-rel");
         let sub = dir.join("sub");
-        fs::create_dir_all(&sub).unwrap();
+        fs::create_dir_all(&sub).expect("test operation should succeed");
         let main = dir.join("config");
         // Relative path is resolved against the including file's directory.
-        fs::write(&main, "[include]\n\tpath = sub/child.cfg\n").unwrap();
-        fs::write(sub.join("child.cfg"), "[user]\n\temail = a@b.c\n").unwrap();
+        fs::write(&main, "[include]\n\tpath = sub/child.cfg\n")
+            .expect("test operation should succeed");
+        fs::write(sub.join("child.cfg"), "[user]\n\temail = a@b.c\n")
+            .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config = load_config_with_includes(&main, &ctx).unwrap();
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "email"), Some("a@b.c"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -1865,10 +1885,10 @@ mod tests {
             &main,
             "[core]\n\tfilemode = true\n[include]\n\tpath = does-not-exist.cfg\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config = load_config_with_includes(&main, &ctx).unwrap();
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         // No error, and the existing value is preserved.
         assert_eq!(config.get_bool("core", None, "filemode"), Some(true));
         fs::remove_dir_all(&dir).ok();
@@ -1878,7 +1898,7 @@ mod tests {
     fn config_include_if_gitdir_match_and_non_match() {
         let dir = unique_include_dir("inc-gitdir");
         let work = dir.join("work");
-        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&work).expect("test operation should succeed");
         let main = dir.join("config");
         let work_git = work.join(".git");
         fs::write(
@@ -1888,17 +1908,20 @@ mod tests {
                 work.display()
             ),
         )
-        .unwrap();
-        fs::write(dir.join("matched.cfg"), "[user]\n\tname = work\n").unwrap();
+        .expect("test operation should succeed");
+        fs::write(dir.join("matched.cfg"), "[user]\n\tname = work\n")
+            .expect("test operation should succeed");
 
         // git_dir under the pattern: condition matches.
         let matching = ConfigIncludeContext::new(Some(work_git.clone()), None);
-        let config = load_config_with_includes(&main, &matching).unwrap();
+        let config =
+            load_config_with_includes(&main, &matching).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), Some("work"));
 
         // git_dir elsewhere: condition does not match, nothing is spliced.
         let other = ConfigIncludeContext::new(Some(dir.join("other/.git")), None);
-        let config = load_config_with_includes(&main, &other).unwrap();
+        let config =
+            load_config_with_includes(&main, &other).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), None);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1911,11 +1934,12 @@ mod tests {
             &main,
             "[includeIf \"gitdir/i:/SOME/Path/**\"]\n\tpath = ci.cfg\n",
         )
-        .unwrap();
-        fs::write(dir.join("ci.cfg"), "[user]\n\tname = ci\n").unwrap();
+        .expect("test operation should succeed");
+        fs::write(dir.join("ci.cfg"), "[user]\n\tname = ci\n")
+            .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::new(Some(PathBuf::from("/some/path/repo/.git")), None);
-        let config = load_config_with_includes(&main, &ctx).unwrap();
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), Some("ci"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -1928,17 +1952,18 @@ mod tests {
             &main,
             "[includeIf \"onbranch:feature/*\"]\n\tpath = feat.cfg\n",
         )
-        .unwrap();
-        fs::write(dir.join("feat.cfg"), "[user]\n\tname = feature\n").unwrap();
+        .expect("test operation should succeed");
+        fs::write(dir.join("feat.cfg"), "[user]\n\tname = feature\n")
+            .expect("test operation should succeed");
 
         // Matching branch.
         let on = ConfigIncludeContext::new(None, Some("feature/login".into()));
-        let config = load_config_with_includes(&main, &on).unwrap();
+        let config = load_config_with_includes(&main, &on).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), Some("feature"));
 
         // Non-matching branch (slash boundary: `*` does not cross `/`).
         let off = ConfigIncludeContext::new(None, Some("main".into()));
-        let config = load_config_with_includes(&main, &off).unwrap();
+        let config = load_config_with_includes(&main, &off).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), None);
         fs::remove_dir_all(&dir).ok();
     }
@@ -1958,11 +1983,11 @@ mod tests {
                     next.display()
                 ),
             )
-            .unwrap();
+            .expect("test operation should succeed");
         }
         let entry = dir.join("c0.cfg");
         let ctx = ConfigIncludeContext::default();
-        let err = load_config_with_includes(&entry, &ctx).unwrap_err();
+        let err = load_config_with_includes(&entry, &ctx).expect_err("test operation should fail");
         assert!(matches!(err, GitError::InvalidFormat(_)), "got {err:?}");
         fs::remove_dir_all(&dir).ok();
     }
@@ -1971,16 +1996,16 @@ mod tests {
     fn config_resolve_includes_on_parsed_value() {
         let dir = unique_include_dir("inc-parsed");
         let extra = dir.join("extra.cfg");
-        fs::write(&extra, "[user]\n\temail = parsed@x.y\n").unwrap();
+        fs::write(&extra, "[user]\n\temail = parsed@x.y\n").expect("test operation should succeed");
         let parsed =
             GitConfig::parse(format!("[include]\n\tpath = {}\n", extra.display()).as_bytes())
-                .unwrap();
+                .expect("test operation should succeed");
         // The parser leaves the include unresolved.
         assert_eq!(parsed.get("user", None, "email"), None);
         // Resolving against the base dir splices it in.
         let resolved = parsed
             .resolve_includes(&dir, &ConfigIncludeContext::default())
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(resolved.get("user", None, "email"), Some("parsed@x.y"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -1991,12 +2016,14 @@ mod tests {
         let main = dir.join("config");
         let mid = dir.join("mid.cfg");
         let leaf = dir.join("leaf.cfg");
-        fs::write(&main, format!("[include]\n\tpath = {}\n", mid.display())).unwrap();
-        fs::write(&mid, format!("[include]\n\tpath = {}\n", leaf.display())).unwrap();
-        fs::write(&leaf, "[deep]\n\tvalue = ok\n").unwrap();
+        fs::write(&main, format!("[include]\n\tpath = {}\n", mid.display()))
+            .expect("test operation should succeed");
+        fs::write(&mid, format!("[include]\n\tpath = {}\n", leaf.display()))
+            .expect("test operation should succeed");
+        fs::write(&leaf, "[deep]\n\tvalue = ok\n").expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config = load_config_with_includes(&main, &ctx).unwrap();
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("deep", None, "value"), Some("ok"));
         fs::remove_dir_all(&dir).ok();
     }
@@ -2018,7 +2045,11 @@ mod tests {
     fn merge_layers(layers: &[&str]) -> GitConfig {
         let mut sections = Vec::new();
         for layer in layers {
-            sections.extend(GitConfig::parse(layer.as_bytes()).unwrap().sections);
+            sections.extend(
+                GitConfig::parse(layer.as_bytes())
+                    .expect("test operation should succeed")
+                    .sections,
+            );
         }
         GitConfig { sections }
     }
@@ -2077,7 +2108,7 @@ mod tests {
         // Subsections are honoured.
         let with_sub =
             GitConfig::parse(b"[remote \"origin\"]\n\turl = https://example.invalid/repo.git\n")
-                .unwrap();
+                .expect("test operation should succeed");
         assert_eq!(
             config_string(&with_sub, "remote", Some("origin"), "url"),
             Some("https://example.invalid/repo.git".to_string())

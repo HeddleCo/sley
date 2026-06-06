@@ -222,13 +222,19 @@ fn run(
         Mode::Independent => show_independent(state, &selected, &rev_mask),
         Mode::MergeBase => show_merge_base(state, selected.len()),
         Mode::Matrix { extra } => show_matrix(
-            options,
-            git_dir,
-            format,
-            db,
+            ShowMatrixContext {
+                options,
+                selected: &selected,
+                head: head.as_ref(),
+                commit_line: CommitLineContext {
+                    git_dir,
+                    format,
+                    db,
+                    no_name: options.no_name,
+                    sha1_name: options.sha1_name,
+                },
+            },
             state,
-            &selected,
-            head.as_ref(),
             extra,
         ),
     }
@@ -465,19 +471,34 @@ fn join_revs(state: &mut TraversalState, num_rev: usize, extra: i64) -> Result<(
 // Display: the matrix (header + separator + body)
 // ---------------------------------------------------------------------------
 
+/// Borrowed inputs shared across matrix rendering.
+struct ShowMatrixContext<'a> {
+    options: &'a ShowBranchOptions,
+    selected: &'a [SelectedRef],
+    head: Option<&'a HeadInfo>,
+    commit_line: CommitLineContext<'a>,
+}
+
+/// Rendering inputs needed to name a single commit in the matrix body.
+#[derive(Clone, Copy)]
+struct CommitLineContext<'a> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    db: &'a FileObjectDatabase,
+    no_name: bool,
+    sha1_name: bool,
+}
+
 /// Render the show-branch matrix. `extra < 0` (`--list`) prints only the header
 /// block and stops; otherwise the separator and the per-commit body follow.
-#[allow(clippy::too_many_arguments)]
 fn show_matrix(
-    options: &ShowBranchOptions,
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    context: ShowMatrixContext<'_>,
     state: &mut TraversalState,
-    selected: &[SelectedRef],
-    head: Option<&HeadInfo>,
     extra: i64,
 ) -> Result<()> {
+    let options = context.options;
+    let selected = context.selected;
+    let head = context.head;
     let num_rev = selected.len();
     let mut stdout = io::stdout();
 
@@ -576,16 +597,7 @@ fn show_matrix(
             write!(stdout, " ")?;
         }
 
-        write_one_commit(
-            &mut stdout,
-            git_dir,
-            format,
-            db,
-            state,
-            oid,
-            options.no_name,
-            options.sha1_name,
-        )?;
+        write_one_commit(&mut stdout, &context.commit_line, state, oid)?;
 
         if shown_merge_point {
             extra -= 1;
@@ -613,24 +625,21 @@ fn omit_in_dense(oid: &ObjectId, flags: u32, selected: &[SelectedRef]) -> bool {
 
 /// Emit a single body line's `[name] subject` (or, with `--no-name`, just the
 /// subject). Unnamed commits and `--sha1-name` fall back to an abbreviated oid.
-#[allow(clippy::too_many_arguments)]
 fn write_one_commit(
     stdout: &mut io::Stdout,
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    context: &CommitLineContext<'_>,
     state: &mut TraversalState,
     oid: &ObjectId,
-    no_name: bool,
-    sha1_name: bool,
 ) -> Result<()> {
     let commit = state.commit(oid)?;
     let subject = oneline_subject(&commit.message);
-    if no_name {
+    if context.no_name {
         writeln!(stdout, "{subject}")?;
         return Ok(());
     }
-    if !sha1_name && let Some(name) = state.names.get(oid) {
+    if !context.sha1_name
+        && let Some(name) = state.names.get(oid)
+    {
         write!(stdout, "[{}", name.head_name)?;
         if name.generation == 1 {
             write!(stdout, "^")?;
@@ -639,7 +648,7 @@ fn write_one_commit(
         }
         write!(stdout, "] ")?;
     } else {
-        let abbrev = unique_abbrev(git_dir, format, db, oid)?;
+        let abbrev = unique_abbrev(context.git_dir, context.format, context.db, oid)?;
         write!(stdout, "[{abbrev}] ")?;
     }
     writeln!(stdout, "{subject}")?;

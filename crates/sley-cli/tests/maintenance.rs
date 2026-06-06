@@ -80,7 +80,14 @@ fn apply_modifies_worktree_like_git() {
     }
     let root = unique_temp_dir("apply-mod");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "f.txt", "a\nb\nc\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -89,7 +96,7 @@ fn apply_modifies_worktree_like_git() {
     git_ok(&repo, &["checkout", "--", "f.txt"]);
     let patch_path = root.join("change.patch");
     fs::write(&patch_path, &patch).expect("write patch");
-    let patch_arg = patch_path.to_str().unwrap();
+    let patch_arg = patch_path.to_str().expect("test operation should succeed");
 
     let candidate = root.join("candidate");
     let reference = root.join("reference");
@@ -104,11 +111,14 @@ fn apply_modifies_worktree_like_git() {
     );
     git_ok(&reference, &["apply", patch_arg]);
     assert_eq!(
-        fs::read(candidate.join("f.txt")).unwrap(),
-        fs::read(reference.join("f.txt")).unwrap(),
+        fs::read(candidate.join("f.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("f.txt")).expect("test operation should succeed"),
         "sley apply produced different bytes than git apply"
     );
-    assert_eq!(fs::read(candidate.join("f.txt")).unwrap(), b"a\nB\nc\n");
+    assert_eq!(
+        fs::read(candidate.join("f.txt")).expect("test operation should succeed"),
+        b"a\nB\nc\n"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -120,7 +130,14 @@ fn apply_check_succeeds_for_clean_patch() {
     }
     let root = unique_temp_dir("apply-check");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "f.txt", "1\n2\n3\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -131,13 +148,23 @@ fn apply_check_succeeds_for_clean_patch() {
     fs::write(&patch_path, &patch).expect("write patch");
 
     // --check must not modify the worktree and must succeed for an applicable patch.
-    let out = git_rs(&repo, &["apply", "--check", patch_path.to_str().unwrap()]);
+    let out = git_rs(
+        &repo,
+        &[
+            "apply",
+            "--check",
+            patch_path.to_str().expect("test operation should succeed"),
+        ],
+    );
     assert!(
         out.status.success(),
         "sley apply --check rejected a clean patch: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(fs::read(repo.join("f.txt")).unwrap(), b"1\n2\n3\n");
+    assert_eq!(
+        fs::read(repo.join("f.txt")).expect("test operation should succeed"),
+        b"1\n2\n3\n"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -149,7 +176,14 @@ fn apply_creates_new_file_like_git() {
     }
     let root = unique_temp_dir("apply-new");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "seed.txt", "seed\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -161,13 +195,22 @@ fn apply_creates_new_file_like_git() {
     let patch_path = root.join("new.patch");
     fs::write(&patch_path, &patch).expect("write patch");
 
-    let out = git_rs(&repo, &["apply", patch_path.to_str().unwrap()]);
+    let out = git_rs(
+        &repo,
+        &[
+            "apply",
+            patch_path.to_str().expect("test operation should succeed"),
+        ],
+    );
     assert!(
         out.status.success(),
         "sley apply (new file) failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(fs::read(repo.join("added.txt")).unwrap(), b"hello\nworld\n");
+    assert_eq!(
+        fs::read(repo.join("added.txt")).expect("test operation should succeed"),
+        b"hello\nworld\n"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -179,7 +222,14 @@ fn gc_consolidates_loose_objects_and_stays_valid() {
     }
     let root = unique_temp_dir("gc");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     for i in 0..3 {
         write_file(&repo, "f.txt", &format!("v{i}\n"));
         git_ok(&repo, &["add", "."]);
@@ -227,7 +277,14 @@ fn repack_d_keeps_repository_complete() {
     }
     let root = unique_temp_dir("repack");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     for i in 0..4 {
         write_file(&repo, "f.txt", &format!("line {i}\ncommon\n"));
         git_ok(&repo, &["add", "."]);
@@ -245,9 +302,11 @@ fn repack_d_keeps_repository_complete() {
         "git fsck failed after sley repack -d: {}",
         String::from_utf8_lossy(&fsck.stderr)
     );
-    assert!(git(&repo, &["cat-file", "-e", "HEAD^{tree}"])
-        .status
-        .success());
+    assert!(
+        git(&repo, &["cat-file", "-e", "HEAD^{tree}"])
+            .status
+            .success()
+    );
 
     fs::remove_dir_all(&root).ok();
 }

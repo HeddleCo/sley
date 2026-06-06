@@ -188,14 +188,24 @@ fn assert_same_files(repo: &Path, extra: &[&str]) {
 fn build_repo(name: &str) -> PathBuf {
     let root = unique_temp_dir(name);
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
 
-    fs::write(repo.join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    fs::write(repo.join("a.txt"), "alpha\nbeta\ngamma\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "a.txt"]);
     git_ok(&repo, &["commit", "-qm", "first commit"]);
 
-    fs::write(repo.join("a.txt"), "alpha\nBETA\ngamma\ndelta\n").unwrap();
-    fs::write(repo.join("b.txt"), "new file\n").unwrap();
+    fs::write(repo.join("a.txt"), "alpha\nBETA\ngamma\ndelta\n")
+        .expect("test operation should succeed");
+    fs::write(repo.join("b.txt"), "new file\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(
         &repo,
@@ -206,8 +216,9 @@ fn build_repo(name: &str) -> PathBuf {
         ],
     );
 
-    fs::create_dir_all(repo.join("sub")).unwrap();
-    fs::write(repo.join("sub").join("nested.txt"), "deep\n").unwrap();
+    fs::create_dir_all(repo.join("sub")).expect("test operation should succeed");
+    fs::write(repo.join("sub").join("nested.txt"), "deep\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "add nested directory"]);
 
@@ -217,18 +228,20 @@ fn build_repo(name: &str) -> PathBuf {
 
     // Mode change to executable.
     let exec = repo.join("renamed.txt");
-    let mut perms = fs::metadata(&exec).unwrap().permissions();
+    let mut perms = fs::metadata(&exec)
+        .expect("test operation should succeed")
+        .permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         perms.set_mode(0o755);
     }
-    fs::set_permissions(&exec, perms).unwrap();
+    fs::set_permissions(&exec, perms).expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "make renamed executable"]);
 
     // A file with no trailing newline.
-    fs::write(repo.join("nonl.txt"), "no newline here").unwrap();
+    fs::write(repo.join("nonl.txt"), "no newline here").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(
         &repo,
@@ -236,7 +249,8 @@ fn build_repo(name: &str) -> PathBuf {
     );
 
     // A path containing a space.
-    fs::write(repo.join("with space.txt"), "spaced content\n").unwrap();
+    fs::write(repo.join("with space.txt"), "spaced content\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "add a path with a space"]);
 
@@ -245,7 +259,8 @@ fn build_repo(name: &str) -> PathBuf {
     git_ok(&repo, &["commit", "-qm", "remove nested file"]);
 
     // A commit whose subject is long enough to exercise header folding.
-    fs::write(repo.join("a.txt"), "alpha\nBETA\ngamma\ndelta\nepsilon\n").unwrap();
+    fs::write(repo.join("a.txt"), "alpha\nBETA\ngamma\ndelta\nepsilon\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(
         &repo,
@@ -287,7 +302,7 @@ fn format_patch_stdout_matches_git() {
         assert_same_stdout(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -310,7 +325,7 @@ fn format_patch_ranges_match_git() {
         assert_same_stdout(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -351,7 +366,7 @@ fn format_patch_numbering_and_options_match_git() {
         assert_same_stdout(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -373,7 +388,7 @@ fn format_patch_file_output_matches_git() {
     // long-subject commit (truncated to git's 52-character cap).
     assert_same_files(&repo, &["-9"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -386,5 +401,5 @@ fn format_patch_unknown_revision_matches_git() {
     // Unknown revision: identical fatal stderr and exit 128.
     assert_same_stdout(&repo, &["format-patch", "no-such-rev", "--stdout"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }

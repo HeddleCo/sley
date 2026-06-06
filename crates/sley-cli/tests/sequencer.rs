@@ -99,7 +99,14 @@ fn cherry_pick_clean_matches_git() {
     let root = unique_temp_dir("cp-clean");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(&root, &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "f.txt", "1\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "base"]);
@@ -141,7 +148,14 @@ fn cherry_pick_conflict_matches_git() {
     let root = unique_temp_dir("cp-conflict");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(&root, &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "x.txt", "1\n2\n3\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "base"]);
@@ -167,8 +181,8 @@ fn cherry_pick_conflict_matches_git() {
     );
     // Conflict markers (incl. the "<short> (subject)" label) match git exactly.
     assert_eq!(
-        fs::read(candidate.join("x.txt")).unwrap(),
-        fs::read(reference.join("x.txt")).unwrap(),
+        fs::read(candidate.join("x.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("x.txt")).expect("test operation should succeed"),
         "cherry-pick conflict markers differ"
     );
     assert_eq!(
@@ -193,7 +207,14 @@ fn cherry_pick_abort_restores_state() {
     }
     let root = unique_temp_dir("cp-abort");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "x.txt", "1\n2\n3\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -219,10 +240,15 @@ fn cherry_pick_abort_restores_state() {
         String::from_utf8_lossy(&abort.stderr)
     );
     assert_eq!(head(&repo), pre, "HEAD moved after abort");
-    assert_eq!(fs::read(repo.join("x.txt")).unwrap(), b"1\nMAIN\n3\n");
-    assert!(!git(&repo, &["rev-parse", "--verify", "CHERRY_PICK_HEAD"])
-        .status
-        .success());
+    assert_eq!(
+        fs::read(repo.join("x.txt")).expect("test operation should succeed"),
+        b"1\nMAIN\n3\n"
+    );
+    assert!(
+        !git(&repo, &["rev-parse", "--verify", "CHERRY_PICK_HEAD"])
+            .status
+            .success()
+    );
     assert!(git(&repo, &["ls-files", "-u"]).stdout.is_empty());
 
     fs::remove_dir_all(&root).ok();
@@ -236,7 +262,14 @@ fn revert_clean_matches_git() {
     let root = unique_temp_dir("revert-clean");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(&root, &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "f.txt", "1\n2\n3\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "base"]);
@@ -255,7 +288,10 @@ fn revert_clean_matches_git() {
     );
     // Revert message + reverted tree → identical commit oid.
     assert_eq!(head(&candidate), head(&reference), "revert oid differs");
-    assert_eq!(fs::read(candidate.join("f.txt")).unwrap(), b"1\n2\n3\n");
+    assert_eq!(
+        fs::read(candidate.join("f.txt")).expect("test operation should succeed"),
+        b"1\n2\n3\n"
+    );
 
     fs::remove_dir_all(&root).ok();
 }
@@ -268,7 +304,14 @@ fn revert_conflict_matches_git() {
     let root = unique_temp_dir("revert-conflict");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(&root, &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "x.txt", "1\n2\n3\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "base"]);
@@ -291,8 +334,8 @@ fn revert_conflict_matches_git() {
         String::from_utf8_lossy(&rs_out.stderr)
     );
     assert_eq!(
-        fs::read(candidate.join("x.txt")).unwrap(),
-        fs::read(reference.join("x.txt")).unwrap(),
+        fs::read(candidate.join("x.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("x.txt")).expect("test operation should succeed"),
         "revert conflict markers differ"
     );
     assert_eq!(

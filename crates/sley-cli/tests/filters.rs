@@ -73,9 +73,17 @@ fn autocrlf_true_round_trip_matches_git() {
 
     for program in [GIT_RS, "git"] {
         let repo = root.join(if program == "git" { "ref" } else { "cand" });
-        ok(program, &root, &["init", "-q", repo.to_str().unwrap()]);
+        ok(
+            program,
+            &root,
+            &[
+                "init",
+                "-q",
+                repo.to_str().expect("test operation should succeed"),
+            ],
+        );
         ok(program, &repo, &["config", "core.autocrlf", "true"]);
-        fs::write(repo.join("f.txt"), crlf).unwrap();
+        fs::write(repo.join("f.txt"), crlf).expect("test operation should succeed");
 
         // clean: add + commit store the LF-normalized blob.
         ok(program, &repo, &["add", "f.txt"]);
@@ -100,7 +108,7 @@ fn autocrlf_true_round_trip_matches_git() {
         ok(program, &repo, &["commit", "-m", "drop"]);
         ok(program, &repo, &["checkout", "main"]);
         assert_eq!(
-            fs::read(repo.join("f.txt")).unwrap(),
+            fs::read(repo.join("f.txt")).expect("test operation should succeed"),
             crlf,
             "{program}: checkout did not smudge back to CRLF"
         );
@@ -128,9 +136,18 @@ fn gitattributes_eol_crlf_matches_git() {
 
     for program in [GIT_RS, "git"] {
         let repo = root.join(if program == "git" { "ref" } else { "cand" });
-        ok(program, &root, &["init", "-q", repo.to_str().unwrap()]);
-        fs::write(repo.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
-        fs::write(repo.join("doc.txt"), "alpha\nbeta\n").unwrap();
+        ok(
+            program,
+            &root,
+            &[
+                "init",
+                "-q",
+                repo.to_str().expect("test operation should succeed"),
+            ],
+        );
+        fs::write(repo.join(".gitattributes"), "*.txt text eol=crlf\n")
+            .expect("test operation should succeed");
+        fs::write(repo.join("doc.txt"), "alpha\nbeta\n").expect("test operation should succeed");
         ok(program, &repo, &["add", "."]);
         ok(program, &repo, &["commit", "-m", "base"]);
 
@@ -144,12 +161,12 @@ fn gitattributes_eol_crlf_matches_git() {
     }
 
     assert_eq!(
-        fs::read(root.join("ref").join("doc.txt")).unwrap(),
-        fs::read(root.join("cand").join("doc.txt")).unwrap(),
+        fs::read(root.join("ref").join("doc.txt")).expect("test operation should succeed"),
+        fs::read(root.join("cand").join("doc.txt")).expect("test operation should succeed"),
         "eol=crlf smudge output differs from git"
     );
     assert_eq!(
-        fs::read(root.join("cand").join("doc.txt")).unwrap(),
+        fs::read(root.join("cand").join("doc.txt")).expect("test operation should succeed"),
         b"alpha\r\nbeta\r\n",
         "eol=crlf did not produce CRLF in the worktree"
     );
@@ -171,8 +188,16 @@ fn no_filter_default_is_passthrough() {
     let cand = root.join("cand");
     let reference = root.join("ref");
     for (program, repo) in [(GIT_RS, &cand), ("git", &reference)] {
-        ok(program, &root, &["init", "-q", repo.to_str().unwrap()]);
-        fs::write(repo.join("m.bin"), mixed).unwrap();
+        ok(
+            program,
+            &root,
+            &[
+                "init",
+                "-q",
+                repo.to_str().expect("test operation should succeed"),
+            ],
+        );
+        fs::write(repo.join("m.bin"), mixed).expect("test operation should succeed");
         ok(program, repo, &["add", "m.bin"]);
         ok(program, repo, &["commit", "-m", "c"]);
         assert_eq!(blob_at_head(program, repo, "m.bin"), mixed);

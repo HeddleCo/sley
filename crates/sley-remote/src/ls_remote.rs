@@ -95,7 +95,9 @@ pub fn ls_remote(
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     match source {
-        LsRemoteSource::Http(remote) => ls_remote_http(remote, format, filter, matches, credentials),
+        LsRemoteSource::Http(remote) => {
+            ls_remote_http(remote, format, filter, matches, credentials)
+        }
         LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
     }
@@ -129,11 +131,10 @@ fn ls_remote_http(
         .collect::<HashMap<_, _>>();
     let mut records = Vec::new();
     for advertisement in refs {
-        if is_zero_object_id(&advertisement.oid) {
+        if advertisement.oid.is_null() {
             continue;
         }
-        if filter.refs_only
-            && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
+        if filter.refs_only && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
         {
             continue;
         }
@@ -244,11 +245,6 @@ fn ref_class_selected(name: &str, filter: &LsRemoteFilter) -> bool {
     let is_head = name.starts_with("refs/heads/");
     let is_tag = name.starts_with("refs/tags/");
     (filter.heads && is_head) || (filter.tags && is_tag)
-}
-
-/// Whether `oid` is the all-zero object id (the `capabilities^{}` sentinel).
-fn is_zero_object_id(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 /// Resolve a (possibly symbolic) ref target to its object id, following up to

@@ -716,14 +716,14 @@ fn render_regions(
                 }
                 Favor::None => emit_conflict(
                     &mut out,
-                    ours,
-                    base,
-                    theirs,
-                    options.style,
-                    options.marker_size,
-                    ours_label,
-                    base_label,
-                    theirs_label,
+                    ConflictLines { ours, base, theirs },
+                    ConflictMarkers {
+                        style: options.style,
+                        marker_size: options.marker_size,
+                        ours_label,
+                        base_label,
+                        theirs_label,
+                    },
                 ),
             },
         }
@@ -762,18 +762,30 @@ fn common_suffix_len(
     count
 }
 
-#[allow(clippy::too_many_arguments)]
-fn emit_conflict(
-    out: &mut Vec<u8>,
-    ours: &[sley_diff_merge::DiffLine<'_>],
-    base: &[sley_diff_merge::DiffLine<'_>],
-    theirs: &[sley_diff_merge::DiffLine<'_>],
+struct ConflictLines<'a, 'line> {
+    ours: &'a [sley_diff_merge::DiffLine<'line>],
+    base: &'a [sley_diff_merge::DiffLine<'line>],
+    theirs: &'a [sley_diff_merge::DiffLine<'line>],
+}
+
+struct ConflictMarkers<'a> {
     style: MergeStyle,
     marker_size: usize,
-    ours_label: &str,
-    base_label: &str,
-    theirs_label: &str,
-) {
+    ours_label: &'a str,
+    base_label: &'a str,
+    theirs_label: &'a str,
+}
+
+fn emit_conflict(out: &mut Vec<u8>, lines: ConflictLines<'_, '_>, markers: ConflictMarkers<'_>) {
+    let ConflictLines { ours, base, theirs } = lines;
+    let ConflictMarkers {
+        style,
+        marker_size,
+        ours_label,
+        base_label,
+        theirs_label,
+    } = markers;
+
     // zdiff3 hoists shared leading/trailing context out of the conflict.
     let (prefix, suffix) = if style == MergeStyle::Zdiff3 {
         let prefix = common_prefix_len(ours, theirs);

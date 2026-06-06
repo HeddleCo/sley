@@ -247,7 +247,7 @@ fn prepare_per_directory_exclude_fixture(root: &Path) {
 fn ls_files_short_option_aliases_match_upstream_git() {
     let root = unique_temp_dir("ls-files-short-options");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete");
         fs::write(root.join("--dash.txt"), b"dash\n").expect("write dash path");
@@ -329,16 +329,15 @@ fn ls_files_short_option_aliases_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
     let root = unique_temp_dir("ls-files-sha256");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q", "--object-format=sha256"]);
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked fixture");
@@ -360,9 +359,8 @@ fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -372,7 +370,7 @@ fn ls_files_unmerged_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         prepare_unmerged_index(&expected);
         prepare_unmerged_index(&actual);
 
@@ -392,9 +390,8 @@ fn ls_files_unmerged_matches_upstream_git() {
                 "sley output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -404,7 +401,7 @@ fn ls_files_directory_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             git(repo, &["init", "-q"]);
             fs::create_dir_all(repo.join("dir").join("sub")).expect("create untracked dir");
@@ -447,9 +444,8 @@ fn ls_files_directory_matches_upstream_git() {
                 "sley output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -459,7 +455,7 @@ fn ls_files_ignored_and_exclude_standard_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_ignored_fixture(&upstream);
         prepare_ignored_fixture(&rust);
 
@@ -513,13 +509,9 @@ fn ls_files_ignored_and_exclude_standard_match_upstream_git() {
         let args = ["ls-files", "--others", "--exclude-from=missing.txt"];
         let expected = run_status("git", &upstream, &args);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_eq!(
-            actual, expected,
-            "sley status/output differed for {args:?}"
-        );
-    })();
+        assert_eq!(actual, expected, "sley status/output differed for {args:?}");
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -533,7 +525,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     fs::create_dir_all(home.join(".config/git")).expect("create home git config");
     fs::create_dir_all(xdg.join("git")).expect("create xdg git config");
-    let result = (|| {
+    {
         fs::write(home.join(".config/git/ignore"), b"*.home\nhome-dir/\n")
             .expect("write home fallback excludes");
         fs::write(
@@ -557,13 +549,8 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             vec!["ls-files", "-o", "-i", "--exclude-standard", "-z"],
         ] {
             let expected_output = run_with_global_env("git", &upstream, &args, &home, Some(&xdg));
-            let actual_output = run_with_global_env(
-                env!("CARGO_BIN_EXE_sley"),
-                &rust,
-                &args,
-                &home,
-                Some(&xdg),
-            );
+            let actual_output =
+                run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
             assert_eq!(
                 actual_output, expected_output,
                 "sley XDG global excludes output differed for {args:?}"
@@ -576,13 +563,8 @@ fn ls_files_default_global_excludes_match_upstream_git() {
         fs::write(rust.join("repo-excludes"), b"*.tmp\n").expect("write rust excludes");
         let args = ["ls-files", "--others", "--exclude-standard"];
         let expected_output = run_with_global_env("git", &upstream, &args, &home, Some(&xdg));
-        let actual_output = run_with_global_env(
-            env!("CARGO_BIN_EXE_sley"),
-            &rust,
-            &args,
-            &home,
-            Some(&xdg),
-        );
+        let actual_output =
+            run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
         assert_eq!(
             actual_output, expected_output,
             "sley core.excludesFile override differed"
@@ -608,9 +590,8 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             actual_output, expected_output,
             "sley HOME fallback global excludes output differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -620,7 +601,7 @@ fn ls_files_exclude_per_directory_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_per_directory_exclude_fixture(&upstream);
         prepare_per_directory_exclude_fixture(&rust);
 
@@ -665,77 +646,73 @@ fn ls_files_exclude_per_directory_matches_upstream_git() {
             let actual = git_rs(&rust, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_files_quoted_paths_match_upstream_git() {
     let root = unique_temp_dir("ls-files-quoted-paths");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (case, path) in [
-            ("space", "space name.txt"),
-            ("quote", "quote\"name.txt"),
-            ("tab", "tab\tname.txt"),
-        ] {
-            let repo = root.join(case);
-            fs::create_dir_all(&repo).expect("create case repo");
-            git(&repo, &["init", "-q"]);
-            let deleted = format!("deleted-{path}");
-            let untracked = format!("untracked-{path}");
-            fs::write(repo.join(path), b"base\n").expect("write tracked fixture");
-            fs::write(repo.join(&deleted), b"delete\n").expect("write deleted fixture");
-            git(&repo, &["add", path, deleted.as_str()]);
-            git(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=Example User",
-                    "-c",
-                    "user.email=example@example.invalid",
-                    "commit",
-                    "-m",
-                    "base",
-                    "-q",
-                ],
-            );
-            fs::write(repo.join(path), b"modified\n").expect("modify tracked fixture");
-            fs::remove_file(repo.join(&deleted)).expect("remove deleted fixture");
-            fs::write(repo.join(&untracked), b"untracked\n").expect("write untracked fixture");
+    for (case, path) in [
+        ("space", "space name.txt"),
+        ("quote", "quote\"name.txt"),
+        ("tab", "tab\tname.txt"),
+    ] {
+        let repo = root.join(case);
+        fs::create_dir_all(&repo).expect("create case repo");
+        git(&repo, &["init", "-q"]);
+        let deleted = format!("deleted-{path}");
+        let untracked = format!("untracked-{path}");
+        fs::write(repo.join(path), b"base\n").expect("write tracked fixture");
+        fs::write(repo.join(&deleted), b"delete\n").expect("write deleted fixture");
+        git(&repo, &["add", path, deleted.as_str()]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+        fs::write(repo.join(path), b"modified\n").expect("modify tracked fixture");
+        fs::remove_file(repo.join(&deleted)).expect("remove deleted fixture");
+        fs::write(repo.join(&untracked), b"untracked\n").expect("write untracked fixture");
 
-            for args in [
-                vec!["ls-files"],
-                vec!["ls-files", "-s"],
-                vec!["ls-files", "--cached"],
-                vec!["ls-files", "--modified"],
-                vec!["ls-files", "--deleted"],
-                vec!["ls-files", "--others"],
-                vec!["ls-files", "-z"],
-                vec!["ls-files", "-s", "-z"],
-                vec!["ls-files", "--modified", "-z"],
-                vec!["ls-files", "--deleted", "-z"],
-                vec!["ls-files", "--others", "-z"],
-            ] {
-                let expected = git(&repo, &args);
-                let actual = git_rs(&repo, &args);
-                assert_eq!(
-                    actual, expected,
-                    "sley output differed for {args:?} path {path:?}"
-                );
-            }
+        for args in [
+            vec!["ls-files"],
+            vec!["ls-files", "-s"],
+            vec!["ls-files", "--cached"],
+            vec!["ls-files", "--modified"],
+            vec!["ls-files", "--deleted"],
+            vec!["ls-files", "--others"],
+            vec!["ls-files", "-z"],
+            vec!["ls-files", "-s", "-z"],
+            vec!["ls-files", "--modified", "-z"],
+            vec!["ls-files", "--deleted", "-z"],
+            vec!["ls-files", "--others", "-z"],
+        ] {
+            let expected = git(&repo, &args);
+            let actual = git_rs(&repo, &args);
+            assert_eq!(
+                actual, expected,
+                "sley output differed for {args:?} path {path:?}"
+            );
         }
-    })();
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_files_error_unmatch_matches_upstream_git() {
     let root = unique_temp_dir("ls-files-error-unmatch");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked");
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete");
@@ -782,7 +759,6 @@ fn ls_files_error_unmatch_matches_upstream_git() {
                 "sley status/stdout/stderr differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

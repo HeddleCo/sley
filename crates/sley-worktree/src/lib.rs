@@ -1,8 +1,8 @@
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{Index, IndexEntry};
-use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_object::TreeEntries;
+use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::cell::RefCell;
@@ -1569,7 +1569,10 @@ fn index_has_path_under(index: &BTreeMap<Vec<u8>, TrackedEntry>, directory: &[u8
     let mut prefix = directory.to_vec();
     prefix.push(b'/');
     index
-        .range(prefix.clone()..)
+        .range::<[u8], _>((
+            std::ops::Bound::Included(prefix.as_slice()),
+            std::ops::Bound::Unbounded,
+        ))
         .next()
         .is_some_and(|(path, _)| path.starts_with(&prefix))
 }
@@ -2306,9 +2309,14 @@ fn wildcard_path_matches_from(
         value_index == value.len()
     } else {
         match pattern[pattern_index] {
-            b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => {
-                wildcard_double_star_matches(pattern, value, pattern_index, value_index, memo, stride)
-            }
+            b'*' if pattern.get(pattern_index + 1) == Some(&b'*') => wildcard_double_star_matches(
+                pattern,
+                value,
+                pattern_index,
+                value_index,
+                memo,
+                stride,
+            ),
             b'*' => {
                 if wildcard_path_matches_from(
                     pattern,
@@ -2423,7 +2431,14 @@ fn wildcard_double_star_matches(
         }
         for next in value_index..value.len() {
             if value[next] == b'/'
-                && wildcard_path_matches_from(pattern, value, after_stars + 1, next + 1, memo, stride)
+                && wildcard_path_matches_from(
+                    pattern,
+                    value,
+                    after_stars + 1,
+                    next + 1,
+                    memo,
+                    stride,
+                )
             {
                 return true;
             }
@@ -3488,7 +3503,7 @@ pub fn checkout_detached(
     let git_dir = git_dir.as_ref();
     let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, target)?;
     let refs = FileRefStore::new(git_dir, format);
-    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let zero = ObjectId::null(format);
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: "HEAD".into(),
@@ -3582,7 +3597,7 @@ pub fn checkout_detached_filtered(
         Some(config),
     )?;
     let refs = FileRefStore::new(git_dir, format);
-    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let zero = ObjectId::null(format);
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: "HEAD".into(),
@@ -4449,7 +4464,7 @@ pub fn checkout_detached_sparse(
         Some((sparse, SparseCheckoutMode::Auto)),
     )?;
     let refs = FileRefStore::new(git_dir, format);
-    let zero = ObjectId::from_raw(format, &vec![0; format.raw_len()])?;
+    let zero = ObjectId::null(format);
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: "HEAD".into(),
@@ -5449,54 +5464,54 @@ fn worktree_entries_with_stat_cache(
     // a second traversal of every directory).
     let mut attr_matcher = AttributeMatcher::from_worktree_base(worktree_root);
     let attr_requested = filter_attribute_names();
-    collect_worktree_entries(
-        worktree_root,
+    let mut context = WorktreeEntriesWalk {
+        root: worktree_root,
         git_dir,
-        worktree_root,
         format,
-        &config,
-        &mut attr_matcher,
-        &attr_requested,
+        config: &config,
+        matcher: &mut attr_matcher,
+        requested: &attr_requested,
         stat_cache,
         tracked_paths,
-        &mut entries,
-    )?;
+        entries: &mut entries,
+    };
+    collect_worktree_entries(&mut context, worktree_root)?;
     Ok(entries)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn collect_worktree_entries(
-    root: &Path,
-    git_dir: &Path,
-    dir: &Path,
+struct WorktreeEntriesWalk<'a> {
+    root: &'a Path,
+    git_dir: &'a Path,
     format: ObjectFormat,
-    config: &GitConfig,
-    matcher: &mut AttributeMatcher,
-    requested: &[Vec<u8>],
-    stat_cache: Option<&IndexStatCache>,
-    tracked_paths: Option<&BTreeSet<Vec<u8>>>,
-    entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
-) -> Result<()> {
-    if is_same_path(dir, git_dir) {
+    config: &'a GitConfig,
+    matcher: &'a mut AttributeMatcher,
+    requested: &'a [Vec<u8>],
+    stat_cache: Option<&'a IndexStatCache>,
+    tracked_paths: Option<&'a BTreeSet<Vec<u8>>>,
+    entries: &'a mut BTreeMap<Vec<u8>, TrackedEntry>,
+}
+
+fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -> Result<()> {
+    if is_same_path(dir, context.git_dir) {
         return Ok(());
     }
     // Fold this directory's `.gitattributes` into the matcher before processing its
     // files, so lookups for files here (and below) see it. This is what lets the
     // walk read the tree once instead of doing a separate full-tree attribute pass.
-    read_dir_attribute_patterns(root, dir, matcher)?;
+    read_dir_attribute_patterns(context.root, dir, context.matcher)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if is_worktree_dot_git(root, &path) {
+        if is_worktree_dot_git(context.root, &path) {
             continue;
         }
-        if is_same_path(&path, git_dir) {
+        if is_same_path(&path, context.git_dir) {
             continue;
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            if let Some(tracked_paths) = tracked_paths {
-                let relative = path.strip_prefix(root).map_err(|_| {
+            if let Some(tracked_paths) = context.tracked_paths {
+                let relative = path.strip_prefix(context.root).map_err(|_| {
                     GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
                 })?;
                 let git_path = git_path_bytes(relative)?;
@@ -5504,24 +5519,13 @@ fn collect_worktree_entries(
                     continue;
                 }
             }
-            collect_worktree_entries(
-                root,
-                git_dir,
-                &path,
-                format,
-                config,
-                matcher,
-                requested,
-                stat_cache,
-                tracked_paths,
-                entries,
-            )?;
+            collect_worktree_entries(context, &path)?;
         } else if metadata.is_file() {
-            let relative = path.strip_prefix(root).map_err(|_| {
+            let relative = path.strip_prefix(context.root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
             let git_path = git_path_bytes(relative)?;
-            if let Some(tracked_paths) = tracked_paths
+            if let Some(tracked_paths) = context.tracked_paths
                 && !tracked_paths.contains(&git_path)
             {
                 continue;
@@ -5532,10 +5536,11 @@ fn collect_worktree_entries(
             // returns `Some` ONLY for a non-racy size+mtime+mode match, so a
             // modified file always falls through to the full hash below and is
             // never silently reported clean.
-            if let Some(tracked) =
-                stat_cache.and_then(|cache| cache.reuse_tracked_entry(&git_path, &metadata))
+            if let Some(tracked) = context
+                .stat_cache
+                .and_then(|cache| cache.reuse_tracked_entry(&git_path, &metadata))
             {
-                entries.insert(git_path, tracked);
+                context.entries.insert(git_path, tracked);
                 continue;
             }
             // A file absent from the index is untracked: status and the
@@ -5544,12 +5549,15 @@ fn collect_worktree_entries(
             // untracked files. Record presence with a null oid and skip the
             // read+filter+hash. Without a stat cache we cannot tell tracked from
             // untracked, so fall through and hash as before.
-            if stat_cache.is_some_and(|cache| !cache.contains(&git_path)) {
-                entries.insert(
+            if context
+                .stat_cache
+                .is_some_and(|cache| !cache.contains(&git_path))
+            {
+                context.entries.insert(
                     git_path,
                     TrackedEntry {
                         mode: file_mode(&metadata),
-                        oid: ObjectId::null(format),
+                        oid: ObjectId::null(context.format),
                     },
                 );
                 continue;
@@ -5559,17 +5567,20 @@ fn collect_worktree_entries(
             // pattern match) and apply the clean filter -- no per-file matcher
             // rebuild. With no attributes/autocrlf configured this is an exact
             // passthrough, so the stored OID is unchanged.
-            let checks = matcher.attributes_for_path(&git_path, requested, false);
-            let body = apply_clean_filter_with_attributes(config, &checks, &git_path, &body)?;
-            let oid = EncodedObject::new(ObjectType::Blob, body).object_id(format)?;
-            entries.insert(
+            let checks = context
+                .matcher
+                .attributes_for_path(&git_path, context.requested, false);
+            let body =
+                apply_clean_filter_with_attributes(context.config, &checks, &git_path, &body)?;
+            let oid = EncodedObject::new(ObjectType::Blob, body).object_id(context.format)?;
+            context.entries.insert(
                 git_path,
                 TrackedEntry {
                     mode: file_mode(&metadata),
                     oid,
                 },
             );
-        } else if format == ObjectFormat::Sha1 {
+        } else if context.format == ObjectFormat::Sha1 {
             continue;
         }
     }
@@ -5584,7 +5595,10 @@ fn tracked_paths_may_contain(tracked_paths: &BTreeSet<Vec<u8>>, directory: &[u8]
     prefix.extend_from_slice(directory);
     prefix.push(b'/');
     tracked_paths
-        .range(prefix.clone()..)
+        .range::<[u8], _>((
+            std::ops::Bound::Included(prefix.as_slice()),
+            std::ops::Bound::Unbounded,
+        ))
         .next()
         .is_some_and(|path| path.starts_with(&prefix))
 }
@@ -5814,7 +5828,10 @@ mod tests {
         assert!(matcher.is_ignored(b"a/b/Pods", true));
         assert!(matcher.is_ignored(b"Pods", false));
         assert!(!matcher.is_ignored(b"Pods_not", false));
-        assert!(matches!(classify_ignore_pattern(b"Pods"), MatchKind::Literal));
+        assert!(matches!(
+            classify_ignore_pattern(b"Pods"),
+            MatchKind::Literal
+        ));
 
         // Suffix `*.log`: basename ending in `.log` at any depth.
         let matcher = ignore_matcher(&[b"*.log"]);
@@ -5822,14 +5839,20 @@ mod tests {
         assert!(matcher.is_ignored(b"a/b/x.log", false));
         assert!(matcher.is_ignored(b".log", false));
         assert!(!matcher.is_ignored(b"x.logx", false));
-        assert!(matches!(classify_ignore_pattern(b"*.log"), MatchKind::Suffix));
+        assert!(matches!(
+            classify_ignore_pattern(b"*.log"),
+            MatchKind::Suffix
+        ));
 
         // Prefix `build*`: basename starting with `build`.
         let matcher = ignore_matcher(&[b"build*"]);
         assert!(matcher.is_ignored(b"buildfoo", false));
         assert!(matcher.is_ignored(b"a/build", false));
         assert!(!matcher.is_ignored(b"xbuild", false));
-        assert!(matches!(classify_ignore_pattern(b"build*"), MatchKind::Prefix));
+        assert!(matches!(
+            classify_ignore_pattern(b"build*"),
+            MatchKind::Prefix
+        ));
     }
 
     #[test]
@@ -5873,7 +5896,10 @@ mod tests {
         assert!(matcher.is_ignored(b"x.cache", false));
         assert!(matcher.is_ignored(b"x.Cache", false));
         assert!(!matcher.is_ignored(b"x.xache", false));
-        assert!(matches!(classify_ignore_pattern(b"*.[Cc]ache"), MatchKind::Glob));
+        assert!(matches!(
+            classify_ignore_pattern(b"*.[Cc]ache"),
+            MatchKind::Glob
+        ));
 
         let matcher = ignore_matcher(&[b"Icon?"]);
         assert!(matcher.is_ignored(b"IconA", false));
@@ -5881,7 +5907,10 @@ mod tests {
         assert!(!matcher.is_ignored(b"IconAB", false));
 
         // Multi-star is not a simple prefix/suffix.
-        assert!(matches!(classify_ignore_pattern(b"app.*.symbols"), MatchKind::Glob));
+        assert!(matches!(
+            classify_ignore_pattern(b"app.*.symbols"),
+            MatchKind::Glob
+        ));
         assert!(matches!(classify_ignore_pattern(b"a*b*c"), MatchKind::Glob));
     }
 
@@ -5897,91 +5926,101 @@ mod tests {
     fn update_index_adds_file_entry_and_blob() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("hello.txt"), b"hello\n").expect("test operation should succeed");
         let result = add_paths_to_index(
             &root,
             &git_dir,
             ObjectFormat::Sha1,
             &[PathBuf::from("hello.txt")],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(result.entries, 1);
-        let index =
-            Index::parse_v2_sha1(&fs::read(repository_index_path(git_dir)).unwrap()).unwrap();
+        let index = Index::parse_v2_sha1(
+            &fs::read(repository_index_path(git_dir)).expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
         assert_eq!(index.entries[0].path, b"hello.txt");
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn update_index_and_write_tree_support_sha256() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("hello.txt"), b"hello\n").expect("test operation should succeed");
         let result = add_paths_to_index(
             &root,
             &git_dir,
             ObjectFormat::Sha256,
             &[PathBuf::from("hello.txt")],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(result.entries, 1);
 
         let index = Index::parse(
-            &fs::read(repository_index_path(&git_dir)).unwrap(),
+            &fs::read(repository_index_path(&git_dir)).expect("test operation should succeed"),
             ObjectFormat::Sha256,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(index.entries[0].path, b"hello.txt");
         assert_eq!(index.entries[0].oid.format(), ObjectFormat::Sha256);
 
-        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha256).unwrap();
+        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         assert_eq!(tree_oid.format(), ObjectFormat::Sha256);
         let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
-        let tree = odb.read_object(&tree_oid).unwrap();
+        let tree = odb
+            .read_object(&tree_oid)
+            .expect("test operation should succeed");
         assert_eq!(tree.object_type, ObjectType::Tree);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn write_tree_from_index_writes_nested_tree_objects() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(root.join("README.md"), b"readme\n").unwrap();
-        fs::write(root.join("src").join("lib.rs"), b"pub fn demo() {}\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("src")).expect("test operation should succeed");
+        fs::write(root.join("README.md"), b"readme\n").expect("test operation should succeed");
+        fs::write(root.join("src").join("lib.rs"), b"pub fn demo() {}\n")
+            .expect("test operation should succeed");
         let result = add_paths_to_index(
             &root,
             &git_dir,
             ObjectFormat::Sha1,
             &[PathBuf::from("README.md"), PathBuf::from("src/lib.rs")],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(result.entries, 2);
-        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha1).unwrap();
+        let tree_oid = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        let tree = odb.read_object(&tree_oid).unwrap();
+        let tree = odb
+            .read_object(&tree_oid)
+            .expect("test operation should succeed");
         assert_eq!(tree.object_type, ObjectType::Tree);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn short_status_reports_added_and_untracked_paths() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
-        fs::write(root.join("extra.txt"), b"extra\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("hello.txt"), b"hello\n").expect("test operation should succeed");
+        fs::write(root.join("extra.txt"), b"extra\n").expect("test operation should succeed");
         add_paths_to_index(
             &root,
             &git_dir,
             ObjectFormat::Sha1,
             &[PathBuf::from("hello.txt")],
         )
-        .unwrap();
-        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        .expect("test operation should succeed");
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(
             status
                 .iter()
@@ -5989,7 +6028,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["A  hello.txt", "?? extra.txt"]
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     fn temp_root() -> PathBuf {
@@ -5998,7 +6037,7 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).expect("test operation should succeed");
         path
     }
 
@@ -6012,10 +6051,10 @@ mod tests {
 
     fn read_index(git_dir: &Path) -> Index {
         Index::parse(
-            &fs::read(repository_index_path(git_dir)).unwrap(),
+            &fs::read(repository_index_path(git_dir)).expect("test operation should succeed"),
             ObjectFormat::Sha1,
         )
-        .unwrap()
+        .expect("test operation should succeed")
     }
 
     /// Stages `paths` from the worktree, writes their tree, wraps it in a commit
@@ -6023,8 +6062,10 @@ mod tests {
     /// id. After this call the index reflects the committed tree.
     fn build_commit(root: &Path, git_dir: &Path, paths: &[&str]) -> ObjectId {
         let path_bufs = paths.iter().map(PathBuf::from).collect::<Vec<_>>();
-        add_paths_to_index(root, git_dir, ObjectFormat::Sha1, &path_bufs).unwrap();
-        let tree = write_tree_from_index(git_dir, ObjectFormat::Sha1).unwrap();
+        add_paths_to_index(root, git_dir, ObjectFormat::Sha1, &path_bufs)
+            .expect("test operation should succeed");
+        let tree = write_tree_from_index(git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let mut body = Vec::new();
         body.extend_from_slice(format!("tree {tree}\n").as_bytes());
         body.extend_from_slice(b"author Test <test@example.com> 0 +0000\n");
@@ -6034,7 +6075,7 @@ mod tests {
         let mut odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
-            .unwrap();
+            .expect("test operation should succeed");
         let refs = FileRefStore::new(git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
@@ -6049,7 +6090,7 @@ mod tests {
             new: RefTarget::Symbolic("refs/heads/main".into()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
         commit
     }
 
@@ -6064,12 +6105,14 @@ mod tests {
     fn apply_sparse_checkout_full_mode_skips_out_of_cone_paths() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("in")).unwrap();
-        fs::create_dir_all(root.join("out")).unwrap();
-        fs::write(root.join("in").join("keep.txt"), b"keep\n").unwrap();
-        fs::write(root.join("out").join("drop.txt"), b"drop\n").unwrap();
-        fs::write(root.join("top.txt"), b"top\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("in")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("out")).expect("test operation should succeed");
+        fs::write(root.join("in").join("keep.txt"), b"keep\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("out").join("drop.txt"), b"drop\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("top.txt"), b"top\n").expect("test operation should succeed");
         build_commit(&root, &git_dir, &["in/keep.txt", "out/drop.txt", "top.txt"]);
 
         // Full (non-cone) pattern: keep only the `in/` subtree.
@@ -6081,7 +6124,7 @@ mod tests {
             &sparse,
             SparseCheckoutMode::Full,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert!(root.join("in").join("keep.txt").exists());
         assert!(!root.join("out").join("drop.txt").exists());
@@ -6104,18 +6147,18 @@ mod tests {
         )));
         // Out-of-cone entries are preserved in the index, just not on disk.
         assert_eq!(index.entries.len(), 3);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn apply_sparse_checkout_toggle_rematerializes() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("a")).unwrap();
-        fs::create_dir_all(root.join("b")).unwrap();
-        fs::write(root.join("a").join("file.txt"), b"a\n").unwrap();
-        fs::write(root.join("b").join("file.txt"), b"b\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("a")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("b")).expect("test operation should succeed");
+        fs::write(root.join("a").join("file.txt"), b"a\n").expect("test operation should succeed");
+        fs::write(root.join("b").join("file.txt"), b"b\n").expect("test operation should succeed");
         build_commit(&root, &git_dir, &["a/file.txt", "b/file.txt"]);
 
         // First narrow to `a/`.
@@ -6126,7 +6169,7 @@ mod tests {
             &full_sparse(&[b"/a/"]),
             SparseCheckoutMode::Full,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(root.join("a").join("file.txt").exists());
         assert!(!root.join("b").join("file.txt").exists());
         let index = read_index(&git_dir);
@@ -6144,10 +6187,13 @@ mod tests {
             &full_sparse(&[b"/b/"]),
             SparseCheckoutMode::Full,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(!root.join("a").join("file.txt").exists());
         assert!(root.join("b").join("file.txt").exists());
-        assert_eq!(fs::read(root.join("b").join("file.txt")).unwrap(), b"b\n");
+        assert_eq!(
+            fs::read(root.join("b").join("file.txt")).expect("test operation should succeed"),
+            b"b\n"
+        );
         let index = read_index(&git_dir);
         assert!(index_entry_skip_worktree(index_entry_for(
             &index,
@@ -6157,20 +6203,22 @@ mod tests {
             &index,
             b"b/file.txt"
         )));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn apply_sparse_checkout_cone_mode_matches_directory_prefixes() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("kept").join("nested")).unwrap();
-        fs::create_dir_all(root.join("other")).unwrap();
-        fs::write(root.join("kept").join("a.txt"), b"a\n").unwrap();
-        fs::write(root.join("kept").join("nested").join("b.txt"), b"b\n").unwrap();
-        fs::write(root.join("other").join("c.txt"), b"c\n").unwrap();
-        fs::write(root.join("root.txt"), b"r\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("kept").join("nested"))
+            .expect("test operation should succeed");
+        fs::create_dir_all(root.join("other")).expect("test operation should succeed");
+        fs::write(root.join("kept").join("a.txt"), b"a\n").expect("test operation should succeed");
+        fs::write(root.join("kept").join("nested").join("b.txt"), b"b\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("other").join("c.txt"), b"c\n").expect("test operation should succeed");
+        fs::write(root.join("root.txt"), b"r\n").expect("test operation should succeed");
         build_commit(
             &root,
             &git_dir,
@@ -6184,7 +6232,8 @@ mod tests {
         };
         // Auto mode should detect cone shape on its own.
         assert!(patterns_are_cone(&sparse.patterns));
-        apply_sparse_checkout(&root, &git_dir, ObjectFormat::Sha1, &sparse).unwrap();
+        apply_sparse_checkout(&root, &git_dir, ObjectFormat::Sha1, &sparse)
+            .expect("test operation should succeed");
 
         assert!(root.join("root.txt").exists());
         assert!(root.join("kept").join("a.txt").exists());
@@ -6208,18 +6257,20 @@ mod tests {
             &index,
             b"other/c.txt"
         )));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn apply_sparse_checkout_honors_preexisting_skip_worktree_via_idempotence() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("in")).unwrap();
-        fs::create_dir_all(root.join("out")).unwrap();
-        fs::write(root.join("in").join("keep.txt"), b"keep\n").unwrap();
-        fs::write(root.join("out").join("drop.txt"), b"drop\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("in")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("out")).expect("test operation should succeed");
+        fs::write(root.join("in").join("keep.txt"), b"keep\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("out").join("drop.txt"), b"drop\n")
+            .expect("test operation should succeed");
         build_commit(&root, &git_dir, &["in/keep.txt", "out/drop.txt"]);
 
         let sparse = full_sparse(&[b"/in/"]);
@@ -6230,7 +6281,7 @@ mod tests {
             &sparse,
             SparseCheckoutMode::Full,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(!root.join("out").join("drop.txt").exists());
 
         // Re-applying the same spec is a no-op: the already-skipped file stays
@@ -6242,7 +6293,7 @@ mod tests {
             &sparse,
             SparseCheckoutMode::Full,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(!root.join("out").join("drop.txt").exists());
         assert!(root.join("in").join("keep.txt").exists());
         assert!(result.skipped.contains(&b"out/drop.txt".to_vec()));
@@ -6251,18 +6302,18 @@ mod tests {
             &index,
             b"out/drop.txt"
         )));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn checkout_detached_sparse_only_writes_in_cone_paths() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::create_dir_all(root.join("keep")).unwrap();
-        fs::create_dir_all(root.join("skip")).unwrap();
-        fs::write(root.join("keep").join("a.txt"), b"a\n").unwrap();
-        fs::write(root.join("skip").join("b.txt"), b"b\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("keep")).expect("test operation should succeed");
+        fs::create_dir_all(root.join("skip")).expect("test operation should succeed");
+        fs::write(root.join("keep").join("a.txt"), b"a\n").expect("test operation should succeed");
+        fs::write(root.join("skip").join("b.txt"), b"b\n").expect("test operation should succeed");
         let commit = build_commit(&root, &git_dir, &["keep/a.txt", "skip/b.txt"]);
 
         // The worktree is clean and matches the commit. A sparse checkout must
@@ -6277,11 +6328,14 @@ mod tests {
             b"checkout".to_vec(),
             &sparse,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(result.files, 2);
 
         assert!(root.join("keep").join("a.txt").exists());
-        assert_eq!(fs::read(root.join("keep").join("a.txt")).unwrap(), b"a\n");
+        assert_eq!(
+            fs::read(root.join("keep").join("a.txt")).expect("test operation should succeed"),
+            b"a\n"
+        );
         assert!(!root.join("skip").join("b.txt").exists());
 
         let index = read_index(&git_dir);
@@ -6294,19 +6348,19 @@ mod tests {
         assert!(index_entry_skip_worktree(skipped));
         // The skipped entry still carries the committed blob id and mode.
         assert_eq!(skipped.mode, 0o100644);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     // ----- content filtering: EOL / autocrlf + clean/smudge drivers -----
 
     /// Build a [`GitConfig`] from raw config text.
     fn config_from(text: &str) -> GitConfig {
-        GitConfig::parse(text.as_bytes()).unwrap()
+        GitConfig::parse(text.as_bytes()).expect("test operation should succeed")
     }
 
     /// Resolve attribute checks against an on-disk `.gitattributes` in `root`.
     fn attrs(root: &Path, path: &[u8]) -> Vec<AttributeCheck> {
-        filter_attribute_checks(root, path).unwrap()
+        filter_attribute_checks(root, path).expect("test operation should succeed")
     }
 
     #[test]
@@ -6332,11 +6386,11 @@ mod tests {
         let config = config_from("[core]\n\tautocrlf = true\n");
         let checks: Vec<AttributeCheck> = Vec::new();
         let worktree = b"line1\r\nline2\r\n";
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"file.txt", worktree).unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"file.txt", worktree)
+            .expect("test operation should succeed");
         assert_eq!(blob, b"line1\nline2\n", "clean must normalize CRLF to LF");
-        let restored =
-            apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob).unwrap();
+        let restored = apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob)
+            .expect("test operation should succeed");
         assert_eq!(
             restored, worktree,
             "smudge must restore CRLF from the LF blob"
@@ -6349,10 +6403,10 @@ mod tests {
         let config = config_from("[core]\n\tautocrlf = input\n");
         let checks: Vec<AttributeCheck> = Vec::new();
         let blob = apply_clean_filter_with_attributes(&config, &checks, b"file.txt", b"a\r\nb\r\n")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(blob, b"a\nb\n");
-        let smudged =
-            apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob).unwrap();
+        let smudged = apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob)
+            .expect("test operation should succeed");
         assert_eq!(
             smudged, b"a\nb\n",
             "input mode must not add carriage returns"
@@ -6367,11 +6421,11 @@ mod tests {
             attribute: b"eol".to_vec(),
             state: Some(AttributeState::Value(b"crlf".to_vec())),
         }];
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"a.txt", b"x\r\ny\r\n").unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"a.txt", b"x\r\ny\r\n")
+            .expect("test operation should succeed");
         assert_eq!(blob, b"x\ny\n");
-        let smudged =
-            apply_smudge_filter_with_attributes(&config, &checks, b"a.txt", &blob).unwrap();
+        let smudged = apply_smudge_filter_with_attributes(&config, &checks, b"a.txt", &blob)
+            .expect("test operation should succeed");
         assert_eq!(smudged, b"x\r\ny\r\n");
     }
 
@@ -6385,11 +6439,11 @@ mod tests {
             state: Some(AttributeState::Unset),
         }];
         let content = b"\x00\x01\r\n\x02\r\n".to_vec();
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"data.bin", &content).unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"data.bin", &content)
+            .expect("test operation should succeed");
         assert_eq!(blob, content, "binary file must not be CRLF-normalized");
-        let smudged =
-            apply_smudge_filter_with_attributes(&config, &checks, b"data.bin", &blob).unwrap();
+        let smudged = apply_smudge_filter_with_attributes(&config, &checks, b"data.bin", &blob)
+            .expect("test operation should succeed");
         assert_eq!(
             smudged, content,
             "binary file must not gain carriage returns"
@@ -6402,7 +6456,8 @@ mod tests {
         let config = config_from("[core]\n\tautocrlf = true\n");
         let checks: Vec<AttributeCheck> = Vec::new();
         let content = b"a\r\n\x00b\r\n".to_vec();
-        let blob = apply_clean_filter_with_attributes(&config, &checks, b"f", &content).unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"f", &content)
+            .expect("test operation should succeed");
         assert_eq!(blob, content, "binary-looking content stays untouched");
     }
 
@@ -6412,10 +6467,11 @@ mod tests {
         // filtered add path, and restored as CRLF by the filtered checkout.
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let config = config_from("[core]\n\tautocrlf = true\n");
 
-        fs::write(root.join("crlf.txt"), b"alpha\r\nbeta\r\n").unwrap();
+        fs::write(root.join("crlf.txt"), b"alpha\r\nbeta\r\n")
+            .expect("test operation should succeed");
         add_paths_to_index_filtered(
             &root,
             &git_dir,
@@ -6423,24 +6479,27 @@ mod tests {
             &[PathBuf::from("crlf.txt")],
             &config,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         // The stored blob must be LF-normalized.
         let index = read_index(&git_dir);
         let entry = index_entry_for(&index, b"crlf.txt");
         let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        let blob = odb.read_object(&entry.oid).unwrap();
+        let blob = odb
+            .read_object(&entry.oid)
+            .expect("test operation should succeed");
         assert_eq!(blob.body, b"alpha\nbeta\n");
 
         // Commit and point HEAD at it, then re-checkout with smudge filtering.
-        let tree = write_tree_from_index(&git_dir, ObjectFormat::Sha1).unwrap();
+        let tree = write_tree_from_index(&git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let mut body = Vec::new();
         body.extend_from_slice(format!("tree {tree}\n").as_bytes());
         body.extend_from_slice(b"author T <t@e> 0 +0000\ncommitter T <t@e> 0 +0000\n\nm\n");
         let mut odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
-            .unwrap();
+            .expect("test operation should succeed");
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
@@ -6449,12 +6508,12 @@ mod tests {
             new: RefTarget::Direct(commit.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         // Make the worktree match the committed (LF) blob so the tree is clean
         // for checkout; `short_status`/`worktree_entries` compare by content
         // hash and are not filter-aware. Checkout will then smudge it to CRLF.
-        fs::write(root.join("crlf.txt"), b"alpha\nbeta\n").unwrap();
+        fs::write(root.join("crlf.txt"), b"alpha\nbeta\n").expect("test operation should succeed");
         checkout_detached_filtered(
             &root,
             &git_dir,
@@ -6464,13 +6523,13 @@ mod tests {
             b"co".to_vec(),
             &config,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
-            fs::read(root.join("crlf.txt")).unwrap(),
+            fs::read(root.join("crlf.txt")).expect("test operation should succeed"),
             b"alpha\r\nbeta\r\n",
             "checkout must restore CRLF line endings"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -6483,12 +6542,12 @@ mod tests {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"case".to_vec())),
         }];
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"Hello World").unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"Hello World")
+            .expect("test operation should succeed");
         assert_eq!(blob, b"HELLO WORLD", "clean driver must upper-case");
         let worktree =
             apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", b"HELLO WORLD")
-                .unwrap();
+                .expect("test operation should succeed");
         assert_eq!(worktree, b"hello world", "smudge driver must lower-case");
     }
 
@@ -6498,12 +6557,14 @@ mod tests {
         // config; exercises the public worktree-rooted entry points.
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join(".gitattributes"), b"*.dat filter=rot\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join(".gitattributes"), b"*.dat filter=rot\n")
+            .expect("test operation should succeed");
         let config =
             config_from("[filter \"rot\"]\n\tclean = sed s/a/b/g\n\tsmudge = sed s/b/a/g\n");
         // Clean reads attributes from the live worktree `.gitattributes`.
-        let blob = apply_clean_filter(&root, &git_dir, &config, b"x.dat", b"banana").unwrap();
+        let blob = apply_clean_filter(&root, &git_dir, &config, b"x.dat", b"banana")
+            .expect("test operation should succeed");
         assert_eq!(blob, b"bbnbnb");
         // Smudge reads attributes from the index (the worktree file may not
         // exist yet during checkout), so stage `.gitattributes` first.
@@ -6513,7 +6574,7 @@ mod tests {
             ObjectFormat::Sha1,
             &[PathBuf::from(".gitattributes")],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let smudged = apply_smudge_filter(
             &root,
             &git_dir,
@@ -6522,11 +6583,11 @@ mod tests {
             b"x.dat",
             &blob,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // sed s/b/a/g is not a perfect inverse, but verifies the smudge command
         // ran on the blob bytes.
         assert_eq!(smudged, b"aanana");
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -6564,7 +6625,8 @@ mod tests {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"opt".to_vec())),
         }];
-        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"keepme").unwrap();
+        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"keepme")
+            .expect("test operation should succeed");
         assert_eq!(
             out, b"keepme",
             "optional filter failure passes content through"
@@ -6579,7 +6641,8 @@ mod tests {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"ghost".to_vec())),
         }];
-        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"unchanged").unwrap();
+        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"unchanged")
+            .expect("test operation should succeed");
         assert_eq!(out, b"unchanged");
     }
 
@@ -6601,10 +6664,10 @@ mod tests {
             },
         ];
         let blob = apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"ab\r\ncd\r\n")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(blob, b"AB\nCD\n", "clean: upper-case then CRLF->LF");
-        let worktree =
-            apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", &blob).unwrap();
+        let worktree = apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", &blob)
+            .expect("test operation should succeed");
         assert_eq!(
             worktree, b"ab\r\ncd\r\n",
             "smudge: LF->CRLF then lower-case"
@@ -6614,7 +6677,8 @@ mod tests {
     #[test]
     fn attrs_helper_reads_filter_from_disk() {
         let root = temp_root();
-        fs::write(root.join(".gitattributes"), b"*.txt text\n*.bin -text\n").unwrap();
+        fs::write(root.join(".gitattributes"), b"*.txt text\n*.bin -text\n")
+            .expect("test operation should succeed");
         let text = attrs(&root, b"a.txt");
         assert!(
             text.iter()
@@ -6625,7 +6689,7 @@ mod tests {
             bin.iter()
                 .any(|c| c.attribute == b"text" && c.state == Some(AttributeState::Unset))
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     /// Builds a stat cache holding a single stage-0 entry whose size+mtime match
@@ -6633,7 +6697,7 @@ mod tests {
     /// the entry mtime so the entry reads as non-racy by default. The entry's oid
     /// is `oid` and its mode is `mode`.
     fn stat_cache_for(file: &Path, oid: ObjectId, mode: u32) -> (IndexStatCache, IndexEntry) {
-        let metadata = fs::metadata(file).unwrap();
+        let metadata = fs::metadata(file).expect("test operation should succeed");
         let mut entry = index_entry_from_metadata(b"f.txt".to_vec(), oid, &metadata);
         entry.mode = mode;
         let index_mtime = Some((u64::from(entry.mtime_seconds) + 10, 0));
@@ -6651,13 +6715,13 @@ mod tests {
     #[test]
     fn reuse_tracked_entry_only_reuses_clean_non_racy_match() {
         let root = temp_root();
-        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
         let file = root.join("f.txt");
-        let metadata = fs::metadata(&file).unwrap();
+        let metadata = fs::metadata(&file).expect("test operation should succeed");
         let real_mode = file_mode(&metadata);
         let oid = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec())
             .object_id(ObjectFormat::Sha1)
-            .unwrap();
+            .expect("test operation should succeed");
 
         // Clean, non-racy, matching stat + mode -> reuse the cached oid.
         let (cache, _) = stat_cache_for(&file, oid.clone(), real_mode);
@@ -6713,7 +6777,7 @@ mod tests {
             &file,
             EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec())
                 .object_id(ObjectFormat::Sha1)
-                .unwrap(),
+                .expect("test operation should succeed"),
             real_mode,
         );
         unknown_cache.index_mtime = None;
@@ -6723,21 +6787,22 @@ mod tests {
             "an unknown index mtime must be treated conservatively as racy"
         );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn short_status_detects_same_length_content_change() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("f.txt"), b"aaaa\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"aaaa\n").expect("test operation should succeed");
         build_commit(&root, &git_dir, &["f.txt"]);
         // Overwrite with the SAME byte length but different content. Right after
         // staging the entry is racily clean (index mtime >= entry mtime), so the
         // stat shortcut must not be trusted and the change must surface as M.
-        fs::write(root.join("f.txt"), b"bbbb\n").unwrap();
-        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        fs::write(root.join("f.txt"), b"bbbb\n").expect("test operation should succeed");
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(
             status
                 .iter()
@@ -6746,41 +6811,43 @@ mod tests {
             vec![" M f.txt"],
             "a same-length content change must be reported modified"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn short_status_clean_after_byte_identical_rewrite() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
         build_commit(&root, &git_dir, &["f.txt"]);
         // Rewrite with byte-identical content; the mtime moves so the stat
         // shortcut declines to reuse and the fallback hash proves it clean.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        fs::write(root.join("f.txt"), b"hello\n").unwrap();
-        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert!(
             status.is_empty(),
             "a byte-identical rewrite must be clean via the fallback hash, got {status:?}"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn short_status_trusts_stat_cache_and_skips_rehash() {
         let root = temp_root();
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
-        fs::write(root.join("f.txt"), b"hello\n").unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(root.join("f.txt"), b"hello\n").expect("test operation should succeed");
         build_commit(&root, &git_dir, &["f.txt"]);
 
         // Plant a BOGUS oid in the stage-0 entry while preserving its size+mtime,
         // so a real re-hash of the (unchanged) worktree file would NOT match it.
         let index_path = repository_index_path(&git_dir);
         let mut index = read_index(&git_dir);
-        let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap();
+        let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40))
+            .expect("test operation should succeed");
         let real_oid = index_entry_for(&index, b"f.txt").oid.clone();
         assert_ne!(
             real_oid, bogus,
@@ -6790,15 +6857,25 @@ mod tests {
             .entries
             .iter_mut()
             .find(|entry| entry.path == b"f.txt")
-            .unwrap()
+            .expect("test operation should succeed")
             .oid = bogus.clone();
-        fs::write(&index_path, index.write(ObjectFormat::Sha1).unwrap()).unwrap();
+        fs::write(
+            &index_path,
+            index
+                .write(ObjectFormat::Sha1)
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
 
         // Make the index file STRICTLY newer than the entry mtime (non-racy) by
         // waiting past one-second filesystem granularity and rewriting it, so the
         // racy-clean guard does not force a re-hash.
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        fs::write(&index_path, fs::read(&index_path).unwrap()).unwrap();
+        fs::write(
+            &index_path,
+            fs::read(&index_path).expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
 
         // The file is unchanged on disk, so a trusted stat reuses the bogus index
         // oid for the worktree entry: worktree-oid == index-oid == bogus, so the
@@ -6806,7 +6883,8 @@ mod tests {
         // would differ from the bogus index oid and the worktree column would be
         // 'M'. (The index-vs-HEAD column is 'M' because we corrupted the index
         // oid away from HEAD; that is expected and not what this test asserts.)
-        let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let entry = status
             .iter()
             .find(|entry| entry.path == b"f.txt")
@@ -6822,6 +6900,6 @@ mod tests {
             "the worktree entry must have reused the planted bogus index oid, not the real hash"
         );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 }

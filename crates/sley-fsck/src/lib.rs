@@ -6,8 +6,8 @@ use std::collections::{HashSet, VecDeque};
 mod connectivity;
 
 pub use connectivity::{
-    check_connectivity, check_refs, ConnectivityOptions, FsckFinding, FsckFindings, FsckRef,
-    FsckRefTarget, FsckSeverity,
+    ConnectivityOptions, FsckFinding, FsckFindings, FsckRef, FsckRefTarget, FsckSeverity,
+    check_connectivity, check_refs,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,19 +32,10 @@ impl FsckReport {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FsckOptions {
     pub report_dangling: bool,
     pub report_unreachable: bool,
-}
-
-impl Default for FsckOptions {
-    fn default() -> Self {
-        Self {
-            report_dangling: false,
-            report_unreachable: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -211,17 +202,16 @@ where
     }
 
     fn check_tree(&mut self, oid: ObjectId, body: &[u8]) {
-        let entries = match TreeEntries::new(self.format, body)
-            .collect::<std::result::Result<Vec<_>, _>>()
-        {
-            Ok(entries) => entries,
-            Err(err) => {
-                self.issues.push(FsckIssue {
-                    message: format!("invalid tree {oid}: {err}"),
-                });
-                return;
-            }
-        };
+        let entries =
+            match TreeEntries::new(self.format, body).collect::<std::result::Result<Vec<_>, _>>() {
+                Ok(entries) => entries,
+                Err(err) => {
+                    self.issues.push(FsckIssue {
+                        message: format!("invalid tree {oid}: {err}"),
+                    });
+                    return;
+                }
+            };
         let source = ObjectLink {
             object_type: ObjectType::Tree,
             oid,
@@ -428,7 +418,7 @@ mod tests {
         let mut db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"payload\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let tree = db
             .write_object(EncodedObject::new(
                 ObjectType::Tree,
@@ -441,7 +431,7 @@ mod tests {
                 }
                 .write(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = db
             .write_object(EncodedObject::new(
                 ObjectType::Commit,
@@ -455,7 +445,7 @@ mod tests {
                 }
                 .write(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
 
         let report = fsck_objects(&db, format, [commit.clone()], [commit]);
         assert!(report.is_ok(), "{report:?}");
@@ -465,8 +455,8 @@ mod tests {
     fn fsck_reports_missing_tree_link() {
         let format = ObjectFormat::Sha1;
         let mut db = ObjectDatabase::new(format);
-        let missing_tree =
-            ObjectId::from_hex(format, "1111111111111111111111111111111111111111").unwrap();
+        let missing_tree = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("test operation should succeed");
         let commit = db
             .write_object(EncodedObject::new(
                 ObjectType::Commit,
@@ -480,13 +470,15 @@ mod tests {
                 }
                 .write(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
 
         let report = fsck_objects(&db, format, [commit.clone()], [commit]);
         assert_eq!(report.issues.len(), 2);
-        assert!(report.issues[0]
-            .message
-            .contains("broken link from  commit"));
+        assert!(
+            report.issues[0]
+                .message
+                .contains("broken link from  commit")
+        );
         assert_eq!(
             report.issues[1].message,
             format!("missing tree {missing_tree}")
@@ -499,7 +491,7 @@ mod tests {
         let mut db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"lost\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
 
         let report = fsck_objects_with_options(
             &db,
@@ -527,7 +519,7 @@ mod tests {
         let mut db = ObjectDatabase::new(format);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"lost\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let tree = db
             .write_object(EncodedObject::new(
                 ObjectType::Tree,
@@ -540,7 +532,7 @@ mod tests {
                 }
                 .write(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = db
             .write_object(EncodedObject::new(
                 ObjectType::Commit,
@@ -554,7 +546,7 @@ mod tests {
                 }
                 .write(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
 
         let dangling = fsck_objects_with_options(
             &db,

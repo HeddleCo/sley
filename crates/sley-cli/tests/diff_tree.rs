@@ -257,17 +257,24 @@ fn assert_same_scoreless(cwd: &Path, args: &[&str]) {
 fn init_basic_repo(name: &str) -> (PathBuf, PathBuf) {
     let root = unique_temp_dir(name);
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
-    fs::create_dir_all(repo.join("sub/deep")).unwrap();
-    fs::write(repo.join("sub/deep/file.txt"), "a\n").unwrap();
-    fs::write(repo.join("top.txt"), "top\n").unwrap();
-    fs::write(repo.join("gone.txt"), "gone\n").unwrap();
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::create_dir_all(repo.join("sub/deep")).expect("test operation should succeed");
+    fs::write(repo.join("sub/deep/file.txt"), "a\n").expect("test operation should succeed");
+    fs::write(repo.join("top.txt"), "top\n").expect("test operation should succeed");
+    fs::write(repo.join("gone.txt"), "gone\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "c1"]);
-    fs::write(repo.join("sub/deep/file.txt"), "b\n").unwrap();
-    fs::write(repo.join("top.txt"), "top2\n").unwrap();
-    fs::write(repo.join("sub/another.txt"), "new\n").unwrap();
-    fs::remove_file(repo.join("gone.txt")).unwrap();
+    fs::write(repo.join("sub/deep/file.txt"), "b\n").expect("test operation should succeed");
+    fs::write(repo.join("top.txt"), "top2\n").expect("test operation should succeed");
+    fs::write(repo.join("sub/another.txt"), "new\n").expect("test operation should succeed");
+    fs::remove_file(repo.join("gone.txt")).expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "c2"]);
     (root, repo)
@@ -408,18 +415,27 @@ fn diff_tree_rename_detection_matches_git() {
     }
     let root = unique_temp_dir("diff-tree-rename");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     // A file that survives a rename with a small edit (so it scores ~80%), plus a
     // top-level rename alongside a nested modification to exercise non-recursive
     // top-level rename detection.
-    fs::write(repo.join("orig.txt"), "a\nb\nc\nd\ne\nf\ng\n").unwrap();
-    fs::create_dir_all(repo.join("keep")).unwrap();
-    fs::write(repo.join("keep/file.txt"), "x\n").unwrap();
+    fs::write(repo.join("orig.txt"), "a\nb\nc\nd\ne\nf\ng\n")
+        .expect("test operation should succeed");
+    fs::create_dir_all(repo.join("keep")).expect("test operation should succeed");
+    fs::write(repo.join("keep/file.txt"), "x\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     git_ok(&repo, &["mv", "orig.txt", "renamed.txt"]);
-    fs::write(repo.join("renamed.txt"), "a\nb\nC\nd\ne\nf\ng\n").unwrap();
-    fs::write(repo.join("keep/file.txt"), "X\n").unwrap();
+    fs::write(repo.join("renamed.txt"), "a\nb\nC\nd\ne\nf\ng\n")
+        .expect("test operation should succeed");
+    fs::write(repo.join("keep/file.txt"), "X\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "rename"]);
 
@@ -451,8 +467,16 @@ fn diff_tree_rename_detection_matches_git() {
     // its full output — including the score — compares byte-for-byte.
     let root2 = unique_temp_dir("diff-tree-rename-exact");
     let repo2 = root2.join("repo");
-    git_ok(&root2, &["init", "-q", repo2.to_str().unwrap()]);
-    fs::write(repo2.join("orig.txt"), "stable\ncontent\nhere\n").unwrap();
+    git_ok(
+        &root2,
+        &[
+            "init",
+            "-q",
+            repo2.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo2.join("orig.txt"), "stable\ncontent\nhere\n")
+        .expect("test operation should succeed");
     git_ok(&repo2, &["add", "."]);
     git_ok(&repo2, &["commit", "-qm", "base"]);
     git_ok(&repo2, &["mv", "orig.txt", "moved.txt"]);
@@ -474,22 +498,29 @@ fn diff_tree_copy_detection_matches_git() {
     }
     let root = unique_temp_dir("diff-tree-copy");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     fs::write(
         repo.join("orig.txt"),
         "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n",
     )
-    .unwrap();
+    .expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     // Copy orig.txt to copy.txt while editing the original (so the original is a
     // changed candidate source for -C without --find-copies-harder).
-    fs::copy(repo.join("orig.txt"), repo.join("copy.txt")).unwrap();
+    fs::copy(repo.join("orig.txt"), repo.join("copy.txt")).expect("test operation should succeed");
     fs::write(
         repo.join("orig.txt"),
         "alpha\nbeta\ngamma\ndelta\nepsilon\nZETA\n",
     )
-    .unwrap();
+    .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "copy"]);
 
@@ -522,8 +553,16 @@ fn diff_tree_mode_change_matches_git() {
     }
     let root = unique_temp_dir("diff-tree-mode");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
-    fs::write(repo.join("script.sh"), "#!/bin/sh\necho hi\n").unwrap();
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo.join("script.sh"), "#!/bin/sh\necho hi\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     // Flip the executable bit via the index so the change is portable.

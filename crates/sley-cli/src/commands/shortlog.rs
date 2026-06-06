@@ -471,7 +471,7 @@ fn push_shortlog_commit_front(
 fn sort_shortlog_groups(groups: &mut [ShortlogEntry], numbered: bool) {
     groups.sort_by(|a, b| a.key.as_bytes().cmp(b.key.as_bytes()));
     if numbered {
-        groups.sort_by(|a, b| b.subjects.len().cmp(&a.subjects.len()));
+        groups.sort_by_key(|group| std::cmp::Reverse(group.subjects.len()));
     }
 }
 

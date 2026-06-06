@@ -25,12 +25,11 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
-    let output = Command::new(program)
+    Command::new(program)
         .current_dir(cwd)
         .args(args)
         .output()
-        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
-    output
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -126,7 +125,7 @@ fn expected_log_args(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn log_minimal_format_matches_upstream_git() {
     let root = unique_temp_dir("log-minimal-format");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
@@ -582,16 +581,15 @@ fn log_minimal_format_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_oneline_matches_upstream_git() {
     let root = unique_temp_dir("log-oneline");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
@@ -660,16 +658,15 @@ fn log_oneline_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_pretty_oneline_aliases_match_upstream_git() {
     let root = unique_temp_dir("log-pretty-oneline");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
@@ -754,16 +751,15 @@ fn log_pretty_oneline_aliases_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_first_parent_matches_upstream_git() {
     let root = unique_temp_dir("log-first-parent");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("base.txt"), b"base\n").expect("write fixture");
         git(&root, &["add", "base.txt"]);
@@ -917,16 +913,15 @@ fn log_first_parent_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_author_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-author-filter");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (author, subject) in [
             ("Alpha Author <alpha@example.invalid>", "alpha"),
@@ -974,16 +969,15 @@ fn log_author_filter_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_committer_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-committer-filter");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (committer_name, committer_email, subject) in [
             ("Alpha Committer", "alpha-commit@example.invalid", "alpha"),
@@ -1049,16 +1043,15 @@ fn log_committer_filter_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_epoch_age_filters_match_upstream_git() {
     let root = unique_temp_dir("log-age-filter");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (timestamp, subject) in [(1000, "one"), (2000, "two"), (3000, "three")] {
             let date = format!("@{timestamp} +0000");
@@ -1129,16 +1122,15 @@ fn log_epoch_age_filters_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_regexp_ignore_case_filters_match_upstream_git() {
     let root = unique_temp_dir("log-regexp-ignore-case");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (author, committer_name, committer_email, subject, body) in [
             (
@@ -1210,16 +1202,15 @@ fn log_regexp_ignore_case_filters_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_fixed_string_filters_match_upstream_git() {
     let root = unique_temp_dir("log-fixed-strings");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (author, committer_name, committer_email, subject) in [
             (
@@ -1327,16 +1318,15 @@ fn log_fixed_string_filters_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_grep_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-grep-filter");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (author, subject, body) in [
             (
@@ -1432,16 +1422,15 @@ fn log_grep_filter_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_custom_format_placeholders_match_upstream_git() {
     let root = unique_temp_dir("log-custom-format");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
@@ -1593,16 +1582,15 @@ fn log_custom_format_placeholders_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn log_reverse_matches_upstream_git() {
     let root = unique_temp_dir("log-reverse");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for (path, subject) in [
             ("one.txt", "first subject"),
@@ -1636,7 +1624,6 @@ fn log_reverse_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

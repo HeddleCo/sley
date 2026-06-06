@@ -110,7 +110,7 @@ fn check_ignore_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -240,9 +240,8 @@ fn check_ignore_matches_upstream_git() {
             let actual = git_rs(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -252,7 +251,7 @@ fn check_ignore_sha256_tracked_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         sha256_fixture(&upstream);
         sha256_fixture(&rust);
 
@@ -280,7 +279,6 @@ fn check_ignore_sha256_tracked_paths_match_upstream_git() {
             let actual = git_rs(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

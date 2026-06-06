@@ -93,7 +93,11 @@ fn head(cwd: &Path) -> String {
 fn setup_clean(dir: &Path) {
     git_ok(
         dir.parent().unwrap_or(dir),
-        &["init", "-q", dir.to_str().unwrap()],
+        &[
+            "init",
+            "-q",
+            dir.to_str().expect("test operation should succeed"),
+        ],
     );
     write_file(dir, "a.txt", "a1\na2\na3\n");
     write_file(dir, "b.txt", "b1\nb2\nb3\n");
@@ -161,12 +165,12 @@ fn merge_clean_threeway_matches_git() {
     );
     // Worktree content matches.
     assert_eq!(
-        fs::read(candidate.join("a.txt")).unwrap(),
-        fs::read(reference.join("a.txt")).unwrap()
+        fs::read(candidate.join("a.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("a.txt")).expect("test operation should succeed")
     );
     assert_eq!(
-        fs::read(candidate.join("b.txt")).unwrap(),
-        fs::read(reference.join("b.txt")).unwrap()
+        fs::read(candidate.join("b.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("b.txt")).expect("test operation should succeed")
     );
 
     fs::remove_dir_all(&root).ok();
@@ -180,7 +184,14 @@ fn merge_fast_forward_matches_git() {
     let root = unique_temp_dir("merge-ff");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(root.as_path(), &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "f.txt", "one\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "c1"]);
@@ -211,8 +222,8 @@ fn merge_fast_forward_matches_git() {
         String::from_utf8_lossy(&rs_out.stdout)
     );
     assert_eq!(
-        fs::read(candidate.join("f.txt")).unwrap(),
-        fs::read(reference.join("f.txt")).unwrap()
+        fs::read(candidate.join("f.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("f.txt")).expect("test operation should succeed")
     );
 
     fs::remove_dir_all(&root).ok();
@@ -225,7 +236,14 @@ fn merge_already_up_to_date_matches_git() {
     }
     let root = unique_temp_dir("merge-utd");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "f.txt", "one\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "c1"]);
@@ -255,7 +273,14 @@ fn merge_conflict_matches_git() {
     let root = unique_temp_dir("merge-conflict");
     let reference = root.join("reference");
     let candidate = root.join("candidate");
-    git_ok(root.as_path(), &["init", "-q", reference.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            reference.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&reference, "x.txt", "1\n2\n3\n");
     git_ok(&reference, &["add", "."]);
     git_ok(&reference, &["commit", "-qm", "base"]);
@@ -283,8 +308,8 @@ fn merge_conflict_matches_git() {
     );
     // Conflicted working-tree bytes (markers) must match git exactly.
     assert_eq!(
-        fs::read(candidate.join("x.txt")).unwrap(),
-        fs::read(reference.join("x.txt")).unwrap(),
+        fs::read(candidate.join("x.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("x.txt")).expect("test operation should succeed"),
         "conflict markers differ from git"
     );
     // Index conflict stages must match git.
@@ -311,7 +336,14 @@ fn merge_abort_restores_pre_merge_state() {
     }
     let root = unique_temp_dir("merge-abort");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "x.txt", "1\n2\n3\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -337,7 +369,10 @@ fn merge_abort_restores_pre_merge_state() {
     );
     assert_eq!(head(&repo), pre_head, "HEAD moved after abort");
     // Working tree restored to ours; no merge state left.
-    assert_eq!(fs::read(repo.join("x.txt")).unwrap(), b"1\nMAIN\n3\n");
+    assert_eq!(
+        fs::read(repo.join("x.txt")).expect("test operation should succeed"),
+        b"1\nMAIN\n3\n"
+    );
     assert!(
         !git(&repo, &["rev-parse", "--verify", "MERGE_HEAD"])
             .status

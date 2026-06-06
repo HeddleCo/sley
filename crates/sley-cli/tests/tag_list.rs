@@ -24,12 +24,11 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
-    let output = Command::new(program)
+    Command::new(program)
         .current_dir(cwd)
         .args(args)
         .output()
-        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
-    output
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
 
 fn run_output_with_identity(program: &str, cwd: &Path, args: &[&str]) -> Output {
@@ -189,7 +188,7 @@ fn read_tag_reflog(root: &Path, tag: &str) -> Option<Vec<u8>> {
 fn tag_create_errors_match_upstream_git() {
     let root = unique_temp_dir("tag-create-errors");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -314,16 +313,15 @@ fn tag_create_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_file_messages_match_upstream_git_objects() {
     let root = unique_temp_dir("tag-file-messages");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             (
                 "file-no-lf",
@@ -396,8 +394,7 @@ fn tag_file_messages_match_upstream_git_objects() {
             prepare_tag_message_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 cat_tag("git", &actual_root, name),
@@ -416,16 +413,15 @@ fn tag_file_messages_match_upstream_git_objects() {
         let expected = run_output_with_identity("git", &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_delete_missing_matches_upstream_git() {
     let root = unique_temp_dir("tag-delete-missing");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -465,16 +461,15 @@ fn tag_delete_missing_matches_upstream_git() {
         git(&root, &["tag", "v1"]);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_cleanup_modes_match_upstream_git_objects() {
     let root = unique_temp_dir("tag-cleanup-modes");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             (
                 "strip-equals",
@@ -588,8 +583,7 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
             prepare_tag_message_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 cat_tag("git", &actual_root, name),
@@ -616,20 +610,18 @@ fn tag_cleanup_modes_match_upstream_git_objects() {
             prepare_tag_message_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_trailers_match_upstream_git_objects() {
     let root = unique_temp_dir("tag-trailers");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             (
                 "trailer-equals",
@@ -767,11 +759,7 @@ fn tag_trailers_match_upstream_git_objects() {
                 run_output_with_identity("git", &expected_root, &args)
             };
             let actual = if name == "trailer-only" {
-                run_output_with_identity_and_editor(
-                    env!("CARGO_BIN_EXE_sley"),
-                    &actual_root,
-                    &args,
-                )
+                run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args)
             } else {
                 run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args)
             };
@@ -801,20 +789,18 @@ fn tag_trailers_match_upstream_git_objects() {
             ],
         ] {
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_force_create_and_update_match_upstream_git() {
     let root = unique_temp_dir("tag-force");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -919,16 +905,15 @@ fn tag_force_create_and_update_match_upstream_git() {
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(git(&root, &["cat-file", "-t", "ann"]), b"tag\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_no_edit_lightweight_matches_upstream_git() {
     let root = unique_temp_dir("tag-no-edit-lightweight");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let expected_root = root.join("expected");
         let actual_root = root.join("actual");
         fs::create_dir_all(&expected_root).expect("create expected repo");
@@ -950,16 +935,15 @@ fn tag_no_edit_lightweight_matches_upstream_git() {
             git(&expected_root, &["cat-file", "-t", "no-edit-lightweight"]),
             "tag object type differed for {args:?}"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_edit_option_matches_upstream_git_objects() {
     let root = unique_temp_dir("tag-edit-option");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             (
                 "edit-long",
@@ -1013,16 +997,15 @@ fn tag_edit_option_matches_upstream_git_objects() {
             );
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_create_reflog_matches_upstream_git() {
     let root = unique_temp_dir("tag-create-reflog");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let expected_root = root.join("expected");
         let actual_root = root.join("actual");
         fs::create_dir_all(&expected_root).expect("create expected repo");
@@ -1130,63 +1113,58 @@ fn tag_create_reflog_matches_upstream_git() {
             git(&expected_root, &["cat-file", "-p", "ann-reflog"]),
             "annotated tag object differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_annotate_negation_matches_upstream_git() {
     let root = unique_temp_dir("tag-annotate-negation");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("plain", vec!["tag", "--annotate", "--no-annotate", "plain"]),
-            (
-                "ann",
-                vec!["tag", "--no-annotate", "--annotate", "ann", "-m", "msg"],
-            ),
-            ("msg", vec!["tag", "--no-annotate", "msg", "-m", "message"]),
-            ("nosign", vec!["tag", "--no-sign", "nosign"]),
-            (
+    for (name, args) in [
+        ("plain", vec!["tag", "--annotate", "--no-annotate", "plain"]),
+        (
+            "ann",
+            vec!["tag", "--no-annotate", "--annotate", "ann", "-m", "msg"],
+        ),
+        ("msg", vec!["tag", "--no-annotate", "msg", "-m", "message"]),
+        ("nosign", vec!["tag", "--no-sign", "nosign"]),
+        (
+            "sign-cancelled",
+            vec![
+                "tag",
+                "--sign",
+                "--no-sign",
                 "sign-cancelled",
-                vec![
-                    "tag",
-                    "--sign",
-                    "--no-sign",
-                    "sign-cancelled",
-                    "-m",
-                    "message",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_tag_message_repo(&expected_root);
-            prepare_tag_message_repo(&actual_root);
+                "-m",
+                "message",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_tag_message_repo(&expected_root);
+        prepare_tag_message_repo(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&actual_root, &["cat-file", "-t", name]),
-                git(&expected_root, &["cat-file", "-t", name]),
-                "tag object type differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&actual_root, &["cat-file", "-t", name]),
+            git(&expected_root, &["cat-file", "-t", name]),
+            "tag object type differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_verify_unsigned_and_lightweight_match_upstream_git() {
     let root = unique_temp_dir("tag-verify");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -1218,16 +1196,15 @@ fn tag_verify_unsigned_and_lightweight_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_local_user_negation_and_missing_values_match_upstream_git() {
     let root = unique_temp_dir("tag-local-user");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         for (name, args) in [
             ("lightweight", vec!["tag", "--no-local-user", "lightweight"]),
             (
@@ -1243,8 +1220,7 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
             prepare_tag_message_repo(&actual_root);
 
             let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
                 git(&actual_root, &["cat-file", "-t", name]),
@@ -1268,16 +1244,15 @@ fn tag_local_user_negation_and_missing_values_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &errors_root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_list_ignore_case_sorts_metadata_like_upstream_git() {
     let root = unique_temp_dir("tag-list-ignore-case-sort-metadata");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_named_identity_at(
             "git",
@@ -1419,16 +1394,15 @@ fn tag_list_ignore_case_sorts_metadata_like_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_list_column_modes_match_upstream_git() {
     let root = unique_temp_dir("tag-list-column");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -1476,16 +1450,15 @@ fn tag_list_column_modes_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn tag_list_patterns_match_upstream_git() {
     let root = unique_temp_dir("tag-list-patterns");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             "git",
@@ -1897,10 +1870,7 @@ fn tag_list_patterns_match_upstream_git() {
         let no_contains_eq = format!("--no-contains={second_oid}");
         let expected = git(&root, &["tag", no_contains_eq.as_str()]);
         let actual = git_rs(&root, &["tag", no_contains_eq.as_str()]);
-        assert_eq!(
-            actual, expected,
-            "sley output differed for --no-contains="
-        );
+        assert_eq!(actual, expected, "sley output differed for --no-contains=");
         let merged_eq = format!("--merged={first_oid}");
         let expected = git(&root, &["tag", merged_eq.as_str()]);
         let actual = git_rs(&root, &["tag", merged_eq.as_str()]);
@@ -1909,7 +1879,6 @@ fn tag_list_patterns_match_upstream_git() {
         let expected = git(&root, &["tag", no_merged_eq.as_str()]);
         let actual = git_rs(&root, &["tag", no_merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-merged=");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

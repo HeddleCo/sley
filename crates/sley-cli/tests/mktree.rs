@@ -106,7 +106,7 @@ fn mktree_basic_and_z_modes_match_upstream_git() {
     let root = unique_temp_dir("mktree-basic");
     let expected = root.join("expected");
     let actual = root.join("actual");
-    let result = (|| {
+    {
         prepare_repo(&expected);
         prepare_repo(&actual);
         let expected_a = hash_blob(&expected, b"a");
@@ -135,9 +135,8 @@ fn mktree_basic_and_z_modes_match_upstream_git() {
         let expected_output = run_with_stdin("git", &expected, &["mktree", "-z"], &nul_input);
         let actual_output = run_with_stdin(git_rs(), &actual, &["mktree", "-z"], &nul_input);
         assert_same_output(actual_output, expected_output, &["mktree", "-z"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -145,7 +144,7 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
     let root = unique_temp_dir("mktree-missing-batch");
     let expected = root.join("expected");
     let actual = root.join("actual");
-    let result = (|| {
+    {
         prepare_repo(&expected);
         prepare_repo(&actual);
         let missing = "0000000000000000000000000000000000000000";
@@ -185,7 +184,6 @@ fn mktree_missing_commit_and_batch_modes_match_upstream_git() {
         let actual_output =
             run_with_stdin(git_rs(), &actual, &["mktree", "--batch"], batch.as_bytes());
         assert_same_output(actual_output, expected_output, &["mktree", "--batch"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

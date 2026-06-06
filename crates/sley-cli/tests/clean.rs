@@ -174,7 +174,7 @@ fn clean_long_option_negations_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -197,9 +197,8 @@ fn clean_long_option_negations_match_upstream_git() {
             files(&upstream),
             "filesystem differed after clean --no-quiet"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -209,7 +208,7 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -227,9 +226,8 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -239,7 +237,7 @@ fn clean_dry_run_and_force_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -280,9 +278,8 @@ fn clean_dry_run_and_force_match_upstream_git() {
             "clean -fd filesystem differed"
         );
         assert_eq!(files(&rust), vec!["tracked/keep.txt"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -292,7 +289,7 @@ fn clean_include_ignored_option_matches_upstream_git_without_ignored_files() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -311,82 +308,75 @@ fn clean_include_ignored_option_matches_upstream_git_without_ignored_files() {
                 "filesystem differed after {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn clean_exclude_patterns_match_upstream_git() {
     let root = unique_temp_dir("clean-excludes");
-    let result = (|| {
-        for args in [
-            ["clean", "-n", "-e", "keep.tmp"].as_slice(),
-            ["clean", "-n", "-e", "*.tmp"].as_slice(),
-            ["clean", "-f", "-e", "keep.tmp"].as_slice(),
-            ["clean", "-fd", "-e", "scratch"].as_slice(),
-            ["clean", "-n", "--exclude=keep.tmp"].as_slice(),
-            ["clean", "-n", "--exclude", "keep.tmp"].as_slice(),
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-")));
-            let rust = root.join(format!("rust-{}", args.join("-")));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            exclude_fixture(&upstream);
-            exclude_fixture(&rust);
+    for args in [
+        ["clean", "-n", "-e", "keep.tmp"].as_slice(),
+        ["clean", "-n", "-e", "*.tmp"].as_slice(),
+        ["clean", "-f", "-e", "keep.tmp"].as_slice(),
+        ["clean", "-fd", "-e", "scratch"].as_slice(),
+        ["clean", "-n", "--exclude=keep.tmp"].as_slice(),
+        ["clean", "-n", "--exclude", "keep.tmp"].as_slice(),
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-")));
+        let rust = root.join(format!("rust-{}", args.join("-")));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        exclude_fixture(&upstream);
+        exclude_fixture(&rust);
 
-            let expected = run_output("git", &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
-            assert_same_output(actual, expected, args);
-            assert_eq!(
-                files(&rust),
-                files(&upstream),
-                "filesystem differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run_output("git", &upstream, args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+        assert_same_output(actual, expected, args);
+        assert_eq!(
+            files(&rust),
+            files(&upstream),
+            "filesystem differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn clean_respects_root_gitignore_and_x_matches_upstream_git() {
     let root = unique_temp_dir("clean-gitignore");
-    let result = (|| {
-        for args in [
-            ["clean", "-n"].as_slice(),
-            ["clean", "-nx"].as_slice(),
-            ["clean", "-f"].as_slice(),
-            ["clean", "-fx"].as_slice(),
-            ["clean", "-nd"].as_slice(),
-            ["clean", "-nxd"].as_slice(),
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-")));
-            let rust = root.join(format!("rust-{}", args.join("-")));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            ignore_fixture(&upstream);
-            ignore_fixture(&rust);
+    for args in [
+        ["clean", "-n"].as_slice(),
+        ["clean", "-nx"].as_slice(),
+        ["clean", "-f"].as_slice(),
+        ["clean", "-fx"].as_slice(),
+        ["clean", "-nd"].as_slice(),
+        ["clean", "-nxd"].as_slice(),
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-")));
+        let rust = root.join(format!("rust-{}", args.join("-")));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        ignore_fixture(&upstream);
+        ignore_fixture(&rust);
 
-            let expected = run_output("git", &upstream, args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
-            assert_same_output(actual, expected, args);
-            assert_eq!(
-                files(&rust),
-                files(&upstream),
-                "filesystem differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run_output("git", &upstream, args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
+        assert_same_output(actual, expected, args);
+        assert_eq!(
+            files(&rust),
+            files(&upstream),
+            "filesystem differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn clean_requires_force_or_dry_run_like_upstream_git() {
     let root = unique_temp_dir("clean-requires-force");
     fs::create_dir_all(&root).expect("create repo");
-    let result = (|| {
+    {
         fixture(&root);
         let expected = run_output("git", &root, &["clean"]);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &["clean"]);
@@ -395,9 +385,8 @@ fn clean_requires_force_or_dry_run_like_upstream_git() {
             expected.status.code(),
             "sley clean status differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -407,7 +396,7 @@ fn clean_pathspecs_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -449,9 +438,8 @@ fn clean_pathspecs_match_upstream_git() {
             files(&upstream),
             "clean -f directory pathspec filesystem differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -461,7 +449,7 @@ fn clean_require_force_false_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
         git(&upstream, &["config", "clean.requireForce", "false"]);
@@ -477,7 +465,6 @@ fn clean_require_force_false_matches_upstream_git() {
             files(&upstream),
             "clean with clean.requireForce=false filesystem differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

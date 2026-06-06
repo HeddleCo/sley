@@ -255,7 +255,7 @@ fn clone_local_repository_matches_upstream_git() {
     let expected_repo = root.join("expected");
     let actual_repo = root.join("actual");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
@@ -301,9 +301,8 @@ fn clone_local_repository_matches_upstream_git() {
             fs::read(actual_repo.join("payload.txt")).expect("read actual payload")
         );
         assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo.join(".git"));
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -315,7 +314,7 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_root).expect("create expected root");
     fs::create_dir_all(&actual_root).expect("create actual root");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source
             .join(".git")
@@ -343,9 +342,8 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
             let actual = run("git", &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -355,7 +353,7 @@ fn clone_local_repository_bare_matches_upstream_git() {
     let expected_repo = root.join("expected.git");
     let actual_repo = root.join("actual.git");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -400,9 +398,8 @@ fn clone_local_repository_bare_matches_upstream_git() {
             "bare clone FETCH_HEAD presence differed"
         );
         assert_reachable_objects_stored_in_pack(&actual_repo, &actual_repo);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -414,7 +411,7 @@ fn clone_local_repository_bare_options_match_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_root).expect("create expected root");
     fs::create_dir_all(&actual_root).expect("create actual root");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source
@@ -478,9 +475,8 @@ fn clone_local_repository_bare_options_match_upstream_git() {
             let actual = run("git", &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -488,7 +484,7 @@ fn clone_local_repository_bare_and_mirror_origin_option_match_upstream_git() {
     let root = unique_temp_dir("clone-local-bare-mirror-origin");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -541,9 +537,8 @@ fn clone_local_repository_bare_and_mirror_origin_option_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -555,7 +550,7 @@ fn clone_local_repository_mirror_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_root).expect("create expected root");
     fs::create_dir_all(&actual_root).expect("create actual root");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         run_success("git", &source, &["update-ref", "refs/notes/test", "HEAD"]);
@@ -599,9 +594,8 @@ fn clone_local_repository_mirror_matches_upstream_git() {
             actual_repo.join("FETCH_HEAD").exists(),
             "mirror clone FETCH_HEAD presence differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -611,7 +605,7 @@ fn clone_local_repository_no_mirror_restores_non_bare_clone_like_upstream_git() 
     let expected_repo = root.join("expected");
     let actual_repo = root.join("actual");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
@@ -666,9 +660,8 @@ fn clone_local_repository_no_mirror_restores_non_bare_clone_like_upstream_git() 
             let actual = run("git", &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -676,7 +669,7 @@ fn clone_local_repository_single_branch_matches_upstream_git() {
     let root = unique_temp_dir("clone-local-single-branch");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -716,9 +709,8 @@ fn clone_local_repository_single_branch_matches_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -726,7 +718,7 @@ fn clone_local_repository_bare_and_mirror_single_branch_match_upstream_git() {
     let root = unique_temp_dir("clone-local-bare-mirror-single-branch");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -766,9 +758,8 @@ fn clone_local_repository_bare_and_mirror_single_branch_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -778,7 +769,7 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
     let expected_repo = root.join("expected");
     let actual_repo = root.join("actual");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
@@ -815,9 +806,8 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
             actual_repo.join("payload.txt").exists(),
             "payload checkout presence differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -825,7 +815,7 @@ fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
     let root = unique_temp_dir("clone-sha256-index-options");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_sha256_nested_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
 
@@ -859,9 +849,8 @@ fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -869,7 +858,7 @@ fn clone_local_repository_tag_options_match_upstream_git() {
     let root = unique_temp_dir("clone-local-tag-options");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
 
@@ -902,9 +891,8 @@ fn clone_local_repository_tag_options_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -912,7 +900,7 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
     let root = unique_temp_dir("clone-local-branch-option");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -957,9 +945,8 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
                 fs::read(actual_repo.join("payload.txt")).expect("read actual payload")
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -967,7 +954,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
     let root = unique_temp_dir("clone-local-revision-option");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1118,9 +1105,8 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1128,7 +1114,7 @@ fn clone_local_repository_origin_option_matches_upstream_git() {
     let root = unique_temp_dir("clone-local-origin-option");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         let source_arg = source.to_str().expect("source path is utf8");
 
@@ -1175,9 +1161,8 @@ fn clone_local_repository_origin_option_matches_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1185,7 +1170,7 @@ fn clone_local_repository_config_options_match_upstream_git() {
     let root = unique_temp_dir("clone-local-config-options");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1242,9 +1227,8 @@ fn clone_local_repository_config_options_match_upstream_git() {
                 expected_value
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1255,7 +1239,7 @@ fn clone_local_repository_template_options_match_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(template.join("info")).expect("create template info");
     fs::create_dir_all(template.join("hooks")).expect("create template hooks");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         fs::write(template.join("info").join("exclude"), b"template-exclude\n")
@@ -1356,9 +1340,8 @@ fn clone_local_repository_template_options_match_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1366,7 +1349,7 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-filter-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1409,9 +1392,8 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1419,7 +1401,7 @@ fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
     let root = unique_temp_dir("clone-file-filter-promisor-pack");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = format!("file://{}", source.display());
@@ -1464,9 +1446,8 @@ fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
         let (pack, index) = repository_pack_pair(&actual_git_dir);
         assert_eq!(promisors[0].file_stem(), pack.file_stem());
         assert_eq!(promisors[0].file_stem(), index.file_stem());
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1476,7 +1457,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
     let bundle = root.join("source.bundle");
     let missing_bundle = root.join("missing.bundle");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1556,9 +1537,8 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1567,7 +1547,7 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
     let source = root.join("source");
     fs::create_dir_all(source.join("dir")).expect("create source dir");
     fs::create_dir_all(source.join("deep/nested")).expect("create source nested dir");
-    let result = (|| {
+    {
         run_success("git", &source, &["init", "-q"]);
         fs::write(source.join("root.txt"), b"root\n").expect("write root file");
         fs::write(source.join("dir/file.txt"), b"dir\n").expect("write dir file");
@@ -1634,9 +1614,8 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
                 "sparse-checkout file differed for {label}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1644,7 +1623,7 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-separate-git-dir-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1830,9 +1809,8 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
                 &actual_args,
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1842,7 +1820,7 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
     let reference = root.join("reference");
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&reference).expect("create reference repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         run_success("git", &reference, &["init", "-q"]);
@@ -1965,9 +1943,8 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
                 "alternates differed for {label}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1975,7 +1952,7 @@ fn clone_local_repository_local_transport_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-transport-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2018,9 +1995,8 @@ fn clone_local_repository_local_transport_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2028,7 +2004,7 @@ fn clone_local_repository_upload_pack_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-upload-pack-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2077,9 +2053,8 @@ fn clone_local_repository_upload_pack_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2087,7 +2062,7 @@ fn clone_local_repository_server_option_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-server-option-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2139,9 +2114,8 @@ fn clone_local_repository_server_option_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2149,7 +2123,7 @@ fn clone_local_repository_jobs_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-jobs-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2196,9 +2170,8 @@ fn clone_local_repository_jobs_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2206,7 +2179,7 @@ fn clone_local_repository_ref_format_files_matches_upstream_git() {
     let root = unique_temp_dir("clone-local-ref-format-files");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2249,9 +2222,8 @@ fn clone_local_repository_ref_format_files_matches_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2259,7 +2231,7 @@ fn clone_local_repository_reject_shallow_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-reject-shallow-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2301,9 +2273,8 @@ fn clone_local_repository_reject_shallow_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2311,7 +2282,7 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-shallow-hint-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2379,9 +2350,8 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2389,7 +2359,7 @@ fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-recurse-submodules-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2441,9 +2411,8 @@ fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2451,7 +2420,7 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-submodule-hint-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2564,9 +2533,8 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2574,7 +2542,7 @@ fn clone_local_repository_ip_family_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-ip-family-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2615,9 +2583,8 @@ fn clone_local_repository_ip_family_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2625,7 +2592,7 @@ fn clone_local_repository_negative_noop_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-negative-noop-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2692,9 +2659,8 @@ fn clone_local_repository_negative_noop_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2702,7 +2668,7 @@ fn clone_local_repository_progress_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-progress-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2748,9 +2714,8 @@ fn clone_local_repository_progress_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2758,7 +2723,7 @@ fn clone_local_repository_verbose_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-verbose-flags");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         create_source_repo(&source);
         add_feature_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -2805,7 +2770,6 @@ fn clone_local_repository_verbose_flags_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

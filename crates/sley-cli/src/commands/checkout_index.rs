@@ -222,6 +222,14 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
 
     let mut had_error = false;
     let mut wrote_index = false;
+    let checkout_context = CheckoutIndexContext {
+        worktree_root,
+        db,
+        config,
+        git_dir,
+        format,
+        options: &options,
+    };
 
     let CheckoutIndexStage::Single(stage) = options.stage;
 
@@ -240,16 +248,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             .map(|(idx, _)| idx)
             .collect();
         for idx in targets {
-            match checkout_one_index_entry(
-                worktree_root,
-                db,
-                config,
-                git_dir,
-                format,
-                &options,
-                idx,
-                &mut index,
-            )? {
+            match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
                 CheckoutOutcome::Wrote => wrote_index |= options.update_stat,
                 CheckoutOutcome::Skipped => {}
                 CheckoutOutcome::Warned => had_error = true,
@@ -281,16 +280,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             {
                 continue;
             }
-            match checkout_one_index_entry(
-                worktree_root,
-                db,
-                config,
-                git_dir,
-                format,
-                &options,
-                idx,
-                &mut index,
-            )? {
+            match checkout_one_index_entry(&checkout_context, idx, &mut index)? {
                 CheckoutOutcome::Wrote => wrote_index |= options.update_stat,
                 CheckoutOutcome::Skipped => {}
                 CheckoutOutcome::Warned => had_error = true,
@@ -322,45 +312,49 @@ enum CheckoutOutcome {
     Warned,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn checkout_one_index_entry(
-    worktree_root: &Path,
-    db: &FileObjectDatabase,
-    config: &GitConfig,
-    git_dir: &Path,
+struct CheckoutIndexContext<'a> {
+    worktree_root: &'a Path,
+    db: &'a FileObjectDatabase,
+    config: &'a GitConfig,
+    git_dir: &'a Path,
     format: ObjectFormat,
-    options: &CheckoutIndexOptions,
+    options: &'a CheckoutIndexOptions,
+}
+
+fn checkout_one_index_entry(
+    context: &CheckoutIndexContext<'_>,
     index: usize,
     index_data: &mut Index,
 ) -> Result<CheckoutOutcome> {
     let entry = index_data.entries[index].clone();
-    let dest = checkout_index_output_path(worktree_root, &options.prefix, &entry.path)?;
+    let dest =
+        checkout_index_output_path(context.worktree_root, &context.options.prefix, &entry.path)?;
 
     let metadata = fs::symlink_metadata(&dest).ok();
     let exists = metadata.is_some();
-    if let Some(metadata) = &metadata {
-        if !options.force {
-            // Without --force git silently leaves files that already match the
-            // index (stat is up to date) and warns for any that differ.
-            if checkout_index_entry_up_to_date(&entry, metadata) {
-                return Ok(CheckoutOutcome::Skipped);
-            }
-            if !options.quiet {
-                eprintln!(
-                    "{}{} already exists, no checkout",
-                    options.prefix,
-                    String::from_utf8_lossy(&entry.path)
-                );
-            }
-            return Ok(CheckoutOutcome::Warned);
+    if let Some(metadata) = &metadata
+        && !context.options.force
+    {
+        // Without --force git silently leaves files that already match the
+        // index (stat is up to date) and warns for any that differ.
+        if checkout_index_entry_up_to_date(&entry, metadata) {
+            return Ok(CheckoutOutcome::Skipped);
         }
+        if !context.options.quiet {
+            eprintln!(
+                "{}{} already exists, no checkout",
+                context.options.prefix,
+                String::from_utf8_lossy(&entry.path)
+            );
+        }
+        return Ok(CheckoutOutcome::Warned);
     }
-    if !exists && !options.create {
+    if !exists && !context.options.create {
         // `--no-create` suppresses creation of files that are not already there.
         return Ok(CheckoutOutcome::Skipped);
     }
 
-    let object = db.read_object(&entry.oid)?;
+    let object = context.db.read_object(&entry.oid)?;
     if object.object_type != ObjectType::Blob {
         return Err(GitError::InvalidObject(format!(
             "expected blob {}, found {}",
@@ -379,17 +373,17 @@ fn checkout_one_index_entry(
         write_checkout_symlink(&dest, &object.body, exists)?;
     } else {
         let body = sley_worktree::apply_smudge_filter(
-            worktree_root,
-            git_dir,
-            format,
-            config,
+            context.worktree_root,
+            context.git_dir,
+            context.format,
+            context.config,
             &entry.path,
             &object.body,
         )?;
         write_checkout_regular_file(&dest, &body, entry.mode)?;
     }
 
-    if options.update_stat {
+    if context.options.update_stat {
         if let Ok(metadata) = fs::symlink_metadata(&dest) {
             checkout_index_refresh_stat(&mut index_data.entries[index], &metadata);
         }
@@ -476,10 +470,10 @@ fn write_checkout_symlink(dest: &Path, target: &[u8], exists: bool) -> Result<()
 fn write_checkout_regular_file(dest: &Path, body: &[u8], mode: u32) -> Result<()> {
     // Replace any existing symlink with a real file rather than writing through
     // it, mirroring git's create-or-truncate semantics.
-    if let Ok(metadata) = fs::symlink_metadata(dest) {
-        if metadata.file_type().is_symlink() {
-            fs::remove_file(dest)?;
-        }
+    if let Ok(metadata) = fs::symlink_metadata(dest)
+        && metadata.file_type().is_symlink()
+    {
+        fs::remove_file(dest)?;
     }
     fs::write(dest, body)?;
     apply_checkout_file_mode(dest, mode)?;

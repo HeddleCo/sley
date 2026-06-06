@@ -80,15 +80,15 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
     let format = repo.format();
     let db = repo.objects();
 
-    let tips = collect_tips(&git_dir, format, &db, &options)?;
+    let tips = collect_tips(git_dir, format, db, &options)?;
     let mut rev_names: HashMap<ObjectId, RevName> = HashMap::new();
-    name_all_tips(&db, format, &tips, &mut rev_names)?;
+    name_all_tips(db, format, &tips, &mut rev_names)?;
 
     if options.all {
-        return emit_all(&db, &rev_names, &options);
+        return emit_all(db, &rev_names, &options);
     }
     if options.annotate_stdin {
-        return annotate_stdin(&db, format, &tips, &rev_names, &options);
+        return annotate_stdin(db, format, &tips, &rev_names, &options);
     }
     emit_positional(&repo, &tips, &rev_names, &options)
 }
@@ -251,10 +251,10 @@ fn collect_tips(
                 }
                 ObjectType::Tag => {
                     let tag = Tag::parse(format, &object.body)?;
-                    if let Some(tagger) = &tag.tagger {
-                        if let Some(date) = committer_timestamp(tagger) {
-                            taggerdate = date;
-                        }
+                    if let Some(tagger) = &tag.tagger
+                        && let Some(date) = committer_timestamp(tagger)
+                    {
+                        taggerdate = date;
                     }
                     deref = true;
                     current = tag.object.clone();
@@ -390,10 +390,10 @@ fn create_or_update_name(
     distance: i64,
     from_tag: bool,
 ) -> bool {
-    if let Some(existing) = rev_names.get(commit) {
-        if !is_better_name(existing, taggerdate, generation, distance, from_tag) {
-            return false;
-        }
+    if let Some(existing) = rev_names.get(commit)
+        && !is_better_name(existing, taggerdate, generation, distance, from_tag)
+    {
+        return false;
     }
     rev_names.insert(
         commit.clone(),
@@ -477,7 +477,7 @@ fn emit_all(
         .iter()
         .map(|(oid, name)| (oid.clone(), name.clone()))
         .collect();
-    rows.sort_by(|left, right| left.0.to_hex().cmp(&right.0.to_hex()));
+    rows.sort_by_key(|left| left.0.to_hex());
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for (oid, name) in rows {
@@ -508,6 +508,14 @@ fn annotate_stdin(
     let hex_len = format.hex_len();
     let stdout = io::stdout();
     let mut out = stdout.lock();
+    let context = NameRevAnnotationContext {
+        hex_len,
+        db,
+        format,
+        tips,
+        rev_names,
+        options,
+    };
     // Process line by line so a hash split across the buffer boundary is treated
     // the same way upstream's per-line `name_rev_line` would.
     let mut start = 0;
@@ -516,30 +524,24 @@ fn annotate_stdin(
             Some(offset) => start + offset + 1,
             None => input.len(),
         };
-        annotate_stdin_line(
-            &input[start..end],
-            hex_len,
-            db,
-            format,
-            tips,
-            rev_names,
-            options,
-            &mut out,
-        )?;
+        annotate_stdin_line(&input[start..end], &context, &mut out)?;
         start = end;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct NameRevAnnotationContext<'a> {
+    hex_len: usize,
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    tips: &'a [Tip],
+    rev_names: &'a HashMap<ObjectId, RevName>,
+    options: &'a NameRevOptions,
+}
+
 fn annotate_stdin_line(
     line: &[u8],
-    hex_len: usize,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tips: &[Tip],
-    rev_names: &HashMap<ObjectId, RevName>,
-    options: &NameRevOptions,
+    context: &NameRevAnnotationContext<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
     let mut segment_start = 0;
@@ -552,12 +554,19 @@ fn annotate_stdin_line(
         } else {
             counter += 1;
             let next_is_hex = line.get(index + 1).is_some_and(|next| is_lower_hex(*next));
-            if counter == hex_len && !next_is_hex {
-                let hex_start = index + 1 - hex_len;
+            if counter == context.hex_len && !next_is_hex {
+                let hex_start = index + 1 - context.hex_len;
                 let hex = &line[hex_start..=index];
                 counter = 0;
-                if let Some(name) = resolve_stdin_name(hex, db, format, tips, rev_names, options)? {
-                    if options.name_only {
+                if let Some(name) = resolve_stdin_name(
+                    hex,
+                    context.db,
+                    context.format,
+                    context.tips,
+                    context.rev_names,
+                    context.options,
+                )? {
+                    if context.options.name_only {
                         out.write_all(&line[segment_start..hex_start])?;
                         out.write_all(name.as_bytes())?;
                     } else {
@@ -594,7 +603,7 @@ fn resolve_stdin_name(
     if db.read_object(&oid).is_err() {
         return Ok(None);
     }
-    Ok(name_for_object(&oid, db, format, tips, rev_names, options)?)
+    name_for_object(&oid, db, format, tips, rev_names, options)
 }
 
 /// `<commit>...`: resolve each argument and print its name (or `undefined`).
@@ -783,12 +792,10 @@ fn wildmatch_inner(pattern: &[char], text: &[char]) -> bool {
                         continue;
                     }
                 }
-                '\\' if p + 1 < pattern.len() => {
-                    if pattern[p + 1] == text[t] {
-                        p += 2;
-                        t += 1;
-                        continue;
-                    }
+                '\\' if p + 1 < pattern.len() && pattern[p + 1] == text[t] => {
+                    p += 2;
+                    t += 1;
+                    continue;
                 }
                 other if other == text[t] => {
                     p += 1;

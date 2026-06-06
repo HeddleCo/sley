@@ -72,7 +72,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 fn show_ref_exists_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exists");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         for args in [
             vec!["show-ref", "--exists"],
@@ -115,16 +115,15 @@ fn show_ref_exists_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn show_ref_head_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-head");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         run_success(
             "git",
@@ -254,16 +253,15 @@ fn show_ref_head_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn show_ref_exclude_existing_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exclude-existing");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         run_success(
             "git",
@@ -291,16 +289,15 @@ fn show_ref_exclude_existing_matches_upstream_git() {
             let actual = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, input);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn show_ref_reftable_repository_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-reftable");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q", "--ref-format=reftable"]);
         run_success(
             "git",
@@ -333,7 +330,6 @@ fn show_ref_reftable_repository_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

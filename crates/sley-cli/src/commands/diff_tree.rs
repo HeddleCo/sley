@@ -280,7 +280,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
 
     // Resolve the raw-mode abbreviation against core.abbrev only when the user
     // explicitly asked to abbreviate; otherwise diff-tree prints full ids.
-    let repo_abbrev = repository_abbrev(&git_dir, format)?;
+    let repo_abbrev = repository_abbrev(git_dir, format)?;
     let raw_abbrev = options.raw_abbrev.map(|width| width.min(format.hex_len()));
     let patch_abbrev = if options.patch_full_index {
         format.hex_len()
@@ -290,6 +290,13 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             .or(repo_abbrev)
             .unwrap_or(7)
             .min(format.hex_len())
+    };
+    let request_context = DiffRequestContext {
+        format,
+        db,
+        options: &options,
+        raw_abbrev,
+        patch_abbrev,
     };
 
     let mut has_differences = false;
@@ -303,16 +310,8 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             if line.is_empty() {
                 continue;
             }
-            let request = parse_stdin_request(format, &db, &options, line)?;
-            if run_diff_request(
-                &mut stdout,
-                format,
-                &db,
-                &options,
-                raw_abbrev,
-                patch_abbrev,
-                &request,
-            )? {
+            let request = parse_stdin_request(format, db, &options, line)?;
+            if run_diff_request(&mut stdout, &request_context, &request)? {
                 has_differences = true;
             }
         }
@@ -322,15 +321,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(129));
         }
         let request = resolve_arg_request(&repo, db, &options, &options.revs)?;
-        if run_diff_request(
-            &mut stdout,
-            format,
-            &db,
-            &options,
-            raw_abbrev,
-            patch_abbrev,
-            &request,
-        )? {
+        if run_diff_request(&mut stdout, &request_context, &request)? {
             has_differences = true;
         }
     }
@@ -575,14 +566,17 @@ fn resolve_tree_ish_arg(repo: &RepositoryContext, spec: &str) -> Result<ObjectId
 
 /// Execute and print one diff request. Returns `true` when there were
 /// differences (so the caller can track an overall change flag).
-#[allow(clippy::too_many_arguments)]
-fn run_diff_request(
-    stdout: &mut io::Stdout,
+struct DiffRequestContext<'a> {
     format: ObjectFormat,
-    db: &FileObjectDatabase,
-    options: &DiffTreeOptions,
+    db: &'a FileObjectDatabase,
+    options: &'a DiffTreeOptions,
     raw_abbrev: Option<usize>,
     patch_abbrev: usize,
+}
+
+fn run_diff_request(
+    stdout: &mut io::Stdout,
+    context: &DiffRequestContext<'_>,
     request: &DiffRequest,
 ) -> Result<bool> {
     // The header (commit id, or the verbatim stdin line for the two-tree form)
@@ -590,7 +584,7 @@ fn run_diff_request(
     // only suppresses suppressible headers (the single-commit form), not the
     // two-tree stdin echo.
     if let Some(header) = &request.header
-        && !(header.suppressible && options.no_commit_id)
+        && !(header.suppressible && context.options.no_commit_id)
     {
         writeln!(stdout, "{}", header.text)?;
     }
@@ -604,27 +598,34 @@ fn run_diff_request(
         return Ok(false);
     };
 
-    let recursive = options.recursive || options.output.forces_recursion();
+    let recursive = context.options.recursive || context.options.output.forces_recursion();
     let entries = compute_entries(
-        format,
-        db,
-        options,
+        context.format,
+        context.db,
+        context.options,
         request.left.as_ref(),
         &right,
         recursive,
     )?;
     let has_differences = !entries.is_empty();
 
-    match options.output {
+    match context.options.output {
         DiffTreeOutput::Silent => {}
         DiffTreeOutput::Raw => {
             for entry in &entries {
-                write_diff_raw_entry(stdout, entry, options.z, false, raw_abbrev, format)?;
+                write_diff_raw_entry(
+                    stdout,
+                    entry,
+                    context.options.z,
+                    false,
+                    context.raw_abbrev,
+                    context.format,
+                )?;
             }
         }
         DiffTreeOutput::NameOnly => {
             for entry in &entries {
-                if options.z {
+                if context.options.z {
                     stdout.write_all(&entry.path)?;
                     stdout.write_all(b"\0")?;
                 } else {
@@ -635,7 +636,7 @@ fn run_diff_request(
         }
         DiffTreeOutput::NameStatus => {
             for entry in &entries {
-                if options.z {
+                if context.options.z {
                     stdout.write_all(entry.status.label().as_bytes())?;
                     stdout.write_all(b"\0")?;
                     if let Some(old_path) = &entry.old_path {
@@ -657,17 +658,24 @@ fn run_diff_request(
         }
         DiffTreeOutput::Numstat => {
             for entry in &entries {
-                write_diff_numstat_entry(stdout, entry, options.z, db, None, false)?;
+                write_diff_numstat_entry(
+                    stdout,
+                    entry,
+                    context.options.z,
+                    context.db,
+                    None,
+                    false,
+                )?;
             }
         }
         DiffTreeOutput::Shortstat => {
-            write_diff_shortstat(stdout, &entries, db, None, false)?;
+            write_diff_shortstat(stdout, &entries, context.db, None, false)?;
         }
         DiffTreeOutput::Stat => {
             write_diff_stat(
                 stdout,
                 &entries,
-                db,
+                context.db,
                 None,
                 false,
                 DiffStatOptions {
@@ -685,13 +693,13 @@ fn run_diff_request(
         DiffTreeOutput::Patch => {
             for entry in &entries {
                 let patch_options = DiffPatchOptions {
-                    db,
+                    db: context.db,
                     worktree_root: None,
                     use_worktree_new: false,
-                    format,
-                    abbrev: patch_abbrev,
-                    src_prefix: &options.src_prefix,
-                    dst_prefix: &options.dst_prefix,
+                    format: context.format,
+                    abbrev: context.patch_abbrev,
+                    src_prefix: &context.options.src_prefix,
+                    dst_prefix: &context.options.dst_prefix,
                 };
                 write_diff_patch_entry(stdout, entry, patch_options)?;
             }

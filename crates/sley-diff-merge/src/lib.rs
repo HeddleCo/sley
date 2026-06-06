@@ -1,4 +1,4 @@
-use sley_core::{object_id_for_bytes, GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
 use sley_odb::{FileObjectDatabase, ObjectReader};
@@ -370,13 +370,7 @@ pub fn diff_lines_with_algorithm(
 /// `new[b0..b1]` is empty: a pure deletion, a pure insertion, or nothing at
 /// all. Used by both the patience and histogram recursions before they look
 /// for an anchor.
-fn emit_trivial_range(
-    a0: usize,
-    a1: usize,
-    b0: usize,
-    b1: usize,
-    out: &mut Vec<DiffOp>,
-) -> bool {
+fn emit_trivial_range(a0: usize, a1: usize, b0: usize, b1: usize, out: &mut Vec<DiffOp>) -> bool {
     let old_len = a1 - a0;
     let new_len = b1 - b0;
     if old_len == 0 && new_len == 0 {
@@ -527,11 +521,7 @@ fn patience_anchors(
     // already sorted by old-index, so an LIS by new-index yields a set of
     // anchors increasing in both coordinates.
     let lis = longest_increasing_by_new(&pairs);
-    if lis.is_empty() {
-        None
-    } else {
-        Some(lis)
-    }
+    if lis.is_empty() { None } else { Some(lis) }
 }
 
 /// Longest increasing subsequence of `pairs` (sorted by old-index) keyed on the
@@ -690,8 +680,7 @@ fn histogram_region(
             // Score this run by the rarest occurrence count along it; using the
             // anchor line's own count is the standard, cheaper approximation.
             let run_count = occ;
-            let better = run_count < best_count
-                || (run_count == best_count && len > best_len);
+            let better = run_count < best_count || (run_count == best_count && len > best_len);
             if better && len > 0 {
                 best_count = run_count;
                 best_len = len;
@@ -2383,7 +2372,15 @@ fn changed_tree_entries(
     let mut right = BTreeMap::new();
     // Identical root trees produce no changes at all and need not be read.
     if left_tree != right_tree {
-        diff_tree_pair(db, format, left_tree, right_tree, &[], &mut left, &mut right)?;
+        diff_tree_pair(
+            db,
+            format,
+            left_tree,
+            right_tree,
+            &[],
+            &mut left,
+            &mut right,
+        )?;
     }
     Ok((left, right))
 }
@@ -2415,7 +2412,15 @@ fn diff_tree_pair(
     for left_entry in &left_entries {
         match right_by_name.remove(left_entry.name.as_slice()) {
             Some(right_entry) => {
-                merge_tree_entry(db, format, prefix, Some(left_entry), Some(right_entry), left, right)?;
+                merge_tree_entry(
+                    db,
+                    format,
+                    prefix,
+                    Some(left_entry),
+                    Some(right_entry),
+                    left,
+                    right,
+                )?;
             }
             None => {
                 merge_tree_entry(db, format, prefix, Some(left_entry), None, left, right)?;
@@ -3417,11 +3422,12 @@ mod tests {
     #[test]
     fn name_status_reports_added_from_index() {
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let index = Index {
             version: 2,
             entries: vec![sley_index::IndexEntry {
@@ -3443,12 +3449,18 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        fs::write(layout.git_dir.join("index"), index.write_v2_sha1().unwrap()).unwrap();
-        fs::write(root.join("hello.txt"), b"hello\n").unwrap();
-        let changes =
-            diff_name_status_head_worktree(&root, &layout.git_dir, ObjectFormat::Sha1).unwrap();
+        fs::write(
+            layout.git_dir.join("index"),
+            index
+                .write_v2_sha1()
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed");
+        fs::write(root.join("hello.txt"), b"hello\n").expect("test operation should succeed");
+        let changes = diff_name_status_head_worktree(&root, &layout.git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(changes[0].line(), "A\thello.txt");
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     fn temp_root() -> PathBuf {
@@ -3457,7 +3469,7 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).expect("test operation should succeed");
         path
     }
 
@@ -3748,7 +3760,7 @@ index ccccccc..ddddddd 100644
 +inserted
  second
 ";
-        let patches = parse_unified_patch(patch).unwrap();
+        let patches = parse_unified_patch(patch).expect("test operation should succeed");
         assert_eq!(patches.len(), 2);
 
         assert_eq!(patches[0].old_path.as_deref(), Some(b"one.txt".as_slice()));
@@ -3784,7 +3796,7 @@ index ccccccc..ddddddd 100644
  line
 +added
 ";
-        let patches = parse_unified_patch(patch).unwrap();
+        let patches = parse_unified_patch(patch).expect("test operation should succeed");
         let h = &patches[0].hunks[0];
         assert_eq!(
             (h.old_start, h.old_len, h.new_start, h.new_len),
@@ -3811,7 +3823,7 @@ index ccccccc..ddddddd 100644
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"alpha\nBETA\ngamma\n");
     }
@@ -3824,7 +3836,7 @@ index ccccccc..ddddddd 100644
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"pre1\npre2\npre3\nalpha\nBETA\ngamma\n");
     }
@@ -3836,7 +3848,7 @@ index ccccccc..ddddddd 100644
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -50,3 +50,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"alpha\nBETA\ngamma\n");
     }
@@ -3849,7 +3861,7 @@ index ccccccc..ddddddd 100644
 @@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n\
 @@ -6,3 +6,3 @@\n f\n-g\n+G\n h\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"a\nB\nc\nd\ne\nf\nG\nh\n");
     }
@@ -3860,7 +3872,7 @@ index ccccccc..ddddddd 100644
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n alpha\n-beta\n+BETA\n gamma\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
     }
 
@@ -3878,7 +3890,7 @@ index 0000000..1111111
 +world
 ",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patches_first_is_new(&patch));
         assert_eq!(patch[0].old_path, None);
         assert_eq!(patch[0].new_path.as_deref(), Some(b"new.txt".as_slice()));
@@ -3906,7 +3918,7 @@ index 1111111..0000000
 -world
 ",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].is_delete);
         assert_eq!(patch[0].old_path.as_deref(), Some(b"gone.txt".as_slice()));
         assert_eq!(patch[0].new_path, None);
@@ -3925,7 +3937,7 @@ rename from old/name.txt
 rename to new/name.txt
 ",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].is_rename);
         assert_eq!(
             patch[0].old_path.as_deref(),
@@ -3947,7 +3959,7 @@ old mode 100644
 new mode 100755
 ",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(patch[0].old_mode, Some(0o100644));
         assert_eq!(patch[0].new_mode, Some(0o100755));
         assert!(!patch[0].is_new);
@@ -3959,8 +3971,8 @@ new mode 100755
         // The change is on line 1; the final line has no newline and is not in
         // the hunk, so its no-newline state must survive.
         let base = b"alpha\nbeta\nnotail"; // "notail" has no trailing \n
-        let patch =
-            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n").unwrap();
+        let patch = parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-alpha\n+ALPHA\n")
+            .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"ALPHA\nbeta\nnotail");
     }
@@ -3973,7 +3985,7 @@ new mode 100755
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -2,1 +2,1 @@\n-beta\n+beta-notail\n\\ No newline at end of file\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].hunks[0].new_no_newline);
         assert!(!patch[0].hunks[0].old_no_newline);
         let out = applied(apply_file_patch(base, &patch[0]));
@@ -3988,7 +4000,7 @@ new mode 100755
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-alpha\n+ALPHA\n beta\n\\ No newline at end of file\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].hunks[0].old_no_newline);
         assert!(patch[0].hunks[0].new_no_newline);
         let out = applied(apply_file_patch(base, &patch[0]));
@@ -4003,7 +4015,7 @@ new mode 100755
         let patch = parse_unified_patch(
             b"--- a/x\n+++ b/x\n@@ -2,1 +2,1 @@\n-beta\n\\ No newline at end of file\n+beta2\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].hunks[0].old_no_newline);
         assert_eq!(apply_file_patch(base, &patch[0]), ApplyOutcome::Rejected);
     }
@@ -4015,7 +4027,7 @@ new mode 100755
         let patch = parse_unified_patch(
             b"--- a/x\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-only line no newline\n\\ No newline at end of file\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(patch[0].is_delete);
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"");
@@ -4026,7 +4038,7 @@ new mode 100755
         let base = b"first\nsecond\n";
         let patch =
             parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,2 +1,3 @@\n first\n+middle\n second\n")
-                .unwrap();
+                .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"first\nmiddle\nsecond\n");
     }
@@ -4036,7 +4048,7 @@ new mode 100755
         let base = b"first\nmiddle\nsecond\n";
         let patch =
             parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,3 +1,2 @@\n first\n-middle\n second\n")
-                .unwrap();
+                .expect("test operation should succeed");
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"first\nsecond\n");
     }
@@ -4048,8 +4060,8 @@ new mode 100755
         // identical structure (idempotent parse).
         let base = b"l1\nl2\nl3\nl4\nl5\n";
         let text = b"--- a/f\n+++ b/f\n@@ -2,3 +2,4 @@\n l2\n-l3\n+L3\n+L3b\n l4\n";
-        let p1 = parse_unified_patch(text).unwrap();
-        let p2 = parse_unified_patch(text).unwrap();
+        let p1 = parse_unified_patch(text).expect("test operation should succeed");
+        let p2 = parse_unified_patch(text).expect("test operation should succeed");
         assert_eq!(p1, p2);
         let out = applied(apply_file_patch(base, &p1[0]));
         assert_eq!(out, b"l1\nl2\nL3\nL3b\nl4\nl5\n");
@@ -4060,8 +4072,8 @@ new mode 100755
         // Some transports strip the single leading space from blank context
         // lines; the parser treats a wholly empty body line as blank context.
         let base = b"a\n\nb\n";
-        let patch =
-            parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n\n-b\n+B\n").unwrap();
+        let patch = parse_unified_patch(b"--- a/x\n+++ b/x\n@@ -1,3 +1,3 @@\n a\n\n-b\n+B\n")
+            .expect("test operation should succeed");
         assert_eq!(patch[0].hunks[0].lines[1], HunkLine::Context(Vec::new()));
         let out = applied(apply_file_patch(base, &patch[0]));
         assert_eq!(out, b"a\n\nB\n");
@@ -4142,7 +4154,7 @@ new mode 100755
     /// Write a blob and return its oid.
     fn write_blob(db: &mut FileObjectDatabase, bytes: &[u8]) -> ObjectId {
         db.write_object(EncodedObject::new(ObjectType::Blob, bytes.to_vec()))
-            .unwrap()
+            .expect("test operation should succeed")
     }
 
     /// Write a tree from `(name, mode, oid)` entries (sorted by name as git
@@ -4161,7 +4173,7 @@ new mode 100755
             entries: tree_entries,
         };
         db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
-            .unwrap()
+            .expect("test operation should succeed")
     }
 
     #[test]
@@ -4169,7 +4181,8 @@ new mode 100755
         // a.txt (one changed line vs the new b.txt) should be detected as a
         // rename with score 75 (see `similarity_one_changed_line_is_75`).
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let old = write_blob(&mut db, b"one\ntwo\nthree\nfour\nfive\n");
@@ -4195,14 +4208,18 @@ new mode 100755
             &right,
             opts,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
-        assert_eq!(entries.len(), 1, "expected a single rename entry: {entries:?}");
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected a single rename entry: {entries:?}"
+        );
         assert_eq!(entries[0].status, NameStatus::Renamed(75));
         assert_eq!(entries[0].old_path.as_deref(), Some(b"a.txt".as_slice()));
         assert_eq!(entries[0].path, b"b.txt");
         assert_eq!(entries[0].line(), "R075\ta.txt\tb.txt");
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -4210,7 +4227,8 @@ new mode 100755
         // A half-rewrite scores 50%. With a 60% threshold it must NOT be paired;
         // the change shows up as a separate Add + Delete instead.
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let old = write_blob(&mut db, b"l1\nl2\nl3\nl4\nl5\nl6\n");
@@ -4236,7 +4254,7 @@ new mode 100755
             &right,
             opts,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let statuses: Vec<_> = entries.iter().map(|e| e.status).collect();
         assert!(
@@ -4261,10 +4279,10 @@ new mode 100755
             &right,
             opts_low,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(entries_low.len(), 1);
         assert_eq!(entries_low[0].status, NameStatus::Renamed(50));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -4272,7 +4290,8 @@ new mode 100755
         // Identical content moved to a new path is an exact rename: score 100,
         // detected even with inexact disabled, and still 100 with it enabled.
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let oid = write_blob(&mut db, b"identical\ncontent\nhere\n");
@@ -4298,13 +4317,13 @@ new mode 100755
                 &right,
                 opts,
             )
-            .unwrap();
+            .expect("test operation should succeed");
             assert_eq!(entries.len(), 1, "inexact={inexact}: {entries:?}");
             assert_eq!(entries[0].status, NameStatus::Renamed(100));
             assert_eq!(entries[0].old_path.as_deref(), Some(b"old.txt".as_slice()));
             assert_eq!(entries[0].path, b"new.txt");
         }
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -4314,7 +4333,8 @@ new mode 100755
         // file is reported as a copy with score 80 (matches `git diff -C
         // --find-copies-harder`).
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let orig = write_blob(&mut db, b"aaa\nbbb\nccc\nddd\neee\n");
@@ -4343,7 +4363,7 @@ new mode 100755
             &right,
             opts,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let copy_entry = entries
             .iter()
@@ -4356,7 +4376,7 @@ new mode 100755
             entries.iter().all(|e| e.status != NameStatus::Deleted),
             "copy must not delete the source: {entries:?}"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -4364,10 +4384,14 @@ new mode 100755
         // A rename that also appends a single line scores 88% (see
         // `similarity_small_append_is_88`).
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
-        let old = write_blob(&mut db, b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n");
+        let old = write_blob(
+            &mut db,
+            b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\n",
+        );
         let new = write_blob(
             &mut db,
             b"alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\nADDED\n",
@@ -4388,13 +4412,13 @@ new mode 100755
             &right,
             opts,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].status, NameStatus::Renamed(88));
         assert_eq!(entries[0].old_path.as_deref(), Some(b"src.txt".as_slice()));
         assert_eq!(entries[0].path, b"dst.txt");
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -4409,7 +4433,8 @@ new mode 100755
         );
 
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let old = write_blob(&mut db, b"one\ntwo\nthree\nfour\nfive\n");
@@ -4424,12 +4449,12 @@ new mode 100755
             &right,
             RenameDetectionOptions::default(),
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let statuses: Vec<_> = entries.iter().map(|e| e.status).collect();
         assert!(statuses.contains(&NameStatus::Added));
         assert!(statuses.contains(&NameStatus::Deleted));
         assert!(!statuses.iter().any(|s| matches!(s, NameStatus::Renamed(_))));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     // ---- patience / histogram diff tests ------------------------------------
@@ -4549,7 +4574,10 @@ new mode 100755
         // produces a delete-then-insert (or insert-then-delete) that still
         // reconstructs `new`. Validity is the contract; exact shape may differ
         // from Myers, so we only assert reconstruction here.
-        check_all_algorithms(b"alpha\nbeta\ngamma\ndelta\n", b"gamma\ndelta\nalpha\nbeta\n");
+        check_all_algorithms(
+            b"alpha\nbeta\ngamma\ndelta\n",
+            b"gamma\ndelta\nalpha\nbeta\n",
+        );
     }
 
     #[test]
@@ -4761,7 +4789,9 @@ new mode 100755
         // Every algorithm must produce a valid LCS-correct script for each pair.
         let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         let alphabet = [b"a\n", b"b\n", b"c\n", b"d\n"];
@@ -4773,7 +4803,7 @@ new mode 100755
                 buf.extend_from_slice(alphabet[pick]);
             }
             // Occasionally drop the trailing newline to exercise that path.
-            if !buf.is_empty() && rng() % 4 == 0 {
+            if !buf.is_empty() && rng().is_multiple_of(4) {
                 buf.pop();
             }
             buf
@@ -4824,7 +4854,9 @@ new mode 100755
         // of distinct tokens to guarantee global uniqueness on both sides.
         let mut state: u64 = 0x1234_5678_9ABC_DEF0;
         let mut next = || {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (state >> 33) as u32
         };
         for _ in 0..200 {
@@ -4833,7 +4865,7 @@ new mode 100755
             let pick_subseq = |rng: &mut dyn FnMut() -> u32| -> Vec<u8> {
                 let mut buf = Vec::new();
                 for t in 0..10u32 {
-                    if rng() % 2 == 0 {
+                    if rng().is_multiple_of(2) {
                         buf.extend_from_slice(format!("{t}\n").as_bytes());
                     }
                 }
@@ -4870,26 +4902,26 @@ new mode 100755
         options: DiffNameStatusOptions,
     ) {
         // Reference ("old") behaviour: fully flatten both trees, then diff.
-        let (full_left, full_right) =
-            collect_full_tree_pair(db, ObjectFormat::Sha1, left, right).unwrap();
+        let (full_left, full_right) = collect_full_tree_pair(db, ObjectFormat::Sha1, left, right)
+            .expect("test operation should succeed");
         let reference = diff_name_status_maps(
             &full_left,
             &full_right,
             full_left.keys().chain(full_right.keys()),
             options,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         // Optimized ("new") behaviour: prune identical subtrees, then diff.
-        let (pruned_left, pruned_right) =
-            changed_tree_entries(db, ObjectFormat::Sha1, left, right).unwrap();
+        let (pruned_left, pruned_right) = changed_tree_entries(db, ObjectFormat::Sha1, left, right)
+            .expect("test operation should succeed");
         let pruned = diff_name_status_maps(
             &pruned_left,
             &pruned_right,
             pruned_left.keys().chain(pruned_right.keys()),
             options,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert_eq!(
             status_lines(&reference),
@@ -4899,8 +4931,9 @@ new mode 100755
 
         // And the public entry point (which itself selects pruned vs full) must
         // match the reference too.
-        let public = diff_name_status_trees_with_options(db, ObjectFormat::Sha1, left, right, options)
-            .unwrap();
+        let public =
+            diff_name_status_trees_with_options(db, ObjectFormat::Sha1, left, right, options)
+                .expect("test operation should succeed");
         assert_eq!(
             status_lines(&reference),
             status_lines(&public),
@@ -4977,7 +5010,8 @@ new mode 100755
     /// Build a DB pre-seeded with a fixed bank of blobs for the structural tests.
     fn structural_db() -> (PathBuf, FileObjectDatabase) {
         let root = temp_root();
-        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false).unwrap();
+        let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
+            .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
         (root, db)
     }
@@ -5018,15 +5052,13 @@ new mode 100755
         );
         let right = write_tree(
             &mut db,
-            &[
-                (b"app", 0o040000, app_right),
-                (b"shared", 0o040000, shared),
-            ],
+            &[(b"app", 0o040000, app_right), (b"shared", 0o040000, shared)],
         );
 
         // Sanity: the only change is the nested app/main.rs modification.
         let (pruned_left, pruned_right) =
-            changed_tree_entries(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+            changed_tree_entries(&db, ObjectFormat::Sha1, &left, &right)
+                .expect("test operation should succeed");
         assert_eq!(
             pruned_left.keys().collect::<Vec<_>>(),
             vec![&b"app/main.rs".to_vec()],
@@ -5043,7 +5075,7 @@ new mode 100755
         );
 
         assert_tree_diff_matches_full_all_modes(&db, &left, &right);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5092,14 +5124,19 @@ new mode 100755
             ],
         );
 
-        let entries =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            DiffNameStatusOptions {
                 detect_renames: false,
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            })
-            .unwrap();
+            },
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             status_lines(&entries),
             vec![
@@ -5111,7 +5148,7 @@ new mode 100755
         );
 
         assert_tree_diff_matches_full_all_modes(&db, &left, &right);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5143,14 +5180,19 @@ new mode 100755
             ],
         );
 
-        let entries =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            DiffNameStatusOptions {
                 detect_renames: true,
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            })
-            .unwrap();
+            },
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             status_lines(&entries),
             vec!["R100\tsrc/file.txt\tdst/renamed.txt".to_string()],
@@ -5158,7 +5200,7 @@ new mode 100755
         );
 
         assert_tree_diff_matches_full_all_modes(&db, &left, &right);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5188,14 +5230,19 @@ new mode 100755
             ],
         );
 
-        let entries =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            DiffNameStatusOptions {
                 detect_renames: false,
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            })
-            .unwrap();
+            },
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             status_lines(&entries),
             vec!["M\timage.bin".to_string(), "M\trun.sh".to_string()],
@@ -5203,7 +5250,7 @@ new mode 100755
         );
 
         assert_tree_diff_matches_full_all_modes(&db, &left, &right);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5218,10 +5265,7 @@ new mode 100755
         let inner_b = write_blob(&mut db, b"inner b\n");
         let thing_dir = write_tree(
             &mut db,
-            &[
-                (b"a.txt", 0o100644, inner_a),
-                (b"b.txt", 0o100644, inner_b),
-            ],
+            &[(b"a.txt", 0o100644, inner_a), (b"b.txt", 0o100644, inner_b)],
         );
         let thing_file = write_blob(&mut db, b"now i am a file\n");
 
@@ -5245,14 +5289,19 @@ new mode 100755
             ],
         );
 
-        let entries =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, DiffNameStatusOptions {
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &left,
+            &right,
+            DiffNameStatusOptions {
                 detect_renames: false,
                 detect_copies: false,
                 find_copies_harder: false,
                 rename_empty: true,
-            })
-            .unwrap();
+            },
+        )
+        .expect("test operation should succeed");
         assert_eq!(
             status_lines(&entries),
             vec![
@@ -5266,7 +5315,7 @@ new mode 100755
         );
 
         assert_tree_diff_matches_full_all_modes(&db, &left, &right);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5277,22 +5326,31 @@ new mode 100755
 
         let blob = write_blob(&mut db, b"same\n");
         let sub = write_tree(&mut db, &[(b"f.txt", 0o100644, blob.clone())]);
-        let tree = write_tree(&mut db, &[(b"sub", 0o040000, sub), (b"top.txt", 0o100644, blob)]);
+        let tree = write_tree(
+            &mut db,
+            &[(b"sub", 0o040000, sub), (b"top.txt", 0o100644, blob)],
+        );
 
         let (pruned_left, pruned_right) =
-            changed_tree_entries(&db, ObjectFormat::Sha1, &tree, &tree).unwrap();
+            changed_tree_entries(&db, ObjectFormat::Sha1, &tree, &tree)
+                .expect("test operation should succeed");
         assert!(
             pruned_left.is_empty() && pruned_right.is_empty(),
             "identical trees must produce no changed entries"
         );
 
-        let entries =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &tree, &tree, DiffNameStatusOptions::default())
-                .unwrap();
+        let entries = diff_name_status_trees_with_options(
+            &db,
+            ObjectFormat::Sha1,
+            &tree,
+            &tree,
+            DiffNameStatusOptions::default(),
+        )
+        .expect("test operation should succeed");
         assert!(entries.is_empty(), "identical trees must produce no diff");
 
         assert_tree_diff_matches_full_all_modes(&db, &tree, &tree);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5336,17 +5394,19 @@ new mode 100755
 
         // Reference via the full flatten (the old algorithm).
         let (full_left, full_right) =
-            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right)
+                .expect("test operation should succeed");
         let reference = diff_name_status_maps(
             &full_left,
             &full_right,
             full_left.keys().chain(full_right.keys()),
             options,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let public =
-            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, options).unwrap();
+            diff_name_status_trees_with_options(&db, ObjectFormat::Sha1, &left, &right, options)
+                .expect("test operation should succeed");
         assert_eq!(
             status_lines(&reference),
             status_lines(&public),
@@ -5354,12 +5414,14 @@ new mode 100755
         );
         // The copy must be detected from the unchanged template source.
         assert!(
-            public.iter().any(|entry| matches!(entry.status, NameStatus::Copied(_))
-                && entry.old_path.as_deref() == Some(b"lib/template.txt".as_slice())
-                && entry.path == b"copy.txt"),
+            public
+                .iter()
+                .any(|entry| matches!(entry.status, NameStatus::Copied(_))
+                    && entry.old_path.as_deref() == Some(b"lib/template.txt".as_slice())
+                    && entry.path == b"copy.txt"),
             "copy from unchanged source must be found with find_copies_harder: {public:?}"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -5404,7 +5466,8 @@ new mode 100755
 
         // Reference: full flatten + same detection.
         let (full_left, full_right) =
-            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right).unwrap();
+            collect_full_tree_pair(&db, ObjectFormat::Sha1, &left, &right)
+                .expect("test operation should succeed");
         let reference = diff_name_status_maps_with_renames(
             &full_left,
             &full_right,
@@ -5412,7 +5475,7 @@ new mode 100755
             options,
             |oid| read_blob_bytes(&db, oid),
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let public = diff_name_status_trees_with_rename_options(
             &db,
@@ -5421,7 +5484,7 @@ new mode 100755
             &right,
             options,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert_eq!(
             status_lines(&reference),
@@ -5433,6 +5496,6 @@ new mode 100755
             vec!["R075\ta.txt\tb.txt".to_string()],
             "expected a 75% inexact rename"
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 }

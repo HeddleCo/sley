@@ -100,7 +100,7 @@ fn rm_tracked_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -109,10 +109,7 @@ fn rm_tracked_paths_match_upstream_git() {
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
-        assert!(
-            !rust.join("file.txt").exists(),
-            "sley rm left tracked file"
-        );
+        assert!(!rust.join("file.txt").exists(), "sley rm left tracked file");
         assert!(
             !rust.join("dir/nested.txt").exists(),
             "sley rm left nested tracked file"
@@ -127,9 +124,8 @@ fn rm_tracked_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -139,7 +135,7 @@ fn rm_sha256_tracked_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_sha256_repo(&upstream);
         prepare_sha256_repo(&rust);
 
@@ -165,9 +161,8 @@ fn rm_sha256_tracked_paths_match_upstream_git() {
             let actual = run_output("git", &rust, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -177,7 +172,7 @@ fn rm_cached_keeps_worktree_and_removes_index_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -205,9 +200,8 @@ fn rm_cached_keeps_worktree_and_removes_index_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --cached"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -217,7 +211,7 @@ fn rm_dry_run_reports_paths_without_removing_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -241,9 +235,8 @@ fn rm_dry_run_reports_paths_without_removing_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm -n"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -253,7 +246,7 @@ fn rm_no_dry_run_overrides_dry_run_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -268,9 +261,8 @@ fn rm_no_dry_run_overrides_dry_run_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --no-dry-run"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -280,7 +272,7 @@ fn rm_no_quiet_overrides_quiet_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -294,9 +286,8 @@ fn rm_no_quiet_overrides_quiet_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --no-quiet"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -306,7 +297,7 @@ fn rm_no_cached_overrides_cached_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -324,9 +315,8 @@ fn rm_no_cached_overrides_cached_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --no-cached"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -336,7 +326,7 @@ fn rm_no_force_overrides_force_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -352,9 +342,8 @@ fn rm_no_force_overrides_force_like_upstream_git() {
             rust.join("file.txt").exists(),
             "sley rm --no-force removed modified file"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -364,7 +353,7 @@ fn rm_combined_short_options_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -387,9 +376,8 @@ fn rm_combined_short_options_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm -rn"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -399,7 +387,7 @@ fn rm_ignore_unmatch_skips_missing_paths_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -422,9 +410,8 @@ fn rm_ignore_unmatch_skips_missing_paths_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --ignore-unmatch"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -434,7 +421,7 @@ fn rm_ignore_unmatch_removes_matched_paths_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -457,9 +444,8 @@ fn rm_ignore_unmatch_removes_matched_paths_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --ignore-unmatch with matched path"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -469,7 +455,7 @@ fn rm_no_ignore_unmatch_restores_missing_path_error_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -482,9 +468,8 @@ fn rm_no_ignore_unmatch_restores_missing_path_error_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -494,7 +479,7 @@ fn rm_sparse_flags_are_accepted_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -508,9 +493,8 @@ fn rm_sparse_flags_are_accepted_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm sparse flags"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -520,7 +504,7 @@ fn rm_pathspec_from_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -551,9 +535,8 @@ fn rm_pathspec_from_file_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --pathspec-from-file"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -563,7 +546,7 @@ fn rm_pathspec_file_nul_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -599,9 +582,8 @@ fn rm_pathspec_file_nul_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --pathspec-file-nul"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -611,7 +593,7 @@ fn rm_no_pathspec_file_nul_overrides_previous_value_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -634,9 +616,8 @@ fn rm_no_pathspec_file_nul_overrides_previous_value_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm --no-pathspec-file-nul"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -646,7 +627,7 @@ fn rm_no_pathspec_from_file_keeps_inline_rejection_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -662,9 +643,8 @@ fn rm_no_pathspec_from_file_keeps_inline_rejection_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -674,7 +654,7 @@ fn rm_pathspec_from_file_rejects_inline_pathspecs_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -685,9 +665,8 @@ fn rm_pathspec_from_file_rejects_inline_pathspecs_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -697,7 +676,7 @@ fn rm_pathspec_file_nul_requires_pathspec_from_file_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -705,9 +684,8 @@ fn rm_pathspec_file_nul_requires_pathspec_from_file_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -717,7 +695,7 @@ fn rm_force_removes_modified_paths_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -741,7 +719,6 @@ fn rm_force_removes_modified_paths_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after rm -f"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

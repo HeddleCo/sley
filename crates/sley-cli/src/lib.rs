@@ -204,7 +204,7 @@ fn cmd_archive(args: &[String]) -> Result<()> {
                 format_name = &value["--format=".len()..];
             }
             value if value.starts_with("--prefix=") => {
-                prefix = value["--prefix=".len()..].as_bytes().to_vec();
+                prefix = value.as_bytes()["--prefix=".len()..].to_vec();
             }
             value if value.starts_with("--output=") => {
                 output = Some(value["--output=".len()..].to_string());
@@ -2748,36 +2748,43 @@ fn cmd_clone(args: &[String]) -> Result<()> {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     };
+    let clone_options = sley_remote::CloneOptions {
+        origin: &origin,
+        checkout_branch: &checkout_branch,
+        remote_head_branch: &remote_head_branch,
+        single_branch,
+        // Local clones have no shallow support; `--depth` was warned-and-ignored
+        // above, so the local clone is always a full clone.
+        depth: None,
+        committer: commit_identity_from_env("COMMITTER")?,
+    };
+    let mut credentials = sley_remote::NoCredentials;
+    let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
-        &destination,
-        format,
-        &remote_source,
-        &sley_remote::CloneOptions {
-            origin: &origin,
-            checkout_branch: &checkout_branch,
-            remote_head_branch: &remote_head_branch,
-            single_branch,
-            // Local clones have no shallow support; `--depth` was warned-and-ignored
-            // above, so the local clone is always a full clone.
-            depth: None,
-            committer: commit_identity_from_env("COMMITTER")?,
+        sley_remote::CloneRequest {
+            destination: &destination,
+            format,
+            source: &remote_source,
+            options: &clone_options,
         },
-        &mut |git_dir| {
-            let fetch_refspec = if single_branch {
-                Some(format!(
-                    "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
-                ))
-            } else {
-                Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
-            };
-            configure_local_clone(git_dir, fetch_refspec)
+        sley_remote::CloneServices {
+            configure: &mut |git_dir| {
+                let fetch_refspec = if single_branch {
+                    Some(format!(
+                        "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                    ))
+                } else {
+                    Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+                };
+                configure_local_clone(git_dir, fetch_refspec)
+            },
+            configure_branch: &mut |git_dir, branch| {
+                configure_clone_branch(git_dir, branch, &origin)?;
+                read_repo_config(git_dir)
+            },
+            credentials: &mut credentials,
+            progress: &mut progress,
         },
-        &mut |git_dir, branch| {
-            configure_clone_branch(git_dir, branch, &origin)?;
-            read_repo_config(git_dir)
-        },
-        &mut sley_remote::NoCredentials,
-        &mut StdoutProgress,
     )?;
     let git_dir = outcome.git_dir;
     if !checkout {
@@ -2913,46 +2920,53 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
     let tag_opt = options.tag_opt;
     let config_overrides = options.config_overrides;
     let submodule_active = options.submodule_active;
+    let remote_source = sley_remote::CloneSource::Http(remote);
+    let clone_options = sley_remote::CloneOptions {
+        origin,
+        checkout_branch: &checkout_branch,
+        remote_head_branch: &remote_head_branch,
+        single_branch,
+        depth: options.depth,
+        committer: commit_identity_from_env("COMMITTER")?,
+    };
+    let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
-        options.destination,
-        format,
-        &sley_remote::CloneSource::Http(remote),
-        &sley_remote::CloneOptions {
-            origin,
-            checkout_branch: &checkout_branch,
-            remote_head_branch: &remote_head_branch,
-            single_branch,
-            depth: options.depth,
-            committer: commit_identity_from_env("COMMITTER")?,
+        sley_remote::CloneRequest {
+            destination: options.destination,
+            format,
+            source: &remote_source,
+            options: &clone_options,
         },
-        &mut |git_dir| {
-            apply_clone_template(git_dir, template, template_config)?;
-            let fetch_refspec = if single_branch {
-                Some(format!(
-                    "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
-                ))
-            } else {
-                Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
-            };
-            configure_clone_remote(
-                git_dir,
-                origin,
-                repository,
-                fetch_refspec,
-                false,
-                tag_opt,
-                None,
-            )?;
-            apply_clone_config_overrides(git_dir, config_overrides)?;
-            apply_clone_submodule_active(git_dir, submodule_active)?;
-            read_repo_config(git_dir)
+        sley_remote::CloneServices {
+            configure: &mut |git_dir| {
+                apply_clone_template(git_dir, template, template_config)?;
+                let fetch_refspec = if single_branch {
+                    Some(format!(
+                        "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                    ))
+                } else {
+                    Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+                };
+                configure_clone_remote(
+                    git_dir,
+                    origin,
+                    repository,
+                    fetch_refspec,
+                    false,
+                    tag_opt,
+                    None,
+                )?;
+                apply_clone_config_overrides(git_dir, config_overrides)?;
+                apply_clone_submodule_active(git_dir, submodule_active)?;
+                read_repo_config(git_dir)
+            },
+            configure_branch: &mut |git_dir, branch| {
+                configure_clone_branch(git_dir, branch, origin)?;
+                read_repo_config(git_dir)
+            },
+            credentials: &mut credentials,
+            progress: &mut progress,
         },
-        &mut |git_dir, branch| {
-            configure_clone_branch(git_dir, branch, origin)?;
-            read_repo_config(git_dir)
-        },
-        &mut sley_remote::NoCredentials,
-        &mut StdoutProgress,
     );
     let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
     let git_dir = outcome.git_dir;
@@ -4398,10 +4412,10 @@ fn cmd_apply(args: &[String]) -> Result<()> {
                 mode,
                 content,
             });
-            if patch.is_rename {
-                if let Some(old) = &patch.old_path {
-                    actions.push(ApplyAction::Remove { path: old.clone() });
-                }
+            if patch.is_rename
+                && let Some(old) = &patch.old_path
+            {
+                actions.push(ApplyAction::Remove { path: old.clone() });
             }
         }
     }
@@ -4655,6 +4669,9 @@ enum MergePathResult {
     },
 }
 
+type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
+type MergeConflictPaths = Vec<Vec<u8>>;
+
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
 /// to the ODB and returns per-path results plus the sorted list of conflicted paths.
 fn three_way_merge_trees(
@@ -4664,7 +4681,7 @@ fn three_way_merge_trees(
     theirs: &MergeTreeMap,
     ours_label: &str,
     theirs_label: &str,
-) -> Result<(BTreeMap<Vec<u8>, MergePathResult>, Vec<Vec<u8>>)> {
+) -> Result<(MergePathResults, MergeConflictPaths)> {
     let mut all_paths = BTreeSet::new();
     all_paths.extend(base.keys().cloned());
     all_paths.extend(ours.keys().cloned());
@@ -8457,20 +8474,25 @@ fn run_push(
     let config = read_repo_config(git_dir).unwrap_or_default();
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(&config));
     let mut progress = StdoutProgress;
+    let remote_options = sley_remote::PushOptions {
+        quiet: options.quiet,
+        force: options.force,
+    };
     let outcome = sley_remote::push(
-        git_dir,
-        common_git_dir,
-        format,
-        &config,
-        remote,
-        destination,
-        refspecs,
-        &sley_remote::PushOptions {
-            quiet: options.quiet,
-            force: options.force,
+        sley_remote::PushRequest {
+            git_dir,
+            common_git_dir,
+            format,
+            config: &config,
+            remote,
+            destination,
+            refspecs,
+            options: &remote_options,
         },
-        &mut credentials,
-        &mut progress,
+        sley_remote::PushServices {
+            credentials: &mut credentials,
+            progress: &mut progress,
+        },
     )?;
     if outcome.commands.is_empty() {
         return Ok(());
@@ -8675,15 +8697,19 @@ fn run_fetch(
     let mut credentials = sley_remote::CredentialHelperProvider::new(Some(config));
     let mut progress = StdoutProgress;
     sley_remote::fetch(
-        git_dir,
-        format,
-        config,
-        source,
-        fetch_source,
-        refspecs,
-        &options,
-        &mut credentials,
-        &mut progress,
+        sley_remote::FetchRequest {
+            git_dir,
+            format,
+            config,
+            remote_name: source,
+            source: fetch_source,
+            refspecs,
+            options: &options,
+        },
+        sley_remote::FetchServices {
+            credentials: &mut credentials,
+            progress: &mut progress,
+        },
     )?;
     Ok(())
 }
@@ -19918,49 +19944,49 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
         Vec::new()
     };
     if selected && !output_stage {
-        if cached || deleted || modified {
-            if let Some(index) = sley_worktree::read_repository_index(&git_dir, format)? {
-                let oid_candidates = ls_files_oid_candidates(&index);
-                if ignored && cached {
-                    let ignored_entries = sley_worktree::ignored_index_entries(
-                        &worktree_root,
-                        &index.entries,
-                        exclude_standard,
-                        &exclude_patterns,
-                        &exclude_per_directory,
-                    )?;
-                    write_ls_files_selected(
-                        &mut stdout,
-                        ignored_entries,
-                        deleted_entries.iter(),
-                        modified_entries.iter(),
-                        &pathspec,
-                        LsFilesWriteOptions {
-                            cached,
-                            stage: false,
-                            terminator,
-                            deduplicate,
-                            oid_abbrev,
-                            oid_candidates: &oid_candidates,
-                        },
-                    )?;
-                } else {
-                    write_ls_files_selected(
-                        &mut stdout,
-                        index.entries.iter(),
-                        deleted_entries.iter(),
-                        modified_entries.iter(),
-                        &pathspec,
-                        LsFilesWriteOptions {
-                            cached,
-                            stage: false,
-                            terminator,
-                            deduplicate,
-                            oid_abbrev,
-                            oid_candidates: &oid_candidates,
-                        },
-                    )?;
-                }
+        if (cached || deleted || modified)
+            && let Some(index) = sley_worktree::read_repository_index(&git_dir, format)?
+        {
+            let oid_candidates = ls_files_oid_candidates(&index);
+            if ignored && cached {
+                let ignored_entries = sley_worktree::ignored_index_entries(
+                    &worktree_root,
+                    &index.entries,
+                    exclude_standard,
+                    &exclude_patterns,
+                    &exclude_per_directory,
+                )?;
+                write_ls_files_selected(
+                    &mut stdout,
+                    ignored_entries,
+                    deleted_entries.iter(),
+                    modified_entries.iter(),
+                    &pathspec,
+                    LsFilesWriteOptions {
+                        cached,
+                        stage: false,
+                        terminator,
+                        deduplicate,
+                        oid_abbrev,
+                        oid_candidates: &oid_candidates,
+                    },
+                )?;
+            } else {
+                write_ls_files_selected(
+                    &mut stdout,
+                    index.entries.iter(),
+                    deleted_entries.iter(),
+                    modified_entries.iter(),
+                    &pathspec,
+                    LsFilesWriteOptions {
+                        cached,
+                        stage: false,
+                        terminator,
+                        deduplicate,
+                        oid_abbrev,
+                        oid_candidates: &oid_candidates,
+                    },
+                )?;
             }
         }
         stdout.flush()?;
@@ -19986,10 +20012,15 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                 index.entries.iter(),
                 deleted_entries.iter(),
                 modified_entries.iter(),
-                terminator,
                 &pathspec,
-                oid_abbrev,
-                &oid_candidates,
+                LsFilesWriteOptions {
+                    cached: false,
+                    stage: true,
+                    terminator,
+                    deduplicate: false,
+                    oid_abbrev,
+                    oid_candidates: &oid_candidates,
+                },
             )?;
         } else {
             write_ls_files_index(
@@ -20068,39 +20099,24 @@ fn write_ls_files_index_with_selected<'a>(
     entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
     deleted_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
     modified_entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
-    terminator: u8,
     pathspec: &LsFilesPathspec,
-    oid_abbrev: Option<usize>,
-    oid_candidates: &[ObjectId],
+    options: LsFilesWriteOptions,
 ) -> Result<()> {
     let deleted = deleted_entries.into_iter().collect::<Vec<_>>();
     let modified = modified_entries.into_iter().collect::<Vec<_>>();
     let mut seen = BTreeSet::new();
     for entry in entries {
         write_ls_files_entry_if_selected(
-            stdout,
-            entry,
-            &deleted,
-            &modified,
-            pathspec,
-            LsFilesWriteOptions {
-                cached: false,
-                stage: true,
-                terminator,
-                deduplicate: false,
-                oid_abbrev,
-                oid_candidates,
-            },
-            &mut seen,
+            stdout, entry, &deleted, &modified, pathspec, options, &mut seen,
         )?;
         write_ls_files_index(
             stdout,
             [entry],
             true,
-            terminator,
+            options.terminator,
             pathspec,
-            oid_abbrev,
-            oid_candidates,
+            options.oid_abbrev,
+            options.oid_candidates,
         )?;
     }
     Ok(())
@@ -25785,16 +25801,15 @@ fn cmd_update_ref(args: &[String]) -> Result<()> {
                 "update-ref --stdin does not accept command-line refs".into(),
             ));
         }
-        return update_ref_stdin(
-            &git_dir,
-            &store,
+        let stdin_context = UpdateRefStdinContext {
+            git_dir: &git_dir,
+            store: &store,
             format,
-            deref,
             create_reflog,
-            message,
-            nul,
             batch_updates,
-        );
+            message,
+        };
+        return update_ref_stdin(stdin_context, deref, nul);
     }
     if batch_updates {
         eprintln!("fatal: --batch-updates can only be used with --stdin");
@@ -25871,27 +25886,24 @@ fn update_ref_usage() -> Result<()> {
     Err(GitError::Exit(129))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn update_ref_stdin(
-    git_dir: &Path,
-    store: &FileRefStore,
+struct UpdateRefStdinContext<'a> {
+    git_dir: &'a Path,
+    store: &'a FileRefStore,
     format: ObjectFormat,
-    deref: bool,
     create_reflog: bool,
     message: Vec<u8>,
-    nul: bool,
     batch_updates: bool,
-) -> Result<()> {
+}
+
+struct UpdateRefStdinWriteRequest<'a> {
+    name: String,
+    new_oid: ObjectId,
+    expected_oid: Option<&'a ObjectId>,
+}
+
+fn update_ref_stdin(context: UpdateRefStdinContext<'_>, deref: bool, nul: bool) -> Result<()> {
     if nul {
-        return update_ref_stdin_z(
-            git_dir,
-            store,
-            format,
-            deref,
-            create_reflog,
-            message,
-            batch_updates,
-        );
+        return update_ref_stdin_z(&context, deref);
     }
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -25901,34 +25913,18 @@ fn update_ref_stdin(
         if line.is_empty() {
             continue;
         }
-        let result = update_ref_stdin_line(
-            git_dir,
-            store,
-            format,
-            &mut deref,
-            create_reflog,
-            &message,
-            batch_updates,
-            &mut transaction,
-            line,
-        );
+        let result = update_ref_stdin_line(&context, &mut deref, &mut transaction, line);
         if let Err(err) = result {
-            transaction.restore(store)?;
+            transaction.restore(context.store)?;
             return Err(err);
         }
     }
-    transaction.finish_implicit(store)
+    transaction.finish_implicit(context.store)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_ref_stdin_line(
-    git_dir: &Path,
-    store: &FileRefStore,
-    format: ObjectFormat,
+    context: &UpdateRefStdinContext<'_>,
     deref: &mut bool,
-    create_reflog: bool,
-    message: &[u8],
-    batch_updates: bool,
     transaction: &mut UpdateRefStdinTransaction,
     line: &str,
 ) -> Result<()> {
@@ -25955,118 +25951,120 @@ fn update_ref_stdin_line(
             if parts.len() != 3 && parts.len() != 4 {
                 return update_ref_stdin_bad_command(command);
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
-            let new_oid = ObjectId::from_hex(format, parts[2])?;
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
+            let new_oid = ObjectId::from_hex(context.format, parts[2])?;
             let expected = if let Some(old) = parts.get(3) {
-                Some(parse_update_ref_expected(format, old)?)
+                Some(parse_update_ref_expected(context.format, old)?)
             } else {
                 None
             };
-            if batch_updates {
+            if context.batch_updates {
                 return update_ref_stdin_write_batch(
-                    git_dir,
-                    store,
-                    format,
-                    name,
-                    new_oid,
-                    expected.as_ref(),
-                    create_reflog,
-                    message.to_vec(),
+                    context,
+                    UpdateRefStdinWriteRequest {
+                        name,
+                        new_oid,
+                        expected_oid: expected.as_ref(),
+                    },
                 );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
             update_ref_stdin_write(
-                git_dir,
-                store,
-                format,
-                name,
-                new_oid,
-                expected.as_ref(),
-                create_reflog,
-                message.to_vec(),
+                context,
+                UpdateRefStdinWriteRequest {
+                    name,
+                    new_oid,
+                    expected_oid: expected.as_ref(),
+                },
             )
         }
         "create" => {
             if parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
-            let new_oid = ObjectId::from_hex(format, parts[2])?;
-            if new_oid == zero_oid(format)? {
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
+            let new_oid = ObjectId::from_hex(context.format, parts[2])?;
+            if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(parts[1]);
             }
-            let zero = zero_oid(format)?;
-            if batch_updates {
+            let zero = zero_oid(context.format)?;
+            if context.batch_updates {
                 return update_ref_stdin_write_batch(
-                    git_dir,
-                    store,
-                    format,
-                    name,
-                    new_oid,
-                    Some(&zero),
-                    create_reflog,
-                    message.to_vec(),
+                    context,
+                    UpdateRefStdinWriteRequest {
+                        name,
+                        new_oid,
+                        expected_oid: Some(&zero),
+                    },
                 );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
             update_ref_stdin_write(
-                git_dir,
-                store,
-                format,
-                name,
-                new_oid,
-                Some(&zero),
-                create_reflog,
-                message.to_vec(),
+                context,
+                UpdateRefStdinWriteRequest {
+                    name,
+                    new_oid,
+                    expected_oid: Some(&zero),
+                },
             )
         }
         "delete" => {
             if parts.len() != 2 && parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
             let expected = if let Some(old) = parts.get(2) {
-                Some(parse_update_ref_expected(format, old)?)
+                Some(parse_update_ref_expected(context.format, old)?)
             } else {
                 None
             };
-            if batch_updates {
-                return update_ref_delete_stdin_batch(store, format, &name, expected.as_ref());
+            if context.batch_updates {
+                return update_ref_delete_stdin_batch(
+                    context.store,
+                    context.format,
+                    &name,
+                    expected.as_ref(),
+                );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_delete_stdin(store, format, &name, expected.as_ref())
+            update_ref_delete_stdin(context.store, context.format, &name, expected.as_ref())
         }
         "verify" => {
             if parts.len() != 2 && parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
             let expected = if let Some(old) = parts.get(2) {
-                parse_update_ref_expected(format, old)?
+                parse_update_ref_expected(context.format, old)?
             } else {
-                zero_oid(format)?
+                zero_oid(context.format)?
             };
-            let current = store.read_ref(&name)?;
-            if batch_updates {
-                return verify_update_ref_stdin_batch(format, &name, current.as_ref(), &expected);
+            let current = context.store.read_ref(&name)?;
+            if context.batch_updates {
+                return verify_update_ref_stdin_batch(
+                    context.format,
+                    &name,
+                    current.as_ref(),
+                    &expected,
+                );
             }
-            check_update_ref_stdin_expected(format, &name, current.as_ref(), &expected)
+            check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
         }
         "symref-create" => {
             if parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
-            if transaction.capture(store, &name)? {
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_create(store, &name, parts[2])
+            update_ref_stdin_symref_create(context.store, &name, parts[2])
         }
         "symref-update" => {
             if parts.len() == 2 {
@@ -26078,21 +26076,21 @@ fn update_ref_stdin_line(
             if parts.len() != 3 && parts.len() != 5 {
                 return update_ref_stdin_symref_update_bad(command, parts.get(1).copied());
             }
-            let name = update_ref_effective_name(store, parts[1], *deref)?;
+            let name = update_ref_effective_name(context.store, parts[1], *deref)?;
             let expected = match parts.get(3).copied() {
                 None => None,
                 Some("ref") => Some(UpdateRefStdinSymrefExpected::Target(parts[4].to_string())),
                 Some("oid") => Some(UpdateRefStdinSymrefExpected::Oid(
-                    parse_update_ref_expected(format, parts[4])?,
+                    parse_update_ref_expected(context.format, parts[4])?,
                 )),
                 Some(kind) => {
                     return update_ref_stdin_symref_update_invalid_old_kind(parts[1], kind);
                 }
             };
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_update(store, format, &name, parts[2], expected)
+            update_ref_stdin_symref_update(context.store, context.format, &name, parts[2], expected)
         }
         "symref-verify" => {
             if *deref {
@@ -26101,7 +26099,7 @@ fn update_ref_stdin_line(
             if parts.len() != 2 && parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            update_ref_stdin_symref_verify(store, parts[1], parts.get(2).copied())
+            update_ref_stdin_symref_verify(context.store, parts[1], parts.get(2).copied())
         }
         "symref-delete" => {
             if *deref {
@@ -26110,28 +26108,20 @@ fn update_ref_stdin_line(
             if parts.len() != 2 && parts.len() != 3 {
                 return update_ref_stdin_bad_command(command);
             }
-            if transaction.capture(store, parts[1])? {
+            if transaction.capture(context.store, parts[1])? {
                 return Ok(());
             }
-            update_ref_stdin_symref_delete(store, parts[1], parts.get(2).copied())
+            update_ref_stdin_symref_delete(context.store, parts[1], parts.get(2).copied())
         }
         "start" => transaction.start(),
-        "prepare" => transaction.prepare(store),
-        "commit" => transaction.commit(store),
-        "abort" => transaction.abort(store),
+        "prepare" => transaction.prepare(context.store),
+        "commit" => transaction.commit(context.store),
+        "abort" => transaction.abort(context.store),
         _ => update_ref_stdin_bad_command(command),
     }
 }
 
-fn update_ref_stdin_z(
-    git_dir: &Path,
-    store: &FileRefStore,
-    format: ObjectFormat,
-    deref: bool,
-    create_reflog: bool,
-    message: Vec<u8>,
-    batch_updates: bool,
-) -> Result<()> {
+fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Result<()> {
     let mut input = Vec::new();
     io::stdin().read_to_end(&mut input)?;
     let mut cursor = 0usize;
@@ -26143,38 +26133,27 @@ fn update_ref_stdin_z(
             continue;
         }
         let result = update_ref_stdin_z_command(
-            git_dir,
-            store,
-            format,
+            context,
             &mut deref,
-            create_reflog,
-            &message,
             &input,
             &mut cursor,
             &command,
-            batch_updates,
             &mut transaction,
         );
         if let Err(err) = result {
-            transaction.restore(store)?;
+            transaction.restore(context.store)?;
             return Err(err);
         }
     }
-    transaction.finish_implicit(store)
+    transaction.finish_implicit(context.store)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_ref_stdin_z_command(
-    git_dir: &Path,
-    store: &FileRefStore,
-    format: ObjectFormat,
+    context: &UpdateRefStdinContext<'_>,
     deref: &mut bool,
-    create_reflog: bool,
-    message: &[u8],
     input: &[u8],
     cursor: &mut usize,
     command: &str,
-    batch_updates: bool,
     transaction: &mut UpdateRefStdinTransaction,
 ) -> Result<()> {
     let (verb, name) = update_ref_stdin_z_verb_and_name(command);
@@ -26198,37 +26177,33 @@ fn update_ref_stdin_z_command(
             };
             let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
             let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
-            let name = update_ref_effective_name(store, name, *deref)?;
-            let new_oid = ObjectId::from_hex(format, &new)?;
+            let name = update_ref_effective_name(context.store, name, *deref)?;
+            let new_oid = ObjectId::from_hex(context.format, &new)?;
             let expected = if old.is_empty() {
                 None
             } else {
-                Some(parse_update_ref_expected(format, &old)?)
+                Some(parse_update_ref_expected(context.format, &old)?)
             };
-            if batch_updates {
+            if context.batch_updates {
                 return update_ref_stdin_write_batch(
-                    git_dir,
-                    store,
-                    format,
-                    name,
-                    new_oid,
-                    expected.as_ref(),
-                    create_reflog,
-                    message.to_vec(),
+                    context,
+                    UpdateRefStdinWriteRequest {
+                        name,
+                        new_oid,
+                        expected_oid: expected.as_ref(),
+                    },
                 );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
             update_ref_stdin_write(
-                git_dir,
-                store,
-                format,
-                name,
-                new_oid,
-                expected.as_ref(),
-                create_reflog,
-                message.to_vec(),
+                context,
+                UpdateRefStdinWriteRequest {
+                    name,
+                    new_oid,
+                    expected_oid: expected.as_ref(),
+                },
             )
         }
         "create" => {
@@ -26236,36 +26211,32 @@ fn update_ref_stdin_z_command(
                 return update_ref_stdin_bad_command(verb);
             };
             let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
-            let name = update_ref_effective_name(store, name, *deref)?;
-            let new_oid = ObjectId::from_hex(format, &new)?;
-            if new_oid == zero_oid(format)? {
+            let name = update_ref_effective_name(context.store, name, *deref)?;
+            let new_oid = ObjectId::from_hex(context.format, &new)?;
+            if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(&name);
             }
-            let zero = zero_oid(format)?;
-            if batch_updates {
+            let zero = zero_oid(context.format)?;
+            if context.batch_updates {
                 return update_ref_stdin_write_batch(
-                    git_dir,
-                    store,
-                    format,
-                    name,
-                    new_oid,
-                    Some(&zero),
-                    create_reflog,
-                    message.to_vec(),
+                    context,
+                    UpdateRefStdinWriteRequest {
+                        name,
+                        new_oid,
+                        expected_oid: Some(&zero),
+                    },
                 );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
             update_ref_stdin_write(
-                git_dir,
-                store,
-                format,
-                name,
-                new_oid,
-                Some(&zero),
-                create_reflog,
-                message.to_vec(),
+                context,
+                UpdateRefStdinWriteRequest {
+                    name,
+                    new_oid,
+                    expected_oid: Some(&zero),
+                },
             )
         }
         "delete" => {
@@ -26273,47 +26244,57 @@ fn update_ref_stdin_z_command(
                 return update_ref_stdin_bad_command(verb);
             };
             let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
-            let name = update_ref_effective_name(store, name, *deref)?;
+            let name = update_ref_effective_name(context.store, name, *deref)?;
             let expected = if old.is_empty() {
                 None
             } else {
-                Some(parse_update_ref_expected(format, &old)?)
+                Some(parse_update_ref_expected(context.format, &old)?)
             };
-            if batch_updates {
-                return update_ref_delete_stdin_batch(store, format, &name, expected.as_ref());
+            if context.batch_updates {
+                return update_ref_delete_stdin_batch(
+                    context.store,
+                    context.format,
+                    &name,
+                    expected.as_ref(),
+                );
             }
-            if transaction.capture(store, &name)? {
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_delete_stdin(store, format, &name, expected.as_ref())
+            update_ref_delete_stdin(context.store, context.format, &name, expected.as_ref())
         }
         "verify" => {
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
             let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
-            let name = update_ref_effective_name(store, name, *deref)?;
+            let name = update_ref_effective_name(context.store, name, *deref)?;
             let expected = if old.is_empty() {
-                zero_oid(format)?
+                zero_oid(context.format)?
             } else {
-                parse_update_ref_expected(format, &old)?
+                parse_update_ref_expected(context.format, &old)?
             };
-            let current = store.read_ref(&name)?;
-            if batch_updates {
-                return verify_update_ref_stdin_batch(format, &name, current.as_ref(), &expected);
+            let current = context.store.read_ref(&name)?;
+            if context.batch_updates {
+                return verify_update_ref_stdin_batch(
+                    context.format,
+                    &name,
+                    current.as_ref(),
+                    &expected,
+                );
             }
-            check_update_ref_stdin_expected(format, &name, current.as_ref(), &expected)
+            check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
         }
         "symref-create" => {
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
             let target = update_ref_stdin_z_next(input, cursor, command, "<new-target>")?;
-            let name = update_ref_effective_name(store, name, *deref)?;
-            if transaction.capture(store, &name)? {
+            let name = update_ref_effective_name(context.store, name, *deref)?;
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_create(store, &name, &target)
+            update_ref_stdin_symref_create(context.store, &name, &target)
         }
         "symref-update" => {
             let Some(name) = name else {
@@ -26331,16 +26312,16 @@ fn update_ref_stdin_z_command(
                     let _ = update_ref_stdin_z_next(input, cursor, command, "")?;
                     let old_oid = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
                     Some(UpdateRefStdinSymrefExpected::Oid(
-                        parse_update_ref_expected(format, &old_oid)?,
+                        parse_update_ref_expected(context.format, &old_oid)?,
                     ))
                 }
                 _ => None,
             };
-            let name = update_ref_effective_name(store, name, *deref)?;
-            if transaction.capture(store, &name)? {
+            let name = update_ref_effective_name(context.store, name, *deref)?;
+            if transaction.capture(context.store, &name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_update(store, format, &name, &target, expected)
+            update_ref_stdin_symref_update(context.store, context.format, &name, &target, expected)
         }
         "symref-verify" => {
             if *deref {
@@ -26351,7 +26332,7 @@ fn update_ref_stdin_z_command(
             };
             let target = update_ref_stdin_z_next(input, cursor, command, "<old-target>")?;
             let expected = (!target.is_empty()).then_some(target.as_str());
-            update_ref_stdin_symref_verify(store, name, expected)
+            update_ref_stdin_symref_verify(context.store, name, expected)
         }
         "symref-delete" => {
             if *deref {
@@ -26362,10 +26343,10 @@ fn update_ref_stdin_z_command(
             };
             let target = update_ref_stdin_z_next(input, cursor, command, "<old-target>")?;
             let expected = (!target.is_empty()).then_some(target.as_str());
-            if transaction.capture(store, name)? {
+            if transaction.capture(context.store, name)? {
                 return Ok(());
             }
-            update_ref_stdin_symref_delete(store, name, expected)
+            update_ref_stdin_symref_delete(context.store, name, expected)
         }
         "start" | "prepare" | "commit" | "abort" => {
             if name.is_some() {
@@ -26373,9 +26354,9 @@ fn update_ref_stdin_z_command(
             }
             match verb {
                 "start" => transaction.start(),
-                "prepare" => transaction.prepare(store),
-                "commit" => transaction.commit(store),
-                "abort" => transaction.abort(store),
+                "prepare" => transaction.prepare(context.store),
+                "commit" => transaction.commit(context.store),
+                "abort" => transaction.abort(context.store),
                 _ => unreachable!(),
             }
         }
@@ -26838,54 +26819,50 @@ fn update_ref_requires_commit(name: &str) -> bool {
     name == "HEAD" || name.starts_with("refs/heads/")
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_ref_stdin_write_batch(
-    git_dir: &Path,
-    store: &FileRefStore,
-    format: ObjectFormat,
-    name: String,
-    new_oid: ObjectId,
-    expected_oid: Option<&ObjectId>,
-    create_reflog: bool,
-    message: Vec<u8>,
+    context: &UpdateRefStdinContext<'_>,
+    request: UpdateRefStdinWriteRequest<'_>,
 ) -> Result<()> {
-    let current = store.read_ref(&name)?;
-    if let Some(expected_oid) = expected_oid
+    let current = context.store.read_ref(&request.name)?;
+    if let Some(expected_oid) = request.expected_oid
         && let Some(rejection) = update_ref_stdin_expected_rejection(
-            format,
-            &name,
+            context.format,
+            &request.name,
             current.as_ref(),
             expected_oid,
-            new_oid.to_string(),
+            request.new_oid.to_string(),
         )?
     {
         print_update_ref_stdin_rejection(rejection);
         return Ok(());
     }
-    if new_oid == zero_oid(format)? {
-        return update_ref_delete_stdin(store, format, &name, None);
+    if request.new_oid == zero_oid(context.format)? {
+        return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
-    if let Err(reason) = check_update_ref_new_value(git_dir, format, &name, &new_oid) {
+    if let Err(reason) = check_update_ref_new_value(
+        context.git_dir,
+        context.format,
+        &request.name,
+        &request.new_oid,
+    ) {
         println!(
             "rejected {} {} {} invalid new value provided",
-            name,
-            new_oid,
-            expected_oid
+            request.name,
+            request.new_oid,
+            request
+                .expected_oid
                 .map(ObjectId::to_string)
                 .unwrap_or_else(|| "(null)".to_string())
         );
-        eprintln!("error: cannot update ref '{name}': {reason}");
+        eprintln!("error: cannot update ref '{}': {reason}", request.name);
         return Ok(());
     }
     update_ref_stdin_write(
-        git_dir,
-        store,
-        format,
-        name,
-        new_oid,
-        None,
-        create_reflog,
-        message,
+        context,
+        UpdateRefStdinWriteRequest {
+            expected_oid: None,
+            ..request
+        },
     )
 }
 
@@ -26925,44 +26902,49 @@ fn verify_update_ref_stdin_batch(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_ref_stdin_write(
-    git_dir: &Path,
-    store: &FileRefStore,
-    format: ObjectFormat,
-    name: String,
-    new_oid: ObjectId,
-    expected_oid: Option<&ObjectId>,
-    create_reflog: bool,
-    message: Vec<u8>,
+    context: &UpdateRefStdinContext<'_>,
+    request: UpdateRefStdinWriteRequest<'_>,
 ) -> Result<()> {
-    let current = store.read_ref(&name)?;
-    if let Some(expected_oid) = expected_oid {
-        check_update_ref_stdin_expected(format, &name, current.as_ref(), expected_oid)?;
+    let current = context.store.read_ref(&request.name)?;
+    if let Some(expected_oid) = request.expected_oid {
+        check_update_ref_stdin_expected(
+            context.format,
+            &request.name,
+            current.as_ref(),
+            expected_oid,
+        )?;
     }
-    if new_oid == zero_oid(format)? {
-        return update_ref_delete_stdin(store, format, &name, None);
+    if request.new_oid == zero_oid(context.format)? {
+        return update_ref_delete_stdin(context.store, context.format, &request.name, None);
     }
-    check_update_ref_new_value(git_dir, format, &name, &new_oid).map_err(|reason| {
-        eprintln!("fatal: cannot update ref '{name}': {reason}");
+    check_update_ref_new_value(
+        context.git_dir,
+        context.format,
+        &request.name,
+        &request.new_oid,
+    )
+    .map_err(|reason| {
+        eprintln!("fatal: cannot update ref '{}': {reason}", request.name);
         GitError::Exit(128)
     })?;
     let old_oid = match current {
         Some(RefTarget::Direct(oid)) => oid,
-        _ => zero_oid(format)?,
+        _ => zero_oid(context.format)?,
     };
     let reflog =
-        update_ref_should_write_reflog(git_dir, &name, create_reflog)?.then(|| ReflogEntry {
-            old_oid,
-            new_oid: new_oid.clone(),
-            committer: default_committer(),
-            message,
-        });
-    let mut tx = store.transaction();
+        update_ref_should_write_reflog(context.git_dir, &request.name, context.create_reflog)?
+            .then(|| ReflogEntry {
+                old_oid,
+                new_oid: request.new_oid.clone(),
+                committer: default_committer(),
+                message: context.message.clone(),
+            });
+    let mut tx = context.store.transaction();
     tx.update(RefUpdate {
-        name,
+        name: request.name,
         expected: None,
-        new: RefTarget::Direct(new_oid),
+        new: RefTarget::Direct(request.new_oid),
         reflog,
     });
     tx.commit()
@@ -31610,7 +31592,7 @@ fn revision_ref_name_exists(git_dir: &Path, format: ObjectFormat, rev: &str) -> 
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 fn default_committer() -> Vec<u8> {

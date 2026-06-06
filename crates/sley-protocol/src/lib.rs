@@ -5165,8 +5165,7 @@ where
         .iter()
         .filter(|command| is_receive_pack_delete_command(command))
     {
-        if !is_zero_oid(&command.old_id) && read_ref(&command.name)? != Some(command.old_id.clone())
-        {
+        if !command.old_id.is_null() && read_ref(&command.name)? != Some(command.old_id.clone()) {
             return Err(GitError::Transaction(format!(
                 "expected ref {} to match",
                 command.name
@@ -5590,11 +5589,7 @@ fn is_known_receive_pack_capability(name: &str) -> bool {
 }
 
 fn is_receive_pack_delete_command(command: &ReceivePackCommand) -> bool {
-    is_zero_oid(&command.new_id)
-}
-
-fn is_zero_oid(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
+    command.new_id.is_null()
 }
 
 fn parse_receive_pack_unpack_status(payload: &[u8]) -> Result<ReceivePackUnpackStatus> {
@@ -6528,7 +6523,7 @@ fn refspec_is_excluded(negative: &[&RefSpec], source: &str) -> Result<bool> {
 }
 
 fn zero_object_id(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 fn local_ref<'a>(refs: &'a [PushSourceRef], name: &str) -> Option<&'a PushSourceRef> {
@@ -6788,7 +6783,9 @@ mod tests {
     fn pkt_line_frame_encodes_data_and_control_frames() {
         assert_eq!(PktLine(b"hello\n".to_vec()).encode(), b"000ahello\n");
         assert_eq!(
-            PktLineFrame::data(b"hello\n".to_vec()).unwrap().encode(),
+            PktLineFrame::data(b"hello\n".to_vec())
+                .expect("test operation should succeed")
+                .encode(),
             b"000ahello\n"
         );
         assert_eq!(PktLineFrame::Flush.encode(), b"0000");
@@ -6796,9 +6793,9 @@ mod tests {
         assert_eq!(PktLineFrame::ResponseEnd.encode(), b"0002");
         assert_eq!(
             PktLineFrame::data(b"hello\n".to_vec())
-                .unwrap()
+                .expect("test operation should succeed")
                 .try_encode()
-                .unwrap(),
+                .expect("test operation should succeed"),
             b"000ahello\n"
         );
     }
@@ -6806,26 +6803,27 @@ mod tests {
     #[test]
     fn pkt_line_frame_parses_data_and_control_frames() {
         assert_eq!(
-            PktLineFrame::parse(b"000ahello\n").unwrap(),
+            PktLineFrame::parse(b"000ahello\n").expect("test operation should succeed"),
             (PktLineFrame::Data(b"hello\n".to_vec()), 10)
         );
         assert_eq!(
-            PktLineFrame::parse(b"0000").unwrap(),
+            PktLineFrame::parse(b"0000").expect("test operation should succeed"),
             (PktLineFrame::Flush, 4)
         );
         assert_eq!(
-            PktLineFrame::parse(b"0001").unwrap(),
+            PktLineFrame::parse(b"0001").expect("test operation should succeed"),
             (PktLineFrame::Delimiter, 4)
         );
         assert_eq!(
-            PktLineFrame::parse(b"0002").unwrap(),
+            PktLineFrame::parse(b"0002").expect("test operation should succeed"),
             (PktLineFrame::ResponseEnd, 4)
         );
     }
 
     #[test]
     fn pkt_line_stream_parses_multiple_frames() {
-        let frames = parse_pkt_line_stream(b"000eversion 2\n00010009done\n0000").unwrap();
+        let frames = parse_pkt_line_stream(b"000eversion 2\n00010009done\n0000")
+            .expect("test operation should succeed");
         assert_eq!(
             frames,
             vec![
@@ -6846,21 +6844,25 @@ mod tests {
             PktLineFrame::Flush,
         ];
         let mut encoded = Vec::new();
-        write_pkt_line_frames(&mut encoded, &frames).unwrap();
+        write_pkt_line_frames(&mut encoded, &frames).expect("test operation should succeed");
         assert_eq!(encoded, b"000eversion 2\n00010009done\n0000");
         assert_eq!(
-            read_pkt_line_frames(&mut encoded.as_slice()).unwrap(),
+            read_pkt_line_frames(&mut encoded.as_slice()).expect("test operation should succeed"),
             frames
         );
 
         let mut empty: &[u8] = b"";
-        assert_eq!(read_pkt_line_frame(&mut empty).unwrap(), None);
+        assert_eq!(
+            read_pkt_line_frame(&mut empty).expect("test operation should succeed"),
+            None
+        );
     }
 
     #[test]
     fn pkt_line_stream_reads_until_control_packets() {
         let input = b"000eversion 2\n0000trailing";
-        let frames = read_pkt_line_frames_until_flush(&mut &input[..]).unwrap();
+        let frames = read_pkt_line_frames_until_flush(&mut &input[..])
+            .expect("test operation should succeed");
         assert_eq!(
             frames,
             vec![
@@ -6870,7 +6872,8 @@ mod tests {
         );
 
         let input = b"0009done\n0002next";
-        let frames = read_pkt_line_frames_until_response_end(&mut &input[..]).unwrap();
+        let frames = read_pkt_line_frames_until_response_end(&mut &input[..])
+            .expect("test operation should succeed");
         assert_eq!(
             frames,
             vec![
@@ -6903,7 +6906,8 @@ mod tests {
 
     #[test]
     fn protocol_error_lines_parse_encode_and_stream() {
-        let error = parse_error_line(b"ERR remote rejected request\n").unwrap();
+        let error = parse_error_line(b"ERR remote rejected request\n")
+            .expect("test operation should succeed");
         assert_eq!(
             error,
             ProtocolErrorLine {
@@ -6911,26 +6915,30 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_error_line(&error).unwrap(),
+            encode_error_line(&error).expect("test operation should succeed"),
             b"ERR remote rejected request\n"
         );
         assert_eq!(
             parse_error_frame(&PktLineFrame::Data(
                 b"ERR remote rejected request\n".to_vec()
             ))
-            .unwrap(),
+            .expect("test operation should succeed"),
             Some(error.clone())
         );
         assert_eq!(
-            parse_error_frame(&PktLineFrame::Data(b"NAK\n".to_vec())).unwrap(),
+            parse_error_frame(&PktLineFrame::Data(b"NAK\n".to_vec()))
+                .expect("test operation should succeed"),
             None
         );
 
         let mut encoded = Vec::new();
-        write_error_line(&mut encoded, &error).unwrap();
+        write_error_line(&mut encoded, &error).expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
         let mut input = encoded.as_slice();
-        assert_eq!(read_error_line(&mut input).unwrap(), error);
+        assert_eq!(
+            read_error_line(&mut input).expect("test operation should succeed"),
+            error
+        );
         assert_eq!(input, b"tail");
     }
 
@@ -6940,17 +6948,20 @@ mod tests {
         assert!(parse_error_line(b"ERR \n").is_err());
         assert!(parse_error_line(b"ERR bad\0message\n").is_err());
         assert!(parse_error_line(b"NAK\n").is_err());
-        assert!(encode_error_line(&ProtocolErrorLine {
-            message: "bad\nmessage".into(),
-        })
-        .is_err());
+        assert!(
+            encode_error_line(&ProtocolErrorLine {
+                message: "bad\nmessage".into(),
+            })
+            .is_err()
+        );
         assert!(read_error_line(&mut &b"0000"[..]).is_err());
     }
 
     #[test]
     fn refspec_parser_handles_fetch_push_and_negative_forms() {
         assert_eq!(
-            parse_refspec("+refs/heads/*:refs/remotes/origin/*").unwrap(),
+            parse_refspec("+refs/heads/*:refs/remotes/origin/*")
+                .expect("test operation should succeed"),
             RefSpec {
                 force: true,
                 negative: false,
@@ -6960,7 +6971,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_refspec("refs/heads/main").unwrap(),
+            parse_refspec("refs/heads/main").expect("test operation should succeed"),
             RefSpec {
                 force: false,
                 negative: false,
@@ -6970,7 +6981,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_refspec(":refs/heads/topic").unwrap(),
+            parse_refspec(":refs/heads/topic").expect("test operation should succeed"),
             RefSpec {
                 force: false,
                 negative: false,
@@ -6980,7 +6991,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_refspec(":").unwrap(),
+            parse_refspec(":").expect("test operation should succeed"),
             RefSpec {
                 force: false,
                 negative: false,
@@ -6990,7 +7001,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_refspec("^refs/tags/private/*").unwrap(),
+            parse_refspec("^refs/tags/private/*").expect("test operation should succeed"),
             RefSpec {
                 force: false,
                 negative: true,
@@ -7003,31 +7014,50 @@ mod tests {
 
     #[test]
     fn refspec_encode_and_map_sources() {
-        let pattern = parse_refspec("+refs/heads/*:refs/remotes/origin/*").unwrap();
+        let pattern = parse_refspec("+refs/heads/*:refs/remotes/origin/*")
+            .expect("test operation should succeed");
         assert_eq!(
-            encode_refspec(&pattern).unwrap(),
+            encode_refspec(&pattern).expect("test operation should succeed"),
             "+refs/heads/*:refs/remotes/origin/*"
         );
-        assert!(refspec_matches_source(&pattern, "refs/heads/main").unwrap());
+        assert!(
+            refspec_matches_source(&pattern, "refs/heads/main")
+                .expect("test operation should succeed")
+        );
         assert_eq!(
-            refspec_map_source(&pattern, "refs/heads/main").unwrap(),
+            refspec_map_source(&pattern, "refs/heads/main").expect("test operation should succeed"),
             Some("refs/remotes/origin/main".into())
         );
-        assert_eq!(refspec_map_source(&pattern, "refs/tags/v1").unwrap(), None);
-
-        let direct = parse_refspec("HEAD:refs/heads/main").unwrap();
-        assert_eq!(encode_refspec(&direct).unwrap(), "HEAD:refs/heads/main");
         assert_eq!(
-            refspec_map_source(&direct, "HEAD").unwrap(),
+            refspec_map_source(&pattern, "refs/tags/v1").expect("test operation should succeed"),
+            None
+        );
+
+        let direct = parse_refspec("HEAD:refs/heads/main").expect("test operation should succeed");
+        assert_eq!(
+            encode_refspec(&direct).expect("test operation should succeed"),
+            "HEAD:refs/heads/main"
+        );
+        assert_eq!(
+            refspec_map_source(&direct, "HEAD").expect("test operation should succeed"),
             Some("refs/heads/main".into())
         );
 
-        let delete = parse_refspec(":refs/heads/old").unwrap();
-        assert_eq!(encode_refspec(&delete).unwrap(), ":refs/heads/old");
-        assert_eq!(refspec_map_source(&delete, "HEAD").unwrap(), None);
+        let delete = parse_refspec(":refs/heads/old").expect("test operation should succeed");
+        assert_eq!(
+            encode_refspec(&delete).expect("test operation should succeed"),
+            ":refs/heads/old"
+        );
+        assert_eq!(
+            refspec_map_source(&delete, "HEAD").expect("test operation should succeed"),
+            None
+        );
 
-        let matching = parse_refspec(":").unwrap();
-        assert_eq!(encode_refspec(&matching).unwrap(), ":");
+        let matching = parse_refspec(":").expect("test operation should succeed");
+        assert_eq!(
+            encode_refspec(&matching).expect("test operation should succeed"),
+            ":"
+        );
     }
 
     #[test]
@@ -7039,14 +7069,16 @@ mod tests {
         assert!(parse_refspec("refs/heads/**:refs/remotes/origin/*").is_err());
         assert!(parse_refspec("refs/heads/main:refs/remotes/origin/main:extra").is_err());
         assert!(parse_refspec("refs/heads/main\n").is_err());
-        assert!(encode_refspec(&RefSpec {
-            force: false,
-            negative: false,
-            src: Some("refs/heads/*".into()),
-            dst: Some("refs/remotes/origin/main".into()),
-            pattern: true,
-        })
-        .is_err());
+        assert!(
+            encode_refspec(&RefSpec {
+                force: false,
+                negative: false,
+                src: Some("refs/heads/*".into()),
+                dst: Some("refs/remotes/origin/main".into()),
+                pattern: true,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -7055,14 +7087,15 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let input = b"1111111111111111111111111111111111111111\t\tbranch 'main' of ../bundle.bdl\n2222222222222222222222222222222222222222\tnot-for-merge\ttag 'v1' of ../bundle.bdl\n";
-        let records = parse_fetch_head(ObjectFormat::Sha1, input).unwrap();
+        let records =
+            parse_fetch_head(ObjectFormat::Sha1, input).expect("test operation should succeed");
         assert_eq!(
             records,
             vec![
@@ -7078,21 +7111,27 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(encode_fetch_head(&records).unwrap(), input);
         assert_eq!(
-            parse_fetch_head(ObjectFormat::Sha1, b"").unwrap(),
+            encode_fetch_head(&records).expect("test operation should succeed"),
+            input
+        );
+        assert_eq!(
+            parse_fetch_head(ObjectFormat::Sha1, b"").expect("test operation should succeed"),
             Vec::<FetchHeadRecord>::new()
         );
         assert_eq!(
-            fetch_head_remote_description("refs/heads/main", "../bundle.bdl").unwrap(),
+            fetch_head_remote_description("refs/heads/main", "../bundle.bdl")
+                .expect("test operation should succeed"),
             "branch 'main' of ../bundle.bdl"
         );
         assert_eq!(
-            fetch_head_remote_description("refs/tags/v1", "../bundle.bdl").unwrap(),
+            fetch_head_remote_description("refs/tags/v1", "../bundle.bdl")
+                .expect("test operation should succeed"),
             "tag 'v1' of ../bundle.bdl"
         );
         assert_eq!(
-            fetch_head_remote_description("HEAD", "../bundle.bdl").unwrap(),
+            fetch_head_remote_description("HEAD", "../bundle.bdl")
+                .expect("test operation should succeed"),
             "HEAD of ../bundle.bdl"
         );
     }
@@ -7104,15 +7143,15 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             not_for_merge: false,
             description: "branch 'main' of ../bundle.bdl".into(),
         }];
         let mut encoded = Vec::new();
-        write_fetch_head(&mut encoded, &records).unwrap();
+        write_fetch_head(&mut encoded, &records).expect("test operation should succeed");
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_fetch_head(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_fetch_head(ObjectFormat::Sha1, &mut input).expect("test operation should succeed"),
             records
         );
         assert!(input.is_empty());
@@ -7120,27 +7159,33 @@ mod tests {
 
     #[test]
     fn fetch_head_records_reject_malformed_lines() {
-        assert!(parse_fetch_head(
-            ObjectFormat::Sha1,
-            b"1111111111111111111111111111111111111111\t\tbranch 'main'"
-        )
-        .is_err());
-        assert!(parse_fetch_head(
-            ObjectFormat::Sha1,
-            b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
-        )
-        .is_err());
-        assert!(parse_fetch_head(ObjectFormat::Sha1, b"not-a-hash\t\tbranch 'main'\n").is_err());
-        assert!(encode_fetch_head(&[FetchHeadRecord {
-            oid: ObjectId::from_hex(
+        assert!(
+            parse_fetch_head(
                 ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111"
+                b"1111111111111111111111111111111111111111\t\tbranch 'main'"
             )
-            .unwrap(),
-            not_for_merge: false,
-            description: "bad\ndescription".into(),
-        }])
-        .is_err());
+            .is_err()
+        );
+        assert!(
+            parse_fetch_head(
+                ObjectFormat::Sha1,
+                b"1111111111111111111111111111111111111111\tfor-merge\tbranch 'main'\n"
+            )
+            .is_err()
+        );
+        assert!(parse_fetch_head(ObjectFormat::Sha1, b"not-a-hash\t\tbranch 'main'\n").is_err());
+        assert!(
+            encode_fetch_head(&[FetchHeadRecord {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111"
+                )
+                .expect("test operation should succeed"),
+                not_for_merge: false,
+                description: "bad\ndescription".into(),
+            }])
+            .is_err()
+        );
     }
 
     #[test]
@@ -7149,12 +7194,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let next = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let refs = vec![
             RefAdvertisement {
                 oid: main.clone(),
@@ -7168,11 +7213,12 @@ mod tests {
             },
         ];
         let refspecs = vec![
-            parse_refspec("+refs/heads/*:refs/remotes/origin/*").unwrap(),
-            parse_refspec("^refs/heads/tmp").unwrap(),
+            parse_refspec("+refs/heads/*:refs/remotes/origin/*")
+                .expect("test operation should succeed"),
+            parse_refspec("^refs/heads/tmp").expect("test operation should succeed"),
         ];
         assert_eq!(
-            plan_fetch_ref_updates(&refs, &refspecs, false).unwrap(),
+            plan_fetch_ref_updates(&refs, &refspecs, false).expect("test operation should succeed"),
             vec![FetchRefUpdate {
                 src: "refs/heads/main".into(),
                 dst: Some("refs/remotes/origin/main".into()),
@@ -7188,7 +7234,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let refs = vec![
             RefAdvertisement {
                 oid: commit.clone(),
@@ -7201,8 +7247,12 @@ mod tests {
                 capabilities: Vec::new(),
             },
         ];
-        let refspecs = vec![parse_refspec("refs/heads/main:refs/heads/main").unwrap()];
-        let updates = plan_fetch_ref_updates(&refs, &refspecs, true).unwrap();
+        let refspecs = vec![
+            parse_refspec("refs/heads/main:refs/heads/main")
+                .expect("test operation should succeed"),
+        ];
+        let updates =
+            plan_fetch_ref_updates(&refs, &refspecs, true).expect("test operation should succeed");
         assert_eq!(
             updates,
             vec![
@@ -7221,7 +7271,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            fetch_ref_updates_to_fetch_head(&updates, "../bundle.bdl").unwrap(),
+            fetch_ref_updates_to_fetch_head(&updates, "../bundle.bdl")
+                .expect("test operation should succeed"),
             vec![
                 FetchHeadRecord {
                     oid: commit.clone(),
@@ -7244,22 +7295,26 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             name: "refs/heads/main".into(),
             capabilities: Vec::new(),
         }];
-        assert!(plan_fetch_ref_updates(
-            &refs,
-            &[parse_refspec("refs/heads/missing").unwrap()],
-            false
-        )
-        .is_err());
-        assert!(plan_fetch_ref_updates(
-            &refs,
-            &[parse_refspec(":refs/heads/main").unwrap()],
-            false
-        )
-        .is_err());
+        assert!(
+            plan_fetch_ref_updates(
+                &refs,
+                &[parse_refspec("refs/heads/missing").expect("test operation should succeed")],
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            plan_fetch_ref_updates(
+                &refs,
+                &[parse_refspec(":refs/heads/main").expect("test operation should succeed")],
+                false
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7268,13 +7323,13 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
-        let zero = zero_object_id(ObjectFormat::Sha1).unwrap();
+        .expect("test operation should succeed");
+        let zero = zero_object_id(ObjectFormat::Sha1).expect("test operation should succeed");
         let local_refs = vec![
             PushSourceRef {
                 oid: new.clone(),
@@ -7303,9 +7358,9 @@ mod tests {
                 ObjectFormat::Sha1,
                 &local_refs,
                 &remote_refs,
-                &[parse_refspec("refs/heads/main").unwrap()],
+                &[parse_refspec("refs/heads/main").expect("test operation should succeed")],
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             vec![ReceivePackCommand {
                 old_id: old.clone(),
                 new_id: new.clone(),
@@ -7317,9 +7372,10 @@ mod tests {
                 ObjectFormat::Sha1,
                 &local_refs,
                 &remote_refs,
-                &[parse_refspec("refs/heads/new:refs/heads/new").unwrap()],
+                &[parse_refspec("refs/heads/new:refs/heads/new")
+                    .expect("test operation should succeed")],
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             vec![ReceivePackCommand {
                 old_id: zero.clone(),
                 new_id: new.clone(),
@@ -7331,9 +7387,9 @@ mod tests {
                 ObjectFormat::Sha1,
                 &local_refs,
                 &remote_refs,
-                &[parse_refspec(":refs/heads/old").unwrap()],
+                &[parse_refspec(":refs/heads/old").expect("test operation should succeed")],
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             vec![ReceivePackCommand {
                 old_id: old.clone(),
                 new_id: zero,
@@ -7345,9 +7401,9 @@ mod tests {
                 ObjectFormat::Sha1,
                 &local_refs,
                 &remote_refs,
-                &[parse_refspec(":").unwrap()],
+                &[parse_refspec(":").expect("test operation should succeed")],
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             vec![ReceivePackCommand {
                 old_id: old,
                 new_id: new,
@@ -7362,8 +7418,8 @@ mod tests {
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
-        let zero = zero_object_id(ObjectFormat::Sha1).unwrap();
+        .expect("test operation should succeed");
+        let zero = zero_object_id(ObjectFormat::Sha1).expect("test operation should succeed");
         let local_refs = vec![PushSourceRef {
             oid: new.clone(),
             name: "refs/heads/topic".into(),
@@ -7372,9 +7428,10 @@ mod tests {
             ObjectFormat::Sha1,
             &local_refs,
             &[],
-            &[parse_refspec("refs/heads/*:refs/heads/review/*").unwrap()],
+            &[parse_refspec("refs/heads/*:refs/heads/review/*")
+                .expect("test operation should succeed")],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             commands,
             vec![ReceivePackCommand {
@@ -7383,20 +7440,24 @@ mod tests {
                 name: "refs/heads/review/topic".into(),
             }]
         );
-        assert!(plan_push_commands(
-            ObjectFormat::Sha1,
-            &local_refs,
-            &[],
-            &[parse_refspec("^refs/heads/topic").unwrap()],
-        )
-        .is_err());
-        assert!(plan_push_commands(
-            ObjectFormat::Sha1,
-            &local_refs,
-            &[],
-            &[parse_refspec(":refs/heads/missing").unwrap()],
-        )
-        .is_err());
+        assert!(
+            plan_push_commands(
+                ObjectFormat::Sha1,
+                &local_refs,
+                &[],
+                &[parse_refspec("^refs/heads/topic").expect("test operation should succeed")],
+            )
+            .is_err()
+        );
+        assert!(
+            plan_push_commands(
+                ObjectFormat::Sha1,
+                &local_refs,
+                &[],
+                &[parse_refspec(":refs/heads/missing").expect("test operation should succeed")],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7405,12 +7466,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let features = ReceivePackFeatures {
             report_status_v2: true,
             atomic: true,
@@ -7441,7 +7502,7 @@ mod tests {
                 ..ReceivePackPushRequestOptions::default()
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             request.commands.capabilities,
             vec![
@@ -7480,7 +7541,8 @@ mod tests {
             ]
         );
         assert_eq!(request.push_options, Some(vec!["ci.skip".into()]));
-        validate_receive_pack_push_request_features(&features, &request).unwrap();
+        validate_receive_pack_push_request_features(&features, &request)
+            .expect("test operation should succeed");
     }
 
     #[test]
@@ -7489,8 +7551,8 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
-        let zero = zero_object_id(ObjectFormat::Sha1).unwrap();
+        .expect("test operation should succeed");
+        let zero = zero_object_id(ObjectFormat::Sha1).expect("test operation should succeed");
         let features = ReceivePackFeatures {
             delete_refs: true,
             ..ReceivePackFeatures::default()
@@ -7505,7 +7567,7 @@ mod tests {
             Vec::new(),
             ReceivePackPushRequestOptions::default(),
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             request.commands.capabilities,
             vec![Capability {
@@ -7515,30 +7577,36 @@ mod tests {
         );
         assert!(request.packfile.is_empty());
 
-        assert!(build_receive_pack_push_request(
-            &ReceivePackFeatures::default(),
-            request.commands.commands.clone(),
-            Vec::new(),
-            ReceivePackPushRequestOptions::default(),
-        )
-        .is_err());
-        assert!(build_receive_pack_push_request(
-            &features,
-            request.commands.commands,
-            b"PACK".to_vec(),
-            ReceivePackPushRequestOptions::default(),
-        )
-        .is_err());
-        assert!(build_receive_pack_push_request(
-            &features,
-            Vec::new(),
-            Vec::new(),
-            ReceivePackPushRequestOptions {
-                push_options: vec!["ci.skip".into()],
-                ..ReceivePackPushRequestOptions::default()
-            },
-        )
-        .is_err());
+        assert!(
+            build_receive_pack_push_request(
+                &ReceivePackFeatures::default(),
+                request.commands.commands.clone(),
+                Vec::new(),
+                ReceivePackPushRequestOptions::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            build_receive_pack_push_request(
+                &features,
+                request.commands.commands,
+                b"PACK".to_vec(),
+                ReceivePackPushRequestOptions::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            build_receive_pack_push_request(
+                &features,
+                Vec::new(),
+                Vec::new(),
+                ReceivePackPushRequestOptions {
+                    push_options: vec!["ci.skip".into()],
+                    ..ReceivePackPushRequestOptions::default()
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7547,75 +7615,82 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let sha256 = ObjectId::from_hex(
             ObjectFormat::Sha256,
             "2222222222222222222222222222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
-            smart_http_info_refs_path("/repo.git/", GitService::UploadPack).unwrap(),
+            smart_http_info_refs_path("/repo.git/", GitService::UploadPack)
+                .expect("test operation should succeed"),
             "/repo.git/info/refs?service=git-upload-pack"
         );
         assert_eq!(
-            dumb_http_info_refs_path("/repo.git/").unwrap(),
+            dumb_http_info_refs_path("/repo.git/").expect("test operation should succeed"),
             "/repo.git/info/refs"
         );
         assert_eq!(
-            dumb_http_alternates_path("/repo.git").unwrap(),
+            dumb_http_alternates_path("/repo.git").expect("test operation should succeed"),
             "/repo.git/objects/info/http-alternates"
         );
         assert_eq!(
-            dumb_http_packs_path("/repo.git/").unwrap(),
+            dumb_http_packs_path("/repo.git/").expect("test operation should succeed"),
             "/repo.git/objects/info/packs"
         );
         assert_eq!(
-            dumb_http_loose_object_path("/repo.git/", &sha1).unwrap(),
+            dumb_http_loose_object_path("/repo.git/", &sha1)
+                .expect("test operation should succeed"),
             "/repo.git/objects/11/11111111111111111111111111111111111111"
         );
         assert_eq!(
-            dumb_http_loose_object_path("/repo.git/", &sha256).unwrap(),
+            dumb_http_loose_object_path("/repo.git/", &sha256)
+                .expect("test operation should succeed"),
             "/repo.git/objects/22/22222222222222222222222222222222222222222222222222222222222222"
         );
         assert_eq!(
-            dumb_http_pack_file_path("/repo.git/", &sha1).unwrap(),
+            dumb_http_pack_file_path("/repo.git/", &sha1).expect("test operation should succeed"),
             "/repo.git/objects/pack/pack-1111111111111111111111111111111111111111.pack"
         );
         assert_eq!(
-            dumb_http_pack_index_path("/repo.git/", &sha1).unwrap(),
+            dumb_http_pack_index_path("/repo.git/", &sha1).expect("test operation should succeed"),
             "/repo.git/objects/pack/pack-1111111111111111111111111111111111111111.idx"
         );
         assert_eq!(
-            smart_http_rpc_path("/repo.git", GitService::ReceivePack).unwrap(),
+            smart_http_rpc_path("/repo.git", GitService::ReceivePack)
+                .expect("test operation should succeed"),
             "/repo.git/git-receive-pack"
         );
         assert_eq!(
-            smart_http_advertisement_content_type(GitService::UploadPack).unwrap(),
+            smart_http_advertisement_content_type(GitService::UploadPack)
+                .expect("test operation should succeed"),
             "application/x-git-upload-pack-advertisement"
         );
         assert_eq!(
-            smart_http_rpc_request_content_type(GitService::UploadPack).unwrap(),
+            smart_http_rpc_request_content_type(GitService::UploadPack)
+                .expect("test operation should succeed"),
             "application/x-git-upload-pack-request"
         );
         assert_eq!(
-            smart_http_rpc_result_content_type(GitService::ReceivePack).unwrap(),
+            smart_http_rpc_result_content_type(GitService::ReceivePack)
+                .expect("test operation should succeed"),
             "application/x-git-receive-pack-result"
         );
         assert_eq!(
             parse_smart_http_advertisement_content_type(
                 "Application/X-Git-Upload-Pack-Advertisement"
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             GitService::UploadPack
         );
         assert_eq!(
             parse_smart_http_rpc_request_content_type("application/x-git-receive-pack-request")
-                .unwrap(),
+                .expect("test operation should succeed"),
             GitService::ReceivePack
         );
         assert_eq!(
             parse_smart_http_rpc_result_content_type("application/x-git-upload-pack-result")
-                .unwrap(),
+                .expect("test operation should succeed"),
             GitService::UploadPack
         );
     }
@@ -7626,7 +7701,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(smart_http_info_refs_path("repo.git", GitService::UploadPack).is_err());
         assert!(smart_http_rpc_path("/repo.git?x=1", GitService::UploadPack).is_err());
         assert!(dumb_http_info_refs_path("repo.git").is_err());
@@ -7637,18 +7712,22 @@ mod tests {
         assert!(dumb_http_pack_index_path("/repo.git?query", &oid).is_err());
         assert!(smart_http_info_refs_path("/repo.git", GitService::UploadArchive).is_err());
         assert!(smart_http_advertisement_content_type(GitService::UploadArchive).is_err());
-        assert!(parse_smart_http_advertisement_content_type(
-            "application/x-git-upload-archive-advertisement"
-        )
-        .is_err());
+        assert!(
+            parse_smart_http_advertisement_content_type(
+                "application/x-git-upload-archive-advertisement"
+            )
+            .is_err()
+        );
         assert!(
             parse_smart_http_rpc_request_content_type("application/x-git-upload-pack-result")
                 .is_err()
         );
-        assert!(parse_smart_http_rpc_result_content_type(
-            "application/x-git-receive-pack-result; charset=utf-8"
-        )
-        .is_err());
+        assert!(
+            parse_smart_http_rpc_result_content_type(
+                "application/x-git-receive-pack-result; charset=utf-8"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7658,7 +7737,7 @@ mod tests {
             b"\x02counting objects\n".to_vec(),
             b"\x03fatal error\n".to_vec(),
         ];
-        let packets = parse_sideband_packets(&payloads).unwrap();
+        let packets = parse_sideband_packets(&payloads).expect("test operation should succeed");
         assert_eq!(
             packets,
             vec![
@@ -7676,7 +7755,10 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(encode_sideband_packets(&packets).unwrap(), payloads);
+        assert_eq!(
+            encode_sideband_packets(&packets).expect("test operation should succeed"),
+            payloads
+        );
     }
 
     #[test]
@@ -7687,7 +7769,7 @@ mod tests {
             PktLineFrame::Data(vec![1, b'C', b'K']),
             PktLineFrame::Flush,
         ];
-        let packets = parse_sideband_stream(&frames).unwrap();
+        let packets = parse_sideband_stream(&frames).expect("test operation should succeed");
         assert_eq!(
             packets,
             vec![
@@ -7705,9 +7787,12 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(encode_sideband_stream(&packets).unwrap(), frames);
         assert_eq!(
-            demux_sideband_stream(&frames).unwrap(),
+            encode_sideband_stream(&packets).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            demux_sideband_stream(&frames).expect("test operation should succeed"),
             SideBandDemux {
                 data: b"PACK".to_vec(),
                 progress: vec![b"count\n".to_vec()],
@@ -7728,16 +7813,19 @@ mod tests {
             },
         ];
         let mut encoded = Vec::new();
-        write_sideband_stream(&mut encoded, &packets).unwrap();
+        write_sideband_stream(&mut encoded, &packets).expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_sideband_stream(&mut input).unwrap(), packets);
+        assert_eq!(
+            read_sideband_stream(&mut input).expect("test operation should succeed"),
+            packets
+        );
         assert_eq!(input, b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_and_demux_sideband_stream(&mut input).unwrap(),
+            read_and_demux_sideband_stream(&mut input).expect("test operation should succeed"),
             SideBandDemux {
                 data: b"PACK".to_vec(),
                 progress: vec![b"done\n".to_vec()],
@@ -7755,7 +7843,7 @@ mod tests {
             b"\x02done\n".to_vec(),
         ];
         assert_eq!(
-            parse_and_demux_sideband_packets(&payloads).unwrap(),
+            parse_and_demux_sideband_packets(&payloads).expect("test operation should succeed"),
             SideBandDemux {
                 data: b"PACK bytes".to_vec(),
                 progress: vec![b"counting objects\n".to_vec(), b"done\n".to_vec()],
@@ -7771,28 +7859,36 @@ mod tests {
             parse_sideband_stream(&[PktLineFrame::Data(vec![1, b'P', b'A', b'C', b'K'])]).is_err()
         );
         assert!(parse_sideband_stream(&[PktLineFrame::Delimiter, PktLineFrame::Flush]).is_err());
-        assert!(parse_sideband_stream(&[
-            PktLineFrame::Data(vec![1, b'P', b'A']),
-            PktLineFrame::Flush,
-            PktLineFrame::Data(vec![1, b'C', b'K']),
-        ])
-        .is_err());
-        assert!(parse_sideband_stream(&[
-            PktLineFrame::Data(vec![1, b'P', b'A']),
-            PktLineFrame::Data(b"\x04bad".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(encode_sideband_packet(&SideBandPacket {
-            channel: SideBandChannel::Data,
-            data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
-        })
-        .is_err());
-        assert!(demux_sideband_packets(&[SideBandPacket {
-            channel: SideBandChannel::Fatal,
-            data: b"remote died\n".to_vec(),
-        }])
-        .is_err());
+        assert!(
+            parse_sideband_stream(&[
+                PktLineFrame::Data(vec![1, b'P', b'A']),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(vec![1, b'C', b'K']),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_sideband_stream(&[
+                PktLineFrame::Data(vec![1, b'P', b'A']),
+                PktLineFrame::Data(b"\x04bad".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_sideband_packet(&SideBandPacket {
+                channel: SideBandChannel::Data,
+                data: vec![0; PKT_LINE_MAX_PAYLOAD_LEN],
+            })
+            .is_err()
+        );
+        assert!(
+            demux_sideband_packets(&[SideBandPacket {
+                channel: SideBandChannel::Fatal,
+                data: b"remote died\n".to_vec(),
+            }])
+            .is_err()
+        );
     }
 
     #[test]
@@ -7802,14 +7898,17 @@ mod tests {
             PktLineFrame::Data(b"argument HEAD:dir with spaces\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let request = parse_upload_archive_request(&frames).unwrap();
+        let request = parse_upload_archive_request(&frames).expect("test operation should succeed");
         assert_eq!(
             request,
             UploadArchiveRequest {
                 arguments: vec!["--format=tar".into(), "HEAD:dir with spaces".into()],
             }
         );
-        assert_eq!(encode_upload_archive_request(&request).unwrap(), frames);
+        assert_eq!(
+            encode_upload_archive_request(&request).expect("test operation should succeed"),
+            frames
+        );
     }
 
     #[test]
@@ -7818,32 +7917,42 @@ mod tests {
             arguments: vec!["--prefix=src/".into(), "main".into()],
         };
         let mut encoded = Vec::new();
-        write_upload_archive_request(&mut encoded, &request).unwrap();
+        write_upload_archive_request(&mut encoded, &request)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_upload_archive_request(&mut input).unwrap(), request);
+        assert_eq!(
+            read_upload_archive_request(&mut input).expect("test operation should succeed"),
+            request
+        );
         assert_eq!(input, b"tail");
     }
 
     #[test]
     fn upload_archive_request_rejects_malformed_streams() {
         assert!(parse_upload_archive_request(&[PktLineFrame::Flush]).is_err());
-        assert!(parse_upload_archive_request(&[
-            PktLineFrame::Data(b"--format=tar\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(parse_upload_archive_request(&[
-            PktLineFrame::Data(b"argument HEAD\n".to_vec()),
-            PktLineFrame::Delimiter,
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(encode_upload_archive_request(&UploadArchiveRequest {
-            arguments: vec!["bad\narg".into()],
-        })
-        .is_err());
+        assert!(
+            parse_upload_archive_request(&[
+                PktLineFrame::Data(b"--format=tar\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_upload_archive_request(&[
+                PktLineFrame::Data(b"argument HEAD\n".to_vec()),
+                PktLineFrame::Delimiter,
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_upload_archive_request(&UploadArchiveRequest {
+                arguments: vec!["bad\narg".into()],
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -7854,7 +7963,8 @@ mod tests {
             PktLineFrame::Data(b"\x02progress\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let response = parse_upload_archive_response(&ack_frames).unwrap();
+        let response =
+            parse_upload_archive_response(&ack_frames).expect("test operation should succeed");
         assert_eq!(
             response,
             UploadArchiveResponse::Ack {
@@ -7871,11 +7981,11 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_upload_archive_response(&response).unwrap(),
+            encode_upload_archive_response(&response).expect("test operation should succeed"),
             ack_frames
         );
         assert_eq!(
-            demux_upload_archive_response(&response).unwrap(),
+            demux_upload_archive_response(&response).expect("test operation should succeed"),
             SideBandDemux {
                 data: b"tar bytes".to_vec(),
                 progress: vec![b"progress\n".to_vec()],
@@ -7889,8 +7999,14 @@ mod tests {
             PktLineFrame::Data(b"NACK unreachable tree\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        assert_eq!(parse_upload_archive_response(&nack_frames).unwrap(), nack);
-        assert_eq!(encode_upload_archive_response(&nack).unwrap(), nack_frames);
+        assert_eq!(
+            parse_upload_archive_response(&nack_frames).expect("test operation should succeed"),
+            nack
+        );
+        assert_eq!(
+            encode_upload_archive_response(&nack).expect("test operation should succeed"),
+            nack_frames
+        );
         assert!(demux_upload_archive_response(&nack).is_err());
     }
 
@@ -7903,34 +8019,44 @@ mod tests {
             }],
         };
         let mut encoded = Vec::new();
-        write_upload_archive_response(&mut encoded, &response).unwrap();
+        write_upload_archive_response(&mut encoded, &response)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_upload_archive_response(&mut input).unwrap(), response);
+        assert_eq!(
+            read_upload_archive_response(&mut input).expect("test operation should succeed"),
+            response
+        );
         assert_eq!(input, b"tail");
     }
 
     #[test]
     fn upload_archive_response_rejects_malformed_streams() {
         assert!(parse_upload_archive_response(&[]).is_err());
-        assert!(parse_upload_archive_response(&[
-            PktLineFrame::Data(b"ACK\n".to_vec()),
-            PktLineFrame::Flush,
-            PktLineFrame::Data(b"\x01tail".to_vec()),
-        ])
-        .is_err());
-        assert!(parse_upload_archive_response(&[
-            PktLineFrame::Data(b"NACK\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(parse_upload_archive_response(&[
-            PktLineFrame::Data(b"NACK denied\n".to_vec()),
-            PktLineFrame::Data(b"\x02extra\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_upload_archive_response(&[
+                PktLineFrame::Data(b"ACK\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"\x01tail".to_vec()),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_upload_archive_response(&[
+                PktLineFrame::Data(b"NACK\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_upload_archive_response(&[
+                PktLineFrame::Data(b"NACK denied\n".to_vec()),
+                PktLineFrame::Data(b"\x02extra\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
         assert!(
             encode_upload_archive_response(&UploadArchiveResponse::Nack {
                 message: "bad\nmessage".into(),
@@ -7944,7 +8070,7 @@ mod tests {
         let capabilities = parse_capabilities(
             b"multi_ack thin-pack agent=git/2.54.0 symref=HEAD:refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             capabilities,
             vec![
@@ -7967,7 +8093,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            encode_capabilities(&capabilities).unwrap(),
+            encode_capabilities(&capabilities).expect("test operation should succeed"),
             b"multi_ack thin-pack agent=git/2.54.0 symref=HEAD:refs/heads/main"
         );
     }
@@ -7977,45 +8103,56 @@ mod tests {
         assert!(parse_capabilities(b"multi_ack  thin-pack").is_err());
         assert!(parse_capabilities(b"agent=").is_err());
         assert!(parse_capabilities(b"symref=HEAD:refs/heads/main\nbad").is_err());
-        assert!(encode_capabilities(&[Capability {
-            name: "bad name".into(),
-            value: None,
-        }])
-        .is_err());
+        assert!(
+            encode_capabilities(&[Capability {
+                name: "bad name".into(),
+                value: None,
+            }])
+            .is_err()
+        );
     }
 
     #[test]
     fn protocol_v2_object_format_uses_capability_or_defaults_to_sha1() {
-        assert_eq!(protocol_v2_object_format(&[]).unwrap(), ObjectFormat::Sha1);
+        assert_eq!(
+            protocol_v2_object_format(&[]).expect("test operation should succeed"),
+            ObjectFormat::Sha1
+        );
         assert_eq!(
             protocol_v2_object_format(&[Capability {
                 name: "object-format".into(),
                 value: Some("sha256".into()),
             }])
-            .unwrap(),
+            .expect("test operation should succeed"),
             ObjectFormat::Sha256
         );
-        assert!(protocol_v2_object_format(&[Capability {
-            name: "object-format".into(),
-            value: None,
-        }])
-        .is_err());
-        assert!(protocol_v2_object_format(&[
-            Capability {
+        assert!(
+            protocol_v2_object_format(&[Capability {
                 name: "object-format".into(),
-                value: Some("sha1".into()),
-            },
-            Capability {
+                value: None,
+            }])
+            .is_err()
+        );
+        assert!(
+            protocol_v2_object_format(&[
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha1".into()),
+                },
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha256".into()),
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            protocol_v2_object_format(&[Capability {
                 name: "object-format".into(),
-                value: Some("sha256".into()),
-            },
-        ])
-        .is_err());
-        assert!(protocol_v2_object_format(&[Capability {
-            name: "object-format".into(),
-            value: Some("unknown".into()),
-        }])
-        .is_err());
+                value: Some("unknown".into()),
+            }])
+            .is_err()
+        );
     }
 
     #[test]
@@ -8054,52 +8191,60 @@ mod tests {
                 arguments: Vec::new(),
             },
         )
-        .unwrap();
-        assert!(validate_protocol_v2_command_request_capabilities(
-            &handshake,
-            &ProtocolV2CommandRequest {
-                command: "ls-refs".into(),
-                capabilities: Vec::new(),
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(validate_protocol_v2_command_request_capabilities(
-            &handshake,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: vec![Capability {
-                    name: "server-option".into(),
-                    value: None,
-                }],
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(validate_protocol_v2_command_request_capabilities(
-            &handshake,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: vec![Capability {
-                    name: "object-format".into(),
-                    value: Some("sha256".into()),
-                }],
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(validate_protocol_v2_command_request_capabilities(
-            &handshake,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: vec![Capability {
-                    name: "agent".into(),
-                    value: None,
-                }],
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
+        .expect("test operation should succeed");
+        assert!(
+            validate_protocol_v2_command_request_capabilities(
+                &handshake,
+                &ProtocolV2CommandRequest {
+                    command: "ls-refs".into(),
+                    capabilities: Vec::new(),
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_v2_command_request_capabilities(
+                &handshake,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: vec![Capability {
+                        name: "server-option".into(),
+                        value: None,
+                    }],
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_v2_command_request_capabilities(
+                &handshake,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: vec![Capability {
+                        name: "object-format".into(),
+                        value: Some("sha256".into()),
+                    }],
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_v2_command_request_capabilities(
+                &handshake,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: vec![Capability {
+                        name: "agent".into(),
+                        value: None,
+                    }],
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8126,7 +8271,8 @@ mod tests {
                 value: Some("abc123".into()),
             },
         ];
-        let options = parse_protocol_v2_command_options(&capabilities).unwrap();
+        let options = parse_protocol_v2_command_options(&capabilities)
+            .expect("test operation should succeed");
         assert_eq!(
             options,
             ProtocolV2CommandOptions {
@@ -8140,34 +8286,40 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_command_options(&options).unwrap(),
+            encode_protocol_v2_command_options(&options).expect("test operation should succeed"),
             capabilities
         );
     }
 
     #[test]
     fn protocol_v2_command_options_reject_malformed_known_capabilities() {
-        assert!(parse_protocol_v2_command_options(&[
-            Capability {
-                name: "agent".into(),
-                value: Some("sley/0".into()),
-            },
-            Capability {
-                name: "agent".into(),
-                value: Some("sley/1".into()),
-            },
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_command_options(&[Capability {
-            name: "object-format".into(),
-            value: Some("sha512".into()),
-        }])
-        .is_err());
-        assert!(parse_protocol_v2_command_options(&[Capability {
-            name: "server-option".into(),
-            value: None,
-        }])
-        .is_err());
+        assert!(
+            parse_protocol_v2_command_options(&[
+                Capability {
+                    name: "agent".into(),
+                    value: Some("sley/0".into()),
+                },
+                Capability {
+                    name: "agent".into(),
+                    value: Some("sley/1".into()),
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_command_options(&[Capability {
+                name: "object-format".into(),
+                value: Some("sha512".into()),
+            }])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_command_options(&[Capability {
+                name: "server-option".into(),
+                value: None,
+            }])
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_command_options(&ProtocolV2CommandOptions {
                 extra: vec![Capability {
@@ -8187,8 +8339,8 @@ mod tests {
             value: Some("unborn custom".into()),
         }];
         let features = parse_protocol_v2_ls_refs_features(&capabilities)
-            .unwrap()
-            .unwrap();
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert_eq!(
             features,
             ProtocolV2LsRefsFeatures {
@@ -8197,7 +8349,8 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_ls_refs_capability(&features).unwrap(),
+            encode_protocol_v2_ls_refs_capability(&features)
+                .expect("test operation should succeed"),
             capabilities[0]
         );
         assert_eq!(
@@ -8205,36 +8358,42 @@ mod tests {
                 name: "ls-refs".into(),
                 value: None,
             }])
-            .unwrap()
-            .unwrap(),
+            .expect("test operation should succeed")
+            .expect("test operation should succeed"),
             ProtocolV2LsRefsFeatures::default()
         );
-        assert!(parse_protocol_v2_ls_refs_features(&[Capability {
-            name: "fetch".into(),
-            value: Some("filter".into()),
-        }])
-        .unwrap()
-        .is_none());
+        assert!(
+            parse_protocol_v2_ls_refs_features(&[Capability {
+                name: "fetch".into(),
+                value: Some("filter".into()),
+            }])
+            .expect("test operation should succeed")
+            .is_none()
+        );
     }
 
     #[test]
     fn protocol_v2_ls_refs_features_reject_malformed_advertisements() {
-        assert!(parse_protocol_v2_ls_refs_features(&[
-            Capability {
+        assert!(
+            parse_protocol_v2_ls_refs_features(&[
+                Capability {
+                    name: "ls-refs".into(),
+                    value: None,
+                },
+                Capability {
+                    name: "ls-refs".into(),
+                    value: None,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_ls_refs_features(&[Capability {
                 name: "ls-refs".into(),
-                value: None,
-            },
-            Capability {
-                name: "ls-refs".into(),
-                value: None,
-            },
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_ls_refs_features(&[Capability {
-            name: "ls-refs".into(),
-            value: Some("unborn  custom".into()),
-        }])
-        .is_err());
+                value: Some("unborn  custom".into()),
+            }])
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_ls_refs_capability(&ProtocolV2LsRefsFeatures {
                 unknown: vec!["unborn".into()],
@@ -8258,7 +8417,8 @@ mod tests {
             capabilities: Vec::new(),
             arguments: vec![b"unborn".to_vec(), b"ref-prefix HEAD".to_vec()],
         };
-        let parsed = validate_protocol_v2_ls_refs_command_request(&handshake, &request).unwrap();
+        let parsed = validate_protocol_v2_ls_refs_command_request(&handshake, &request)
+            .expect("test operation should succeed");
         assert!(parsed.unborn);
         assert_eq!(parsed.ref_prefixes, vec!["HEAD"]);
 
@@ -8281,8 +8441,8 @@ mod tests {
             ),
         }];
         let features = parse_protocol_v2_fetch_features(&capabilities)
-            .unwrap()
-            .unwrap();
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert_eq!(
             features,
             ProtocolV2FetchFeatures {
@@ -8296,7 +8456,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_fetch_capability(&features).unwrap(),
+            encode_protocol_v2_fetch_capability(&features).expect("test operation should succeed"),
             capabilities[0]
         );
         assert_eq!(
@@ -8304,31 +8464,39 @@ mod tests {
                 name: "fetch".into(),
                 value: None,
             }])
-            .unwrap()
-            .unwrap(),
+            .expect("test operation should succeed")
+            .expect("test operation should succeed"),
             ProtocolV2FetchFeatures::default()
         );
-        assert!(parse_protocol_v2_fetch_features(&[]).unwrap().is_none());
+        assert!(
+            parse_protocol_v2_fetch_features(&[])
+                .expect("test operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
     fn protocol_v2_fetch_features_reject_malformed_advertisements() {
-        assert!(parse_protocol_v2_fetch_features(&[
-            Capability {
+        assert!(
+            parse_protocol_v2_fetch_features(&[
+                Capability {
+                    name: "fetch".into(),
+                    value: None,
+                },
+                Capability {
+                    name: "fetch".into(),
+                    value: None,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_features(&[Capability {
                 name: "fetch".into(),
-                value: None,
-            },
-            Capability {
-                name: "fetch".into(),
-                value: None,
-            },
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_fetch_features(&[Capability {
-            name: "fetch".into(),
-            value: Some("filter  shallow".into()),
-        }])
-        .is_err());
+                value: Some("filter  shallow".into()),
+            }])
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_fetch_capability(&ProtocolV2FetchFeatures {
                 unknown: vec!["filter".into()],
@@ -8353,11 +8521,13 @@ mod tests {
             &features,
             &ProtocolV2FetchRequest {
                 want_refs: vec!["refs/heads/main".into()],
-                shallow: vec![ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap()],
+                shallow: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed"),
+                ],
                 deepen: Some(1),
                 filter: Some("blob:none".into()),
                 packfile_uris: Some("https".into()),
@@ -8366,7 +8536,7 @@ mod tests {
                 ..ProtocolV2FetchRequest::default()
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let request = ProtocolV2FetchRequest {
             want_refs: vec!["refs/heads/main".into()],
@@ -8374,20 +8544,24 @@ mod tests {
             sideband_all: true,
             ..ProtocolV2FetchRequest::default()
         };
-        assert!(validate_protocol_v2_fetch_request_features(
-            &ProtocolV2FetchFeatures::default(),
-            &request,
-        )
-        .is_err());
-        assert!(validate_protocol_v2_fetch_request_features(
-            &ProtocolV2FetchFeatures {
-                ref_in_want: true,
-                filter: true,
-                ..ProtocolV2FetchFeatures::default()
-            },
-            &request,
-        )
-        .is_err());
+        assert!(
+            validate_protocol_v2_fetch_request_features(
+                &ProtocolV2FetchFeatures::default(),
+                &request,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_v2_fetch_request_features(
+                &ProtocolV2FetchFeatures {
+                    ref_in_want: true,
+                    filter: true,
+                    ..ProtocolV2FetchFeatures::default()
+                },
+                &request,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8418,7 +8592,7 @@ mod tests {
         };
         let fetch =
             validate_protocol_v2_fetch_command_request(&handshake, ObjectFormat::Sha1, &request)
-                .unwrap();
+                .expect("test operation should succeed");
         assert_eq!(fetch.want_refs, vec!["refs/heads/main"]);
         assert_eq!(fetch.filter.as_deref(), Some("blob:none"));
 
@@ -8436,7 +8610,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = ProtocolV2CommandRequest {
             command: "object-info".into(),
             capabilities: Vec::new(),
@@ -8447,7 +8621,7 @@ mod tests {
         };
         let parsed =
             ProtocolV2ObjectInfoRequest::from_command_request(ObjectFormat::Sha1, &request)
-                .unwrap();
+                .expect("test operation should succeed");
         assert_eq!(
             parsed,
             ProtocolV2ObjectInfoRequest {
@@ -8455,7 +8629,12 @@ mod tests {
                 oids: vec![oid],
             }
         );
-        assert_eq!(parsed.to_command_request().unwrap(), request);
+        assert_eq!(
+            parsed
+                .to_command_request()
+                .expect("test operation should succeed"),
+            request
+        );
 
         let handshake = TransportHandshake {
             protocol: ProtocolVersion::V2,
@@ -8470,7 +8649,7 @@ mod tests {
                 ObjectFormat::Sha1,
                 &request,
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             parsed
         );
     }
@@ -8479,19 +8658,23 @@ mod tests {
     fn protocol_v2_object_info_request_streams_round_trip() {
         let request = ProtocolV2ObjectInfoRequest {
             size: true,
-            oids: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
+            oids: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
         };
         let mut encoded = Vec::new();
-        write_protocol_v2_object_info_request(&mut encoded, &request).unwrap();
+        write_protocol_v2_object_info_request(&mut encoded, &request)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_object_info_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_object_info_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             request
         );
         assert_eq!(input, b"tail");
@@ -8499,58 +8682,68 @@ mod tests {
 
     #[test]
     fn protocol_v2_object_info_request_rejects_malformed_arguments() {
-        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "object-info".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "object-info".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"size".to_vec(), b"size".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "object-info".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"size".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2ObjectInfoRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "object-info".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(validate_protocol_v2_object_info_command_request(
-            &TransportHandshake {
-                protocol: ProtocolVersion::V2,
-                capabilities: Vec::new(),
-            },
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "object-info".into(),
-                capabilities: Vec::new(),
-                arguments: vec![
-                    b"size".to_vec(),
-                    b"oid 1111111111111111111111111111111111111111".to_vec(),
-                ],
-            },
-        )
-        .is_err());
+        assert!(
+            ProtocolV2ObjectInfoRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "object-info".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"oid 1111111111111111111111111111111111111111".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2ObjectInfoRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "object-info".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"size".to_vec(), b"size".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2ObjectInfoRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "object-info".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"size".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2ObjectInfoRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "object-info".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"size".to_vec(), b"oid not-an-oid".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_protocol_v2_object_info_command_request(
+                &TransportHandshake {
+                    protocol: ProtocolVersion::V2,
+                    capabilities: Vec::new(),
+                },
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "object-info".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![
+                        b"size".to_vec(),
+                        b"oid 1111111111111111111111111111111111111111".to_vec(),
+                    ],
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8590,7 +8783,7 @@ mod tests {
                     arguments: vec![b"unborn".to_vec()],
                 },
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             ProtocolV2Command::LsRefs(ProtocolV2LsRefsRequest {
                 unborn: true,
                 ..ProtocolV2LsRefsRequest::default()
@@ -8609,7 +8802,7 @@ mod tests {
                     ],
                 },
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             ProtocolV2Command::Fetch(ProtocolV2FetchRequest {
                 want_refs: vec!["refs/heads/main".into()],
                 filter: Some("blob:none".into()),
@@ -8629,14 +8822,16 @@ mod tests {
                     ],
                 },
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             ProtocolV2Command::ObjectInfo(ProtocolV2ObjectInfoRequest {
                 size: true,
-                oids: vec![ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap()],
+                oids: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed")
+                ],
             })
         );
 
@@ -8649,19 +8844,22 @@ mod tests {
             arguments: Vec::new(),
         };
         assert_eq!(
-            classify_protocol_v2_command_request(&handshake, ObjectFormat::Sha1, &unknown).unwrap(),
+            classify_protocol_v2_command_request(&handshake, ObjectFormat::Sha1, &unknown)
+                .expect("test operation should succeed"),
             ProtocolV2Command::Unknown(unknown)
         );
-        assert!(classify_protocol_v2_command_request(
-            &handshake,
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "not-advertised".into(),
-                capabilities: Vec::new(),
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
+        assert!(
+            classify_protocol_v2_command_request(
+                &handshake,
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "not-advertised".into(),
+                    capabilities: Vec::new(),
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8685,7 +8883,8 @@ mod tests {
             arguments: vec![b"unborn".to_vec()],
         });
         assert_eq!(
-            classify_protocol_v2_request(&handshake, ObjectFormat::Sha1, &command).unwrap(),
+            classify_protocol_v2_request(&handshake, ObjectFormat::Sha1, &command)
+                .expect("test operation should succeed"),
             ProtocolV2SessionRequest::Command(ProtocolV2Command::LsRefs(ProtocolV2LsRefsRequest {
                 unborn: true,
                 ..ProtocolV2LsRefsRequest::default()
@@ -8693,25 +8892,28 @@ mod tests {
         );
         assert_eq!(
             classify_protocol_v2_request(&handshake, ObjectFormat::Sha1, &ProtocolV2Request::Done)
-                .unwrap(),
+                .expect("test operation should succeed"),
             ProtocolV2SessionRequest::Done
         );
 
         let mut encoded = Vec::new();
-        write_protocol_v2_request(&mut encoded, &command).unwrap();
-        write_protocol_v2_request(&mut encoded, &ProtocolV2Request::Done).unwrap();
+        write_protocol_v2_request(&mut encoded, &command).expect("test operation should succeed");
+        write_protocol_v2_request(&mut encoded, &ProtocolV2Request::Done)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_session_request(&handshake, ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_session_request(&handshake, ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             ProtocolV2SessionRequest::Command(ProtocolV2Command::LsRefs(ProtocolV2LsRefsRequest {
                 unborn: true,
                 ..ProtocolV2LsRefsRequest::default()
             }))
         );
         assert_eq!(
-            read_protocol_v2_session_request(&handshake, ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_session_request(&handshake, ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             ProtocolV2SessionRequest::Done
         );
         assert_eq!(input, b"tail");
@@ -8721,14 +8923,15 @@ mod tests {
     fn advertised_ref_parses_first_v0_capability_line() {
         let payload =
             b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 HEAD\0multi_ack symref=HEAD:refs/heads/main\n";
-        let advertisement = parse_ref_advertisement(ObjectFormat::Sha1, payload).unwrap();
+        let advertisement = parse_ref_advertisement(ObjectFormat::Sha1, payload)
+            .expect("test operation should succeed");
         assert_eq!(
             advertisement.oid,
             ObjectId::from_hex(
                 ObjectFormat::Sha1,
                 "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
             )
-            .unwrap()
+            .expect("test operation should succeed")
         );
         assert_eq!(advertisement.name, "HEAD");
         assert_eq!(
@@ -8752,7 +8955,7 @@ mod tests {
             ObjectFormat::Sha1,
             b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(advertisement.name, "refs/heads/main");
         assert!(advertisement.capabilities.is_empty());
     }
@@ -8762,11 +8965,13 @@ mod tests {
         assert!(
             parse_ref_advertisement(ObjectFormat::Sha1, b"not-an-oid refs/heads/main\n").is_err()
         );
-        assert!(parse_ref_advertisement(
-            ObjectFormat::Sha1,
-            b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
-        )
-        .is_err());
+        assert!(
+            parse_ref_advertisement(
+                ObjectFormat::Sha1,
+                b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -8775,12 +8980,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let feature = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(
                 b"1111111111111111111111111111111111111111 HEAD\0multi_ack thin-pack agent=git/2.54.0\n"
@@ -8791,7 +8996,8 @@ mod tests {
             ),
             PktLineFrame::Flush,
         ];
-        let advertisements = parse_ref_advertisements(ObjectFormat::Sha1, &frames).unwrap();
+        let advertisements = parse_ref_advertisements(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             advertisements,
             vec![
@@ -8820,9 +9026,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(encode_ref_advertisements(&advertisements).unwrap(), frames);
         assert_eq!(
-            parse_ref_advertisements(ObjectFormat::Sha1, &[PktLineFrame::Flush]).unwrap(),
+            encode_ref_advertisements(&advertisements).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            parse_ref_advertisements(ObjectFormat::Sha1, &[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             Vec::<RefAdvertisement>::new()
         );
     }
@@ -8833,17 +9043,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let feature = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let shallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"version 1\n".to_vec()),
             PktLineFrame::Data(
@@ -8857,7 +9067,8 @@ mod tests {
             PktLineFrame::Flush,
         ];
 
-        let set = parse_ref_advertisement_set(ObjectFormat::Sha1, &frames).unwrap();
+        let set = parse_ref_advertisement_set(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(set.protocol, ProtocolVersion::V1);
         assert_eq!(set.shallow, vec![shallow]);
         assert_eq!(
@@ -8885,10 +9096,14 @@ mod tests {
             ]
         );
         assert_eq!(
-            parse_ref_advertisements(ObjectFormat::Sha1, &frames).unwrap(),
+            parse_ref_advertisements(ObjectFormat::Sha1, &frames)
+                .expect("test operation should succeed"),
             set.refs
         );
-        assert_eq!(encode_ref_advertisement_set(&set).unwrap(), frames);
+        assert_eq!(
+            encode_ref_advertisement_set(&set).expect("test operation should succeed"),
+            frames
+        );
     }
 
     #[test]
@@ -8898,7 +9113,7 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             name: "HEAD".into(),
             capabilities: vec![Capability {
                 name: "symref".into(),
@@ -8906,12 +9121,14 @@ mod tests {
             }],
         }];
         let mut encoded = Vec::new();
-        write_ref_advertisements(&mut encoded, &advertisements).unwrap();
+        write_ref_advertisements(&mut encoded, &advertisements)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_ref_advertisements(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_ref_advertisements(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             advertisements
         );
         assert_eq!(input, b"tail");
@@ -8926,26 +9143,29 @@ mod tests {
                     ObjectFormat::Sha1,
                     "1111111111111111111111111111111111111111",
                 )
-                .unwrap(),
+                .expect("test operation should succeed"),
                 name: "HEAD".into(),
                 capabilities: vec![Capability {
                     name: "symref".into(),
                     value: Some("HEAD:refs/heads/main".into()),
                 }],
             }],
-            shallow: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "2222222222222222222222222222222222222222",
-            )
-            .unwrap()],
+            shallow: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .expect("test operation should succeed"),
+            ],
         };
         let mut encoded = Vec::new();
-        write_ref_advertisement_set(&mut encoded, &set).unwrap();
+        write_ref_advertisement_set(&mut encoded, &set).expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_ref_advertisement_set(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_ref_advertisement_set(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             set
         );
         assert_eq!(input, b"tail");
@@ -8953,18 +9173,22 @@ mod tests {
 
     #[test]
     fn advertised_refs_reject_malformed_streams() {
-        assert!(parse_ref_advertisements(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
-            )],
-        )
-        .is_err());
-        assert!(parse_ref_advertisements(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-        )
-        .is_err());
+        assert!(
+            parse_ref_advertisements(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 HEAD\n".to_vec(),
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ref_advertisements(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+            )
+            .is_err()
+        );
         assert!(parse_ref_advertisements(
             ObjectFormat::Sha1,
             &[
@@ -8986,22 +9210,28 @@ mod tests {
             ],
         )
         .is_err());
-        assert!(parse_ref_advertisement_set(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"version 2\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_ref_advertisement_set(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_ref_advertisement_set(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"version 2\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_ref_advertisement_set(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"shallow 1111111111111111111111111111111111111111\n".to_vec()
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(parse_ref_advertisement_set(
             ObjectFormat::Sha1,
             &[
@@ -9023,56 +9253,66 @@ mod tests {
             ],
         )
         .is_err());
-        assert!(encode_ref_advertisements(&[
-            RefAdvertisement {
+        assert!(
+            encode_ref_advertisements(&[
+                RefAdvertisement {
+                    oid: ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed"),
+                    name: "HEAD".into(),
+                    capabilities: Vec::new(),
+                },
+                RefAdvertisement {
+                    oid: ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "2222222222222222222222222222222222222222",
+                    )
+                    .expect("test operation should succeed"),
+                    name: "refs/heads/main".into(),
+                    capabilities: vec![Capability {
+                        name: "thin-pack".into(),
+                        value: None,
+                    }],
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_ref_advertisement(&RefAdvertisement {
                 oid: ObjectId::from_hex(
                     ObjectFormat::Sha1,
                     "1111111111111111111111111111111111111111",
                 )
-                .unwrap(),
-                name: "HEAD".into(),
+                .expect("test operation should succeed"),
+                name: "bad ref".into(),
                 capabilities: Vec::new(),
-            },
-            RefAdvertisement {
-                oid: ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "2222222222222222222222222222222222222222",
-                )
-                .unwrap(),
-                name: "refs/heads/main".into(),
-                capabilities: vec![Capability {
-                    name: "thin-pack".into(),
-                    value: None,
-                }],
-            },
-        ])
-        .is_err());
-        assert!(encode_ref_advertisement(&RefAdvertisement {
-            oid: ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap(),
-            name: "bad ref".into(),
-            capabilities: Vec::new(),
-        })
-        .is_err());
-        assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
-            protocol: ProtocolVersion::V2,
-            refs: Vec::new(),
-            shallow: Vec::new(),
-        })
-        .is_err());
-        assert!(encode_ref_advertisement_set(&RefAdvertisementSet {
-            protocol: ProtocolVersion::V0,
-            refs: Vec::new(),
-            shallow: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
-        })
-        .is_err());
+            })
+            .is_err()
+        );
+        assert!(
+            encode_ref_advertisement_set(&RefAdvertisementSet {
+                protocol: ProtocolVersion::V2,
+                refs: Vec::new(),
+                shallow: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            encode_ref_advertisement_set(&RefAdvertisementSet {
+                protocol: ProtocolVersion::V0,
+                refs: Vec::new(),
+                shallow: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed")
+                ],
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -9081,20 +9321,21 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let peeled = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let input = b"1111111111111111111111111111111111111111\trefs/heads/main\n2222222222222222222222222222222222222222\trefs/tags/v1.0\n3333333333333333333333333333333333333333\trefs/tags/v1.0^{}\n";
 
-        let records = parse_dumb_http_info_refs(ObjectFormat::Sha1, input).unwrap();
+        let records = parse_dumb_http_info_refs(ObjectFormat::Sha1, input)
+            .expect("test operation should succeed");
         assert_eq!(
             records,
             vec![
@@ -9115,9 +9356,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(encode_dumb_http_info_refs(&records).unwrap(), input);
         assert_eq!(
-            parse_dumb_http_info_refs(ObjectFormat::Sha1, b"").unwrap(),
+            encode_dumb_http_info_refs(&records).expect("test operation should succeed"),
+            input
+        );
+        assert_eq!(
+            parse_dumb_http_info_refs(ObjectFormat::Sha1, b"")
+                .expect("test operation should succeed"),
             Vec::<DumbHttpRefRecord>::new()
         );
     }
@@ -9129,15 +9374,16 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             name: "refs/heads/main".into(),
             peeled: false,
         }];
         let mut encoded = Vec::new();
-        write_dumb_http_info_refs(&mut encoded, &records).unwrap();
+        write_dumb_http_info_refs(&mut encoded, &records).expect("test operation should succeed");
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_dumb_http_info_refs(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_dumb_http_info_refs(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             records
         );
         assert!(input.is_empty());
@@ -9145,41 +9391,49 @@ mod tests {
 
     #[test]
     fn dumb_http_info_refs_reject_malformed_records() {
-        assert!(parse_dumb_http_info_refs(
-            ObjectFormat::Sha1,
-            b"1111111111111111111111111111111111111111 refs/heads/main\n",
-        )
-        .is_err());
-        assert!(parse_dumb_http_info_refs(
-            ObjectFormat::Sha1,
-            b"1111111111111111111111111111111111111111\trefs/heads/main",
-        )
-        .is_err());
+        assert!(
+            parse_dumb_http_info_refs(
+                ObjectFormat::Sha1,
+                b"1111111111111111111111111111111111111111 refs/heads/main\n",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_dumb_http_info_refs(
+                ObjectFormat::Sha1,
+                b"1111111111111111111111111111111111111111\trefs/heads/main",
+            )
+            .is_err()
+        );
         assert!(
             parse_dumb_http_info_refs(ObjectFormat::Sha1, b"not-an-oid\trefs/heads/main\n")
                 .is_err()
         );
-        assert!(parse_dumb_http_info_refs(
-            ObjectFormat::Sha1,
-            b"1111111111111111111111111111111111111111\tbad ref\n",
-        )
-        .is_err());
-        assert!(encode_dumb_http_info_refs(&[DumbHttpRefRecord {
-            oid: ObjectId::from_hex(
+        assert!(
+            parse_dumb_http_info_refs(
                 ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
+                b"1111111111111111111111111111111111111111\tbad ref\n",
             )
-            .unwrap(),
-            name: "refs/tags/v1.0^{}".into(),
-            peeled: false,
-        }])
-        .is_err());
+            .is_err()
+        );
+        assert!(
+            encode_dumb_http_info_refs(&[DumbHttpRefRecord {
+                oid: ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+                name: "refs/tags/v1.0^{}".into(),
+                peeled: false,
+            }])
+            .is_err()
+        );
     }
 
     #[test]
     fn dumb_http_alternates_parse_and_encode_locations() {
         let input = b"https://example.com/base.git/objects/\n../other.git/objects/\n";
-        let alternates = parse_dumb_http_alternates(input).unwrap();
+        let alternates = parse_dumb_http_alternates(input).expect("test operation should succeed");
         assert_eq!(
             alternates,
             vec![
@@ -9187,9 +9441,12 @@ mod tests {
                 "../other.git/objects/".to_string(),
             ]
         );
-        assert_eq!(encode_dumb_http_alternates(&alternates).unwrap(), input);
         assert_eq!(
-            parse_dumb_http_alternates(b"").unwrap(),
+            encode_dumb_http_alternates(&alternates).expect("test operation should succeed"),
+            input
+        );
+        assert_eq!(
+            parse_dumb_http_alternates(b"").expect("test operation should succeed"),
             Vec::<String>::new()
         );
     }
@@ -9198,9 +9455,13 @@ mod tests {
     fn dumb_http_alternates_streams_round_trip() {
         let alternates = vec!["https://example.com/base.git/objects/".to_string()];
         let mut encoded = Vec::new();
-        write_dumb_http_alternates(&mut encoded, &alternates).unwrap();
+        write_dumb_http_alternates(&mut encoded, &alternates)
+            .expect("test operation should succeed");
         let mut input = encoded.as_slice();
-        assert_eq!(read_dumb_http_alternates(&mut input).unwrap(), alternates);
+        assert_eq!(
+            read_dumb_http_alternates(&mut input).expect("test operation should succeed"),
+            alternates
+        );
         assert!(input.is_empty());
     }
 
@@ -9218,14 +9479,15 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let input = b"P pack-1111111111111111111111111111111111111111.pack\nP pack-2222222222222222222222222222222222222222.pack\n";
-        let records = parse_dumb_http_packs(ObjectFormat::Sha1, input).unwrap();
+        let records = parse_dumb_http_packs(ObjectFormat::Sha1, input)
+            .expect("test operation should succeed");
         assert_eq!(
             records,
             vec![
@@ -9233,9 +9495,12 @@ mod tests {
                 DumbHttpPackRecord { hash: second },
             ]
         );
-        assert_eq!(encode_dumb_http_packs(&records).unwrap(), input);
         assert_eq!(
-            parse_dumb_http_packs(ObjectFormat::Sha1, b"").unwrap(),
+            encode_dumb_http_packs(&records).expect("test operation should succeed"),
+            input
+        );
+        assert_eq!(
+            parse_dumb_http_packs(ObjectFormat::Sha1, b"").expect("test operation should succeed"),
             Vec::<DumbHttpPackRecord>::new()
         );
     }
@@ -9247,13 +9512,14 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
         }];
         let mut encoded = Vec::new();
-        write_dumb_http_packs(&mut encoded, &records).unwrap();
+        write_dumb_http_packs(&mut encoded, &records).expect("test operation should succeed");
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_dumb_http_packs(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_dumb_http_packs(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             records
         );
         assert!(input.is_empty());
@@ -9261,22 +9527,28 @@ mod tests {
 
     #[test]
     fn dumb_http_packs_reject_malformed_records() {
-        assert!(parse_dumb_http_packs(
-            ObjectFormat::Sha1,
-            b"P pack-1111111111111111111111111111111111111111.pack",
-        )
-        .is_err());
-        assert!(parse_dumb_http_packs(
-            ObjectFormat::Sha1,
-            b"pack-1111111111111111111111111111111111111111.pack\n",
-        )
-        .is_err());
+        assert!(
+            parse_dumb_http_packs(
+                ObjectFormat::Sha1,
+                b"P pack-1111111111111111111111111111111111111111.pack",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_dumb_http_packs(
+                ObjectFormat::Sha1,
+                b"pack-1111111111111111111111111111111111111111.pack\n",
+            )
+            .is_err()
+        );
         assert!(parse_dumb_http_packs(ObjectFormat::Sha1, b"P pack-not-a-hash.pack\n",).is_err());
-        assert!(parse_dumb_http_packs(
-            ObjectFormat::Sha1,
-            b"P pack-1111111111111111111111111111111111111111.idx\n",
-        )
-        .is_err());
+        assert!(
+            parse_dumb_http_packs(
+                ObjectFormat::Sha1,
+                b"P pack-1111111111111111111111111111111111111111.idx\n",
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9347,7 +9619,8 @@ mod tests {
                 value: Some("value".into()),
             },
         ];
-        let features = parse_upload_pack_features(&capabilities).unwrap();
+        let features =
+            parse_upload_pack_features(&capabilities).expect("test operation should succeed");
         assert_eq!(
             features,
             UploadPackFeatures {
@@ -9374,16 +9647,18 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_upload_pack_features(&features).unwrap(),
+            encode_upload_pack_features(&features).expect("test operation should succeed"),
             capabilities
         );
 
         let request = UploadPackRequest {
-            wants: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
+            wants: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
             capabilities: vec![
                 Capability {
                     name: "multi_ack_detailed".into(),
@@ -9410,17 +9685,20 @@ mod tests {
                     value: Some("sley".into()),
                 },
             ],
-            shallow: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "2222222222222222222222222222222222222222",
-            )
-            .unwrap()],
+            shallow: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "2222222222222222222222222222222222222222",
+                )
+                .expect("test operation should succeed"),
+            ],
             deepen: Some(5),
             deepen_since: Some(1_710_000_000),
             deepen_not: vec!["refs/tags/base".into()],
             filter: Some("blob:none".into()),
         };
-        validate_upload_pack_request_features(&features, &request).unwrap();
+        validate_upload_pack_request_features(&features, &request)
+            .expect("test operation should succeed");
     }
 
     #[test]
@@ -9429,85 +9707,97 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let features = UploadPackFeatures {
             thin_pack: true,
             side_band: true,
             ..UploadPackFeatures::default()
         };
 
-        assert!(validate_upload_pack_request_features(
-            &features,
-            &UploadPackRequest {
-                wants: vec![want.clone()],
-                capabilities: vec![Capability {
-                    name: "ofs-delta".into(),
+        assert!(
+            validate_upload_pack_request_features(
+                &features,
+                &UploadPackRequest {
+                    wants: vec![want.clone()],
+                    capabilities: vec![Capability {
+                        name: "ofs-delta".into(),
+                        value: None,
+                    }],
+                    ..UploadPackRequest::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_upload_pack_request_features(
+                &features,
+                &UploadPackRequest {
+                    wants: vec![want.clone()],
+                    shallow: vec![want.clone()],
+                    ..UploadPackRequest::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_upload_pack_request_features(
+                &features,
+                &UploadPackRequest {
+                    wants: vec![want.clone()],
+                    filter: Some("blob:none".into()),
+                    ..UploadPackRequest::default()
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            validate_upload_pack_request_features(
+                &UploadPackFeatures {
+                    side_band: true,
+                    side_band_64k: true,
+                    ..UploadPackFeatures::default()
+                },
+                &UploadPackRequest {
+                    wants: vec![want.clone()],
+                    capabilities: vec![
+                        Capability {
+                            name: "side-band".into(),
+                            value: None,
+                        },
+                        Capability {
+                            name: "side-band-64k".into(),
+                            value: None,
+                        },
+                    ],
+                    ..UploadPackRequest::default()
+                },
+            )
+            .is_err()
+        );
+
+        assert!(
+            parse_upload_pack_features(&[
+                Capability {
+                    name: "thin-pack".into(),
+                    value: None,
+                },
+                Capability {
+                    name: "thin-pack".into(),
+                    value: None,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_upload_pack_features(&UploadPackFeatures {
+                unknown: vec![Capability {
+                    name: "filter".into(),
                     value: None,
                 }],
-                ..UploadPackRequest::default()
-            },
-        )
-        .is_err());
-        assert!(validate_upload_pack_request_features(
-            &features,
-            &UploadPackRequest {
-                wants: vec![want.clone()],
-                shallow: vec![want.clone()],
-                ..UploadPackRequest::default()
-            },
-        )
-        .is_err());
-        assert!(validate_upload_pack_request_features(
-            &features,
-            &UploadPackRequest {
-                wants: vec![want.clone()],
-                filter: Some("blob:none".into()),
-                ..UploadPackRequest::default()
-            },
-        )
-        .is_err());
-        assert!(validate_upload_pack_request_features(
-            &UploadPackFeatures {
-                side_band: true,
-                side_band_64k: true,
                 ..UploadPackFeatures::default()
-            },
-            &UploadPackRequest {
-                wants: vec![want.clone()],
-                capabilities: vec![
-                    Capability {
-                        name: "side-band".into(),
-                        value: None,
-                    },
-                    Capability {
-                        name: "side-band-64k".into(),
-                        value: None,
-                    },
-                ],
-                ..UploadPackRequest::default()
-            },
-        )
-        .is_err());
-
-        assert!(parse_upload_pack_features(&[
-            Capability {
-                name: "thin-pack".into(),
-                value: None,
-            },
-            Capability {
-                name: "thin-pack".into(),
-                value: None,
-            },
-        ])
-        .is_err());
-        assert!(encode_upload_pack_features(&UploadPackFeatures {
-            unknown: vec![Capability {
-                name: "filter".into(),
-                value: None,
-            }],
-            ..UploadPackFeatures::default()
-        })
-        .is_err());
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -9516,17 +9806,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let known_have = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let unknown_have = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let existing = std::collections::HashSet::from([want.clone(), known_have.clone()]);
 
         let response = build_upload_pack_raw_packfile_response(
@@ -9543,7 +9833,7 @@ mod tests {
                 Ok(Some(b"PACKmock".to_vec()))
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert_eq!(
             response.acknowledgments,
@@ -9558,31 +9848,35 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
-        assert!(build_upload_pack_raw_packfile_response(
-            &UploadPackFeatures::default(),
-            UploadPackRequest {
-                wants: vec![want.clone()],
-                ..UploadPackRequest::default()
-            },
-            Vec::<ObjectId>::new(),
-            |_| Ok(false),
-            |_, _| Ok(Some(b"PACKmock".to_vec())),
-        )
-        .is_err());
+        assert!(
+            build_upload_pack_raw_packfile_response(
+                &UploadPackFeatures::default(),
+                UploadPackRequest {
+                    wants: vec![want.clone()],
+                    ..UploadPackRequest::default()
+                },
+                Vec::<ObjectId>::new(),
+                |_| Ok(false),
+                |_, _| Ok(Some(b"PACKmock".to_vec())),
+            )
+            .is_err()
+        );
 
-        assert!(build_upload_pack_raw_packfile_response(
-            &UploadPackFeatures::default(),
-            UploadPackRequest {
-                wants: vec![want],
-                ..UploadPackRequest::default()
-            },
-            Vec::<ObjectId>::new(),
-            |_| Ok(true),
-            |_, _| Ok(None),
-        )
-        .is_err());
+        assert!(
+            build_upload_pack_raw_packfile_response(
+                &UploadPackFeatures::default(),
+                UploadPackRequest {
+                    wants: vec![want],
+                    ..UploadPackRequest::default()
+                },
+                Vec::<ObjectId>::new(),
+                |_| Ok(true),
+                |_, _| Ok(None),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9591,17 +9885,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second_want = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let shallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(
                 b"want 1111111111111111111111111111111111111111 multi_ack thin-pack agent=git/2.54.0\n"
@@ -9615,8 +9909,8 @@ mod tests {
             PktLineFrame::Flush,
         ];
         let request = parse_upload_pack_request(ObjectFormat::Sha1, &frames)
-            .unwrap()
-            .unwrap();
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             UploadPackRequest {
@@ -9642,13 +9936,17 @@ mod tests {
                 filter: Some("blob:none".into()),
             }
         );
-        assert_eq!(encode_upload_pack_request(Some(&request)).unwrap(), frames);
         assert_eq!(
-            parse_upload_pack_request(ObjectFormat::Sha1, &[PktLineFrame::Flush]).unwrap(),
+            encode_upload_pack_request(Some(&request)).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            parse_upload_pack_request(ObjectFormat::Sha1, &[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             None
         );
         assert_eq!(
-            encode_upload_pack_request(None).unwrap(),
+            encode_upload_pack_request(None).expect("test operation should succeed"),
             vec![PktLineFrame::Flush]
         );
     }
@@ -9656,11 +9954,13 @@ mod tests {
     #[test]
     fn upload_pack_request_streams_round_trip() {
         let request = UploadPackRequest {
-            wants: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
+            wants: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
             capabilities: vec![Capability {
                 name: "ofs-delta".into(),
                 value: None,
@@ -9669,12 +9969,14 @@ mod tests {
             ..UploadPackRequest::default()
         };
         let mut encoded = Vec::new();
-        write_upload_pack_request(&mut encoded, Some(&request)).unwrap();
+        write_upload_pack_request(&mut encoded, Some(&request))
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             Some(request)
         );
         assert_eq!(input, b"tail");
@@ -9682,34 +9984,42 @@ mod tests {
 
     #[test]
     fn upload_pack_request_rejects_malformed_requests() {
-        assert!(parse_upload_pack_request(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"want 1111111111111111111111111111111111111111\n".to_vec(),
-            )],
-        )
-        .is_err());
-        assert!(parse_upload_pack_request(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_upload_pack_request(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
-                ),
-                PktLineFrame::Data(
-                    b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_request(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"want 1111111111111111111111111111111111111111\n".to_vec(),
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_request(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_request(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"want 1111111111111111111111111111111111111111 thin-pack\n".to_vec(),
+                    ),
+                    PktLineFrame::Data(
+                        b"want 2222222222222222222222222222222222222222 ofs-delta\n".to_vec(),
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(parse_upload_pack_request(
             ObjectFormat::Sha1,
             &[
@@ -9731,16 +10041,20 @@ mod tests {
         )
         .is_err());
         assert!(encode_upload_pack_request(Some(&UploadPackRequest::default())).is_err());
-        assert!(encode_upload_pack_request(Some(&UploadPackRequest {
-            wants: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
-            deepen: Some(0),
-            ..UploadPackRequest::default()
-        }))
-        .is_err());
+        assert!(
+            encode_upload_pack_request(Some(&UploadPackRequest {
+                wants: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed")
+                ],
+                deepen: Some(0),
+                ..UploadPackRequest::default()
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -9749,18 +10063,19 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let unshallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec()),
             PktLineFrame::Data(b"unshallow 2222222222222222222222222222222222222222\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let entries = parse_upload_pack_shallow_update(ObjectFormat::Sha1, &frames).unwrap();
+        let entries = parse_upload_pack_shallow_update(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             entries,
             vec![
@@ -9768,9 +10083,13 @@ mod tests {
                 ProtocolV2FetchShallowInfo::Unshallow(unshallow),
             ]
         );
-        assert_eq!(encode_upload_pack_shallow_update(&entries).unwrap(), frames);
         assert_eq!(
-            parse_upload_pack_shallow_update(ObjectFormat::Sha1, &[PktLineFrame::Flush]).unwrap(),
+            encode_upload_pack_shallow_update(&entries).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            parse_upload_pack_shallow_update(ObjectFormat::Sha1, &[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             Vec::<ProtocolV2FetchShallowInfo>::new()
         );
     }
@@ -9782,15 +10101,17 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
         )];
         let mut encoded = Vec::new();
-        write_upload_pack_shallow_update(&mut encoded, &entries).unwrap();
+        write_upload_pack_shallow_update(&mut encoded, &entries)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_shallow_update(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_shallow_update(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             entries
         );
         assert_eq!(input, b"tail");
@@ -9798,39 +10119,49 @@ mod tests {
 
     #[test]
     fn upload_pack_shallow_update_rejects_malformed_records() {
-        assert!(parse_upload_pack_shallow_update(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
-            )],
-        )
-        .is_err());
-        assert!(parse_upload_pack_shallow_update(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-        )
-        .is_err());
-        assert!(parse_upload_pack_shallow_update(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"shallow 1111111111111111111111111111111111111111\n".to_vec(),),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(
-                    b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),
-                ),
-            ],
-        )
-        .is_err());
-        assert!(parse_upload_pack_shallow_update(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_shallow_update(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_shallow_update(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_shallow_update(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"shallow 1111111111111111111111111111111111111111\n".to_vec(),
+                    ),
+                    PktLineFrame::Flush,
+                    PktLineFrame::Data(
+                        b"unshallow 2222222222222222222222222222222222222222\n".to_vec(),
+                    ),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_shallow_update(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"unsupported 1111111111111111111111111111111111111111\n".to_vec(),
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9839,19 +10170,19 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second_have = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let flush_round = vec![
             PktLineFrame::Data(b"have 1111111111111111111111111111111111111111\n".to_vec()),
             PktLineFrame::Data(b"have 2222222222222222222222222222222222222222\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let request =
-            parse_upload_pack_negotiation_request(ObjectFormat::Sha1, &flush_round).unwrap();
+        let request = parse_upload_pack_negotiation_request(ObjectFormat::Sha1, &flush_round)
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             UploadPackNegotiationRequest {
@@ -9860,7 +10191,8 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_upload_pack_negotiation_request(&request).unwrap(),
+            encode_upload_pack_negotiation_request(&request)
+                .expect("test operation should succeed"),
             flush_round
         );
 
@@ -9868,8 +10200,8 @@ mod tests {
             PktLineFrame::Data(b"have 1111111111111111111111111111111111111111\n".to_vec()),
             PktLineFrame::Data(b"done\n".to_vec()),
         ];
-        let request =
-            parse_upload_pack_negotiation_request(ObjectFormat::Sha1, &done_round).unwrap();
+        let request = parse_upload_pack_negotiation_request(ObjectFormat::Sha1, &done_round)
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             UploadPackNegotiationRequest {
@@ -9878,7 +10210,8 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_upload_pack_negotiation_request(&request).unwrap(),
+            encode_upload_pack_negotiation_request(&request)
+                .expect("test operation should succeed"),
             done_round
         );
     }
@@ -9886,11 +10219,13 @@ mod tests {
     #[test]
     fn upload_pack_negotiation_request_streams_round_trip() {
         let first = UploadPackNegotiationRequest {
-            haves: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
+            haves: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
             done: false,
         };
         let second = UploadPackNegotiationRequest {
@@ -9898,17 +10233,21 @@ mod tests {
             done: true,
         };
         let mut encoded = Vec::new();
-        write_upload_pack_negotiation_request(&mut encoded, &first).unwrap();
-        write_upload_pack_negotiation_request(&mut encoded, &second).unwrap();
+        write_upload_pack_negotiation_request(&mut encoded, &first)
+            .expect("test operation should succeed");
+        write_upload_pack_negotiation_request(&mut encoded, &second)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_negotiation_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_negotiation_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             first
         );
         assert_eq!(
-            read_upload_pack_negotiation_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_negotiation_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             second
         );
         assert_eq!(input, b"tail");
@@ -9916,20 +10255,24 @@ mod tests {
 
     #[test]
     fn upload_pack_negotiation_request_rejects_malformed_rounds() {
-        assert!(parse_upload_pack_negotiation_request(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"have 1111111111111111111111111111111111111111\n".to_vec(),
-            )],
-        )
-        .is_err());
-        assert!(parse_upload_pack_negotiation_request(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"want 1111111111111111111111111111111111111111\n".to_vec(),
-            )],
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_negotiation_request(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"have 1111111111111111111111111111111111111111\n".to_vec(),
+                )],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_negotiation_request(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"want 1111111111111111111111111111111111111111\n".to_vec(),
+                )],
+            )
+            .is_err()
+        );
         assert!(parse_upload_pack_negotiation_request(
             ObjectFormat::Sha1,
             &[
@@ -9938,11 +10281,13 @@ mod tests {
             ],
         )
         .is_err());
-        assert!(parse_upload_pack_negotiation_request(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_negotiation_request(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -9951,9 +10296,10 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
-            parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"NAK\n").unwrap(),
+            parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"NAK\n")
+                .expect("test operation should succeed"),
             UploadPackAcknowledgment::Nak
         );
         for (payload, status) in [
@@ -9974,8 +10320,8 @@ mod tests {
                 Some(UploadPackAckStatus::Ready),
             ),
         ] {
-            let acknowledgment =
-                parse_upload_pack_acknowledgment(ObjectFormat::Sha1, payload).unwrap();
+            let acknowledgment = parse_upload_pack_acknowledgment(ObjectFormat::Sha1, payload)
+                .expect("test operation should succeed");
             assert_eq!(
                 acknowledgment,
                 UploadPackAcknowledgment::Ack {
@@ -9984,7 +10330,8 @@ mod tests {
                 }
             );
             assert_eq!(
-                encode_upload_pack_acknowledgment(&acknowledgment).unwrap(),
+                encode_upload_pack_acknowledgment(&acknowledgment)
+                    .expect("test operation should succeed"),
                 payload
             );
         }
@@ -9997,30 +10344,36 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             status: Some(UploadPackAckStatus::Ready),
         };
         let mut encoded = Vec::new();
-        write_upload_pack_acknowledgment(&mut encoded, &acknowledgment).unwrap();
+        write_upload_pack_acknowledgment(&mut encoded, &acknowledgment)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_acknowledgment(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_acknowledgment(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             acknowledgment
         );
         assert_eq!(input, b"tail");
         assert!(parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ACK not-an-oid\n").is_err());
-        assert!(parse_upload_pack_acknowledgment(
-            ObjectFormat::Sha1,
-            b"ACK 1111111111111111111111111111111111111111 unknown\n",
-        )
-        .is_err());
-        assert!(parse_upload_pack_acknowledgment(
-            ObjectFormat::Sha1,
-            b"ACK 1111111111111111111111111111111111111111 ready extra\n",
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_acknowledgment(
+                ObjectFormat::Sha1,
+                b"ACK 1111111111111111111111111111111111111111 unknown\n",
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_acknowledgment(
+                ObjectFormat::Sha1,
+                b"ACK 1111111111111111111111111111111111111111 ready extra\n",
+            )
+            .is_err()
+        );
         assert!(
             parse_upload_pack_acknowledgment(ObjectFormat::Sha1, b"ERR remote died\n").is_err()
         );
@@ -10033,7 +10386,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()),
             PktLineFrame::Data(b"NAK\n".to_vec()),
@@ -10042,7 +10395,8 @@ mod tests {
             PktLineFrame::Data(b"\x01 bytes".to_vec()),
             PktLineFrame::Flush,
         ];
-        let response = parse_upload_pack_packfile_response(ObjectFormat::Sha1, &frames).unwrap();
+        let response = parse_upload_pack_packfile_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             response,
             UploadPackPackfileResponse {
@@ -10070,14 +10424,14 @@ mod tests {
             }
         );
         assert_eq!(
-            demux_upload_pack_packfile_response(&response).unwrap(),
+            demux_upload_pack_packfile_response(&response).expect("test operation should succeed"),
             SideBandDemux {
                 data: b"PACK bytes".to_vec(),
                 progress: vec![b"counting objects\n".to_vec()],
             }
         );
         assert_eq!(
-            encode_upload_pack_packfile_response(&response).unwrap(),
+            encode_upload_pack_packfile_response(&response).expect("test operation should succeed"),
             frames
         );
     }
@@ -10092,12 +10446,14 @@ mod tests {
             }],
         };
         let mut encoded = Vec::new();
-        write_upload_pack_packfile_response(&mut encoded, &response).unwrap();
+        write_upload_pack_packfile_response(&mut encoded, &response)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_packfile_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_packfile_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             response
         );
         assert_eq!(input, b"tail");
@@ -10105,45 +10461,55 @@ mod tests {
 
     #[test]
     fn upload_pack_packfile_response_rejects_malformed_streams() {
-        assert!(parse_upload_pack_packfile_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(b"NAK\n".to_vec())],
-        )
-        .is_err());
-        assert!(parse_upload_pack_packfile_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-        )
-        .is_err());
-        assert!(parse_upload_pack_packfile_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"\x01PACK".to_vec()),
-                PktLineFrame::Data(
-                    b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_upload_pack_packfile_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"NAK\n".to_vec()),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(b"\x01PACK".to_vec()),
-            ],
-        )
-        .is_err());
-        assert!(parse_upload_pack_packfile_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"NAK\n".to_vec()),
-                PktLineFrame::Data(b"\x04bad".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_packfile_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(b"NAK\n".to_vec())],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_packfile_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_packfile_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"\x01PACK".to_vec()),
+                    PktLineFrame::Data(
+                        b"ACK 1111111111111111111111111111111111111111 common\n".to_vec()
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_packfile_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"NAK\n".to_vec()),
+                    PktLineFrame::Flush,
+                    PktLineFrame::Data(b"\x01PACK".to_vec()),
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_upload_pack_packfile_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"NAK\n".to_vec()),
+                    PktLineFrame::Data(b"\x04bad".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -10152,7 +10518,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let response = UploadPackRawPackfileResponse {
             acknowledgments: vec![
                 UploadPackAcknowledgment::Ack {
@@ -10163,9 +10529,11 @@ mod tests {
             ],
             packfile: b"PACK\x00\x00\x00\x02raw-bytes".to_vec(),
         };
-        let encoded = encode_upload_pack_raw_packfile_response(&response).unwrap();
+        let encoded = encode_upload_pack_raw_packfile_response(&response)
+            .expect("test operation should succeed");
         assert_eq!(
-            parse_upload_pack_raw_packfile_response(ObjectFormat::Sha1, &encoded).unwrap(),
+            parse_upload_pack_raw_packfile_response(ObjectFormat::Sha1, &encoded)
+                .expect("test operation should succeed"),
             response
         );
     }
@@ -10177,15 +10545,18 @@ mod tests {
             packfile: b"PACK\x00\x00\x00\x02raw-bytes".to_vec(),
         };
         let mut encoded = Vec::new();
-        write_upload_pack_raw_packfile_response(&mut encoded, &response).unwrap();
+        write_upload_pack_raw_packfile_response(&mut encoded, &response)
+            .expect("test operation should succeed");
         assert_eq!(
             encoded,
-            encode_upload_pack_raw_packfile_response(&response).unwrap()
+            encode_upload_pack_raw_packfile_response(&response)
+                .expect("test operation should succeed")
         );
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_upload_pack_raw_packfile_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_upload_pack_raw_packfile_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             response
         );
         assert!(input.is_empty());
@@ -10194,18 +10565,18 @@ mod tests {
     #[test]
     fn upload_pack_raw_packfile_response_rejects_malformed_streams() {
         let ack = PktLineFrame::data(b"NAK\n".to_vec())
-            .unwrap()
+            .expect("test operation should succeed")
             .try_encode()
-            .unwrap();
+            .expect("test operation should succeed");
         let bad_ack = PktLineFrame::data(b"ACK not-an-oid\n".to_vec())
-            .unwrap()
+            .expect("test operation should succeed")
             .try_encode()
-            .unwrap();
+            .expect("test operation should succeed");
         let non_ack =
             PktLineFrame::data(b"have 1111111111111111111111111111111111111111\n".to_vec())
-                .unwrap()
+                .expect("test operation should succeed")
                 .try_encode()
-                .unwrap();
+                .expect("test operation should succeed");
         let mut garbage_after_ack = ack.clone();
         garbage_after_ack.extend_from_slice(b"garbage");
 
@@ -10244,12 +10615,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let boundary = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = UploadPackRequest {
             wants: vec![want],
             capabilities: vec![Capability {
@@ -10261,7 +10632,8 @@ mod tests {
             ..UploadPackRequest::default()
         };
         let mut encoded = Vec::new();
-        write_upload_pack_request(&mut encoded, Some(&request)).unwrap();
+        write_upload_pack_request(&mut encoded, Some(&request))
+            .expect("test operation should succeed");
         let mut expected = Vec::new();
         expected.extend_from_slice(b"003awant 1111111111111111111111111111111111111111 shallow\n");
         expected.extend_from_slice(b"0035shallow 2222222222222222222222222222222222222222\n");
@@ -10279,12 +10651,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let unshallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut input = Vec::new();
         input.extend_from_slice(b"0035shallow 1111111111111111111111111111111111111111\n");
         input.extend_from_slice(b"0037unshallow 2222222222222222222222222222222222222222\n");
@@ -10294,7 +10666,7 @@ mod tests {
 
         let (entries, response) =
             parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &input)
-                .unwrap();
+                .expect("test operation should succeed");
         assert_eq!(
             entries,
             vec![
@@ -10317,7 +10689,7 @@ mod tests {
                 ObjectFormat::Sha1,
                 &mut stream,
             )
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(read_entries, entries);
         assert_eq!(read_response, response);
     }
@@ -10333,7 +10705,7 @@ mod tests {
 
         let (entries, response) =
             parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &input)
-                .unwrap();
+                .expect("test operation should succeed");
         assert!(entries.is_empty());
         assert_eq!(
             response.acknowledgments,
@@ -10346,11 +10718,13 @@ mod tests {
     fn upload_pack_shallow_info_response_rejects_malformed_sections() {
         // Truncated section (no terminating flush before EOF).
         let truncated = b"0035shallow 1111111111111111111111111111111111111111\n".to_vec();
-        assert!(parse_upload_pack_shallow_info_and_raw_packfile_response(
-            ObjectFormat::Sha1,
-            &truncated
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_shallow_info_and_raw_packfile_response(
+                ObjectFormat::Sha1,
+                &truncated
+            )
+            .is_err()
+        );
         // A non-flush control packet inside the shallow-info section.
         let mut delimiter_section = Vec::new();
         delimiter_section.extend_from_slice(b"0001"); // delimiter, not a flush
@@ -10365,11 +10739,10 @@ mod tests {
         let mut no_pack = Vec::new();
         no_pack.extend_from_slice(b"0000"); // empty shallow-info
         no_pack.extend_from_slice(b"0008NAK\n");
-        assert!(parse_upload_pack_shallow_info_and_raw_packfile_response(
-            ObjectFormat::Sha1,
-            &no_pack
-        )
-        .is_err());
+        assert!(
+            parse_upload_pack_shallow_info_and_raw_packfile_response(ObjectFormat::Sha1, &no_pack)
+                .is_err()
+        );
     }
 
     #[test]
@@ -10378,27 +10751,27 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let delete_old_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let zero = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "0000000000000000000000000000000000000000",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let shallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "4444444444444444444444444444444444444444",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"shallow 4444444444444444444444444444444444444444\n".to_vec()),
             PktLineFrame::Data(
@@ -10411,7 +10784,8 @@ mod tests {
             ),
             PktLineFrame::Flush,
         ];
-        let request = parse_receive_pack_request(ObjectFormat::Sha1, &frames).unwrap();
+        let request = parse_receive_pack_request(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             ReceivePackRequest {
@@ -10444,9 +10818,13 @@ mod tests {
                 ],
             }
         );
-        assert_eq!(encode_receive_pack_request(&request).unwrap(), frames);
         assert_eq!(
-            parse_receive_pack_request(ObjectFormat::Sha1, &[PktLineFrame::Flush]).unwrap(),
+            encode_receive_pack_request(&request).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            parse_receive_pack_request(ObjectFormat::Sha1, &[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             ReceivePackRequest::default()
         );
     }
@@ -10459,12 +10837,12 @@ mod tests {
                     ObjectFormat::Sha1,
                     "0000000000000000000000000000000000000000",
                 )
-                .unwrap(),
+                .expect("test operation should succeed"),
                 new_id: ObjectId::from_hex(
                     ObjectFormat::Sha1,
                     "1111111111111111111111111111111111111111",
                 )
-                .unwrap(),
+                .expect("test operation should succeed"),
                 name: "refs/heads/main".into(),
             }],
             capabilities: vec![Capability {
@@ -10474,12 +10852,13 @@ mod tests {
             ..ReceivePackRequest::default()
         };
         let mut encoded = Vec::new();
-        write_receive_pack_request(&mut encoded, &request).unwrap();
+        write_receive_pack_request(&mut encoded, &request).expect("test operation should succeed");
         encoded.extend_from_slice(b"PACK");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_receive_pack_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_receive_pack_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             request
         );
         assert_eq!(input, b"PACK");
@@ -10530,42 +10909,50 @@ mod tests {
             )
             .is_err()
         );
-        assert!(parse_receive_pack_request(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(encode_receive_pack_request(&ReceivePackRequest {
-            shallow: vec![ObjectId::from_hex(
+        assert!(
+            parse_receive_pack_request(
                 ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
+                &[
+                    PktLineFrame::Data(
+                        b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec(),
+                    ),
+                    PktLineFrame::Flush,
+                ],
             )
-            .unwrap()],
-            ..ReceivePackRequest::default()
-        })
-        .is_err());
-        assert!(encode_receive_pack_request(&ReceivePackRequest {
-            commands: vec![ReceivePackCommand {
-                old_id: ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap(),
-                new_id: ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "2222222222222222222222222222222222222222",
-                )
-                .unwrap(),
-                name: "bad ref".into(),
-            }],
-            ..ReceivePackRequest::default()
-        })
-        .is_err());
+            .is_err()
+        );
+        assert!(
+            encode_receive_pack_request(&ReceivePackRequest {
+                shallow: vec![
+                    ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed")
+                ],
+                ..ReceivePackRequest::default()
+            })
+            .is_err()
+        );
+        assert!(
+            encode_receive_pack_request(&ReceivePackRequest {
+                commands: vec![ReceivePackCommand {
+                    old_id: ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "1111111111111111111111111111111111111111",
+                    )
+                    .expect("test operation should succeed"),
+                    new_id: ObjectId::from_hex(
+                        ObjectFormat::Sha1,
+                        "2222222222222222222222222222222222222222",
+                    )
+                    .expect("test operation should succeed"),
+                    name: "bad ref".into(),
+                }],
+                ..ReceivePackRequest::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -10620,7 +11007,8 @@ mod tests {
                 value: Some("value".into()),
             },
         ];
-        let features = parse_receive_pack_features(&capabilities).unwrap();
+        let features =
+            parse_receive_pack_features(&capabilities).expect("test operation should succeed");
         assert_eq!(
             features,
             ReceivePackFeatures {
@@ -10642,7 +11030,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_receive_pack_features(&features).unwrap(),
+            encode_receive_pack_features(&features).expect("test operation should succeed"),
             capabilities
         );
 
@@ -10653,12 +11041,12 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     new_id: ObjectId::from_hex(
                         ObjectFormat::Sha1,
                         "2222222222222222222222222222222222222222",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "refs/heads/main".into(),
                 }],
                 capabilities: vec![
@@ -10688,7 +11076,8 @@ mod tests {
             push_options: Some(vec!["ci.skip".into()]),
             packfile: b"PACKpayload".to_vec(),
         };
-        validate_receive_pack_push_request_features(&features, &request).unwrap();
+        validate_receive_pack_push_request_features(&features, &request)
+            .expect("test operation should succeed");
     }
 
     #[test]
@@ -10697,17 +11086,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let zero = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "0000000000000000000000000000000000000000",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let features = ReceivePackFeatures {
             report_status: true,
             push_options: true,
@@ -10719,117 +11108,133 @@ mod tests {
             name: "refs/heads/main".into(),
         };
 
-        assert!(validate_receive_pack_push_request_features(
-            &features,
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![update.clone()],
-                    capabilities: vec![Capability {
-                        name: "push-options".into(),
-                        value: None,
-                    }],
-                    ..ReceivePackRequest::default()
+        assert!(
+            validate_receive_pack_push_request_features(
+                &features,
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![update.clone()],
+                        capabilities: vec![Capability {
+                            name: "push-options".into(),
+                            value: None,
+                        }],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: None,
+                    packfile: b"PACKpayload".to_vec(),
                 },
-                push_options: None,
-                packfile: b"PACKpayload".to_vec(),
-            },
-        )
-        .is_err());
-        assert!(validate_receive_pack_push_request_features(
-            &features,
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![update.clone()],
-                    ..ReceivePackRequest::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receive_pack_push_request_features(
+                &features,
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![update.clone()],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: Some(Vec::new()),
+                    packfile: b"PACKpayload".to_vec(),
                 },
-                push_options: Some(Vec::new()),
-                packfile: b"PACKpayload".to_vec(),
-            },
-        )
-        .is_err());
-        assert!(validate_receive_pack_push_request_features(
-            &features,
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![ReceivePackCommand {
-                        old_id: old_id.clone(),
-                        new_id: zero.clone(),
-                        name: "refs/heads/main".into(),
-                    }],
-                    ..ReceivePackRequest::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receive_pack_push_request_features(
+                &features,
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![ReceivePackCommand {
+                            old_id: old_id.clone(),
+                            new_id: zero.clone(),
+                            name: "refs/heads/main".into(),
+                        }],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: None,
+                    packfile: Vec::new(),
                 },
-                push_options: None,
-                packfile: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(validate_receive_pack_push_request_features(
-            &features,
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![update.clone()],
-                    ..ReceivePackRequest::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receive_pack_push_request_features(
+                &features,
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![update.clone()],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: None,
+                    packfile: Vec::new(),
                 },
-                push_options: None,
-                packfile: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(validate_receive_pack_push_request_features(
-            &ReceivePackFeatures {
-                delete_refs: true,
-                ..ReceivePackFeatures::default()
-            },
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![ReceivePackCommand {
-                        old_id,
-                        new_id: zero,
-                        name: "refs/heads/main".into(),
-                    }],
-                    ..ReceivePackRequest::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receive_pack_push_request_features(
+                &ReceivePackFeatures {
+                    delete_refs: true,
+                    ..ReceivePackFeatures::default()
                 },
-                push_options: None,
-                packfile: b"PACKpayload".to_vec(),
-            },
-        )
-        .is_err());
-        assert!(validate_receive_pack_push_request_features(
-            &features,
-            &ReceivePackPushRequest {
-                commands: ReceivePackRequest {
-                    commands: vec![update],
-                    capabilities: vec![Capability {
-                        name: "atomic".into(),
-                        value: None,
-                    }],
-                    ..ReceivePackRequest::default()
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![ReceivePackCommand {
+                            old_id,
+                            new_id: zero,
+                            name: "refs/heads/main".into(),
+                        }],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: None,
+                    packfile: b"PACKpayload".to_vec(),
                 },
-                push_options: None,
-                packfile: b"PACKpayload".to_vec(),
-            },
-        )
-        .is_err());
+            )
+            .is_err()
+        );
+        assert!(
+            validate_receive_pack_push_request_features(
+                &features,
+                &ReceivePackPushRequest {
+                    commands: ReceivePackRequest {
+                        commands: vec![update],
+                        capabilities: vec![Capability {
+                            name: "atomic".into(),
+                            value: None,
+                        }],
+                        ..ReceivePackRequest::default()
+                    },
+                    push_options: None,
+                    packfile: b"PACKpayload".to_vec(),
+                },
+            )
+            .is_err()
+        );
 
-        assert!(parse_receive_pack_features(&[
-            Capability {
-                name: "push-options".into(),
-                value: None,
-            },
-            Capability {
-                name: "push-options".into(),
-                value: None,
-            },
-        ])
-        .is_err());
-        assert!(encode_receive_pack_features(&ReceivePackFeatures {
-            unknown: vec![Capability {
-                name: "atomic".into(),
-                value: None,
-            }],
-            ..ReceivePackFeatures::default()
-        })
-        .is_err());
+        assert!(
+            parse_receive_pack_features(&[
+                Capability {
+                    name: "push-options".into(),
+                    value: None,
+                },
+                Capability {
+                    name: "push-options".into(),
+                    value: None,
+                },
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_receive_pack_features(&ReceivePackFeatures {
+                unknown: vec![Capability {
+                    name: "atomic".into(),
+                    value: None,
+                }],
+                ..ReceivePackFeatures::default()
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -10838,12 +11243,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = ReceivePackPushRequest {
             commands: ReceivePackRequest {
                 commands: vec![ReceivePackCommand {
@@ -10875,7 +11280,7 @@ mod tests {
             },
             |_| unreachable!("no delete command should be applied"),
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert!(installed.get());
         assert_eq!(applied.into_inner(), request.commands.commands);
@@ -10894,13 +11299,13 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let other_id = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
-        let zero = zero_object_id(ObjectFormat::Sha1).unwrap();
+        .expect("test operation should succeed");
+        let zero = zero_object_id(ObjectFormat::Sha1).expect("test operation should succeed");
         let request = ReceivePackPushRequest {
             commands: ReceivePackRequest {
                 commands: vec![ReceivePackCommand {
@@ -10934,21 +11339,23 @@ mod tests {
                 Ok(())
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert!(!installed.get());
         assert_eq!(deleted.into_inner(), vec!["refs/heads/main"]);
         assert_eq!(report.unpack, ReceivePackUnpackStatus::Ok);
-        assert!(apply_receive_pack_push_request(
-            &features,
-            &request,
-            |_| Ok(Some(other_id.clone())),
-            |_| Ok(()),
-            |_| Ok(false),
-            |_| Ok(()),
-            |_| Ok(()),
-        )
-        .is_err());
+        assert!(
+            apply_receive_pack_push_request(
+                &features,
+                &request,
+                |_| Ok(Some(other_id.clone())),
+                |_| Ok(()),
+                |_| Ok(false),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -10958,12 +11365,12 @@ mod tests {
                 ObjectFormat::Sha1,
                 "1111111111111111111111111111111111111111",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             new_id: ObjectId::from_hex(
                 ObjectFormat::Sha1,
                 "2222222222222222222222222222222222222222",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             name: "refs/heads/main".into(),
         };
         let expected = ReceivePackPushRequest {
@@ -10984,10 +11391,12 @@ mod tests {
             push_options: Some(vec!["ci.skip".into(), "deploy=staging".into()]),
             packfile: b"PACK\x00\x00\x00\x02payload".to_vec(),
         };
-        let encoded = encode_receive_pack_push_request(&expected).unwrap();
+        let encoded =
+            encode_receive_pack_push_request(&expected).expect("test operation should succeed");
 
         assert_eq!(
-            parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, true).unwrap(),
+            parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, true)
+                .expect("test operation should succeed"),
             expected
         );
     }
@@ -11001,12 +11410,12 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     new_id: ObjectId::from_hex(
                         ObjectFormat::Sha1,
                         "2222222222222222222222222222222222222222",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "refs/heads/main".into(),
                 }],
                 ..ReceivePackRequest::default()
@@ -11014,10 +11423,12 @@ mod tests {
             push_options: None,
             packfile: b"0000PACK-like bytes stay raw".to_vec(),
         };
-        let encoded = encode_receive_pack_push_request(&request).unwrap();
+        let encoded =
+            encode_receive_pack_push_request(&request).expect("test operation should succeed");
 
         assert_eq!(
-            parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, false).unwrap(),
+            parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, false)
+                .expect("test operation should succeed"),
             request
         );
     }
@@ -11031,12 +11442,12 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     new_id: ObjectId::from_hex(
                         ObjectFormat::Sha1,
                         "2222222222222222222222222222222222222222",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "refs/heads/main".into(),
                 }],
                 capabilities: vec![Capability {
@@ -11049,23 +11460,26 @@ mod tests {
             packfile: b"PACKpayload".to_vec(),
         };
         let mut encoded = Vec::new();
-        write_receive_pack_push_request(&mut encoded, &request).unwrap();
+        write_receive_pack_push_request(&mut encoded, &request)
+            .expect("test operation should succeed");
 
         assert_eq!(
             read_receive_pack_push_request(ObjectFormat::Sha1, &mut encoded.as_slice(), true)
-                .unwrap(),
+                .expect("test operation should succeed"),
             request
         );
     }
 
     #[test]
     fn receive_pack_push_request_rejects_malformed_sections() {
-        assert!(parse_receive_pack_push_request(
-            ObjectFormat::Sha1,
-            b"0014not-a-command\n0000PACK",
-            false,
-        )
-        .is_err());
+        assert!(
+            parse_receive_pack_push_request(
+                ObjectFormat::Sha1,
+                b"0014not-a-command\n0000PACK",
+                false,
+            )
+            .is_err()
+        );
 
         let request = ReceivePackPushRequest {
             commands: ReceivePackRequest {
@@ -11074,12 +11488,12 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     new_id: ObjectId::from_hex(
                         ObjectFormat::Sha1,
                         "2222222222222222222222222222222222222222",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "refs/heads/main".into(),
                 }],
                 ..ReceivePackRequest::default()
@@ -11087,22 +11501,27 @@ mod tests {
             push_options: None,
             packfile: b"PACKpayload".to_vec(),
         };
-        let encoded = encode_receive_pack_push_request(&request).unwrap();
+        let encoded =
+            encode_receive_pack_push_request(&request).expect("test operation should succeed");
         assert!(parse_receive_pack_push_request(ObjectFormat::Sha1, &encoded, true).is_err());
 
-        assert!(encode_receive_pack_push_request(&ReceivePackPushRequest {
-            commands: ReceivePackRequest {
-                shallow: vec![ObjectId::from_hex(
-                    ObjectFormat::Sha1,
-                    "1111111111111111111111111111111111111111",
-                )
-                .unwrap()],
-                ..ReceivePackRequest::default()
-            },
-            push_options: None,
-            packfile: Vec::new(),
-        })
-        .is_err());
+        assert!(
+            encode_receive_pack_push_request(&ReceivePackPushRequest {
+                commands: ReceivePackRequest {
+                    shallow: vec![
+                        ObjectId::from_hex(
+                            ObjectFormat::Sha1,
+                            "1111111111111111111111111111111111111111",
+                        )
+                        .expect("test operation should succeed")
+                    ],
+                    ..ReceivePackRequest::default()
+                },
+                push_options: None,
+                packfile: Vec::new(),
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -11113,7 +11532,8 @@ mod tests {
             PktLineFrame::Data(b"ng refs/heads/old non-fast-forward\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let report = parse_receive_pack_report_status(&frames).unwrap();
+        let report =
+            parse_receive_pack_report_status(&frames).expect("test operation should succeed");
         assert_eq!(
             report,
             ReceivePackReportStatus {
@@ -11129,14 +11549,17 @@ mod tests {
                 ],
             }
         );
-        assert_eq!(encode_receive_pack_report_status(&report).unwrap(), frames);
+        assert_eq!(
+            encode_receive_pack_report_status(&report).expect("test operation should succeed"),
+            frames
+        );
 
         let frames = vec![
             PktLineFrame::Data(b"unpack pack exceeds maximum size\n".to_vec()),
             PktLineFrame::Flush,
         ];
         assert_eq!(
-            parse_receive_pack_report_status(&frames).unwrap(),
+            parse_receive_pack_report_status(&frames).expect("test operation should succeed"),
             ReceivePackReportStatus {
                 unpack: ReceivePackUnpackStatus::Error("pack exceeds maximum size".into()),
                 commands: Vec::new(),
@@ -11153,51 +11576,67 @@ mod tests {
             }],
         };
         let mut encoded = Vec::new();
-        write_receive_pack_report_status(&mut encoded, &report).unwrap();
+        write_receive_pack_report_status(&mut encoded, &report)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_receive_pack_report_status(&mut input).unwrap(), report);
+        assert_eq!(
+            read_receive_pack_report_status(&mut input).expect("test operation should succeed"),
+            report
+        );
         assert_eq!(input, b"tail");
     }
 
     #[test]
     fn receive_pack_report_status_rejects_malformed_status_lines() {
         assert!(parse_receive_pack_report_status(&[]).is_err());
-        assert!(parse_receive_pack_report_status(&[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-        ])
-        .is_err());
-        assert!(parse_receive_pack_report_status(&[
-            PktLineFrame::Flush,
-            PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
-        ])
-        .is_err());
-        assert!(parse_receive_pack_report_status(&[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(parse_receive_pack_report_status(&[
-            PktLineFrame::Data(b"unpack ok\n".to_vec()),
-            PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
-            unpack: ReceivePackUnpackStatus::Error("".into()),
-            commands: Vec::new(),
-        })
-        .is_err());
-        assert!(encode_receive_pack_report_status(&ReceivePackReportStatus {
-            unpack: ReceivePackUnpackStatus::Ok,
-            commands: vec![ReceivePackCommandStatus::Ok {
-                name: "bad ref".into(),
-            }],
-        })
-        .is_err());
+        assert!(
+            parse_receive_pack_report_status(&[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status(&[
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"ok refs/heads/main\n".to_vec()),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status(&[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"bad refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status(&[
+                PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                PktLineFrame::Data(b"ng refs/heads/main\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            encode_receive_pack_report_status(&ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Error("".into()),
+                commands: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            encode_receive_pack_report_status(&ReceivePackReportStatus {
+                unpack: ReceivePackUnpackStatus::Ok,
+                commands: vec![ReceivePackCommandStatus::Ok {
+                    name: "bad ref".into(),
+                }],
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -11206,12 +11645,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"unpack ok\n".to_vec()),
             PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
@@ -11226,7 +11665,8 @@ mod tests {
             PktLineFrame::Data(b"ng refs/heads/old rejected by hook\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let report = parse_receive_pack_report_status_v2(ObjectFormat::Sha1, &frames).unwrap();
+        let report = parse_receive_pack_report_status_v2(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             report,
             ReceivePackReportStatusV2 {
@@ -11249,7 +11689,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_receive_pack_report_status_v2(&report).unwrap(),
+            encode_receive_pack_report_status_v2(&report).expect("test operation should succeed"),
             frames
         );
     }
@@ -11269,12 +11709,14 @@ mod tests {
             }],
         };
         let mut encoded = Vec::new();
-        write_receive_pack_report_status_v2(&mut encoded, &report).unwrap();
+        write_receive_pack_report_status_v2(&mut encoded, &report)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_receive_pack_report_status_v2(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_receive_pack_report_status_v2(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             report
         );
         assert_eq!(input, b"tail");
@@ -11283,46 +11725,54 @@ mod tests {
     #[test]
     fn receive_pack_report_status_v2_rejects_malformed_options() {
         assert!(parse_receive_pack_report_status_v2(ObjectFormat::Sha1, &[]).is_err());
-        assert!(parse_receive_pack_report_status_v2(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_receive_pack_report_status_v2(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
-                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_receive_pack_report_status_v2(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-                PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
-                PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_receive_pack_report_status_v2(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"unpack ok\n".to_vec()),
-                PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
-                PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_receive_pack_report_status_v2(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status_v2(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                    PktLineFrame::Data(b"ng refs/heads/main rejected\n".to_vec()),
+                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status_v2(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                    PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                    PktLineFrame::Data(b"option refname refs/heads/main\n".to_vec()),
+                    PktLineFrame::Data(b"option refname refs/heads/next\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_report_status_v2(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"unpack ok\n".to_vec()),
+                    PktLineFrame::Data(b"ok refs/for/main\n".to_vec()),
+                    PktLineFrame::Data(b"option old-oid not-an-oid\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(
             encode_receive_pack_report_status_v2(&ReceivePackReportStatusV2 {
                 unpack: ReceivePackUnpackStatus::Ok,
@@ -11346,7 +11796,8 @@ mod tests {
             PktLineFrame::Data(b"\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let options = parse_receive_pack_push_options(&frames).unwrap();
+        let options =
+            parse_receive_pack_push_options(&frames).expect("test operation should succeed");
         assert_eq!(
             options,
             vec![
@@ -11355,9 +11806,13 @@ mod tests {
                 String::new(),
             ]
         );
-        assert_eq!(encode_receive_pack_push_options(&options).unwrap(), frames);
         assert_eq!(
-            parse_receive_pack_push_options(&[PktLineFrame::Flush]).unwrap(),
+            encode_receive_pack_push_options(&options).expect("test operation should succeed"),
+            frames
+        );
+        assert_eq!(
+            parse_receive_pack_push_options(&[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             Vec::<String>::new()
         );
     }
@@ -11366,11 +11821,15 @@ mod tests {
     fn receive_pack_push_options_streams_round_trip() {
         let options = vec!["ci.skip".to_string(), "reviewer=alice".to_string()];
         let mut encoded = Vec::new();
-        write_receive_pack_push_options(&mut encoded, &options).unwrap();
+        write_receive_pack_push_options(&mut encoded, &options)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"PACK");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_receive_pack_push_options(&mut input).unwrap(), options);
+        assert_eq!(
+            read_receive_pack_push_options(&mut input).expect("test operation should succeed"),
+            options
+        );
         assert_eq!(input, b"PACK");
     }
 
@@ -11383,17 +11842,21 @@ mod tests {
             parse_receive_pack_push_options(&[PktLineFrame::Delimiter, PktLineFrame::Flush])
                 .is_err()
         );
-        assert!(parse_receive_pack_push_options(&[
-            PktLineFrame::Data(b"ci.skip\n".to_vec()),
-            PktLineFrame::Flush,
-            PktLineFrame::Data(b"after\n".to_vec()),
-        ])
-        .is_err());
-        assert!(parse_receive_pack_push_options(&[
-            PktLineFrame::Data(b"bad\0option\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_receive_pack_push_options(&[
+                PktLineFrame::Data(b"ci.skip\n".to_vec()),
+                PktLineFrame::Flush,
+                PktLineFrame::Data(b"after\n".to_vec()),
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_receive_pack_push_options(&[
+                PktLineFrame::Data(b"bad\0option\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
         assert!(encode_receive_pack_push_options(&["bad\noption".to_string()]).is_err());
     }
 
@@ -11402,8 +11865,9 @@ mod tests {
         let frames = parse_pkt_line_stream(
             b"000eversion 2\n0015agent=git/2.54.0\n0013ls-refs=unborn\n0027fetch=shallow wait-for-done filter\n0012server-option\n0000",
         )
-        .unwrap();
-        let handshake = parse_protocol_v2_advertisement(&frames).unwrap();
+        .expect("test operation should succeed");
+        let handshake =
+            parse_protocol_v2_advertisement(&frames).expect("test operation should succeed");
         assert_eq!(handshake.protocol, ProtocolVersion::V2);
         assert_eq!(
             handshake.capabilities,
@@ -11427,7 +11891,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            encode_protocol_v2_advertisement(&handshake).unwrap(),
+            encode_protocol_v2_advertisement(&handshake).expect("test operation should succeed"),
             frames
         );
     }
@@ -11435,7 +11899,8 @@ mod tests {
     #[test]
     fn protocol_v2_advertisement_reads_until_flush() {
         let mut input = b"000eversion 2\n0013ls-refs=unborn\n0000next-session".as_slice();
-        let handshake = read_protocol_v2_advertisement(&mut input).unwrap();
+        let handshake =
+            read_protocol_v2_advertisement(&mut input).expect("test operation should succeed");
         assert_eq!(handshake.protocol, ProtocolVersion::V2);
         assert_eq!(
             handshake.capabilities,
@@ -11463,43 +11928,52 @@ mod tests {
             ],
         };
         let mut encoded = Vec::new();
-        write_protocol_v2_advertisement(&mut encoded, &handshake).unwrap();
+        write_protocol_v2_advertisement(&mut encoded, &handshake)
+            .expect("test operation should succeed");
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_advertisement(&mut input).unwrap(),
+            read_protocol_v2_advertisement(&mut input).expect("test operation should succeed"),
             handshake
         );
         assert!(input.is_empty());
-        assert!(encode_protocol_v2_advertisement(&TransportHandshake {
-            protocol: ProtocolVersion::V1,
-            capabilities: Vec::new(),
-        })
-        .is_err());
+        assert!(
+            encode_protocol_v2_advertisement(&TransportHandshake {
+                protocol: ProtocolVersion::V1,
+                capabilities: Vec::new(),
+            })
+            .is_err()
+        );
     }
 
     #[test]
     fn protocol_v2_advertisement_rejects_malformed_sequences() {
         assert!(parse_protocol_v2_advertisement(&[]).is_err());
-        assert!(parse_protocol_v2_advertisement(&[
-            PktLineFrame::Data(b"version 1\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_protocol_v2_advertisement(&[
+                PktLineFrame::Data(b"version 1\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
         assert!(
             parse_protocol_v2_advertisement(&[PktLineFrame::Data(b"version 2\n".to_vec())])
                 .is_err()
         );
-        assert!(parse_protocol_v2_advertisement(&[
-            PktLineFrame::Data(b"version 2\n".to_vec()),
-            PktLineFrame::Delimiter,
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_advertisement(&[
-            PktLineFrame::Data(b"version 2\n".to_vec()),
-            PktLineFrame::Data(b"fetch=\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_protocol_v2_advertisement(&[
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+                PktLineFrame::Delimiter,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_advertisement(&[
+                PktLineFrame::Data(b"version 2\n".to_vec()),
+                PktLineFrame::Data(b"fetch=\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -11507,8 +11981,9 @@ mod tests {
         let frames = parse_pkt_line_stream(
             b"0014command=ls-refs\n0011agent=sley/0\n0017object-format=sha1\n00010009peel\n000csymrefs\n001bref-prefix refs/heads/\n0000",
         )
-        .unwrap();
-        let request = parse_protocol_v2_command_request(&frames).unwrap();
+        .expect("test operation should succeed");
+        let request =
+            parse_protocol_v2_command_request(&frames).expect("test operation should succeed");
         assert_eq!(
             request,
             ProtocolV2CommandRequest {
@@ -11531,15 +12006,17 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_command_request(&request).unwrap(),
+            encode_protocol_v2_command_request(&request).expect("test operation should succeed"),
             frames
         );
     }
 
     #[test]
     fn protocol_v2_command_request_allows_no_argument_section() {
-        let frames = parse_pkt_line_stream(b"0012command=fetch\n0000").unwrap();
-        let request = parse_protocol_v2_command_request(&frames).unwrap();
+        let frames = parse_pkt_line_stream(b"0012command=fetch\n0000")
+            .expect("test operation should succeed");
+        let request =
+            parse_protocol_v2_command_request(&frames).expect("test operation should succeed");
         assert_eq!(
             request,
             ProtocolV2CommandRequest {
@@ -11549,34 +12026,38 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_command_request(&request).unwrap(),
+            encode_protocol_v2_command_request(&request).expect("test operation should succeed"),
             frames
         );
     }
 
     #[test]
     fn protocol_v2_request_parses_commands_and_empty_done() {
-        let frames = parse_pkt_line_stream(b"0012command=fetch\n0000").unwrap();
+        let frames = parse_pkt_line_stream(b"0012command=fetch\n0000")
+            .expect("test operation should succeed");
         let command = ProtocolV2CommandRequest {
             command: "fetch".into(),
             capabilities: Vec::new(),
             arguments: Vec::new(),
         };
         assert_eq!(
-            parse_protocol_v2_request(&frames).unwrap(),
+            parse_protocol_v2_request(&frames).expect("test operation should succeed"),
             ProtocolV2Request::Command(command.clone())
         );
         assert_eq!(
-            encode_protocol_v2_request(&ProtocolV2Request::Command(command)).unwrap(),
+            encode_protocol_v2_request(&ProtocolV2Request::Command(command))
+                .expect("test operation should succeed"),
             frames
         );
 
         assert_eq!(
-            parse_protocol_v2_request(&[PktLineFrame::Flush]).unwrap(),
+            parse_protocol_v2_request(&[PktLineFrame::Flush])
+                .expect("test operation should succeed"),
             ProtocolV2Request::Done
         );
         assert_eq!(
-            encode_protocol_v2_request(&ProtocolV2Request::Done).unwrap(),
+            encode_protocol_v2_request(&ProtocolV2Request::Done)
+                .expect("test operation should succeed"),
             vec![PktLineFrame::Flush]
         );
     }
@@ -11584,12 +12065,13 @@ mod tests {
     #[test]
     fn protocol_v2_request_streams_empty_done() {
         let mut encoded = Vec::new();
-        write_protocol_v2_request(&mut encoded, &ProtocolV2Request::Done).unwrap();
+        write_protocol_v2_request(&mut encoded, &ProtocolV2Request::Done)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_request(&mut input).unwrap(),
+            read_protocol_v2_request(&mut input).expect("test operation should succeed"),
             ProtocolV2Request::Done
         );
         assert_eq!(input, b"tail");
@@ -11608,12 +12090,13 @@ mod tests {
             arguments: vec![b"peel".to_vec(), b"symrefs".to_vec()],
         };
         let mut encoded = Vec::new();
-        write_protocol_v2_command_request(&mut encoded, &request).unwrap();
+        write_protocol_v2_command_request(&mut encoded, &request)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_command_request(&mut input).unwrap(),
+            read_protocol_v2_command_request(&mut input).expect("test operation should succeed"),
             request
         );
         assert_eq!(input, b"tail");
@@ -11622,25 +12105,31 @@ mod tests {
     #[test]
     fn protocol_v2_command_request_rejects_malformed_sequences() {
         assert!(parse_protocol_v2_command_request(&[]).is_err());
-        assert!(parse_protocol_v2_command_request(&[
-            PktLineFrame::Data(b"agent=sley/0\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_command_request(&[
-            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-            PktLineFrame::Delimiter,
-            PktLineFrame::Delimiter,
-            PktLineFrame::Flush,
-        ])
-        .is_err());
-        assert!(parse_protocol_v2_command_request(&[
-            PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
-            PktLineFrame::Delimiter,
-            PktLineFrame::Data(b"\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_protocol_v2_command_request(&[
+                PktLineFrame::Data(b"agent=sley/0\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_command_request(&[
+                PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+                PktLineFrame::Delimiter,
+                PktLineFrame::Delimiter,
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_command_request(&[
+                PktLineFrame::Data(b"command=ls-refs\n".to_vec()),
+                PktLineFrame::Delimiter,
+                PktLineFrame::Data(b"\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_command_request(&ProtocolV2CommandRequest {
                 command: "bad command".into(),
@@ -11664,7 +12153,8 @@ mod tests {
                 b"ref-prefix refs/heads/".to_vec(),
             ],
         };
-        let request = ProtocolV2LsRefsRequest::from_command_request(&command).unwrap();
+        let request = ProtocolV2LsRefsRequest::from_command_request(&command)
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             ProtocolV2LsRefsRequest {
@@ -11674,7 +12164,12 @@ mod tests {
                 ref_prefixes: vec!["HEAD".into(), "refs/heads/".into()],
             }
         );
-        assert_eq!(request.to_command_request().unwrap(), command);
+        assert_eq!(
+            request
+                .to_command_request()
+                .expect("test operation should succeed"),
+            command
+        );
         assert!(
             ProtocolV2LsRefsRequest::from_command_request(&ProtocolV2CommandRequest {
                 command: "fetch".into(),
@@ -11702,12 +12197,13 @@ mod tests {
             ref_prefixes: vec!["HEAD".into(), "refs/tags/".into()],
         };
         let mut encoded = Vec::new();
-        write_protocol_v2_ls_refs_request(&mut encoded, &request).unwrap();
+        write_protocol_v2_ls_refs_request(&mut encoded, &request)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_ls_refs_request(&mut input).unwrap(),
+            read_protocol_v2_ls_refs_request(&mut input).expect("test operation should succeed"),
             request
         );
         assert_eq!(input, b"tail");
@@ -11719,12 +12215,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let peeled = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(
                 b"1111111111111111111111111111111111111111 refs/tags/v1 peeled:2222222222222222222222222222222222222222 symref-target:refs/heads/main custom\n"
@@ -11733,7 +12229,8 @@ mod tests {
             PktLineFrame::Data(b"unborn HEAD symref-target:refs/heads/main\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let records = parse_protocol_v2_ls_refs_response(ObjectFormat::Sha1, &frames).unwrap();
+        let records = parse_protocol_v2_ls_refs_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             records,
             vec![
@@ -11752,7 +12249,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            encode_protocol_v2_ls_refs_response(&records).unwrap(),
+            encode_protocol_v2_ls_refs_response(&records).expect("test operation should succeed"),
             frames
         );
     }
@@ -11763,7 +12260,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let records = vec![ProtocolV2LsRefsRecord::Ref(ProtocolV2LsRefsRef {
             oid,
             name: "refs/heads/main".into(),
@@ -11772,12 +12269,14 @@ mod tests {
             attributes: vec!["custom".into()],
         })];
         let mut encoded = Vec::new();
-        write_protocol_v2_ls_refs_response(&mut encoded, &records).unwrap();
+        write_protocol_v2_ls_refs_response(&mut encoded, &records)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_ls_refs_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_ls_refs_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             records
         );
         assert_eq!(input, b"tail");
@@ -11789,7 +12288,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let records = vec![ProtocolV2LsRefsRecord::Ref(ProtocolV2LsRefsRef {
             oid,
             name: "refs/heads/main".into(),
@@ -11798,26 +12297,29 @@ mod tests {
             attributes: Vec::new(),
         })];
         let mut encoded = Vec::new();
-        write_protocol_v2_ls_refs_response_with_response_end(&mut encoded, &records).unwrap();
+        write_protocol_v2_ls_refs_response_with_response_end(&mut encoded, &records)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
             read_protocol_v2_ls_refs_response_until_response_end(ObjectFormat::Sha1, &mut input)
-                .unwrap(),
+                .expect("test operation should succeed"),
             records
         );
         assert_eq!(input, b"tail");
-        assert!(parse_protocol_v2_ls_refs_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-                ),
-                PktLineFrame::ResponseEnd
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_ls_refs_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+                    ),
+                    PktLineFrame::ResponseEnd
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -11826,7 +12328,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = ProtocolV2LsRefsRequest {
             peel: true,
             symrefs: true,
@@ -11841,32 +12343,36 @@ mod tests {
             attributes: Vec::new(),
         })];
         let mut response = Vec::new();
-        write_protocol_v2_ls_refs_response(&mut response, &records).unwrap();
+        write_protocol_v2_ls_refs_response(&mut response, &records)
+            .expect("test operation should succeed");
 
         let mut input = response.as_slice();
         let mut output = Vec::new();
         assert_eq!(
             exchange_protocol_v2_ls_refs(ObjectFormat::Sha1, &mut input, &mut output, &request)
-                .unwrap(),
+                .expect("test operation should succeed"),
             records
         );
         assert!(input.is_empty());
         let mut output_read = output.as_slice();
         assert_eq!(
-            read_protocol_v2_ls_refs_request(&mut output_read).unwrap(),
+            read_protocol_v2_ls_refs_request(&mut output_read)
+                .expect("test operation should succeed"),
             request
         );
     }
 
     #[test]
     fn protocol_v2_ls_refs_response_rejects_malformed_records() {
-        assert!(parse_protocol_v2_ls_refs_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(
-                b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
-            )],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_ls_refs_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(
+                    b"1111111111111111111111111111111111111111 refs/heads/main\n".to_vec()
+                )],
+            )
+            .is_err()
+        );
         assert!(
             parse_protocol_v2_ls_refs_response(
                 ObjectFormat::Sha1,
@@ -11880,16 +12386,18 @@ mod tests {
             )
             .is_err()
         );
-        assert!(parse_protocol_v2_ls_refs_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_ls_refs_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        b"unborn HEAD peeled:2222222222222222222222222222222222222222\n".to_vec()
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_ls_refs_response(&[ProtocolV2LsRefsRecord::Ref(
                 ProtocolV2LsRefsRef {
@@ -11897,7 +12405,7 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "refs/heads/main".into(),
                     peeled: None,
                     symref_target: None,
@@ -11914,17 +12422,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let have = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let shallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let command = ProtocolV2CommandRequest {
             command: "fetch".into(),
             capabilities: Vec::new(),
@@ -11948,8 +12456,8 @@ mod tests {
                 b"done".to_vec(),
             ],
         };
-        let request =
-            ProtocolV2FetchRequest::from_command_request(ObjectFormat::Sha1, &command).unwrap();
+        let request = ProtocolV2FetchRequest::from_command_request(ObjectFormat::Sha1, &command)
+            .expect("test operation should succeed");
         assert_eq!(
             request,
             ProtocolV2FetchRequest {
@@ -11972,53 +12480,68 @@ mod tests {
                 done: true,
             }
         );
-        assert_eq!(request.to_command_request().unwrap(), command);
+        assert_eq!(
+            request
+                .to_command_request()
+                .expect("test operation should succeed"),
+            command
+        );
     }
 
     #[test]
     fn protocol_v2_fetch_request_rejects_malformed_arguments() {
-        assert!(ProtocolV2FetchRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "ls-refs".into(),
-                capabilities: Vec::new(),
-                arguments: Vec::new(),
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2FetchRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"want not-an-oid".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2FetchRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"deepen 0".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2FetchRequest::from_command_request(
-            ObjectFormat::Sha1,
-            &ProtocolV2CommandRequest {
-                command: "fetch".into(),
-                capabilities: Vec::new(),
-                arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
-            },
-        )
-        .is_err());
-        assert!(ProtocolV2FetchRequest {
-            deepen: Some(0),
-            ..ProtocolV2FetchRequest::default()
-        }
-        .to_command_request()
-        .is_err());
+        assert!(
+            ProtocolV2FetchRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "ls-refs".into(),
+                    capabilities: Vec::new(),
+                    arguments: Vec::new(),
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2FetchRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"want not-an-oid".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2FetchRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"deepen 0".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2FetchRequest::from_command_request(
+                ObjectFormat::Sha1,
+                &ProtocolV2CommandRequest {
+                    command: "fetch".into(),
+                    capabilities: Vec::new(),
+                    arguments: vec![b"filter blob:none".to_vec(), b"filter tree:0".to_vec()],
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            ProtocolV2FetchRequest {
+                deepen: Some(0),
+                ..ProtocolV2FetchRequest::default()
+            }
+            .to_command_request()
+            .is_err()
+        );
     }
 
     #[test]
@@ -12027,12 +12550,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let have = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = ProtocolV2FetchRequest {
             wants: vec![want],
             haves: vec![have],
@@ -12043,12 +12566,14 @@ mod tests {
             ..ProtocolV2FetchRequest::default()
         };
         let mut encoded = Vec::new();
-        write_protocol_v2_fetch_request(&mut encoded, &request).unwrap();
+        write_protocol_v2_fetch_request(&mut encoded, &request)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_fetch_request(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_fetch_request(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             request
         );
         assert_eq!(input, b"tail");
@@ -12060,22 +12585,22 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let shallow = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let wanted = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let pack_hash = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "4444444444444444444444444444444444444444",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"acknowledgments\n".to_vec()),
             PktLineFrame::Data(b"ACK 1111111111111111111111111111111111111111\n".to_vec()),
@@ -12099,7 +12624,8 @@ mod tests {
             PktLineFrame::Data(b"\x01PACK bytes".to_vec()),
             PktLineFrame::Flush,
         ];
-        let sections = parse_protocol_v2_fetch_response(ObjectFormat::Sha1, &frames).unwrap();
+        let sections = parse_protocol_v2_fetch_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             sections,
             vec![
@@ -12122,7 +12648,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            encode_protocol_v2_fetch_response(&sections).unwrap(),
+            encode_protocol_v2_fetch_response(&sections).expect("test operation should succeed"),
             frames
         );
     }
@@ -12134,7 +12660,8 @@ mod tests {
             PktLineFrame::Data(b"opaque line\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let sections = parse_protocol_v2_fetch_response(ObjectFormat::Sha1, &frames).unwrap();
+        let sections = parse_protocol_v2_fetch_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             sections,
             vec![ProtocolV2FetchResponseSection::Unknown {
@@ -12143,7 +12670,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            encode_protocol_v2_fetch_response(&sections).unwrap(),
+            encode_protocol_v2_fetch_response(&sections).expect("test operation should succeed"),
             frames
         );
     }
@@ -12154,7 +12681,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let sections = vec![
             ProtocolV2FetchResponseSection::Acknowledgments(vec![
                 ProtocolV2FetchAcknowledgment::Ack(ack),
@@ -12163,12 +12690,14 @@ mod tests {
             ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK bytes".to_vec()]),
         ];
         let mut encoded = Vec::new();
-        write_protocol_v2_fetch_response(&mut encoded, &sections).unwrap();
+        write_protocol_v2_fetch_response(&mut encoded, &sections)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             sections
         );
         assert_eq!(input, b"tail");
@@ -12182,21 +12711,21 @@ mod tests {
                     channel: SideBandChannel::Data,
                     data: b"acknowledgments\n".to_vec(),
                 })
-                .unwrap(),
+                .expect("test operation should succeed"),
             ),
             PktLineFrame::Data(
                 encode_sideband_packet(&SideBandPacket {
                     channel: SideBandChannel::Data,
                     data: b"NAK\n".to_vec(),
                 })
-                .unwrap(),
+                .expect("test operation should succeed"),
             ),
             PktLineFrame::Data(
                 encode_sideband_packet(&SideBandPacket {
                     channel: SideBandChannel::Progress,
                     data: b"keepalive\n".to_vec(),
                 })
-                .unwrap(),
+                .expect("test operation should succeed"),
             ),
             PktLineFrame::Delimiter,
             PktLineFrame::Data(
@@ -12204,15 +12733,15 @@ mod tests {
                     channel: SideBandChannel::Data,
                     data: b"packfile\n".to_vec(),
                 })
-                .unwrap(),
+                .expect("test operation should succeed"),
             ),
             PktLineFrame::Data(b"\x01PACK".to_vec()),
             PktLineFrame::Data(b"\x02counting objects\n".to_vec()),
             PktLineFrame::Flush,
         ];
 
-        let response =
-            parse_protocol_v2_fetch_sideband_all_response(ObjectFormat::Sha1, &frames).unwrap();
+        let response = parse_protocol_v2_fetch_sideband_all_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             response,
             ProtocolV2FetchSidebandAllResponse {
@@ -12229,7 +12758,8 @@ mod tests {
             }
         );
         assert_eq!(
-            demux_protocol_v2_fetch_packfile(&response.sections).unwrap(),
+            demux_protocol_v2_fetch_packfile(&response.sections)
+                .expect("test operation should succeed"),
             Some(SideBandDemux {
                 data: b"PACK".to_vec(),
                 progress: vec![b"counting objects\n".to_vec()],
@@ -12246,12 +12776,14 @@ mod tests {
             ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK bytes".to_vec()]),
         ];
         let mut encoded = Vec::new();
-        write_protocol_v2_fetch_sideband_all_response(&mut encoded, &sections).unwrap();
+        write_protocol_v2_fetch_sideband_all_response(&mut encoded, &sections)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_fetch_sideband_all_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_fetch_sideband_all_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             ProtocolV2FetchSidebandAllResponse {
                 sections: sections.clone(),
                 progress: Vec::new(),
@@ -12261,7 +12793,7 @@ mod tests {
 
         let mut encoded = Vec::new();
         write_protocol_v2_fetch_sideband_all_response_with_response_end(&mut encoded, &sections)
-            .unwrap();
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
@@ -12270,7 +12802,7 @@ mod tests {
                 ObjectFormat::Sha1,
                 &mut input,
             )
-            .unwrap()
+            .expect("test operation should succeed")
             .sections,
             sections
         );
@@ -12279,28 +12811,32 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_sideband_all_response_rejects_malformed_sideband() {
-        assert!(parse_protocol_v2_fetch_sideband_all_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_fetch_sideband_all_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(
-                    encode_sideband_packet(&SideBandPacket {
-                        channel: SideBandChannel::Fatal,
-                        data: b"remote died\n".to_vec(),
-                    })
-                    .unwrap(),
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_fetch_sideband_all_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_sideband_all_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(
+                        encode_sideband_packet(&SideBandPacket {
+                            channel: SideBandChannel::Fatal,
+                            data: b"remote died\n".to_vec(),
+                        })
+                        .expect("test operation should succeed"),
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -12309,13 +12845,14 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"size\n".to_vec()),
             PktLineFrame::Data(b"1111111111111111111111111111111111111111 12345\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let response = parse_protocol_v2_object_info_response(ObjectFormat::Sha1, &frames).unwrap();
+        let response = parse_protocol_v2_object_info_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             response,
             ProtocolV2ObjectInfoResponse {
@@ -12324,7 +12861,8 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_protocol_v2_object_info_response(&response).unwrap(),
+            encode_protocol_v2_object_info_response(&response)
+                .expect("test operation should succeed"),
             frames
         );
     }
@@ -12333,11 +12871,13 @@ mod tests {
     fn protocol_v2_object_info_response_streams_and_exchanges() {
         let request = ProtocolV2ObjectInfoRequest {
             size: true,
-            oids: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "1111111111111111111111111111111111111111",
-            )
-            .unwrap()],
+            oids: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "1111111111111111111111111111111111111111",
+                )
+                .expect("test operation should succeed"),
+            ],
         };
         let response = ProtocolV2ObjectInfoResponse {
             size: true,
@@ -12348,17 +12888,20 @@ mod tests {
         };
 
         let mut encoded = Vec::new();
-        write_protocol_v2_object_info_response(&mut encoded, &response).unwrap();
+        write_protocol_v2_object_info_response(&mut encoded, &response)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_protocol_v2_object_info_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_protocol_v2_object_info_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             response
         );
         assert_eq!(input, b"tail");
 
         let mut response_bytes = Vec::new();
-        write_protocol_v2_object_info_response(&mut response_bytes, &response).unwrap();
+        write_protocol_v2_object_info_response(&mut response_bytes, &response)
+            .expect("test operation should succeed");
         let mut input = response_bytes.as_slice();
         let mut output = Vec::new();
         assert_eq!(
@@ -12368,13 +12911,14 @@ mod tests {
                 &mut output,
                 &request,
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             response
         );
         assert!(input.is_empty());
         let mut output_read = output.as_slice();
         assert_eq!(
-            read_protocol_v2_object_info_request(ObjectFormat::Sha1, &mut output_read).unwrap(),
+            read_protocol_v2_object_info_request(ObjectFormat::Sha1, &mut output_read)
+                .expect("test operation should succeed"),
             request
         );
     }
@@ -12382,36 +12926,44 @@ mod tests {
     #[test]
     fn protocol_v2_object_info_response_rejects_malformed_records() {
         assert!(parse_protocol_v2_object_info_response(ObjectFormat::Sha1, &[]).is_err());
-        assert!(parse_protocol_v2_object_info_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(b"size\n".to_vec())],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_object_info_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_object_info_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"size\n".to_vec()),
-                PktLineFrame::Data(
-                    b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()
-                ),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_object_info_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"size\n".to_vec()),
-                PktLineFrame::Delimiter,
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_object_info_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(b"size\n".to_vec())],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_object_info_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(b"type\n".to_vec()), PktLineFrame::Flush,],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_object_info_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"size\n".to_vec()),
+                    PktLineFrame::Data(
+                        b"1111111111111111111111111111111111111111 not-a-size\n".to_vec()
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_object_info_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"size\n".to_vec()),
+                    PktLineFrame::Delimiter,
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_object_info_response(&ProtocolV2ObjectInfoResponse {
                 size: false,
@@ -12427,24 +12979,27 @@ mod tests {
             ProtocolV2FetchAcknowledgment::Nak,
         ])];
         let mut encoded = Vec::new();
-        write_protocol_v2_fetch_response_with_response_end(&mut encoded, &sections).unwrap();
+        write_protocol_v2_fetch_response_with_response_end(&mut encoded, &sections)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
             read_protocol_v2_fetch_response_until_response_end(ObjectFormat::Sha1, &mut input)
-                .unwrap(),
+                .expect("test operation should succeed"),
             sections
         );
         assert_eq!(input, b"tail");
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                PktLineFrame::ResponseEnd,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                    PktLineFrame::ResponseEnd,
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -12453,7 +13008,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let request = ProtocolV2FetchRequest {
             wants: vec![want],
             thin_pack: true,
@@ -12464,19 +13019,21 @@ mod tests {
             ProtocolV2FetchAcknowledgment::Nak,
         ])];
         let mut response = Vec::new();
-        write_protocol_v2_fetch_response(&mut response, &sections).unwrap();
+        write_protocol_v2_fetch_response(&mut response, &sections)
+            .expect("test operation should succeed");
 
         let mut input = response.as_slice();
         let mut output = Vec::new();
         assert_eq!(
             exchange_protocol_v2_fetch(ObjectFormat::Sha1, &mut input, &mut output, &request)
-                .unwrap(),
+                .expect("test operation should succeed"),
             sections
         );
         assert!(input.is_empty());
         let mut output_read = output.as_slice();
         assert_eq!(
-            read_protocol_v2_fetch_request(ObjectFormat::Sha1, &mut output_read).unwrap(),
+            read_protocol_v2_fetch_request(ObjectFormat::Sha1, &mut output_read)
+                .expect("test operation should succeed"),
             request
         );
     }
@@ -12496,7 +13053,7 @@ mod tests {
         ];
 
         assert_eq!(
-            demux_protocol_v2_fetch_packfile(&sections).unwrap(),
+            demux_protocol_v2_fetch_packfile(&sections).expect("test operation should succeed"),
             Some(SideBandDemux {
                 data: b"PACK bytes".to_vec(),
                 progress: vec![b"counting objects\n".to_vec(), b"done\n".to_vec()],
@@ -12506,18 +13063,20 @@ mod tests {
             demux_protocol_v2_fetch_packfile(&[ProtocolV2FetchResponseSection::Acknowledgments(
                 vec![ProtocolV2FetchAcknowledgment::Nak],
             )])
-            .unwrap(),
+            .expect("test operation should succeed"),
             None
         );
     }
 
     #[test]
     fn protocol_v2_fetch_packfile_demux_rejects_duplicate_or_bad_sideband() {
-        assert!(demux_protocol_v2_fetch_packfile(&[
-            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
-            ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
-        ])
-        .is_err());
+        assert!(
+            demux_protocol_v2_fetch_packfile(&[
+                ProtocolV2FetchResponseSection::Packfile(vec![b"\x01PACK".to_vec()]),
+                ProtocolV2FetchResponseSection::Packfile(vec![b"\x01more".to_vec()]),
+            ])
+            .is_err()
+        );
         assert!(
             demux_protocol_v2_fetch_packfile(&[ProtocolV2FetchResponseSection::Packfile(vec![
                 b"\x03remote died\n".to_vec()
@@ -12534,43 +13093,55 @@ mod tests {
 
     #[test]
     fn protocol_v2_fetch_response_rejects_malformed_sections() {
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[PktLineFrame::Delimiter, PktLineFrame::Flush],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"acknowledgments\n".to_vec()),
-                PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-                PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_protocol_v2_fetch_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"packfile-uris\n".to_vec()),
-                PktLineFrame::Data(b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Data(b"acknowledgments\n".to_vec())],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[PktLineFrame::Delimiter, PktLineFrame::Flush],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"acknowledgments\n".to_vec()),
+                    PktLineFrame::Data(b"ACK not-an-oid\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                    PktLineFrame::Data(b"https://example.invalid/pack-a.pack\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_protocol_v2_fetch_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"packfile-uris\n".to_vec()),
+                    PktLineFrame::Data(
+                        b"not-a-hash https://example.invalid/pack-a.pack\n".to_vec()
+                    ),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
         assert!(
             encode_protocol_v2_fetch_response(&[ProtocolV2FetchResponseSection::WantedRefs(vec![
                 ProtocolV2FetchWantedRef {
@@ -12578,7 +13149,7 @@ mod tests {
                         ObjectFormat::Sha1,
                         "1111111111111111111111111111111111111111",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     name: "bad ref".into(),
                 }
             ])])
@@ -12592,17 +13163,17 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_peeled = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "3333333333333333333333333333333333333333",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(
                 b"1111111111111111111111111111111111111111 HEAD symref-target:refs/heads/main\n"
@@ -12622,7 +13193,7 @@ mod tests {
             ObjectFormat::Sha1,
             &frames,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             set,
             RefAdvertisementSet {
@@ -12658,7 +13229,7 @@ mod tests {
 
         // The streaming reader path produces the same bridged set.
         let mut encoded = Vec::new();
-        write_pkt_line_frames(&mut encoded, &frames).unwrap();
+        write_pkt_line_frames(&mut encoded, &frames).expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
         let mut input = encoded.as_slice();
         assert_eq!(
@@ -12666,7 +13237,7 @@ mod tests {
                 ObjectFormat::Sha1,
                 &mut input,
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             set,
         );
         assert_eq!(input, b"tail");
@@ -12685,7 +13256,8 @@ mod tests {
 
         // An empty ls-refs response bridges to an empty v2 set.
         assert_eq!(
-            protocol_v2_ls_refs_records_to_ref_advertisement_set(&[]).unwrap(),
+            protocol_v2_ls_refs_records_to_ref_advertisement_set(&[])
+                .expect("test operation should succeed"),
             RefAdvertisementSet {
                 protocol: ProtocolVersion::V2,
                 refs: Vec::new(),
@@ -12699,7 +13271,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4444444444444444444444444444444444444444",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let records = vec![
             ProtocolV2LsRefsRecord::Unborn {
                 name: "HEAD".into(),
@@ -12714,7 +13286,8 @@ mod tests {
                 attributes: Vec::new(),
             }),
         ];
-        let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records).unwrap();
+        let set = protocol_v2_ls_refs_records_to_ref_advertisement_set(&records)
+            .expect("test operation should succeed");
         assert_eq!(
             set,
             RefAdvertisementSet {

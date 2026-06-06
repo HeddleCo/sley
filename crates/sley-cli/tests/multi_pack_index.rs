@@ -188,7 +188,7 @@ fn create_named_pack_in_object_dir(root: &Path, object_dir: &str, body: &[u8]) -
 fn multi_pack_index_write_matches_upstream_and_verifies() {
     let root = unique_temp_dir("midx-write");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         let first = create_pack(&root, b"first midx object\n");
         let second = create_pack(&root, b"second midx object\n");
@@ -217,16 +217,15 @@ fn multi_pack_index_write_matches_upstream_and_verifies() {
             run_success("git", &root, &["cat-file", "-p", &second]),
             b"second midx object\n"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn multi_pack_index_write_object_dir_matches_upstream() {
     let root = unique_temp_dir("midx-write-object-dir");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         create_pack(&root, b"object-dir midx object\n");
         let args = ["multi-pack-index", "write", "--object-dir=.git/objects"];
@@ -245,9 +244,8 @@ fn multi_pack_index_write_object_dir_matches_upstream() {
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
         run_success("git", &root, &["multi-pack-index", "verify"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -257,7 +255,7 @@ fn multi_pack_index_git_object_directory_default_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
         for repo in [&expected, &actual] {
             run_success("git", repo, &["init", "-q"]);
@@ -290,27 +288,24 @@ fn multi_pack_index_git_object_directory_default_matches_upstream_git() {
 
         let verify_args = ["multi-pack-index", "verify"];
         let expected_verify = run_with_env("git", &expected, &verify_args, &envs);
-        let actual_verify =
-            run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
+        let actual_verify = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
         assert_same_output(actual_verify, expected_verify, &verify_args);
         let actual_upstream_verify = run_with_env("git", &actual, &verify_args, &envs);
         assert_success("git", &verify_args, &actual_upstream_verify);
 
         let expire_args = ["multi-pack-index", "expire"];
         let expected_expire = run_with_env("git", &expected, &expire_args, &envs);
-        let actual_expire =
-            run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &expire_args, &envs);
+        let actual_expire = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &expire_args, &envs);
         assert_same_output(actual_expire, expected_expire, &expire_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn multi_pack_index_write_stdin_packs_matches_upstream() {
     let root = unique_temp_dir("midx-write-stdin-packs");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         let (_first, first_pack) = create_named_pack(&root, b"stdin first midx object\n");
         let (_second, second_pack) = create_named_pack(&root, b"stdin second midx object\n");
@@ -339,16 +334,15 @@ fn multi_pack_index_write_stdin_packs_matches_upstream() {
                 .join(first_pack)
                 .exists()
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn multi_pack_index_verify_matches_upstream_git() {
     let root = unique_temp_dir("midx-verify");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         create_pack(&root, b"verify first midx object\n");
         create_pack(&root, b"verify second midx object\n");
@@ -363,16 +357,15 @@ fn multi_pack_index_verify_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, args);
             assert_same_output(actual, expected, args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn multi_pack_index_expire_quiet_baseline_matches_upstream_git() {
     let root = unique_temp_dir("midx-expire");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         let args = ["multi-pack-index", "expire"];
         let expected = run("git", &root, &args);
@@ -392,7 +385,6 @@ fn multi_pack_index_expire_quiet_baseline_matches_upstream_git() {
             assert_same_output(actual, expected, args);
         }
         run_success("git", &root, &["multi-pack-index", "verify"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

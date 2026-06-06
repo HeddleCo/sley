@@ -213,7 +213,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 #[test]
 fn reflog_show_default_and_formats_match_upstream_git() {
     let root = unique_temp_dir("reflog-show");
-    let result = (|| {
+    {
         prepare_reflog_repo(&root);
 
         for args in [
@@ -230,15 +230,14 @@ fn reflog_show_default_and_formats_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_exists_status_matches_upstream_git() {
     let root = unique_temp_dir("reflog-exists");
-    let result = (|| {
+    {
         prepare_reflog_repo(&root);
 
         for args in [
@@ -253,15 +252,14 @@ fn reflog_exists_status_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_list_matches_upstream_git() {
     let root = unique_temp_dir("reflog-list");
-    let result = (|| {
+    {
         prepare_reflog_repo(&root);
         run_success("git", &root, &["tag", "--create-reflog", "v1"]);
 
@@ -276,97 +274,85 @@ fn reflog_list_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_delete_matches_upstream_git() {
     let root = unique_temp_dir("reflog-delete");
-    let result = (|| {
-        for args in [
-            vec!["reflog", "delete", "HEAD@{0}"],
-            vec!["reflog", "delete", "-n", "HEAD@{0}"],
-            vec!["reflog", "delete", "--verbose", "HEAD@{0}"],
-            vec!["reflog", "delete", "HEAD@{99}"],
-            vec!["reflog", "delete"],
-            vec!["reflog", "delete", "--bogus"],
-            vec!["reflog", "delete", "HEAD@{0}", "extra"],
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
-            let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
-            prepare_linear_reflog_repo(&upstream);
-            prepare_linear_reflog_repo(&actual);
+    for args in [
+        vec!["reflog", "delete", "HEAD@{0}"],
+        vec!["reflog", "delete", "-n", "HEAD@{0}"],
+        vec!["reflog", "delete", "--verbose", "HEAD@{0}"],
+        vec!["reflog", "delete", "HEAD@{99}"],
+        vec!["reflog", "delete"],
+        vec!["reflog", "delete", "--bogus"],
+        vec!["reflog", "delete", "HEAD@{0}", "extra"],
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
+        let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
+        prepare_linear_reflog_repo(&upstream);
+        prepare_linear_reflog_repo(&actual);
 
-            let expected = run("git", &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected, &args);
-            assert_eq!(
-                fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
-                fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
-                "HEAD reflog differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run("git", &upstream, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+        assert_eq!(
+            fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
+            fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
+            "HEAD reflog differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_delete_updateref_matches_upstream_git() {
     let root = unique_temp_dir("reflog-delete-updateref");
-    let result = (|| {
-        for args in [
-            vec!["reflog", "delete", "--updateref", "HEAD@{0}"],
-            vec!["reflog", "delete", "--updateref", "main@{0}"],
-            vec!["reflog", "delete", "--updateref", "refs/heads/main@{0}"],
-            vec![
-                "reflog",
-                "delete",
-                "--updateref",
-                "--no-updateref",
-                "main@{0}",
-            ],
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
-            let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
-            prepare_linear_reflog_repo(&upstream);
-            prepare_linear_reflog_repo(&actual);
+    for args in [
+        vec!["reflog", "delete", "--updateref", "HEAD@{0}"],
+        vec!["reflog", "delete", "--updateref", "main@{0}"],
+        vec!["reflog", "delete", "--updateref", "refs/heads/main@{0}"],
+        vec![
+            "reflog",
+            "delete",
+            "--updateref",
+            "--no-updateref",
+            "main@{0}",
+        ],
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
+        let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
+        prepare_linear_reflog_repo(&upstream);
+        prepare_linear_reflog_repo(&actual);
 
-            let expected = run("git", &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected, &args);
-            assert_eq!(
-                fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
-                fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
-                "HEAD reflog differed after {args:?}"
-            );
-            assert_eq!(
-                fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
-                fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
-                "main reflog differed after {args:?}"
-            );
-            assert_eq!(
-                run(
-                    env!("CARGO_BIN_EXE_sley"),
-                    &actual,
-                    &["rev-parse", "main"]
-                )
-                .stdout,
-                run("git", &upstream, &["rev-parse", "main"]).stdout,
-                "main ref differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run("git", &upstream, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+        assert_eq!(
+            fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
+            fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
+            "HEAD reflog differed after {args:?}"
+        );
+        assert_eq!(
+            fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
+            fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
+            "main reflog differed after {args:?}"
+        );
+        assert_eq!(
+            run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
+            run("git", &upstream, &["rev-parse", "main"]).stdout,
+            "main ref differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_drop_matches_upstream_git() {
     let root = unique_temp_dir("reflog-drop");
-    let result = (|| {
+    {
         let upstream_template = root.join("upstream-template");
         let actual_template = root.join("actual-template");
         prepare_drop_reflog_repo(&upstream_template);
@@ -398,15 +384,14 @@ fn reflog_drop_matches_upstream_git() {
                 "reflog files differed after {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_write_matches_upstream_git() {
     let root = unique_temp_dir("reflog-write");
-    let result = (|| {
+    {
         let upstream_template = root.join("upstream-template");
         let actual_template = root.join("actual-template");
         prepare_drop_reflog_repo(&upstream_template);
@@ -481,153 +466,141 @@ fn reflog_write_matches_upstream_git() {
                 "reflog files differed after {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_expire_matches_upstream_git() {
     let root = unique_temp_dir("reflog-expire");
-    let result = (|| {
-        for args in [
-            vec![
-                "reflog",
-                "expire",
-                "--expire=1970-01-01 00:00:02 +0000",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--verbose",
-                "--expire=1970-01-01 00:00:02 +0000",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "-n",
-                "--expire=1970-01-01 00:00:02 +0000",
-                "refs/heads/main",
-            ],
-            vec!["reflog", "expire", "--expire=never", "refs/heads/main"],
-            vec!["reflog", "expire", "--expire=all", "main"],
-            vec![
-                "reflog",
-                "expire",
-                "--rewrite",
-                "--expire=1970-01-01 00:00:02 +0000",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--updateref",
-                "--expire=1970-01-01 00:00:03 +0000",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--all",
-                "--expire=1970-01-01 00:00:02 +0000",
-            ],
-            vec!["reflog", "expire"],
-            vec!["reflog", "expire", "--bogus"],
-            vec!["reflog", "expire", "--expire"],
-            vec!["reflog", "expire", "--expire=bad", "refs/heads/main"],
-            vec!["reflog", "expire", "refs/heads/missing"],
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
-            let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
-            prepare_linear_reflog_repo(&upstream);
-            prepare_linear_reflog_repo(&actual);
+    for args in [
+        vec![
+            "reflog",
+            "expire",
+            "--expire=1970-01-01 00:00:02 +0000",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--verbose",
+            "--expire=1970-01-01 00:00:02 +0000",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "-n",
+            "--expire=1970-01-01 00:00:02 +0000",
+            "refs/heads/main",
+        ],
+        vec!["reflog", "expire", "--expire=never", "refs/heads/main"],
+        vec!["reflog", "expire", "--expire=all", "main"],
+        vec![
+            "reflog",
+            "expire",
+            "--rewrite",
+            "--expire=1970-01-01 00:00:02 +0000",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--updateref",
+            "--expire=1970-01-01 00:00:03 +0000",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--all",
+            "--expire=1970-01-01 00:00:02 +0000",
+        ],
+        vec!["reflog", "expire"],
+        vec!["reflog", "expire", "--bogus"],
+        vec!["reflog", "expire", "--expire"],
+        vec!["reflog", "expire", "--expire=bad", "refs/heads/main"],
+        vec!["reflog", "expire", "refs/heads/missing"],
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
+        let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
+        prepare_linear_reflog_repo(&upstream);
+        prepare_linear_reflog_repo(&actual);
 
-            let expected = run("git", &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected, &args);
-            assert_eq!(
-                fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
-                fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
-                "HEAD reflog differed after {args:?}"
-            );
-            assert_eq!(
-                fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
-                fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
-                "main reflog differed after {args:?}"
-            );
-            assert_eq!(
-                run(
-                    env!("CARGO_BIN_EXE_sley"),
-                    &actual,
-                    &["rev-parse", "main"]
-                )
-                .stdout,
-                run("git", &upstream, &["rev-parse", "main"]).stdout,
-                "main ref differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run("git", &upstream, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+        assert_eq!(
+            fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
+            fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
+            "HEAD reflog differed after {args:?}"
+        );
+        assert_eq!(
+            fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
+            fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
+            "main reflog differed after {args:?}"
+        );
+        assert_eq!(
+            run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
+            run("git", &upstream, &["rev-parse", "main"]).stdout,
+            "main ref differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn reflog_expire_unreachable_matches_upstream_git() {
     let root = unique_temp_dir("reflog-expire-unreachable");
-    let result = (|| {
-        for args in [
-            vec![
-                "reflog",
-                "expire",
-                "--expire=never",
-                "--expire-unreachable=1970-01-01 00:00:04 +0000",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--expire=never",
-                "--expire-unreachable=all",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--expire=never",
-                "--expire-unreachable=never",
-                "refs/heads/main",
-            ],
-            vec![
-                "reflog",
-                "expire",
-                "--verbose",
-                "--expire=never",
-                "--expire-unreachable=1970-01-01 00:00:04 +0000",
-                "refs/heads/main",
-            ],
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
-            let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
-            prepare_reflog_repo_with_unreachable_entry(&upstream);
-            prepare_reflog_repo_with_unreachable_entry(&actual);
+    for args in [
+        vec![
+            "reflog",
+            "expire",
+            "--expire=never",
+            "--expire-unreachable=1970-01-01 00:00:04 +0000",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--expire=never",
+            "--expire-unreachable=all",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--expire=never",
+            "--expire-unreachable=never",
+            "refs/heads/main",
+        ],
+        vec![
+            "reflog",
+            "expire",
+            "--verbose",
+            "--expire=never",
+            "--expire-unreachable=1970-01-01 00:00:04 +0000",
+            "refs/heads/main",
+        ],
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
+        let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
+        prepare_reflog_repo_with_unreachable_entry(&upstream);
+        prepare_reflog_repo_with_unreachable_entry(&actual);
 
-            let expected = run("git", &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected, &args);
-            assert_eq!(
-                fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
-                fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
-                "HEAD reflog differed after {args:?}"
-            );
-            assert_eq!(
-                fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
-                fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
-                "main reflog differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run("git", &upstream, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+        assert_eq!(
+            fs::read(actual.join(".git/logs/HEAD")).expect("actual HEAD reflog"),
+            fs::read(upstream.join(".git/logs/HEAD")).expect("upstream HEAD reflog"),
+            "HEAD reflog differed after {args:?}"
+        );
+        assert_eq!(
+            fs::read(actual.join(".git/logs/refs/heads/main")).expect("actual main reflog"),
+            fs::read(upstream.join(".git/logs/refs/heads/main")).expect("upstream main reflog"),
+            "main reflog differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }

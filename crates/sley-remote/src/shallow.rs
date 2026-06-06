@@ -117,7 +117,11 @@ mod tests {
     #[test]
     fn read_missing_shallow_is_empty() {
         let dir = temp_dir();
-        assert!(read_shallow(&dir, ObjectFormat::Sha1).unwrap().is_empty());
+        assert!(
+            read_shallow(&dir, ObjectFormat::Sha1)
+                .expect("test operation should succeed")
+                .is_empty()
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -126,22 +130,27 @@ mod tests {
         let dir = temp_dir();
         let a = oid("1");
         let b = oid("2");
-        write_shallow(&dir, &[b.clone(), a.clone(), b.clone()]).unwrap();
-        let contents = fs::read_to_string(dir.join("shallow")).unwrap();
+        write_shallow(&dir, &[b.clone(), a.clone(), b.clone()])
+            .expect("test operation should succeed");
+        let contents =
+            fs::read_to_string(dir.join("shallow")).expect("test operation should succeed");
         assert_eq!(contents, format!("{}\n{}\n", a.to_hex(), b.to_hex()));
-        assert_eq!(read_shallow(&dir, ObjectFormat::Sha1).unwrap(), vec![a, b]);
+        assert_eq!(
+            read_shallow(&dir, ObjectFormat::Sha1).expect("test operation should succeed"),
+            vec![a, b]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn write_empty_removes_file() {
         let dir = temp_dir();
-        write_shallow(&dir, &[oid("3")]).unwrap();
+        write_shallow(&dir, &[oid("3")]).expect("test operation should succeed");
         assert!(dir.join("shallow").exists());
-        write_shallow(&dir, &[]).unwrap();
+        write_shallow(&dir, &[]).expect("test operation should succeed");
         assert!(!dir.join("shallow").exists());
         // Removing an already-absent file is fine.
-        write_shallow(&dir, &[]).unwrap();
+        write_shallow(&dir, &[]).expect("test operation should succeed");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -151,7 +160,8 @@ mod tests {
         let keep = oid("a");
         let added = oid("b");
         let removed = oid("c");
-        write_shallow(&dir, &[keep.clone(), removed.clone()]).unwrap();
+        write_shallow(&dir, &[keep.clone(), removed.clone()])
+            .expect("test operation should succeed");
         apply_shallow_info(
             &dir,
             ObjectFormat::Sha1,
@@ -160,11 +170,11 @@ mod tests {
                 ProtocolV2FetchShallowInfo::Unshallow(removed),
             ],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // The file is written sorted by hex, so `read_shallow` returns
         // `keep` (aaaa…) before `added` (bbbb…), with `removed` (cccc…) gone.
         assert_eq!(
-            read_shallow(&dir, ObjectFormat::Sha1).unwrap(),
+            read_shallow(&dir, ObjectFormat::Sha1).expect("test operation should succeed"),
             vec![keep, added]
         );
         let _ = fs::remove_dir_all(&dir);
@@ -174,10 +184,11 @@ mod tests {
     fn apply_empty_entries_is_noop() {
         let dir = temp_dir();
         let existing = oid("d");
-        write_shallow(&dir, std::slice::from_ref(&existing)).unwrap();
-        apply_shallow_info(&dir, ObjectFormat::Sha1, &[]).unwrap();
+        write_shallow(&dir, std::slice::from_ref(&existing))
+            .expect("test operation should succeed");
+        apply_shallow_info(&dir, ObjectFormat::Sha1, &[]).expect("test operation should succeed");
         assert_eq!(
-            read_shallow(&dir, ObjectFormat::Sha1).unwrap(),
+            read_shallow(&dir, ObjectFormat::Sha1).expect("test operation should succeed"),
             vec![existing]
         );
         let _ = fs::remove_dir_all(&dir);
@@ -187,13 +198,14 @@ mod tests {
     fn apply_unshallowing_last_boundary_removes_file() {
         let dir = temp_dir();
         let boundary = oid("e");
-        write_shallow(&dir, std::slice::from_ref(&boundary)).unwrap();
+        write_shallow(&dir, std::slice::from_ref(&boundary))
+            .expect("test operation should succeed");
         apply_shallow_info(
             &dir,
             ObjectFormat::Sha1,
             &[ProtocolV2FetchShallowInfo::Unshallow(boundary)],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(!dir.join("shallow").exists());
         let _ = fs::remove_dir_all(&dir);
     }

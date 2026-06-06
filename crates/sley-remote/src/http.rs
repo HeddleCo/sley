@@ -18,21 +18,21 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    parse_upload_pack_features, read_upload_pack_raw_packfile_response,
+    GitService, ProtocolV2FetchShallowInfo, RefAdvertisement, RefAdvertisementSet,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
+    UploadPackRequest, parse_upload_pack_features, read_upload_pack_raw_packfile_response,
     read_upload_pack_shallow_info_and_raw_packfile_response, smart_http_advertisement_content_type,
     smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
-    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
-    ProtocolV2FetchShallowInfo, RefAdvertisement, RefAdvertisementSet, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
+    HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
     git_credential_basic_authorization, http_smart_info_refs_url, http_smart_rpc_url,
-    parse_remote_url, read_service_discovery_response, HttpClient, HttpResponse, RemoteTransport,
-    RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
+    parse_remote_url, read_service_discovery_response,
 };
 
-use crate::credentials::{credential_request_for_url, http_url_credential};
 use crate::CredentialProvider;
+use crate::credentials::{credential_request_for_url, http_url_credential};
 
 /// Whether an already-resolved remote `url` uses HTTP(S) transport.
 ///
@@ -265,63 +265,82 @@ pub fn http_upload_pack_shallow_fetch_response(
 /// entries are the server's shallow-info updates the caller must fold into
 /// `$GIT_DIR/shallow` (see [`crate::apply_shallow_info`]); they are empty for a
 /// non-deepen fetch.
-#[allow(clippy::too_many_arguments)]
+pub struct HttpFetchPackRequest<'a> {
+    /// HTTP client used for smart-HTTP RPCs.
+    pub client: &'a UreqHttpClient,
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Resolved HTTP(S) remote.
+    pub remote: &'a RemoteUrl,
+    /// Wanted object ids.
+    pub wants: Vec<ObjectId>,
+    /// Existing shallow boundary to replay.
+    pub shallow: Vec<ObjectId>,
+    /// Requested deepen depth, if this is a shallow fetch.
+    pub deepen: Option<u32>,
+    /// Whether to install the response as a promisor pack.
+    pub promisor: bool,
+}
+
 pub fn install_fetch_pack_via_http_upload_pack(
-    client: &UreqHttpClient,
-    git_dir: &Path,
-    format: ObjectFormat,
-    remote: &RemoteUrl,
-    wants: Vec<ObjectId>,
-    shallow: Vec<ObjectId>,
-    deepen: Option<u32>,
-    promisor: bool,
+    request: HttpFetchPackRequest<'_>,
     credentials: &mut dyn CredentialProvider,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    if wants.is_empty() {
+    if request.wants.is_empty() {
         return Ok(Vec::new());
     }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
     // A deepen request must always reach the server (the shallow boundary may move
     // even when every wanted object is already present), so only the plain fetch
     // takes the "everything is local already" shortcut.
-    if deepen.is_none()
-        && wants
-            .iter()
-            .map(|want| local_db.contains(want))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|contains| contains)
-    {
+    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
         return Ok(Vec::new());
     }
-    let request = UploadPackRequest {
-        wants,
-        capabilities: shallow_request_capabilities(deepen),
-        shallow,
-        deepen,
+    let upload_request = UploadPackRequest {
+        wants: request.wants,
+        capabilities: shallow_request_capabilities(request.deepen),
+        shallow: request.shallow,
+        deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let haves = crate::local::local_have_oids(git_dir, format)?;
-    let (shallow_info, response) = if deepen.is_some() {
+    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let (shallow_info, response) = if request.deepen.is_some() {
         http_upload_pack_shallow_fetch_response(
-            client,
-            remote,
-            format,
-            request,
+            request.client,
+            request.remote,
+            request.format,
+            upload_request,
             haves,
             credentials,
         )?
     } else {
-        let response =
-            http_upload_pack_fetch_response(client, remote, format, request, haves, credentials)?;
+        let response = http_upload_pack_fetch_response(
+            request.client,
+            request.remote,
+            request.format,
+            upload_request,
+            haves,
+            credentials,
+        )?;
         (Vec::new(), response)
     };
-    if promisor {
+    if request.promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
     } else {
         install_upload_pack_raw_response(&response, &local_db)?;
     }
     Ok(shallow_info)
+}
+
+fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {
+    for want in wants {
+        if !db.contains(want)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The want-line capabilities to advertise for a fetch: the `shallow` capability

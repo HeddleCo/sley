@@ -360,11 +360,7 @@ pub fn tree_entry_cmp(
 }
 
 fn tree_name_terminator(mode: u32) -> u8 {
-    if mode == 0o040000 {
-        b'/'
-    } else {
-        0
-    }
+    if mode == 0o040000 { b'/' } else { 0 }
 }
 
 /// Builds a single tree level: deduplicates entries by name and emits them in
@@ -801,7 +797,10 @@ mod tests {
     #[test]
     fn framed_object_round_trips() {
         let object = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec());
-        assert_eq!(parse_framed_object(&object.framed_bytes()).unwrap(), object);
+        assert_eq!(
+            parse_framed_object(&object.framed_bytes()).expect("test operation should succeed"),
+            object
+        );
     }
 
     #[test]
@@ -810,7 +809,7 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tree = Tree {
             entries: vec![TreeEntry {
                 mode: 0o100644,
@@ -819,7 +818,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            Tree::parse(ObjectFormat::Sha1, &tree.write()).unwrap(),
+            Tree::parse(ObjectFormat::Sha1, &tree.write()).expect("test operation should succeed"),
             tree
         );
     }
@@ -827,7 +826,8 @@ mod tests {
     #[test]
     fn tree_entries_iterates_without_name_allocations() {
         let format = ObjectFormat::Sha1;
-        let blob = ObjectId::from_hex(format, "ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
+        let blob = ObjectId::from_hex(format, "ce013625030ba8dba906f756967f9e9ca394464a")
+            .expect("test operation should succeed");
         let subtree = ObjectId::empty_tree(format);
         let mut bytes = Vec::new();
 
@@ -837,7 +837,10 @@ mod tests {
         write_tree_entry(&mut bytes, EntryKind::Tree.mode(), b"src", &subtree);
 
         let mut entries = TreeEntries::new(format, &bytes);
-        let first = entries.next().expect("first entry").unwrap();
+        let first = entries
+            .next()
+            .expect("first entry")
+            .expect("test operation should succeed");
         assert_eq!(first.mode, EntryKind::Blob.mode());
         assert_eq!(first.name, b"hello.txt");
         assert_eq!(first.oid, blob);
@@ -847,7 +850,10 @@ mod tests {
             bytes[first_name_start..].as_ptr()
         ));
 
-        let second = entries.next().expect("second entry").unwrap();
+        let second = entries
+            .next()
+            .expect("second entry")
+            .expect("test operation should succeed");
         assert_eq!(second.mode, EntryKind::Tree.mode());
         assert_eq!(second.name, b"src");
         assert_eq!(second.oid, subtree);
@@ -858,7 +864,7 @@ mod tests {
         ));
         assert!(entries.next().is_none());
 
-        let owned = Tree::parse(format, &bytes).unwrap();
+        let owned = Tree::parse(format, &bytes).expect("test operation should succeed");
         assert_eq!(owned.entries, vec![first.to_owned(), second.to_owned()]);
     }
 
@@ -950,7 +956,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let commit = Commit {
             tree,
             parents: Vec::new(),
@@ -960,7 +966,8 @@ mod tests {
             message: b"subject\n\nbody\n".to_vec(),
         };
         assert_eq!(
-            Commit::parse(ObjectFormat::Sha1, &commit.write()).unwrap(),
+            Commit::parse(ObjectFormat::Sha1, &commit.write())
+                .expect("test operation should succeed"),
             commit
         );
     }
@@ -981,11 +988,14 @@ mod tests {
         )
         .into_bytes();
 
-        let commit = CommitRef::parse(format, &body).unwrap();
-        assert_eq!(commit.tree, ObjectId::from_hex(format, tree_hex).unwrap());
+        let commit = CommitRef::parse(format, &body).expect("test operation should succeed");
+        assert_eq!(
+            commit.tree,
+            ObjectId::from_hex(format, tree_hex).expect("test operation should succeed")
+        );
         assert_eq!(
             commit.parents,
-            vec![ObjectId::from_hex(format, parent_hex).unwrap()]
+            vec![ObjectId::from_hex(format, parent_hex).expect("test operation should succeed")]
         );
         assert_borrows_from(
             &body,
@@ -997,11 +1007,21 @@ mod tests {
             commit.committer,
             b"C O Mitter <c@example.invalid> 1 -0000",
         );
-        assert_borrows_from(&body, commit.encoding.unwrap(), b"UTF-8");
+        assert_borrows_from(
+            &body,
+            commit.encoding.expect("test operation should succeed"),
+            b"UTF-8",
+        );
         assert_borrows_from(&body, commit.message, b"subject\n\nbody\n");
 
-        assert_eq!(Commit::parse_ref(format, &body).unwrap(), commit);
-        assert_eq!(commit.to_owned(), Commit::parse(format, &body).unwrap());
+        assert_eq!(
+            Commit::parse_ref(format, &body).expect("test operation should succeed"),
+            commit
+        );
+        assert_eq!(
+            commit.to_owned(),
+            Commit::parse(format, &body).expect("test operation should succeed")
+        );
     }
 
     #[test]
@@ -1038,7 +1058,7 @@ mod tests {
             ObjectFormat::Sha1,
             "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag = Tag {
             object,
             object_type: ObjectType::Commit,
@@ -1046,7 +1066,10 @@ mod tests {
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
             message: b"release\n".to_vec(),
         };
-        assert_eq!(Tag::parse(ObjectFormat::Sha1, &tag.write()).unwrap(), tag);
+        assert_eq!(
+            Tag::parse(ObjectFormat::Sha1, &tag.write()).expect("test operation should succeed"),
+            tag
+        );
     }
 
     #[test]
@@ -1063,19 +1086,28 @@ mod tests {
         )
         .into_bytes();
 
-        let tag = TagRef::parse(format, &body).unwrap();
-        assert_eq!(tag.object, ObjectId::from_hex(format, object_hex).unwrap());
+        let tag = TagRef::parse(format, &body).expect("test operation should succeed");
+        assert_eq!(
+            tag.object,
+            ObjectId::from_hex(format, object_hex).expect("test operation should succeed")
+        );
         assert_eq!(tag.object_type, ObjectType::Commit);
         assert_borrows_from(&body, tag.name, b"v1.0-borrowed");
         assert_borrows_from(
             &body,
-            tag.tagger.unwrap(),
+            tag.tagger.expect("test operation should succeed"),
             b"Example User <example@example.invalid> 0 +0000",
         );
         assert_borrows_from(&body, tag.message, b"release notes\n");
 
-        assert_eq!(Tag::parse_ref(format, &body).unwrap(), tag);
-        assert_eq!(tag.to_owned(), Tag::parse(format, &body).unwrap());
+        assert_eq!(
+            Tag::parse_ref(format, &body).expect("test operation should succeed"),
+            tag
+        );
+        assert_eq!(
+            tag.to_owned(),
+            Tag::parse(format, &body).expect("test operation should succeed")
+        );
     }
 
     #[test]
@@ -1106,7 +1138,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let author_raw = b"A U Thor <a@example.invalid> 1700000000 +0530".to_vec();
         let committer_raw = b"C O Mitter <c@example.invalid> 1700000001 -0000".to_vec();
         let commit = Commit {
@@ -1138,7 +1170,10 @@ mod tests {
         assert_eq!(commit.author, author_raw);
         assert_eq!(commit.committer, committer_raw);
         let written = commit.write();
-        assert_eq!(Commit::parse(ObjectFormat::Sha1, &written).unwrap(), commit);
+        assert_eq!(
+            Commit::parse(ObjectFormat::Sha1, &written).expect("test operation should succeed"),
+            commit
+        );
     }
 
     #[test]
@@ -1147,7 +1182,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let commit = Commit {
             tree,
             parents: Vec::new(),
@@ -1166,7 +1201,7 @@ mod tests {
             ObjectFormat::Sha1,
             "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tagger_raw = b"Example User <example@example.invalid> 1700000000 -0000".to_vec();
         let tag = Tag {
             object: object.clone(),

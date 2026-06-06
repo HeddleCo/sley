@@ -234,7 +234,7 @@ fn head_update_target(refs: &FileRefStore) -> Result<(String, Option<ObjectId>)>
 }
 
 fn zero_oid(format: sley_core::ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 fn validate_identity_component(name: &str, value: &str) -> Result<()> {
@@ -289,7 +289,8 @@ mod tests {
     #[test]
     fn commit_identity_formats_raw_git_date() {
         let identity =
-            format_commit_identity("Example User", "example@example.invalid", "@0 +0000").unwrap();
+            format_commit_identity("Example User", "example@example.invalid", "@0 +0000")
+                .expect("test operation should succeed");
         assert_eq!(identity, b"Example User <example@example.invalid> 0 +0000");
     }
 
@@ -299,9 +300,10 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let identity =
-            format_commit_identity("Example User", "example@example.invalid", "@0 +0000").unwrap();
+            format_commit_identity("Example User", "example@example.invalid", "@0 +0000")
+                .expect("test operation should succeed");
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = create_commit(
             &mut db,
@@ -313,7 +315,7 @@ mod tests {
                 message: b"initial subject\n".to_vec(),
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(oid.to_hex(), "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15");
     }
 
@@ -323,9 +325,9 @@ mod tests {
             ObjectFormat::Sha1,
             "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15",
         )
-        .unwrap();
-        let tagger =
-            format_commit_identity("Example User", "example@example.invalid", "@0 +0000").unwrap();
+        .expect("test operation should succeed");
+        let tagger = format_commit_identity("Example User", "example@example.invalid", "@0 +0000")
+            .expect("test operation should succeed");
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = create_annotated_tag(
             &mut db,
@@ -337,7 +339,7 @@ mod tests {
                 message: b"release\n".to_vec(),
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(oid.to_hex(), "b9c6a18e58a4efa0a5c023bcf0d8f2a320ae4098");
     }
 }

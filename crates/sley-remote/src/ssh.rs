@@ -28,21 +28,20 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
-use sley_odb::{build_reachable_pack, collect_reachable_object_ids, FileObjectDatabase};
+use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
 use sley_protocol::{
-    build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
+    GitService, ProtocolV2FetchShallowInfo, ReceivePackPushRequestOptions, RefAdvertisement,
+    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
+    UploadPackRequest, build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
     parse_upload_pack_features, plan_push_commands, read_receive_pack_report_status,
     read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
     read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request, GitService,
-    ProtocolV2FetchShallowInfo, ReceivePackPushRequestOptions, RefAdvertisement,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::FileRefStore;
-use sley_transport::{ssh_process_command, RemoteTransport, RemoteUrl, SshCommandVariant};
+use sley_transport::{RemoteTransport, RemoteUrl, SshCommandVariant, ssh_process_command};
 
-use crate::{CredentialProvider, PushOutcome};
+use crate::PushOutcome;
 
 /// The `ssh` program to spawn for SSH transport: the `GIT_SSH` environment
 /// variable when set, otherwise `ssh`. This mirrors git's basic `GIT_SSH`
@@ -62,17 +61,26 @@ pub fn ssh_program() -> String {
 /// report-status. `credentials` is accepted for seam uniformity but unused. The
 /// "To <remote>" summary and set-upstream config stay with the caller, driven from
 /// [`PushOutcome::commands`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn push_ssh(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    remote: &RemoteUrl,
-    refspecs: &[String],
-    quiet: bool,
-    force: bool,
-    _credentials: &mut dyn CredentialProvider,
-) -> Result<PushOutcome> {
+pub(crate) struct SshPushRequest<'a> {
+    pub git_dir: &'a Path,
+    pub common_git_dir: &'a Path,
+    pub format: ObjectFormat,
+    pub remote: &'a RemoteUrl,
+    pub refspecs: &'a [String],
+    pub quiet: bool,
+    pub force: bool,
+}
+
+pub(crate) fn push_ssh(request: SshPushRequest<'_>) -> Result<PushOutcome> {
+    let SshPushRequest {
+        git_dir,
+        common_git_dir,
+        format,
+        remote,
+        refspecs,
+        quiet,
+        force,
+    } = request;
     if remote.transport != RemoteTransport::Ssh {
         return Err(GitError::InvalidFormat(
             "SSH receive-pack requires an SSH remote".into(),
@@ -155,7 +163,7 @@ pub(crate) fn push_ssh(
     let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
     let starts = commands
         .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
+        .filter(|command| !command.new_id.is_null())
         .map(|command| command.new_id.clone());
     let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
         .map(|pack| pack.pack)
@@ -256,7 +264,7 @@ pub(crate) fn ls_remote_ssh(
         .collect::<HashMap<_, _>>();
     let mut records = Vec::new();
     for advertisement in set.refs {
-        if is_zero_object_id(&advertisement.oid) {
+        if advertisement.oid.is_null() {
             continue;
         }
         if filter.refs_only && (advertisement.name == "HEAD" || advertisement.name.ends_with("^{}"))
@@ -291,57 +299,82 @@ pub(crate) fn ls_remote_ssh(
 /// entries are the server's shallow-info updates the caller must fold into
 /// `$GIT_DIR/shallow` (see [`crate::apply_shallow_info`]); they are empty for a
 /// non-deepen fetch.
-#[allow(clippy::too_many_arguments)]
+pub struct SshFetchPackRequest<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Resolved SSH remote.
+    pub remote: &'a RemoteUrl,
+    /// Upload-pack features advertised by the remote.
+    pub features: &'a UploadPackFeatures,
+    /// Wanted object ids.
+    pub wants: Vec<ObjectId>,
+    /// Existing shallow boundary to replay.
+    pub shallow: Vec<ObjectId>,
+    /// Requested deepen depth, if this is a shallow fetch.
+    pub deepen: Option<u32>,
+    /// Whether to install the response as a promisor pack.
+    pub promisor: bool,
+}
+
 pub fn install_fetch_pack_via_ssh_upload_pack(
-    git_dir: &Path,
-    format: ObjectFormat,
-    remote: &RemoteUrl,
-    features: &UploadPackFeatures,
-    wants: Vec<ObjectId>,
-    shallow: Vec<ObjectId>,
-    deepen: Option<u32>,
-    promisor: bool,
+    request: SshFetchPackRequest<'_>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
-    if wants.is_empty() {
+    if request.wants.is_empty() {
         return Ok(Vec::new());
     }
-    let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
     // A deepen request must always reach the server (the shallow boundary may move
     // even when every wanted object is already present), so only the plain fetch
     // takes the "everything is local already" shortcut.
-    if deepen.is_none()
-        && wants
-            .iter()
-            .map(|want| local_db.contains(want))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .all(|contains| contains)
-    {
+    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
         return Ok(Vec::new());
     }
-    let request = UploadPackRequest {
-        wants,
-        capabilities: ssh_shallow_request_capabilities(deepen),
-        shallow,
-        deepen,
+    let upload_request = UploadPackRequest {
+        wants: request.wants,
+        capabilities: ssh_shallow_request_capabilities(request.deepen),
+        shallow: request.shallow,
+        deepen: request.deepen,
         ..UploadPackRequest::default()
     };
-    let haves = crate::local::local_have_oids(git_dir, format)?;
+    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
     // Only a deepen request gets a leading shallow-info section in the response;
     // a plain fetch must use the non-shallow reader (the response starts straight
     // at the NAK/ACK), preserving the existing SSH wire handling exactly.
-    let (shallow_info, response) = if deepen.is_some() {
-        ssh_upload_pack_shallow_fetch_response(remote, format, features, request, haves)?
+    let (shallow_info, response) = if request.deepen.is_some() {
+        ssh_upload_pack_shallow_fetch_response(
+            request.remote,
+            request.format,
+            request.features,
+            upload_request,
+            haves,
+        )?
     } else {
-        let response = ssh_upload_pack_fetch_response(remote, format, features, request, haves)?;
+        let response = ssh_upload_pack_fetch_response(
+            request.remote,
+            request.format,
+            request.features,
+            upload_request,
+            haves,
+        )?;
         (Vec::new(), response)
     };
-    if promisor {
+    if request.promisor {
         install_upload_pack_raw_promisor_response(&response, &local_db)?;
     } else {
         install_upload_pack_raw_response(&response, &local_db)?;
     }
     Ok(shallow_info)
+}
+
+fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {
+    for want in wants {
+        if !db.contains(want)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// The want-line capabilities for an SSH fetch: the `shallow` capability when a
@@ -523,9 +556,4 @@ fn ssh_remote_display(remote: &RemoteUrl) -> String {
         out.push_str(&remote.path);
     }
     out
-}
-
-/// Whether `oid` is the all-zero object id (a ref creation/deletion sentinel).
-fn is_zero_object_id(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
 }

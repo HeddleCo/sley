@@ -74,12 +74,19 @@ fn diff_inexact_rename_matches_git() {
     }
     let root = unique_temp_dir("diff-rename");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
-    fs::write(repo.join("orig.txt"), "a\nb\nc\nd\ne\n").unwrap();
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo.join("orig.txt"), "a\nb\nc\nd\ne\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     git_ok(&repo, &["mv", "orig.txt", "renamed.txt"]);
-    fs::write(repo.join("renamed.txt"), "a\nb\nC\nd\ne\n").unwrap();
+    fs::write(repo.join("renamed.txt"), "a\nb\nC\nd\ne\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "renamed.txt"]);
 
     // Default (git detects renames via diff.renames), explicit -M, a threshold,
@@ -104,12 +111,19 @@ fn diff_inexact_rename_one_edit_similarity_matches_git() {
     }
     let root = unique_temp_dir("diff-rename-sim");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
-    fs::write(repo.join("f.txt"), "a\nb\nc\n").unwrap();
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo.join("f.txt"), "a\nb\nc\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     git_ok(&repo, &["mv", "f.txt", "g.txt"]);
-    fs::write(repo.join("g.txt"), "a\nB\nc\n").unwrap();
+    fs::write(repo.join("g.txt"), "a\nB\nc\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "rename"]);
 
@@ -134,14 +148,23 @@ fn diff_binary_mode_change_stat_matches_git() {
     }
     let root = unique_temp_dir("diff-bin-stat");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", repo.to_str().unwrap()]);
-    fs::write(repo.join("data.bin"), b"bin\x00data\n").unwrap();
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    fs::write(repo.join("data.bin"), b"bin\x00data\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "add"]);
     let file = repo.join("data.bin");
-    let mut perms = fs::metadata(&file).unwrap().permissions();
+    let mut perms = fs::metadata(&file)
+        .expect("test operation should succeed")
+        .permissions();
     perms.set_mode(0o755);
-    fs::set_permissions(&file, perms).unwrap();
+    fs::set_permissions(&file, perms).expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "chmod"]);
 

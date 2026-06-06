@@ -136,7 +136,7 @@ fn remove_single_commit_graph(root: &Path) {
 fn commit_graph_verify_matches_upstream_git() {
     let root = unique_temp_dir("commit-graph-verify");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_commit_graph_fixture(&root);
         for args in [
             vec!["commit-graph", "verify"],
@@ -147,16 +147,15 @@ fn commit_graph_verify_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_graph_verify_split_chain_matches_upstream_git() {
     let root = unique_temp_dir("commit-graph-verify-split");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_commit_graph_fixture(&root);
         remove_single_commit_graph(&root);
         run_success(
@@ -183,16 +182,15 @@ fn commit_graph_verify_split_chain_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
     let root = unique_temp_dir("commit-graph-write");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_commit_graph_fixture(&root);
         let graph_path = root
             .join(".git")
@@ -229,9 +227,8 @@ fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
         );
         assert_same_output(actual, expected, &args);
         run_success("git", &root, &["commit-graph", "verify"]);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -241,7 +238,7 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             run_success("git", repo, &["init", "-q", "-b", "main"]);
             run_success(
@@ -286,9 +283,8 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
         let expected_output = run("git", &empty_expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &empty_actual, &args);
         assert_same_output(actual_output, expected_output, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -298,7 +294,7 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
         for repo in [&expected, &actual] {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
@@ -334,7 +330,6 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
         let actual_verify = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
         assert_same_output(actual_verify, expected_verify, &verify_args);
         run_success_with_env("git", &actual, &verify_args, &envs);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

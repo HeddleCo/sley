@@ -10,7 +10,7 @@ use sley_refs::{FileRefStore, RefPrecondition, RefTarget, RefUpdate};
 fn unique_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("sley-cas-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&dir).expect("test operation should succeed");
     dir
 }
 
@@ -19,7 +19,8 @@ fn store(dir: &Path) -> FileRefStore {
 }
 
 fn oid(nibble: char) -> ObjectId {
-    ObjectId::from_hex(ObjectFormat::Sha1, &String::from(nibble).repeat(40)).unwrap()
+    ObjectId::from_hex(ObjectFormat::Sha1, &String::from(nibble).repeat(40))
+        .expect("test operation should succeed")
 }
 
 #[test]
@@ -35,9 +36,10 @@ fn must_not_exist_is_create_only() {
         RefPrecondition::MustNotExist,
         None,
     );
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
     assert_eq!(
-        s.read_ref("refs/heads/x").unwrap(),
+        s.read_ref("refs/heads/x")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(a.clone()))
     );
 
@@ -51,7 +53,8 @@ fn must_not_exist_is_create_only() {
     );
     assert!(tx.commit().is_err());
     assert_eq!(
-        s.read_ref("refs/heads/x").unwrap(),
+        s.read_ref("refs/heads/x")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(a))
     );
 
@@ -72,7 +75,7 @@ fn existing_must_match_allows_absent_or_equal() {
         RefPrecondition::ExistingMustMatch(RefTarget::Direct(a.clone())),
         None,
     );
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
 
     // Present and matching -> allowed (updates).
     let b = oid('b');
@@ -83,9 +86,10 @@ fn existing_must_match_allows_absent_or_equal() {
         RefPrecondition::ExistingMustMatch(RefTarget::Direct(a.clone())),
         None,
     );
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
     assert_eq!(
-        s.read_ref("refs/heads/y").unwrap(),
+        s.read_ref("refs/heads/y")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(b.clone()))
     );
 
@@ -99,7 +103,8 @@ fn existing_must_match_allows_absent_or_equal() {
     );
     assert!(tx.commit().is_err());
     assert_eq!(
-        s.read_ref("refs/heads/y").unwrap(),
+        s.read_ref("refs/heads/y")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(b))
     );
 
@@ -119,7 +124,11 @@ fn must_exist_requires_presence() {
         None,
     );
     assert!(tx.commit().is_err());
-    assert_eq!(s.read_ref("refs/heads/z").unwrap(), None);
+    assert_eq!(
+        s.read_ref("refs/heads/z")
+            .expect("test operation should succeed"),
+        None
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -137,7 +146,7 @@ fn failed_precondition_rolls_back_whole_batch() {
         RefPrecondition::MustNotExist,
         None,
     );
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
 
     // One valid create plus one that violates MustNotExist on an existing ref:
     // the whole commit must fail and neither change may land.
@@ -156,12 +165,14 @@ fn failed_precondition_rolls_back_whole_batch() {
     );
     assert!(tx.commit().is_err());
     assert_eq!(
-        s.read_ref("refs/heads/new").unwrap(),
+        s.read_ref("refs/heads/new")
+            .expect("test operation should succeed"),
         None,
         "the new ref must not have been created"
     );
     assert_eq!(
-        s.read_ref("refs/heads/keep").unwrap(),
+        s.read_ref("refs/heads/keep")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(a)),
         "the existing ref must be unchanged"
     );
@@ -182,7 +193,7 @@ fn refupdate_expected_still_behaves_as_must_match() {
         new: RefTarget::Direct(a.clone()),
         reflog: None,
     });
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
 
     // expected = Some(matching) -> ok.
     let b = oid('2');
@@ -193,7 +204,7 @@ fn refupdate_expected_still_behaves_as_must_match() {
         new: RefTarget::Direct(b.clone()),
         reflog: None,
     });
-    tx.commit().unwrap();
+    tx.commit().expect("test operation should succeed");
 
     // expected = Some(wrong) -> rejected, value unchanged.
     let mut tx = s.transaction();
@@ -205,7 +216,8 @@ fn refupdate_expected_still_behaves_as_must_match() {
     });
     assert!(tx.commit().is_err());
     assert_eq!(
-        s.read_ref("refs/heads/c").unwrap(),
+        s.read_ref("refs/heads/c")
+            .expect("test operation should succeed"),
         Some(RefTarget::Direct(b))
     );
 

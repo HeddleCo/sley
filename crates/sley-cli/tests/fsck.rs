@@ -63,7 +63,7 @@ fn create_single_commit_repo(root: &Path) -> String {
 fn fsck_clean_repository_no_progress_matches_upstream_git() {
     let root = unique_temp_dir("fsck-clean");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_single_commit_repo(&root);
         let args = ["fsck", "--no-progress"];
         let expected = run("git", &root, &args);
@@ -71,16 +71,15 @@ fn fsck_clean_repository_no_progress_matches_upstream_git() {
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn fsck_missing_tree_reports_broken_link_like_upstream_git() {
     let root = unique_temp_dir("fsck-missing-tree");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let tree = create_single_commit_repo(&root);
         fs::remove_file(loose_object_path(&root.join(".git"), &tree)).expect("remove tree object");
         let args = ["fsck", "--no-progress"];
@@ -96,16 +95,15 @@ fn fsck_missing_tree_reports_broken_link_like_upstream_git() {
             stdout.contains(&format!("missing tree {tree}")),
             "expected missing tree report, got {stdout}"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn fsck_dangling_blob_matches_upstream_git() {
     let root = unique_temp_dir("fsck-dangling-blob");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_single_commit_repo(&root);
         run_success("git", &root, &["hash-object", "-w", "--stdin"]);
         let args = ["fsck", "--no-progress"];
@@ -121,16 +119,15 @@ fn fsck_dangling_blob_matches_upstream_git() {
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn fsck_unreachable_commit_matches_upstream_git() {
     let root = unique_temp_dir("fsck-unreachable-commit");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         create_single_commit_repo(&root);
         let tree = String::from_utf8(run_success("git", &root, &["rev-parse", "HEAD^{tree}"]))
             .expect("tree oid is utf8");
@@ -156,7 +153,6 @@ fn fsck_unreachable_commit_matches_upstream_git() {
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

@@ -59,7 +59,7 @@ fn ref_exists(root: &Path, name: &str) -> bool {
 fn symbolic_ref_quiet_matches_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-quiet");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         for args in [
             vec!["symbolic-ref", "--quiet", "HEAD"],
@@ -75,9 +75,8 @@ fn symbolic_ref_quiet_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -86,7 +85,7 @@ fn symbolic_ref_reftable_repository_matches_upstream_git() {
     let expected = root.join("expected");
     let actual = root.join("actual");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         fs::create_dir_all(&expected).expect("create expected repo dir");
         fs::create_dir_all(&actual).expect("create actual repo dir");
         run_success("git", &expected, &["init", "-q", "--ref-format=reftable"]);
@@ -102,9 +101,8 @@ fn symbolic_ref_reftable_repository_matches_upstream_git() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -113,7 +111,7 @@ fn symbolic_ref_update_options_match_upstream_git() {
     let expected = root.join("expected");
     let actual = root.join("actual");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         fs::create_dir_all(&expected).expect("create expected repo dir");
         fs::create_dir_all(&actual).expect("create actual repo dir");
         run_success("git", &expected, &["init", "-q"]);
@@ -163,9 +161,8 @@ fn symbolic_ref_update_options_match_upstream_git() {
                 "HEAD differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -175,7 +172,7 @@ fn symbolic_ref_delete_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -223,16 +220,15 @@ fn symbolic_ref_delete_matches_upstream_git() {
                 "direct ref existence differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-short-no-recurse");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         fs::create_dir_all(root.join(".git").join("refs").join("meta"))
             .expect("create meta refs dir");
@@ -277,7 +273,6 @@ fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

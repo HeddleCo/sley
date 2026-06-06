@@ -225,7 +225,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     };
     let pathspec = GrepPathspec::new(
         worktree_root.as_deref(),
-        &cwd,
+        cwd,
         opts.full_name,
         &opts.pathspecs,
     )?;
@@ -237,10 +237,12 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             return Err(GitError::Command("grep: missing worktree".into()));
         };
         any_match = grep_index_source(
-            git_dir,
-            worktree_root,
-            format,
-            db,
+            GrepIndexSource {
+                git_dir,
+                worktree_root,
+                format,
+                db,
+            },
             &matcher,
             &opts,
             &pathspec,
@@ -251,7 +253,16 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             let oid = repo.resolve_revision(rev)?;
             let tree_oid = sley_rev::peel_to_tree(db, format, &oid)?;
             let matched = grep_tree_source(
-                db, format, &tree_oid, rev, &matcher, &opts, &pathspec, &mut out,
+                GrepTreeSource {
+                    db,
+                    format,
+                    tree_oid: &tree_oid,
+                    rev,
+                },
+                &matcher,
+                &opts,
+                &pathspec,
+                &mut out,
             )?;
             any_match = any_match || matched;
         }
@@ -334,17 +345,21 @@ fn grep_unknown_option(flag: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Greps the working tree (default) or the index (`--cached`).
-fn grep_index_source(
-    git_dir: &Path,
-    worktree_root: &Path,
+struct GrepIndexSource<'a> {
+    git_dir: &'a Path,
+    worktree_root: &'a Path,
     format: ObjectFormat,
-    db: &FileObjectDatabase,
+    db: &'a FileObjectDatabase,
+}
+
+fn grep_index_source(
+    source: GrepIndexSource<'_>,
     matcher: &GrepMatcher,
     opts: &GrepOptions,
     pathspec: &GrepPathspec,
     out: &mut impl Write,
 ) -> Result<bool> {
-    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+    let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
         return Ok(false);
     };
     let mut any = false;
@@ -362,9 +377,9 @@ fn grep_index_source(
             continue;
         }
         let content = if opts.cached {
-            db.read_object(&entry.oid)?.body
+            source.db.read_object(&entry.oid)?.body
         } else {
-            let absolute = worktree_root.join(bytes_to_path(path));
+            let absolute = source.worktree_root.join(bytes_to_path(path));
             match fs::read(&absolute) {
                 Ok(bytes) => bytes,
                 Err(_) => continue,
@@ -378,27 +393,36 @@ fn grep_index_source(
 }
 
 /// Greps a tree-ish, recursing through subtrees.
-#[allow(clippy::too_many_arguments)]
-fn grep_tree_source(
-    db: &FileObjectDatabase,
+struct GrepTreeSource<'a> {
+    db: &'a FileObjectDatabase,
     format: ObjectFormat,
-    tree_oid: &ObjectId,
-    rev: &str,
+    tree_oid: &'a ObjectId,
+    rev: &'a str,
+}
+
+fn grep_tree_source(
+    source: GrepTreeSource<'_>,
     matcher: &GrepMatcher,
     opts: &GrepOptions,
     pathspec: &GrepPathspec,
     out: &mut impl Write,
 ) -> Result<bool> {
     let mut entries: Vec<(Vec<u8>, ObjectId)> = Vec::new();
-    collect_tree_blobs(db, format, tree_oid, &mut Vec::new(), &mut entries)?;
+    collect_tree_blobs(
+        source.db,
+        source.format,
+        source.tree_oid,
+        &mut Vec::new(),
+        &mut entries,
+    )?;
     let mut any = false;
     for (path, oid) in entries {
         if !pathspec.matches(&path) {
             continue;
         }
         let display = pathspec.display(&path);
-        let content = db.read_object(&oid)?.body;
-        let matched = grep_buffer(&content, &display, Some(rev), matcher, opts, out)?;
+        let content = source.db.read_object(&oid)?.body;
+        let matched = grep_buffer(&content, &display, Some(source.rev), matcher, opts, out)?;
         any = any || matched;
     }
     Ok(any)
@@ -429,10 +453,8 @@ fn collect_tree_blobs(
             ObjectType::Tree => {
                 collect_tree_blobs(db, format, &entry.oid, prefix, out)?;
             }
-            ObjectType::Blob => {
-                if entry.mode != 0o160000 {
-                    out.push((prefix.clone(), entry.oid.clone()));
-                }
+            ObjectType::Blob if entry.mode != 0o160000 => {
+                out.push((prefix.clone(), entry.oid.clone()));
             }
             _ => {}
         }
@@ -1065,9 +1087,7 @@ fn bytes_eq(a: &[u8], b: &[u8], ignore_case: bool) -> bool {
         return false;
     }
     if ignore_case {
-        a.iter()
-            .zip(b)
-            .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+        a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
     } else {
         a == b
     }
@@ -1090,7 +1110,7 @@ fn find_substring(haystack: &[u8], needle: &[u8], ignore_case: bool, from: usize
             window
                 .iter()
                 .zip(needle)
-                .all(|(x, y)| x.to_ascii_lowercase() == y.to_ascii_lowercase())
+                .all(|(x, y)| x.eq_ignore_ascii_case(y))
         } else {
             window == needle
         };
@@ -1338,17 +1358,14 @@ impl RegexParser<'_> {
         };
         if !self.extended {
             // BRE: `\(`, `\)`, `\|` handled elsewhere; `\{` is a quantifier.
-            match next {
-                b'(' => {
-                    self.pos += 2;
-                    let inner = self.parse_alternation()?;
-                    if !self.at_group_close() {
-                        return Err(GitError::Command("unbalanced \\( in regex".into()));
-                    }
-                    self.pos += 2; // consume `\)`
-                    return Ok(Node::Group(Box::new(inner)));
+            if next == b'(' {
+                self.pos += 2;
+                let inner = self.parse_alternation()?;
+                if !self.at_group_close() {
+                    return Err(GitError::Command("unbalanced \\( in regex".into()));
                 }
-                _ => {}
+                self.pos += 2; // consume `\)`
+                return Ok(Node::Group(Box::new(inner)));
             }
         }
         match next {
@@ -1424,11 +1441,12 @@ impl RegexParser<'_> {
                 break;
             }
             first = false;
-            if byte == b'[' && self.bytes.get(self.pos + 1) == Some(&b':') {
-                if let Some(class) = self.parse_posix_class()? {
-                    items.push(ClassItem::Posix(class));
-                    continue;
-                }
+            if byte == b'['
+                && self.bytes.get(self.pos + 1) == Some(&b':')
+                && let Some(class) = self.parse_posix_class()?
+            {
+                items.push(ClassItem::Posix(class));
+                continue;
             }
             // Range?
             let lo = byte;
@@ -1666,7 +1684,17 @@ fn match_seq(
             min,
             max,
             greedy,
-        } => match_repeat(node, *min, *max, *greedy, text, pos, ignore_case, cont),
+        } => match_repeat(
+            RepeatPattern {
+                node,
+                min: *min,
+                max: *max,
+                greedy: *greedy,
+            },
+            MatchSubject { text, ignore_case },
+            pos,
+            cont,
+        ),
     }
 }
 
@@ -1685,15 +1713,23 @@ fn match_concat(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn match_repeat(
-    node: &Node,
+struct RepeatPattern<'a> {
+    node: &'a Node,
     min: usize,
     max: Option<usize>,
     greedy: bool,
-    text: &[u8],
-    pos: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MatchSubject<'a> {
+    text: &'a [u8],
     ignore_case: bool,
+}
+
+fn match_repeat(
+    repeat: RepeatPattern<'_>,
+    subject: MatchSubject<'_>,
+    pos: usize,
     cont: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
     // First satisfy the mandatory `min` repetitions.
@@ -1745,16 +1781,30 @@ fn match_repeat(
         cont(pos)
     }
 
-    let max_optional = max.map(|m| m.saturating_sub(min));
-    let _ = greedy;
-    match_min(node, min, text, pos, ignore_case, &|p| {
-        match_optional(node, max_optional, text, p, ignore_case, cont)
-    })
+    let max_optional = repeat.max.map(|m| m.saturating_sub(repeat.min));
+    let _ = repeat.greedy;
+    match_min(
+        repeat.node,
+        repeat.min,
+        subject.text,
+        pos,
+        subject.ignore_case,
+        &|p| {
+            match_optional(
+                repeat.node,
+                max_optional,
+                subject.text,
+                p,
+                subject.ignore_case,
+                cont,
+            )
+        },
+    )
 }
 
 fn byte_eq(a: u8, b: u8, ignore_case: bool) -> bool {
     if ignore_case {
-        a.to_ascii_lowercase() == b.to_ascii_lowercase()
+        a.eq_ignore_ascii_case(&b)
     } else {
         a == b
     }

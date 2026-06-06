@@ -3620,8 +3620,7 @@ impl PackBitmapWriter {
         // dedicated `write` path fills it in. `build` reports a placeholder of
         // the correct format so the struct is self-consistent for callers that
         // only need the decoded bitmaps.
-        let placeholder_checksum =
-            ObjectId::from_raw(self.format, &vec![0u8; self.format.raw_len()])?;
+        let placeholder_checksum = ObjectId::null(self.format);
         Ok(PackBitmapIndex {
             version: 1,
             format: self.format,
@@ -3775,7 +3774,7 @@ mod tests {
     #[test]
     fn parses_single_blob_pack() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"hello\n");
-        let parsed = PackFile::parse_sha1(&pack).unwrap();
+        let parsed = PackFile::parse_sha1(&pack).expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.entries.len(), 1);
         let object = &parsed.entries[0].object;
@@ -3790,7 +3789,8 @@ mod tests {
     #[test]
     fn parses_single_blob_pack_sha256() {
         let pack = single_object_pack(ObjectFormat::Sha256, ObjectType::Blob, b"hello\n");
-        let parsed = PackFile::parse(&pack, ObjectFormat::Sha256).unwrap();
+        let parsed =
+            PackFile::parse(&pack, ObjectFormat::Sha256).expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.entries.len(), 1);
         let object = &parsed.entries[0].object;
@@ -3798,22 +3798,26 @@ mod tests {
         assert_eq!(object.body, b"hello\n");
         assert_eq!(
             parsed.entries[0].entry.oid,
-            object.object_id(ObjectFormat::Sha256).unwrap()
+            object
+                .object_id(ObjectFormat::Sha256)
+                .expect("test operation should succeed")
         );
     }
 
     #[test]
     fn parses_bundle_pack_payload_with_bundle_format() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"bundle\n");
-        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"bundle\n").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"bundle\n")
+            .expect("test operation should succeed");
         let bundle_bytes = format!("# v2 git bundle\n{oid} refs/heads/main\n\n")
             .into_bytes()
             .into_iter()
             .chain(pack)
             .collect::<Vec<_>>();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
-        let parsed = PackFile::parse_bundle(&bundle).unwrap();
+        let parsed = PackFile::parse_bundle(&bundle).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].object.object_type, ObjectType::Blob);
         assert_eq!(parsed.entries[0].object.body, b"bundle\n");
@@ -3822,15 +3826,16 @@ mod tests {
     #[test]
     fn rejects_bundle_pack_payload_with_wrong_object_format() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"bundle\n");
-        let oid =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"bundle\n").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"bundle\n")
+            .expect("test operation should succeed");
         let bundle_bytes =
             format!("# v3 git bundle\n@object-format=sha256\n{oid} refs/heads/main\n\n")
                 .into_bytes()
                 .into_iter()
                 .chain(pack)
                 .collect::<Vec<_>>();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
         assert!(PackFile::parse_bundle(&bundle).is_err());
     }
@@ -3838,13 +3843,23 @@ mod tests {
     #[test]
     fn writes_pack_and_index_that_round_trip() {
         let object = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec());
-        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
-        let pack = PackFile::parse_sha1(&written.pack).unwrap();
-        let index = PackIndex::parse_v2_sha1(&written.index).unwrap();
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
+        let pack = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
+        let index =
+            PackIndex::parse_v2_sha1(&written.index).expect("test operation should succeed");
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(pack.entries[0].object, object);
         assert_eq!(index.pack_checksum, pack.checksum);
-        assert_eq!(index.find(&oid).unwrap().offset, 12);
+        assert_eq!(
+            index
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
     }
 
     #[test]
@@ -3852,15 +3867,25 @@ mod tests {
         let object = EncodedObject::new(ObjectType::Blob, b"hello sha256\n".to_vec());
         let written =
             PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-                .unwrap();
-        let pack = PackFile::parse(&written.pack, ObjectFormat::Sha256).unwrap();
-        let index = PackIndex::parse(&written.index, ObjectFormat::Sha256).unwrap();
-        let oid = object.object_id(ObjectFormat::Sha256).unwrap();
+                .expect("test operation should succeed");
+        let pack = PackFile::parse(&written.pack, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+        let index = PackIndex::parse(&written.index, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+        let oid = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         assert_eq!(pack.entries[0].object, object);
         assert_eq!(index.pack_checksum, pack.checksum);
         assert_eq!(index.pack_checksum.format(), ObjectFormat::Sha256);
         assert_eq!(index.index_checksum.format(), ObjectFormat::Sha256);
-        assert_eq!(index.find(&oid).unwrap().offset, 12);
+        assert_eq!(
+            index
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
     }
 
     #[test]
@@ -3868,10 +3893,12 @@ mod tests {
         let object = EncodedObject::new(ObjectType::Blob, b"index raw sha256 pack\n".to_vec());
         let written =
             PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-                .unwrap();
+                .expect("test operation should succeed");
 
-        let indexed = PackIndex::write_v2_for_pack(&written.pack, ObjectFormat::Sha256).unwrap();
-        let index = PackIndex::parse(&indexed.index, ObjectFormat::Sha256).unwrap();
+        let indexed = PackIndex::write_v2_for_pack(&written.pack, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+        let index = PackIndex::parse(&indexed.index, ObjectFormat::Sha256)
+            .expect("test operation should succeed");
 
         assert_eq!(indexed.pack_checksum, written.checksum);
         assert_eq!(indexed.entries, written.entries);
@@ -3887,20 +3914,30 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::OfsDelta,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
-        let indexed = PackIndex::write_v2_for_pack_sha1(&written.pack).unwrap();
-        let index = PackIndex::parse_v2_sha1(&indexed.index).unwrap();
-        let changed_oid = changed.object_id(ObjectFormat::Sha1).unwrap();
+        let indexed = PackIndex::write_v2_for_pack_sha1(&written.pack)
+            .expect("test operation should succeed");
+        let index =
+            PackIndex::parse_v2_sha1(&indexed.index).expect("test operation should succeed");
+        let changed_oid = changed
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
         assert_eq!(indexed.pack_checksum, written.checksum);
         assert_eq!(indexed.entries, written.entries);
         assert_eq!(
-            index.find(&changed_oid).unwrap().offset,
+            index
+                .find(&changed_oid)
+                .expect("test operation should succeed")
+                .offset,
             written.entries[1].offset
         );
         assert_eq!(
-            index.find(&changed_oid).unwrap().crc32,
+            index
+                .find(&changed_oid)
+                .expect("test operation should succeed")
+                .crc32,
             written.entries[1].crc32
         );
     }
@@ -3913,18 +3950,28 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::RefDelta,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut second_offset = written.entries[1].offset as usize;
-        let header = parse_entry_header(&written.pack, &mut second_offset).unwrap();
+        let header = parse_entry_header(&written.pack, &mut second_offset)
+            .expect("test operation should succeed");
         assert_eq!(header.kind, PackObjectKind::RefDelta);
 
-        let pack = PackFile::parse_sha1(&written.pack).unwrap();
-        let index = PackIndex::parse_v2_sha1(&written.index).unwrap();
-        let oid = changed.object_id(ObjectFormat::Sha1).unwrap();
+        let pack = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
+        let index =
+            PackIndex::parse_v2_sha1(&written.index).expect("test operation should succeed");
+        let oid = changed
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(pack.entries[0].object, base);
         assert_eq!(pack.entries[1].object, changed);
         assert_eq!(index.pack_checksum, pack.checksum);
-        assert_eq!(index.find(&oid).unwrap().offset, written.entries[1].offset);
+        assert_eq!(
+            index
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            written.entries[1].offset
+        );
     }
 
     #[test]
@@ -3935,20 +3982,22 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::OfsDelta,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
         let mut second = written.entries[1].offset as usize;
         assert_eq!(
-            parse_entry_header(&written.pack, &mut second).unwrap().kind,
+            parse_entry_header(&written.pack, &mut second)
+                .expect("test operation should succeed")
+                .kind,
             PackObjectKind::OfsDelta
         );
         // Ground truth from a full parse; single-object decode must match at every offset.
-        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+        let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
         for po in &parsed.entries {
             let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
                 Ok(None)
             })
-            .unwrap();
+            .expect("test operation should succeed");
             assert_eq!(got, po.object, "offset {}", po.entry.offset);
         }
     }
@@ -3961,8 +4010,8 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::RefDelta,
         )
-        .unwrap();
-        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+        .expect("test operation should succeed");
+        let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
         let by_oid: HashMap<ObjectId, EncodedObject> = parsed
             .entries
             .iter()
@@ -3972,7 +4021,7 @@ mod tests {
             let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
                 Ok(by_oid.get(oid).cloned())
             })
-            .unwrap();
+            .expect("test operation should succeed");
             assert_eq!(got, po.object);
         }
     }
@@ -4016,8 +4065,8 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::OfsDelta,
         )
-        .unwrap();
-        let parsed = PackFile::parse_sha1(&written.pack).unwrap();
+        .expect("test operation should succeed");
+        let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
 
         let cache = CountingDeltaCache::default();
         // Read every object twice through the cache; each result must equal the
@@ -4031,7 +4080,7 @@ mod tests {
                     |_| Ok(None),
                     &cache,
                 )
-                .unwrap();
+                .expect("test operation should succeed");
                 assert_eq!(got, po.object, "offset {}", po.entry.offset);
             }
         }
@@ -4048,18 +4097,28 @@ mod tests {
             ObjectFormat::Sha1,
             DeltaStrategy::OfsDelta,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut second_offset = written.entries[1].offset as usize;
-        let header = parse_entry_header(&written.pack, &mut second_offset).unwrap();
+        let header = parse_entry_header(&written.pack, &mut second_offset)
+            .expect("test operation should succeed");
         assert_eq!(header.kind, PackObjectKind::OfsDelta);
 
-        let pack = PackFile::parse_sha1(&written.pack).unwrap();
-        let index = PackIndex::parse_v2_sha1(&written.index).unwrap();
-        let oid = changed.object_id(ObjectFormat::Sha1).unwrap();
+        let pack = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
+        let index =
+            PackIndex::parse_v2_sha1(&written.index).expect("test operation should succeed");
+        let oid = changed
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(pack.entries[0].object, base);
         assert_eq!(pack.entries[1].object, changed);
         assert_eq!(index.pack_checksum, pack.checksum);
-        assert_eq!(index.find(&oid).unwrap().offset, written.entries[1].offset);
+        assert_eq!(
+            index
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            written.entries[1].offset
+        );
     }
 
     #[test]
@@ -4067,13 +4126,14 @@ mod tests {
         let base = b"hello";
         let result = b"hello world";
         let pack = two_object_delta_pack(ObjectFormat::Sha1, base, result, DeltaKind::Offset);
-        let parsed = PackFile::parse_sha1(&pack).unwrap();
+        let parsed = PackFile::parse_sha1(&pack).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 2);
         assert_eq!(parsed.entries[0].object.body, base);
         assert_eq!(parsed.entries[1].object.body, result);
         assert_eq!(
             parsed.entries[1].entry.oid,
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result).unwrap()
+            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result)
+                .expect("test operation should succeed")
         );
     }
 
@@ -4082,13 +4142,14 @@ mod tests {
         let base = b"hello";
         let result = b"hello world";
         let pack = two_object_delta_pack(ObjectFormat::Sha1, base, result, DeltaKind::Ref);
-        let parsed = PackFile::parse_sha1(&pack).unwrap();
+        let parsed = PackFile::parse_sha1(&pack).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 2);
         assert_eq!(parsed.entries[0].object.body, base);
         assert_eq!(parsed.entries[1].object.body, result);
         assert_eq!(
             parsed.entries[1].entry.oid,
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result).unwrap()
+            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result)
+                .expect("test operation should succeed")
         );
     }
 
@@ -4099,7 +4160,8 @@ mod tests {
         let pack = thin_ref_delta_pack(ObjectFormat::Sha1, base, result);
         assert!(PackFile::parse_sha1(&pack).is_err());
 
-        let base_oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", base).unwrap();
+        let base_oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", base)
+            .expect("test operation should succeed");
         let parsed = PackFile::parse_thin(&pack, ObjectFormat::Sha1, |oid| {
             if oid == &base_oid {
                 Ok(Some(EncodedObject::new(ObjectType::Blob, base.to_vec())))
@@ -4107,12 +4169,13 @@ mod tests {
                 Ok(None)
             }
         })
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].object.body, result);
         assert_eq!(
             parsed.entries[0].entry.oid,
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result).unwrap()
+            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", result)
+                .expect("test operation should succeed")
         );
     }
 
@@ -4134,8 +4197,10 @@ mod tests {
 
     #[test]
     fn pack_index_writer_rejects_duplicate_object_ids() {
-        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"same\n").unwrap();
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"same\n")
+            .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let entries = vec![
             PackIndexEntry {
                 oid: oid.clone(),
@@ -4157,8 +4222,9 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let index = single_entry_index(
             ObjectFormat::Sha1,
             oid.clone(),
@@ -4166,12 +4232,24 @@ mod tests {
             12,
             pack_checksum.clone(),
         );
-        let parsed = PackIndex::parse_v2_sha1(&index).unwrap();
+        let parsed = PackIndex::parse_v2_sha1(&index).expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.find(&oid).unwrap().offset, 12);
-        assert_eq!(parsed.find(&oid).unwrap().crc32, 0x1234_5678);
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .crc32,
+            0x1234_5678
+        );
     }
 
     #[test]
@@ -4180,20 +4258,34 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let index = single_entry_index_v1(
             ObjectFormat::Sha1,
             oid.clone(),
             0x1234_5678,
             pack_checksum.clone(),
         );
-        let parsed = PackIndex::parse(&index, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            PackIndex::parse(&index, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.find(&oid).unwrap().offset, 0x1234_5678);
-        assert_eq!(parsed.find(&oid).unwrap().crc32, 0);
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            0x1234_5678
+        );
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .crc32,
+            0
+        );
     }
 
     #[test]
@@ -4202,8 +4294,9 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let mut index = single_entry_index_v1(ObjectFormat::Sha1, oid, 12, pack_checksum);
         let last = index.len() - 1;
         index[last] ^= 1;
@@ -4212,26 +4305,29 @@ mod tests {
 
     #[test]
     fn parses_pack_reverse_index() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
-        let reverse_index =
-            PackReverseIndex::write(ObjectFormat::Sha1, &[2, 0, 1], &pack_checksum).unwrap();
-        let parsed = PackReverseIndex::parse(&reverse_index, ObjectFormat::Sha1, 3).unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let reverse_index = PackReverseIndex::write(ObjectFormat::Sha1, &[2, 0, 1], &pack_checksum)
+            .expect("test operation should succeed");
+        let parsed = PackReverseIndex::parse(&reverse_index, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert_eq!(parsed.positions, vec![2, 0, 1]);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(
             PackReverseIndex::write(ObjectFormat::Sha1, &parsed.positions, &parsed.pack_checksum)
-                .unwrap(),
+                .expect("test operation should succeed"),
             reverse_index
         );
     }
 
     #[test]
     fn rejects_bad_pack_reverse_index_checksum() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
-        let mut reverse_index =
-            PackReverseIndex::write(ObjectFormat::Sha1, &[0], &pack_checksum).unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let mut reverse_index = PackReverseIndex::write(ObjectFormat::Sha1, &[0], &pack_checksum)
+            .expect("test operation should succeed");
         let last = reverse_index.len() - 1;
         reverse_index[last] ^= 1;
         assert!(PackReverseIndex::parse(&reverse_index, ObjectFormat::Sha1, 1).is_err());
@@ -4239,40 +4335,47 @@ mod tests {
 
     #[test]
     fn rejects_bad_pack_reverse_index_positions() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let duplicate = pack_reverse_index(ObjectFormat::Sha1, &[0, 0], pack_checksum.clone());
         assert!(PackReverseIndex::parse(&duplicate, ObjectFormat::Sha1, 2).is_err());
         let out_of_range = pack_reverse_index(ObjectFormat::Sha1, &[0, 2], pack_checksum);
         assert!(PackReverseIndex::parse(&out_of_range, ObjectFormat::Sha1, 2).is_err());
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         assert!(PackReverseIndex::write(ObjectFormat::Sha1, &[0, 0], &pack_checksum).is_err());
         assert!(PackReverseIndex::write(ObjectFormat::Sha1, &[0, 2], &pack_checksum).is_err());
     }
 
     #[test]
     fn parses_pack_mtimes() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let mtimes = PackMtimes::write(
             ObjectFormat::Sha1,
             &[1, 1_700_000_000, u32::MAX],
             &pack_checksum,
         )
-        .unwrap();
-        let parsed = PackMtimes::parse(&mtimes, ObjectFormat::Sha1, 3).unwrap();
+        .expect("test operation should succeed");
+        let parsed = PackMtimes::parse(&mtimes, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert_eq!(parsed.mtimes, vec![1, 1_700_000_000, u32::MAX]);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(
-            PackMtimes::write(ObjectFormat::Sha1, &parsed.mtimes, &parsed.pack_checksum).unwrap(),
+            PackMtimes::write(ObjectFormat::Sha1, &parsed.mtimes, &parsed.pack_checksum)
+                .expect("test operation should succeed"),
             mtimes
         );
     }
 
     #[test]
     fn rejects_bad_pack_mtimes_checksum() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
-        let mut mtimes = PackMtimes::write(ObjectFormat::Sha1, &[1], &pack_checksum).unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
+        let mut mtimes = PackMtimes::write(ObjectFormat::Sha1, &[1], &pack_checksum)
+            .expect("test operation should succeed");
         let last = mtimes.len() - 1;
         mtimes[last] ^= 1;
         assert!(PackMtimes::parse(&mtimes, ObjectFormat::Sha1, 1).is_err());
@@ -4280,42 +4383,68 @@ mod tests {
 
     #[test]
     fn rejects_bad_pack_mtimes_shape() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let mtimes = pack_mtimes(ObjectFormat::Sha1, &[1, 2], pack_checksum.clone());
         assert!(PackMtimes::parse(&mtimes, ObjectFormat::Sha1, 1).is_err());
 
         let mut wrong_hash = pack_mtimes(ObjectFormat::Sha1, &[1], pack_checksum);
         wrong_hash[11] = 2;
         let checksum_offset = wrong_hash.len() - ObjectFormat::Sha1.raw_len();
-        let checksum =
-            sley_core::digest_bytes(ObjectFormat::Sha1, &wrong_hash[..checksum_offset]).unwrap();
+        let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &wrong_hash[..checksum_offset])
+            .expect("test operation should succeed");
         wrong_hash[checksum_offset..].copy_from_slice(checksum.as_bytes());
         assert!(PackMtimes::parse(&wrong_hash, ObjectFormat::Sha1, 1).is_err());
     }
 
     #[test]
     fn parses_multi_pack_index_header_and_chunk_lookup() {
-        let first =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n").unwrap();
-        let second =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n").unwrap();
+        let first = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n")
+            .expect("test operation should succeed");
+        let second = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n")
+            .expect("test operation should succeed");
         let chunks = midx_chunks_with_pack_names(
             ObjectFormat::Sha1,
             b"pack-a.idx\0pack-b.idx\0\0\0".to_vec(),
             &[(first.clone(), 0, 12), (second.clone(), 1, 0x1_0000_0000)],
         );
         let midx = multi_pack_index(ObjectFormat::Sha1, 2, 2, &chunks);
-        let parsed = MultiPackIndex::parse(&midx, ObjectFormat::Sha1).unwrap();
+        let parsed = MultiPackIndex::parse(&midx, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert_eq!(parsed.pack_count, 2);
         assert_eq!(parsed.pack_names, vec!["pack-a.idx", "pack-b.idx"]);
         assert_eq!(parsed.object_count, 2);
         assert_eq!(parsed.objects.len(), 2);
-        assert_eq!(parsed.find(&first).unwrap().pack_int_id, 0);
-        assert_eq!(parsed.find(&first).unwrap().offset, 12);
-        assert_eq!(parsed.find(&second).unwrap().pack_int_id, 1);
-        assert_eq!(parsed.find(&second).unwrap().offset, 0x1_0000_0000);
+        assert_eq!(
+            parsed
+                .find(&first)
+                .expect("test operation should succeed")
+                .pack_int_id,
+            0
+        );
+        assert_eq!(
+            parsed
+                .find(&first)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
+        assert_eq!(
+            parsed
+                .find(&second)
+                .expect("test operation should succeed")
+                .pack_int_id,
+            1
+        );
+        assert_eq!(
+            parsed
+                .find(&second)
+                .expect("test operation should succeed")
+                .offset,
+            0x1_0000_0000
+        );
         assert_eq!(parsed.reverse_index, None);
         assert_eq!(parsed.bitmapped_packs, None);
         assert_eq!(parsed.chunks.len(), 5);
@@ -4342,8 +4471,8 @@ mod tests {
         let mut wrong_hash = multi_pack_index(ObjectFormat::Sha1, 1, 0, &chunks);
         wrong_hash[5] = 2;
         let checksum_offset = wrong_hash.len() - ObjectFormat::Sha1.raw_len();
-        let checksum =
-            sley_core::digest_bytes(ObjectFormat::Sha1, &wrong_hash[..checksum_offset]).unwrap();
+        let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &wrong_hash[..checksum_offset])
+            .expect("test operation should succeed");
         wrong_hash[checksum_offset..].copy_from_slice(checksum.as_bytes());
         assert!(MultiPackIndex::parse(&wrong_hash, ObjectFormat::Sha1).is_err());
 
@@ -4352,7 +4481,7 @@ mod tests {
         let checksum_offset = missing_terminator.len() - ObjectFormat::Sha1.raw_len();
         let checksum =
             sley_core::digest_bytes(ObjectFormat::Sha1, &missing_terminator[..checksum_offset])
-                .unwrap();
+                .expect("test operation should succeed");
         missing_terminator[checksum_offset..].copy_from_slice(checksum.as_bytes());
         assert!(MultiPackIndex::parse(&missing_terminator, ObjectFormat::Sha1).is_err());
 
@@ -4364,8 +4493,8 @@ mod tests {
         );
         bad_offset[16..24].copy_from_slice(&0u64.to_be_bytes());
         let checksum_offset = bad_offset.len() - ObjectFormat::Sha1.raw_len();
-        let checksum =
-            sley_core::digest_bytes(ObjectFormat::Sha1, &bad_offset[..checksum_offset]).unwrap();
+        let checksum = sley_core::digest_bytes(ObjectFormat::Sha1, &bad_offset[..checksum_offset])
+            .expect("test operation should succeed");
         bad_offset[checksum_offset..].copy_from_slice(checksum.as_bytes());
         assert!(MultiPackIndex::parse(&bad_offset, ObjectFormat::Sha1).is_err());
     }
@@ -4413,7 +4542,8 @@ mod tests {
                 &[],
             ),
         );
-        let parsed = MultiPackIndex::parse(&unsorted_v2, ObjectFormat::Sha1).unwrap();
+        let parsed = MultiPackIndex::parse(&unsorted_v2, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(parsed.pack_names, vec!["pack-b.idx", "pack-a.idx"]);
     }
 
@@ -4423,12 +4553,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let oid_b = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let missing_oidf = multi_pack_index(
             ObjectFormat::Sha1,
@@ -4495,10 +4625,10 @@ mod tests {
 
     #[test]
     fn parses_multi_pack_index_bitmap_chunks() {
-        let first =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n").unwrap();
-        let second =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n").unwrap();
+        let first = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n")
+            .expect("test operation should succeed");
+        let second = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n")
+            .expect("test operation should succeed");
         let mut chunks = midx_chunks_with_pack_names(
             ObjectFormat::Sha1,
             b"pack-a.idx\0pack-b.idx\0\0\0".to_vec(),
@@ -4508,7 +4638,8 @@ mod tests {
         chunks.push((*b"BTMP", midx_bitmap_packs(&[(0, 1), (1, 1)])));
         let midx = multi_pack_index(ObjectFormat::Sha1, 2, 2, &chunks);
 
-        let parsed = MultiPackIndex::parse(&midx, ObjectFormat::Sha1).unwrap();
+        let parsed = MultiPackIndex::parse(&midx, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(parsed.reverse_index, Some(vec![1, 0]));
         assert_eq!(
             parsed.bitmapped_packs,
@@ -4527,10 +4658,10 @@ mod tests {
 
     #[test]
     fn writes_multi_pack_index_that_round_trips() {
-        let first =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n").unwrap();
-        let second =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n").unwrap();
+        let first = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"first object\n")
+            .expect("test operation should succeed");
+        let second = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"second object\n")
+            .expect("test operation should succeed");
         let bytes = MultiPackIndex::write(
             ObjectFormat::Sha1,
             2,
@@ -4548,22 +4679,48 @@ mod tests {
                 },
             ],
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
-        let parsed = MultiPackIndex::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed = MultiPackIndex::parse(&bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.pack_names, vec!["pack-b.idx", "pack-a.idx"]);
         assert_eq!(parsed.object_count, 2);
-        assert_eq!(parsed.find(&first).unwrap().pack_int_id, 1);
-        assert_eq!(parsed.find(&first).unwrap().offset, 12);
-        assert_eq!(parsed.find(&second).unwrap().pack_int_id, 0);
-        assert_eq!(parsed.find(&second).unwrap().offset, 0x1_0000_0000);
+        assert_eq!(
+            parsed
+                .find(&first)
+                .expect("test operation should succeed")
+                .pack_int_id,
+            1
+        );
+        assert_eq!(
+            parsed
+                .find(&first)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
+        assert_eq!(
+            parsed
+                .find(&second)
+                .expect("test operation should succeed")
+                .pack_int_id,
+            0
+        );
+        assert_eq!(
+            parsed
+                .find(&second)
+                .expect("test operation should succeed")
+                .offset,
+            0x1_0000_0000
+        );
         assert!(parsed.chunks.iter().any(|chunk| chunk.id == *b"LOFF"));
     }
 
     #[test]
     fn write_multi_pack_index_rejects_invalid_inputs() {
-        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"object\n").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"object\n")
+            .expect("test operation should succeed");
         assert!(MultiPackIndex::write(ObjectFormat::Sha1, 3, &["pack-a.idx".into()], &[]).is_err());
         assert!(
             MultiPackIndex::write(
@@ -4616,12 +4773,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let oid_b = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let mut duplicate_ridx = midx_chunks_with_pack_names(
             ObjectFormat::Sha1,
@@ -4653,7 +4810,8 @@ mod tests {
 
     #[test]
     fn parses_pack_bitmap_index_with_hash_cache() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let bitmap = pack_bitmap_index(
             ObjectFormat::Sha1,
             3,
@@ -4663,7 +4821,8 @@ mod tests {
             Some(&[0x1111_1111, 0x2222_2222, 0x3333_3333]),
         );
 
-        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha1, 3).unwrap();
+        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert_eq!(
@@ -4674,7 +4833,9 @@ mod tests {
         assert_eq!(parsed.type_bitmaps.commits.bit_size, 3);
         assert_eq!(parsed.type_bitmaps.trees.bit_size, 3);
         assert_eq!(parsed.entries.len(), 1);
-        let entry = parsed.entry_for_pack_position(2).unwrap();
+        let entry = parsed
+            .entry_for_pack_position(2)
+            .expect("test operation should succeed");
         assert_eq!(entry.xor_offset, 0);
         assert_eq!(entry.flags, 1);
         assert_eq!(entry.bitmap.words, ewah_literal_words(&[0b101]));
@@ -4686,7 +4847,8 @@ mod tests {
 
     #[test]
     fn parses_pack_bitmap_index_sha256() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack")
+            .expect("test operation should succeed");
         let bitmap = pack_bitmap_index(
             ObjectFormat::Sha256,
             2,
@@ -4696,7 +4858,8 @@ mod tests {
             None,
         );
 
-        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha256, 2).unwrap();
+        let parsed = PackBitmapIndex::parse(&bitmap, ObjectFormat::Sha256, 2)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.format, ObjectFormat::Sha256);
         assert_eq!(parsed.pack_checksum, pack_checksum);
@@ -4708,8 +4871,8 @@ mod tests {
     #[test]
     fn parses_upstream_git_written_pack_bitmap_index() {
         let root = unique_temp_dir("git-pack-bitmap-upstream");
-        fs::create_dir_all(&root).unwrap();
-        let result = (|| {
+        fs::create_dir_all(&root).expect("test operation should succeed");
+        {
             run_git_success(&root, &["init", "-q", "-b", "main"]);
             run_git_success(
                 &root,
@@ -4743,23 +4906,27 @@ mod tests {
             let pack_dir = root.join(".git").join("objects").join("pack");
             let idx_path = single_path_with_extension(&pack_dir, "idx");
             let bitmap_path = single_path_with_extension(&pack_dir, "bitmap");
-            let index = PackIndex::parse(&fs::read(idx_path).unwrap(), ObjectFormat::Sha1).unwrap();
+            let index = PackIndex::parse(
+                &fs::read(idx_path).expect("test operation should succeed"),
+                ObjectFormat::Sha1,
+            )
+            .expect("test operation should succeed");
             let bitmap = PackBitmapIndex::parse(
-                &fs::read(bitmap_path).unwrap(),
+                &fs::read(bitmap_path).expect("test operation should succeed"),
                 ObjectFormat::Sha1,
                 index.entries.len(),
             )
-            .unwrap();
+            .expect("test operation should succeed");
             assert_eq!(bitmap.pack_checksum, index.pack_checksum);
             assert!(!bitmap.entries.is_empty());
-        })();
+        };
         let _ = fs::remove_dir_all(&root);
-        result
     }
 
     #[test]
     fn rejects_bad_pack_bitmap_index_header_and_checksum() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let bitmap = pack_bitmap_index(
             ObjectFormat::Sha1,
             1,
@@ -4791,7 +4958,8 @@ mod tests {
 
     #[test]
     fn rejects_bad_pack_bitmap_index_ewah_and_entries() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
+            .expect("test operation should succeed");
         let bitmap = pack_bitmap_index(
             ObjectFormat::Sha1,
             2,
@@ -4832,8 +5000,9 @@ mod tests {
     #[test]
     fn parses_single_entry_pack_index_sha256() {
         let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello sha256\n")
-            .unwrap();
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+            .expect("test operation should succeed");
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack")
+            .expect("test operation should succeed");
         let index = single_entry_index(
             ObjectFormat::Sha256,
             oid.clone(),
@@ -4841,12 +5010,25 @@ mod tests {
             12,
             pack_checksum.clone(),
         );
-        let parsed = PackIndex::parse(&index, ObjectFormat::Sha256).unwrap();
+        let parsed =
+            PackIndex::parse(&index, ObjectFormat::Sha256).expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(parsed.entries.len(), 1);
-        assert_eq!(parsed.find(&oid).unwrap().offset, 12);
-        assert_eq!(parsed.find(&oid).unwrap().crc32, 0x1234_5678);
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .offset,
+            12
+        );
+        assert_eq!(
+            parsed
+                .find(&oid)
+                .expect("test operation should succeed")
+                .crc32,
+            0x1234_5678
+        );
         assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
     }
 
@@ -4868,8 +5050,10 @@ mod tests {
 
     fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {
         let objects = similar_blob_family(8);
-        let packed = PackFile::write_packed(&objects, format).unwrap();
-        let undeltified = PackFile::write_undeltified(&objects, format).unwrap();
+        let packed =
+            PackFile::write_packed(&objects, format).expect("test operation should succeed");
+        let undeltified =
+            PackFile::write_undeltified(&objects, format).expect("test operation should succeed");
 
         // The whole point of delta selection: the packed output is smaller than
         // storing every object undeltified.
@@ -4892,10 +5076,12 @@ mod tests {
         );
 
         // Round-trip: every original object reconstructs byte-for-byte.
-        let parsed = PackFile::parse(&packed.pack, format).unwrap();
+        let parsed = PackFile::parse(&packed.pack, format).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), objects.len());
         for object in &objects {
-            let oid = object.object_id(format).unwrap();
+            let oid = object
+                .object_id(format)
+                .expect("test operation should succeed");
             let found = parsed
                 .entries
                 .iter()
@@ -4905,10 +5091,12 @@ mod tests {
         }
 
         // The index must agree with the pack and locate every object.
-        let index = PackIndex::parse(&packed.index, format).unwrap();
+        let index = PackIndex::parse(&packed.index, format).expect("test operation should succeed");
         assert_eq!(index.pack_checksum, packed.checksum);
         for object in &objects {
-            let oid = object.object_id(format).unwrap();
+            let oid = object
+                .object_id(format)
+                .expect("test operation should succeed");
             assert!(index.find(&oid).is_some(), "index missing {oid}");
         }
     }
@@ -4916,14 +5104,15 @@ mod tests {
     #[test]
     fn write_packed_emits_ofs_delta_by_default() {
         let objects = similar_blob_family(6);
-        let packed = PackFile::write_packed(&objects, ObjectFormat::Sha1).unwrap();
+        let packed = PackFile::write_packed(&objects, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
         assert!(
-            kinds.iter().any(|kind| *kind == PackObjectKind::OfsDelta),
+            kinds.contains(&PackObjectKind::OfsDelta),
             "expected an ofs-delta entry by default, found {kinds:?}"
         );
         assert!(
-            !kinds.iter().any(|kind| *kind == PackObjectKind::RefDelta),
+            !kinds.contains(&PackObjectKind::RefDelta),
             "default self-contained pack must not use ref-delta, found {kinds:?}"
         );
         // Round-trips.
@@ -4934,21 +5123,22 @@ mod tests {
     fn write_packed_can_emit_ref_delta() {
         let objects = similar_blob_family(6);
         let options = PackWriteOptions::new().with_prefer_ofs_delta(false);
-        let packed =
-            PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options).unwrap();
+        let packed = PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options)
+            .expect("test operation should succeed");
         let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
         assert!(
-            kinds.iter().any(|kind| *kind == PackObjectKind::RefDelta),
+            kinds.contains(&PackObjectKind::RefDelta),
             "expected a ref-delta entry, found {kinds:?}"
         );
         assert!(
-            !kinds.iter().any(|kind| *kind == PackObjectKind::OfsDelta),
+            !kinds.contains(&PackObjectKind::OfsDelta),
             "ref-delta mode must not emit ofs-delta, found {kinds:?}"
         );
 
         // Ref-delta packs are still self-contained here, so they round-trip
         // without any external base lookup.
-        let parsed = PackFile::parse(&packed.pack, ObjectFormat::Sha1).unwrap();
+        let parsed = PackFile::parse(&packed.pack, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), objects.len());
     }
 
@@ -4964,7 +5154,8 @@ mod tests {
             let options = PackWriteOptions::new()
                 .with_window(20)
                 .with_depth(max_depth);
-            let packed = PackFile::write_packed_with_options(&objects, format, &options).unwrap();
+            let packed = PackFile::write_packed_with_options(&objects, format, &options)
+                .expect("test operation should succeed");
 
             let depths = pack_entry_depths(&packed.pack, format);
             let observed = depths.iter().copied().max().unwrap_or(0);
@@ -4974,14 +5165,17 @@ mod tests {
             );
 
             // Still correct: round-trips byte-for-byte.
-            let parsed = PackFile::parse(&packed.pack, format).unwrap();
+            let parsed =
+                PackFile::parse(&packed.pack, format).expect("test operation should succeed");
             for object in &objects {
-                let oid = object.object_id(format).unwrap();
+                let oid = object
+                    .object_id(format)
+                    .expect("test operation should succeed");
                 let found = parsed
                     .entries
                     .iter()
                     .find(|entry| entry.entry.oid == oid)
-                    .unwrap();
+                    .expect("test operation should succeed");
                 assert_eq!(&found.object, object);
             }
         }
@@ -4991,8 +5185,8 @@ mod tests {
     fn write_packed_depth_zero_stores_everything_undeltified() {
         let objects = similar_blob_family(5);
         let options = PackWriteOptions::new().with_depth(0);
-        let packed =
-            PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options).unwrap();
+        let packed = PackFile::write_packed_with_options(&objects, ObjectFormat::Sha1, &options)
+            .expect("test operation should succeed");
         let kinds = pack_entry_kinds(&packed.pack, ObjectFormat::Sha1);
         assert!(
             kinds
@@ -5017,11 +5211,14 @@ mod tests {
         // ref-delta against the external base's object id.
         let base = blob_with_marker("EXTERNAL-BASE");
         let target = blob_with_marker("EXTERNAL-TARGET");
-        let base_oid = base.object_id(format).unwrap();
+        let base_oid = base
+            .object_id(format)
+            .expect("test operation should succeed");
 
         let mut external = HashMap::new();
         external.insert(base_oid.clone(), base.clone());
-        let packed = PackFile::write_thin(std::slice::from_ref(&target), format, external).unwrap();
+        let packed = PackFile::write_thin(std::slice::from_ref(&target), format, external)
+            .expect("test operation should succeed");
 
         // Exactly one entry, encoded as a ref-delta to the external base.
         let kinds = pack_entry_kinds(&packed.pack, format);
@@ -5029,10 +5226,12 @@ mod tests {
 
         // The external base reference must be the base oid.
         let mut offset = 12usize;
-        let header = parse_entry_header(&packed.pack, &mut offset).unwrap();
+        let header =
+            parse_entry_header(&packed.pack, &mut offset).expect("test operation should succeed");
         assert_eq!(header.kind, PackObjectKind::RefDelta);
         let referenced =
-            ObjectId::from_raw(format, &packed.pack[offset..offset + format.raw_len()]).unwrap();
+            ObjectId::from_raw(format, &packed.pack[offset..offset + format.raw_len()])
+                .expect("test operation should succeed");
         assert_eq!(referenced, base_oid);
 
         // A plain (non-thin) parse fails: the base is not present.
@@ -5046,7 +5245,7 @@ mod tests {
                 Ok(None)
             }
         })
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 1);
         assert_eq!(parsed.entries[0].object, target);
     }
@@ -5061,11 +5260,14 @@ mod tests {
             EncodedObject::new(ObjectType::Commit, b"tree 0000\n".to_vec()),
         ];
         let format = ObjectFormat::Sha1;
-        let packed = PackFile::write_packed(&objects, format).unwrap();
-        let parsed = PackFile::parse(&packed.pack, format).unwrap();
+        let packed =
+            PackFile::write_packed(&objects, format).expect("test operation should succeed");
+        let parsed = PackFile::parse(&packed.pack, format).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), objects.len());
         for object in &objects {
-            let oid = object.object_id(format).unwrap();
+            let oid = object
+                .object_id(format)
+                .expect("test operation should succeed");
             assert!(parsed.entries.iter().any(|entry| entry.entry.oid == oid));
         }
     }
@@ -5171,11 +5373,12 @@ mod tests {
         let mut descriptors = Vec::with_capacity(count);
         for _ in 0..count {
             let entry_offset = offset as u64;
-            let header = parse_entry_header(pack, &mut offset).unwrap();
+            let header =
+                parse_entry_header(pack, &mut offset).expect("test operation should succeed");
             let base = match header.kind {
                 PackObjectKind::OfsDelta => {
-                    let base_offset =
-                        parse_ofs_delta_base_offset(pack, &mut offset, entry_offset).unwrap();
+                    let base_offset = parse_ofs_delta_base_offset(pack, &mut offset, entry_offset)
+                        .expect("test operation should succeed");
                     EntryBase::Offset(base_offset)
                 }
                 PackObjectKind::RefDelta => {
@@ -5186,7 +5389,9 @@ mod tests {
             };
             let mut decoder = ZlibDecoder::new(&pack[offset..trailer_offset]);
             let mut body = Vec::new();
-            decoder.read_to_end(&mut body).unwrap();
+            decoder
+                .read_to_end(&mut body)
+                .expect("test operation should succeed");
             offset += decoder.total_in() as usize;
             descriptors.push(EntryDescriptor {
                 offset: entry_offset,
@@ -5221,9 +5426,12 @@ mod tests {
         pack.extend_from_slice(&1u32.to_be_bytes());
         write_entry_header(&mut pack, object_type, body.len() as u64);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(body).unwrap();
-        pack.extend_from_slice(&encoder.finish().unwrap());
-        let checksum = sley_core::digest_bytes(format, &pack).unwrap();
+        encoder
+            .write_all(body)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
         pack.extend_from_slice(checksum.as_bytes());
         pack
     }
@@ -5248,8 +5456,10 @@ mod tests {
         let base_offset = pack.len();
         write_entry_header(&mut pack, ObjectType::Blob, base.len() as u64);
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(base).unwrap();
-        pack.extend_from_slice(&encoder.finish().unwrap());
+        encoder
+            .write_all(base)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
 
         let delta = append_suffix_delta(base, result);
         let delta_offset = pack.len();
@@ -5264,15 +5474,19 @@ mod tests {
         match delta_kind {
             DeltaKind::Offset => write_ofs_delta_offset(&mut pack, delta_offset - base_offset),
             DeltaKind::Ref => {
-                let base_oid = sley_core::object_id_for_bytes(format, "blob", base).unwrap();
+                let base_oid = sley_core::object_id_for_bytes(format, "blob", base)
+                    .expect("test operation should succeed");
                 pack.extend_from_slice(base_oid.as_bytes());
             }
         }
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&delta).unwrap();
-        pack.extend_from_slice(&encoder.finish().unwrap());
+        encoder
+            .write_all(&delta)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
 
-        let checksum = sley_core::digest_bytes(format, &pack).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
         pack.extend_from_slice(checksum.as_bytes());
         pack
     }
@@ -5285,13 +5499,17 @@ mod tests {
 
         let delta = append_suffix_delta(base, result);
         write_pack_entry_header_kind(&mut pack, 7, delta.len() as u64);
-        let base_oid = sley_core::object_id_for_bytes(format, "blob", base).unwrap();
+        let base_oid = sley_core::object_id_for_bytes(format, "blob", base)
+            .expect("test operation should succeed");
         pack.extend_from_slice(base_oid.as_bytes());
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&delta).unwrap();
-        pack.extend_from_slice(&encoder.finish().unwrap());
+        encoder
+            .write_all(&delta)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
 
-        let checksum = sley_core::digest_bytes(format, &pack).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
         pack.extend_from_slice(checksum.as_bytes());
         pack
     }
@@ -5299,7 +5517,7 @@ mod tests {
     fn unique_temp_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("test operation should succeed")
             .as_nanos();
         std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}", std::process::id()))
     }
@@ -5321,8 +5539,8 @@ mod tests {
 
     fn single_path_with_extension(dir: &Path, extension: &str) -> PathBuf {
         let mut paths = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .expect("test operation should succeed")
+            .map(|entry| entry.expect("test operation should succeed").path())
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some(extension))
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 1, "expected one .{extension} file");
@@ -5358,7 +5576,8 @@ mod tests {
                 out.extend_from_slice(&value.to_be_bytes());
             }
         }
-        let checksum = sley_core::digest_bytes(format, &out).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
     }
@@ -5382,7 +5601,8 @@ mod tests {
 
     fn refresh_trailing_checksum(format: ObjectFormat, bytes: &mut [u8]) {
         let checksum_offset = bytes.len() - format.raw_len();
-        let checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset]).unwrap();
+        let checksum = sley_core::digest_bytes(format, &bytes[..checksum_offset])
+            .expect("test operation should succeed");
         bytes[checksum_offset..].copy_from_slice(checksum.as_bytes());
     }
 
@@ -5459,7 +5679,8 @@ mod tests {
         index.extend_from_slice(&crc32.to_be_bytes());
         index.extend_from_slice(&offset.to_be_bytes());
         index.extend_from_slice(pack_checksum.as_bytes());
-        let checksum = sley_core::digest_bytes(format, &index).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &index).expect("test operation should succeed");
         index.extend_from_slice(checksum.as_bytes());
         index
     }
@@ -5482,7 +5703,8 @@ mod tests {
         index.extend_from_slice(&offset.to_be_bytes());
         index.extend_from_slice(oid.as_bytes());
         index.extend_from_slice(pack_checksum.as_bytes());
-        let checksum = sley_core::digest_bytes(format, &index).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &index).expect("test operation should succeed");
         index.extend_from_slice(checksum.as_bytes());
         index
     }
@@ -5500,7 +5722,8 @@ mod tests {
             reverse_index.extend_from_slice(&position.to_be_bytes());
         }
         reverse_index.extend_from_slice(pack_checksum.as_bytes());
-        let checksum = sley_core::digest_bytes(format, &reverse_index).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &reverse_index).expect("test operation should succeed");
         reverse_index.extend_from_slice(checksum.as_bytes());
         reverse_index
     }
@@ -5514,7 +5737,8 @@ mod tests {
             out.extend_from_slice(&mtime.to_be_bytes());
         }
         out.extend_from_slice(pack_checksum.as_bytes());
-        let checksum = sley_core::digest_bytes(format, &out).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
     }
@@ -5628,7 +5852,8 @@ mod tests {
         for (_id, data) in chunks {
             out.extend_from_slice(data);
         }
-        let checksum = sley_core::digest_bytes(format, &out).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
     }
@@ -5636,7 +5861,7 @@ mod tests {
     // ---- EWAH encoder / bitmap writer tests ------------------------------
 
     fn pack_checksum_sha1() -> ObjectId {
-        sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap()
+        sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").expect("test operation should succeed")
     }
 
     fn parse_ewah_bytes(bytes: &[u8]) -> EwahBitmap {
@@ -5644,7 +5869,8 @@ mod tests {
         // expects: a checksum offset that lies just past the serialised bitmap.
         let mut offset = 0usize;
         let checksum_offset = bytes.len();
-        parse_bitmap_ewah(bytes, &mut offset, checksum_offset, 0).unwrap()
+        parse_bitmap_ewah(bytes, &mut offset, checksum_offset, 0)
+            .expect("test operation should succeed")
     }
 
     #[test]
@@ -5652,7 +5878,7 @@ mod tests {
         // A bitmap whose only word is a literal must serialise as one RLW with
         // literal_len == 1 followed by the literal, identical to the test
         // helper used by the existing parser tests.
-        let ewah = EwahBitmap::from_words(64, &[0b101]).unwrap();
+        let ewah = EwahBitmap::from_words(64, &[0b101]).expect("test operation should succeed");
         assert_eq!(ewah.words, ewah_literal_words(&[0b101]));
         assert_eq!(ewah.rlw_position, 0);
         assert_eq!(ewah.bit_size, 64);
@@ -5660,7 +5886,8 @@ mod tests {
 
     #[test]
     fn ewah_byte_layout_is_big_endian() {
-        let ewah = EwahBitmap::from_words(64, &[0x0102_0304_0506_0708]).unwrap();
+        let ewah = EwahBitmap::from_words(64, &[0x0102_0304_0506_0708])
+            .expect("test operation should succeed");
         let bytes = ewah.to_bytes();
         let mut expected = Vec::new();
         expected.extend_from_slice(&64u32.to_be_bytes()); // bit_size
@@ -5680,14 +5907,20 @@ mod tests {
         // It must still parse and decode to nothing.
         let parsed = parse_ewah_bytes(&bytes);
         assert_eq!(parsed, ewah);
-        assert!(parsed.to_positions().unwrap().is_empty());
+        assert!(
+            parsed
+                .to_positions()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
     }
 
     #[test]
     fn ewah_compresses_clean_zero_run() {
         // Three all-zero words followed by a literal: the encoder should emit a
         // single RLW carrying a run of 3 clean-zero words plus one literal.
-        let ewah = EwahBitmap::from_words(256, &[0, 0, 0, 0b1]).unwrap();
+        let ewah =
+            EwahBitmap::from_words(256, &[0, 0, 0, 0b1]).expect("test operation should succeed");
         assert_eq!(ewah.words.len(), 2, "expected one RLW plus one literal");
         let rlw = ewah.words[0];
         assert_eq!(rlw & 1, 0, "run bit should be zero");
@@ -5698,7 +5931,8 @@ mod tests {
 
     #[test]
     fn ewah_compresses_clean_ones_run() {
-        let ewah = EwahBitmap::from_words(192, &[u64::MAX, u64::MAX, u64::MAX]).unwrap();
+        let ewah = EwahBitmap::from_words(192, &[u64::MAX, u64::MAX, u64::MAX])
+            .expect("test operation should succeed");
         // Pure run of ones, no literals: one RLW only.
         assert_eq!(ewah.words.len(), 1);
         let rlw = ewah.words[0];
@@ -5711,8 +5945,11 @@ mod tests {
     fn ewah_run_then_literal_then_run_roundtrips() {
         let words = vec![0, 0, 0xdead_beef, u64::MAX, u64::MAX, 0, 0xabc];
         let bit_size = (words.len() * 64) as u32;
-        let ewah = EwahBitmap::from_words(bit_size, &words).unwrap();
-        assert_eq!(ewah.to_words().unwrap(), words);
+        let ewah = EwahBitmap::from_words(bit_size, &words).expect("test operation should succeed");
+        assert_eq!(
+            ewah.to_words().expect("test operation should succeed"),
+            words
+        );
     }
 
     #[test]
@@ -5720,25 +5957,33 @@ mod tests {
         // Trailing all-zero words beyond a literal carry no information and git
         // does not serialise them, but to_words() restores them up to bit_size.
         let words = vec![0b1, 0, 0, 0];
-        let ewah = EwahBitmap::from_words(1, &words).unwrap();
+        let ewah = EwahBitmap::from_words(1, &words).expect("test operation should succeed");
         // bit_size of 1 means a single backing word.
         assert_eq!(ewah.bit_size, 1);
-        assert_eq!(ewah.to_words().unwrap(), vec![0b1]);
+        assert_eq!(
+            ewah.to_words().expect("test operation should succeed"),
+            vec![0b1]
+        );
     }
 
     #[test]
     fn ewah_from_positions_roundtrips_via_positions() {
         let positions = [0u32, 1, 63, 64, 65, 200, 511];
-        let ewah = EwahBitmap::from_positions(512, &positions).unwrap();
-        let mut decoded = ewah.to_positions().unwrap();
+        let ewah =
+            EwahBitmap::from_positions(512, &positions).expect("test operation should succeed");
+        let mut decoded = ewah.to_positions().expect("test operation should succeed");
         decoded.sort_unstable();
         assert_eq!(decoded, positions);
     }
 
     #[test]
     fn ewah_from_positions_dedupes_and_orders() {
-        let ewah = EwahBitmap::from_positions(128, &[100, 5, 100, 5, 5]).unwrap();
-        assert_eq!(ewah.to_positions().unwrap(), vec![5, 100]);
+        let ewah = EwahBitmap::from_positions(128, &[100, 5, 100, 5, 5])
+            .expect("test operation should succeed");
+        assert_eq!(
+            ewah.to_positions().expect("test operation should succeed"),
+            vec![5, 100]
+        );
     }
 
     #[test]
@@ -5750,7 +5995,7 @@ mod tests {
         let mut builder = EwahBuilder::new(0);
         builder.add_empty_words(false, 0xffff_ffff);
         builder.add_empty_words(false, 5);
-        let ewah = builder.finish().unwrap();
+        let ewah = builder.finish().expect("test operation should succeed");
         assert_eq!(ewah.words.len(), 2, "run split across two RLWs");
         assert_eq!((ewah.words[0] >> 1) & 0xffff_ffff, 0xffff_ffff);
         assert_eq!(ewah.words[1] & 1, 0);
@@ -5775,11 +6020,14 @@ mod tests {
         // pattern and assert structural equality against the parser's model.
         let words = vec![0, u64::MAX, 0x1234_5678_9abc_def0, 0, 0, 0xff];
         let bit_size = (words.len() * 64) as u32;
-        let ewah = EwahBitmap::from_words(bit_size, &words).unwrap();
+        let ewah = EwahBitmap::from_words(bit_size, &words).expect("test operation should succeed");
         let bytes = ewah.to_bytes();
         let parsed = parse_ewah_bytes(&bytes);
         assert_eq!(parsed, ewah);
-        assert_eq!(parsed.to_words().unwrap(), words);
+        assert_eq!(
+            parsed.to_words().expect("test operation should succeed"),
+            words
+        );
     }
 
     #[test]
@@ -5793,28 +6041,66 @@ mod tests {
             &[(0u32, vec![1u32, 2u32])],
             None,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(&bytes[..4], b"BITM");
 
-        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3).unwrap();
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.options, PackBitmapIndex::OPTION_FULL_DAG);
         assert_eq!(parsed.pack_checksum, pack_checksum_sha1());
-        assert_eq!(parsed.type_bitmaps.commits.to_positions().unwrap(), vec![0]);
-        assert_eq!(parsed.type_bitmaps.trees.to_positions().unwrap(), vec![1]);
-        assert_eq!(parsed.type_bitmaps.blobs.to_positions().unwrap(), vec![2]);
-        assert!(parsed.type_bitmaps.tags.to_positions().unwrap().is_empty());
+        assert_eq!(
+            parsed
+                .type_bitmaps
+                .commits
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![0]
+        );
+        assert_eq!(
+            parsed
+                .type_bitmaps
+                .trees
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![1]
+        );
+        assert_eq!(
+            parsed
+                .type_bitmaps
+                .blobs
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![2]
+        );
+        assert!(
+            parsed
+                .type_bitmaps
+                .tags
+                .to_positions()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
         assert_eq!(parsed.entries.len(), 1);
-        let entry = parsed.entry_for_pack_position(0).unwrap();
+        let entry = parsed
+            .entry_for_pack_position(0)
+            .expect("test operation should succeed");
         assert_eq!(entry.xor_offset, 0);
         assert_eq!(entry.flags, 0);
-        assert_eq!(entry.bitmap.to_positions().unwrap(), vec![0, 1, 2]);
+        assert_eq!(
+            entry
+                .bitmap
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![0, 1, 2]
+        );
         assert_eq!(parsed.name_hash_cache, None);
     }
 
     #[test]
     fn pack_bitmap_index_write_parse_roundtrip_sha256() {
-        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack")
+            .expect("test operation should succeed");
         let object_types = [ObjectType::Commit, ObjectType::Tree];
         let bytes = write_bitmap(
             ObjectFormat::Sha256,
@@ -5823,12 +6109,19 @@ mod tests {
             &[(0u32, vec![1u32])],
             None,
         )
-        .unwrap();
-        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha256, 2).unwrap();
+        .expect("test operation should succeed");
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha256, 2)
+            .expect("test operation should succeed");
         assert_eq!(parsed.format, ObjectFormat::Sha256);
         assert_eq!(parsed.pack_checksum, pack_checksum);
         assert_eq!(parsed.index_checksum.format(), ObjectFormat::Sha256);
-        assert_eq!(parsed.entries[0].bitmap.to_positions().unwrap(), vec![0, 1]);
+        assert_eq!(
+            parsed.entries[0]
+                .bitmap
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![0, 1]
+        );
     }
 
     #[test]
@@ -5842,8 +6135,9 @@ mod tests {
             &[(0u32, vec![1u32, 2u32])],
             Some(cache.clone()),
         )
-        .unwrap();
-        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3).unwrap();
+        .expect("test operation should succeed");
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 3)
+            .expect("test operation should succeed");
         assert_eq!(
             parsed.options,
             PackBitmapIndex::OPTION_FULL_DAG | PackBitmapIndex::OPTION_HASH_CACHE
@@ -5860,20 +6154,46 @@ mod tests {
             ObjectType::Blob,
         ];
         let mut writer =
-            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
-        writer.add_commit(0, &[2, 3]).unwrap();
-        writer.add_commit(1, &[2]).unwrap();
-        let bytes = writer.write().unwrap();
-        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 4).unwrap();
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
+                .expect("test operation should succeed");
+        writer
+            .add_commit(0, &[2, 3])
+            .expect("test operation should succeed");
+        writer
+            .add_commit(1, &[2])
+            .expect("test operation should succeed");
+        let bytes = writer.write().expect("test operation should succeed");
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 4)
+            .expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), 2);
         assert_eq!(
-            parsed.type_bitmaps.commits.to_positions().unwrap(),
+            parsed
+                .type_bitmaps
+                .commits
+                .to_positions()
+                .expect("test operation should succeed"),
             vec![0, 1]
         );
-        let first = parsed.entry_for_pack_position(0).unwrap();
-        assert_eq!(first.bitmap.to_positions().unwrap(), vec![0, 2, 3]);
-        let second = parsed.entry_for_pack_position(1).unwrap();
-        assert_eq!(second.bitmap.to_positions().unwrap(), vec![1, 2]);
+        let first = parsed
+            .entry_for_pack_position(0)
+            .expect("test operation should succeed");
+        assert_eq!(
+            first
+                .bitmap
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![0, 2, 3]
+        );
+        let second = parsed
+            .entry_for_pack_position(1)
+            .expect("test operation should succeed");
+        assert_eq!(
+            second
+                .bitmap
+                .to_positions()
+                .expect("test operation should succeed"),
+            vec![1, 2]
+        );
     }
 
     #[test]
@@ -5881,9 +6201,9 @@ mod tests {
         // The provided index_checksum field is ignored; write recomputes it so
         // a bogus placeholder still produces a valid, parseable file.
         let object_types = [ObjectType::Commit, ObjectType::Blob];
-        let writer =
-            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
-        let mut index = writer.build().unwrap();
+        let writer = PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
+            .expect("test operation should succeed");
+        let mut index = writer.build().expect("test operation should succeed");
         // build() sets an all-zero placeholder checksum.
         assert_eq!(index.index_checksum.as_bytes(), [0u8; 20]);
         index.entries.clear(); // mutate the model after build
@@ -5891,11 +6211,12 @@ mod tests {
             object_position: 0,
             xor_offset: 0,
             flags: 0,
-            bitmap: EwahBitmap::from_positions(2, &[0, 1]).unwrap(),
+            bitmap: EwahBitmap::from_positions(2, &[0, 1]).expect("test operation should succeed"),
         });
-        let bytes = index.write().unwrap();
+        let bytes = index.write().expect("test operation should succeed");
         // Parsing validates the trailing checksum, so a wrong checksum fails.
-        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 2).unwrap();
+        let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 2)
+            .expect("test operation should succeed");
         assert_ne!(parsed.index_checksum.as_bytes(), [0u8; 20]);
     }
 
@@ -5903,7 +6224,8 @@ mod tests {
     fn pack_bitmap_writer_rejects_non_commit_selection() {
         let object_types = [ObjectType::Commit, ObjectType::Blob];
         let mut writer =
-            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types).unwrap();
+            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
+                .expect("test operation should succeed");
         // Position 1 is a blob, not a commit.
         assert!(writer.add_commit(1, &[]).is_err());
         // Position 5 is out of range entirely.
@@ -5914,7 +6236,8 @@ mod tests {
 
     #[test]
     fn pack_bitmap_writer_rejects_checksum_format_mismatch() {
-        let sha256_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
+        let sha256_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack")
+            .expect("test operation should succeed");
         assert!(
             PackBitmapWriter::new(ObjectFormat::Sha1, sha256_checksum, &[ObjectType::Commit])
                 .is_err()
@@ -5928,7 +6251,7 @@ mod tests {
             pack_checksum_sha1(),
             &[ObjectType::Commit],
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(writer.with_name_hash_cache(vec![1, 2]).is_err());
     }
 
@@ -5939,9 +6262,9 @@ mod tests {
             pack_checksum_sha1(),
             &[ObjectType::Commit],
         )
-        .unwrap()
+        .expect("test operation should succeed")
         .build()
-        .unwrap();
+        .expect("test operation should succeed");
         // Flag set but no cache present.
         index.options |= PackBitmapIndex::OPTION_HASH_CACHE;
         assert!(index.write().is_err());
@@ -5957,8 +6280,8 @@ mod tests {
         // writer using the real pack checksum and object types, and confirm our
         // bytes parse under the same parser that reads upstream bitmaps.
         let root = unique_temp_dir("git-pack-bitmap-writer");
-        fs::create_dir_all(&root).unwrap();
-        let result = (|| {
+        fs::create_dir_all(&root).expect("test operation should succeed");
+        {
             run_git_success(&root, &["init", "-q", "-b", "main"]);
             run_git_success(
                 &root,
@@ -5977,16 +6300,25 @@ mod tests {
             run_git_success(&root, &["repack", "-adb"]);
             let pack_dir = root.join(".git").join("objects").join("pack");
             let idx_path = single_path_with_extension(&pack_dir, "idx");
-            let index = PackIndex::parse(&fs::read(idx_path).unwrap(), ObjectFormat::Sha1).unwrap();
+            let index = PackIndex::parse(
+                &fs::read(idx_path).expect("test operation should succeed"),
+                ObjectFormat::Sha1,
+            )
+            .expect("test operation should succeed");
             // Read object types from the pack so the type bitmaps are accurate.
             let pack_path = single_path_with_extension(&pack_dir, "pack");
-            let pack = PackFile::parse_sha1(&fs::read(pack_path).unwrap()).unwrap();
+            let pack =
+                PackFile::parse_sha1(&fs::read(pack_path).expect("test operation should succeed"))
+                    .expect("test operation should succeed");
             // Map each index entry (sorted by oid) to its pack offset, then to a
             // pack-order position so positions line up with the index ordering.
             let mut offsets: Vec<u64> = index.entries.iter().map(|entry| entry.offset).collect();
             offsets.sort_unstable();
             let position_of = |offset: u64| -> u32 {
-                offsets.iter().position(|value| *value == offset).unwrap() as u32
+                offsets
+                    .iter()
+                    .position(|value| *value == offset)
+                    .expect("test operation should succeed") as u32
             };
             let mut object_types = vec![ObjectType::Blob; index.entries.len()];
             for entry in &index.entries {
@@ -6004,7 +6336,7 @@ mod tests {
             let commit_position = object_types
                 .iter()
                 .position(|ty| *ty == ObjectType::Commit)
-                .unwrap() as u32;
+                .expect("test operation should succeed") as u32;
             let reachable: Vec<u32> = (0..index.entries.len() as u32).collect();
             let bytes = write_bitmap(
                 ObjectFormat::Sha1,
@@ -6013,17 +6345,20 @@ mod tests {
                 &[(commit_position, reachable)],
                 None,
             )
-            .unwrap();
-            let parsed =
-                PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, index.entries.len()).unwrap();
+            .expect("test operation should succeed");
+            let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, index.entries.len())
+                .expect("test operation should succeed");
             assert_eq!(parsed.pack_checksum, index.pack_checksum);
             assert_eq!(parsed.entries.len(), 1);
             assert_eq!(
-                parsed.entries[0].bitmap.to_positions().unwrap().len(),
+                parsed.entries[0]
+                    .bitmap
+                    .to_positions()
+                    .expect("test operation should succeed")
+                    .len(),
                 index.entries.len()
             );
-        })();
+        };
         let _ = fs::remove_dir_all(&root);
-        result
     }
 }

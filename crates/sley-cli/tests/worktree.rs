@@ -197,7 +197,7 @@ fn prepare_worktree_add_contents(repo: &Path) {
 fn worktree_list_matches_upstream_git() {
     let root = unique_temp_dir("worktree-list");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let repo = root.join("repo");
         let linked = root.join("linked");
         fs::create_dir_all(&repo).expect("create repo");
@@ -222,16 +222,15 @@ fn worktree_list_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_list_detached_head_matches_upstream_git() {
     let root = unique_temp_dir("worktree-list-detached");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let repo = root.join("repo");
         fs::create_dir_all(&repo).expect("create repo");
         run_success("git", &repo, &["init", "-q"]);
@@ -246,16 +245,15 @@ fn worktree_list_detached_head_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
     let root = unique_temp_dir("worktree-add");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream_area = root.join("upstream-area");
         let actual_area = root.join("actual-area");
         let upstream = upstream_area.join("repo");
@@ -407,16 +405,15 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
             .stdout,
             run("git", &upstream_topic, &["status", "--short"]).stdout
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_add_sha256_branch_matches_upstream_git() {
     let root = unique_temp_dir("worktree-add-sha256");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream_area = root.join("upstream-area");
         let actual_area = root.join("actual-area");
         let upstream = upstream_area.join("repo");
@@ -452,16 +449,15 @@ fn worktree_add_sha256_branch_matches_upstream_git() {
             let actual = run("git", &actual_topic, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn sha256_linked_worktree_commands_use_common_git_dir() {
     let root = unique_temp_dir("worktree-sha256-common-dir");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream_area = root.join("upstream-area");
         let actual_area = root.join("actual-area");
         let upstream = upstream_area.join("repo");
@@ -637,16 +633,15 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
                 .is_file(),
             "update-ref from linked worktree should create shared branch reflog in the common git dir"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_add_error_paths_match_upstream_git() {
     let root = unique_temp_dir("worktree-add-errors");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream_area = root.join("upstream-area");
         let actual_area = root.join("actual-area");
         let upstream = upstream_area.join("repo");
@@ -669,16 +664,15 @@ fn worktree_add_error_paths_match_upstream_git() {
                 &upstream_area,
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_stale_list_and_prune_match_upstream_git() {
     let root = unique_temp_dir("worktree-stale");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let repo = root.join("repo");
         let linked = root.join("linked");
         prepare_repo_with_stale_linked_worktree(&repo, &linked);
@@ -697,16 +691,15 @@ fn worktree_stale_list_and_prune_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_prune_removes_stale_admin_dirs_like_upstream_git() {
     let root = unique_temp_dir("worktree-prune");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -722,16 +715,15 @@ fn worktree_prune_removes_stale_admin_dirs_like_upstream_git() {
             !actual.join(".git/worktrees/linked").exists(),
             "stale worktree admin dir should be removed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_lock_unlock_and_list_match_upstream_git() {
     let root = unique_temp_dir("worktree-lock");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -767,16 +759,15 @@ fn worktree_lock_unlock_and_list_match_upstream_git() {
                 &root.join("upstream"),
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_prune_skips_locked_stale_worktrees_like_upstream_git() {
     let root = unique_temp_dir("worktree-prune-locked");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -811,16 +802,15 @@ fn worktree_prune_skips_locked_stale_worktrees_like_upstream_git() {
                 &root.join("upstream"),
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_remove_clean_and_error_paths_match_upstream_git() {
     let root = unique_temp_dir("worktree-remove");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -867,16 +857,15 @@ fn worktree_remove_clean_and_error_paths_match_upstream_git() {
                 &root.join("upstream-errors"),
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
     let root = unique_temp_dir("worktree-remove-force");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -960,16 +949,15 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
             !actual_locked.exists(),
             "double-forced locked worktree should be removed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
     let root = unique_temp_dir("worktree-move");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -1048,16 +1036,15 @@ fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
             root.join("actual-dir/destination/linked").exists(),
             "directory destination should receive source basename"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_move_locked_and_error_paths_match_upstream_git() {
     let root = unique_temp_dir("worktree-move-errors");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -1120,16 +1107,15 @@ fn worktree_move_locked_and_error_paths_match_upstream_git() {
                 &root.join("upstream-errors"),
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_repair_updates_moved_worktree_metadata_like_upstream_git() {
     let root = unique_temp_dir("worktree-repair");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let upstream_moved = root.join("upstream/moved");
@@ -1184,16 +1170,15 @@ fn worktree_repair_updates_moved_worktree_metadata_like_upstream_git() {
             &root.join("actual-noarg"),
             &root.join("upstream-noarg"),
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn worktree_repair_error_paths_match_upstream_git() {
     let root = unique_temp_dir("worktree-repair-errors");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream = root.join("upstream/repo");
         let upstream_linked = root.join("upstream/linked");
         let actual = root.join("actual/repo");
@@ -1215,7 +1200,6 @@ fn worktree_repair_error_paths_match_upstream_git() {
                 &root.join("upstream"),
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

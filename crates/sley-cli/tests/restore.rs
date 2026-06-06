@@ -100,7 +100,7 @@ fn restore_worktree_paths_from_index_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -131,9 +131,8 @@ fn restore_worktree_paths_from_index_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -143,7 +142,7 @@ fn restore_sha256_worktree_and_staged_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_sha256_repo(&upstream);
         prepare_sha256_repo(&rust);
 
@@ -169,9 +168,8 @@ fn restore_sha256_worktree_and_staged_paths_match_upstream_git() {
             let actual = run_output("git", &rust, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -181,7 +179,7 @@ fn restore_sha256_source_staged_and_worktree_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_sha256_repo(&upstream);
         prepare_sha256_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -216,9 +214,8 @@ fn restore_sha256_source_staged_and_worktree_paths_match_upstream_git() {
             let actual = run_output("git", &rust, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -228,7 +225,7 @@ fn restore_pathspec_from_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -250,9 +247,8 @@ fn restore_pathspec_from_file_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --pathspec-from-file"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -262,7 +258,7 @@ fn restore_pathspec_file_nul_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -289,9 +285,8 @@ fn restore_pathspec_file_nul_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --pathspec-file-nul"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -301,7 +296,7 @@ fn restore_pathspec_file_option_errors_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -328,9 +323,8 @@ fn restore_pathspec_file_option_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
             assert_same_output(actual, expected, args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -340,7 +334,7 @@ fn restore_accepted_noop_options_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -372,9 +366,8 @@ fn restore_accepted_noop_options_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore accepted no-op options"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -384,7 +377,7 @@ fn restore_staged_paths_from_head_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -423,9 +416,8 @@ fn restore_staged_paths_from_head_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --staged"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -435,7 +427,7 @@ fn restore_source_head_worktree_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -471,9 +463,8 @@ fn restore_source_head_worktree_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --source=HEAD"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -483,7 +474,7 @@ fn restore_source_commit_worktree_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -532,9 +523,8 @@ fn restore_source_commit_worktree_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --source=<commit>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -544,7 +534,7 @@ fn restore_source_commit_staged_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -594,9 +584,8 @@ fn restore_source_commit_staged_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --source=<commit> --staged"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -606,7 +595,7 @@ fn restore_source_commit_staged_and_worktree_paths_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -656,9 +645,8 @@ fn restore_source_commit_staged_and_worktree_paths_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --source=<commit> --staged --worktree"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -668,7 +656,7 @@ fn restore_staged_and_worktree_paths_from_head_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -708,7 +696,6 @@ fn restore_staged_and_worktree_paths_from_head_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after restore --staged --worktree"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

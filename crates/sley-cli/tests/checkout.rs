@@ -120,7 +120,7 @@ fn checkout_branch_creation_and_quiet_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         let base_oid = prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -173,9 +173,8 @@ fn checkout_branch_creation_and_quiet_match_upstream_git() {
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -185,7 +184,7 @@ fn switch_branch_creation_and_force_create_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         let base_oid = prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -235,7 +234,6 @@ fn switch_branch_creation_and_force_create_match_upstream_git() {
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

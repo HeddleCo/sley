@@ -115,19 +115,29 @@ fn assert_same(cwd: &Path, args: &[&str]) {
 fn build_repo(name: &str) -> PathBuf {
     let root = unique_temp_dir(name);
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
 
-    fs::write(repo.join("a.txt"), "hello\nworld\n").unwrap();
+    fs::write(repo.join("a.txt"), "hello\nworld\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "a.txt"]);
     git_ok(&repo, &["commit", "-qm", "first commit\n\nbody line"]);
 
-    fs::write(repo.join("a.txt"), "hello\nthere\n").unwrap();
-    fs::write(repo.join("b.txt"), "new file\n").unwrap();
+    fs::write(repo.join("a.txt"), "hello\nthere\n").expect("test operation should succeed");
+    fs::write(repo.join("b.txt"), "new file\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "second"]);
 
-    fs::create_dir_all(repo.join("sub")).unwrap();
-    fs::write(repo.join("sub").join("nested.txt"), "deep\n").unwrap();
+    fs::create_dir_all(repo.join("sub")).expect("test operation should succeed");
+    fs::write(repo.join("sub").join("nested.txt"), "deep\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "add subdir"]);
 
@@ -137,11 +147,11 @@ fn build_repo(name: &str) -> PathBuf {
     // Side branch + no-ff merge so we exercise a merge commit (Merge: line, no
     // patch by default).
     git_ok(&repo, &["checkout", "-q", "-b", "feature"]);
-    fs::write(repo.join("feat.txt"), "feature\n").unwrap();
+    fs::write(repo.join("feat.txt"), "feature\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "feature work"]);
     git_ok(&repo, &["checkout", "-q", "main"]);
-    fs::write(repo.join("c.txt"), "mainline\n").unwrap();
+    fs::write(repo.join("c.txt"), "mainline\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "mainline work"]);
     git_ok(
@@ -169,7 +179,7 @@ fn show_commit_default_matches_git() {
     assert_same(&repo, &["show", first.as_str()]);
     assert_same(&repo, &["show", root.as_str()]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -207,7 +217,7 @@ fn show_commit_formats_match_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -235,7 +245,7 @@ fn show_commit_stat_modes_match_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -267,7 +277,7 @@ fn show_merge_commit_matches_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -297,7 +307,7 @@ fn show_tag_tree_blob_match_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -323,7 +333,7 @@ fn show_multiple_objects_match_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -336,7 +346,7 @@ fn show_unknown_revision_matches_git() {
     // Unknown revision: identical fatal stderr and exit 128.
     assert_same(&repo, &["show", "no-such-rev"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 /// Ref decorations: off by default, on with `--decorate`/`--decorate=full`, and
@@ -364,7 +374,7 @@ fn show_decorations_match_git() {
         assert_same(&repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 /// A dedicated linear repo exercising deletions, nested-tree `<rev>:<path>`, the
@@ -376,14 +386,24 @@ fn show_deletions_nested_and_body_match_git() {
     }
     let root = unique_temp_dir("show-misc");
     let repo = root.join("repo");
-    git_ok(&root, &["init", "-q", "-b", "main", repo.to_str().unwrap()]);
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            "-b",
+            "main",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
 
-    std::fs::create_dir_all(repo.join("dir").join("sub")).unwrap();
-    std::fs::write(repo.join("dir").join("sub").join("deep.txt"), "x\ny\n").unwrap();
-    std::fs::write(repo.join("keep.txt"), "k\n").unwrap();
+    std::fs::create_dir_all(repo.join("dir").join("sub")).expect("test operation should succeed");
+    std::fs::write(repo.join("dir").join("sub").join("deep.txt"), "x\ny\n")
+        .expect("test operation should succeed");
+    std::fs::write(repo.join("keep.txt"), "k\n").expect("test operation should succeed");
     // A filename with a space exercises path handling in the tree listing and
     // patch headers.
-    std::fs::write(repo.join("with space.txt"), "spaced\n").unwrap();
+    std::fs::write(repo.join("with space.txt"), "spaced\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(
         &repo,

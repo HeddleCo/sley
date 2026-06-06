@@ -7,25 +7,13 @@ use std::io::Write;
 const TAR_BLOCK_SIZE: usize = 512;
 const TAR_RECORD_SIZE: usize = 10 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TarArchiveOptions {
     pub prefix: Vec<u8>,
     pub strip_prefix: Vec<u8>,
     pub mtime: u64,
     pub commit_id: Option<ObjectId>,
     pub pathspecs: Vec<Vec<u8>>,
-}
-
-impl Default for TarArchiveOptions {
-    fn default() -> Self {
-        Self {
-            prefix: Vec::new(),
-            strip_prefix: Vec::new(),
-            mtime: 0,
-            commit_id: None,
-            pathspecs: Vec::new(),
-        }
-    }
 }
 
 pub fn write_tar_archive<R, W>(
@@ -71,16 +59,19 @@ where
         write_directory_entry(&mut writer, &prefix, options.mtime)?;
         emitted_directories.insert(prefix.clone());
     }
-    write_tree_entries(
-        &mut writer,
+    let context = ArchiveWriteContext {
         reader,
         format,
+        prefix: &prefix,
+        strip_prefix: &strip_prefix,
+        mtime: options.mtime,
+        pathspecs: &pathspecs,
+    };
+    write_tree_entries(
+        &mut writer,
+        &context,
         tree_oid,
         b"",
-        &prefix,
-        &strip_prefix,
-        options.mtime,
-        &pathspecs,
         false,
         &mut matched,
         &mut emitted_directories,
@@ -150,16 +141,20 @@ where
     Ok(())
 }
 
+struct ArchiveWriteContext<'a, R> {
+    reader: &'a R,
+    format: ObjectFormat,
+    prefix: &'a [u8],
+    strip_prefix: &'a [u8],
+    mtime: u64,
+    pathspecs: &'a [Vec<u8>],
+}
+
 fn write_tree_entries<R, W>(
     writer: &mut W,
-    reader: &R,
-    format: ObjectFormat,
+    context: &ArchiveWriteContext<'_, R>,
     tree_oid: &ObjectId,
     relative_prefix: &[u8],
-    prefix: &[u8],
-    strip_prefix: &[u8],
-    mtime: u64,
-    pathspecs: &[Vec<u8>],
     force_include: bool,
     matched: &mut [bool],
     emitted_directories: &mut HashSet<Vec<u8>>,
@@ -168,14 +163,14 @@ where
     R: ObjectReader,
     W: Write,
 {
-    let object = reader.read_object(tree_oid)?;
+    let object = context.reader.read_object(tree_oid)?;
     if object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(
             "expected tree {tree_oid}, found {}",
             object.object_type.as_str()
         )));
     }
-    for entry in TreeEntries::new(format, &object.body) {
+    for entry in TreeEntries::new(context.format, &object.body) {
         let entry = entry?;
         let relative_path = join_path(relative_prefix, entry.name);
         match tree_entry_object_type(entry.mode) {
@@ -186,47 +181,45 @@ where
                         full_subtree: true,
                     }
                 } else {
-                    archive_tree_selection(&relative_path, pathspecs)
+                    archive_tree_selection(&relative_path, context.pathspecs)
                 };
                 if !selection.descend {
                     continue;
                 }
                 if let Some(output_relative_path) =
-                    strip_archive_prefix(&relative_path, strip_prefix)
+                    strip_archive_prefix(&relative_path, context.strip_prefix)
                     && !output_relative_path.is_empty()
                 {
-                    let directory = ensure_trailing_slash(&join_path(prefix, output_relative_path));
+                    let directory =
+                        ensure_trailing_slash(&join_path(context.prefix, output_relative_path));
                     if emitted_directories.insert(directory.clone()) {
-                        write_directory_entry(writer, &directory, mtime)?;
+                        write_directory_entry(writer, &directory, context.mtime)?;
                     }
                 }
-                mark_exact_pathspec_matches(&relative_path, pathspecs, matched);
+                mark_exact_pathspec_matches(&relative_path, context.pathspecs, matched);
                 let relative_directory = ensure_trailing_slash(&relative_path);
                 write_tree_entries(
                     writer,
-                    reader,
-                    format,
+                    context,
                     &entry.oid,
                     &relative_directory,
-                    prefix,
-                    strip_prefix,
-                    mtime,
-                    pathspecs,
                     force_include || selection.full_subtree,
                     matched,
                     emitted_directories,
                 )?;
             }
             ObjectType::Blob => {
-                if !archive_blob_selected(&relative_path, pathspecs, force_include, matched) {
+                if !archive_blob_selected(&relative_path, context.pathspecs, force_include, matched)
+                {
                     continue;
                 }
-                let Some(output_relative_path) = strip_archive_prefix(&relative_path, strip_prefix)
+                let Some(output_relative_path) =
+                    strip_archive_prefix(&relative_path, context.strip_prefix)
                 else {
                     continue;
                 };
-                let path = join_path(prefix, output_relative_path);
-                let object = reader.read_object(&entry.oid)?;
+                let path = join_path(context.prefix, output_relative_path);
+                let object = context.reader.read_object(&entry.oid)?;
                 if object.object_type != ObjectType::Blob {
                     return Err(GitError::InvalidObject(format!(
                         "expected blob {}, found {}",
@@ -235,14 +228,14 @@ where
                     )));
                 }
                 if entry.mode == 0o120000 {
-                    write_symlink_entry(writer, &path, &object.body, mtime)?;
+                    write_symlink_entry(writer, &path, &object.body, context.mtime)?;
                 } else {
                     let mode = if entry.mode & 0o111 != 0 {
                         0o775
                     } else {
                         0o664
                     };
-                    write_file_entry(writer, &path, mode, &object.body, mtime)?;
+                    write_file_entry(writer, &path, mode, &object.body, context.mtime)?;
                 }
             }
             _ => {
@@ -578,13 +571,13 @@ mod tests {
         let mut db = ObjectDatabase::new(format);
         let regular = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n"))
-            .unwrap();
+            .expect("test operation should succeed");
         let executable = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"#!/bin/sh\n"))
-            .unwrap();
+            .expect("test operation should succeed");
         let symlink = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"regular.txt"))
-            .unwrap();
+            .expect("test operation should succeed");
         let tree = Tree {
             entries: vec![
                 sley_object::TreeEntry {
@@ -606,7 +599,7 @@ mod tests {
         };
         let tree_oid = db
             .write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         let mut archive = Vec::new();
         write_tar_archive(
             &mut archive,
@@ -621,7 +614,7 @@ mod tests {
                 pathspecs: Vec::new(),
             },
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert!(archive.starts_with(b"pfx/"));
         assert_eq!(archive.len() % TAR_RECORD_SIZE, 0);
         assert!(

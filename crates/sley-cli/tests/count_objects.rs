@@ -74,7 +74,7 @@ fn count_objects_git_object_directory_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         run("git", &expected, &["init", "-q"]);
         run("git", &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
@@ -99,16 +99,15 @@ fn count_objects_git_object_directory_matches_upstream_git() {
                 run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn count_objects_matches_upstream_git_for_loose_objects() {
     let root = unique_temp_dir("count-objects");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
@@ -133,16 +132,15 @@ fn count_objects_matches_upstream_git_for_loose_objects() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn count_objects_matches_upstream_git_for_packed_objects() {
     let root = unique_temp_dir("count-objects-packed");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
@@ -175,16 +173,15 @@ fn count_objects_matches_upstream_git_for_packed_objects() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn count_objects_prune_packable_and_garbage_match_upstream_git() {
     let root = unique_temp_dir("count-objects-prune-garbage");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         let hash_output = git(&root, &["hash-object", "-w", "one.txt"]);
@@ -223,9 +220,8 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -235,7 +231,7 @@ fn count_objects_verbose_lists_alternates_like_upstream_git() {
     let alternate = root.join("alternate");
     fs::create_dir_all(&repo).expect("create repo");
     fs::create_dir_all(&alternate).expect("create alternate repo");
-    let result = (|| {
+    {
         run("git", &alternate, &["init", "-q"]);
         fs::write(alternate.join("alt.txt"), b"alt\n").expect("write alternate object");
         run("git", &alternate, &["hash-object", "-w", "alt.txt"]);
@@ -255,7 +251,6 @@ fn count_objects_verbose_lists_alternates_like_upstream_git() {
             let actual = git_rs(&repo, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

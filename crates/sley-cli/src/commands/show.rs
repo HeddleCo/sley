@@ -90,6 +90,22 @@ struct ShowOptions {
     specs: Vec<String>,
 }
 
+struct ShowContext<'a> {
+    git_dir: &'a Path,
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
+    config: &'a GitConfig,
+    options: &'a ShowOptions,
+    decorations: &'a HashMap<ObjectId, Vec<String>>,
+}
+
+struct CommitTrailerLayout {
+    text_self_terminated: bool,
+    blank_before_diff: bool,
+    separator_mode: bool,
+    is_merge: bool,
+}
+
 impl Default for ShowOptions {
     fn default() -> Self {
         Self {
@@ -185,24 +201,20 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 
     let mut shown_one = false;
     let mut stdout = io::stdout();
+    let context = ShowContext {
+        git_dir,
+        db,
+        format,
+        config,
+        options: &options,
+        decorations: &decorations,
+    };
     for spec in &specs {
         let oid = match repo.resolve_revision(spec) {
             Ok(oid) => oid,
             Err(_) => return show_unknown_revision(spec),
         };
-        show_object(
-            &mut stdout,
-            git_dir,
-            db,
-            format,
-            config,
-            &options,
-            &decorations,
-            spec,
-            &oid,
-            &mut shown_one,
-            false,
-        )?;
+        show_object(&mut stdout, &context, spec, &oid, &mut shown_one, false)?;
     }
     stdout.flush()?;
     Ok(())
@@ -216,60 +228,30 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
 /// the inter-entry blank-line separator is inserted only before the second and
 /// later such entries. `suppress_separator` is `true` when this object is the
 /// immediate target of an annotated tag, whose block has already emitted the gap.
-#[allow(clippy::too_many_arguments)]
 fn show_object(
     stdout: &mut io::Stdout,
-    git_dir: &Path,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    config: &GitConfig,
-    options: &ShowOptions,
-    decorations: &HashMap<ObjectId, Vec<String>>,
+    context: &ShowContext<'_>,
     name: &str,
     oid: &ObjectId,
     shown_one: &mut bool,
     suppress_separator: bool,
 ) -> Result<()> {
-    let object = db.read_object(oid)?;
+    let object = context.db.read_object(oid)?;
     match object.object_type {
         ObjectType::Commit => {
-            let commit = Commit::parse(format, &object.body)?;
-            show_commit(
-                stdout,
-                git_dir,
-                db,
-                format,
-                config,
-                options,
-                decorations,
-                oid,
-                &commit,
-                shown_one,
-                suppress_separator,
-            )
+            let commit = Commit::parse(context.format, &object.body)?;
+            show_commit(stdout, context, oid, &commit, shown_one, suppress_separator)
         }
         ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
+            let tag = Tag::parse(context.format, &object.body)?;
             show_tag_header(stdout, &tag, shown_one, suppress_separator)?;
             // Recurse into the tagged object, threading the *same* display name
             // through (git keeps `obj->name` from the original argument). The tag
             // block already supplied the gap line, so the target must not add its
             // own leading separator.
-            show_object(
-                stdout,
-                git_dir,
-                db,
-                format,
-                config,
-                options,
-                decorations,
-                name,
-                &tag.object,
-                shown_one,
-                true,
-            )
+            show_object(stdout, context, name, &tag.object, shown_one, true)
         }
-        ObjectType::Tree => show_tree(stdout, format, name, &object.body),
+        ObjectType::Tree => show_tree(stdout, context.format, name, &object.body),
         ObjectType::Blob => {
             stdout.write_all(&object.body)?;
             Ok(())
@@ -291,20 +273,16 @@ fn show_object(
 /// `--diff-merges=off`, show no patch — but the format still emits the trailing
 /// gap as if a diff had run. `suppress_separator` is set when this commit is the
 /// immediate target of an annotated tag, whose block already supplied the gap.
-#[allow(clippy::too_many_arguments)]
 fn show_commit(
     stdout: &mut io::Stdout,
-    git_dir: &Path,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    config: &GitConfig,
-    options: &ShowOptions,
-    decorations: &HashMap<ObjectId, Vec<String>>,
+    context: &ShowContext<'_>,
     oid: &ObjectId,
     commit: &Commit,
     shown_one: &mut bool,
     suppress_separator: bool,
 ) -> Result<()> {
+    let options = context.options;
+    let decorations = context.decorations;
     let record = sley_rev::CommitRecord {
         oid: oid.clone(),
         parents: commit.parents.clone(),
@@ -411,19 +389,17 @@ fn show_commit(
     // `git show`, which defaults to a diff). The first-parent diff (empty-tree for
     // a root) is computed for merges too, because git's default renders the stat
     // family for them even though the patch/raw/name listings are suppressed.
-    let entries = commit_diff_entries(db, format, options, commit)?;
+    let entries = commit_diff_entries(context.db, context.format, options, commit)?;
 
     write_commit_trailer(
         stdout,
-        git_dir,
-        db,
-        format,
-        config,
-        options,
-        text_self_terminated,
-        blank_before_diff,
-        separator_mode,
-        is_merge,
+        context,
+        CommitTrailerLayout {
+            text_self_terminated,
+            blank_before_diff,
+            separator_mode,
+            is_merge,
+        },
         &entries,
     )
 }
@@ -435,53 +411,54 @@ fn show_commit(
 /// `is_merge` selects git's merge handling, where the default `--diff-merges=off`
 /// suppresses the patch / raw / name listings but still renders the `--stat`
 /// family against the first parent.
-#[allow(clippy::too_many_arguments)]
 fn write_commit_trailer(
     stdout: &mut io::Stdout,
-    git_dir: &Path,
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    config: &GitConfig,
-    options: &ShowOptions,
-    text_self_terminated: bool,
-    blank_before_diff: bool,
-    separator_mode: bool,
-    is_merge: bool,
+    context: &ShowContext<'_>,
+    layout: CommitTrailerLayout,
     entries: &[sley_diff_merge::NameStatusEntry],
 ) -> Result<()> {
+    let options = context.options;
     let diff_active = options.diff_mode != ShowDiffMode::None;
     // For a merge, only the stat family renders; for an ordinary commit every
     // mode renders when there are changes.
-    let body_renders = if is_merge {
+    let body_renders = if layout.is_merge {
         diff_active && merge_renders_stat(options) && !entries.is_empty()
     } else {
         diff_active && !entries.is_empty()
     };
     // `--pretty=format:` is the only mode that leaves its text line unterminated
     // when no diff follows.
-    let format_unterminated = !text_self_terminated && separator_mode;
+    let format_unterminated = !layout.text_self_terminated && layout.separator_mode;
 
     if body_renders {
         // Close the commit-text line if the format left it open, then, for the
         // formats that use one, add the blank line separating message from diff.
-        if !text_self_terminated {
+        if !layout.text_self_terminated {
             writeln!(stdout)?;
         }
-        if blank_before_diff {
+        if layout.blank_before_diff {
             writeln!(stdout)?;
         }
-        return if is_merge {
-            write_merge_stat(stdout, db, config, options, entries)
+        return if layout.is_merge {
+            write_merge_stat(stdout, context.db, context.config, options, entries)
         } else {
-            write_commit_diff(stdout, git_dir, db, format, config, options, entries)
+            write_commit_diff(
+                stdout,
+                context.git_dir,
+                context.db,
+                context.format,
+                context.config,
+                options,
+                entries,
+            )
         };
     }
 
     // No diff body. A merge whose diff is active still prints the trailing gap as
     // if a diff had run: a blank line for every format except `--pretty=format:`,
     // which only closes its text line.
-    if is_merge && diff_active {
-        if !text_self_terminated {
+    if layout.is_merge && diff_active {
+        if !layout.text_self_terminated {
             writeln!(stdout)?;
         }
         if !format_unterminated {
@@ -493,7 +470,7 @@ fn write_commit_trailer(
     // Otherwise there is nothing after the text. Terminator-mode formats whose
     // text was left open (`--format=`) still need a closing newline; medium and
     // oneline already ended their line, and `--pretty=format:` keeps none.
-    if !text_self_terminated && !separator_mode {
+    if !layout.text_self_terminated && !layout.separator_mode {
         writeln!(stdout)?;
     }
     Ok(())

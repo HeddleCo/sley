@@ -1781,8 +1781,9 @@ mod tests {
 
     #[test]
     fn reftable_empty_table_round_trips() {
-        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 1, 1, &[]).unwrap();
-        let table = Reftable::parse(&bytes).unwrap();
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 1, 1, &[])
+            .expect("test operation should succeed");
+        let table = Reftable::parse(&bytes).expect("test operation should succeed");
 
         assert_eq!(table.header.version, ReftableVersion::V1);
         assert_eq!(table.header.object_format, ObjectFormat::Sha1);
@@ -1815,8 +1816,9 @@ mod tests {
             },
         ];
 
-        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 7, 7, &refs).unwrap();
-        let table = Reftable::parse(&bytes).unwrap();
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha1, 7, 7, &refs)
+            .expect("test operation should succeed");
+        let table = Reftable::parse(&bytes).expect("test operation should succeed");
 
         assert_eq!(table.header.min_update_index, 7);
         assert_eq!(table.header.max_update_index, 7);
@@ -1851,15 +1853,16 @@ mod tests {
             ObjectFormat::Sha256,
             "1111111111111111111111111111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let refs = vec![ReftableRefRecord {
             name: "refs/heads/main".into(),
             update_index: 3,
             value: ReftableRefValue::Direct(oid.clone()),
         }];
 
-        let bytes = Reftable::write_ref_only(ObjectFormat::Sha256, 3, 3, &refs).unwrap();
-        let table = Reftable::parse(&bytes).unwrap();
+        let bytes = Reftable::write_ref_only(ObjectFormat::Sha256, 3, 3, &refs)
+            .expect("test operation should succeed");
+        let table = Reftable::parse(&bytes).expect("test operation should succeed");
 
         assert_eq!(table.header.version, ReftableVersion::V2);
         assert_eq!(table.header.object_format, ObjectFormat::Sha256);
@@ -1870,7 +1873,7 @@ mod tests {
     fn upstream_git_reads_rust_written_minimal_reftable() {
         let root = unique_temp_dir("reftable-upstream");
         fs::create_dir_all(&root).expect("create temp repo");
-        let result = (|| {
+        {
             run_success("git", &root, &["init", "-q"]);
             let oid = run_success_with_stdin(
                 "git",
@@ -1879,7 +1882,8 @@ mod tests {
                 b"payload\n",
             );
             let oid = String::from_utf8(oid).expect("oid is utf8");
-            let oid = ObjectId::from_hex(ObjectFormat::Sha1, oid.trim()).unwrap();
+            let oid = ObjectId::from_hex(ObjectFormat::Sha1, oid.trim())
+                .expect("test operation should succeed");
             let git_dir = root.join(".git");
             fs::write(
                 git_dir.join("config"),
@@ -1900,7 +1904,7 @@ mod tests {
                     value: ReftableRefValue::Direct(oid.clone()),
                 }],
             )
-            .unwrap();
+            .expect("test operation should succeed");
             fs::write(reftable_dir.join(table_name), table).expect("write reftable");
             fs::write(reftable_dir.join("tables.list"), format!("{table_name}\n"))
                 .expect("write tables.list");
@@ -1910,11 +1914,9 @@ mod tests {
                 String::from_utf8(output).expect("show-ref output is utf8"),
                 format!("{oid} refs/heads/main\n")
             );
-        })();
+        };
         let _ = fs::remove_dir_all(&root);
-        result
     }
-
 
     #[test]
     fn parses_commit_graph_core_chunks() {
@@ -1951,12 +1953,15 @@ mod tests {
         ];
         let bytes = commit_graph(ObjectFormat::Sha1, 0, &commit_graph_chunks(&commits));
 
-        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.version, 1);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert_eq!(parsed.base_graph_count, 0);
         assert_eq!(parsed.commits.len(), 4);
-        let merge = parsed.find(&commits[3].0).unwrap();
+        let merge = parsed
+            .find(&commits[3].0)
+            .expect("test operation should succeed");
         assert_eq!(merge.parents, vec![0, 1, 2]);
         assert_eq!(merge.generation, 4);
         assert_eq!(merge.commit_time, 0x1_0000_0001);
@@ -2006,16 +2011,53 @@ mod tests {
                 },
             ],
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
-        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.commits.len(), 4);
-        assert_eq!(parsed.find(&base).unwrap().parents, Vec::<u32>::new());
-        assert_eq!(parsed.find(&main).unwrap().parents, vec![0]);
-        assert_eq!(parsed.find(&side).unwrap().parents, vec![0]);
-        assert_eq!(parsed.find(&merge).unwrap().parents, vec![1, 2]);
-        assert_eq!(parsed.find(&merge).unwrap().generation, 3);
-        assert_eq!(parsed.find(&merge).unwrap().commit_time, 30);
+        assert_eq!(
+            parsed
+                .find(&base)
+                .expect("test operation should succeed")
+                .parents,
+            Vec::<u32>::new()
+        );
+        assert_eq!(
+            parsed
+                .find(&main)
+                .expect("test operation should succeed")
+                .parents,
+            vec![0]
+        );
+        assert_eq!(
+            parsed
+                .find(&side)
+                .expect("test operation should succeed")
+                .parents,
+            vec![0]
+        );
+        assert_eq!(
+            parsed
+                .find(&merge)
+                .expect("test operation should succeed")
+                .parents,
+            vec![1, 2]
+        );
+        assert_eq!(
+            parsed
+                .find(&merge)
+                .expect("test operation should succeed")
+                .generation,
+            3
+        );
+        assert_eq!(
+            parsed
+                .find(&merge)
+                .expect("test operation should succeed")
+                .commit_time,
+            30
+        );
     }
 
     #[test]
@@ -2042,7 +2084,8 @@ mod tests {
         chunks.push((*b"BDAT", commit_graph_bdat(2, 7, 10, &[0xaa, 0xbb, 0xcc])));
         let bytes = commit_graph(ObjectFormat::Sha1, 0, &chunks);
 
-        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(
             parsed.bloom_filters,
             Some(CommitGraphBloomFilters {
@@ -2078,7 +2121,8 @@ mod tests {
         chunks.push((*b"GDO2", commit_graph_gdo2(&[0x1_0000_0007])));
         let bytes = commit_graph(ObjectFormat::Sha1, 0, &chunks);
 
-        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.commits[0].corrected_commit_date_offset, Some(7));
         assert_eq!(
             parsed.commits[1].corrected_commit_date_offset,
@@ -2100,7 +2144,8 @@ mod tests {
         chunks.push((*b"BASE", base_graph.as_bytes().to_vec()));
         let bytes = commit_graph(ObjectFormat::Sha1, 1, &chunks);
 
-        let parsed = CommitGraph::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            CommitGraph::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.base_graph_count, 1);
         assert_eq!(parsed.base_graphs, vec![base_graph]);
     }
@@ -2137,7 +2182,7 @@ mod tests {
             &[
                 (*b"OIDF", vec![0; 256 * 4]),
                 (*b"OIDL", commit.0.as_bytes().to_vec()),
-                (*b"CDAT", commit_graph_cdat(&[commit.clone()]).0),
+                (*b"CDAT", commit_graph_cdat(std::slice::from_ref(&commit)).0),
             ],
         );
         assert!(CommitGraph::parse(&bad_fanout, ObjectFormat::Sha1).is_err());
@@ -2218,7 +2263,7 @@ mod tests {
         let bidx_without_bdat = commit_graph(ObjectFormat::Sha1, 0, &bidx_without_bdat);
         assert_eq!(
             CommitGraph::parse(&bidx_without_bdat, ObjectFormat::Sha1)
-                .unwrap()
+                .expect("test operation should succeed")
                 .bloom_filters,
             None
         );
@@ -2253,7 +2298,6 @@ mod tests {
         assert!(CommitGraph::parse(&trailing_payload, ObjectFormat::Sha1).is_err());
     }
 
-
     #[test]
     fn parses_bundle_v2_header_and_pack() {
         let prerequisite = oid("1111111111111111111111111111111111111111");
@@ -2266,7 +2310,8 @@ mod tests {
         .chain(b"PACKdata".iter().copied())
         .collect::<Vec<_>>();
 
-        let parsed = Bundle::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            Bundle::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.version, 2);
         assert_eq!(parsed.format, ObjectFormat::Sha1);
         assert!(parsed.capabilities.is_empty());
@@ -2293,18 +2338,19 @@ mod tests {
             ObjectFormat::Sha256,
             "1111111111111111111111111111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let reference = ObjectId::from_hex(
             ObjectFormat::Sha256,
             "2222222222222222222222222222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let bytes = format!(
             "# v3 git bundle\n@object-format=sha256\n@filter=blob:none\n-{prerequisite} base\n{reference} refs/heads/main\n\n"
         )
         .into_bytes();
 
-        let parsed = Bundle::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            Bundle::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.format, ObjectFormat::Sha256);
         assert_eq!(
@@ -2326,28 +2372,32 @@ mod tests {
 
     #[test]
     fn standalone_bundle_parse_uses_sha1_default_and_header_object_format_override() {
-        let sha1 = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n").unwrap();
-        let sha256 = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n").unwrap();
+        let sha1 = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n")
+            .expect("test operation should succeed");
+        let sha256 = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n")
+            .expect("test operation should succeed");
 
         let sha1_bytes = format!("# v2 git bundle\n{sha1} refs/heads/main\n\nPACK").into_bytes();
-        let sha1_bundle = Bundle::parse_standalone(&sha1_bytes).unwrap();
+        let sha1_bundle =
+            Bundle::parse_standalone(&sha1_bytes).expect("test operation should succeed");
         assert_eq!(sha1_bundle.format, ObjectFormat::Sha1);
         assert_eq!(sha1_bundle.references[0].oid, sha1);
 
         let sha256_bytes =
             format!("# v3 git bundle\n@object-format=sha256\n{sha256} refs/heads/main\n\nPACK")
                 .into_bytes();
-        let sha256_bundle = Bundle::parse_standalone(&sha256_bytes).unwrap();
+        let sha256_bundle =
+            Bundle::parse_standalone(&sha256_bytes).expect("test operation should succeed");
         assert_eq!(sha256_bundle.format, ObjectFormat::Sha256);
         assert_eq!(sha256_bundle.references[0].oid, sha256);
     }
 
     #[test]
     fn writes_bundle_v2_header_and_pack() {
-        let prerequisite =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"base\n").unwrap();
-        let reference =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n").unwrap();
+        let prerequisite = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"base\n")
+            .expect("test operation should succeed");
+        let reference = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n")
+            .expect("test operation should succeed");
         let bundle = Bundle {
             version: 2,
             format: ObjectFormat::Sha1,
@@ -2363,7 +2413,7 @@ mod tests {
             pack: b"PACKv2".to_vec(),
         };
 
-        let bytes = bundle.write().unwrap();
+        let bytes = bundle.write().expect("test operation should succeed");
         let expected = format!(
             "# v2 git bundle\n-{prerequisite} base comment\n{reference} refs/heads/main\n\n"
         )
@@ -2372,12 +2422,16 @@ mod tests {
         .chain(b"PACKv2".iter().copied())
         .collect::<Vec<_>>();
         assert_eq!(bytes, expected);
-        assert_eq!(Bundle::parse(&bytes, ObjectFormat::Sha1).unwrap(), bundle);
+        assert_eq!(
+            Bundle::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed"),
+            bundle
+        );
     }
 
     #[test]
     fn writes_bundle_v3_sha256_object_format_capability() {
-        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n")
+            .expect("test operation should succeed");
         let bundle = Bundle {
             version: 3,
             format: ObjectFormat::Sha256,
@@ -2393,10 +2447,11 @@ mod tests {
             pack: b"PACKv3".to_vec(),
         };
 
-        let bytes = bundle.write().unwrap();
-        let text = String::from_utf8(bytes.clone()).unwrap();
+        let bytes = bundle.write().expect("test operation should succeed");
+        let text = String::from_utf8(bytes.clone()).expect("test operation should succeed");
         assert!(text.starts_with("# v3 git bundle\n@filter=blob:none\n@object-format=sha256\n"));
-        let parsed = Bundle::parse(&bytes, ObjectFormat::Sha1).unwrap();
+        let parsed =
+            Bundle::parse(&bytes, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.format, ObjectFormat::Sha256);
         assert_eq!(parsed.references[0].oid, oid);
         assert_eq!(parsed.pack, b"PACKv3");
@@ -2404,8 +2459,10 @@ mod tests {
 
     #[test]
     fn rejects_bad_bundle_write_inputs() {
-        let sha1 = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n").unwrap();
-        let sha256 = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n").unwrap();
+        let sha1 = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"tip\n")
+            .expect("test operation should succeed");
+        let sha256 = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"tip\n")
+            .expect("test operation should succeed");
         let mut bundle = Bundle {
             version: 2,
             format: ObjectFormat::Sha1,
@@ -2481,9 +2538,8 @@ mod tests {
         );
     }
 
-
     fn oid(hex: &str) -> ObjectId {
-        ObjectId::from_hex(ObjectFormat::Sha1, hex).unwrap()
+        ObjectId::from_hex(ObjectFormat::Sha1, hex).expect("test operation should succeed")
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -2538,7 +2594,6 @@ mod tests {
         output.stdout
     }
 
-
     fn commit_graph(
         format: ObjectFormat,
         base_graph_count: u8,
@@ -2562,7 +2617,8 @@ mod tests {
         for (_id, data) in chunks {
             out.extend_from_slice(data);
         }
-        let checksum = sley_core::digest_bytes(format, &out).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
     }
@@ -2677,5 +2733,4 @@ mod tests {
         out.extend_from_slice(payload);
         out
     }
-
 }

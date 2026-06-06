@@ -86,7 +86,7 @@ fn rev_parse(cwd: &Path, rev: &str) -> String {
 fn merge_base_two_commits_matches_upstream_git() {
     let root = unique_temp_dir("merge-base");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
@@ -145,16 +145,15 @@ fn merge_base_two_commits_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn merge_base_no_common_history_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-unrelated");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let first = rev_parse(&root, "HEAD");
@@ -181,16 +180,15 @@ fn merge_base_no_common_history_matches_upstream_git() {
         let expected = git(&root, &args);
         let actual = git_rs(&root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn merge_base_fork_point_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-fork-point");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
@@ -214,7 +212,6 @@ fn merge_base_fork_point_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

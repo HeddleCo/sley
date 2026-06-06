@@ -39,7 +39,7 @@ use sley_formats::RepositoryLayout;
 use sley_refs::{FileRefStore, RefTarget, RefUpdate};
 use sley_transport::RemoteUrl;
 
-use crate::fetch::{fetch, FetchOptions, FetchSource};
+use crate::fetch::{FetchOptions, FetchSource, fetch};
 use crate::{CredentialProvider, ProgressSink};
 
 /// The unborn placeholder branch the destination is initialized on, replaced by
@@ -99,6 +99,32 @@ pub struct CloneOutcome {
     pub branch_oid: ObjectId,
 }
 
+/// Fully resolved inputs for a [`clone`] run.
+pub struct CloneRequest<'a> {
+    /// Destination worktree/repository path.
+    pub destination: &'a Path,
+    /// Destination repository object format.
+    pub format: ObjectFormat,
+    /// Already-resolved clone source.
+    pub source: &'a CloneSource,
+    /// Clone behavior and branch-tracking options.
+    pub options: &'a CloneOptions<'a>,
+}
+
+/// Mutable seams used while cloning.
+pub struct CloneServices<'a> {
+    /// Callback that writes initial repository config and returns the resulting
+    /// config snapshot used for the fetch.
+    pub configure: &'a mut dyn FnMut(&Path) -> Result<GitConfig>,
+    /// Callback that writes local branch upstream config and returns the config
+    /// snapshot used for checkout filtering.
+    pub configure_branch: &'a mut dyn FnMut(&Path, &str) -> Result<GitConfig>,
+    /// Credential source for authenticated transports.
+    pub credentials: &'a mut dyn CredentialProvider,
+    /// Progress sink for fetch progress/prune notices.
+    pub progress: &'a mut dyn ProgressSink,
+}
+
 /// Clone the resolved `source` into a fresh repository at `destination`.
 ///
 /// Performs the transport-shaped core the CLI's `clone_http_repository` and the
@@ -123,27 +149,17 @@ pub struct CloneOutcome {
 /// `GitError::Exit`. A missing `refs/remotes/<origin>/<checkout_branch>` after the
 /// fetch is reported as [`GitError::NotFound`] for the caller to map (the CLI
 /// turns an explicit `--branch` miss into its own message).
-#[allow(clippy::too_many_arguments)]
-pub fn clone(
-    destination: &Path,
-    format: ObjectFormat,
-    source: &CloneSource,
-    options: &CloneOptions,
-    configure: &mut dyn FnMut(&Path) -> Result<GitConfig>,
-    configure_branch: &mut dyn FnMut(&Path, &str) -> Result<GitConfig>,
-    credentials: &mut dyn CredentialProvider,
-    progress: &mut dyn ProgressSink,
-) -> Result<CloneOutcome> {
+pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<CloneOutcome> {
     let layout = RepositoryLayout::init_at_with_initial_branch(
-        destination,
-        format,
+        request.destination,
+        request.format,
         false,
         CLONE_UNBORN_BRANCH,
     )?;
     let git_dir = layout.git_dir;
 
-    let config = configure(&git_dir)?;
-    let fetch_source = match source {
+    let config = (services.configure)(&git_dir)?;
+    let fetch_source = match request.source {
         CloneSource::Http(remote) => FetchSource::Http(remote.clone()),
         CloneSource::Local {
             git_dir: remote_git_dir,
@@ -153,22 +169,27 @@ pub fn clone(
             common_git_dir: remote_common_git_dir.clone(),
         },
     };
+    let fetch_options = clone_fetch_options(request.options.depth);
     fetch(
-        &git_dir,
-        format,
-        &config,
-        options.origin,
-        &fetch_source,
-        &[],
-        &clone_fetch_options(options.depth),
-        credentials,
-        progress,
+        crate::fetch::FetchRequest {
+            git_dir: &git_dir,
+            format: request.format,
+            config: &config,
+            remote_name: request.options.origin,
+            source: &fetch_source,
+            refspecs: &[],
+            options: &fetch_options,
+        },
+        crate::fetch::FetchServices {
+            credentials: services.credentials,
+            progress: services.progress,
+        },
     )?;
 
-    let store = FileRefStore::new(&git_dir, format);
+    let store = FileRefStore::new(&git_dir, request.format);
     let remote_branch_ref = format!(
         "refs/remotes/{}/{}",
-        options.origin, options.checkout_branch
+        request.options.origin, request.options.checkout_branch
     );
     let branch_oid = match store.read_ref(&remote_branch_ref)? {
         Some(RefTarget::Direct(oid)) => oid,
@@ -184,12 +205,12 @@ pub fn clone(
         }
     };
     store.create_branch(
-        options.checkout_branch,
+        request.options.checkout_branch,
         branch_oid.clone(),
-        options.committer.clone(),
+        request.options.committer.clone(),
         format!(
             "branch: Created from {}/{}",
-            options.origin, options.checkout_branch
+            request.options.origin, request.options.checkout_branch
         )
         .into_bytes(),
     )?;
@@ -198,15 +219,17 @@ pub fn clone(
     // branch, point the remote `HEAD`, then read the (now final) config for the
     // smudge-side checkout filters. Pointing `HEAD` only updates refs, so it does
     // not change the config `configure_branch` returns.
-    let checkout_config = configure_branch(&git_dir, options.checkout_branch)?;
-    if !options.single_branch || options.checkout_branch == options.remote_head_branch {
+    let checkout_config = (services.configure_branch)(&git_dir, request.options.checkout_branch)?;
+    if !request.options.single_branch
+        || request.options.checkout_branch == request.options.remote_head_branch
+    {
         let mut tx = store.transaction();
         tx.update(RefUpdate {
-            name: format!("refs/remotes/{}/HEAD", options.origin),
+            name: format!("refs/remotes/{}/HEAD", request.options.origin),
             expected: None,
             new: RefTarget::Symbolic(format!(
                 "refs/remotes/{}/{}",
-                options.origin, options.remote_head_branch
+                request.options.origin, request.options.remote_head_branch
             )),
             reflog: None,
         });
@@ -214,11 +237,11 @@ pub fn clone(
     }
 
     sley_worktree::checkout_branch_filtered(
-        destination,
+        request.destination,
         &git_dir,
-        format,
-        options.checkout_branch,
-        options.committer.clone(),
+        request.format,
+        request.options.checkout_branch,
+        request.options.committer.clone(),
         &checkout_config,
     )?;
 

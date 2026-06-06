@@ -12,7 +12,7 @@ use std::process::{Command, Stdio};
 use sley_config::GitConfig;
 use sley_core::Result;
 use sley_transport::{
-    encode_git_credential, parse_git_credential, GitCredential, RemoteTransport, RemoteUrl,
+    GitCredential, RemoteTransport, RemoteUrl, encode_git_credential, parse_git_credential,
 };
 
 use crate::CredentialProvider;

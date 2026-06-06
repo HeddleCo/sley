@@ -20,10 +20,9 @@
 // is in scope here without re-listing it.
 use crate::*;
 
-use sley_worktree::{apply_sparse_checkout_with_mode, SparseCheckout, SparseCheckoutMode};
+use sley_worktree::{SparseCheckout, SparseCheckoutMode, apply_sparse_checkout_with_mode};
 
-const SPARSE_USAGE: &str =
-    "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
+const SPARSE_USAGE: &str = "usage: git sparse-checkout (init | list | set | add | reapply | disable | check-rules | clean) [<options>]";
 
 // The exact usage + option-help blocks upstream prints when it rejects an
 // option. Keeping them verbatim lets the differential tests compare stderr
@@ -469,7 +468,7 @@ fn ancestors(dir: &[u8]) -> Vec<Vec<u8>> {
 /// ordering matches upstream's comparison of the bracketed pattern strings (this
 /// makes `/a-b/` sort before `/a/b/`, where `-` < `/`).
 fn sort_cone_dirs(dirs: &mut [Vec<u8>]) {
-    dirs.sort_by(|a, b| slash_wrapped(a).cmp(&slash_wrapped(b)));
+    dirs.sort_by_key(|a| slash_wrapped(a));
 }
 
 fn slash_wrapped(dir: &[u8]) -> Vec<u8> {

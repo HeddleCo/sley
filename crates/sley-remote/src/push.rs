@@ -26,18 +26,18 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{
-    build_reachable_pack, collect_reachable_object_ids, FileObjectDatabase, ObjectReader,
+    FileObjectDatabase, ObjectReader, build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
-    build_receive_pack_push_request, parse_receive_pack_features, parse_refspec, plan_push_commands,
+    GitService, PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
+    ReceivePackPushRequest, ReceivePackPushRequestOptions, ReceivePackReportStatus,
+    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, build_receive_pack_push_request,
+    parse_receive_pack_features, parse_refspec, plan_push_commands,
     read_receive_pack_report_status, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, write_receive_pack_push_request, GitService, PushSourceRef,
-    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequest,
-    ReceivePackPushRequestOptions, ReceivePackReportStatus, ReceivePackRequest,
-    ReceivePackUnpackStatus, RefAdvertisement,
+    smart_http_rpc_result_content_type, write_receive_pack_push_request,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget};
-use sley_transport::{http_smart_rpc_url, HttpClient, RemoteUrl};
+use sley_transport::{HttpClient, RemoteUrl, http_smart_rpc_url};
 
 use crate::{CredentialProvider, ProgressSink};
 
@@ -96,6 +96,34 @@ pub struct PushOutcome {
     pub report: Option<ReceivePackReportStatus>,
 }
 
+/// Fully resolved inputs for a [`push`] run.
+pub struct PushRequest<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository common `$GIT_DIR`, used for object access.
+    pub common_git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Local repository config snapshot.
+    pub config: &'a GitConfig,
+    /// Remote name or source string, used for diagnostics.
+    pub remote: &'a str,
+    /// Already-resolved push destination.
+    pub destination: &'a PushDestination,
+    /// Refspecs requested by the caller.
+    pub refspecs: &'a [String],
+    /// Push behavior flags.
+    pub options: &'a PushOptions,
+}
+
+/// Mutable seams used while pushing.
+pub struct PushServices<'a> {
+    /// Credential source for authenticated transports.
+    pub credentials: &'a mut dyn CredentialProvider,
+    /// Progress sink reserved for future push progress.
+    pub progress: &'a mut dyn ProgressSink,
+}
+
 /// Push `refspecs` to a resolved `destination` from the repository at `git_dir`.
 ///
 /// Performs the work the CLI's `push_http_repository`/`push_local_repository`
@@ -110,72 +138,69 @@ pub struct PushOutcome {
 /// `GitError::Exit`. A still-`None` report in the outcome means the remote did
 /// not advertise `report-status`. Set-upstream config and the "To <remote>"
 /// summary are the caller's job, driven from [`PushOutcome::commands`].
-#[allow(clippy::too_many_arguments)]
-pub fn push(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    format: ObjectFormat,
-    config: &GitConfig,
-    remote: &str,
-    destination: &PushDestination,
-    refspecs: &[String],
-    options: &PushOptions,
-    credentials: &mut dyn CredentialProvider,
-    progress: &mut dyn ProgressSink,
-) -> Result<PushOutcome> {
+pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<PushOutcome> {
     // `config` and `progress` are part of the seam (mirroring `fetch`) but the
     // current push flow drives credentials from the caller-built provider and
     // returns its summary in `PushOutcome` rather than streaming progress, so
     // neither is consumed yet. Kept named for the public API and future use.
-    let _ = (config, progress);
-    match destination {
-        PushDestination::Http(remote_url) => push_http(
-            git_dir,
-            common_git_dir,
-            format,
+    let _ = (request.config, services.progress);
+    match request.destination {
+        PushDestination::Http(remote_url) => push_http(PushHttpRequest {
+            git_dir: request.git_dir,
+            common_git_dir: request.common_git_dir,
+            format: request.format,
             remote_url,
-            refspecs,
-            options,
-            credentials,
-        ),
-        PushDestination::Ssh(remote_url) => crate::ssh::push_ssh(
-            git_dir,
-            common_git_dir,
-            format,
-            remote_url,
-            refspecs,
-            options.quiet,
-            options.force,
-            credentials,
-        ),
+            refspecs: request.refspecs,
+            options: request.options,
+            credentials: services.credentials,
+        }),
+        PushDestination::Ssh(remote_url) => crate::ssh::push_ssh(crate::ssh::SshPushRequest {
+            git_dir: request.git_dir,
+            common_git_dir: request.common_git_dir,
+            format: request.format,
+            remote: remote_url,
+            refspecs: request.refspecs,
+            quiet: request.options.quiet,
+            force: request.options.force,
+        }),
         PushDestination::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,
-        } => push_local(
-            git_dir,
-            common_git_dir,
-            format,
-            remote,
+        } => push_local(PushLocalRequest {
+            git_dir: request.git_dir,
+            common_git_dir: request.common_git_dir,
+            format: request.format,
+            remote: request.remote,
             remote_git_dir,
             remote_common_git_dir,
-            refspecs,
-            options,
-        ),
+            refspecs: request.refspecs,
+            options: request.options,
+        }),
     }
 }
 
 /// Push to a smart-HTTP(S) remote: advertise via receive-pack info/refs, plan,
 /// build the pack, POST the receive-pack RPC, and validate the report-status.
-#[allow(clippy::too_many_arguments)]
-fn push_http(
-    git_dir: &Path,
-    common_git_dir: &Path,
+struct PushHttpRequest<'a> {
+    git_dir: &'a Path,
+    common_git_dir: &'a Path,
     format: ObjectFormat,
-    remote_url: &RemoteUrl,
-    refspecs: &[String],
-    options: &PushOptions,
-    credentials: &mut dyn CredentialProvider,
-) -> Result<PushOutcome> {
+    remote_url: &'a RemoteUrl,
+    refspecs: &'a [String],
+    options: &'a PushOptions,
+    credentials: &'a mut dyn CredentialProvider,
+}
+
+fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
+    let PushHttpRequest {
+        git_dir,
+        common_git_dir,
+        format,
+        remote_url,
+        refspecs,
+        options,
+        credentials,
+    } = request;
     let client = crate::http::new_http_client();
     let advertisement_set = crate::http::http_service_advertisements(
         &client,
@@ -249,17 +274,28 @@ fn push_http(
 /// Push to a local repository served in-process: advertise from the remote
 /// `git_dir`, plan, build the pack against the remote's reachable objects, and
 /// apply the receive-pack request directly.
-#[allow(clippy::too_many_arguments)]
-fn push_local(
-    git_dir: &Path,
-    common_git_dir: &Path,
+struct PushLocalRequest<'a> {
+    git_dir: &'a Path,
+    common_git_dir: &'a Path,
     format: ObjectFormat,
-    remote: &str,
-    remote_git_dir: &Path,
-    remote_common_git_dir: &Path,
-    refspecs: &[String],
-    options: &PushOptions,
-) -> Result<PushOutcome> {
+    remote: &'a str,
+    remote_git_dir: &'a Path,
+    remote_common_git_dir: &'a Path,
+    refspecs: &'a [String],
+    options: &'a PushOptions,
+}
+
+fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
+    let PushLocalRequest {
+        git_dir,
+        common_git_dir,
+        format,
+        remote,
+        remote_git_dir,
+        remote_common_git_dir,
+        refspecs,
+        options,
+    } = request;
     let _ = remote;
     let remote_format = crate::object_format_for_git_dir(remote_common_git_dir)?;
     if remote_format != format {
@@ -286,7 +322,7 @@ fn push_local(
         .collect::<Vec<_>>();
     let starts = commands
         .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
+        .filter(|command| !command.new_id.is_null())
         .map(|command| command.new_id.clone());
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
@@ -413,11 +449,13 @@ fn build_push_packfile_against_advertisements(
     let remote_excluded = collect_reachable_object_ids(local_db, format, remote_excluded_tips)?;
     let starts = commands
         .iter()
-        .filter(|command| !is_zero_object_id(&command.new_id))
+        .filter(|command| !command.new_id.is_null())
         .map(|command| command.new_id.clone());
-    Ok(build_reachable_pack(local_db, format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default())
+    Ok(
+        build_reachable_pack(local_db, format, starts, &remote_excluded)?
+            .map(|pack| pack.pack)
+            .unwrap_or_default(),
+    )
 }
 
 /// The advertised tips the local repository already has, deduplicated and
@@ -429,7 +467,7 @@ pub fn remote_advertisement_tips_known_to_local(
     let mut tips = Vec::new();
     let mut seen = HashSet::new();
     for advertisement in advertisements {
-        if is_zero_object_id(&advertisement.oid) || !seen.insert(advertisement.oid.clone()) {
+        if advertisement.oid.is_null() || !seen.insert(advertisement.oid.clone()) {
             continue;
         }
         if local_db.contains(&advertisement.oid)? {
@@ -554,8 +592,8 @@ pub fn reject_non_fast_forward_pushes(
     for (command, force) in command_forces {
         if *force
             || !command.name.starts_with("refs/heads/")
-            || is_zero_object_id(&command.old_id)
-            || is_zero_object_id(&command.new_id)
+            || command.old_id.is_null()
+            || command.new_id.is_null()
         {
             continue;
         }
@@ -598,11 +636,6 @@ fn ancestor_depths(
         }
     }
     Ok(depths)
-}
-
-/// Whether `oid` is the all-zero object id (a ref creation/deletion sentinel).
-fn is_zero_object_id(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
 }
 
 /// Resolve a (possibly symbolic) ref target to its object id, following up to

@@ -55,10 +55,10 @@ fn run_output_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
         .expect("stdin pipe")
         .write_all(stdin)
         .expect("write stdin");
-    let output = child
+
+    child
         .wait_with_output()
-        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"));
-    output
+        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
 fn run_output_with_env(program: &str, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
@@ -94,7 +94,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
     let expected_alt = root.join("expected-alt");
     let actual_alt = root.join("actual-alt");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for repo in [&expected, &actual, &expected_alt, &actual_alt] {
             fs::create_dir_all(repo).expect("create repo dir");
             git(repo, &["init", "-q"]);
@@ -170,9 +170,8 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
             run_output_with_env("git", &expected, &args, &expected_env),
             &args,
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -182,7 +181,7 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             git(repo, &["init", "-q"]);
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
@@ -209,9 +208,8 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
                 &args,
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -221,7 +219,7 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             git(repo, &["init", "-q"]);
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
@@ -245,9 +243,8 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
             run_output_with_env("git", &expected, &args, &envs),
             &args,
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 fn remove_loose_object(root: &Path, oid: &str) {
@@ -271,7 +268,7 @@ fn git_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 fn cat_file_batch_modes_match_upstream_git() {
     let root = unique_temp_dir("cat-file-batch-check");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
@@ -539,10 +536,7 @@ fn cat_file_batch_modes_match_upstream_git() {
         ] {
             let expected = git_stdin(&root, &args, &input);
             let actual = git_rs(&root, &args, &input);
-            assert_eq!(
-                actual, expected,
-                "sley packed output differed for {args:?}"
-            );
+            assert_eq!(actual, expected, "sley packed output differed for {args:?}");
         }
         for args in [
             vec!["cat-file", "--batch-check", "--batch-all-objects"],
@@ -559,21 +553,17 @@ fn cat_file_batch_modes_match_upstream_git() {
         ] {
             let expected = git_stdin(&root, &args, b"ignored\n");
             let actual = git_rs(&root, &args, b"ignored\n");
-            assert_eq!(
-                actual, expected,
-                "sley packed output differed for {args:?}"
-            );
+            assert_eq!(actual, expected, "sley packed output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn cat_file_batch_storage_atoms_match_upstream_for_delta_pack() {
     let root = unique_temp_dir("cat-file-delta-storage-atoms");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let mut base = Vec::new();
         for idx in 0..4000 {
@@ -622,11 +612,7 @@ fn cat_file_batch_storage_atoms_match_upstream_for_delta_pack() {
             "fixture did not produce a packed delta object"
         );
         let actual = git_rs(&root, &args, input.as_bytes());
-        assert_eq!(
-            actual, expected,
-            "sley delta storage atom output differed"
-        );
-    })();
+        assert_eq!(actual, expected, "sley delta storage atom output differed");
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

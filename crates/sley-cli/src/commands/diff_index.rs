@@ -268,14 +268,14 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let entries = if cached {
         if inexact_renames {
             sley_diff_merge::diff_name_status_tree_index_with_rename_options(
-                &git_dir,
+                git_dir,
                 format,
                 &tree_oid,
                 rename_options,
             )?
         } else {
             sley_diff_merge::diff_name_status_tree_index_with_options(
-                &git_dir,
+                git_dir,
                 format,
                 &tree_oid,
                 base_options,
@@ -287,7 +287,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         if inexact_renames {
             sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
                 worktree_root,
-                &git_dir,
+                git_dir,
                 format,
                 &tree_oid,
                 rename_options,
@@ -295,7 +295,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         } else {
             sley_diff_merge::diff_name_status_tree_worktree_with_options(
                 worktree_root,
-                &git_dir,
+                git_dir,
                 format,
                 &tree_oid,
                 base_options,

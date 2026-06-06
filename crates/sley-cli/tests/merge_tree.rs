@@ -123,7 +123,11 @@ fn assert_same(dir: &Path, args: &[&str]) {
 fn setup_clean(dir: &Path) -> String {
     git_ok(
         dir.parent().unwrap_or(dir),
-        &["init", "-q", dir.to_str().unwrap()],
+        &[
+            "init",
+            "-q",
+            dir.to_str().expect("test operation should succeed"),
+        ],
     );
     write_file(dir, "a.txt", "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n");
     git_ok(dir, &["add", "."]);
@@ -147,7 +151,11 @@ fn setup_clean(dir: &Path) -> String {
 fn setup_conflict(dir: &Path) -> String {
     git_ok(
         dir.parent().unwrap_or(dir),
-        &["init", "-q", dir.to_str().unwrap()],
+        &[
+            "init",
+            "-q",
+            dir.to_str().expect("test operation should succeed"),
+        ],
     );
     write_file(dir, "a.txt", "line1\nline2\nline3\n");
     git_ok(dir, &["add", "."]);
@@ -212,7 +220,14 @@ fn nested_paths_and_modes_match_git() {
     }
     let root = unique_temp_dir("merge-tree-nested");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "dir/nested/f.txt", "a\nb\nc\n");
     write_file(&repo, "top.sh", "echo hi\n");
     git_ok(&repo, &["add", "."]);
@@ -243,7 +258,14 @@ fn modify_delete_and_add_add_match_git() {
     }
     let root = unique_temp_dir("merge-tree-md-aa");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "deleteme.txt", "a\nb\nc\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
@@ -328,7 +350,14 @@ fn unrelated_histories_match_git() {
     }
     let root = unique_temp_dir("merge-tree-unrelated");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     write_file(&repo, "x.txt", "x\n");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "one"]);
@@ -389,7 +418,14 @@ fn legacy_trivial_merge_matches_git() {
     }
     let root = unique_temp_dir("merge-tree-legacy");
     let repo = root.join("repo");
-    git_ok(root.as_path(), &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root.as_path(),
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     // Construct base/our/their trees that exercise the trivial resolver's whole
     // vocabulary: changed-in-both, added-in-both, added-in-remote, merged
     // (remote-only change), and removed-in-remote.

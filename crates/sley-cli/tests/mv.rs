@@ -98,7 +98,7 @@ fn mv_tracked_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -123,9 +123,8 @@ fn mv_tracked_file_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after mv"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -135,7 +134,7 @@ fn mv_sha256_tracked_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_sha256_repo(&upstream);
         prepare_sha256_repo(&rust);
 
@@ -161,9 +160,8 @@ fn mv_sha256_tracked_file_matches_upstream_git() {
             let actual = run_output("git", &rust, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -173,7 +171,7 @@ fn mv_modified_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -201,9 +199,8 @@ fn mv_modified_file_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after modified mv"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -213,7 +210,7 @@ fn mv_accepted_noop_options_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -237,337 +234,312 @@ fn mv_accepted_noop_options_match_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after mv accepted no-op options"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_dry_run_and_verbose_match_upstream_git() {
     let root = unique_temp_dir("mv-dry-run-verbose");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, (args, moves_path)) in [
-            (vec!["mv", "--dry-run", "file.txt", "renamed.txt"], false),
-            (
-                vec!["mv", "-n", "--no-dry-run", "file.txt", "renamed.txt"],
-                true,
-            ),
-            (vec!["mv", "--verbose", "file.txt", "renamed.txt"], true),
-            (
-                vec!["mv", "-v", "--no-verbose", "file.txt", "renamed.txt"],
-                true,
-            ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
+    for (idx, (args, moves_path)) in [
+        (vec!["mv", "--dry-run", "file.txt", "renamed.txt"], false),
+        (
+            vec!["mv", "-n", "--no-dry-run", "file.txt", "renamed.txt"],
+            true,
+        ),
+        (vec!["mv", "--verbose", "file.txt", "renamed.txt"], true),
+        (
+            vec!["mv", "-v", "--no-verbose", "file.txt", "renamed.txt"],
+            true,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
 
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
 
-            assert_eq!(
-                rust.join("file.txt").exists(),
-                !moves_path,
-                "source path state differed for {args:?}"
-            );
-            assert_eq!(
-                rust.join("renamed.txt").exists(),
-                moves_path,
-                "destination path state differed for {args:?}"
-            );
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
-        }
-    })();
+        assert_eq!(
+            rust.join("file.txt").exists(),
+            !moves_path,
+            "source path state differed for {args:?}"
+        );
+        assert_eq!(
+            rust.join("renamed.txt").exists(),
+            moves_path,
+            "destination path state differed for {args:?}"
+        );
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_multiple_sources_to_directory_match_upstream_git() {
     let root = unique_temp_dir("mv-multiple-sources");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "first.txt", "second.txt", "dir"],
-            vec!["mv", "--verbose", "first.txt", "second.txt", "dir"],
-            vec!["mv", "--dry-run", "first.txt", "second.txt", "dir"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
-            for repo in [&upstream, &rust] {
-                fs::write(repo.join("first.txt"), b"first\n").expect("write first");
-                fs::write(repo.join("second.txt"), b"second\n").expect("write second");
-                fs::create_dir(repo.join("dir")).expect("create destination directory");
-                git(repo, &["add", "first.txt", "second.txt"]);
-                run_with_identity(repo, &["commit", "-m", "multi", "-q"]);
-            }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
+    for (idx, args) in [
+        vec!["mv", "first.txt", "second.txt", "dir"],
+        vec!["mv", "--verbose", "first.txt", "second.txt", "dir"],
+        vec!["mv", "--dry-run", "first.txt", "second.txt", "dir"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        for repo in [&upstream, &rust] {
+            fs::write(repo.join("first.txt"), b"first\n").expect("write first");
+            fs::write(repo.join("second.txt"), b"second\n").expect("write second");
+            fs::create_dir(repo.join("dir")).expect("create destination directory");
+            git(repo, &["add", "first.txt", "second.txt"]);
+            run_with_identity(repo, &["commit", "-m", "multi", "-q"]);
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_tracked_directory_matches_upstream_git() {
     let root = unique_temp_dir("mv-tracked-directory");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "src", "dst"],
-            vec!["mv", "--verbose", "src", "dst"],
-            vec!["mv", "--dry-run", "src", "dst"],
-            vec!["mv", "src", "existing"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            for repo in [&upstream, &rust] {
-                git(repo, &["init", "-q"]);
-                fs::create_dir_all(repo.join("src/sub")).expect("create source directory");
-                fs::write(repo.join("src/a.txt"), b"first\n").expect("write first");
-                fs::write(repo.join("src/sub/b.txt"), b"second\n").expect("write second");
-                fs::create_dir(repo.join("existing")).expect("create existing directory");
-                git(repo, &["add", "src"]);
-                run_with_identity(repo, &["commit", "-m", "base", "-q"]);
-            }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
-            assert_eq!(
-                git(&rust, &["ls-files"]),
-                git(&upstream, &["ls-files"]),
-                "index paths differed after {args:?}"
-            );
+    for (idx, args) in [
+        vec!["mv", "src", "dst"],
+        vec!["mv", "--verbose", "src", "dst"],
+        vec!["mv", "--dry-run", "src", "dst"],
+        vec!["mv", "src", "existing"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q"]);
+            fs::create_dir_all(repo.join("src/sub")).expect("create source directory");
+            fs::write(repo.join("src/a.txt"), b"first\n").expect("write first");
+            fs::write(repo.join("src/sub/b.txt"), b"second\n").expect("write second");
+            fs::create_dir(repo.join("existing")).expect("create existing directory");
+            git(repo, &["add", "src"]);
+            run_with_identity(repo, &["commit", "-m", "base", "-q"]);
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+        assert_eq!(
+            git(&rust, &["ls-files"]),
+            git(&upstream, &["ls-files"]),
+            "index paths differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_destination_error_paths_match_upstream_git() {
     let root = unique_temp_dir("mv-destination-errors");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "file.txt", "missing/"],
-            vec!["mv", "file.txt", "missing/sub"],
-            vec!["mv", "-k", "file.txt", "missing/"],
-            vec!["mv", "-k", "file.txt", "missing/sub"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
+    for (idx, args) in [
+        vec!["mv", "file.txt", "missing/"],
+        vec!["mv", "file.txt", "missing/sub"],
+        vec!["mv", "-k", "file.txt", "missing/"],
+        vec!["mv", "-k", "file.txt", "missing/sub"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
 
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
-        }
-    })();
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_dry_run_error_paths_match_upstream_git() {
     let root = unique_temp_dir("mv-dry-run-errors");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, (args, add_destination)) in [
-            (vec!["mv", "--dry-run", "file.txt", "missing/"], false),
-            (vec!["mv", "--dry-run", "missing.txt", "renamed.txt"], false),
-            (vec!["mv", "--dry-run", "file.txt", "dest.txt"], true),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
-            if add_destination {
-                for repo in [&upstream, &rust] {
-                    fs::write(repo.join("dest.txt"), b"dest\n").expect("write destination");
-                    git(repo, &["add", "dest.txt"]);
-                    run_with_identity(repo, &["commit", "-m", "dest", "-q"]);
-                }
+    for (idx, (args, add_destination)) in [
+        (vec!["mv", "--dry-run", "file.txt", "missing/"], false),
+        (vec!["mv", "--dry-run", "missing.txt", "renamed.txt"], false),
+        (vec!["mv", "--dry-run", "file.txt", "dest.txt"], true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        if add_destination {
+            for repo in [&upstream, &rust] {
+                fs::write(repo.join("dest.txt"), b"dest\n").expect("write destination");
+                git(repo, &["add", "dest.txt"]);
+                run_with_identity(repo, &["commit", "-m", "dest", "-q"]);
             }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_bad_source_errors_match_upstream_git() {
     let root = unique_temp_dir("mv-bad-source-errors");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "missing.txt", "renamed.txt"],
-            vec!["mv", "missing.txt", "file.txt", "dir"],
-            vec!["mv", "untracked.txt", "renamed.txt"],
-            vec!["mv", "untracked.txt", "file.txt", "dir"],
-            vec!["mv", "--dry-run", "untracked.txt", "renamed.txt"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
-            for repo in [&upstream, &rust] {
-                fs::create_dir(repo.join("dir")).expect("create destination directory");
-                fs::write(repo.join("untracked.txt"), b"untracked\n").expect("write untracked");
-            }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
+    for (idx, args) in [
+        vec!["mv", "missing.txt", "renamed.txt"],
+        vec!["mv", "missing.txt", "file.txt", "dir"],
+        vec!["mv", "untracked.txt", "renamed.txt"],
+        vec!["mv", "untracked.txt", "file.txt", "dir"],
+        vec!["mv", "--dry-run", "untracked.txt", "renamed.txt"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        for repo in [&upstream, &rust] {
+            fs::create_dir(repo.join("dir")).expect("create destination directory");
+            fs::write(repo.join("untracked.txt"), b"untracked\n").expect("write untracked");
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_skip_errors_matches_upstream_git() {
     let root = unique_temp_dir("mv-skip-errors");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "-k", "missing.txt", "file.txt", "dir"],
-            vec!["mv", "-k", "--verbose", "missing.txt", "file.txt", "dir"],
-            vec!["mv", "-k", "--dry-run", "missing.txt", "file.txt", "dir"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
-            for repo in [&upstream, &rust] {
-                fs::create_dir(repo.join("dir")).expect("create destination directory");
-            }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
+    for (idx, args) in [
+        vec!["mv", "-k", "missing.txt", "file.txt", "dir"],
+        vec!["mv", "-k", "--verbose", "missing.txt", "file.txt", "dir"],
+        vec!["mv", "-k", "--dry-run", "missing.txt", "file.txt", "dir"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        for repo in [&upstream, &rust] {
+            fs::create_dir(repo.join("dir")).expect("create destination directory");
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn mv_combined_short_options_match_upstream_git() {
     let root = unique_temp_dir("mv-combined-short-options");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
-        for (idx, args) in [
-            vec!["mv", "-vn", "file.txt", "renamed.txt"],
-            vec!["mv", "-nv", "file.txt", "renamed.txt"],
-            vec!["mv", "-kf", "missing.txt", "file.txt", "dir"],
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let upstream = root.join(format!("upstream-{idx}"));
-            let rust = root.join(format!("rust-{idx}"));
-            fs::create_dir_all(&upstream).expect("create upstream repo");
-            fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_repo(&upstream);
-            prepare_repo(&rust);
-            for repo in [&upstream, &rust] {
-                fs::create_dir(repo.join("dir")).expect("create destination directory");
-            }
-
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-            assert_same_output(actual, expected, &args);
-            assert_eq!(
-                git(&rust, &["status", "--short"]),
-                git(&upstream, &["status", "--short"]),
-                "status differed after {args:?}"
-            );
+    for (idx, args) in [
+        vec!["mv", "-vn", "file.txt", "renamed.txt"],
+        vec!["mv", "-nv", "file.txt", "renamed.txt"],
+        vec!["mv", "-kf", "missing.txt", "file.txt", "dir"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let upstream = root.join(format!("upstream-{idx}"));
+        let rust = root.join(format!("rust-{idx}"));
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        prepare_repo(&upstream);
+        prepare_repo(&rust);
+        for repo in [&upstream, &rust] {
+            fs::create_dir(repo.join("dir")).expect("create destination directory");
         }
-    })();
+
+        let expected = run_output("git", &upstream, &args);
+        let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_same_output(actual, expected, &args);
+        assert_eq!(
+            git(&rust, &["status", "--short"]),
+            git(&upstream, &["status", "--short"]),
+            "status differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }

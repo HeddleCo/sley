@@ -84,30 +84,27 @@ fn prepare_prefix_repo(root: &Path) {
 #[test]
 fn write_tree_missing_ok_matches_upstream_git() {
     let root = unique_temp_dir("write-tree-missing-ok");
-    let result = (|| {
-        for (case, args) in [
-            ("default", vec!["write-tree"]),
-            ("missing-ok", vec!["write-tree", "--missing-ok"]),
-            (
-                "missing-ok-no-missing-ok",
-                vec!["write-tree", "--missing-ok", "--no-missing-ok"],
-            ),
-            (
-                "no-missing-ok-missing-ok",
-                vec!["write-tree", "--no-missing-ok", "--missing-ok"],
-            ),
-        ] {
-            let expected = root.join(format!("{case}-expected"));
-            let actual = root.join(format!("{case}-actual"));
-            prepare_repo(&expected);
-            prepare_repo(&actual);
-            let expected_output = run("git", &expected, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected_output, &args);
-        }
-    })();
+    for (case, args) in [
+        ("default", vec!["write-tree"]),
+        ("missing-ok", vec!["write-tree", "--missing-ok"]),
+        (
+            "missing-ok-no-missing-ok",
+            vec!["write-tree", "--missing-ok", "--no-missing-ok"],
+        ),
+        (
+            "no-missing-ok-missing-ok",
+            vec!["write-tree", "--no-missing-ok", "--missing-ok"],
+        ),
+    ] {
+        let expected = root.join(format!("{case}-expected"));
+        let actual = root.join(format!("{case}-actual"));
+        prepare_repo(&expected);
+        prepare_repo(&actual);
+        let expected_output = run("git", &expected, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -115,7 +112,7 @@ fn write_tree_prefix_matches_upstream_git() {
     let root = unique_temp_dir("write-tree-prefix");
     let expected = root.join("expected");
     let actual = root.join("actual");
-    let result = (|| {
+    {
         prepare_prefix_repo(&expected);
         prepare_prefix_repo(&actual);
 
@@ -131,7 +128,6 @@ fn write_tree_prefix_matches_upstream_git() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

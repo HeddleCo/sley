@@ -215,7 +215,7 @@ fn update_index_path_modes_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -289,9 +289,8 @@ fn update_index_path_modes_match_upstream_git() {
                 assert_index_matches(&expected, &actual, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -301,7 +300,7 @@ fn update_index_no_input_compat_flags_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -355,9 +354,8 @@ fn update_index_no_input_compat_flags_match_upstream_git() {
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -367,7 +365,7 @@ fn update_index_git_index_file_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
@@ -378,8 +376,7 @@ fn update_index_git_index_file_matches_upstream_git() {
 
         let update_args = ["update-index", "--add", "file.txt"];
         let expected_output = run_with_env("git", &expected, &update_args, &envs);
-        let actual_output =
-            run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &update_args, &envs);
+        let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &update_args, &envs);
         assert_same_output(actual_output, expected_output, &update_args);
 
         for args in [
@@ -400,9 +397,8 @@ fn update_index_git_index_file_matches_upstream_git() {
             run("git", &expected, &default_args),
             &default_args,
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -412,7 +408,7 @@ fn update_index_test_untracked_cache_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -446,9 +442,8 @@ fn update_index_test_untracked_cache_matches_upstream_git() {
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -458,7 +453,7 @@ fn update_index_fsmonitor_matches_upstream_git_when_unset() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -493,9 +488,8 @@ fn update_index_fsmonitor_matches_upstream_git_when_unset() {
                 assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -505,7 +499,7 @@ fn update_index_unresolve_no_resolve_undo_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -543,9 +537,8 @@ fn update_index_unresolve_no_resolve_undo_matches_upstream_git() {
             assert_index_matches(&expected, &actual, &args);
             assert_index_version_matches(&expected, &actual, &format!("{args:?}"));
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -555,7 +548,7 @@ fn update_index_again_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -611,9 +604,8 @@ fn update_index_again_matches_upstream_git() {
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches(&expected, &actual, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -623,7 +615,7 @@ fn update_index_verbose_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -657,9 +649,8 @@ fn update_index_verbose_matches_upstream_git() {
                 assert_index_matches(&expected, &actual, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -669,7 +660,7 @@ fn update_index_refresh_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -733,9 +724,8 @@ fn update_index_refresh_matches_upstream_git() {
             assert_index_matches(&expected, &actual, &args);
             assert_ls_files_verbose_matches(&expected, &actual, &format!("{args:?}"));
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -745,7 +735,7 @@ fn update_index_refresh_ignore_missing_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -780,9 +770,8 @@ fn update_index_refresh_ignore_missing_matches_upstream_git() {
                 assert_index_matches(&expected, &actual, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -792,7 +781,7 @@ fn update_index_clear_resolve_undo_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -822,9 +811,8 @@ fn update_index_clear_resolve_undo_matches_upstream_git() {
                 assert_index_matches(&expected, &actual, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -834,7 +822,7 @@ fn update_index_assume_unchanged_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -889,9 +877,8 @@ fn update_index_assume_unchanged_matches_upstream_git() {
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "clear-existing-assume");
         assert_ls_files_verbose_matches(&expected, &actual, "clear-existing-assume");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -901,7 +888,7 @@ fn update_index_skip_worktree_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -975,9 +962,8 @@ fn update_index_skip_worktree_matches_upstream_git() {
         assert_index_matches_for_label(&expected, &actual, "clear-upstream-written-skip");
         assert_ls_files_verbose_matches(&expected, &actual, "clear-upstream-written-skip");
         assert_index_version_matches(&expected, &actual, "clear-upstream-written-skip");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -987,7 +973,7 @@ fn update_index_ignore_skip_worktree_entries_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1058,9 +1044,8 @@ fn update_index_ignore_skip_worktree_entries_matches_upstream_git() {
             assert_ls_files_verbose_matches(&expected, &actual, label);
             assert_index_version_matches(&expected, &actual, label);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1070,7 +1055,7 @@ fn update_index_fsmonitor_valid_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1107,9 +1092,8 @@ fn update_index_fsmonitor_valid_matches_upstream_git() {
                 assert_ls_files_verbose_matches(&expected, &actual, &format!("{args:?}"));
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1119,7 +1103,7 @@ fn update_index_info_only_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1157,9 +1141,8 @@ fn update_index_info_only_matches_upstream_git() {
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches_for_label(&expected, &actual, "info-only-stdin");
         assert_object_existence_matches(&expected, &actual, "new.txt", "info-only-stdin");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1169,7 +1152,7 @@ fn update_index_show_index_version_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1209,9 +1192,8 @@ fn update_index_show_index_version_matches_upstream_git() {
             assert_same_output(actual_output, expected_output, &args);
             assert_index_matches(&expected, &actual, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1221,7 +1203,7 @@ fn update_index_index_version_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1314,9 +1296,8 @@ fn update_index_index_version_matches_upstream_git() {
             assert_index_matches_for_label(&expected, &actual, label);
             assert_ls_files_verbose_matches(&expected, &actual, label);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1326,7 +1307,7 @@ fn update_index_cacheinfo_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
         reset_fixture(&expected);
@@ -1391,9 +1372,8 @@ fn update_index_cacheinfo_matches_upstream_git() {
                 assert_index_matches_for_label(&expected, &actual, label);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1403,7 +1383,7 @@ fn update_index_index_info_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
         let one = String::from_utf8(
@@ -1441,9 +1421,8 @@ fn update_index_index_info_matches_upstream_git() {
         let expected_output = run_with_stdin("git", &expected, &args, b"");
         let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, b"");
         assert_same_output(actual_output, expected_output, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1453,7 +1432,7 @@ fn update_index_stdin_modes_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -1479,17 +1458,15 @@ fn update_index_stdin_modes_match_upstream_git() {
             reset_fixture(&expected);
             reset_fixture(&actual);
             let expected_output = run_with_stdin("git", &expected, &args, &stdin);
-            let actual_output =
-                run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &stdin);
+            let actual_output = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &stdin);
             let expected_success = expected_output.status.success();
             assert_same_output(actual_output, expected_output, &args);
             if expected_success {
                 assert_index_matches(&expected, &actual, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1499,7 +1476,7 @@ fn update_index_adds_sha256_index_entries() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q", "--object-format=sha256"]);
         run_success("git", &actual, &["init", "-q", "--object-format=sha256"]);
         fs::write(expected.join("a.txt"), b"sha256\n").expect("write expected fixture");
@@ -1510,7 +1487,6 @@ fn update_index_adds_sha256_index_entries() {
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         assert_index_matches(&expected, &actual, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

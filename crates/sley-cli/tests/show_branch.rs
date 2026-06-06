@@ -99,7 +99,13 @@ impl RepoBuilder {
         let repo = root.join("repo");
         git_ok(
             &root,
-            &["init", "-q", "-b", default_branch, repo.to_str().unwrap()],
+            &[
+                "init",
+                "-q",
+                "-b",
+                default_branch,
+                repo.to_str().expect("test operation should succeed"),
+            ],
         );
         Self { repo, step: 0 }
     }
@@ -249,7 +255,7 @@ fn diverged_default_and_list_match_git() {
     // A single rev prints just `[name] subject` with no matrix.
     assert_same(repo, &["show-branch", "topic"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -273,7 +279,7 @@ fn diverged_more_and_ordering_match_git() {
         assert_same(repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -289,7 +295,7 @@ fn diverged_merge_base_and_independent_match_git() {
     assert_same(repo, &["show-branch", "--independent", "main", "topic"]);
     assert_same(repo, &["show-branch", "--independent", "--all"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -318,7 +324,7 @@ fn merge_history_matrix_matches_git() {
         assert_same(repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -369,7 +375,7 @@ fn three_branch_matrix_matches_git() {
         assert_same(repo, &args);
     }
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -385,7 +391,7 @@ fn revision_expressions_match_git() {
     assert_same(repo, &["show-branch", "--more=20", "main", "HEAD~2"]);
     assert_same(repo, &["show-branch", "HEAD"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -406,7 +412,7 @@ fn remote_tracking_refs_match_git() {
     assert_same(repo, &["show-branch", "--all", "--more=20"]);
     assert_same(repo, &["show-branch", "origin/main", "main"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -423,7 +429,7 @@ fn detached_head_current_matches_git() {
     assert_same(repo, &["show-branch", "--current"]);
     assert_same(repo, &["show-branch", "--current", "--all"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -443,7 +449,7 @@ fn errors_and_usage_match_git() {
     assert_same(repo, &["show-branch", "-h"]);
     assert_same(repo, &["show-branch", "--no-such-option"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }
 
 #[test]
@@ -459,5 +465,5 @@ fn empty_repository_matches_git() {
     assert_same(repo, &["show-branch", "--all"]);
     assert_same(repo, &["show-branch", "--list"]);
 
-    fs::remove_dir_all(repo.parent().unwrap()).ok();
+    fs::remove_dir_all(repo.parent().expect("test operation should succeed")).ok();
 }

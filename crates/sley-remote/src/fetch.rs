@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_odb::{collect_reachable_object_ids, FileObjectDatabase};
+use sley_odb::{FileObjectDatabase, collect_reachable_object_ids};
 use sley_protocol::{
-    encode_fetch_head, fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates,
-    refspec_map_source, FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec,
+    FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
+    fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refspec_map_source,
 };
 use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
@@ -109,6 +109,33 @@ pub struct FetchOutcome {
     pub wrote_fetch_head: bool,
 }
 
+/// Fully resolved inputs for a [`fetch`] run.
+pub struct FetchRequest<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Local repository config snapshot.
+    pub config: &'a GitConfig,
+    /// Remote name or source string used for config lookup and `FETCH_HEAD`.
+    pub remote_name: &'a str,
+    /// Already-resolved transport source.
+    pub source: &'a FetchSource,
+    /// Refspecs requested by the caller. Empty means configured fetch refspecs,
+    /// falling back to `HEAD`.
+    pub refspecs: &'a [String],
+    /// Fetch behavior flags.
+    pub options: &'a FetchOptions,
+}
+
+/// Mutable seams used while fetching.
+pub struct FetchServices<'a> {
+    /// Credential source for authenticated transports.
+    pub credentials: &'a mut dyn CredentialProvider,
+    /// Progress sink for prune notices.
+    pub progress: &'a mut dyn ProgressSink,
+}
+
 /// Fetch from a resolved `source` into the repository at `git_dir`.
 ///
 /// Performs the work the CLI's `fetch_http_repository`/`fetch_local_repository`
@@ -120,87 +147,89 @@ pub struct FetchOutcome {
 ///
 /// Emits prune notices through `progress` and returns the structured
 /// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
-#[allow(clippy::too_many_arguments)]
-pub fn fetch(
-    git_dir: &Path,
-    format: ObjectFormat,
-    config: &GitConfig,
-    remote_name: &str,
-    source: &FetchSource,
-    refspecs: &[String],
-    options: &FetchOptions,
-    credentials: &mut dyn CredentialProvider,
-    progress: &mut dyn ProgressSink,
-) -> Result<FetchOutcome> {
-    let mut options = *options;
-    apply_configured_remote_tag_option(config, remote_name, &mut options);
-    apply_configured_fetch_prune_option(config, remote_name, &mut options);
-    let promisor_remote = config
-        .get_bool("remote", Some(remote_name), "promisor")
+pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<FetchOutcome> {
+    let mut options = *request.options;
+    apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
+    apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
+    let promisor_remote = request
+        .config
+        .get_bool("remote", Some(request.remote_name), "promisor")
         .unwrap_or(false);
-    let configured_refspecs = if refspecs.is_empty() {
-        remote_config_values(config, remote_name, "fetch")
+    let configured_refspecs = if request.refspecs.is_empty() {
+        remote_config_values(request.config, request.remote_name, "fetch")
     } else {
         Vec::new()
     };
-    let default_head_fetch = refspecs.is_empty() && configured_refspecs.is_empty();
-    let configured_remote_fetch = refspecs.is_empty() && !configured_refspecs.is_empty();
-    let fetch_head_source = fetch_head_source_description(config, remote_name);
-    let effective_refspecs =
-        fetch_refspecs_for_source(configured_refspecs, refspecs, options.fetch_all_tags);
+    let default_head_fetch = request.refspecs.is_empty() && configured_refspecs.is_empty();
+    let configured_remote_fetch = request.refspecs.is_empty() && !configured_refspecs.is_empty();
+    let fetch_head_source = fetch_head_source_description(request.config, request.remote_name);
+    let effective_refspecs = fetch_refspecs_for_source(
+        configured_refspecs,
+        request.refspecs,
+        options.fetch_all_tags,
+    );
     let parsed_refspecs = effective_refspecs
         .iter()
         .map(|refspec| parse_refspec(refspec))
         .collect::<Result<Vec<_>>>()?;
 
-    let store = FileRefStore::new(git_dir, format);
+    let store = FileRefStore::new(request.git_dir, request.format);
     let mut outcome = FetchOutcome::default();
 
     // Advertise refs, plan the ref-map, install the pack, then update refs/prune.
     // The two transports differ only in how they advertise and how they pull the
     // pack; the ref-map planning and ref bookkeeping are identical.
-    let advertisements = match source {
+    let advertisements = match request.source {
         FetchSource::Http(remote) => {
             let client = crate::http::new_http_client();
-            let (advertisements, features) =
-                crate::http::http_upload_pack_advertisements(&client, remote, format, credentials)?;
-            outcome.head_symref = head_symref_from_features(&features.symrefs);
-            let mut updates = plan_and_adjust_updates(
-                &advertisements,
-                &parsed_refspecs,
-                &options,
-                &store,
-                None,
-                format,
-                configured_remote_fetch,
+            let (advertisements, features) = crate::http::http_upload_pack_advertisements(
+                &client,
+                remote,
+                request.format,
+                services.credentials,
             )?;
+            outcome.head_symref = head_symref_from_features(&features.symrefs);
+            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+                advertisements: &advertisements,
+                refspecs: &parsed_refspecs,
+                options: &options,
+                store: &store,
+                reachable: None,
+                format: request.format,
+                configured_remote_fetch,
+            })?;
             let wants = updates.iter().map(|update| update.oid.clone()).collect();
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
-            let existing_shallow = shallow_boundary_for_request(git_dir, format, options.depth)?;
+            let existing_shallow =
+                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
             let shallow_info = crate::http::install_fetch_pack_via_http_upload_pack(
-                &client,
-                git_dir,
-                format,
-                remote,
-                wants,
-                existing_shallow,
-                options.depth,
-                promisor_remote,
-                credentials,
+                crate::http::HttpFetchPackRequest {
+                    client: &client,
+                    git_dir: request.git_dir,
+                    format: request.format,
+                    remote,
+                    wants,
+                    shallow: existing_shallow,
+                    deepen: options.depth,
+                    promisor: promisor_remote,
+                },
+                services.credentials,
             )?;
             if !options.dry_run {
-                crate::shallow::apply_shallow_info(git_dir, format, &shallow_info)?;
+                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
             finalize_fetch(
-                git_dir,
-                &store,
+                FetchFinalize {
+                    git_dir: request.git_dir,
+                    store: &store,
+                    options: &options,
+                    remote_name: request.remote_name,
+                    fetch_head_source: &fetch_head_source,
+                    default_head_fetch,
+                },
                 &mut updates,
-                &options,
-                remote_name,
-                &fetch_head_source,
-                default_head_fetch,
                 &mut outcome,
             )?;
             advertisements
@@ -210,42 +239,47 @@ pub fn fetch(
             // seam — the `ssh` program authenticates), but the ref-map planning
             // and ref bookkeeping are the same shared flow as HTTP.
             let (advertisements, features) =
-                crate::ssh::ssh_upload_pack_advertisements(remote, format)?;
+                crate::ssh::ssh_upload_pack_advertisements(remote, request.format)?;
             outcome.head_symref = head_symref_from_features(&features.symrefs);
-            let mut updates = plan_and_adjust_updates(
-                &advertisements,
-                &parsed_refspecs,
-                &options,
-                &store,
-                None,
-                format,
+            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+                advertisements: &advertisements,
+                refspecs: &parsed_refspecs,
+                options: &options,
+                store: &store,
+                reachable: None,
+                format: request.format,
                 configured_remote_fetch,
-            )?;
+            })?;
             let wants = updates.iter().map(|update| update.oid.clone()).collect();
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
-            let existing_shallow = shallow_boundary_for_request(git_dir, format, options.depth)?;
+            let existing_shallow =
+                shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
             let shallow_info = crate::ssh::install_fetch_pack_via_ssh_upload_pack(
-                git_dir,
-                format,
-                remote,
-                &features,
-                wants,
-                existing_shallow,
-                options.depth,
-                promisor_remote,
+                crate::ssh::SshFetchPackRequest {
+                    git_dir: request.git_dir,
+                    format: request.format,
+                    remote,
+                    features: &features,
+                    wants,
+                    shallow: existing_shallow,
+                    deepen: options.depth,
+                    promisor: promisor_remote,
+                },
             )?;
             if !options.dry_run {
-                crate::shallow::apply_shallow_info(git_dir, format, &shallow_info)?;
+                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
             finalize_fetch(
-                git_dir,
-                &store,
+                FetchFinalize {
+                    git_dir: request.git_dir,
+                    store: &store,
+                    options: &options,
+                    remote_name: request.remote_name,
+                    fetch_head_source: &fetch_head_source,
+                    default_head_fetch,
+                },
                 &mut updates,
-                &options,
-                remote_name,
-                &fetch_head_source,
-                default_head_fetch,
                 &mut outcome,
             )?;
             advertisements
@@ -255,54 +289,57 @@ pub fn fetch(
             common_git_dir: remote_common_git_dir,
         } => {
             let remote_format = crate::object_format_for_git_dir(remote_common_git_dir)?;
-            if remote_format != format {
+            if remote_format != request.format {
                 return Err(GitError::InvalidObjectId(format!(
                     "remote repository uses {}, local repository uses {}",
                     remote_format.name(),
-                    format.name()
+                    request.format.name()
                 )));
             }
-            let advertisements = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
-            let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
-            let mut updates = plan_and_adjust_updates(
-                &advertisements,
-                &parsed_refspecs,
-                &options,
-                &store,
-                Some((&remote_db, &advertisements)),
-                format,
+            let advertisements =
+                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
+            let mut updates = plan_and_adjust_updates(FetchPlanInput {
+                advertisements: &advertisements,
+                refspecs: &parsed_refspecs,
+                options: &options,
+                store: &store,
+                reachable: Some((&remote_db, &advertisements)),
+                format: request.format,
                 configured_remote_fetch,
-            )?;
+            })?;
             let starts = updates.iter().map(|update| update.oid.clone()).collect();
             crate::local::install_fetch_pack_via_local_upload_pack(
-                git_dir,
+                request.git_dir,
                 remote_git_dir,
-                format,
+                request.format,
                 starts,
                 promisor_remote,
             )?;
             finalize_fetch(
-                git_dir,
-                &store,
+                FetchFinalize {
+                    git_dir: request.git_dir,
+                    store: &store,
+                    options: &options,
+                    remote_name: request.remote_name,
+                    fetch_head_source: &fetch_head_source,
+                    default_head_fetch,
+                },
                 &mut updates,
-                &options,
-                remote_name,
-                &fetch_head_source,
-                default_head_fetch,
                 &mut outcome,
             )?;
             advertisements
         }
     };
 
-    if !options.dry_run && options.prune && remote_exists(config, remote_name) {
+    if !options.dry_run && options.prune && remote_exists(request.config, request.remote_name) {
         outcome.pruned = prune_remote_tracking_refs_from_advertisements(
-            config,
+            request.config,
             &store,
-            remote_name,
+            request.remote_name,
             &advertisements,
             options.quiet,
-            progress,
+            services.progress,
         )?;
     }
 
@@ -327,16 +364,26 @@ fn shallow_boundary_for_request(
 /// Plan the ref-map and apply the auto-follow-tag / not-for-merge adjustments
 /// shared by both transports. `reachable` (local only) enables appending tags
 /// reachable from fetched commits via the remote object database.
-#[allow(clippy::too_many_arguments)]
-fn plan_and_adjust_updates(
-    advertisements: &[RefAdvertisement],
-    refspecs: &[RefSpec],
-    options: &FetchOptions,
-    store: &FileRefStore,
-    reachable: Option<(&FileObjectDatabase, &[RefAdvertisement])>,
+struct FetchPlanInput<'a> {
+    advertisements: &'a [RefAdvertisement],
+    refspecs: &'a [RefSpec],
+    options: &'a FetchOptions,
+    store: &'a FileRefStore,
+    reachable: Option<(&'a FileObjectDatabase, &'a [RefAdvertisement])>,
     format: ObjectFormat,
     configured_remote_fetch: bool,
-) -> Result<Vec<FetchRefUpdate>> {
+}
+
+fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpdate>> {
+    let FetchPlanInput {
+        advertisements,
+        refspecs,
+        options,
+        store,
+        reachable,
+        format,
+        configured_remote_fetch,
+    } = input;
     let mut updates = plan_fetch_ref_updates(advertisements, refspecs, options.auto_follow_tags)?;
     if options.fetch_all_tags {
         mark_tag_refspec_updates_not_for_merge(&mut updates);
@@ -365,17 +412,28 @@ fn plan_and_adjust_updates(
 /// Write `FETCH_HEAD`, apply the remote-tracking ref updates, and record the
 /// applied updates in `outcome`. A no-op on `dry_run` (the pack is already
 /// installed; refs and `FETCH_HEAD` are left untouched), matching the CLI.
-#[allow(clippy::too_many_arguments)]
-fn finalize_fetch(
-    git_dir: &Path,
-    store: &FileRefStore,
-    updates: &mut Vec<FetchRefUpdate>,
-    options: &FetchOptions,
-    remote_name: &str,
-    fetch_head_source: &str,
+struct FetchFinalize<'a> {
+    git_dir: &'a Path,
+    store: &'a FileRefStore,
+    options: &'a FetchOptions,
+    remote_name: &'a str,
+    fetch_head_source: &'a str,
     default_head_fetch: bool,
+}
+
+fn finalize_fetch(
+    finalize: FetchFinalize<'_>,
+    updates: &mut Vec<FetchRefUpdate>,
     outcome: &mut FetchOutcome,
 ) -> Result<()> {
+    let FetchFinalize {
+        git_dir,
+        store,
+        options,
+        remote_name,
+        fetch_head_source,
+        default_head_fetch,
+    } = finalize;
     if options.dry_run {
         outcome.ref_updates = std::mem::take(updates);
         return Ok(());

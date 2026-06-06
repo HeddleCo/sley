@@ -73,7 +73,7 @@ fn run_status_with_env(
 fn rev_parse_is_shallow_repository_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-shallow");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let args = ["rev-parse", "--is-shallow-repository"];
 
@@ -88,16 +88,15 @@ fn rev_parse_is_shallow_repository_matches_upstream_git() {
         git(&root, &["init", "-q", "--bare", "bare.git"]);
         fs::write(bare.join("shallow"), b"").expect("write bare shallow marker");
         assert_eq!(git_rs(&bare, &args), git(&bare, &args));
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_git_common_dir_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-git-common-dir");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         fs::create_dir_all(&nested).expect("create nested worktree dir");
@@ -136,16 +135,15 @@ fn rev_parse_git_common_dir_matches_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_inside_repository_flags_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-inside-flags");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
@@ -172,16 +170,15 @@ fn rev_parse_inside_repository_flags_match_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_worktree_path_options_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-worktree-path-options");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
@@ -210,16 +207,15 @@ fn rev_parse_worktree_path_options_match_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_show_ref_format_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-show-ref-format");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         fs::create_dir_all(&nested).expect("create nested worktree dir");
@@ -238,16 +234,15 @@ fn rev_parse_show_ref_format_matches_upstream_git() {
                 cwd.display()
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_submodule_gitfile_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-submodule-gitfile");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -309,16 +304,15 @@ fn rev_parse_submodule_gitfile_matches_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_path_format_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-path-format");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
@@ -359,16 +353,15 @@ fn rev_parse_path_format_matches_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_git_path_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-git-path");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
@@ -462,16 +455,15 @@ fn rev_parse_git_path_matches_upstream_git() {
                 "sley result differed for {args:?} with env {envs:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_resolve_git_dir_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-resolve-git-dir");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q", "repo"]);
         git(&root, &["init", "-q", "--bare", "bare.git"]);
         let repo = root.join("repo");
@@ -511,16 +503,15 @@ fn rev_parse_resolve_git_dir_matches_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-local-env-vars");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let outside = root.join("outside");
         fs::create_dir_all(&outside).expect("create outside dir");
         let repo = root.join("repo");
@@ -545,16 +536,15 @@ fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_sq_quote_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-sq-quote");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let outside = root.join("outside");
         fs::create_dir_all(&outside).expect("create outside dir");
         let repo = root.join("repo");
@@ -577,16 +567,15 @@ fn rev_parse_sq_quote_matches_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_object_format_modes_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-object-format-modes");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let git_root = root.join(".git");
         let bare = root.join("bare.git");
@@ -618,16 +607,15 @@ fn rev_parse_object_format_modes_match_upstream_git() {
                 );
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_verify_quiet_missing_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-verify-missing");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(
             &root,
@@ -659,16 +647,15 @@ fn rev_parse_verify_quiet_missing_matches_upstream_git() {
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_abbreviated_object_ids_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-abbrev-object-id");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
         git(&root, &["add", "payload.txt"]);
@@ -701,16 +688,15 @@ fn rev_parse_abbreviated_object_ids_match_upstream_git() {
             git_rs(&root, &["rev-parse", packed_prefix]),
             git(&root, &["rev-parse", packed_prefix])
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_hex_refname_prefers_ref_and_warns_like_upstream_git() {
     let root = unique_temp_dir("rev-parse-hex-refname");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("first.txt"), b"first\n").expect("write first");
         git(&root, &["add", "first.txt"]);
@@ -753,16 +739,15 @@ fn rev_parse_hex_refname_prefers_ref_and_warns_like_upstream_git() {
         let expected = run_status("git", &root, &args);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual, expected);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
     let root = unique_temp_dir("rev-parse-commit-graph");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -820,9 +805,8 @@ fn rev_parse_parent_suffixes_use_upstream_commit_graph() {
                 "sley result differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
@@ -840,13 +824,19 @@ fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
             if let Some(mut stdout) = child.stdout.take() {
                 let _ = std::io::Read::read_to_string(&mut stdout, &mut out);
             }
-            assert!(status.success(), "sley {args:?} exited with {:?}", status.code());
+            assert!(
+                status.success(),
+                "sley {args:?} exited with {:?}",
+                status.code()
+            );
             return out.trim().to_string();
         }
         if std::time::Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("sley {args:?} did not terminate within 10s (rev-parse infinite-loop regression)");
+            panic!(
+                "sley {args:?} did not terminate within 10s (rev-parse infinite-loop regression)"
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
@@ -863,7 +853,14 @@ fn setup_rev_parse_repo(dir: &Path, sha256: bool) {
         "git",
         dir,
         &[
-            "-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-m", "c1",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "c1",
             "-q",
         ],
     );
@@ -897,7 +894,11 @@ fn rev_parse_short_and_ref_flags_terminate_and_match_git() {
     ] {
         let actual = rev_parse_terminates(&sha256, &args);
         let expected = String::from_utf8(git(&sha256, &args)).expect("utf8");
-        assert_eq!(actual, expected.trim(), "rev-parse {args:?} mismatch (sha256)");
+        assert_eq!(
+            actual,
+            expected.trim(),
+            "rev-parse {args:?} mismatch (sha256)"
+        );
     }
 
     let _ = fs::remove_dir_all(&root);

@@ -1314,9 +1314,8 @@ mod tests {
 
     #[test]
     fn service_request_parses_and_encodes_host_and_protocol() {
-        let payload =
-            b"git-upload-pack /project.git\0host=example.com\0\0version=2\0agent=sley\0";
-        let request = parse_service_request(payload).unwrap();
+        let payload = b"git-upload-pack /project.git\0host=example.com\0\0version=2\0agent=sley\0";
+        let request = parse_service_request(payload).expect("test operation should succeed");
         assert_eq!(
             request,
             ServiceRequest {
@@ -1328,14 +1327,17 @@ mod tests {
                 extra_parameters: vec!["agent=sley".into()],
             }
         );
-        assert_eq!(encode_service_request(&request).unwrap(), payload);
+        assert_eq!(
+            encode_service_request(&request).expect("test operation should succeed"),
+            payload
+        );
     }
 
     #[test]
     fn service_request_preserves_regular_and_extra_parameters() {
         let payload =
             b"git-receive-pack repo with spaces\0host=example.com\0version-hint=1\0\0trace=1\0";
-        let request = parse_service_request(payload).unwrap();
+        let request = parse_service_request(payload).expect("test operation should succeed");
         assert_eq!(
             request,
             ServiceRequest {
@@ -1347,7 +1349,10 @@ mod tests {
                 extra_parameters: vec!["trace=1".into()],
             }
         );
-        assert_eq!(encode_service_request(&request).unwrap(), payload);
+        assert_eq!(
+            encode_service_request(&request).expect("test operation should succeed"),
+            payload
+        );
     }
 
     #[test]
@@ -1361,11 +1366,14 @@ mod tests {
             extra_parameters: Vec::new(),
         };
         let mut encoded = Vec::new();
-        write_service_request(&mut encoded, &request).unwrap();
+        write_service_request(&mut encoded, &request).expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_service_request(&mut input).unwrap(), request);
+        assert_eq!(
+            read_service_request(&mut input).expect("test operation should succeed"),
+            request
+        );
         assert_eq!(input, b"tail");
     }
 
@@ -1380,15 +1388,17 @@ mod tests {
             parse_service_request(b"git-upload-pack /repo.git\0\0version=2\0version=1\0").is_err()
         );
         assert!(parse_service_request(b"git-upload-pack /repo.git\0\0version=0\0").is_err());
-        assert!(encode_service_request(&ServiceRequest {
-            service: GitService::UploadPack,
-            path: "/repo.git".into(),
-            host: None,
-            parameters: Vec::new(),
-            protocol: Some(ProtocolVersion::V0),
-            extra_parameters: Vec::new(),
-        })
-        .is_err());
+        assert!(
+            encode_service_request(&ServiceRequest {
+                service: GitService::UploadPack,
+                path: "/repo.git".into(),
+                host: None,
+                parameters: Vec::new(),
+                protocol: Some(ProtocolVersion::V0),
+                extra_parameters: Vec::new(),
+            })
+            .is_err()
+        );
         assert!(read_service_request(&mut &b"0000"[..]).is_err());
     }
 
@@ -1398,7 +1408,8 @@ mod tests {
             PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let announcement = parse_service_announcement_stream(&frames).unwrap();
+        let announcement =
+            parse_service_announcement_stream(&frames).expect("test operation should succeed");
         assert_eq!(
             announcement,
             ServiceAnnouncement {
@@ -1406,11 +1417,12 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_service_announcement(&announcement).unwrap(),
+            encode_service_announcement(&announcement).expect("test operation should succeed"),
             b"# service=git-upload-pack\n"
         );
         assert_eq!(
-            encode_service_announcement_stream(&announcement).unwrap(),
+            encode_service_announcement_stream(&announcement)
+                .expect("test operation should succeed"),
             frames
         );
     }
@@ -1421,11 +1433,15 @@ mod tests {
             service: GitService::ReceivePack,
         };
         let mut encoded = Vec::new();
-        write_service_announcement(&mut encoded, &announcement).unwrap();
+        write_service_announcement(&mut encoded, &announcement)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_service_announcement(&mut input).unwrap(), announcement);
+        assert_eq!(
+            read_service_announcement(&mut input).expect("test operation should succeed"),
+            announcement
+        );
         assert_eq!(input, b"tail");
     }
 
@@ -1435,16 +1451,20 @@ mod tests {
         assert!(parse_service_announcement(b"# service=git-not-a-service\n").is_err());
         assert!(parse_service_announcement(b"# service=git-upload-pack\0\n").is_err());
         assert!(parse_service_announcement_stream(&[]).is_err());
-        assert!(parse_service_announcement_stream(&[PktLineFrame::Data(
-            b"# service=git-upload-pack\n".to_vec(),
-        )])
-        .is_err());
-        assert!(parse_service_announcement_stream(&[
-            PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-            PktLineFrame::Data(b"extra\n".to_vec()),
-            PktLineFrame::Flush,
-        ])
-        .is_err());
+        assert!(
+            parse_service_announcement_stream(&[PktLineFrame::Data(
+                b"# service=git-upload-pack\n".to_vec(),
+            )])
+            .is_err()
+        );
+        assert!(
+            parse_service_announcement_stream(&[
+                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                PktLineFrame::Data(b"extra\n".to_vec()),
+                PktLineFrame::Flush,
+            ])
+            .is_err()
+        );
         assert!(parse_service_announcement_stream(&[PktLineFrame::Flush]).is_err());
         assert!(read_service_announcement(&mut &b"0000"[..]).is_err());
     }
@@ -1455,7 +1475,7 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let frames = vec![
             PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
             PktLineFrame::Flush,
@@ -1464,7 +1484,8 @@ mod tests {
             ),
             PktLineFrame::Flush,
         ];
-        let response = parse_service_discovery_response(ObjectFormat::Sha1, &frames).unwrap();
+        let response = parse_service_discovery_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             response,
             ServiceDiscoveryResponse {
@@ -1486,7 +1507,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_service_discovery_response(&response).unwrap(),
+            encode_service_discovery_response(&response).expect("test operation should succeed"),
             frames
         );
     }
@@ -1501,7 +1522,8 @@ mod tests {
             PktLineFrame::Data(b"fetch=shallow filter\n".to_vec()),
             PktLineFrame::Flush,
         ];
-        let response = parse_service_discovery_response(ObjectFormat::Sha1, &frames).unwrap();
+        let response = parse_service_discovery_response(ObjectFormat::Sha1, &frames)
+            .expect("test operation should succeed");
         assert_eq!(
             response,
             ServiceDiscoveryResponse {
@@ -1524,7 +1546,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_service_discovery_response(&response).unwrap(),
+            encode_service_discovery_response(&response).expect("test operation should succeed"),
             frames
         );
     }
@@ -1542,12 +1564,14 @@ mod tests {
             }),
         };
         let mut encoded = Vec::new();
-        write_service_discovery_response(&mut encoded, &response).unwrap();
+        write_service_discovery_response(&mut encoded, &response)
+            .expect("test operation should succeed");
         encoded.extend_from_slice(b"tail");
 
         let mut input = encoded.as_slice();
         assert_eq!(
-            read_service_discovery_response(ObjectFormat::Sha1, &mut input).unwrap(),
+            read_service_discovery_response(ObjectFormat::Sha1, &mut input)
+                .expect("test operation should succeed"),
             response
         );
         assert_eq!(input, b"tail");
@@ -1556,48 +1580,56 @@ mod tests {
     #[test]
     fn service_discovery_response_rejects_malformed_streams() {
         assert!(parse_service_discovery_response(ObjectFormat::Sha1, &[]).is_err());
-        assert!(parse_service_discovery_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_service_discovery_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                PktLineFrame::Data(b"version 2\n".to_vec()),
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_service_discovery_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                PktLineFrame::Flush,
-                PktLineFrame::Delimiter,
-                PktLineFrame::Flush,
-            ],
-        )
-        .is_err());
-        assert!(parse_service_discovery_response(
-            ObjectFormat::Sha1,
-            &[
-                PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
-                PktLineFrame::Flush,
-                PktLineFrame::Data(b"version 2\n".to_vec()),
-            ],
-        )
-        .is_err());
+        assert!(
+            parse_service_discovery_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service_discovery_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                    PktLineFrame::Data(b"version 2\n".to_vec()),
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service_discovery_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                    PktLineFrame::Flush,
+                    PktLineFrame::Delimiter,
+                    PktLineFrame::Flush,
+                ],
+            )
+            .is_err()
+        );
+        assert!(
+            parse_service_discovery_response(
+                ObjectFormat::Sha1,
+                &[
+                    PktLineFrame::Data(b"# service=git-upload-pack\n".to_vec()),
+                    PktLineFrame::Flush,
+                    PktLineFrame::Data(b"version 2\n".to_vec()),
+                ],
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn remote_url_parser_classifies_local_http_git_and_ssh_forms() {
         assert_eq!(
-            parse_remote_url("../repo.git").unwrap(),
+            parse_remote_url("../repo.git").expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Local,
                 user: None,
@@ -1608,7 +1640,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("C:/work/repo.git").unwrap(),
+            parse_remote_url("C:/work/repo.git").expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Local,
                 user: None,
@@ -1619,7 +1651,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("file:///tmp/repo.git").unwrap(),
+            parse_remote_url("file:///tmp/repo.git").expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::File,
                 user: None,
@@ -1630,7 +1662,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("https://example.com/org/repo.git").unwrap(),
+            parse_remote_url("https://example.com/org/repo.git")
+                .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Https,
                 user: None,
@@ -1641,7 +1674,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("http://example.com:8080/repo.git").unwrap(),
+            parse_remote_url("http://example.com:8080/repo.git")
+                .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Http,
                 user: None,
@@ -1652,7 +1686,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("git://example.com/repo.git").unwrap(),
+            parse_remote_url("git://example.com/repo.git").expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Git,
                 user: None,
@@ -1663,7 +1697,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("ssh://git@[2001:db8::1]:2222/org/repo.git").unwrap(),
+            parse_remote_url("ssh://git@[2001:db8::1]:2222/org/repo.git")
+                .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
@@ -1674,7 +1709,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s.git").unwrap(),
+            parse_remote_url("ssh://git@example.com/org/repo%20space/it%27s.git")
+                .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
@@ -1685,7 +1721,8 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_remote_url("git@example.com:org/repo.git").unwrap(),
+            parse_remote_url("git@example.com:org/repo.git")
+                .expect("test operation should succeed"),
             RemoteUrl {
                 transport: RemoteTransport::Ssh,
                 user: Some("git".into()),
@@ -1716,7 +1753,7 @@ mod tests {
         let credential = parse_git_credential(
             b"protocol=https\nhost=example.com\npath=org/repo.git\nusername=alice\npassword=secret\npassword_expiry_utc=1700000000\noauth_refresh_token=refresh\nurl=https://example.com/org/repo.git\nwwwauth[]=Bearer realm=one\nwwwauth[]=Basic realm=two\nquit=true\nhelper-state=opaque\n\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
             credential,
             GitCredential {
@@ -1734,7 +1771,7 @@ mod tests {
             }
         );
         assert_eq!(
-            encode_git_credential(&credential).unwrap(),
+            encode_git_credential(&credential).expect("test operation should succeed"),
             b"protocol=https\nhost=example.com\npath=org/repo.git\nusername=alice\npassword=secret\npassword_expiry_utc=1700000000\noauth_refresh_token=refresh\nurl=https://example.com/org/repo.git\nwwwauth[]=Bearer realm=one\nwwwauth[]=Basic realm=two\nquit=true\nhelper-state=opaque\n\n"
         );
     }
@@ -1749,10 +1786,13 @@ mod tests {
             ..GitCredential::default()
         };
         let mut encoded = Vec::new();
-        write_git_credential(&mut encoded, &credential).unwrap();
+        write_git_credential(&mut encoded, &credential).expect("test operation should succeed");
 
         let mut input = encoded.as_slice();
-        assert_eq!(read_git_credential(&mut input).unwrap(), credential);
+        assert_eq!(
+            read_git_credential(&mut input).expect("test operation should succeed"),
+            credential
+        );
     }
 
     #[test]
@@ -1763,7 +1803,7 @@ mod tests {
             ..GitCredential::default()
         };
         assert_eq!(
-            git_credential_basic_authorization(&credential).unwrap(),
+            git_credential_basic_authorization(&credential).expect("test operation should succeed"),
             Some("Basic YWxpY2U6c2VjcmV0".into())
         );
         assert_eq!(
@@ -1771,11 +1811,12 @@ mod tests {
                 username: Some("alice".into()),
                 ..GitCredential::default()
             })
-            .unwrap(),
+            .expect("test operation should succeed"),
             None
         );
         assert_eq!(
-            git_credential_bearer_authorization("token-123").unwrap(),
+            git_credential_bearer_authorization("token-123")
+                .expect("test operation should succeed"),
             "Bearer token-123"
         );
     }
@@ -1789,28 +1830,36 @@ mod tests {
         assert!(parse_git_credential(b"protocol=http\r\n\n").is_err());
         assert!(parse_git_credential(b"protocol=http\nhost=example.com\n\ntrailing").is_err());
         assert!(parse_git_credential(b"protocol=http\nprotocol=https\n\n").is_err());
-        assert!(encode_git_credential(&GitCredential {
-            protocol: Some("http\nhttps".into()),
-            ..GitCredential::default()
-        })
-        .is_err());
-        assert!(encode_git_credential(&GitCredential {
-            extra: vec![("protocol".into(), "https".into())],
-            ..GitCredential::default()
-        })
-        .is_err());
-        assert!(git_credential_basic_authorization(&GitCredential {
-            username: Some("ali:ce".into()),
-            password: Some("secret".into()),
-            ..GitCredential::default()
-        })
-        .is_err());
-        assert!(git_credential_basic_authorization(&GitCredential {
-            username: Some("alice".into()),
-            password: Some("sec\nret".into()),
-            ..GitCredential::default()
-        })
-        .is_err());
+        assert!(
+            encode_git_credential(&GitCredential {
+                protocol: Some("http\nhttps".into()),
+                ..GitCredential::default()
+            })
+            .is_err()
+        );
+        assert!(
+            encode_git_credential(&GitCredential {
+                extra: vec![("protocol".into(), "https".into())],
+                ..GitCredential::default()
+            })
+            .is_err()
+        );
+        assert!(
+            git_credential_basic_authorization(&GitCredential {
+                username: Some("ali:ce".into()),
+                password: Some("secret".into()),
+                ..GitCredential::default()
+            })
+            .is_err()
+        );
+        assert!(
+            git_credential_basic_authorization(&GitCredential {
+                username: Some("alice".into()),
+                password: Some("sec\nret".into()),
+                ..GitCredential::default()
+            })
+            .is_err()
+        );
         assert!(git_credential_bearer_authorization("").is_err());
         assert!(git_credential_bearer_authorization("tok\nen").is_err());
     }
@@ -1818,42 +1867,53 @@ mod tests {
     #[test]
     fn http_smart_urls_build_absolute_urls_from_remote() {
         // https without an explicit port.
-        let remote = parse_remote_url("https://example.com/org/repo.git").unwrap();
+        let remote = parse_remote_url("https://example.com/org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap(),
+            http_smart_info_refs_url(&remote, GitService::UploadPack)
+                .expect("test operation should succeed"),
             "https://example.com/org/repo.git/info/refs?service=git-upload-pack"
         );
         assert_eq!(
-            http_smart_rpc_url(&remote, GitService::UploadPack).unwrap(),
+            http_smart_rpc_url(&remote, GitService::UploadPack)
+                .expect("test operation should succeed"),
             "https://example.com/org/repo.git/git-upload-pack"
         );
 
         // https with an explicit port and a .git suffix path.
-        let remote = parse_remote_url("https://example.com:8443/org/repo.git").unwrap();
+        let remote = parse_remote_url("https://example.com:8443/org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            http_smart_info_refs_url(&remote, GitService::ReceivePack).unwrap(),
+            http_smart_info_refs_url(&remote, GitService::ReceivePack)
+                .expect("test operation should succeed"),
             "https://example.com:8443/org/repo.git/info/refs?service=git-receive-pack"
         );
         assert_eq!(
-            http_smart_rpc_url(&remote, GitService::ReceivePack).unwrap(),
+            http_smart_rpc_url(&remote, GitService::ReceivePack)
+                .expect("test operation should succeed"),
             "https://example.com:8443/org/repo.git/git-receive-pack"
         );
 
         // http scheme is honored too.
-        let remote = parse_remote_url("http://example.com/repo").unwrap();
+        let remote =
+            parse_remote_url("http://example.com/repo").expect("test operation should succeed");
         assert_eq!(
-            http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap(),
+            http_smart_info_refs_url(&remote, GitService::UploadPack)
+                .expect("test operation should succeed"),
             "http://example.com/repo/info/refs?service=git-upload-pack"
         );
     }
 
     #[test]
     fn http_smart_urls_never_include_userinfo() {
-        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git").unwrap();
+        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("alice"));
         assert_eq!(remote.password.as_deref(), Some("s3cret"));
-        let info = http_smart_info_refs_url(&remote, GitService::UploadPack).unwrap();
-        let rpc = http_smart_rpc_url(&remote, GitService::UploadPack).unwrap();
+        let info = http_smart_info_refs_url(&remote, GitService::UploadPack)
+            .expect("test operation should succeed");
+        let rpc = http_smart_rpc_url(&remote, GitService::UploadPack)
+            .expect("test operation should succeed");
         assert_eq!(
             info,
             "https://example.com/org/repo.git/info/refs?service=git-upload-pack"
@@ -1866,47 +1926,56 @@ mod tests {
 
     #[test]
     fn http_smart_urls_bracket_ipv6_hosts() {
-        let remote = parse_remote_url("https://[2001:db8::1]:8443/repo.git").unwrap();
+        let remote = parse_remote_url("https://[2001:db8::1]:8443/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            http_smart_rpc_url(&remote, GitService::UploadPack).unwrap(),
+            http_smart_rpc_url(&remote, GitService::UploadPack)
+                .expect("test operation should succeed"),
             "https://[2001:db8::1]:8443/repo.git/git-upload-pack"
         );
     }
 
     #[test]
     fn http_smart_urls_reject_non_http_transports() {
-        let remote = parse_remote_url("ssh://git@example.com/repo.git").unwrap();
+        let remote = parse_remote_url("ssh://git@example.com/repo.git")
+            .expect("test operation should succeed");
         assert!(http_smart_info_refs_url(&remote, GitService::UploadPack).is_err());
         assert!(http_smart_rpc_url(&remote, GitService::UploadPack).is_err());
 
-        let remote = parse_remote_url("git://example.com/repo.git").unwrap();
+        let remote =
+            parse_remote_url("git://example.com/repo.git").expect("test operation should succeed");
         assert!(http_smart_info_refs_url(&remote, GitService::UploadPack).is_err());
     }
 
     #[test]
     fn remote_url_parser_extracts_http_password_but_not_ssh() {
         // http(s) userinfo is split into user + password.
-        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git").unwrap();
+        let remote = parse_remote_url("https://alice:s3cret@example.com/org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("alice"));
         assert_eq!(remote.password.as_deref(), Some("s3cret"));
 
-        let remote = parse_remote_url("http://bob:pw@example.com:8080/repo.git").unwrap();
+        let remote = parse_remote_url("http://bob:pw@example.com:8080/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("bob"));
         assert_eq!(remote.password.as_deref(), Some("pw"));
         assert_eq!(remote.port, Some(8080));
 
         // http(s) user without a password leaves the password unset.
-        let remote = parse_remote_url("https://token@example.com/repo.git").unwrap();
+        let remote = parse_remote_url("https://token@example.com/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("token"));
         assert_eq!(remote.password, None);
 
         // SSH userinfo is preserved verbatim (no embedded-password concept), so
         // behavior does not regress for scp-like or ssh:// forms.
-        let remote = parse_remote_url("ssh://git@example.com/org/repo.git").unwrap();
+        let remote = parse_remote_url("ssh://git@example.com/org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("git"));
         assert_eq!(remote.password, None);
 
-        let remote = parse_remote_url("git@example.com:org/repo.git").unwrap();
+        let remote = parse_remote_url("git@example.com:org/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(remote.user.as_deref(), Some("git"));
         assert_eq!(remote.password, None);
     }
@@ -1914,22 +1983,26 @@ mod tests {
     #[test]
     fn ssh_service_command_builds_shell_quoted_commands() {
         assert_eq!(
-            ssh_service_command(GitService::UploadPack, "/srv/repo.git").unwrap(),
+            ssh_service_command(GitService::UploadPack, "/srv/repo.git")
+                .expect("test operation should succeed"),
             "git-upload-pack '/srv/repo.git'"
         );
         assert_eq!(
-            ssh_service_command(GitService::ReceivePack, "team/project.git").unwrap(),
+            ssh_service_command(GitService::ReceivePack, "team/project.git")
+                .expect("test operation should succeed"),
             "git-receive-pack 'team/project.git'"
         );
         assert_eq!(
-            ssh_service_command(GitService::UploadArchive, "/srv/it's.git").unwrap(),
+            ssh_service_command(GitService::UploadArchive, "/srv/it's.git")
+                .expect("test operation should succeed"),
             "git-upload-archive '/srv/it'\\''s.git'"
         );
     }
 
     #[test]
     fn ssh_process_command_builds_openssh_arguments() {
-        let remote = parse_remote_url("ssh://git@example.com:2222/srv/repo.git").unwrap();
+        let remote = parse_remote_url("ssh://git@example.com:2222/srv/repo.git")
+            .expect("test operation should succeed");
         assert_eq!(
             ssh_process_command(
                 &remote,
@@ -1937,7 +2010,7 @@ mod tests {
                 "ssh",
                 SshCommandVariant::OpenSsh,
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             SshProcessCommand {
                 program: "ssh".into(),
                 args: vec![
@@ -1949,9 +2022,11 @@ mod tests {
             }
         );
 
-        let remote = parse_remote_url("ssh://git@[2001:db8::1]:2222/org/it%27s.git").unwrap();
+        let remote = parse_remote_url("ssh://git@[2001:db8::1]:2222/org/it%27s.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh).unwrap(),
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh)
+                .expect("test operation should succeed"),
             vec![
                 "-p".to_string(),
                 "2222".to_string(),
@@ -1963,28 +2038,33 @@ mod tests {
 
     #[test]
     fn ssh_process_command_builds_scp_like_and_plink_arguments() {
-        let remote = parse_remote_url("git@example.com:team/it isn't.git").unwrap();
+        let remote = parse_remote_url("git@example.com:team/it isn't.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            ssh_process_args(&remote, GitService::ReceivePack, SshCommandVariant::OpenSsh).unwrap(),
+            ssh_process_args(&remote, GitService::ReceivePack, SshCommandVariant::OpenSsh)
+                .expect("test operation should succeed"),
             vec![
                 "git@example.com".to_string(),
                 "git-receive-pack 'team/it isn'\\''t.git'".to_string(),
             ]
         );
 
-        let remote = parse_remote_url("example.com:team/project.git").unwrap();
+        let remote = parse_remote_url("example.com:team/project.git")
+            .expect("test operation should succeed");
         assert_eq!(
-            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh).unwrap(),
+            ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::OpenSsh)
+                .expect("test operation should succeed"),
             vec![
                 "example.com".to_string(),
                 "git-upload-pack 'team/project.git'".to_string(),
             ]
         );
 
-        let remote = parse_remote_url("ssh://example.com:29418/team/project.git").unwrap();
+        let remote = parse_remote_url("ssh://example.com:29418/team/project.git")
+            .expect("test operation should succeed");
         assert_eq!(
             ssh_process_args(&remote, GitService::UploadArchive, SshCommandVariant::Plink,)
-                .unwrap(),
+                .expect("test operation should succeed"),
             vec![
                 "-P".to_string(),
                 "29418".to_string(),
@@ -1998,29 +2078,32 @@ mod tests {
                 GitService::UploadArchive,
                 SshCommandVariant::TortoisePlink,
             )
-            .unwrap()[0],
+            .expect("test operation should succeed")[0],
             "-P"
         );
     }
 
     #[test]
     fn ssh_process_command_rejects_invalid_inputs() {
-        let local = parse_remote_url("../repo.git").unwrap();
+        let local = parse_remote_url("../repo.git").expect("test operation should succeed");
         assert!(
             ssh_process_args(&local, GitService::UploadPack, SshCommandVariant::OpenSsh).is_err()
         );
 
-        let remote = parse_remote_url("ssh://example.com:2222/repo.git").unwrap();
+        let remote = parse_remote_url("ssh://example.com:2222/repo.git")
+            .expect("test operation should succeed");
         assert!(
             ssh_process_args(&remote, GitService::UploadPack, SshCommandVariant::Simple).is_err()
         );
-        assert!(ssh_process_command(
-            &remote,
-            GitService::UploadPack,
-            "ssh\n",
-            SshCommandVariant::OpenSsh,
-        )
-        .is_err());
+        assert!(
+            ssh_process_command(
+                &remote,
+                GitService::UploadPack,
+                "ssh\n",
+                SshCommandVariant::OpenSsh,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2038,19 +2121,23 @@ mod tests {
             extra_parameters: vec!["agent=sley".into(), "trace".into()],
         };
         assert_eq!(
-            encode_git_protocol_header(&header).unwrap().as_deref(),
+            encode_git_protocol_header(&header)
+                .expect("test operation should succeed")
+                .as_deref(),
             Some("version=2:agent=sley:trace")
         );
         assert_eq!(
-            parse_git_protocol_header("version=2:agent=sley:trace").unwrap(),
+            parse_git_protocol_header("version=2:agent=sley:trace")
+                .expect("test operation should succeed"),
             header
         );
         assert_eq!(
-            encode_git_protocol_header(&GitProtocolHeader::default()).unwrap(),
+            encode_git_protocol_header(&GitProtocolHeader::default())
+                .expect("test operation should succeed"),
             None
         );
         assert_eq!(
-            parse_git_protocol_header("agent=sley").unwrap(),
+            parse_git_protocol_header("agent=sley").expect("test operation should succeed"),
             GitProtocolHeader {
                 protocol: None,
                 extra_parameters: vec!["agent=sley".into()],
@@ -2065,15 +2152,19 @@ mod tests {
         assert!(parse_git_protocol_header("version=0").is_err());
         assert!(parse_git_protocol_header("version=2:").is_err());
         assert!(parse_git_protocol_header("bad\nparameter").is_err());
-        assert!(encode_git_protocol_header(&GitProtocolHeader {
-            protocol: Some(ProtocolVersion::V0),
-            extra_parameters: Vec::new(),
-        })
-        .is_err());
-        assert!(encode_git_protocol_header(&GitProtocolHeader {
-            protocol: None,
-            extra_parameters: vec!["bad:parameter".into()],
-        })
-        .is_err());
+        assert!(
+            encode_git_protocol_header(&GitProtocolHeader {
+                protocol: Some(ProtocolVersion::V0),
+                extra_parameters: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            encode_git_protocol_header(&GitProtocolHeader {
+                protocol: None,
+                extra_parameters: vec!["bad:parameter".into()],
+            })
+            .is_err()
+        );
     }
 }

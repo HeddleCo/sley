@@ -604,12 +604,14 @@ fn print_cat_file_batch_header(
         print_cat_file_batch_format(
             stdout,
             batch_format,
-            oid,
-            object_type,
-            size as usize,
-            object_mode,
-            storage.as_ref(),
-            record.rest,
+            CatFileBatchFormatValues {
+                oid,
+                object_type,
+                object_size: size as usize,
+                object_mode,
+                storage: storage.as_ref(),
+                rest: record.rest,
+            },
         )?;
     } else {
         write!(stdout, "{} {} {}", oid, object_type.as_str(), size)?;
@@ -699,15 +701,19 @@ enum CatFileBatchAtom<'a> {
     Malformed,
 }
 
+struct CatFileBatchFormatValues<'a> {
+    oid: &'a ObjectId,
+    object_type: ObjectType,
+    object_size: usize,
+    object_mode: Option<&'a str>,
+    storage: Option<&'a CatFileObjectStorage>,
+    rest: &'a str,
+}
+
 fn print_cat_file_batch_format(
     stdout: &mut io::Stdout,
     format: &CatFileBatchFormat<'_>,
-    oid: &ObjectId,
-    object_type: ObjectType,
-    object_size: usize,
-    object_mode: Option<&str>,
-    storage: Option<&CatFileObjectStorage>,
-    rest: &str,
+    values: CatFileBatchFormatValues<'_>,
 ) -> Result<()> {
     for atom in &format.atoms {
         let placeholder = match atom {
@@ -723,23 +729,23 @@ fn print_cat_file_batch_format(
             }
         };
         match *placeholder {
-            "objectname" => write!(stdout, "{oid}")?,
-            "objecttype" => stdout.write_all(object_type.as_str().as_bytes())?,
-            "objectsize" => write!(stdout, "{object_size}")?,
-            "objectmode" => stdout.write_all(object_mode.unwrap_or("").as_bytes())?,
+            "objectname" => write!(stdout, "{}", values.oid)?,
+            "objecttype" => stdout.write_all(values.object_type.as_str().as_bytes())?,
+            "objectsize" => write!(stdout, "{}", values.object_size)?,
+            "objectmode" => stdout.write_all(values.object_mode.unwrap_or("").as_bytes())?,
             "objectsize:disk" => {
-                let storage = storage.ok_or_else(|| {
+                let storage = values.storage.ok_or_else(|| {
                     GitError::Command("cat-file batch storage metadata was not loaded".into())
                 })?;
                 write!(stdout, "{}", storage.disk_size)?
             }
             "deltabase" => {
-                let storage = storage.ok_or_else(|| {
+                let storage = values.storage.ok_or_else(|| {
                     GitError::Command("cat-file batch storage metadata was not loaded".into())
                 })?;
                 write!(stdout, "{}", storage.deltabase)?
             }
-            "rest" => stdout.write_all(rest.as_bytes())?,
+            "rest" => stdout.write_all(values.rest.as_bytes())?,
             other => {
                 return Err(GitError::Command(format!(
                     "unsupported cat-file batch placeholder %({other})"

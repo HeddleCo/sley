@@ -315,7 +315,7 @@ fn create_incremental_bundle_fixture(root: &Path) -> PathBuf {
 fn bundle_list_heads_matches_upstream_git() {
     let root = unique_temp_dir("bundle-list-heads");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (bundle, _) = create_bundle_fixture(&root);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         for args in [
@@ -327,16 +327,15 @@ fn bundle_list_heads_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn bundle_list_heads_matches_upstream_git_sha256() {
     let root = unique_temp_dir("bundle-list-heads-sha256");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (bundle, _) = create_sha256_bundle_fixture(&root);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         for args in [
@@ -348,16 +347,15 @@ fn bundle_list_heads_matches_upstream_git_sha256() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn bundle_verify_matches_upstream_git() {
     let root = unique_temp_dir("bundle-verify");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (bundle, _) = create_bundle_fixture(&root);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         for args in [
@@ -369,9 +367,8 @@ fn bundle_verify_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -383,7 +380,7 @@ fn bundle_verify_prerequisites_match_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_empty).expect("create expected repo");
     fs::create_dir_all(&actual_empty).expect("create actual repo");
-    let result = (|| {
+    {
         let bundle = create_incremental_bundle_fixture(&source);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = ["bundle", "verify", bundle];
@@ -396,16 +393,15 @@ fn bundle_verify_prerequisites_match_upstream_git() {
         let expected = run("git", &expected_empty, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_empty, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn bundle_create_all_writes_upstream_readable_bundle() {
     let root = unique_temp_dir("bundle-create-all");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (expected_bundle, head) = create_bundle_fixture(&root);
         let actual_bundle = root.join("actual.bundle");
         let actual_bundle_arg = actual_bundle.to_str().expect("bundle path is utf8");
@@ -442,16 +438,15 @@ fn bundle_create_all_writes_upstream_readable_bundle() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
     let root = unique_temp_dir("bundle-create-all-sha256");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (expected_bundle, head) = create_sha256_bundle_fixture(&root);
         let actual_bundle = root.join("actual.bundle");
         let actual_bundle_arg = actual_bundle.to_str().expect("bundle path is utf8");
@@ -498,16 +493,15 @@ fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn bundle_create_all_with_explicit_revisions_matches_upstream() {
     let root = unique_temp_dir("bundle-create-all-explicit");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         let (expected_all_bundle, head) = create_bundle_fixture(&root);
         let expected_bundle = root.join("expected-all-head.bundle");
         let actual_bundle = root.join("actual-all-head.bundle");
@@ -576,9 +570,8 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
             expected,
             &["bundle", "create", "<bundle>", "--all", "^HEAD"],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -591,7 +584,7 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_empty).expect("create expected empty repo");
     fs::create_dir_all(&actual_empty).expect("create actual empty repo");
-    let result = (|| {
+    {
         run_success("git", &source, &["init", "-q"]);
         fs::write(source.join("payload.txt"), b"base payload\n").expect("write base payload");
         run_success("git", &source, &["add", "payload.txt"]);
@@ -709,9 +702,8 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"changed payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -723,7 +715,7 @@ fn fetch_bundle_refspec_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -753,9 +745,8 @@ fn fetch_bundle_refspec_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -767,7 +758,7 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -797,9 +788,8 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -811,7 +801,7 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         add_tag_only_commit(&source);
         fs::remove_file(&bundle).expect("remove old bundle");
@@ -855,9 +845,8 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -869,7 +858,7 @@ fn fetch_bundle_source_ref_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -894,9 +883,8 @@ fn fetch_bundle_source_ref_writes_fetch_head_without_ref_update() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -908,7 +896,7 @@ fn fetch_bundle_default_head_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -933,9 +921,8 @@ fn fetch_bundle_default_head_writes_fetch_head_without_ref_update() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -947,7 +934,7 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -985,9 +972,8 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -999,7 +985,7 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let head = create_fetch_fixture_without_tags(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -1063,9 +1049,8 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
             !repository_pack_indexes(&actual_repo.join(".git")).is_empty(),
             "SSH fetch should install a pack"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1077,7 +1062,7 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let head = create_fetch_fixture_without_tags(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -1139,9 +1124,8 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"fetch payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1153,7 +1137,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let head = create_fetch_fixture_without_tags(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -1236,9 +1220,8 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"fetch payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1250,7 +1233,7 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -1280,9 +1263,8 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1294,7 +1276,7 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         add_tag_only_commit(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
@@ -1327,9 +1309,8 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1341,7 +1322,7 @@ fn fetch_local_repository_default_head_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -1366,9 +1347,8 @@ fn fetch_local_repository_default_head_writes_fetch_head_without_ref_update() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1376,7 +1356,7 @@ fn fetch_configured_local_remote_matches_upstream_git() {
     let root = unique_temp_dir("local-fetch-configured");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
             "git",
@@ -1435,9 +1415,8 @@ fn fetch_configured_local_remote_matches_upstream_git() {
             );
             assert_eq!(imported, b"bundle payload\n");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1445,7 +1424,7 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
     let root = unique_temp_dir("local-fetch-configured-tagopt");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         add_tag_only_commit(&source);
         let source_arg = source.to_str().expect("source path is utf8");
@@ -1520,9 +1499,8 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
             );
             assert_eq!(imported, b"bundle payload\n");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1534,7 +1512,7 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
             "git",
@@ -1603,16 +1581,15 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
     let root = unique_temp_dir("local-fetch-configured-prune-config");
     fs::create_dir_all(&root).expect("create root");
-    let result = (|| {
+    {
         let run_case =
             |label: &str, config_args: Vec<Vec<&str>>, fetch_args: Vec<&str>, stale_kept: bool| {
                 let source = root.join(format!("{label}-source"));
@@ -1712,9 +1689,8 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
             vec!["fetch", "-q", "origin"],
             true,
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1726,7 +1702,7 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
             "git",
@@ -1791,9 +1767,8 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1805,7 +1780,7 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let source_arg = source.to_str().expect("source path is utf8");
         run_success("git", &expected_repo, &["init", "-q"]);
@@ -1844,9 +1819,8 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1858,7 +1832,7 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
             "git",
@@ -1921,9 +1895,8 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
                 .expect("read expected FETCH_HEAD"),
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1936,7 +1909,7 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         run_success("git", &source, &["init", "-q"]);
         fs::write(source.join("main.txt"), b"main payload\n").expect("write main payload");
         run_success("git", &source, &["add", "main.txt"]);
@@ -2008,9 +1981,8 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
             &["cat-file", "-p", &format!("{feature_head}:feature.txt")],
         );
         assert_eq!(imported, b"feature payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2018,7 +1990,7 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
     let root = unique_temp_dir("local-fetch-file-url");
     let source = root.join("source");
     fs::create_dir_all(&source).expect("create source repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         let source_file_url = file_url(&source);
         let root_file_url = file_url(&root);
@@ -2090,9 +2062,8 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
             );
             assert_eq!(imported, b"bundle payload\n");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2104,7 +2075,7 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -2141,9 +2112,8 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2155,7 +2125,7 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -2202,9 +2172,8 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2216,7 +2185,7 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, head) = create_sha256_bundle_fixture(&source);
         let source_file_url = file_url(&source);
         run_success(
@@ -2263,9 +2232,8 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"bundle payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2275,7 +2243,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
     let actual_repo = root.join("actual");
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (_bundle, base) = create_bundle_fixture(&source);
         let branch = String::from_utf8(run_success(
             "git",
@@ -2351,9 +2319,8 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
         assert_eq!(imported, b"changed payload\n");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -2365,7 +2332,7 @@ fn bundle_unbundle_matches_upstream_git_and_imports_objects() {
     fs::create_dir_all(&source).expect("create source repo");
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
-    let result = (|| {
+    {
         let (bundle, head) = create_bundle_fixture(&source);
         run_success("git", &expected_repo, &["init", "-q"]);
         run_success("git", &actual_repo, &["init", "-q"]);
@@ -2393,7 +2360,6 @@ fn bundle_unbundle_matches_upstream_git_and_imports_objects() {
         let refs = run("git", &actual_repo, &["show-ref"]);
         assert_eq!(refs.status.code(), Some(1));
         assert!(refs.stdout.is_empty(), "unbundle should not create refs");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

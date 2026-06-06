@@ -259,7 +259,7 @@ fn tag_signature_offset(body: &[u8]) -> Option<usize> {
             .position(|byte| *byte == b'\n')
             .map_or(body.len(), |idx| line_start + idx);
         let line = &body[line_start..line_end];
-        if TAG_SIGNATURE_MARKERS.iter().any(|marker| line == *marker) {
+        if TAG_SIGNATURE_MARKERS.contains(&line) {
             return Some(line_start);
         }
         // Advance past the newline (or to the end if this was the final line).

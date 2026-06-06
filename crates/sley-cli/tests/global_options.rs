@@ -70,7 +70,7 @@ fn prepare_fixed_commit_repo(root: &Path) {
 fn global_version_and_noop_flags_match_upstream_git() {
     let root = unique_temp_dir("global-version-noop");
     let repo = root.join("repo");
-    let result = (|| {
+    {
         fs::create_dir_all(&repo).expect("create repo dir");
         prepare_fixed_commit_repo(&repo);
 
@@ -95,9 +95,8 @@ fn global_version_and_noop_flags_match_upstream_git() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -105,7 +104,7 @@ fn global_git_dir_and_work_tree_match_upstream_git_for_rev_parse() {
     let root = unique_temp_dir("global-git-dir-work-tree");
     let repo = root.join("repo");
     let sub = repo.join("sub");
-    let result = (|| {
+    {
         prepare_fixed_commit_repo(&repo);
         fs::create_dir_all(&sub).expect("create subdir");
 
@@ -135,9 +134,8 @@ fn global_git_dir_and_work_tree_match_upstream_git_for_rev_parse() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), cwd, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -145,7 +143,7 @@ fn repository_environment_matches_upstream_git_for_rev_parse() {
     let root = unique_temp_dir("repository-env");
     let repo = root.join("repo");
     let sub = repo.join("sub");
-    let result = (|| {
+    {
         prepare_fixed_commit_repo(&repo);
         fs::create_dir_all(&sub).expect("create subdir");
 
@@ -195,16 +193,15 @@ fn repository_environment_matches_upstream_git_for_rev_parse() {
             let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), cwd, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn global_bare_matches_upstream_git_for_rev_parse() {
     let root = unique_temp_dir("global-bare");
     let bare = root.join("bare.git");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root dir");
         let init = run(
             "git",
@@ -236,16 +233,15 @@ fn global_bare_matches_upstream_git_for_rev_parse() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &bare, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn global_c_option_matches_upstream_git() {
     let root = unique_temp_dir("global-c");
     let repo = root.join("repo");
-    let result = (|| {
+    {
         fs::create_dir_all(repo.join("sub")).expect("create repo dirs");
         let expected_init = run("git", &root, &["-C", "repo", "init", "-q"]);
         let actual_init = run(
@@ -264,9 +260,8 @@ fn global_c_option_matches_upstream_git() {
         let expected_output = run("git", &root, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual_output, expected_output, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -274,7 +269,7 @@ fn global_config_core_abbrev_matches_upstream_git_for_rev_parse_short() {
     let root = unique_temp_dir("global-config-abbrev");
     let expected = root.join("expected");
     let actual = root.join("actual");
-    let result = (|| {
+    {
         prepare_fixed_commit_repo(&expected);
         prepare_fixed_commit_repo(&actual);
 
@@ -370,9 +365,8 @@ fn global_config_core_abbrev_matches_upstream_git_for_rev_parse_short() {
             let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -380,7 +374,7 @@ fn global_config_log_all_ref_updates_matches_upstream_git_for_update_ref() {
     let root = unique_temp_dir("global-config-logall");
     let expected = root.join("expected");
     let actual = root.join("actual");
-    let result = (|| {
+    {
         prepare_fixed_commit_repo(&expected);
         prepare_fixed_commit_repo(&actual);
         let oid = String::from_utf8(run("git", &expected, &["rev-parse", "HEAD"]).stdout)
@@ -430,9 +424,8 @@ fn global_config_log_all_ref_updates_matches_upstream_git_for_update_ref() {
             actual.join(".git/logs/refs/tags/global-always").exists(),
             expected.join(".git/logs/refs/tags/global-always").exists()
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -444,7 +437,7 @@ fn global_config_init_default_branch_matches_upstream_git() {
     let actual_last = root.join("actual-last");
     let expected_cli = root.join("expected-cli");
     let actual_cli = root.join("actual-cli");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root dir");
         let args = [
             "-c",
@@ -519,7 +512,6 @@ fn global_config_init_default_branch_matches_upstream_git() {
             fs::read(actual_cli.join(".git/HEAD")).expect("read actual-cli HEAD"),
             fs::read(expected_cli.join(".git/HEAD")).expect("read expected-cli HEAD")
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

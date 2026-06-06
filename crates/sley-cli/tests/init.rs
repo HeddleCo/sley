@@ -52,40 +52,37 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn init_initial_branch_matches_upstream_git_head() {
     let root = unique_temp_dir("init-initial-branch");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("short", vec!["init", "-q", "-b", "topic"]),
-            ("long", vec!["init", "-q", "--initial-branch", "release"]),
-            ("equals", vec!["init", "-q", "--initial-branch=integration"]),
-            (
-                "quiet",
-                vec!["init", "--quiet", "--initial-branch=quiet-topic"],
-            ),
-        ] {
-            let upstream = root.join(format!("git-{name}"));
-            let rust = root.join(format!("rust-{name}"));
-            let mut upstream_args = args.clone();
-            upstream_args.push(upstream.to_str().expect("utf8 temp path"));
-            let upstream_stdout = git(&root, &upstream_args);
-            let mut rust_args = args;
-            rust_args.push(rust.to_str().expect("utf8 temp path"));
-            let rust_stdout = git_rs(&root, &rust_args);
-            assert_eq!(rust_stdout, upstream_stdout, "stdout differed for {name}");
+    for (name, args) in [
+        ("short", vec!["init", "-q", "-b", "topic"]),
+        ("long", vec!["init", "-q", "--initial-branch", "release"]),
+        ("equals", vec!["init", "-q", "--initial-branch=integration"]),
+        (
+            "quiet",
+            vec!["init", "--quiet", "--initial-branch=quiet-topic"],
+        ),
+    ] {
+        let upstream = root.join(format!("git-{name}"));
+        let rust = root.join(format!("rust-{name}"));
+        let mut upstream_args = args.clone();
+        upstream_args.push(upstream.to_str().expect("utf8 temp path"));
+        let upstream_stdout = git(&root, &upstream_args);
+        let mut rust_args = args;
+        rust_args.push(rust.to_str().expect("utf8 temp path"));
+        let rust_stdout = git_rs(&root, &rust_args);
+        assert_eq!(rust_stdout, upstream_stdout, "stdout differed for {name}");
 
-            let expected = git(&upstream, &["symbolic-ref", "HEAD"]);
-            let actual = git(&rust, &["symbolic-ref", "HEAD"]);
-            assert_eq!(actual, expected, "HEAD differed for {name}");
-        }
-    })();
+        let expected = git(&upstream, &["symbolic-ref", "HEAD"]);
+        let actual = git(&rust, &["symbolic-ref", "HEAD"]);
+        assert_eq!(actual, expected, "HEAD differed for {name}");
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn init_bare_stdout_and_reinit_match_upstream_git() {
     let root = unique_temp_dir("init-bare-reinit");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let repo = root.join("repo");
         let repo_arg = repo.to_str().expect("utf8 temp path");
         let expected = run_status("git", &root, &["init", "-b", "topic", repo_arg]);
@@ -158,7 +155,6 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         );
         assert_eq!(actual, expected, "bare reinit differed");
         assert_eq!(actual_head, expected_head, "bare reinit HEAD differed");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

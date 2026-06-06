@@ -422,7 +422,6 @@ struct PossibleTag<'a> {
 }
 
 /// Describe a single target commit, printing the result (or an error per git).
-#[allow(clippy::too_many_arguments)]
 fn describe_one(
     format: ObjectFormat,
     db: &FileObjectDatabase,
@@ -670,7 +669,6 @@ struct DescribeSearchResult<'a> {
 /// candidate's depth, mirroring git's `finish_depth_computation`: every commit
 /// not reachable from the winning tag still lies between the target and that
 /// tag and adds one to its depth. Returns the additional depth accumulated.
-#[allow(clippy::too_many_arguments)]
 fn finish_depth_computation(
     format: ObjectFormat,
     db: &FileObjectDatabase,

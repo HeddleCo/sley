@@ -123,7 +123,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn branch_delete_merged_matches_upstream_git() {
     let root = unique_temp_dir("branch-delete-merged");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
@@ -305,9 +305,8 @@ fn branch_delete_merged_matches_upstream_git() {
         git(&root, &["branch", "merged", base_oid.as_str()]);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -317,7 +316,7 @@ fn branch_delete_remote_tracking_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             git(repo, &["init", "-q"]);
             run_with_identity_at(repo, &["commit", "--allow-empty", "-m", "initial", "-q"], 1);
@@ -369,16 +368,15 @@ fn branch_delete_remote_tracking_matches_upstream_git() {
                 git(&expected, &["branch", "-r"])
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn branch_force_update_matches_upstream_git() {
     let root = unique_temp_dir("branch-force-update");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
@@ -561,16 +559,15 @@ fn branch_force_update_matches_upstream_git() {
         let expected = run_output("git", &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn branch_upstream_config_matches_upstream_git() {
     let root = unique_temp_dir("branch-upstream-config");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         git(&root, &["branch", "topic"]);
@@ -658,9 +655,8 @@ fn branch_upstream_config_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -670,7 +666,7 @@ fn branch_create_tracking_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
+    {
         for repo in [&expected, &actual] {
             git(repo, &["init", "-q"]);
             run_with_identity(repo, &["commit", "--allow-empty", "-m", "initial", "-q"]);
@@ -863,16 +859,15 @@ fn branch_create_tracking_matches_upstream_git() {
         let expected_output = branch_test_output("git", &expected, &args);
         let actual_output = branch_test_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn branch_rename_and_copy_match_upstream_git() {
     let root = unique_temp_dir("branch-rename-copy");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         git(&root, &["branch", "topic"]);
@@ -1022,16 +1017,15 @@ fn branch_rename_and_copy_match_upstream_git() {
             git(&root, &["symbolic-ref", "HEAD"]),
             b"refs/heads/target\n".to_vec()
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn branch_verbose_listing_matches_upstream_git() {
     let root = unique_temp_dir("branch-verbose-listing");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
@@ -1080,16 +1074,15 @@ fn branch_verbose_listing_matches_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn branch_list_patterns_match_upstream_git() {
     let root = unique_temp_dir("branch-list-patterns");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         run_with_identity_at(
             &root,
@@ -4918,10 +4911,7 @@ fn branch_list_patterns_match_upstream_git() {
         );
         let expected = git(&root, &["branch", "-r", points_at_eq.as_str()]);
         let actual = git_rs(&root, &["branch", "-r", points_at_eq.as_str()]);
-        assert_eq!(
-            actual, expected,
-            "sley output differed for -r --points-at="
-        );
+        assert_eq!(actual, expected, "sley output differed for -r --points-at=");
         let expected = git(
             &root,
             &["branch", "-r", "--list", points_at_eq.as_str(), "origin/*"],
@@ -4960,10 +4950,7 @@ fn branch_list_patterns_match_upstream_git() {
         );
         let expected = git(&root, &["branch", "-a", points_at_eq.as_str()]);
         let actual = git_rs(&root, &["branch", "-a", points_at_eq.as_str()]);
-        assert_eq!(
-            actual, expected,
-            "sley output differed for -a --points-at="
-        );
+        assert_eq!(actual, expected, "sley output differed for -a --points-at=");
         let expected = git(
             &root,
             &["branch", "-a", "--list", points_at_eq.as_str(), "origin/*"],
@@ -5003,10 +4990,7 @@ fn branch_list_patterns_match_upstream_git() {
         let no_contains_eq = format!("--no-contains={main_oid}");
         let expected = git(&root, &["branch", no_contains_eq.as_str()]);
         let actual = git_rs(&root, &["branch", no_contains_eq.as_str()]);
-        assert_eq!(
-            actual, expected,
-            "sley output differed for --no-contains="
-        );
+        assert_eq!(actual, expected, "sley output differed for --no-contains=");
         let merged_eq = format!("--merged={main_oid}");
         let expected = git(&root, &["branch", merged_eq.as_str()]);
         let actual = git_rs(&root, &["branch", merged_eq.as_str()]);
@@ -5150,7 +5134,6 @@ fn branch_list_patterns_match_upstream_git() {
         let expected = git(&root, &["branch", no_merged_eq.as_str()]);
         let actual = git_rs(&root, &["branch", no_merged_eq.as_str()]);
         assert_eq!(actual, expected, "sley output differed for --no-merged=");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

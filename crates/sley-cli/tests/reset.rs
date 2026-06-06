@@ -98,7 +98,7 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -122,9 +122,8 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -143,7 +142,7 @@ fn reset_sha256_mixed_and_hard_match_upstream_git() {
         fs::write(repo.join("file.txt"), b"dirty\n").expect("write dirty");
         git(repo, &["add", "file.txt"]);
     }
-    let result = (|| {
+    {
         let args = ["reset", "--mixed", "HEAD~1"];
         let expected = run_output("git", &upstream_mixed, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust_mixed, &args);
@@ -165,9 +164,8 @@ fn reset_sha256_mixed_and_hard_match_upstream_git() {
                 assert_same_output(actual, expected, &args);
             }
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -177,7 +175,7 @@ fn reset_path_unstages_added_file_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -201,9 +199,8 @@ fn reset_path_unstages_added_file_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset added"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -213,7 +210,7 @@ fn reset_quiet_suppresses_unstaged_summary_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -226,9 +223,8 @@ fn reset_quiet_suppresses_unstaged_summary_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -238,7 +234,7 @@ fn reset_no_quiet_restores_unstaged_summary_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -251,9 +247,8 @@ fn reset_no_quiet_restores_unstaged_summary_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -263,7 +258,7 @@ fn reset_pathspec_from_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -284,9 +279,8 @@ fn reset_pathspec_from_file_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --pathspec-from-file"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -296,7 +290,7 @@ fn reset_pathspec_file_nul_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -322,9 +316,8 @@ fn reset_pathspec_file_nul_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --pathspec-file-nul"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -334,7 +327,7 @@ fn reset_pathspec_file_option_errors_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
         for repo in [&upstream, &rust] {
@@ -357,9 +350,8 @@ fn reset_pathspec_file_option_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
             assert_same_output(actual, expected, args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -369,7 +361,7 @@ fn reset_source_path_updates_index_without_moving_head_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -418,9 +410,8 @@ fn reset_source_path_updates_index_without_moving_head_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset <tree-ish> -- <path>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -430,7 +421,7 @@ fn reset_source_path_without_separator_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -472,9 +463,8 @@ fn reset_source_path_without_separator_matches_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset <tree-ish> <path>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -484,7 +474,7 @@ fn reset_hard_restores_index_and_worktree_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -518,9 +508,8 @@ fn reset_hard_restores_index_and_worktree_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --hard"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -530,7 +519,7 @@ fn reset_hard_quiet_suppresses_head_summary_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -542,9 +531,8 @@ fn reset_hard_quiet_suppresses_head_summary_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -554,7 +542,7 @@ fn reset_hard_to_commit_moves_head_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -593,9 +581,8 @@ fn reset_hard_to_commit_moves_head_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --hard <commit>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -605,7 +592,7 @@ fn reset_soft_to_commit_moves_head_only_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -644,9 +631,8 @@ fn reset_soft_to_commit_moves_head_only_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --soft <commit>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -656,7 +642,7 @@ fn reset_soft_rejects_paths_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -664,9 +650,8 @@ fn reset_soft_rejects_paths_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -676,7 +661,7 @@ fn reset_mixed_to_commit_moves_head_and_index_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -715,9 +700,8 @@ fn reset_mixed_to_commit_moves_head_and_index_like_upstream_git() {
             git(&upstream, &["status", "--short"]),
             "status differed after reset --mixed <commit>"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -727,7 +711,7 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
@@ -745,7 +729,6 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
         let expected = run_output("git", &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

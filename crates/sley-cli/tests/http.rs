@@ -13,8 +13,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -414,7 +414,7 @@ fn add_upstream_commit(project_root: &Path, bare: &Path) -> String {
         ],
     );
     run_success("git", &work, &["push", "-q", &bare_arg, "main"]);
-    trimmed_utf8(run_success("git", &bare, &["rev-parse", "refs/heads/main"]))
+    trimmed_utf8(run_success("git", bare, &["rev-parse", "refs/heads/main"]))
 }
 
 /// Creates a bare upstream repo named `repo.git` under `project_root` with a
@@ -488,7 +488,7 @@ fn ls_remote_http_matches_upstream() {
     let root = unique_temp_dir("http-ls-remote");
     let project_root = root.join("srv");
     std::fs::create_dir_all(&project_root).expect("create project root");
-    let result = (|| {
+    {
         create_upstream_repo(&project_root);
         let server = HttpBackendServer::start(&project_root, &http_backend);
         let url = server.url("/repo.git");
@@ -512,9 +512,8 @@ fn ls_remote_http_matches_upstream() {
             sorted_ref_lines(&expected.stdout),
             "sley ls-remote refs differed from upstream over http"
         );
-    })();
+    };
     let _ = std::fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -525,7 +524,7 @@ fn clone_http_smoke() {
     let root = unique_temp_dir("http-clone");
     let project_root = root.join("srv");
     std::fs::create_dir_all(&project_root).expect("create project root");
-    let result = (|| {
+    {
         let bare = create_upstream_repo(&project_root);
         let server = HttpBackendServer::start(&project_root, &http_backend);
         let url = server.url("/repo.git");
@@ -574,9 +573,8 @@ fn clone_http_smoke() {
             String::from_utf8_lossy(&fsck.stdout),
             String::from_utf8_lossy(&fsck.stderr)
         );
-    })();
+    };
     let _ = std::fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -587,7 +585,7 @@ fn fetch_http_incremental() {
     let root = unique_temp_dir("http-fetch");
     let project_root = root.join("srv");
     std::fs::create_dir_all(&project_root).expect("create project root");
-    let result = (|| {
+    {
         let bare = create_upstream_repo(&project_root);
         let server = HttpBackendServer::start(&project_root, &http_backend);
         let url = server.url("/repo.git");
@@ -648,9 +646,8 @@ fn fetch_http_incremental() {
             "fetched commit object {new_head} missing from clone\nstderr:\n{}",
             String::from_utf8_lossy(&cat.stderr)
         );
-    })();
+    };
     let _ = std::fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -661,7 +658,7 @@ fn push_http_creates_ref() {
     let root = unique_temp_dir("http-push");
     let project_root = root.join("srv");
     std::fs::create_dir_all(&project_root).expect("create project root");
-    let result = (|| {
+    {
         let bare = create_upstream_repo(&project_root);
         // Enable pushing over smart HTTP on the upstream bare repo.
         run_success("git", &bare, &["config", "http.receivepack", "true"]);
@@ -728,9 +725,8 @@ fn push_http_creates_ref() {
             "pushed commit object {local_head} missing from upstream\nstderr:\n{}",
             String::from_utf8_lossy(&cat.stderr)
         );
-    })();
+    };
     let _ = std::fs::remove_dir_all(&root);
-    result
 }
 
 /// Reads `<repo>/.git/shallow` as sorted lines (empty when the file is absent), so
@@ -763,7 +759,7 @@ fn clone_http_shallow_matches_upstream() {
     let root = unique_temp_dir("http-shallow-clone");
     let project_root = root.join("srv");
     std::fs::create_dir_all(&project_root).expect("create project root");
-    let result = (|| {
+    {
         // A four-commit linear `main` so depth 1 and depth 2 are distinguishable
         // and both still leave a real (non-empty) shallow boundary.
         create_deep_upstream_repo(&project_root, 4);
@@ -865,7 +861,6 @@ fn clone_http_shallow_matches_upstream() {
                 String::from_utf8_lossy(&log.stderr)
             );
         }
-    })();
+    };
     let _ = std::fs::remove_dir_all(&root);
-    result
 }

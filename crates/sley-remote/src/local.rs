@@ -14,29 +14,23 @@ use std::path::Path;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
-use sley_odb::{build_reachable_pack, collect_reachable_object_ids, FileObjectDatabase};
+use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
 use sley_protocol::{
-    apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
+    PKT_LINE_MAX_PAYLOAD_LEN, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
+    ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
+    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
     read_upload_pack_negotiation_request, read_upload_pack_raw_packfile_response,
     read_upload_pack_request, write_upload_pack_negotiation_request,
-    write_upload_pack_raw_packfile_response, write_upload_pack_request, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
-    SideBandChannel, SideBandPacket, UploadPackFeatures, UploadPackNegotiationRequest,
-    UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
-    PKT_LINE_MAX_PAYLOAD_LEN,
+    write_upload_pack_raw_packfile_response, write_upload_pack_request,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate};
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
-}
-
-/// Whether `oid` is the all-zero object id (a ref creation/deletion sentinel).
-fn is_zero_object_id(oid: &ObjectId) -> bool {
-    oid.as_bytes().iter().all(|byte| *byte == 0)
+    Ok(ObjectId::null(format))
 }
 
 /// Resolve a (possibly symbolic) ref target to its object id, following up to
@@ -216,7 +210,7 @@ pub fn receive_pack_into_local_repository(
             for command in commands {
                 tx.update(RefUpdate {
                     name: command.name.clone(),
-                    expected: (!is_zero_object_id(&command.old_id))
+                    expected: (!command.old_id.is_null())
                         .then(|| RefTarget::Direct(command.old_id.clone())),
                     new: RefTarget::Direct(command.new_id.clone()),
                     reflog: None,

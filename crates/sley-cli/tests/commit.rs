@@ -126,84 +126,78 @@ fn remove_message_fixtures(root: &Path) {
 fn commit_empty_message_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-empty-message-errors");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("empty-inline", vec!["commit", "-m", ""]),
-            ("whitespace-inline", vec!["commit", "-m", "   "]),
-            ("empty-file", vec!["commit", "-F", "message-empty.txt"]),
-            (
-                "whitespace-file",
-                vec!["commit", "--file", "message-whitespace.txt"],
-            ),
-            ("empty-signoff", vec!["commit", "-m", "", "-s"]),
-            (
-                "allow-then-disallow",
-                vec![
-                    "commit",
-                    "-m",
-                    "",
-                    "--allow-empty-message",
-                    "--no-allow-empty-message",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
+    for (name, args) in [
+        ("empty-inline", vec!["commit", "-m", ""]),
+        ("whitespace-inline", vec!["commit", "-m", "   "]),
+        ("empty-file", vec!["commit", "-F", "message-empty.txt"]),
+        (
+            "whitespace-file",
+            vec!["commit", "--file", "message-whitespace.txt"],
+        ),
+        ("empty-signoff", vec!["commit", "-m", "", "-s"]),
+        (
+            "allow-then-disallow",
+            vec![
+                "commit",
+                "-m",
+                "",
+                "--allow-empty-message",
+                "--no-allow-empty-message",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert_same_output(actual, expected, &args);
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert_same_output(actual, expected, &args);
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_clean_index_requires_allow_empty_like_upstream_git() {
     let root = unique_temp_dir("commit-clean-index");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("clean", vec!["commit", "-m", "second"]),
-            (
-                "allow-then-disallow",
-                vec![
-                    "commit",
-                    "--allow-empty",
-                    "--no-allow-empty",
-                    "-m",
-                    "second",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            create_initial_commit("git", &expected_root);
-            create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
+    for (name, args) in [
+        ("clean", vec!["commit", "-m", "second"]),
+        (
+            "allow-then-disallow",
+            vec![
+                "commit",
+                "--allow-empty",
+                "--no-allow-empty",
+                "-m",
+                "second",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        create_initial_commit("git", &expected_root);
+        create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert_same_output(actual, expected, &args);
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert_same_output(actual, expected, &args);
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_message_option_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-message-errors");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
         for args in [
@@ -368,16 +362,15 @@ fn commit_message_option_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_file_messages_match_upstream_git_objects() {
     let root = unique_temp_dir("commit-file-messages");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             ("file-no-lf", vec!["commit", "-F", "message-no-lf.txt"]),
             ("attached-file", vec!["commit", "-Fmessage-lf.txt"]),
@@ -989,16 +982,15 @@ fn commit_file_messages_match_upstream_git_objects() {
                 "committed object differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_status_preview_modes_match_upstream_git() {
     let root = unique_temp_dir("commit-status-preview");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         for (name, args) in [
             ("short-no-message", vec!["commit", "--short"]),
             ("short", vec!["commit", "--short", "-m", "subject"]),
@@ -1084,658 +1076,615 @@ fn commit_status_preview_modes_match_upstream_git() {
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
     let root = unique_temp_dir("commit-all-tracked");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args, deleted) in [
-            ("all-modified", vec!["commit", "-a", "-m", "second"], false),
-            ("all-long", vec!["commit", "--all", "-m", "second"], false),
-            ("all-attached-message", vec!["commit", "-amsecond"], false),
-            ("all-deleted", vec!["commit", "-a", "-m", "second"], true),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            create_initial_commit("git", &expected_root);
-            create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
-            if deleted {
-                fs::remove_file(expected_root.join("tracked.txt"))
-                    .expect("delete expected tracked");
-                fs::remove_file(actual_root.join("tracked.txt")).expect("delete actual tracked");
-            } else {
-                fs::write(expected_root.join("tracked.txt"), b"changed\n")
-                    .expect("modify expected tracked");
-                fs::write(actual_root.join("tracked.txt"), b"changed\n")
-                    .expect("modify actual tracked");
-            }
-            fs::write(expected_root.join("untracked.txt"), b"untracked\n")
-                .expect("write expected untracked");
-            fs::write(actual_root.join("untracked.txt"), b"untracked\n")
-                .expect("write actual untracked");
-
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
+    for (name, args, deleted) in [
+        ("all-modified", vec!["commit", "-a", "-m", "second"], false),
+        ("all-long", vec!["commit", "--all", "-m", "second"], false),
+        ("all-attached-message", vec!["commit", "-amsecond"], false),
+        ("all-deleted", vec!["commit", "-a", "-m", "second"], true),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        create_initial_commit("git", &expected_root);
+        create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
+        if deleted {
+            fs::remove_file(expected_root.join("tracked.txt")).expect("delete expected tracked");
+            fs::remove_file(actual_root.join("tracked.txt")).expect("delete actual tracked");
+        } else {
+            fs::write(expected_root.join("tracked.txt"), b"changed\n")
+                .expect("modify expected tracked");
+            fs::write(actual_root.join("tracked.txt"), b"changed\n")
+                .expect("modify actual tracked");
         }
-    })();
+        fs::write(expected_root.join("untracked.txt"), b"untracked\n")
+            .expect("write expected untracked");
+        fs::write(actual_root.join("untracked.txt"), b"untracked\n")
+            .expect("write actual untracked");
+
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_reuse_message_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-reuse-message");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("reuse-short", vec!["commit", "-C", "HEAD"]),
-            ("reuse-attached", vec!["commit", "-CHEAD"]),
-            ("reuse-long", vec!["commit", "--reuse-message", "HEAD"]),
-            ("reuse-equals", vec!["commit", "--reuse-message=HEAD"]),
-            (
-                "reuse-author-override",
-                vec![
-                    "commit",
-                    "-C",
-                    "HEAD",
-                    "--author=Override User <override@example.invalid>",
-                ],
-            ),
-            (
-                "reuse-date-override",
-                vec!["commit", "-C", "HEAD", "--date=@456 +0230"],
-            ),
-            (
-                "reuse-reset-author",
-                vec!["commit", "-C", "HEAD", "--reset-author"],
-            ),
-            (
-                "reuse-reset-author-cancelled",
-                vec![
-                    "commit",
-                    "-C",
-                    "HEAD",
-                    "--reset-author",
-                    "--no-reset-author",
-                ],
-            ),
-            (
-                "reuse-reset-author-restored",
-                vec![
-                    "commit",
-                    "-C",
-                    "HEAD",
-                    "--no-reset-author",
-                    "--reset-author",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
-            let initial_args = [
+    for (name, args) in [
+        ("reuse-short", vec!["commit", "-C", "HEAD"]),
+        ("reuse-attached", vec!["commit", "-CHEAD"]),
+        ("reuse-long", vec!["commit", "--reuse-message", "HEAD"]),
+        ("reuse-equals", vec!["commit", "--reuse-message=HEAD"]),
+        (
+            "reuse-author-override",
+            vec![
                 "commit",
-                "--author=Reuse User <reuse@example.invalid>",
-                "--date=@123 +0000",
-                "-m",
-                "reused subject",
-                "-m",
-                "reused body",
-            ];
-            let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
-            assert!(
-                expected_initial.status.success(),
-                "git initial commit failed: {}",
-                String::from_utf8_lossy(&expected_initial.stderr)
-            );
-            let actual_initial =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
-            assert!(
-                actual_initial.status.success(),
-                "sley initial commit failed: {}",
-                String::from_utf8_lossy(&actual_initial.stderr)
-            );
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
-            fs::write(expected_root.join("tracked.txt"), b"changed\n")
-                .expect("modify expected tracked");
-            fs::write(actual_root.join("tracked.txt"), b"changed\n")
-                .expect("modify actual tracked");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
+                "-C",
+                "HEAD",
+                "--author=Override User <override@example.invalid>",
+            ],
+        ),
+        (
+            "reuse-date-override",
+            vec!["commit", "-C", "HEAD", "--date=@456 +0230"],
+        ),
+        (
+            "reuse-reset-author",
+            vec!["commit", "-C", "HEAD", "--reset-author"],
+        ),
+        (
+            "reuse-reset-author-cancelled",
+            vec![
+                "commit",
+                "-C",
+                "HEAD",
+                "--reset-author",
+                "--no-reset-author",
+            ],
+        ),
+        (
+            "reuse-reset-author-restored",
+            vec![
+                "commit",
+                "-C",
+                "HEAD",
+                "--no-reset-author",
+                "--reset-author",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
+        let initial_args = [
+            "commit",
+            "--author=Reuse User <reuse@example.invalid>",
+            "--date=@123 +0000",
+            "-m",
+            "reused subject",
+            "-m",
+            "reused body",
+        ];
+        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        assert!(
+            expected_initial.status.success(),
+            "git initial commit failed: {}",
+            String::from_utf8_lossy(&expected_initial.stderr)
+        );
+        let actual_initial =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
+        assert!(
+            actual_initial.status.success(),
+            "sley initial commit failed: {}",
+            String::from_utf8_lossy(&actual_initial.stderr)
+        );
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
+        fs::write(expected_root.join("tracked.txt"), b"changed\n")
+            .expect("modify expected tracked");
+        fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_reedit_message_matches_upstream_git_objects_when_editor_is_noop() {
     let root = unique_temp_dir("commit-reedit-message");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("reedit-short", vec!["commit", "-c", "HEAD"]),
-            ("reedit-attached", vec!["commit", "-cHEAD"]),
-            ("reedit-long", vec!["commit", "--reedit-message", "HEAD"]),
-            ("reedit-equals", vec!["commit", "--reedit-message=HEAD"]),
-            (
-                "reedit-author-date-override",
-                vec![
-                    "commit",
-                    "-c",
-                    "HEAD",
-                    "--author=Override User <override@example.invalid>",
-                    "--date=@456 +0230",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
-            let initial_args = [
+    for (name, args) in [
+        ("reedit-short", vec!["commit", "-c", "HEAD"]),
+        ("reedit-attached", vec!["commit", "-cHEAD"]),
+        ("reedit-long", vec!["commit", "--reedit-message", "HEAD"]),
+        ("reedit-equals", vec!["commit", "--reedit-message=HEAD"]),
+        (
+            "reedit-author-date-override",
+            vec![
                 "commit",
-                "--author=Reuse User <reuse@example.invalid>",
-                "--date=@123 +0000",
-                "-m",
-                "reused subject",
-                "-m",
-                "reused body",
-            ];
-            let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
-            assert!(
-                expected_initial.status.success(),
-                "git initial commit failed: {}",
-                String::from_utf8_lossy(&expected_initial.stderr)
-            );
-            let actual_initial =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
-            assert!(
-                actual_initial.status.success(),
-                "sley initial commit failed: {}",
-                String::from_utf8_lossy(&actual_initial.stderr)
-            );
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
-            fs::write(expected_root.join("tracked.txt"), b"changed\n")
-                .expect("modify expected tracked");
-            fs::write(actual_root.join("tracked.txt"), b"changed\n")
-                .expect("modify actual tracked");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
+                "-c",
+                "HEAD",
+                "--author=Override User <override@example.invalid>",
+                "--date=@456 +0230",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
+        let initial_args = [
+            "commit",
+            "--author=Reuse User <reuse@example.invalid>",
+            "--date=@123 +0000",
+            "-m",
+            "reused subject",
+            "-m",
+            "reused body",
+        ];
+        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        assert!(
+            expected_initial.status.success(),
+            "git initial commit failed: {}",
+            String::from_utf8_lossy(&expected_initial.stderr)
+        );
+        let actual_initial =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
+        assert!(
+            actual_initial.status.success(),
+            "sley initial commit failed: {}",
+            String::from_utf8_lossy(&actual_initial.stderr)
+        );
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
+        fs::write(expected_root.join("tracked.txt"), b"changed\n")
+            .expect("modify expected tracked");
+        fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
 
-            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_amend_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-amend");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("amend-message", vec!["commit", "--amend", "-m", "amended"]),
-            ("amend-no-edit", vec!["commit", "--amend", "--no-edit"]),
-            (
-                "amend-reset-author",
-                vec!["commit", "--amend", "--reset-author", "-m", "amended"],
-            ),
-            (
-                "amend-reset-author-cancelled",
-                vec![
-                    "commit",
-                    "--amend",
-                    "--reset-author",
-                    "--no-reset-author",
-                    "-m",
-                    "amended",
-                ],
-            ),
-            (
-                "amend-author-date-override",
-                vec![
-                    "commit",
-                    "--amend",
-                    "--author=Override User <override@example.invalid>",
-                    "--date=@456 +0230",
-                    "-m",
-                    "amended",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            create_initial_commit("git", &expected_root);
-            create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
-
-            fs::write(expected_root.join("tracked.txt"), b"old\n").expect("modify expected old");
-            fs::write(actual_root.join("tracked.txt"), b"old\n").expect("modify actual old");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
-            let old_args = [
+    for (name, args) in [
+        ("amend-message", vec!["commit", "--amend", "-m", "amended"]),
+        ("amend-no-edit", vec!["commit", "--amend", "--no-edit"]),
+        (
+            "amend-reset-author",
+            vec!["commit", "--amend", "--reset-author", "-m", "amended"],
+        ),
+        (
+            "amend-reset-author-cancelled",
+            vec![
                 "commit",
-                "--author=Reuse User <reuse@example.invalid>",
-                "--date=@123 +0000",
+                "--amend",
+                "--reset-author",
+                "--no-reset-author",
                 "-m",
-                "old subject",
+                "amended",
+            ],
+        ),
+        (
+            "amend-author-date-override",
+            vec![
+                "commit",
+                "--amend",
+                "--author=Override User <override@example.invalid>",
+                "--date=@456 +0230",
                 "-m",
-                "old body",
-            ];
-            let expected_old = run_output_with_identity("git", &expected_root, &old_args);
-            assert!(
-                expected_old.status.success(),
-                "git old commit failed: {}",
-                String::from_utf8_lossy(&expected_old.stderr)
-            );
-            let actual_old =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &old_args);
-            assert!(
-                actual_old.status.success(),
-                "sley old commit failed: {}",
-                String::from_utf8_lossy(&actual_old.stderr)
-            );
+                "amended",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        create_initial_commit("git", &expected_root);
+        create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
 
-            fs::write(expected_root.join("tracked.txt"), b"amended\n")
-                .expect("modify expected amend");
-            fs::write(actual_root.join("tracked.txt"), b"amended\n").expect("modify actual amend");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
+        fs::write(expected_root.join("tracked.txt"), b"old\n").expect("modify expected old");
+        fs::write(actual_root.join("tracked.txt"), b"old\n").expect("modify actual old");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        let old_args = [
+            "commit",
+            "--author=Reuse User <reuse@example.invalid>",
+            "--date=@123 +0000",
+            "-m",
+            "old subject",
+            "-m",
+            "old body",
+        ];
+        let expected_old = run_output_with_identity("git", &expected_root, &old_args);
+        assert!(
+            expected_old.status.success(),
+            "git old commit failed: {}",
+            String::from_utf8_lossy(&expected_old.stderr)
+        );
+        let actual_old =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &old_args);
+        assert!(
+            actual_old.status.success(),
+            "sley old commit failed: {}",
+            String::from_utf8_lossy(&actual_old.stderr)
+        );
 
-            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        fs::write(expected_root.join("tracked.txt"), b"amended\n").expect("modify expected amend");
+        fs::write(actual_root.join("tracked.txt"), b"amended\n").expect("modify actual amend");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
+
+        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_fixup_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-fixup");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("fixup-long", vec!["commit", "--fixup", "HEAD"]),
-            ("fixup-equals", vec!["commit", "--fixup=HEAD"]),
-            (
-                "fixup-message",
-                vec!["commit", "--fixup", "HEAD", "-m", "body"],
-            ),
-            ("fixup-amend", vec!["commit", "--fixup=amend:HEAD"]),
-            ("fixup-reword", vec!["commit", "--fixup=reword:HEAD"]),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
-            let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
-            let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
-            assert!(
-                expected_initial.status.success(),
-                "git initial commit failed: {}",
-                String::from_utf8_lossy(&expected_initial.stderr)
-            );
-            let actual_initial =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
-            assert!(
-                actual_initial.status.success(),
-                "sley initial commit failed: {}",
-                String::from_utf8_lossy(&actual_initial.stderr)
-            );
-            fs::write(expected_root.join("tracked.txt"), b"changed\n")
-                .expect("modify expected tracked");
-            fs::write(actual_root.join("tracked.txt"), b"changed\n")
-                .expect("modify actual tracked");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
+    for (name, args) in [
+        ("fixup-long", vec!["commit", "--fixup", "HEAD"]),
+        ("fixup-equals", vec!["commit", "--fixup=HEAD"]),
+        (
+            "fixup-message",
+            vec!["commit", "--fixup", "HEAD", "-m", "body"],
+        ),
+        ("fixup-amend", vec!["commit", "--fixup=amend:HEAD"]),
+        ("fixup-reword", vec!["commit", "--fixup=reword:HEAD"]),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
+        let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
+        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        assert!(
+            expected_initial.status.success(),
+            "git initial commit failed: {}",
+            String::from_utf8_lossy(&expected_initial.stderr)
+        );
+        let actual_initial =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
+        assert!(
+            actual_initial.status.success(),
+            "sley initial commit failed: {}",
+            String::from_utf8_lossy(&actual_initial.stderr)
+        );
+        fs::write(expected_root.join("tracked.txt"), b"changed\n")
+            .expect("modify expected tracked");
+        fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
 
-            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_squash_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-squash");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            ("squash-long", vec!["commit", "--squash", "HEAD"]),
-            (
-                "squash-equals",
-                vec!["commit", "--squash=HEAD", "-m", "body"],
-            ),
-            (
-                "squash-message",
-                vec!["commit", "--squash", "HEAD", "-m", "body"],
-            ),
-            (
-                "squash-file",
-                vec!["commit", "--squash", "HEAD", "-F", "message-lf.txt"],
-            ),
-            (
-                "squash-reuse-body",
-                vec!["commit", "--squash", "HEAD", "-C", "HEAD"],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
-            let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
-            let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
-            assert!(
-                expected_initial.status.success(),
-                "git initial commit failed: {}",
-                String::from_utf8_lossy(&expected_initial.stderr)
-            );
-            let actual_initial =
-                run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
-            assert!(
-                actual_initial.status.success(),
-                "sley initial commit failed: {}",
-                String::from_utf8_lossy(&actual_initial.stderr)
-            );
-            fs::write(expected_root.join("tracked.txt"), b"changed\n")
-                .expect("modify expected tracked");
-            fs::write(actual_root.join("tracked.txt"), b"changed\n")
-                .expect("modify actual tracked");
-            run_success("git", &expected_root, &["add", "tracked.txt"]);
-            run_success("git", &actual_root, &["add", "tracked.txt"]);
+    for (name, args) in [
+        ("squash-long", vec!["commit", "--squash", "HEAD"]),
+        (
+            "squash-equals",
+            vec!["commit", "--squash=HEAD", "-m", "body"],
+        ),
+        (
+            "squash-message",
+            vec!["commit", "--squash", "HEAD", "-m", "body"],
+        ),
+        (
+            "squash-file",
+            vec!["commit", "--squash", "HEAD", "-F", "message-lf.txt"],
+        ),
+        (
+            "squash-reuse-body",
+            vec!["commit", "--squash", "HEAD", "-C", "HEAD"],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
+        let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
+        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        assert!(
+            expected_initial.status.success(),
+            "git initial commit failed: {}",
+            String::from_utf8_lossy(&expected_initial.stderr)
+        );
+        let actual_initial =
+            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &initial_args);
+        assert!(
+            actual_initial.status.success(),
+            "sley initial commit failed: {}",
+            String::from_utf8_lossy(&actual_initial.stderr)
+        );
+        fs::write(expected_root.join("tracked.txt"), b"changed\n")
+            .expect("modify expected tracked");
+        fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
+        run_success("git", &expected_root, &["add", "tracked.txt"]);
+        run_success("git", &actual_root, &["add", "tracked.txt"]);
 
-            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity_and_editor(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual_root,
-                &args,
-            );
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual =
+            run_output_with_identity_and_editor(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_allow_empty_matches_upstream_git_objects() {
     let root = unique_temp_dir("commit-allow-empty");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            (
-                "allow-empty",
-                vec!["commit", "--allow-empty", "-m", "second"],
-            ),
-            (
-                "disallow-then-allow-empty",
-                vec![
-                    "commit",
-                    "--no-allow-empty",
-                    "--allow-empty",
-                    "-m",
-                    "second",
-                ],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            create_initial_commit("git", &expected_root);
-            create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
-            remove_message_fixtures(&expected_root);
-            remove_message_fixtures(&actual_root);
+    for (name, args) in [
+        (
+            "allow-empty",
+            vec!["commit", "--allow-empty", "-m", "second"],
+        ),
+        (
+            "disallow-then-allow-empty",
+            vec![
+                "commit",
+                "--no-allow-empty",
+                "--allow-empty",
+                "-m",
+                "second",
+            ],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        create_initial_commit("git", &expected_root);
+        create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
+        remove_message_fixtures(&expected_root);
+        remove_message_fixtures(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_author_and_date_options_match_upstream_git_objects() {
     let root = unique_temp_dir("commit-author-date");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (name, args) in [
-            (
-                "author-long",
-                vec![
-                    "commit",
-                    "--author",
-                    "Other User <other@example.invalid>",
-                    "-m",
-                    "subject",
-                ],
-            ),
-            (
-                "author-equals",
-                vec![
-                    "commit",
-                    "--author=Other User <other@example.invalid>",
-                    "-m",
-                    "subject",
-                ],
-            ),
-            (
-                "date-long",
-                vec!["commit", "--date", "@123 +0230", "-m", "subject"],
-            ),
-            (
-                "date-equals",
-                vec!["commit", "--date=@123456 -0700", "-m", "subject"],
-            ),
-            (
-                "author-and-date",
-                vec![
-                    "commit",
-                    "--author=Other User <other@example.invalid>",
-                    "--date=@123 +0230",
-                    "-m",
-                    "subject",
-                ],
-            ),
-            (
-                "author-reset",
-                vec![
-                    "commit",
-                    "--author=Other User <other@example.invalid>",
-                    "--no-author",
-                    "-m",
-                    "subject",
-                ],
-            ),
-            (
-                "date-reset",
-                vec!["commit", "--date=@123 +0230", "--no-date", "-m", "subject"],
-            ),
-        ] {
-            let expected_root = root.join(format!("{name}-expected"));
-            let actual_root = root.join(format!("{name}-actual"));
-            fs::create_dir_all(&expected_root).expect("create expected repo");
-            fs::create_dir_all(&actual_root).expect("create actual repo");
-            prepare_commit_repo(&expected_root);
-            prepare_commit_repo(&actual_root);
+    for (name, args) in [
+        (
+            "author-long",
+            vec![
+                "commit",
+                "--author",
+                "Other User <other@example.invalid>",
+                "-m",
+                "subject",
+            ],
+        ),
+        (
+            "author-equals",
+            vec![
+                "commit",
+                "--author=Other User <other@example.invalid>",
+                "-m",
+                "subject",
+            ],
+        ),
+        (
+            "date-long",
+            vec!["commit", "--date", "@123 +0230", "-m", "subject"],
+        ),
+        (
+            "date-equals",
+            vec!["commit", "--date=@123456 -0700", "-m", "subject"],
+        ),
+        (
+            "author-and-date",
+            vec![
+                "commit",
+                "--author=Other User <other@example.invalid>",
+                "--date=@123 +0230",
+                "-m",
+                "subject",
+            ],
+        ),
+        (
+            "author-reset",
+            vec![
+                "commit",
+                "--author=Other User <other@example.invalid>",
+                "--no-author",
+                "-m",
+                "subject",
+            ],
+        ),
+        (
+            "date-reset",
+            vec!["commit", "--date=@123 +0230", "--no-date", "-m", "subject"],
+        ),
+    ] {
+        let expected_root = root.join(format!("{name}-expected"));
+        let actual_root = root.join(format!("{name}-actual"));
+        fs::create_dir_all(&expected_root).expect("create expected repo");
+        fs::create_dir_all(&actual_root).expect("create actual repo");
+        prepare_commit_repo(&expected_root);
+        prepare_commit_repo(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
-            assert!(
-                expected.status.success(),
-                "git {args:?} failed: {}",
-                String::from_utf8_lossy(&expected.stderr)
-            );
-            let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
-            assert!(
-                actual.status.success(),
-                "sley {args:?} failed: {}",
-                String::from_utf8_lossy(&actual.stderr)
-            );
-            assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
-                "committed object differed for {args:?}"
-            );
-        }
-    })();
+        let expected = run_output_with_identity("git", &expected_root, &args);
+        assert!(
+            expected.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&expected.stderr)
+        );
+        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
+        assert!(
+            actual.status.success(),
+            "sley {args:?} failed: {}",
+            String::from_utf8_lossy(&actual.stderr)
+        );
+        assert_eq!(
+            cat_head("git", &actual_root),
+            cat_head("git", &expected_root),
+            "committed object differed for {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_tree_argument_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-argument-errors");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         for args in [
@@ -1749,16 +1698,15 @@ fn commit_tree_argument_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn commit_tree_file_messages_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-file-messages");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run_success("git", &root, &["init", "-q"]);
         fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
@@ -1811,9 +1759,8 @@ fn commit_tree_file_messages_match_upstream_git() {
         let expected = run_output_with_identity("git", &root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 fn git_available() -> bool {

@@ -39,7 +39,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn ls_tree_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-pathspecs");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("--dash.txt"), b"dash\n").expect("write dash path");
@@ -78,16 +78,15 @@ fn ls_tree_pathspecs_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_show_trees_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-show-trees");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -123,16 +122,15 @@ fn ls_tree_show_trees_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_directories_only_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-directories-only");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -168,16 +166,15 @@ fn ls_tree_directories_only_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_name_status_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-name-status");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -209,71 +206,67 @@ fn ls_tree_name_status_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_quoted_paths_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-quoted-paths");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (case, path) in [
-            ("space", "space name.txt"),
-            ("quote", "quote\"name.txt"),
-            ("tab", "tab\tname.txt"),
-        ] {
-            let repo = root.join(case);
-            fs::create_dir_all(&repo).expect("create case repo");
-            git(&repo, &["init", "-q"]);
-            fs::write(repo.join(path), b"content\n").expect("write quoted fixture");
-            git(&repo, &["add", path]);
-            git(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=Example User",
-                    "-c",
-                    "user.email=example@example.invalid",
-                    "commit",
-                    "-m",
-                    "base",
-                    "-q",
-                ],
-            );
+    for (case, path) in [
+        ("space", "space name.txt"),
+        ("quote", "quote\"name.txt"),
+        ("tab", "tab\tname.txt"),
+    ] {
+        let repo = root.join(case);
+        fs::create_dir_all(&repo).expect("create case repo");
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(path), b"content\n").expect("write quoted fixture");
+        git(&repo, &["add", path]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
 
-            for args in [
-                vec!["ls-tree", "HEAD"],
-                vec!["ls-tree", "-z", "HEAD"],
-                vec!["ls-tree", "--name-only", "HEAD"],
-                vec!["ls-tree", "--name-only", "-z", "HEAD"],
-                vec!["ls-tree", "--format=%(path)", "HEAD"],
-                vec!["ls-tree", "-z", "--format=%(path)", "HEAD"],
-                vec![
-                    "ls-tree",
-                    "--format=%(objectmode) %(objecttype) %(objectname)%x09%(path)",
-                    "HEAD",
-                ],
-            ] {
-                let expected = git(&repo, &args);
-                let actual = git_rs(&repo, &args);
-                assert_eq!(
-                    actual, expected,
-                    "sley output differed for {args:?} path {path:?}"
-                );
-            }
+        for args in [
+            vec!["ls-tree", "HEAD"],
+            vec!["ls-tree", "-z", "HEAD"],
+            vec!["ls-tree", "--name-only", "HEAD"],
+            vec!["ls-tree", "--name-only", "-z", "HEAD"],
+            vec!["ls-tree", "--format=%(path)", "HEAD"],
+            vec!["ls-tree", "-z", "--format=%(path)", "HEAD"],
+            vec![
+                "ls-tree",
+                "--format=%(objectmode) %(objecttype) %(objectname)%x09%(path)",
+                "HEAD",
+            ],
+        ] {
+            let expected = git(&repo, &args);
+            let actual = git_rs(&repo, &args);
+            assert_eq!(
+                actual, expected,
+                "sley output differed for {args:?} path {path:?}"
+            );
         }
-    })();
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_abbrev_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-abbrev");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -309,9 +302,8 @@ fn ls_tree_abbrev_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -319,7 +311,7 @@ fn ls_tree_nested_cwd_full_name_and_full_tree_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-nested-cwd");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     fs::create_dir_all(root.join("other")).expect("create other dir");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -375,16 +367,15 @@ fn ls_tree_nested_cwd_full_name_and_full_tree_match_upstream_git() {
             let actual = git_rs(&nested, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_tree_format_placeholders_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-format");
     fs::create_dir_all(root.join("dir")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -427,7 +418,6 @@ fn ls_tree_format_placeholders_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

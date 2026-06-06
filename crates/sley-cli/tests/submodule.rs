@@ -95,7 +95,7 @@ fn embed_submodule_git_dir(superproject: &Path, path: &str) {
 fn submodule_status_sha256_superproject_matches_upstream_git() {
     let root = unique_temp_dir("submodule-status-sha256");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let upstream_child = root.join("upstream-child");
         let actual_child = root.join("actual-child");
         let upstream_super = root.join("upstream-super");
@@ -145,16 +145,15 @@ fn submodule_status_sha256_superproject_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_super, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_status_matches_upstream_git() {
     let root = unique_temp_dir("submodule-status");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -290,16 +289,15 @@ fn submodule_status_matches_upstream_git() {
                 "child update",
             ],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_status_sorts_multiple_submodules_like_upstream_git() {
     let root = unique_temp_dir("submodule-status-sort");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child_a = root.join("child-a");
         let child_b = root.join("child-b");
         let superproject = root.join("super");
@@ -366,16 +364,15 @@ fn submodule_status_sorts_multiple_submodules_like_upstream_git() {
         let expected = run("git", &nested, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &nested, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
     let root = unique_temp_dir("submodule-status-tag-suffix");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -448,16 +445,15 @@ fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
         let expected = run("git", &superproject, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_status_directory_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("submodule-status-directory-pathspecs");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child_a = root.join("child-a");
         let child_b = root.join("child-b");
         let superproject = root.join("super");
@@ -531,16 +527,15 @@ fn submodule_status_directory_pathspecs_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &nested, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_status_recursive_matches_upstream_git() {
     let root = unique_temp_dir("submodule-status-recursive");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let grandchild = root.join("grandchild");
         let child = root.join("child");
         let superproject = root.join("super");
@@ -621,16 +616,15 @@ fn submodule_status_recursive_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_init_registers_local_config_like_upstream_git() {
     let root = unique_temp_dir("submodule-init");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -717,16 +711,15 @@ fn submodule_init_registers_local_config_like_upstream_git() {
         );
         let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_sync_updates_registered_urls_like_upstream_git() {
     let root = unique_temp_dir("submodule-sync");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child_a = root.join("child-a");
         let child_b = root.join("child-b");
         let superproject = root.join("super");
@@ -827,16 +820,15 @@ fn submodule_sync_updates_registered_urls_like_upstream_git() {
         let expected = run("git", &superproject, &bad_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &bad_args);
         assert_same_output(actual, expected, &bad_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
     let root = unique_temp_dir("submodule-set-url");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -955,16 +947,15 @@ fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
         let expected = run("git", &superproject, &usage_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &usage_args);
         assert_same_output(actual, expected, &usage_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
     let root = unique_temp_dir("submodule-set-branch");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -1093,16 +1084,15 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_foreach_runs_commands_like_upstream_git() {
     let root = unique_temp_dir("submodule-foreach");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -1154,16 +1144,15 @@ fn submodule_foreach_runs_commands_like_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_foreach_recursive_matches_upstream_git() {
     let root = unique_temp_dir("submodule-foreach-recursive");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let grandchild = root.join("grandchild");
         let child = root.join("child");
         let superproject = root.join("super");
@@ -1251,16 +1240,15 @@ fn submodule_foreach_recursive_matches_upstream_git() {
         let expected = run("git", &superproject, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_summary_clean_cases_match_upstream_git() {
     let root = unique_temp_dir("submodule-summary-clean");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -1427,16 +1415,15 @@ fn submodule_summary_clean_cases_match_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
     let root = unique_temp_dir("submodule-absorbgitdirs");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -1519,16 +1506,15 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn submodule_deinit_unregisters_local_config_like_upstream_git() {
     let root = unique_temp_dir("submodule-deinit");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
+    {
         let child = root.join("child");
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
@@ -1642,7 +1628,6 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &superproject, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

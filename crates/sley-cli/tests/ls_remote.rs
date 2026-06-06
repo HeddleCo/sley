@@ -138,7 +138,7 @@ fn fake_ssh_script(root: &Path) -> PathBuf {
 #[test]
 fn ls_remote_local_repository_matches_upstream_git() {
     let root = unique_temp_dir("ls-remote-local");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root");
         let remote = prepare_remote_repo(&root);
         let remote_arg = remote.to_string_lossy().to_string();
@@ -280,15 +280,14 @@ fn ls_remote_local_repository_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_remote_ssh_repository_matches_upstream_git_protocol_v0() {
     let root = unique_temp_dir("ls-remote-ssh");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root");
         let remote = prepare_remote_repo(&root);
         let fake_ssh = fake_ssh_script(&root);
@@ -317,15 +316,14 @@ fn ls_remote_ssh_repository_matches_upstream_git_protocol_v0() {
             );
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_remote_configured_percent_encoded_ssh_remote_matches_upstream_git() {
     let root = unique_temp_dir("ls-remote-configured-percent-ssh");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root");
         let remote_dir = root.join("remote with space");
         fs::create_dir_all(&remote_dir).expect("create remote dir");
@@ -354,15 +352,14 @@ fn ls_remote_configured_percent_encoded_ssh_remote_matches_upstream_git() {
             );
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_remote_configured_local_remote_matches_upstream_git() {
     let root = unique_temp_dir("ls-remote-configured");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root");
         prepare_remote_repo(&root);
         let remote_file_url = file_url(&root.join("remote"));
@@ -420,15 +417,14 @@ fn ls_remote_configured_local_remote_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
     let root = unique_temp_dir("ls-remote-configured-percent-file");
-    let result = (|| {
+    {
         fs::create_dir_all(&root).expect("create root");
         let remote = root.join("remote repo");
         fs::create_dir_all(&remote).expect("create remote");
@@ -466,7 +462,6 @@ fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
             let actual = run(env!("CARGO_BIN_EXE_sley"), &client, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

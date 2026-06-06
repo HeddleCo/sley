@@ -79,7 +79,7 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         git(&upstream, &["init", "-q"]);
         git(&rust, &["init", "-q"]);
 
@@ -456,9 +456,8 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
             !rust.join(".git/refs/remotes/upstream/HEAD").exists(),
             "sley did not delete remote HEAD symbolic ref"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -468,7 +467,7 @@ fn remote_rename_moves_packed_remote_tracking_refs_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             git(repo, &["init", "-q"]);
             git(
@@ -526,9 +525,8 @@ fn remote_rename_moves_packed_remote_tracking_refs_match_upstream_git() {
             !packed_refs.contains("refs/remotes/origin/"),
             "sley left old packed remote-tracking refs after rename"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -538,7 +536,7 @@ fn remote_remove_cleans_refs_and_branch_config_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             git(repo, &["init", "-q"]);
             git(
@@ -640,19 +638,15 @@ fn remote_remove_cleans_refs_and_branch_config_match_upstream_git() {
         );
         let expected = git(&upstream, &["remote", "-v"]);
         let actual = git(&rust, &["remote", "-v"]);
-        assert_eq!(
-            actual, expected,
-            "sley remote output differed after remove"
-        );
+        assert_eq!(actual, expected, "sley remote output differed after remove");
         let packed_refs =
             fs::read_to_string(rust.join(".git/packed-refs")).expect("read packed-refs");
         assert!(
             !packed_refs.contains("refs/remotes/origin/"),
             "sley left old packed remote-tracking refs after remove"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -662,7 +656,7 @@ fn remote_set_url_old_url_errors_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         git(&upstream, &["init", "-q"]);
         git(&rust, &["init", "-q"]);
         for repo in [&upstream, &rust] {
@@ -795,9 +789,8 @@ fn remote_set_url_old_url_errors_match_upstream_git() {
             expected,
             &["config", "--local", "--get-regexp", "^remote\\.origin\\."],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -807,7 +800,7 @@ fn remote_set_branches_negations_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         git(&upstream, &["init", "-q"]);
         git(&rust, &["init", "-q"]);
         for repo in [&upstream, &rust] {
@@ -855,9 +848,8 @@ fn remote_set_branches_negations_match_upstream_git() {
                 "sley fetch refspecs differed after {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -867,7 +859,7 @@ fn remote_set_head_option_order_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             git(repo, &["init", "-q"]);
             git(
@@ -933,9 +925,8 @@ fn remote_set_head_option_order_matches_upstream_git() {
                 &["symbolic-ref", "refs/remotes/origin/HEAD"],
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -948,7 +939,7 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
     for repo in [&expected_remote, &actual_remote, &upstream, &rust] {
         fs::create_dir_all(repo).expect("create repo dir");
     }
-    let result = (|| {
+    {
         for repo in [&expected_remote, &actual_remote] {
             git(repo, &["init", "-q"]);
             git(repo, &["checkout", "-q", "-b", "main"]);
@@ -1003,9 +994,8 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
             actual, expected,
             "sley remote HEAD target differed after changed auto set-head"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1017,7 +1007,7 @@ fn remote_show_local_remote_matches_upstream_git() {
     for repo in [&remote, &upstream, &rust] {
         fs::create_dir_all(repo).expect("create repo dir");
     }
-    let result = (|| {
+    {
         git(&remote, &["init", "-q"]);
         git(&remote, &["checkout", "-q", "-b", "main"]);
         git(&remote, &["config", "user.email", "a@b.c"]);
@@ -1075,9 +1065,8 @@ fn remote_show_local_remote_matches_upstream_git() {
             run_output("git", &upstream, &args),
             &args,
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1089,7 +1078,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
     for repo in [&remote, &upstream, &rust] {
         fs::create_dir_all(repo).expect("create repo dir");
     }
-    let result = (|| {
+    {
         git(&remote, &["init", "-q"]);
         git(&remote, &["checkout", "-q", "-b", "main"]);
         git(&remote, &["config", "user.email", "a@b.c"]);
@@ -1201,9 +1190,8 @@ fn remote_prune_local_remote_matches_upstream_git() {
             actual, expected,
             "sley remote-tracking refs differed after prune"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1213,7 +1201,7 @@ fn remote_add_track_branches_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         git(&upstream, &["init", "-q"]);
         git(&rust, &["init", "-q"]);
 
@@ -1236,179 +1224,175 @@ fn remote_add_track_branches_match_upstream_git() {
         let expected = git(&upstream, &["remote", "-v"]);
         let actual = git_rs(&rust, &["remote", "-v"]);
         assert_eq!(actual, expected, "sley verbose remote output differed");
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn remote_add_config_options_match_upstream_git() {
     let root = unique_temp_dir("remote-add-options");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (label, args) in [
-            (
-                "master",
-                vec![
-                    "remote",
-                    "add",
-                    "-m",
-                    "main",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "master-equals",
-                vec![
-                    "remote",
-                    "add",
-                    "--master=main",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "tags",
-                vec![
-                    "remote",
-                    "add",
-                    "--tags",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "no-tags",
-                vec![
-                    "remote",
-                    "add",
-                    "--no-tags",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "tags-reset",
-                vec![
-                    "remote",
-                    "add",
-                    "--tags",
-                    "--no-tags",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "track-reset",
-                vec![
-                    "remote",
-                    "add",
-                    "-t",
-                    "main",
-                    "--no-track",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "master-reset",
-                vec![
-                    "remote",
-                    "add",
-                    "-m",
-                    "main",
-                    "--no-master",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "mirror-fetch",
-                vec![
-                    "remote",
-                    "add",
-                    "--mirror=fetch",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "mirror-push",
-                vec![
-                    "remote",
-                    "add",
-                    "--mirror=push",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "deprecated-mirror",
-                vec![
-                    "remote",
-                    "add",
-                    "--mirror",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "mirror-fetch-reset",
-                vec![
-                    "remote",
-                    "add",
-                    "--mirror=fetch",
-                    "--no-mirror",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "mirror-push-reset",
-                vec![
-                    "remote",
-                    "add",
-                    "--mirror=push",
-                    "--no-mirror",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-            (
-                "combined",
-                vec![
-                    "remote",
-                    "add",
-                    "--tags",
-                    "-t",
-                    "main",
-                    "-m",
-                    "main",
-                    "origin",
-                    "https://example.invalid/repo.git",
-                ],
-            ),
-        ] {
-            let expected = root.join(format!("expected-{label}"));
-            let actual = root.join(format!("actual-{label}"));
-            fs::create_dir_all(&expected).expect("create expected repo");
-            fs::create_dir_all(&actual).expect("create actual repo");
-            git(&expected, &["init", "-q"]);
-            git(&actual, &["init", "-q"]);
+    for (label, args) in [
+        (
+            "master",
+            vec![
+                "remote",
+                "add",
+                "-m",
+                "main",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "master-equals",
+            vec![
+                "remote",
+                "add",
+                "--master=main",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "tags",
+            vec![
+                "remote",
+                "add",
+                "--tags",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "no-tags",
+            vec![
+                "remote",
+                "add",
+                "--no-tags",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "tags-reset",
+            vec![
+                "remote",
+                "add",
+                "--tags",
+                "--no-tags",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "track-reset",
+            vec![
+                "remote",
+                "add",
+                "-t",
+                "main",
+                "--no-track",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "master-reset",
+            vec![
+                "remote",
+                "add",
+                "-m",
+                "main",
+                "--no-master",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "mirror-fetch",
+            vec![
+                "remote",
+                "add",
+                "--mirror=fetch",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "mirror-push",
+            vec![
+                "remote",
+                "add",
+                "--mirror=push",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "deprecated-mirror",
+            vec![
+                "remote",
+                "add",
+                "--mirror",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "mirror-fetch-reset",
+            vec![
+                "remote",
+                "add",
+                "--mirror=fetch",
+                "--no-mirror",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "mirror-push-reset",
+            vec![
+                "remote",
+                "add",
+                "--mirror=push",
+                "--no-mirror",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+        (
+            "combined",
+            vec![
+                "remote",
+                "add",
+                "--tags",
+                "-t",
+                "main",
+                "-m",
+                "main",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        ),
+    ] {
+        let expected = root.join(format!("expected-{label}"));
+        let actual = root.join(format!("actual-{label}"));
+        fs::create_dir_all(&expected).expect("create expected repo");
+        fs::create_dir_all(&actual).expect("create actual repo");
+        git(&expected, &["init", "-q"]);
+        git(&actual, &["init", "-q"]);
 
-            let expected_output = run_output("git", &expected, &args);
-            let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected_output, &args);
-            assert_remote_config_matches(&expected, &actual, label);
-            let expected_head = fs::read(expected.join(".git/refs/remotes/origin/HEAD")).ok();
-            let actual_head = fs::read(actual.join(".git/refs/remotes/origin/HEAD")).ok();
-            assert_eq!(
-                actual_head, expected_head,
-                "remote HEAD differed after {label}"
-            );
-        }
-    })();
+        let expected_output = run_output("git", &expected, &args);
+        let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+        assert_remote_config_matches(&expected, &actual, label);
+        let expected_head = fs::read(expected.join(".git/refs/remotes/origin/HEAD")).ok();
+        let actual_head = fs::read(actual.join(".git/refs/remotes/origin/HEAD")).ok();
+        assert_eq!(
+            actual_head, expected_head,
+            "remote HEAD differed after {label}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }

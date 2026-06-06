@@ -165,7 +165,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     }
 
     let out_dir = options.output_directory.as_deref().unwrap_or(".");
-    let out_dir_path = resolve_cli_path(&cwd, out_dir);
+    let out_dir_path = resolve_cli_path(cwd, out_dir);
     fs::create_dir_all(&out_dir_path)?;
     let mut stdout = io::stdout();
     for (idx, record) in commits.iter().enumerate() {

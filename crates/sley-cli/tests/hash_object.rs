@@ -43,10 +43,10 @@ fn run_output_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
         .expect("stdin pipe")
         .write_all(stdin)
         .expect("write stdin");
-    let output = child
+
+    child
         .wait_with_output()
-        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"));
-    output
+        .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
 fn run_output_with_env_and_stdin(
@@ -107,7 +107,7 @@ fn hash_object_git_object_directory_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run("git", &expected, &["init", "-q"]);
         run("git", &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
@@ -167,16 +167,15 @@ fn hash_object_git_object_directory_matches_upstream_git() {
                 .join(name)
                 .exists()
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn hash_object_multiple_inputs_match_upstream_git() {
     let root = unique_temp_dir("hash-object-multiple-inputs");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
@@ -200,9 +199,8 @@ fn hash_object_multiple_inputs_match_upstream_git() {
             let actual = git_rs(&root, &args, stdin);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -212,7 +210,7 @@ fn hash_object_sha256_repo_default_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run("git", &expected, &["init", "-q", "--object-format=sha256"]);
         run("git", &actual, &["init", "-q", "--object-format=sha256"]);
         for repo in [&expected, &actual] {
@@ -244,16 +242,15 @@ fn hash_object_sha256_repo_default_matches_upstream_git() {
                 "expected SHA-256 object ids for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn hash_object_filter_path_and_option_errors_match_upstream_git() {
     let root = unique_temp_dir("hash-object-filter-path");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         let stdin = b"stdin\n";
@@ -302,16 +299,15 @@ fn hash_object_filter_path_and_option_errors_match_upstream_git() {
             let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn hash_object_stdin_paths_matches_upstream_git() {
     let root = unique_temp_dir("hash-object-stdin-paths");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         run("git", &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
@@ -347,7 +343,6 @@ fn hash_object_stdin_paths_matches_upstream_git() {
             let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

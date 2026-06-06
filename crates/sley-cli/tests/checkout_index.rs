@@ -150,7 +150,7 @@ fn checkout_index_all_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-all");
     let (upstream, rust) = prepare_pair("all", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
@@ -174,9 +174,8 @@ fn checkout_index_all_matches_upstream_git() {
             worktree_status(&upstream),
             "status differed after checkout-index -a"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -186,15 +185,14 @@ fn checkout_index_existing_without_force_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-existing");
     let (upstream, rust) = prepare_pair("existing", &root);
-    let result = (|| {
+    {
         // Leave the worktree populated so each entry already exists on disk.
         let args = ["checkout-index", "-a"];
         let expected = run("git", &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -204,7 +202,7 @@ fn checkout_index_force_overwrites_match_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-force");
     let (upstream, rust) = prepare_pair("force", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             fs::write(repo.join("file.txt"), b"dirty\n").expect("dirty worktree");
         }
@@ -223,9 +221,8 @@ fn checkout_index_force_overwrites_match_upstream_git() {
             worktree_status(&upstream),
             "status differed after checkout-index -a -f"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -235,7 +232,7 @@ fn checkout_index_explicit_paths_match_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-paths");
     let (upstream, rust) = prepare_pair("paths", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
@@ -254,9 +251,8 @@ fn checkout_index_explicit_paths_match_upstream_git() {
             worktree_status(&upstream),
             "status differed after explicit-path checkout-index"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -266,7 +262,7 @@ fn checkout_index_missing_path_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-missing");
     let (upstream, rust) = prepare_pair("missing", &root);
-    let result = (|| {
+    {
         let args = ["checkout-index", "absent.txt"];
         let expected = run("git", &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
@@ -277,9 +273,8 @@ fn checkout_index_missing_path_matches_upstream_git() {
         let expected = run("git", &upstream, &quiet_args);
         let actual = run(GIT_RS, &rust, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -289,7 +284,7 @@ fn checkout_index_prefix_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-prefix");
     let (upstream, rust) = prepare_pair("prefix", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             fs::create_dir_all(repo.join("out")).expect("create out dir");
         }
@@ -313,9 +308,8 @@ fn checkout_index_prefix_matches_upstream_git() {
             fs::read(upstream.join("out/dir/nested.txt")).expect("read upstream prefixed nested"),
             "prefixed nested content differed"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -325,7 +319,7 @@ fn checkout_index_stdin_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-stdin");
     let (upstream, rust) = prepare_pair("stdin", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
@@ -340,9 +334,8 @@ fn checkout_index_stdin_matches_upstream_git() {
             worktree_status(&upstream),
             "status differed after checkout-index --stdin"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -352,7 +345,7 @@ fn checkout_index_stdin_nul_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-stdin-nul");
     let (upstream, rust) = prepare_pair("stdin-nul", &root);
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
@@ -367,9 +360,8 @@ fn checkout_index_stdin_nul_matches_upstream_git() {
             worktree_status(&upstream),
             "status differed after checkout-index --stdin -z"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -379,7 +371,7 @@ fn checkout_index_update_stat_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-update");
     let (upstream, rust) = prepare_pair("update", &root);
-    let result = (|| {
+    {
         // Recreate worktree files so their stat info diverges from the index,
         // then `-u` should refresh stat data and leave a clean status.
         for repo in [&upstream, &rust] {
@@ -405,9 +397,8 @@ fn checkout_index_update_stat_matches_upstream_git() {
         let expected = run("git", &upstream, &diff_args);
         let actual = run("git", &rust, &diff_args);
         assert_same_output(actual, expected, &diff_args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -417,14 +408,13 @@ fn checkout_index_mix_all_and_paths_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-mix-all");
     let (upstream, rust) = prepare_pair("mix-all", &root);
-    let result = (|| {
+    {
         let args = ["checkout-index", "-a", "file.txt"];
         let expected = run("git", &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -434,14 +424,13 @@ fn checkout_index_mix_stdin_and_paths_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-mix-stdin");
     let (upstream, rust) = prepare_pair("mix-stdin", &root);
-    let result = (|| {
+    {
         let args = ["checkout-index", "--stdin", "file.txt"];
         let expected = run_with_stdin("git", &upstream, &args, b"");
         let actual = run_with_stdin(GIT_RS, &rust, &args, b"");
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -454,7 +443,7 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         for repo in [&upstream, &rust] {
             run_success("git", repo, &["init", "-q"]);
             run_success("git", repo, &["config", "core.autocrlf", "false"]);
@@ -493,9 +482,8 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
             staged_index(&upstream),
             "index differed after mode checkout-index"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -505,7 +493,7 @@ fn checkout_index_subdir_all_matches_upstream_git() {
     }
     let root = unique_temp_dir("checkout-index-subdir");
     let (upstream, rust) = prepare_pair("subdir", &root);
-    let result = (|| {
+    {
         // `-a` from a subdirectory only checks out entries beneath it, written
         // to their repository-relative paths.
         for repo in [&upstream, &rust] {
@@ -528,9 +516,8 @@ fn checkout_index_subdir_all_matches_upstream_git() {
             upstream.join("file.txt").exists(),
             "subdir checkout should not write root-level entry"
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[cfg(unix)]

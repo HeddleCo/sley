@@ -166,7 +166,7 @@ fn check_attr_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
 
@@ -254,9 +254,8 @@ fn check_attr_matches_upstream_git() {
             let actual = git_rs(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -266,7 +265,7 @@ fn check_attr_cached_toggle_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
         run("git", &upstream, &["add", "."]);
@@ -364,9 +363,8 @@ fn check_attr_cached_toggle_matches_upstream_git() {
             let actual = git_rs(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -376,7 +374,7 @@ fn check_attr_source_option_matches_upstream_when_tree_matches_worktree() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
         for repo in [&upstream, &rust] {
@@ -467,9 +465,8 @@ fn check_attr_source_option_matches_upstream_when_tree_matches_worktree() {
             let actual = git_rs(&rust, &args, stdin);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -481,7 +478,7 @@ fn check_attr_cached_honors_git_index_file_like_upstream_git() {
     let rust_index = root.join("rust-index");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         fixture(&upstream);
         fixture(&rust);
         for (repo, index) in [(&upstream, &upstream_index), (&rust, &rust_index)] {
@@ -525,9 +522,8 @@ fn check_attr_cached_honors_git_index_file_like_upstream_git() {
         );
         let actual = git_rs_with_env(&rust, &args, None, &[("GIT_INDEX_FILE", &rust_index)], &[]);
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -541,7 +537,7 @@ fn check_attr_default_global_attributes_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     fs::create_dir_all(home.join(".config/git")).expect("create home attributes dir");
     fs::create_dir_all(xdg.join("git")).expect("create xdg attributes dir");
-    let result = (|| {
+    {
         run("git", &upstream, &["init", "-q"]);
         run("git", &rust, &["init", "-q"]);
         fs::write(
@@ -587,7 +583,6 @@ fn check_attr_default_global_attributes_match_upstream_git() {
             &[],
         );
         assert_same_output(actual, expected, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

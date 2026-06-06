@@ -124,9 +124,7 @@ pub(crate) fn cmd_bisect(args: &[String]) -> Result<()> {
 }
 
 fn print_bisect_usage() {
-    eprintln!(
-        "usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old>]"
-    );
+    eprintln!("usage: git bisect start [--term-(bad|new)=<term-new> --term-(good|old)=<term-old>]");
     eprintln!(
         "                        [--no-checkout] [--first-parent] [<bad> [<good>...]] [--] [<pathspec>...]"
     );
@@ -240,12 +238,18 @@ fn cmd_bisect_start(args: &[String]) -> Result<()> {
     remove_bisect_state_files(&repo)?;
 
     fs::write(repo.state_path("BISECT_START"), format!("{start_name}\n"))?;
-    fs::write(repo.state_path("BISECT_NAMES"), names_file_contents(&pathspecs))?;
+    fs::write(
+        repo.state_path("BISECT_NAMES"),
+        names_file_contents(&pathspecs),
+    )?;
     write_bisect_terms(&repo, &terms)?;
     if no_checkout {
         // Record that we should not move the working tree; we still keep BISECT
         // bookkeeping. The presence of the file mirrors git.
-        fs::write(repo.state_path("BISECT_HEAD"), format!("{}\n", current_head_oid(&repo)?.to_hex()))?;
+        fs::write(
+            repo.state_path("BISECT_HEAD"),
+            format!("{}\n", current_head_oid(&repo)?.to_hex()),
+        )?;
     }
     let _ = first_parent; // accepted; the linear midpoint search already follows history.
 
@@ -277,10 +281,7 @@ fn cmd_bisect_start(args: &[String]) -> Result<()> {
 }
 
 /// Resolve the term pair for `start`, validating any user overrides.
-fn resolve_start_terms(
-    term_good: Option<String>,
-    term_bad: Option<String>,
-) -> Result<BisectTerms> {
+fn resolve_start_terms(term_good: Option<String>, term_bad: Option<String>) -> Result<BisectTerms> {
     let mut terms = BisectTerms::default();
     if let Some(good) = term_good {
         validate_term(&good)?;
@@ -291,9 +292,7 @@ fn resolve_start_terms(
         terms.bad = bad;
     }
     if terms.good == terms.bad {
-        eprintln!(
-            "fatal: please use two different terms",
-        );
+        eprintln!("fatal: please use two different terms",);
         return Err(GitError::Exit(128));
     }
     Ok(terms)
@@ -303,8 +302,21 @@ fn validate_term(term: &str) -> Result<()> {
     // git rejects terms that collide with subcommands or are not valid ref
     // components.
     const RESERVED: &[&str] = &[
-        "bad", "new", "good", "old", "skip", "start", "terms", "reset", "log",
-        "replay", "next", "visualize", "view", "run", "help",
+        "bad",
+        "new",
+        "good",
+        "old",
+        "skip",
+        "start",
+        "terms",
+        "reset",
+        "log",
+        "replay",
+        "next",
+        "visualize",
+        "view",
+        "run",
+        "help",
     ];
     if term.is_empty()
         || RESERVED.contains(&term)
@@ -341,7 +353,10 @@ fn cmd_bisect_state(args: &[String], mark: BisectMark) -> Result<()> {
     // accept at most one rev; `good`/`old` accept several.
     let revs: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
     if mark == BisectMark::Bad && revs.len() > 1 {
-        eprintln!("error: 'git bisect {}' can take only one argument.", terms.bad);
+        eprintln!(
+            "error: 'git bisect {}' can take only one argument.",
+            terms.bad
+        );
         return Err(GitError::Exit(1));
     }
 
@@ -534,9 +549,7 @@ fn cmd_bisect_reset(args: &[String]) -> Result<()> {
     // "HEAD is now at" messaging matches git. A branch name checks out the
     // branch; anything else detaches.
     let store = FileRefStore::new(&repo.git_dir, repo.format);
-    let is_branch = store
-        .read_ref(&format!("refs/heads/{target}"))?
-        .is_some();
+    let is_branch = store.read_ref(&format!("refs/heads/{target}"))?.is_some();
     if is_branch {
         cmd_checkout(&[target])
     } else {
@@ -678,10 +691,7 @@ fn cmd_bisect_terms(args: &[String]) -> Result<()> {
 
     match args.first().map(String::as_str) {
         None => {
-            println!(
-                "Your current terms are {} for the old state",
-                terms.good
-            );
+            println!("Your current terms are {} for the old state", terms.good);
             println!("and {} for the new state.", terms.bad);
             Ok(())
         }
@@ -757,9 +767,7 @@ fn bisect_auto_next(
         return Ok(());
     }
     if !have_bad && good_count > 0 {
-        let status = format!(
-            "waiting for bad commit, {good_count} good commit known"
-        );
+        let status = format!("waiting for bad commit, {good_count} good commit known");
         println!("status: {status}");
         write_log_status(repo, &status)?;
         return Ok(());
@@ -856,13 +864,8 @@ fn bisect_step(repo: &BisectRepo, terms: &BisectTerms, no_checkout: bool) -> Res
 
     let Some(choice) = best_unskipped else {
         // Every candidate is skipped; git reports it cannot conclude.
-        eprintln!(
-            "There are only 'skip'ped commits left to test."
-        );
-        eprintln!(
-            "The first {} commit could be any of:",
-            terms.bad
-        );
+        eprintln!("There are only 'skip'ped commits left to test.");
+        eprintln!("The first {} commit could be any of:", terms.bad);
         for record in &candidates {
             println!("{}", record.oid.to_hex());
         }
@@ -1352,7 +1355,10 @@ fn commit_subject_of(repo: &BisectRepo, oid: &ObjectId) -> Result<String> {
 }
 
 fn bisect_option_requires_value(option: &str) -> Result<()> {
-    eprintln!("error: option `{}' requires a value", option.trim_start_matches('-'));
+    eprintln!(
+        "error: option `{}' requires a value",
+        option.trim_start_matches('-')
+    );
     eprintln!();
     print_bisect_usage();
     Err(GitError::Exit(129))

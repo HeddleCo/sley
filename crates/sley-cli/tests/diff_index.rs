@@ -104,7 +104,14 @@ fn assert_same_all(cwd: &Path, args: &[&str]) {
 /// Initialise a fresh repo at `<root>/repo` with the default object format.
 fn init_repo(root: &Path) -> PathBuf {
     let repo = root.join("repo");
-    git_ok(root, &["init", "-q", repo.to_str().unwrap()]);
+    git_ok(
+        root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
     repo
 }
 
@@ -117,17 +124,17 @@ fn diff_index_output_modes_match_git() {
     }
     let root = unique_temp_dir("diff-index-modes");
     let repo = init_repo(&root);
-    fs::write(repo.join("f1.txt"), "a\nb\nc\n").unwrap();
-    fs::write(repo.join("f2.txt"), "keep\n").unwrap();
-    fs::create_dir(repo.join("sub")).unwrap();
-    fs::write(repo.join("sub/nested.txt"), "deep\n").unwrap();
+    fs::write(repo.join("f1.txt"), "a\nb\nc\n").expect("test operation should succeed");
+    fs::write(repo.join("f2.txt"), "keep\n").expect("test operation should succeed");
+    fs::create_dir(repo.join("sub")).expect("test operation should succeed");
+    fs::write(repo.join("sub/nested.txt"), "deep\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
 
     // Stage a modify, a delete, and an add.
-    fs::write(repo.join("f1.txt"), "a\nB\nc\nd\n").unwrap();
-    fs::remove_file(repo.join("f2.txt")).unwrap();
-    fs::write(repo.join("f3.txt"), "new\n").unwrap();
+    fs::write(repo.join("f1.txt"), "a\nB\nc\nd\n").expect("test operation should succeed");
+    fs::remove_file(repo.join("f2.txt")).expect("test operation should succeed");
+    fs::write(repo.join("f3.txt"), "new\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     for flags in [
@@ -161,13 +168,13 @@ fn diff_index_nul_terminated_matches_git() {
     }
     let root = unique_temp_dir("diff-index-z");
     let repo = init_repo(&root);
-    fs::write(repo.join("a.txt"), "one\n").unwrap();
-    fs::write(repo.join("b.txt"), "two\n").unwrap();
+    fs::write(repo.join("a.txt"), "one\n").expect("test operation should succeed");
+    fs::write(repo.join("b.txt"), "two\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("a.txt"), "one\nmore\n").unwrap();
-    fs::remove_file(repo.join("b.txt")).unwrap();
-    fs::write(repo.join("c.txt"), "three\n").unwrap();
+    fs::write(repo.join("a.txt"), "one\nmore\n").expect("test operation should succeed");
+    fs::remove_file(repo.join("b.txt")).expect("test operation should succeed");
+    fs::write(repo.join("c.txt"), "three\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "-z", "--cached", "HEAD"]);
@@ -197,16 +204,17 @@ fn diff_index_worktree_matches_git() {
     }
     let root = unique_temp_dir("diff-index-worktree");
     let repo = init_repo(&root);
-    fs::write(repo.join("tracked.txt"), "v1\n").unwrap();
-    fs::write(repo.join("staged.txt"), "s1\n").unwrap();
+    fs::write(repo.join("tracked.txt"), "v1\n").expect("test operation should succeed");
+    fs::write(repo.join("staged.txt"), "s1\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
 
     // staged.txt: staged change (index == worktree -> real oid).
-    fs::write(repo.join("staged.txt"), "s2\n").unwrap();
+    fs::write(repo.join("staged.txt"), "s2\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "staged.txt"]);
     // tracked.txt: unstaged worktree edit (index != worktree -> zeroed oid).
-    fs::write(repo.join("tracked.txt"), "v1\nworktree-only\n").unwrap();
+    fs::write(repo.join("tracked.txt"), "v1\nworktree-only\n")
+        .expect("test operation should succeed");
 
     assert_same(&repo, &["diff-index", "HEAD"]);
     assert_same(&repo, &["diff-index", "--raw", "HEAD"]);
@@ -229,13 +237,15 @@ fn diff_index_rename_copy_detection_matches_git() {
     }
     let root = unique_temp_dir("diff-index-rename");
     let repo = init_repo(&root);
-    fs::write(repo.join("orig.txt"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
-    fs::write(repo.join("keep.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    fs::write(repo.join("orig.txt"), "line1\nline2\nline3\nline4\nline5\n")
+        .expect("test operation should succeed");
+    fs::write(repo.join("keep.txt"), "alpha\nbeta\ngamma\n")
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
 
     git_ok(&repo, &["mv", "orig.txt", "renamed.txt"]);
-    fs::copy(repo.join("keep.txt"), repo.join("copy.txt")).unwrap();
+    fs::copy(repo.join("keep.txt"), repo.join("copy.txt")).expect("test operation should succeed");
     git_ok(&repo, &["add", "copy.txt"]);
 
     // diff.renames=true must NOT make plumbing diff-index detect renames.
@@ -300,13 +310,13 @@ fn diff_index_reverse_and_filter_match_git() {
     }
     let root = unique_temp_dir("diff-index-filter");
     let repo = init_repo(&root);
-    fs::write(repo.join("mod.txt"), "x\n").unwrap();
-    fs::write(repo.join("del.txt"), "y\n").unwrap();
+    fs::write(repo.join("mod.txt"), "x\n").expect("test operation should succeed");
+    fs::write(repo.join("del.txt"), "y\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("mod.txt"), "x\nz\n").unwrap();
-    fs::remove_file(repo.join("del.txt")).unwrap();
-    fs::write(repo.join("add.txt"), "w\n").unwrap();
+    fs::write(repo.join("mod.txt"), "x\nz\n").expect("test operation should succeed");
+    fs::remove_file(repo.join("del.txt")).expect("test operation should succeed");
+    fs::write(repo.join("add.txt"), "w\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "-R", "--cached", "HEAD"]);
@@ -360,10 +370,10 @@ fn diff_index_abbrev_controls_match_git() {
     }
     let root = unique_temp_dir("diff-index-abbrev");
     let repo = init_repo(&root);
-    fs::write(repo.join("f.txt"), "a\nb\nc\n").unwrap();
+    fs::write(repo.join("f.txt"), "a\nb\nc\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("f.txt"), "a\nB\nc\n").unwrap();
+    fs::write(repo.join("f.txt"), "a\nB\nc\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "--cached", "HEAD"]);
@@ -418,13 +428,13 @@ fn diff_index_pathspec_matches_git() {
     }
     let root = unique_temp_dir("diff-index-pathspec");
     let repo = init_repo(&root);
-    fs::create_dir(repo.join("dir")).unwrap();
-    fs::write(repo.join("top.txt"), "t\n").unwrap();
-    fs::write(repo.join("dir/inner.txt"), "i\n").unwrap();
+    fs::create_dir(repo.join("dir")).expect("test operation should succeed");
+    fs::write(repo.join("top.txt"), "t\n").expect("test operation should succeed");
+    fs::write(repo.join("dir/inner.txt"), "i\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("top.txt"), "t\nt2\n").unwrap();
-    fs::write(repo.join("dir/inner.txt"), "i\ni2\n").unwrap();
+    fs::write(repo.join("top.txt"), "t\nt2\n").expect("test operation should succeed");
+    fs::write(repo.join("dir/inner.txt"), "i\ni2\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "--cached", "HEAD", "--", "dir"]);
@@ -447,7 +457,7 @@ fn diff_index_treeish_and_exit_codes_match_git() {
     }
     let root = unique_temp_dir("diff-index-treeish");
     let repo = init_repo(&root);
-    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    fs::write(repo.join("a.txt"), "a\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
     git_ok(&repo, &["tag", "v1"]);
@@ -462,7 +472,7 @@ fn diff_index_treeish_and_exit_codes_match_git() {
     assert_same(&repo, &["diff-index", "--cached", &tree]);
 
     // Stage a change: exit code becomes 1 for --exit-code/--quiet.
-    fs::write(repo.join("a.txt"), "a\nb\n").unwrap();
+    fs::write(repo.join("a.txt"), "a\nb\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     assert_same(&repo, &["diff-index", "--exit-code", "--cached", "HEAD"]);
     assert_same(&repo, &["diff-index", "--quiet", "--cached", "HEAD"]);
@@ -481,7 +491,7 @@ fn diff_index_empty_tree_matches_git() {
     }
     let root = unique_temp_dir("diff-index-empty-tree");
     let repo = init_repo(&root);
-    fs::write(repo.join("only.txt"), "content\n").unwrap();
+    fs::write(repo.join("only.txt"), "content\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "only.txt"]);
     let empty = git(&repo, &["hash-object", "-t", "tree", "/dev/null"]);
     let empty = String::from_utf8_lossy(&empty.stdout).trim().to_string();
@@ -501,10 +511,12 @@ fn diff_index_binary_matches_git() {
     }
     let root = unique_temp_dir("diff-index-binary");
     let repo = init_repo(&root);
-    fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3, 255, 0, 7]).unwrap();
+    fs::write(repo.join("bin.dat"), [0u8, 1, 2, 3, 255, 0, 7])
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("bin.dat"), [0u8, 1, 9, 9, 255, 0, 7, 42]).unwrap();
+    fs::write(repo.join("bin.dat"), [0u8, 1, 9, 9, 255, 0, 7, 42])
+        .expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "-p", "--cached", "HEAD"]);
@@ -523,10 +535,10 @@ fn diff_index_quoted_paths_match_git() {
     }
     let root = unique_temp_dir("diff-index-quoting");
     let repo = init_repo(&root);
-    fs::write(repo.join("spaced name.txt"), "a b\n").unwrap();
+    fs::write(repo.join("spaced name.txt"), "a b\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
-    fs::write(repo.join("spaced name.txt"), "a b\nc d\n").unwrap();
+    fs::write(repo.join("spaced name.txt"), "a b\nc d\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
 
     assert_same(&repo, &["diff-index", "--cached", "HEAD"]);
@@ -546,7 +558,7 @@ fn diff_index_usage_and_errors_match_git() {
     }
     let root = unique_temp_dir("diff-index-usage");
     let repo = init_repo(&root);
-    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    fs::write(repo.join("a.txt"), "a\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "."]);
     git_ok(&repo, &["commit", "-qm", "base"]);
 

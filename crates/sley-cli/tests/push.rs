@@ -9,13 +9,13 @@ use sley_core::{Capability, ObjectFormat, ObjectId};
 use sley_fetch::install_upload_pack_raw_response;
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    build_receive_pack_push_request, demux_upload_pack_packfile_response,
-    read_receive_pack_report_status, read_ref_advertisement_set,
-    read_upload_pack_packfile_response, read_upload_pack_raw_packfile_response,
-    write_upload_pack_negotiation_request, write_upload_pack_request, ReceivePackCommand,
-    ReceivePackCommandStatus, ReceivePackFeatures, ReceivePackPushRequestOptions,
-    ReceivePackUnpackStatus, UploadPackAcknowledgment, UploadPackNegotiationRequest,
-    UploadPackRequest,
+    ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
+    ReceivePackPushRequestOptions, ReceivePackUnpackStatus, UploadPackAcknowledgment,
+    UploadPackNegotiationRequest, UploadPackRequest, build_receive_pack_push_request,
+    demux_upload_pack_packfile_response, read_receive_pack_report_status,
+    read_ref_advertisement_set, read_upload_pack_packfile_response,
+    read_upload_pack_raw_packfile_response, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -355,10 +355,12 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     let mut stdout = output.stdout.as_slice();
     let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
         .expect("parse receive-pack advertisements");
-    assert!(advertisements.refs[0]
-        .capabilities
-        .iter()
-        .any(|capability| capability.name == "report-status"));
+    assert!(
+        advertisements.refs[0]
+            .capabilities
+            .iter()
+            .any(|capability| capability.name == "report-status")
+    );
     assert!(advertisements.refs[0].capabilities.contains(&Capability {
         name: "object-format".into(),
         value: Some("sha1".into()),
@@ -636,11 +638,13 @@ fn upload_pack_service_serves_raw_pack() {
     write_upload_pack_negotiation_request(
         &mut encoded_request,
         &UploadPackNegotiationRequest {
-            haves: vec![ObjectId::from_hex(
-                ObjectFormat::Sha1,
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            )
-            .expect("parse unknown have")],
+            haves: vec![
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                )
+                .expect("parse unknown have"),
+            ],
             done: true,
         },
     )
@@ -663,10 +667,12 @@ fn upload_pack_service_serves_raw_pack() {
     let mut stdout = output.stdout.as_slice();
     let advertisements = read_ref_advertisement_set(ObjectFormat::Sha1, &mut stdout)
         .expect("parse upload-pack advertisements");
-    assert!(advertisements
-        .refs
-        .iter()
-        .any(|advertisement| advertisement.name == "HEAD" && advertisement.oid == head));
+    assert!(
+        advertisements
+            .refs
+            .iter()
+            .any(|advertisement| advertisement.name == "HEAD" && advertisement.oid == head)
+    );
     assert!(advertisements.refs[0].capabilities.contains(&Capability {
         name: "object-format".into(),
         value: Some("sha1".into()),
@@ -681,9 +687,11 @@ fn upload_pack_service_serves_raw_pack() {
     let receiver_db = FileObjectDatabase::from_git_dir(&receiver, ObjectFormat::Sha1);
     install_upload_pack_raw_response(&response, &receiver_db)
         .expect("install upload-pack response pack");
-    assert!(receiver_db
-        .contains(&head)
-        .expect("read receiver object db"));
+    assert!(
+        receiver_db
+            .contains(&head)
+            .expect("read receiver object db")
+    );
     assert!(
         !loose_object_path(&receiver, &head.to_string()).exists(),
         "upload-pack response should install as pack, not loose object"
@@ -768,9 +776,11 @@ fn upload_pack_service_serves_sideband_64k_pack() {
     receiver_db
         .install_raw_pack(&demuxed.data)
         .expect("install sideband pack");
-    assert!(receiver_db
-        .contains(&head)
-        .expect("read receiver object db"));
+    assert!(
+        receiver_db
+            .contains(&head)
+            .expect("read receiver object db")
+    );
     assert!(
         !loose_object_path(&receiver, &head.to_string()).exists(),
         "upload-pack sideband response should install as pack, not loose object"
@@ -820,7 +830,7 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
     fs::create_dir_all(&actual_work).expect("create actual work");
     fs::create_dir_all(&expected_remote).expect("create expected remote");
     fs::create_dir_all(&actual_remote).expect("create actual remote");
-    let result = (|| {
+    {
         create_work_repo(&expected_work, None);
         create_work_repo(&actual_work, None);
         create_bare_repo(&expected_remote, None);
@@ -866,9 +876,8 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
             &actual_remote,
             &["cat-file", "-p", "refs/heads/main:payload.txt"],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -883,7 +892,7 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
     fs::create_dir_all(&actual_work).expect("create actual work");
     fs::create_dir_all(&expected_remote).expect("create expected remote");
     fs::create_dir_all(&actual_remote).expect("create actual remote");
-    let result = (|| {
+    {
         create_work_repo(&expected_work, None);
         create_work_repo(&actual_work, None);
         create_bare_repo(&expected_remote, None);
@@ -931,9 +940,8 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
             &actual_remote,
             &["cat-file", "-p", "refs/heads/main:payload.txt"],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -944,7 +952,7 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
     let remote = root.join("remote repo.git");
     fs::create_dir_all(&work).expect("create work");
     fs::create_dir_all(&remote).expect("create remote");
-    let result = (|| {
+    {
         create_work_repo(&work, None);
         create_bare_repo(&remote, None);
         let remote_url = percent_encoded_file_url(&remote);
@@ -970,9 +978,8 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
         let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
         assert_eq!(remote_head, local_head);
         assert_remote_stored_pushed_objects_in_pack(&remote);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -984,7 +991,7 @@ fn push_rejects_non_fast_forward_without_force() {
     let remote = root.join("remote.git");
     fs::create_dir_all(&work).expect("create work");
     fs::create_dir_all(&remote).expect("create remote");
-    let result = (|| {
+    {
         create_work_repo(&work, None);
         create_bare_repo(&remote, None);
         let remote_arg = remote.to_string_lossy();
@@ -1049,9 +1056,8 @@ fn push_rejects_non_fast_forward_without_force() {
             remote_head
         );
         assert_ne!(remote_head, local_head);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -1063,7 +1069,7 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
     let remote = root.join("remote.git");
     fs::create_dir_all(&work).expect("create work");
     fs::create_dir_all(&remote).expect("create remote");
-    let result = (|| {
+    {
         create_work_repo(&work, None);
         create_bare_repo(&remote, None);
         let remote_arg = remote.to_string_lossy();
@@ -1116,9 +1122,8 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
             local_head
         );
         assert_remote_stored_pushed_objects_in_pack(&remote);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]

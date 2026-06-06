@@ -631,7 +631,7 @@ impl FileRefStore {
                 "branch {branch} already exists"
             )));
         }
-        let zero = ObjectId::from_raw(self.format, &vec![0; self.format.raw_len()])?;
+        let zero = ObjectId::null(self.format);
         let mut tx = self.transaction();
         tx.update(RefUpdate {
             name: name.clone(),
@@ -2185,7 +2185,7 @@ where
 }
 
 fn null_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 #[cfg(test)]
@@ -2198,8 +2198,8 @@ mod tests {
     #[test]
     fn loose_ref_round_trips_direct() {
         let oid = "ce013625030ba8dba906f756967f9e9ca394464a";
-        let reference =
-            parse_loose_ref(ObjectFormat::Sha1, "refs/heads/main", oid.as_bytes()).unwrap();
+        let reference = parse_loose_ref(ObjectFormat::Sha1, "refs/heads/main", oid.as_bytes())
+            .expect("test operation should succeed");
         assert_eq!(write_loose_ref(&reference), format!("{oid}\n").into_bytes());
     }
 
@@ -2209,7 +2209,7 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut store = RefStore::new();
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -2218,7 +2218,7 @@ mod tests {
             new: RefTarget::Direct(oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
         assert_eq!(store.get("refs/heads/main"), Some(&RefTarget::Direct(oid)));
     }
 
@@ -2227,11 +2227,16 @@ mod tests {
         let packed = b"# pack-refs with: peeled fully-peeled sorted \n\
 ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 ^e69de29bb2d1d6434b8b29ae775ad8c2e48c5391\n";
-        let refs = parse_packed_refs(ObjectFormat::Sha1, packed).unwrap();
+        let refs =
+            parse_packed_refs(ObjectFormat::Sha1, packed).expect("test operation should succeed");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].reference.name, "refs/tags/v1");
         assert_eq!(
-            refs[0].peeled.as_ref().unwrap().to_hex(),
+            refs[0]
+                .peeled
+                .as_ref()
+                .expect("test operation should succeed")
+                .to_hex(),
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
         );
     }
@@ -2242,17 +2247,17 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let peeled_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let refs = vec![
             PackedRef {
                 reference: Ref {
@@ -2269,15 +2274,19 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 peeled: None,
             },
         ];
-        let bytes = write_packed_refs(&refs).unwrap();
+        let bytes = write_packed_refs(&refs).expect("test operation should succeed");
         let expected = format!(
             "# pack-refs with: peeled fully-peeled sorted \n\
 {head_oid} refs/heads/main\n\
 {tag_oid} refs/tags/v1\n\
 ^{peeled_oid}\n"
         );
-        assert_eq!(String::from_utf8(bytes.clone()).unwrap(), expected);
-        let parsed = parse_packed_refs(ObjectFormat::Sha1, &bytes).unwrap();
+        assert_eq!(
+            String::from_utf8(bytes.clone()).expect("test operation should succeed"),
+            expected
+        );
+        let parsed =
+            parse_packed_refs(ObjectFormat::Sha1, &bytes).expect("test operation should succeed");
         assert_eq!(parsed[0], refs[1]);
         assert_eq!(parsed[1], refs[0]);
     }
@@ -2399,28 +2408,32 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
             new: RefTarget::Direct(oid.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).unwrap(),
+                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
                 new_oid: oid.clone(),
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
             }),
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid))
         );
-        let log = store.read_reflog("refs/heads/main").unwrap();
+        let log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].message, b"update by test");
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2431,17 +2444,17 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_main = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -2449,7 +2462,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(old_main.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         let applied = store
             .apply_bundle_ref_updates(
@@ -2468,7 +2481,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     message: b"bundle: import refs".to_vec(),
                 }),
             )
-            .unwrap();
+            .expect("test operation should succeed");
 
         assert_eq!(
             applied,
@@ -2486,23 +2499,34 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ]
         );
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(new_main.clone()))
         );
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag_oid.clone()))
         );
-        let main_log = store.read_reflog("refs/heads/main").unwrap();
+        let main_log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(main_log.len(), 1);
         assert_eq!(main_log[0].old_oid, old_main);
         assert_eq!(main_log[0].new_oid, new_main);
         assert_eq!(main_log[0].message, b"bundle: import refs");
-        let tag_log = store.read_reflog("refs/tags/v1.0").unwrap();
+        let tag_log = store
+            .read_reflog("refs/tags/v1.0")
+            .expect("test operation should succeed");
         assert_eq!(tag_log.len(), 1);
-        assert_eq!(tag_log[0].old_oid, zero_oid(ObjectFormat::Sha1).unwrap());
+        assert_eq!(
+            tag_log[0].old_oid,
+            zero_oid(ObjectFormat::Sha1).expect("test operation should succeed")
+        );
         assert_eq!(tag_log[0].new_oid, tag_oid);
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2513,7 +2537,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let result = store.apply_bundle_ref_updates(
             &[
@@ -2530,8 +2554,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         );
 
         assert!(result.is_err());
-        assert_eq!(store.read_ref("refs/heads/main").unwrap(), None);
-        fs::remove_dir_all(git_dir).unwrap();
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2542,7 +2571,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -2550,7 +2579,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Symbolic("refs/heads/base".into()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         let result = store.apply_bundle_ref_updates(
             &[BundleRefUpdate {
@@ -2562,10 +2591,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
         assert!(result.is_err());
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Symbolic("refs/heads/base".into()))
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2576,19 +2607,19 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
             new: RefTarget::Direct(first.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).unwrap(),
+                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
                 new_oid: first.clone(),
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"old".to_vec(),
@@ -2605,13 +2636,15 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 message: b"new".to_vec(),
             }),
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         let removed = store
             .expire_reflog_older_than("refs/heads/main", 50)
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(removed, 1);
-        let log = store.read_reflog("refs/heads/main").unwrap();
+        let log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].new_oid, second);
         assert_eq!(log[0].message, b"new");
@@ -2623,7 +2656,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .join("main.lock")
                 .exists()
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2634,7 +2667,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let branch = store
             .create_branch(
                 "feature",
@@ -2642,13 +2675,15 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 b"branch: Created from main".to_vec(),
             )
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(branch.name, "refs/heads/feature");
         assert_eq!(
-            store.read_ref("refs/heads/feature").unwrap(),
+            store
+                .read_ref("refs/heads/feature")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid))
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2659,7 +2694,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         store
             .create_branch(
                 "feature",
@@ -2667,11 +2702,18 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 b"branch: Created from main".to_vec(),
             )
-            .unwrap();
-        let deleted = store.delete_branch("feature").unwrap();
+            .expect("test operation should succeed");
+        let deleted = store
+            .delete_branch("feature")
+            .expect("test operation should succeed");
         assert_eq!(deleted.name, "refs/heads/feature");
         assert_eq!(deleted.oid, oid);
-        assert_eq!(store.read_ref("refs/heads/feature").unwrap(), None);
+        assert_eq!(
+            store
+                .read_ref("refs/heads/feature")
+                .expect("test operation should succeed"),
+            None
+        );
         assert!(!git_dir.join("refs").join("heads").join("feature").exists());
         assert!(
             !git_dir
@@ -2681,7 +2723,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .join("feature")
                 .exists()
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2692,24 +2734,31 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/topic".into(),
             expected: None,
             new: RefTarget::Direct(oid.clone()),
             reflog: Some(ReflogEntry {
-                old_oid: zero_oid(ObjectFormat::Sha1).unwrap(),
+                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
                 new_oid: oid.clone(),
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
             }),
         });
-        tx.commit().unwrap();
-        let deleted = store.delete_ref("refs/heads/topic").unwrap();
+        tx.commit().expect("test operation should succeed");
+        let deleted = store
+            .delete_ref("refs/heads/topic")
+            .expect("test operation should succeed");
         assert_eq!(deleted.name, "refs/heads/topic");
         assert_eq!(deleted.oid, oid);
-        assert_eq!(store.read_ref("refs/heads/topic").unwrap(), None);
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            None
+        );
         assert!(!git_dir.join("refs").join("heads").join("topic").exists());
         assert!(
             !git_dir
@@ -2719,52 +2768,66 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .join("topic")
                 .exists()
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn file_ref_store_reports_current_branch() {
         let git_dir = temp_git_dir();
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         assert_eq!(
-            store.current_branch_ref().unwrap(),
+            store
+                .current_branch_ref()
+                .expect("test operation should succeed"),
             Some("refs/heads/main".into())
         );
-        assert_eq!(store.current_branch().unwrap(), Some("main".into()));
-        fs::remove_dir_all(git_dir).unwrap();
+        assert_eq!(
+            store
+                .current_branch()
+                .expect("test operation should succeed"),
+            Some("main".into())
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn file_ref_store_resolves_linked_worktree_head_through_common_refs() {
         let common = temp_git_dir();
         let admin = common.join("worktrees").join("linked");
-        fs::create_dir_all(&admin).unwrap();
-        fs::write(admin.join("commondir"), "../..\n").unwrap();
-        fs::write(admin.join("HEAD"), b"ref: refs/heads/topic\n").unwrap();
+        fs::create_dir_all(&admin).expect("test operation should succeed");
+        fs::write(admin.join("commondir"), "../..\n").expect("test operation should succeed");
+        fs::write(admin.join("HEAD"), b"ref: refs/heads/topic\n")
+            .expect("test operation should succeed");
         let oid = ObjectId::from_hex(
             ObjectFormat::Sha256,
             "08ffba112b648c22b5425f01bec2c37ffc524c4d48ef04337779df3973733050",
         )
-        .unwrap();
-        fs::create_dir_all(common.join("refs").join("heads")).unwrap();
+        .expect("test operation should succeed");
+        fs::create_dir_all(common.join("refs").join("heads"))
+            .expect("test operation should succeed");
         fs::write(
             common.join("refs").join("heads").join("topic"),
             format!("{oid}\n"),
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let store = FileRefStore::new(&admin, ObjectFormat::Sha256);
         assert_eq!(
-            store.read_ref("HEAD").unwrap(),
+            store
+                .read_ref("HEAD")
+                .expect("test operation should succeed"),
             Some(RefTarget::Symbolic("refs/heads/topic".into()))
         );
         assert_eq!(
-            store.read_ref("refs/heads/topic").unwrap(),
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid))
         );
 
-        fs::remove_dir_all(common).unwrap();
+        fs::remove_dir_all(common).expect("test operation should succeed");
     }
 
     #[test]
@@ -2775,15 +2838,24 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        let tag = store.create_tag("v1.0", oid.clone()).unwrap();
+        .expect("test operation should succeed");
+        let tag = store
+            .create_tag("v1.0", oid.clone())
+            .expect("test operation should succeed");
         assert_eq!(tag.name, "refs/tags/v1.0");
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid))
         );
-        assert!(store.read_reflog("refs/tags/v1.0").unwrap().is_empty());
-        fs::remove_dir_all(git_dir).unwrap();
+        assert!(
+            store
+                .read_reflog("refs/tags/v1.0")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2794,14 +2866,23 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        store.create_tag("v1.0", oid.clone()).unwrap();
-        let deleted = store.delete_tag("v1.0").unwrap();
+        .expect("test operation should succeed");
+        store
+            .create_tag("v1.0", oid.clone())
+            .expect("test operation should succeed");
+        let deleted = store
+            .delete_tag("v1.0")
+            .expect("test operation should succeed");
         assert_eq!(deleted.name, "refs/tags/v1.0");
         assert_eq!(deleted.oid, oid);
-        assert_eq!(store.read_ref("refs/tags/v1.0").unwrap(), None);
+        assert_eq!(
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
+            None
+        );
         assert!(!git_dir.join("refs").join("tags").join("v1.0").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2811,13 +2892,15 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             git_dir.join("packed-refs"),
             b"ce013625030ba8dba906f756967f9e9ca394464a refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         assert!(matches!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(_))
         ));
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2827,13 +2910,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             git_dir.join("packed-refs"),
             b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -2841,11 +2924,11 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
-        let refs = store.list_refs().unwrap();
+        tx.commit().expect("test operation should succeed");
+        let refs = store.list_refs().expect("test operation should succeed");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].target, RefTarget::Direct(oid));
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2856,7 +2939,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         store
             .write_packed_refs(&[PackedRef {
                 reference: Ref {
@@ -2865,39 +2948,42 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 },
                 peeled: None,
             }])
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid.clone()))
         );
-        let refs = store.list_refs().unwrap();
+        let refs = store.list_refs().expect("test operation should succeed");
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].target, RefTarget::Direct(oid));
         assert!(git_dir.join("packed-refs").exists());
         assert!(!git_dir.join("packed-refs.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn file_ref_store_reads_reftable_stack_and_ignores_dummy_head() {
         let git_dir = temp_git_dir();
         write_reftable_config(&git_dir);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/.invalid\n")
+            .expect("test operation should succeed");
         let head_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let peeled_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         write_reftable_stack(
             &git_dir,
             &[(
@@ -2927,18 +3013,24 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         assert_eq!(
-            store.read_ref("HEAD").unwrap(),
+            store
+                .read_ref("HEAD")
+                .expect("test operation should succeed"),
             Some(RefTarget::Symbolic("refs/heads/main".into()))
         );
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(head_oid.clone()))
         );
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag_oid.clone()))
         );
-        let refs = store.list_refs().unwrap();
+        let refs = store.list_refs().expect("test operation should succeed");
         assert_eq!(
             refs,
             vec![
@@ -2953,7 +3045,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ]
         );
 
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2964,12 +3056,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         write_reftable_stack(
             &git_dir,
             &[
@@ -3008,19 +3100,26 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(second.clone()))
         );
-        assert_eq!(store.read_ref("refs/heads/topic").unwrap(), None);
         assert_eq!(
-            store.list_refs().unwrap(),
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store.list_refs().expect("test operation should succeed"),
             vec![Ref {
                 name: "refs/heads/main".into(),
                 target: RefTarget::Direct(second),
             }]
         );
 
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3031,12 +3130,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         write_reftable_stack(
             &git_dir,
             &[(
@@ -3063,26 +3162,41 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(second.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         assert_eq!(
-            store.read_ref("HEAD").unwrap(),
+            store
+                .read_ref("HEAD")
+                .expect("test operation should succeed"),
             Some(RefTarget::Symbolic("refs/heads/main".into()))
         );
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(second.clone()))
         );
-        assert_eq!(store.list_refs().unwrap().len(), 1);
+        assert_eq!(
+            store
+                .list_refs()
+                .expect("test operation should succeed")
+                .len(),
+            1
+        );
         assert!(!git_dir.join("HEAD").exists());
-        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list")).unwrap();
+        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list"))
+            .expect("test operation should succeed");
         assert_eq!(tables.lines().count(), 2);
         assert!(
-            tables.lines().last().unwrap().contains("sley"),
+            tables
+                .lines()
+                .last()
+                .expect("test operation should succeed")
+                .contains("sley"),
             "expected rust-written reftable in tables.list, got {tables}"
         );
 
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3093,7 +3207,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         write_reftable_stack(
             &git_dir,
             &[(
@@ -3114,16 +3228,38 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         );
 
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
-        assert!(store.delete_symbolic_ref("refs/alias/main").unwrap());
-        assert_eq!(store.read_ref("refs/alias/main").unwrap(), None);
-        let deleted = store.delete_ref("refs/heads/main").unwrap();
+        assert!(
+            store
+                .delete_symbolic_ref("refs/alias/main")
+                .expect("test operation should succeed")
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/alias/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        let deleted = store
+            .delete_ref("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(deleted.oid, oid);
-        assert_eq!(store.read_ref("refs/heads/main").unwrap(), None);
-        assert!(store.list_refs().unwrap().is_empty());
-        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list")).unwrap();
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert!(
+            store
+                .list_refs()
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        let tables = fs::read_to_string(git_dir.join("reftable").join("tables.list"))
+            .expect("test operation should succeed");
         assert_eq!(tables.lines().count(), 3);
 
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3134,12 +3270,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         store
             .write_packed_refs(&[
                 PackedRef {
@@ -3157,17 +3293,26 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     peeled: None,
                 },
             ])
-            .unwrap();
-        let deleted = store.delete_branch("feature").unwrap();
+            .expect("test operation should succeed");
+        let deleted = store
+            .delete_branch("feature")
+            .expect("test operation should succeed");
         assert_eq!(deleted.name, "refs/heads/feature");
         assert_eq!(deleted.oid, branch_oid);
-        assert_eq!(store.read_ref("refs/heads/feature").unwrap(), None);
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/heads/feature")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag_oid))
         );
         assert!(!git_dir.join("packed-refs.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3178,7 +3323,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         store
             .write_packed_refs(&[PackedRef {
                 reference: Ref {
@@ -3187,13 +3332,20 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 },
                 peeled: None,
             }])
-            .unwrap();
-        let deleted = store.delete_tag("v1.0").unwrap();
+            .expect("test operation should succeed");
+        let deleted = store
+            .delete_tag("v1.0")
+            .expect("test operation should succeed");
         assert_eq!(deleted.name, "refs/tags/v1.0");
         assert_eq!(deleted.oid, oid);
-        assert_eq!(store.read_ref("refs/tags/v1.0").unwrap(), None);
+        assert_eq!(
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
+            None
+        );
         assert!(!git_dir.join("packed-refs.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3204,12 +3356,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -3223,23 +3375,29 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(tag_oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
-        let packed = store.pack_refs(true).unwrap();
+        let packed = store
+            .pack_refs(true)
+            .expect("test operation should succeed");
         assert_eq!(packed.len(), 2);
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(main_oid))
         );
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag_oid))
         );
         assert!(!git_dir.join("refs").join("heads").join("main").exists());
         assert!(!git_dir.join("refs").join("tags").join("v1.0").exists());
         assert!(git_dir.join("packed-refs").exists());
         assert!(!git_dir.join("packed-refs.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3250,7 +3408,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -3258,16 +3416,20 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
-        let packed = store.pack_refs(false).unwrap();
+        let packed = store
+            .pack_refs(false)
+            .expect("test operation should succeed");
         assert_eq!(packed.len(), 1);
         assert!(git_dir.join("refs").join("heads").join("main").exists());
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(oid))
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3278,12 +3440,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let peeled_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
@@ -3291,7 +3453,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(tag_oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         let packed = store
             .pack_refs_with_peeler(true, |name, oid| {
@@ -3301,18 +3463,19 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     Ok(None)
                 }
             })
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(packed.len(), 1);
         assert_eq!(packed[0].peeled, Some(peeled_oid.clone()));
-        let bytes = fs::read_to_string(git_dir.join("packed-refs")).unwrap();
+        let bytes =
+            fs::read_to_string(git_dir.join("packed-refs")).expect("test operation should succeed");
         assert!(bytes.contains(&format!("^{peeled_oid}\n")));
         assert!(!git_dir.join("refs").join("tags").join("v1.0").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     fn reflog_entry(new_oid: &ObjectId, timestamp: i64, message: &str) -> ReflogEntry {
         ReflogEntry {
-            old_oid: zero_oid(new_oid.format()).unwrap(),
+            old_oid: zero_oid(new_oid.format()).expect("test operation should succeed"),
             new_oid: new_oid.clone(),
             committer: format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes(),
             message: message.as_bytes().to_vec(),
@@ -3325,17 +3488,17 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let oid_b = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let oid_c = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let entries = vec![
             reflog_entry(&oid_a, 10, "oldest"),
             reflog_entry(&oid_b, 100, "middle"),
@@ -3344,7 +3507,8 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
         // Cutoff drops the oldest entry; the most recent entry survives even
         // though its timestamp (20) is below the cutoff (50).
-        let retained = expire_reflog(&entries, 50, None, |_| true).unwrap();
+        let retained =
+            expire_reflog(&entries, 50, None, |_| true).expect("test operation should succeed");
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].message, b"middle");
         assert_eq!(retained[1].message, b"latest");
@@ -3356,17 +3520,17 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let unreachable = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tip = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // Both candidate entries sit above the lenient cutoff (50) but below the
         // stricter unreachable cutoff (150). Only the unreachable one is dropped.
         let entries = vec![
@@ -3377,7 +3541,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let retained = expire_reflog(&entries, 50, Some(150), |oid| {
             oid == &reachable || oid == &tip
         })
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].message, b"reachable");
         assert_eq!(retained[1].message, b"tip");
@@ -3389,9 +3553,10 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let entries = vec![reflog_entry(&oid, 1, "only")];
-        let retained = expire_reflog(&entries, i64::MAX, Some(i64::MAX), |_| false).unwrap();
+        let retained = expire_reflog(&entries, i64::MAX, Some(i64::MAX), |_| false)
+            .expect("test operation should succeed");
         assert_eq!(retained.len(), 1);
         assert_eq!(retained[0].message, b"only");
     }
@@ -3404,12 +3569,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let second = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         store
             .write_reflog(
                 "refs/heads/main",
@@ -3418,21 +3583,29 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     reflog_entry(&second, 100, "new"),
                 ],
             )
-            .unwrap();
+            .expect("test operation should succeed");
 
         // Dry run reports the removal count without touching the file.
         let would_remove = store
             .expire_reflog_file("refs/heads/main", 50, None, false, |_| true)
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(would_remove, 1);
-        assert_eq!(store.read_reflog("refs/heads/main").unwrap().len(), 2);
+        assert_eq!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .len(),
+            2
+        );
 
         // Opt-in rewrite drops the stale entry and leaves the latest.
         let removed = store
             .expire_reflog_file("refs/heads/main", 50, None, true, |_| true)
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(removed, 1);
-        let log = store.read_reflog("refs/heads/main").unwrap();
+        let log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].new_oid, second);
         assert!(
@@ -3443,7 +3616,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .join("main.lock")
                 .exists()
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3454,17 +3627,17 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let topic_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let tag_oid = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let mut tx = store.transaction();
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
@@ -3484,21 +3657,29 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(tag_oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         assert_eq!(
-            store.read_ref("refs/heads/main").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(main_oid.clone()))
         );
         assert_eq!(
-            store.read_ref("refs/heads/topic").unwrap(),
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(topic_oid))
         );
         assert_eq!(
-            store.read_ref("refs/tags/v1.0").unwrap(),
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag_oid))
         );
-        let main_log = store.read_reflog("refs/heads/main").unwrap();
+        let main_log = store
+            .read_reflog("refs/heads/main")
+            .expect("test operation should succeed");
         assert_eq!(main_log.len(), 1);
         assert_eq!(main_log[0].new_oid, main_oid);
         // No lock files survive a successful commit.
@@ -3517,7 +3698,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .exists()
         );
         assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3528,22 +3709,22 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_main = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let new_tag = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "18f002b4484b838b205a48b1e9e6763ba5e3a607",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let wrong_expected = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "0000000000000000000000000000000000000001",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         // Seed an existing topic ref so the failing update has a real prior value
         // to be compared against (and left untouched).
@@ -3554,7 +3735,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             new: RefTarget::Direct(old_topic.clone()),
             reflog: None,
         });
-        seed.commit().unwrap();
+        seed.commit().expect("test operation should succeed");
 
         let mut tx = store.transaction();
         // 1st ref: brand new, would succeed in isolation.
@@ -3583,13 +3764,30 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
 
         // Nothing changed: the new refs were never created and the existing one
         // keeps its original value.
-        assert_eq!(store.read_ref("refs/heads/main").unwrap(), None);
         assert_eq!(
-            store.read_ref("refs/heads/topic").unwrap(),
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(old_topic))
         );
-        assert_eq!(store.read_ref("refs/tags/v1.0").unwrap(), None);
-        assert!(store.read_reflog("refs/heads/main").unwrap().is_empty());
+        assert_eq!(
+            store
+                .read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
 
         // All lock files were released.
         assert!(
@@ -3607,7 +3805,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .exists()
         );
         assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     fn temp_git_dir() -> PathBuf {
@@ -3616,12 +3814,12 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).expect("test operation should succeed");
         path
     }
 
     fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-        ObjectId::from_raw(format, &vec![0; format.raw_len()])
+        Ok(ObjectId::null(format))
     }
 
     fn write_reftable_config(git_dir: &Path) {
@@ -3629,7 +3827,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             git_dir.join("config"),
             b"[core]\n\trepositoryformatversion = 1\n[extensions]\n\trefStorage = reftable\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
     }
 
     fn write_reftable_stack(
@@ -3637,7 +3835,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tables: &[(&str, Vec<sley_formats::ReftableRefRecord>)],
     ) {
         let reftable_dir = git_dir.join("reftable");
-        fs::create_dir_all(&reftable_dir).unwrap();
+        fs::create_dir_all(&reftable_dir).expect("test operation should succeed");
         let mut list = String::new();
         for (idx, (name, refs)) in tables.iter().enumerate() {
             let update_index = (idx + 1) as u64;
@@ -3647,11 +3845,11 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 update_index,
                 refs,
             )
-            .unwrap();
-            fs::write(reftable_dir.join(name), bytes).unwrap();
+            .expect("test operation should succeed");
+            fs::write(reftable_dir.join(name), bytes).expect("test operation should succeed");
             list.push_str(name);
             list.push('\n');
         }
-        fs::write(reftable_dir.join("tables.list"), list).unwrap();
+        fs::write(reftable_dir.join("tables.list"), list).expect("test operation should succeed");
     }
 }

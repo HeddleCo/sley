@@ -1,8 +1,8 @@
 use sley_core::Result;
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
-    demux_protocol_v2_fetch_packfile, ProtocolV2FetchResponseSection, SideBandDemux,
-    UploadPackRawPackfileResponse,
+    ProtocolV2FetchResponseSection, SideBandDemux, UploadPackRawPackfileResponse,
+    demux_protocol_v2_fetch_packfile,
 };
 
 pub fn install_upload_pack_raw_response<I: RawPackInstaller>(
@@ -68,7 +68,7 @@ mod tests {
     use sley_object::{EncodedObject, ObjectType};
     use sley_odb::{FileObjectDatabase, ObjectDatabase, ObjectReader};
     use sley_pack::PackFile;
-    use sley_protocol::{encode_sideband_packet, SideBandChannel, SideBandPacket};
+    use sley_protocol::{SideBandChannel, SideBandPacket, encode_sideband_packet};
     use std::fs;
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -80,15 +80,19 @@ mod tests {
         let root = test_temp_root("sley-fetch-upload-pack-raw-install");
         let format = ObjectFormat::Sha256;
         let object = EncodedObject::new(ObjectType::Blob, b"raw upload-pack boundary\n".to_vec());
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let response = UploadPackRawPackfileResponse {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
         let destination = FileObjectDatabase::new(root.join("objects"), format);
 
-        let result = install_upload_pack_raw_response(&response, &destination).unwrap();
+        let result = install_upload_pack_raw_response(&response, &destination)
+            .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
@@ -100,15 +104,19 @@ mod tests {
         let root = test_temp_root("sley-fetch-upload-pack-promisor-install");
         let format = ObjectFormat::Sha1;
         let object = EncodedObject::new(ObjectType::Blob, b"promisor upload-pack\n".to_vec());
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let response = UploadPackRawPackfileResponse {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
         let destination = FileObjectDatabase::new(root.join("objects"), format);
 
-        let result = install_upload_pack_raw_promisor_response(&response, &destination).unwrap();
+        let result = install_upload_pack_raw_promisor_response(&response, &destination)
+            .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
@@ -124,15 +132,19 @@ mod tests {
             ObjectType::Blob,
             b"protocol v2 packfile boundary\n".to_vec(),
         );
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let packfile = SideBandDemux {
             data: pack.pack,
             progress: vec![b"counting objects\n".to_vec()],
         };
         let destination = FileObjectDatabase::new(root.join("objects"), format);
 
-        let result = install_protocol_v2_fetch_packfile(&packfile, &destination).unwrap();
+        let result = install_protocol_v2_fetch_packfile(&packfile, &destination)
+            .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
@@ -144,24 +156,27 @@ mod tests {
         let root = test_temp_root("sley-fetch-v2-response-install");
         let format = ObjectFormat::Sha1;
         let object = EncodedObject::new(ObjectType::Blob, b"v2 response packfile\n".to_vec());
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let sections = vec![ProtocolV2FetchResponseSection::Packfile(vec![
             encode_sideband_packet(&SideBandPacket {
                 channel: SideBandChannel::Progress,
                 data: b"counting objects\n".to_vec(),
             })
-            .unwrap(),
+            .expect("test operation should succeed"),
             encode_sideband_packet(&SideBandPacket {
                 channel: SideBandChannel::Data,
                 data: pack.pack,
             })
-            .unwrap(),
+            .expect("test operation should succeed"),
         ])];
         let destination = FileObjectDatabase::new(root.join("objects"), format);
 
         let result = install_protocol_v2_fetch_response_packfile(&sections, &destination)
-            .unwrap()
+            .expect("test operation should succeed")
             .expect("packfile should be installed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
@@ -174,19 +189,22 @@ mod tests {
         let root = test_temp_root("sley-fetch-v2-response-promisor-install");
         let format = ObjectFormat::Sha1;
         let object = EncodedObject::new(ObjectType::Blob, b"v2 promisor packfile\n".to_vec());
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let sections = vec![ProtocolV2FetchResponseSection::Packfile(vec![
             encode_sideband_packet(&SideBandPacket {
                 channel: SideBandChannel::Data,
                 data: pack.pack,
             })
-            .unwrap(),
+            .expect("test operation should succeed"),
         ])];
         let destination = FileObjectDatabase::new(root.join("objects"), format);
 
         let result = install_protocol_v2_fetch_response_promisor_packfile(&sections, &destination)
-            .unwrap()
+            .expect("test operation should succeed")
             .expect("packfile should be installed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
@@ -201,7 +219,8 @@ mod tests {
         let destination = FileObjectDatabase::new(root.join("objects"), ObjectFormat::Sha1);
         let sections = vec![ProtocolV2FetchResponseSection::Acknowledgments(Vec::new())];
 
-        let result = install_protocol_v2_fetch_response_packfile(&sections, &destination).unwrap();
+        let result = install_protocol_v2_fetch_response_packfile(&sections, &destination)
+            .expect("test operation should succeed");
 
         assert!(result.is_none());
         assert!(!root.join("objects").join("pack").exists());
@@ -230,7 +249,8 @@ mod tests {
             packfile: b"PACKcustom".to_vec(),
         };
 
-        let result = install_upload_pack_raw_response(&response, &installer).unwrap();
+        let result = install_upload_pack_raw_response(&response, &installer)
+            .expect("test operation should succeed");
 
         assert!(result.object_ids.is_empty());
         assert_eq!(installer.packs.into_inner(), vec![b"PACKcustom".to_vec()]);
@@ -240,18 +260,28 @@ mod tests {
     fn raw_upload_pack_response_installs_into_in_memory_database() {
         let format = ObjectFormat::Sha1;
         let object = EncodedObject::new(ObjectType::Blob, b"in memory fetch pack\n".to_vec());
-        let oid = object.object_id(format).unwrap();
-        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format).unwrap();
+        let oid = object
+            .object_id(format)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), format)
+            .expect("test operation should succeed");
         let response = UploadPackRawPackfileResponse {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
         let destination = std::cell::RefCell::new(ObjectDatabase::new(format));
 
-        let result = install_upload_pack_raw_response(&response, &destination).unwrap();
+        let result = install_upload_pack_raw_response(&response, &destination)
+            .expect("test operation should succeed");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
-        assert_eq!(destination.borrow().read_object(&oid).unwrap(), object);
+        assert_eq!(
+            destination
+                .borrow()
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
     }
 
     fn test_temp_root(prefix: &str) -> std::path::PathBuf {
@@ -270,30 +300,45 @@ mod tests {
         oid: &sley_core::ObjectId,
         object: &EncodedObject,
     ) {
-        assert!(!db.loose().object_path(oid).unwrap().exists());
+        assert!(
+            !db.loose()
+                .object_path(oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
         let pack_dir = objects_dir.join("pack");
         let packs = fs::read_dir(&pack_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .expect("test operation should succeed")
+            .map(|entry| entry.expect("test operation should succeed").path())
             .collect::<Vec<_>>();
-        assert!(packs
-            .iter()
-            .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pack")));
-        assert!(packs
-            .iter()
-            .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("idx")));
-        assert!(db.contains(oid).unwrap());
-        assert_eq!(db.read_object(oid).unwrap(), *object);
+        assert!(
+            packs
+                .iter()
+                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("pack"))
+        );
+        assert!(
+            packs
+                .iter()
+                .any(|path| path.extension().and_then(|ext| ext.to_str()) == Some("idx"))
+        );
+        assert!(db.contains(oid).expect("test operation should succeed"));
+        assert_eq!(
+            db.read_object(oid).expect("test operation should succeed"),
+            *object
+        );
     }
 
     fn assert_promisor_sidecar(objects_dir: &Path) {
         let pack_dir = objects_dir.join("pack");
         let promisors = fs::read_dir(&pack_dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .expect("test operation should succeed")
+            .map(|entry| entry.expect("test operation should succeed").path())
             .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("promisor"))
             .collect::<Vec<_>>();
         assert_eq!(promisors.len(), 1);
-        assert_eq!(fs::read(&promisors[0]).unwrap(), b"");
+        assert_eq!(
+            fs::read(&promisors[0]).expect("test operation should succeed"),
+            b""
+        );
     }
 }

@@ -192,19 +192,7 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let mut seen = HashSet::new();
-    let mut objects = Vec::new();
-    for oid in starts {
-        collect_reachable_object(
-            reader,
-            format,
-            oid,
-            &HashSet::new(),
-            &mut seen,
-            &mut objects,
-        )?;
-    }
-    Ok(seen)
+    walk_reachable_objects(reader, format, starts, &HashSet::new(), |_| {})
 }
 
 pub fn collect_reachable_objects<R, I>(
@@ -217,11 +205,10 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let mut seen = HashSet::new();
     let mut objects = Vec::new();
-    for oid in starts {
-        collect_reachable_object(reader, format, oid, excluded, &mut seen, &mut objects)?;
-    }
+    walk_reachable_objects(reader, format, starts, excluded, |object| {
+        objects.push(object);
+    })?;
     Ok(objects)
 }
 
@@ -606,6 +593,60 @@ enum PackDeltaBase {
     Ref(ObjectId),
 }
 
+struct PackIndexOffsetInfo {
+    end_offset: u64,
+    delta_base_oid: Option<ObjectId>,
+}
+
+fn scan_pack_index_offsets(
+    index: &PackIndex,
+    target_offset: u64,
+    trailer_offset: u64,
+    delta_base_offset: Option<u64>,
+) -> Result<PackIndexOffsetInfo> {
+    let mut target_count = 0usize;
+    let mut next_offset = None;
+    let mut delta_base_oid = None;
+
+    for entry in &index.entries {
+        if entry.offset == target_offset {
+            target_count += 1;
+        } else if entry.offset > target_offset {
+            match next_offset {
+                Some(current) if current <= entry.offset => {}
+                _ => next_offset = Some(entry.offset),
+            }
+        }
+        if Some(entry.offset) == delta_base_offset {
+            delta_base_oid = Some(entry.oid.clone());
+        }
+    }
+
+    if target_count == 0 {
+        return Err(GitError::InvalidFormat(format!(
+            "pack index offset {target_offset} not found"
+        )));
+    }
+    if let Some(offset) = delta_base_offset
+        && delta_base_oid.is_none()
+    {
+        return Err(GitError::InvalidFormat(format!(
+            "ofs-delta base offset {offset} not found"
+        )));
+    }
+
+    Ok(PackIndexOffsetInfo {
+        // Preserve the old sorted-vector behavior for malformed indexes with
+        // duplicate offsets: the next sorted entry has the same offset.
+        end_offset: if target_count > 1 {
+            target_offset
+        } else {
+            next_offset.unwrap_or(trailer_offset)
+        },
+        delta_base_oid,
+    })
+}
+
 fn pack_entry_delta_base(
     format: ObjectFormat,
     pack: &[u8],
@@ -675,7 +716,7 @@ fn pack_next_byte(pack: &[u8], cursor: &mut usize) -> Result<u8> {
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 /// Remove `path` if it exists, treating a missing file as success.
@@ -687,61 +728,67 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn collect_reachable_object<R>(
+fn walk_reachable_objects<R, I, F>(
     reader: &R,
     format: ObjectFormat,
-    oid: ObjectId,
+    starts: I,
     excluded: &HashSet<ObjectId>,
-    seen: &mut HashSet<ObjectId>,
-    objects: &mut Vec<EncodedObject>,
-) -> Result<()>
+    mut visit: F,
+) -> Result<HashSet<ObjectId>>
 where
     R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    F: FnMut(EncodedObject),
 {
-    if excluded.contains(&oid) {
-        return Ok(());
-    }
-    if !seen.insert(oid.clone()) {
-        return Ok(());
-    }
-    let object = reader.read_object(&oid)?;
-    match object.object_type {
-        ObjectType::Commit => {
-            let (tree, parents) = {
-                let commit = Commit::parse_ref(format, &object.body)?;
-                (commit.tree, commit.parents)
-            };
-            objects.push(object);
-            collect_reachable_object(reader, format, tree, excluded, seen, objects)?;
-            for parent in parents {
-                collect_reachable_object(reader, format, parent, excluded, seen, objects)?;
+    let mut seen = HashSet::new();
+    let mut pending = Vec::new();
+    for start in starts {
+        pending.push(start);
+        while let Some(oid) = pending.pop() {
+            if excluded.contains(&oid) {
+                continue;
             }
-        }
-        ObjectType::Tree => {
-            let mut child_oids = Vec::new();
-            for entry in TreeEntries::new(format, &object.body) {
-                let entry = entry?;
-                if entry.is_gitlink() {
-                    continue;
+            if !seen.insert(oid.clone()) {
+                continue;
+            }
+            let object = reader.read_object(&oid)?;
+            match object.object_type {
+                ObjectType::Commit => {
+                    let (tree, parents) = {
+                        let commit = Commit::parse_ref(format, &object.body)?;
+                        (commit.tree, commit.parents)
+                    };
+                    visit(object);
+                    for parent in parents.into_iter().rev() {
+                        pending.push(parent);
+                    }
+                    pending.push(tree);
                 }
-                child_oids.push(entry.oid);
-            }
-            objects.push(object);
-            for child_oid in child_oids {
-                collect_reachable_object(reader, format, child_oid, excluded, seen, objects)?;
+                ObjectType::Tree => {
+                    let mut child_oids = Vec::new();
+                    for entry in TreeEntries::new(format, &object.body) {
+                        let entry = entry?;
+                        if entry.is_gitlink() {
+                            continue;
+                        }
+                        child_oids.push(entry.oid);
+                    }
+                    visit(object);
+                    pending.extend(child_oids.into_iter().rev());
+                }
+                ObjectType::Tag => {
+                    let target = {
+                        let tag = Tag::parse_ref(format, &object.body)?;
+                        tag.object
+                    };
+                    visit(object);
+                    pending.push(target);
+                }
+                ObjectType::Blob => visit(object),
             }
         }
-        ObjectType::Tag => {
-            let target = {
-                let tag = Tag::parse_ref(format, &object.body)?;
-                tag.object
-            };
-            objects.push(object);
-            collect_reachable_object(reader, format, target, excluded, seen, objects)?;
-        }
-        ObjectType::Blob => objects.push(object),
     }
-    Ok(())
+    Ok(seen)
 }
 
 #[derive(Debug, Clone)]
@@ -1635,34 +1682,22 @@ impl FileObjectDatabase {
             .ok_or_else(|| GitError::InvalidFormat("pack file shorter than checksum".into()))?;
         let index_path = pack_paths.pack.with_extension("idx");
         let index = self.cached_pack_index(&index_path)?;
-        let mut offset_entries = index.entries.iter().collect::<Vec<_>>();
-        offset_entries.sort_by_key(|entry| entry.offset);
-        let Some(position) = offset_entries
-            .iter()
-            .position(|entry| entry.offset == pack_paths.offset)
-        else {
-            return Err(GitError::InvalidFormat(format!(
-                "pack index offset {} not found",
-                pack_paths.offset
-            )));
-        };
-        let end_offset = offset_entries
-            .get(position + 1)
-            .map(|entry| entry.offset)
-            .unwrap_or(trailer_offset);
-        let disk_size = end_offset
-            .checked_sub(pack_paths.offset)
-            .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
         let pack = self.cached_pack_bytes(&pack_paths.pack)?;
         let delta_base = pack_entry_delta_base(self.format, &pack, pack_paths.offset)?;
+        let delta_base_offset = match &delta_base {
+            Some(PackDeltaBase::Offset(offset)) => Some(*offset),
+            Some(PackDeltaBase::Ref(_)) | None => None,
+        };
+        let offset_info =
+            scan_pack_index_offsets(&index, pack_paths.offset, trailer_offset, delta_base_offset)?;
+        let disk_size = offset_info
+            .end_offset
+            .checked_sub(pack_paths.offset)
+            .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
         let deltabase = match delta_base {
-            Some(PackDeltaBase::Offset(offset)) => offset_entries
-                .iter()
-                .find(|entry| entry.offset == offset)
-                .map(|entry| entry.oid.clone())
-                .ok_or_else(|| {
-                    GitError::InvalidFormat(format!("ofs-delta base offset {offset} not found"))
-                })?,
+            Some(PackDeltaBase::Offset(_)) => offset_info
+                .delta_base_oid
+                .expect("scan_pack_index_offsets validates ofs-delta base offsets"),
             Some(PackDeltaBase::Ref(oid)) => oid,
             None => zero_oid(self.format)?,
         };
@@ -2111,9 +2146,9 @@ mod tests {
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(oid.to_hex(), "ce013625030ba8dba906f756967f9e9ca394464a");
-        db.validate(&oid).unwrap();
+        db.validate(&oid).expect("test operation should succeed");
     }
 
     #[test]
@@ -2125,10 +2160,22 @@ mod tests {
         ));
         let mut store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec());
-        let oid = store.write_object(object.clone()).unwrap();
-        assert_eq!(store.read_object(&oid).unwrap(), object);
-        assert!(store.object_path(&oid).unwrap().exists());
-        fs::remove_dir_all(root).unwrap();
+        let oid = store
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        assert_eq!(
+            store
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
+        assert!(
+            store
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2136,39 +2183,47 @@ mod tests {
         let root = temp_root("sley-file-odb-pack");
         let git_dir = root.join(".git");
         let pack_dir = git_dir.join("objects").join("pack");
-        fs::create_dir_all(&pack_dir).unwrap();
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"packed\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.pack")),
             written.pack,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.idx")),
             written.index,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        assert!(db.contains(&oid).unwrap());
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn read_object_header_matches_full_read_for_loose_and_packed_and_delta() {
         let root = temp_root("sley-read-object-header");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         // Loose object: the header read inflates only the framing, not the body.
         let loose = EncodedObject::new(ObjectType::Blob, b"loose header object\n".to_vec());
-        let loose_oid = db.write_object(loose.clone()).unwrap();
+        let loose_oid = db
+            .write_object(loose.clone())
+            .expect("test operation should succeed");
 
         // Packed objects, including an ofs-delta whose *result* size lives in the
         // delta stream (not the pack entry header) and whose type is inherited from
@@ -2179,16 +2234,23 @@ mod tests {
         let child = EncodedObject::new(ObjectType::Blob, child_body);
         let commitish =
             EncodedObject::new(ObjectType::Commit, b"header-only type probe\n".to_vec());
-        let base_oid = base.object_id(format).unwrap();
-        let child_oid = child.object_id(format).unwrap();
-        let commit_oid = commitish.object_id(format).unwrap();
+        let base_oid = base
+            .object_id(format)
+            .expect("test operation should succeed");
+        let child_oid = child
+            .object_id(format)
+            .expect("test operation should succeed");
+        let commit_oid = commitish
+            .object_id(format)
+            .expect("test operation should succeed");
         let pack = PackFile::write_with_delta_strategy(
             &[base.clone(), child.clone(), commitish.clone()],
             format,
             sley_pack::DeltaStrategy::OfsDelta,
         )
-        .unwrap();
-        db.install_pack(&pack).unwrap();
+        .expect("test operation should succeed");
+        db.install_pack(&pack)
+            .expect("test operation should succeed");
 
         // The header read agrees with a full decode for every object and storage
         // class, without ever materializing the body.
@@ -2199,127 +2261,176 @@ mod tests {
             (&commit_oid, ObjectType::Commit, commitish.body.len()),
         ] {
             assert_eq!(
-                db.read_object_header(oid).unwrap(),
+                db.read_object_header(oid)
+                    .expect("test operation should succeed"),
                 Some((want_type, want_len as u64)),
                 "header for {oid}"
             );
-            let full = db.read_object(oid).unwrap();
+            let full = db.read_object(oid).expect("test operation should succeed");
             assert_eq!(
-                db.read_object_header(oid).unwrap(),
+                db.read_object_header(oid)
+                    .expect("test operation should succeed"),
                 Some((full.object_type, full.body.len() as u64))
             );
         }
 
-        let missing =
-            ObjectId::from_hex(format, "0000000000000000000000000000000000000001").unwrap();
-        assert_eq!(db.read_object_header(&missing).unwrap(), None);
-        fs::remove_dir_all(root).unwrap();
+        let missing = ObjectId::from_hex(format, "0000000000000000000000000000000000000001")
+            .expect("test operation should succeed");
+        assert_eq!(
+            db.read_object_header(&missing)
+                .expect("test operation should succeed"),
+            None
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn object_storage_info_reports_loose_packed_and_delta_metadata() {
         let root = temp_root("sley-object-storage-info");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let loose = EncodedObject::new(ObjectType::Blob, b"loose storage object\n".to_vec());
-        let loose_oid = db.write_object(loose).unwrap();
-        let loose_size = fs::metadata(db.loose().object_path(&loose_oid).unwrap())
-            .unwrap()
-            .len();
-        let loose_info = db.object_storage_info(&loose_oid).unwrap().unwrap();
+        let loose_oid = db
+            .write_object(loose)
+            .expect("test operation should succeed");
+        let loose_size = fs::metadata(
+            db.loose()
+                .object_path(&loose_oid)
+                .expect("test operation should succeed"),
+        )
+        .expect("test operation should succeed")
+        .len();
+        let loose_info = db
+            .object_storage_info(&loose_oid)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert_eq!(loose_info.disk_size, loose_size);
-        assert_eq!(loose_info.deltabase, zero_oid(format).unwrap());
+        assert_eq!(
+            loose_info.deltabase,
+            zero_oid(format).expect("test operation should succeed")
+        );
 
         let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 4096]);
         let mut child_body = vec![b'a'; 4096];
         child_body.extend_from_slice(b" changed tail\n");
         let child = EncodedObject::new(ObjectType::Blob, child_body);
-        let base_oid = base.object_id(format).unwrap();
-        let child_oid = child.object_id(format).unwrap();
+        let base_oid = base
+            .object_id(format)
+            .expect("test operation should succeed");
+        let child_oid = child
+            .object_id(format)
+            .expect("test operation should succeed");
         let pack = PackFile::write_with_delta_strategy(
             &[base, child],
             format,
             sley_pack::DeltaStrategy::OfsDelta,
         )
-        .unwrap();
-        db.install_pack(&pack).unwrap();
+        .expect("test operation should succeed");
+        db.install_pack(&pack)
+            .expect("test operation should succeed");
 
-        let base_info = db.object_storage_info(&base_oid).unwrap().unwrap();
+        let base_info = db
+            .object_storage_info(&base_oid)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert!(base_info.disk_size > 0);
-        assert_eq!(base_info.deltabase, zero_oid(format).unwrap());
+        assert_eq!(
+            base_info.deltabase,
+            zero_oid(format).expect("test operation should succeed")
+        );
 
-        let child_info = db.object_storage_info(&child_oid).unwrap().unwrap();
+        let child_info = db
+            .object_storage_info(&child_oid)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert!(child_info.disk_size > 0);
         assert_eq!(child_info.deltabase, base_oid);
 
-        let missing =
-            ObjectId::from_hex(format, "0000000000000000000000000000000000000001").unwrap();
-        assert_eq!(db.object_storage_info(&missing).unwrap(), None);
-        fs::remove_dir_all(root).unwrap();
+        let missing = ObjectId::from_hex(format, "0000000000000000000000000000000000000001")
+            .expect("test operation should succeed");
+        assert_eq!(
+            db.object_storage_info(&missing)
+                .expect("test operation should succeed"),
+            None
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_resolves_unique_loose_object_prefix() {
         let root = temp_root("sley-file-odb-prefix-loose");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"prefix loose\n".to_vec());
-        let oid = db.write_object(object).unwrap();
+        let oid = db
+            .write_object(object)
+            .expect("test operation should succeed");
         let prefix = &oid.to_hex()[..8];
 
         assert_eq!(
-            db.resolve_prefix(prefix).unwrap(),
+            db.resolve_prefix(prefix)
+                .expect("test operation should succeed"),
             ObjectPrefixResolution::Unique(oid.clone())
         );
-        assert!(db.object_ids().unwrap().contains(&oid));
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            db.object_ids()
+                .expect("test operation should succeed")
+                .contains(&oid)
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_resolves_unique_packed_object_prefix() {
         let root = temp_root("sley-file-odb-prefix-packed");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"prefix packed\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
-        db.install_pack(&pack).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
+        db.install_pack(&pack)
+            .expect("test operation should succeed");
         let prefix = &oid.to_hex()[..8];
 
         assert_eq!(
-            db.resolve_prefix(prefix).unwrap(),
+            db.resolve_prefix(prefix)
+                .expect("test operation should succeed"),
             ObjectPrefixResolution::Unique(oid)
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_reports_ambiguous_object_prefix() {
         let root = temp_root("sley-file-odb-prefix-ambiguous");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let mut seen = HashMap::new();
         let (prefix, first, second) = (0..10_000)
             .find_map(|idx| {
                 let object =
                     EncodedObject::new(ObjectType::Blob, format!("ambiguous {idx}\n").into_bytes());
-                let oid = db.write_object(object).unwrap();
+                let oid = db
+                    .write_object(object)
+                    .expect("test operation should succeed");
                 let prefix = oid.to_hex()[..4].to_string();
-                if let Some(first) = seen.insert(prefix.clone(), oid.clone()) {
-                    Some((prefix, first, oid))
-                } else {
-                    None
-                }
+                seen.insert(prefix.clone(), oid.clone())
+                    .map(|first| (prefix, first, oid))
             })
             .expect("test should find a 4-hex collision");
 
-        let ObjectPrefixResolution::Ambiguous(mut matches) = db.resolve_prefix(&prefix).unwrap()
+        let ObjectPrefixResolution::Ambiguous(mut matches) = db
+            .resolve_prefix(&prefix)
+            .expect("test operation should succeed")
         else {
             panic!("expected ambiguous prefix {prefix}");
         };
@@ -2327,21 +2438,21 @@ mod tests {
         let mut expected = vec![first, second];
         expected.sort_by_key(ObjectId::to_hex);
         assert_eq!(matches, expected);
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_rejects_too_short_object_prefix() {
         let root = temp_root("sley-file-odb-prefix-short");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
 
         assert!(matches!(
             db.resolve_prefix("abc"),
             Err(GitError::InvalidObjectId(_))
         ));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2349,111 +2460,143 @@ mod tests {
         let root = temp_root("sley-file-odb-pack-sha256");
         let git_dir = root.join(".git");
         let pack_dir = git_dir.join("objects").join("pack");
-        fs::create_dir_all(&pack_dir).unwrap();
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"packed sha256\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha256).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         let written =
             PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-                .unwrap();
+                .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.pack")),
             written.pack,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.idx")),
             written.index,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
-        assert!(db.contains(&oid).unwrap());
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_installs_sha256_pack_without_loose_objects() {
         let root = temp_root("sley-file-odb-install-pack");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"installed sha256 pack\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha256).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-            .unwrap();
+            .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
 
-        let result = db.install_pack(&pack).unwrap();
+        let result = db
+            .install_pack(&pack)
+            .expect("test operation should succeed");
 
         assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
         assert_eq!(result.object_ids, vec![oid.clone()]);
         assert!(result.pack_path.exists());
         assert!(result.index_path.exists());
         assert_eq!(result.promisor_path, None);
-        assert!(!db.loose().object_path(&oid).unwrap().exists());
-        assert!(db.contains(&oid).unwrap());
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            !db.loose()
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_installs_raw_sha256_pack_without_loose_objects() {
         let root = temp_root("sley-file-odb-install-raw-pack");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"installed raw sha256 pack\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha256).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-            .unwrap();
+            .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha256);
 
-        let result = db.install_raw_pack(&pack.pack).unwrap();
+        let result = db
+            .install_raw_pack(&pack.pack)
+            .expect("test operation should succeed");
 
         assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
         assert_eq!(result.object_ids, vec![oid.clone()]);
         assert!(result.pack_path.exists());
         assert!(result.index_path.exists());
         assert_eq!(result.promisor_path, None);
-        assert!(!db.loose().object_path(&oid).unwrap().exists());
-        assert!(db.contains(&oid).unwrap());
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            !db.loose()
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        assert!(db.contains(&oid).expect("test operation should succeed"));
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_rejects_noncanonical_pack_index() {
         let root = temp_root("sley-file-odb-install-bad-index");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"bad index crc\n".to_vec());
-        let pack =
-            PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1).unwrap();
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let mut entries = pack.entries.clone();
         entries[0].crc32 ^= 1;
         let mut bad_pack = pack.clone();
-        bad_pack.index = PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack.checksum).unwrap();
+        bad_pack.index = PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack.checksum)
+            .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
 
         assert!(db.install_pack(&bad_pack).is_err());
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn file_database_installs_raw_promisor_pack_with_sidecar() {
         let root = temp_root("sley-file-odb-install-raw-promisor-pack");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"installed promisor pack\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let pack =
-            PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
 
         let result = db
             .install_raw_pack_with_options(&pack.pack, RawPackInstallOptions { promisor: true })
-            .unwrap();
+            .expect("test operation should succeed");
 
         let promisor_path = result.promisor_path.expect("promisor sidecar");
         assert_eq!(promisor_path.file_stem(), result.pack_path.file_stem());
@@ -2462,12 +2605,23 @@ mod tests {
             Some("promisor")
         );
         assert!(promisor_path.exists());
-        assert_eq!(fs::read(&promisor_path).unwrap(), b"");
+        assert_eq!(
+            fs::read(&promisor_path).expect("test operation should succeed"),
+            b""
+        );
         assert!(result.pack_path.exists());
         assert!(result.index_path.exists());
-        assert!(!db.loose().object_path(&oid).unwrap().exists());
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            !db.loose()
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2475,14 +2629,14 @@ mod tests {
         let root = temp_root("sley-odb-common-dir");
         let common = root.join(".git");
         let admin = common.join("worktrees").join("linked");
-        fs::create_dir_all(&admin).unwrap();
-        fs::write(admin.join("commondir"), "../..\n").unwrap();
+        fs::create_dir_all(&admin).expect("test operation should succeed");
+        fs::write(admin.join("commondir"), "../..\n").expect("test operation should succeed");
 
-        let common = fs::canonicalize(common).unwrap();
+        let common = fs::canonicalize(common).expect("test operation should succeed");
         assert_eq!(repository_common_dir(&admin), common);
         assert_eq!(repository_objects_dir(&admin), common.join("objects"));
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2490,14 +2644,17 @@ mod tests {
         let root = temp_root("sley-reachable-pack");
         let source_git_dir = root.join("source.git");
         let destination_git_dir = root.join("destination.git");
-        fs::create_dir_all(source_git_dir.join("objects")).unwrap();
-        fs::create_dir_all(destination_git_dir.join("objects")).unwrap();
+        fs::create_dir_all(source_git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(destination_git_dir.join("objects"))
+            .expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"reachable payload\n".to_vec());
-        let blob_oid = source.write_object(blob.clone()).unwrap();
+        let blob_oid = source
+            .write_object(blob.clone())
+            .expect("test operation should succeed");
         let tree = EncodedObject::new(
             ObjectType::Tree,
             Tree {
@@ -2509,7 +2666,9 @@ mod tests {
             }
             .write(),
         );
-        let tree_oid = source.write_object(tree.clone()).unwrap();
+        let tree_oid = source
+            .write_object(tree.clone())
+            .expect("test operation should succeed");
         let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
         let commit = EncodedObject::new(
             ObjectType::Commit,
@@ -2523,11 +2682,13 @@ mod tests {
             }
             .write(),
         );
-        let commit_oid = source.write_object(commit.clone()).unwrap();
+        let commit_oid = source
+            .write_object(commit.clone())
+            .expect("test operation should succeed");
 
         let reachable =
             collect_reachable_object_ids(&source, format, std::iter::once(commit_oid.clone()))
-                .unwrap();
+                .expect("test operation should succeed");
         assert!(reachable.contains(&commit_oid));
         assert!(reachable.contains(&tree_oid));
         assert!(reachable.contains(&blob_oid));
@@ -2538,7 +2699,7 @@ mod tests {
             format,
             std::iter::once(commit_oid.clone()),
         )
-        .unwrap()
+        .expect("test operation should succeed")
         .expect("reachable pack should be written");
         assert_eq!(install.object_ids.len(), 3);
         for (oid, object) in [
@@ -2546,23 +2707,40 @@ mod tests {
             (&tree_oid, &tree),
             (&blob_oid, &blob),
         ] {
-            assert!(!destination.loose().object_path(oid).unwrap().exists());
-            assert!(destination.contains(oid).unwrap());
-            assert_eq!(destination.read_object(oid).unwrap(), *object);
+            assert!(
+                !destination
+                    .loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
+            assert!(
+                destination
+                    .contains(oid)
+                    .expect("test operation should succeed")
+            );
+            assert_eq!(
+                destination
+                    .read_object(oid)
+                    .expect("test operation should succeed"),
+                *object
+            );
         }
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn reachable_object_helpers_respect_exclusions_and_duplicate_starts() {
         let root = temp_root("sley-reachable-exclusions");
         let git_dir = root.join("repo.git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"excluded payload\n".to_vec());
-        let blob_oid = db.write_object(blob).unwrap();
+        let blob_oid = db
+            .write_object(blob)
+            .expect("test operation should succeed");
         let tree = EncodedObject::new(
             ObjectType::Tree,
             Tree {
@@ -2574,7 +2752,9 @@ mod tests {
             }
             .write(),
         );
-        let tree_oid = db.write_object(tree).unwrap();
+        let tree_oid = db
+            .write_object(tree)
+            .expect("test operation should succeed");
         let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
         let commit = EncodedObject::new(
             ObjectType::Commit,
@@ -2588,7 +2768,9 @@ mod tests {
             }
             .write(),
         );
-        let commit_oid = db.write_object(commit).unwrap();
+        let commit_oid = db
+            .write_object(commit)
+            .expect("test operation should succeed");
         let excluded = HashSet::from([tree_oid.clone()]);
 
         let objects = collect_reachable_objects(
@@ -2597,25 +2779,32 @@ mod tests {
             [commit_oid.clone(), commit_oid.clone()],
             &excluded,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert_eq!(objects.len(), 1);
-        assert_eq!(objects[0].object_id(format).unwrap(), commit_oid);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            objects[0]
+                .object_id(format)
+                .expect("test operation should succeed"),
+            commit_oid
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn build_reachable_pack_returns_raw_pack_and_respects_empty_exclusions() {
         let root = temp_root("sley-build-reachable-pack");
         let git_dir = root.join("repo.git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let object = EncodedObject::new(ObjectType::Blob, b"raw reachable pack\n".to_vec());
-        let oid = db.write_object(object.clone()).unwrap();
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
         let pack = build_reachable_pack(&db, format, std::iter::once(oid.clone()), &HashSet::new())
-            .unwrap()
+            .expect("test operation should succeed")
             .expect("reachable pack should be built");
         assert!(pack.pack.starts_with(b"PACK"));
         assert_eq!(pack.entries.len(), 1);
@@ -2629,22 +2818,24 @@ mod tests {
                 pack.entries.into_iter().map(|entry| entry.oid),
                 &excluded
             )
-            .unwrap()
+            .expect("test operation should succeed")
             .is_none()
         );
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn reachable_object_helpers_follow_tags_and_report_missing_objects() {
         let root = temp_root("sley-reachable-tags");
         let git_dir = root.join("repo.git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"tagged payload\n".to_vec());
-        let blob_oid = db.write_object(blob).unwrap();
+        let blob_oid = db
+            .write_object(blob)
+            .expect("test operation should succeed");
         let tag = EncodedObject::new(
             ObjectType::Tag,
             Tag {
@@ -2656,20 +2847,20 @@ mod tests {
             }
             .write(),
         );
-        let tag_oid = db.write_object(tag).unwrap();
+        let tag_oid = db.write_object(tag).expect("test operation should succeed");
 
-        let reachable =
-            collect_reachable_object_ids(&db, format, std::iter::once(tag_oid.clone())).unwrap();
+        let reachable = collect_reachable_object_ids(&db, format, std::iter::once(tag_oid.clone()))
+            .expect("test operation should succeed");
         assert!(reachable.contains(&tag_oid));
         assert!(reachable.contains(&blob_oid));
 
-        let missing =
-            ObjectId::from_hex(format, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let missing = ObjectId::from_hex(format, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("test operation should succeed");
         assert!(matches!(
             collect_reachable_object_ids(&db, format, std::iter::once(missing)),
             Err(GitError::NotFound(_))
         ));
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2677,18 +2868,19 @@ mod tests {
         let root = temp_root("sley-reachable-empty");
         let source_git_dir = root.join("source.git");
         let destination_git_dir = root.join("destination.git");
-        fs::create_dir_all(source_git_dir.join("objects")).unwrap();
-        fs::create_dir_all(destination_git_dir.join("objects")).unwrap();
+        fs::create_dir_all(source_git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(destination_git_dir.join("objects"))
+            .expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
 
-        let result =
-            install_reachable_pack(&source, &destination, format, Vec::<ObjectId>::new()).unwrap();
+        let result = install_reachable_pack(&source, &destination, format, Vec::<ObjectId>::new())
+            .expect("test operation should succeed");
 
         assert!(result.is_none());
         assert!(!destination_git_dir.join("objects").join("pack").exists());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2696,13 +2888,16 @@ mod tests {
         let root = temp_root("sley-reachable-install-excluding");
         let source_git_dir = root.join("source.git");
         let destination_git_dir = root.join("destination.git");
-        fs::create_dir_all(source_git_dir.join("objects")).unwrap();
-        fs::create_dir_all(destination_git_dir.join("objects")).unwrap();
+        fs::create_dir_all(source_git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(destination_git_dir.join("objects"))
+            .expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
         let object = EncodedObject::new(ObjectType::Blob, b"excluded install\n".to_vec());
-        let oid = source.write_object(object).unwrap();
+        let oid = source
+            .write_object(object)
+            .expect("test operation should succeed");
         let excluded = HashSet::from([oid.clone()]);
 
         let result = install_reachable_pack_excluding(
@@ -2712,11 +2907,11 @@ mod tests {
             std::iter::once(oid),
             &excluded,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         assert!(result.is_none());
         assert!(!destination_git_dir.join("objects").join("pack").exists());
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2724,13 +2919,16 @@ mod tests {
         let root = temp_root("sley-reachable-pack-sha256");
         let source_git_dir = root.join("source.git");
         let destination_git_dir = root.join("destination.git");
-        fs::create_dir_all(source_git_dir.join("objects")).unwrap();
-        fs::create_dir_all(destination_git_dir.join("objects")).unwrap();
+        fs::create_dir_all(source_git_dir.join("objects")).expect("test operation should succeed");
+        fs::create_dir_all(destination_git_dir.join("objects"))
+            .expect("test operation should succeed");
         let format = ObjectFormat::Sha256;
         let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
         let object = EncodedObject::new(ObjectType::Blob, b"sha256 reachable pack\n".to_vec());
-        let oid = source.write_object(object.clone()).unwrap();
+        let oid = source
+            .write_object(object.clone())
+            .expect("test operation should succeed");
 
         let pack = build_reachable_pack(
             &source,
@@ -2738,20 +2936,31 @@ mod tests {
             std::iter::once(oid.clone()),
             &HashSet::new(),
         )
-        .unwrap()
+        .expect("test operation should succeed")
         .expect("sha256 reachable pack should be built");
         assert!(pack.pack.starts_with(b"PACK"));
         assert_eq!(pack.entries[0].oid, oid);
 
         let result =
             install_reachable_pack(&source, &destination, format, std::iter::once(oid.clone()))
-                .unwrap()
+                .expect("test operation should succeed")
                 .expect("sha256 reachable pack should be written");
 
         assert_eq!(result.object_ids, vec![oid.clone()]);
-        assert!(!destination.loose().object_path(&oid).unwrap().exists());
-        assert_eq!(destination.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            !destination
+                .loose()
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        assert_eq!(
+            destination
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2773,12 +2982,14 @@ mod tests {
         let format = ObjectFormat::Sha1;
         let mut source = ObjectDatabase::new(format);
         let object = EncodedObject::new(ObjectType::Blob, b"custom raw installer\n".to_vec());
-        let oid = source.write_object(object).unwrap();
+        let oid = source
+            .write_object(object)
+            .expect("test operation should succeed");
         let installer = RecordingInstaller::default();
         installer.installed.borrow_mut().push(oid.clone());
 
         let result = install_reachable_pack(&source, &installer, format, std::iter::once(oid))
-            .unwrap()
+            .expect("test operation should succeed")
             .expect("custom installer should receive pack");
 
         assert_eq!(result.object_ids, installer.installed.into_inner());
@@ -2792,25 +3003,31 @@ mod tests {
         let root = temp_root("sley-file-odb-midx");
         let git_dir = root.join(".git");
         let pack_dir = git_dir.join("objects").join("pack");
-        fs::create_dir_all(&pack_dir).unwrap();
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
         let first = EncodedObject::new(ObjectType::Blob, b"first packed\n".to_vec());
         let second = EncodedObject::new(ObjectType::Blob, b"second packed\n".to_vec());
-        let first_oid = first.object_id(ObjectFormat::Sha1).unwrap();
-        let second_oid = second.object_id(ObjectFormat::Sha1).unwrap();
-        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first)).unwrap();
-        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second)).unwrap();
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first))
+            .expect("test operation should succeed");
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
+            .expect("test operation should succeed");
         let first_pack_name = format!("pack-{}.idx", first_pack.checksum.to_hex());
         let second_pack_name = format!("pack-{}.idx", second_pack.checksum.to_hex());
         fs::write(
             pack_dir.join(first_pack_name.replace(".idx", ".pack")),
             first_pack.pack,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         fs::write(
             pack_dir.join(second_pack_name.replace(".idx", ".pack")),
             second_pack.pack,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let midx = MultiPackIndex::write(
             ObjectFormat::Sha1,
             2,
@@ -2828,18 +3045,30 @@ mod tests {
                 },
             ],
         )
-        .unwrap();
-        fs::write(pack_dir.join("multi-pack-index"), midx).unwrap();
+        .expect("test operation should succeed");
+        fs::write(pack_dir.join("multi-pack-index"), midx).expect("test operation should succeed");
 
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        assert!(db.contains(&second_oid).unwrap());
+        assert!(
+            db.contains(&second_oid)
+                .expect("test operation should succeed")
+        );
         assert_eq!(
-            db.resolve_prefix(&second_oid.to_hex()[..8]).unwrap(),
+            db.resolve_prefix(&second_oid.to_hex()[..8])
+                .expect("test operation should succeed"),
             ObjectPrefixResolution::Unique(second_oid.clone())
         );
-        assert_eq!(db.read_object(&second_oid).unwrap(), second);
-        assert_eq!(db.read_object(&first_oid).unwrap(), first);
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            db.read_object(&second_oid)
+                .expect("test operation should succeed"),
+            second
+        );
+        assert_eq!(
+            db.read_object(&first_oid)
+                .expect("test operation should succeed"),
+            first
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2849,19 +3078,29 @@ mod tests {
         // discovered by the same handle, because a miss triggers a re-scan.
         let root = temp_root("sley-file-odb-pack-added-late");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
 
         // First pack + object; reading it populates the listing cache.
         let first = EncodedObject::new(ObjectType::Blob, b"first late\n".to_vec());
-        let first_oid = first.object_id(ObjectFormat::Sha1).unwrap();
-        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first)).unwrap();
-        db.install_pack(&first_pack).unwrap();
-        assert_eq!(db.read_object(&first_oid).unwrap(), first);
+        let first_oid = first
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let first_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&first))
+            .expect("test operation should succeed");
+        db.install_pack(&first_pack)
+            .expect("test operation should succeed");
+        assert_eq!(
+            db.read_object(&first_oid)
+                .expect("test operation should succeed"),
+            first
+        );
 
         // A second object that the cached listing does not yet know about.
         let second = EncodedObject::new(ObjectType::Blob, b"second late\n".to_vec());
-        let second_oid = second.object_id(ObjectFormat::Sha1).unwrap();
+        let second_oid = second
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
         // It is genuinely absent right now.
         assert!(matches!(
             db.read_object(&second_oid),
@@ -2870,14 +3109,27 @@ mod tests {
 
         // Install its pack through the same handle; the next read must find it via
         // a re-scan, not be masked by the stale listing.
-        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second)).unwrap();
-        db.install_pack(&second_pack).unwrap();
-        assert!(db.contains(&second_oid).unwrap());
-        assert_eq!(db.read_object(&second_oid).unwrap(), second);
+        let second_pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&second))
+            .expect("test operation should succeed");
+        db.install_pack(&second_pack)
+            .expect("test operation should succeed");
+        assert!(
+            db.contains(&second_oid)
+                .expect("test operation should succeed")
+        );
+        assert_eq!(
+            db.read_object(&second_oid)
+                .expect("test operation should succeed"),
+            second
+        );
         // The original object still resolves too.
-        assert_eq!(db.read_object(&first_oid).unwrap(), first);
+        assert_eq!(
+            db.read_object(&first_oid)
+                .expect("test operation should succeed"),
+            first
+        );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2885,25 +3137,31 @@ mod tests {
         let root = temp_root("sley-file-odb-prefer-loose");
         let git_dir = root.join(".git");
         let pack_dir = git_dir.join("objects").join("pack");
-        fs::create_dir_all(&pack_dir).unwrap();
+        fs::create_dir_all(&pack_dir).expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"same\n".to_vec());
-        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
+        let written = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
         let pack_name = written.checksum.to_hex();
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.pack")),
             written.pack,
         )
-        .unwrap();
+        .expect("test operation should succeed");
         fs::write(
             pack_dir.join(format!("pack-{pack_name}.idx")),
             written.index,
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
-        let oid = db.write_object(object.clone()).unwrap();
-        assert_eq!(db.read_object(&oid).unwrap(), object);
-        fs::remove_dir_all(root).unwrap();
+        let oid = db
+            .write_object(object.clone())
+            .expect("test operation should succeed");
+        assert_eq!(
+            db.read_object(&oid).expect("test operation should succeed"),
+            object
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -2911,20 +3169,22 @@ mod tests {
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"base\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let bundle_bytes = format!("# v2 git bundle\n-{oid} base\n\n").into_bytes();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
-        verify_bundle_prerequisites(&bundle, &db).unwrap();
+        verify_bundle_prerequisites(&bundle, &db).expect("test operation should succeed");
     }
 
     #[test]
     fn bundle_prerequisite_verification_reports_missing_objects() {
         let db = ObjectDatabase::new(ObjectFormat::Sha1);
-        let missing =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"missing\n").unwrap();
+        let missing = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"missing\n")
+            .expect("test operation should succeed");
         let bundle_bytes = format!("# v2 git bundle\n-{missing} missing\n\n").into_bytes();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
         assert!(verify_bundle_prerequisites(&bundle, &db).is_err());
     }
@@ -2934,79 +3194,120 @@ mod tests {
         let prerequisite_reader = ObjectDatabase::new(ObjectFormat::Sha1);
         let mut writer = ObjectDatabase::new(ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"bundle object\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
         let bundle_bytes = format!("# v2 git bundle\n{oid} refs/heads/main\n\n")
             .into_bytes()
             .into_iter()
             .chain(pack.pack)
             .collect::<Vec<_>>();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
-        let result = unbundle_objects(&bundle, &prerequisite_reader, &mut writer).unwrap();
+        let result = unbundle_objects(&bundle, &prerequisite_reader, &mut writer)
+            .expect("test operation should succeed");
         assert_eq!(result.written_objects, vec![oid.clone()]);
         assert_eq!(result.references, bundle.references);
-        assert_eq!(writer.read_object(&oid).unwrap(), object);
+        assert_eq!(
+            writer
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
     }
 
     #[test]
     fn install_bundle_pack_writes_pack_and_returns_refs() {
         let root = temp_root("sley-install-bundle-pack");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let prerequisite_reader = ObjectDatabase::new(ObjectFormat::Sha1);
         let database = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"bundle pack object\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
         let bundle_bytes = format!("# v2 git bundle\n{oid} refs/heads/main\n\n")
             .into_bytes()
             .into_iter()
             .chain(pack.pack)
             .collect::<Vec<_>>();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
-        let result = install_bundle_pack(&bundle, &prerequisite_reader, &database).unwrap();
+        let result = install_bundle_pack(&bundle, &prerequisite_reader, &database)
+            .expect("test operation should succeed");
 
         assert_eq!(result.written_objects, vec![oid.clone()]);
         assert_eq!(result.references, bundle.references);
-        assert!(database.contains(&oid).unwrap());
-        assert_eq!(database.read_object(&oid).unwrap(), object);
-        assert!(!database.loose().object_path(&oid).unwrap().exists());
-        fs::remove_dir_all(root).unwrap();
+        assert!(
+            database
+                .contains(&oid)
+                .expect("test operation should succeed")
+        );
+        assert_eq!(
+            database
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
+        assert!(
+            !database
+                .loose()
+                .object_path(&oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn unpack_packfile_objects_writes_sha256_pack_entries() {
         let mut writer = ObjectDatabase::new(ObjectFormat::Sha256);
         let object = EncodedObject::new(ObjectType::Blob, b"transport pack object\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha256).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
-            .unwrap();
+            .expect("test operation should succeed");
 
-        let result =
-            unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &mut writer).unwrap();
+        let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &mut writer)
+            .expect("test operation should succeed");
 
         assert_eq!(result.written_objects, vec![oid.clone()]);
-        assert_eq!(writer.read_object(&oid).unwrap(), object);
+        assert_eq!(
+            writer
+                .read_object(&oid)
+                .expect("test operation should succeed"),
+            object
+        );
     }
 
     #[test]
     fn unbundle_objects_rejects_missing_prerequisites_before_writing() {
         let prerequisite_reader = ObjectDatabase::new(ObjectFormat::Sha1);
         let mut writer = ObjectDatabase::new(ObjectFormat::Sha1);
-        let missing =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"missing\n").unwrap();
+        let missing = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"missing\n")
+            .expect("test operation should succeed");
         let object = EncodedObject::new(ObjectType::Blob, b"bundle object\n".to_vec());
-        let oid = object.object_id(ObjectFormat::Sha1).unwrap();
-        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object)).unwrap();
+        let oid = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let pack = PackFile::write_undeltified_sha1(std::slice::from_ref(&object))
+            .expect("test operation should succeed");
         let bundle_bytes =
             format!("# v2 git bundle\n-{missing} missing\n{oid} refs/heads/main\n\n")
                 .into_bytes()
                 .into_iter()
                 .chain(pack.pack)
                 .collect::<Vec<_>>();
-        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1).unwrap();
+        let bundle = Bundle::parse(&bundle_bytes, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
 
         assert!(unbundle_objects(&bundle, &prerequisite_reader, &mut writer).is_err());
         assert!(!writer.contains(&oid));
@@ -3019,7 +3320,9 @@ mod tests {
         payload: &[u8],
     ) -> Vec<(ObjectId, EncodedObject)> {
         let blob = EncodedObject::new(ObjectType::Blob, payload.to_vec());
-        let blob_oid = db.write_object(blob.clone()).unwrap();
+        let blob_oid = db
+            .write_object(blob.clone())
+            .expect("test operation should succeed");
         let tree = EncodedObject::new(
             ObjectType::Tree,
             Tree {
@@ -3031,7 +3334,9 @@ mod tests {
             }
             .write(),
         );
-        let tree_oid = db.write_object(tree.clone()).unwrap();
+        let tree_oid = db
+            .write_object(tree.clone())
+            .expect("test operation should succeed");
         let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
         let commit = EncodedObject::new(
             ObjectType::Commit,
@@ -3045,22 +3350,28 @@ mod tests {
             }
             .write(),
         );
-        let commit_oid = db.write_object(commit.clone()).unwrap();
+        let commit_oid = db
+            .write_object(commit.clone())
+            .expect("test operation should succeed");
         vec![(commit_oid, commit), (tree_oid, tree), (blob_oid, blob)]
     }
 
     fn repack_all_objects_consolidates_loose_and_pack(format: ObjectFormat) {
         let root = temp_root("sley-repack-all");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         // A pre-existing pack holds one blob; the rest of the graph is loose.
         let packed_blob = EncodedObject::new(ObjectType::Blob, b"already packed\n".to_vec());
-        let packed_oid = packed_blob.object_id(format).unwrap();
-        let existing_pack =
-            PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
-        let existing = db.install_pack(&existing_pack).unwrap();
+        let packed_oid = packed_blob
+            .object_id(format)
+            .expect("test operation should succeed");
+        let existing_pack = PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format)
+            .expect("test operation should succeed");
+        let existing = db
+            .install_pack(&existing_pack)
+            .expect("test operation should succeed");
 
         let graph = write_commit_graph(&mut db, b"repack payload\n");
 
@@ -3068,22 +3379,28 @@ mod tests {
         expected.insert(packed_oid.clone(), packed_blob.clone());
 
         let result = repack_all_objects(&git_dir, format)
-            .unwrap()
+            .expect("test operation should succeed")
             .expect("repository has objects");
 
         // The new pack round-trips and contains every original object byte-for-byte.
         assert_eq!(result.object_count, expected.len());
-        let parsed = PackFile::parse(&result.pack, format).unwrap();
+        let parsed = PackFile::parse(&result.pack, format).expect("test operation should succeed");
         assert_eq!(parsed.entries.len(), expected.len());
         for entry in &parsed.entries {
             let want = expected
                 .get(&entry.entry.oid)
                 .expect("packed object was in the repository");
             assert_eq!(&entry.object, want);
-            assert_eq!(entry.object.object_id(format).unwrap(), entry.entry.oid);
+            assert_eq!(
+                entry
+                    .object
+                    .object_id(format)
+                    .expect("test operation should succeed"),
+                entry.entry.oid
+            );
         }
         // The generated index parses and agrees with the pack checksum.
-        let idx = PackIndex::parse(&result.idx, format).unwrap();
+        let idx = PackIndex::parse(&result.idx, format).expect("test operation should succeed");
         assert_eq!(idx.pack_checksum, parsed.checksum);
         assert_eq!(idx.entries.len(), expected.len());
 
@@ -3095,7 +3412,7 @@ mod tests {
         assert_eq!(result.packed_loose, want_loose);
         assert!(!result.packed_loose.contains(&packed_oid));
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -3112,31 +3429,34 @@ mod tests {
     fn repack_all_objects_returns_none_for_empty_repository() {
         let root = temp_root("sley-repack-empty");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
 
         assert!(
             repack_all_objects(&git_dir, ObjectFormat::Sha1)
-                .unwrap()
+                .expect("test operation should succeed")
                 .is_none()
         );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn install_repack_result_writes_pack_without_pruning_by_default() {
         let root = temp_root("sley-repack-install-nodelete");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let graph = write_commit_graph(&mut db, b"install no prune\n");
 
-        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
-        install_repack_result(&git_dir, format, &result, false).unwrap();
+        let result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
+        install_repack_result(&git_dir, format, &result, false)
+            .expect("test operation should succeed");
 
         // New pack is on disk and readable.
-        let parsed = PackFile::parse(&result.pack, format).unwrap();
+        let parsed = PackFile::parse(&result.pack, format).expect("test operation should succeed");
         let pack_dir = git_dir.join("objects").join("pack");
         let pack_path = pack_dir.join(format!("pack-{}.pack", parsed.checksum.to_hex()));
         let idx_path = pack_dir.join(format!("pack-{}.idx", parsed.checksum.to_hex()));
@@ -3144,37 +3464,57 @@ mod tests {
         assert!(idx_path.exists());
         // Loose objects survive because prune was not requested.
         for (oid, object) in &graph {
-            assert!(db.loose().object_path(oid).unwrap().exists());
-            assert_eq!(db.read_object(oid).unwrap(), *object);
+            assert!(
+                db.loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
+            assert_eq!(
+                db.read_object(oid).expect("test operation should succeed"),
+                *object
+            );
         }
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn install_repack_result_prunes_obsolete_packs_and_loose_objects() {
         let root = temp_root("sley-repack-install-prune");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let packed_blob = EncodedObject::new(ObjectType::Blob, b"prune packed\n".to_vec());
-        let existing_pack =
-            PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
-        let existing = db.install_pack(&existing_pack).unwrap();
+        let existing_pack = PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format)
+            .expect("test operation should succeed");
+        let existing = db
+            .install_pack(&existing_pack)
+            .expect("test operation should succeed");
         let graph = write_commit_graph(&mut db, b"prune payload\n");
 
-        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
-        let new_pack_checksum = PackFile::parse(&result.pack, format).unwrap().checksum;
-        install_repack_result(&git_dir, format, &result, true).unwrap();
+        let result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
+        let new_pack_checksum = PackFile::parse(&result.pack, format)
+            .expect("test operation should succeed")
+            .checksum;
+        install_repack_result(&git_dir, format, &result, true)
+            .expect("test operation should succeed");
 
         // Obsolete pack and its index are gone.
         assert!(!existing.pack_path.exists());
         assert!(!existing.index_path.exists());
         // Packed loose objects are gone from disk.
         for (oid, _) in &graph {
-            assert!(!db.loose().object_path(oid).unwrap().exists());
+            assert!(
+                !db.loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
         }
         // The new consolidated pack remains and still serves every object.
         let pack_dir = git_dir.join("objects").join("pack");
@@ -3185,47 +3525,69 @@ mod tests {
         );
         let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
         for (oid, object) in &graph {
-            assert!(reopened.contains(oid).unwrap());
-            assert_eq!(reopened.read_object(oid).unwrap(), *object);
+            assert!(
+                reopened
+                    .contains(oid)
+                    .expect("test operation should succeed")
+            );
+            assert_eq!(
+                reopened
+                    .read_object(oid)
+                    .expect("test operation should succeed"),
+                *object
+            );
         }
-        let packed_oid = packed_blob.object_id(format).unwrap();
-        assert_eq!(reopened.read_object(&packed_oid).unwrap(), packed_blob);
+        let packed_oid = packed_blob
+            .object_id(format)
+            .expect("test operation should succeed");
+        assert_eq!(
+            reopened
+                .read_object(&packed_oid)
+                .expect("test operation should succeed"),
+            packed_blob
+        );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn install_repack_result_preserves_keep_and_promisor_packs() {
         let root = temp_root("sley-repack-install-keep-promisor");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let keep_blob = EncodedObject::new(ObjectType::Blob, b"keep protected\n".to_vec());
-        let keep_pack =
-            PackFile::write_undeltified(std::slice::from_ref(&keep_blob), format).unwrap();
-        let keep_install = db.install_pack(&keep_pack).unwrap();
+        let keep_pack = PackFile::write_undeltified(std::slice::from_ref(&keep_blob), format)
+            .expect("test operation should succeed");
+        let keep_install = db
+            .install_pack(&keep_pack)
+            .expect("test operation should succeed");
         let keep_sidecar = keep_install.pack_path.with_extension("keep");
-        fs::write(&keep_sidecar, b"").unwrap();
+        fs::write(&keep_sidecar, b"").expect("test operation should succeed");
 
         let promisor_blob = EncodedObject::new(ObjectType::Blob, b"promisor protected\n".to_vec());
         let promisor_pack =
-            PackFile::write_undeltified(std::slice::from_ref(&promisor_blob), format).unwrap();
+            PackFile::write_undeltified(std::slice::from_ref(&promisor_blob), format)
+                .expect("test operation should succeed");
         let promisor_install = db
             .install_pack_with_options(&promisor_pack, RawPackInstallOptions { promisor: true })
-            .unwrap();
+            .expect("test operation should succeed");
         let promisor_sidecar = promisor_install
             .promisor_path
             .clone()
             .expect("promisor sidecar");
 
         let graph = write_commit_graph(&mut db, b"new consolidated payload\n");
-        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+        let result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
         assert!(result.obsolete_packs.contains(&keep_install.pack_path));
         assert!(result.obsolete_packs.contains(&promisor_install.pack_path));
 
-        install_repack_result(&git_dir, format, &result, true).unwrap();
+        install_repack_result(&git_dir, format, &result, true)
+            .expect("test operation should succeed");
 
         for path in [
             &keep_install.pack_path,
@@ -3238,10 +3600,15 @@ mod tests {
             assert!(path.exists(), "{} should be preserved", path.display());
         }
         for (oid, _) in &graph {
-            assert!(!db.loose().object_path(oid).unwrap().exists());
+            assert!(
+                !db.loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
         }
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
@@ -3250,37 +3617,56 @@ mod tests {
         // pruning even if the caller lists it in `packed_loose`.
         let root = temp_root("sley-repack-install-safety");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let graph = write_commit_graph(&mut db, b"safety packed\n");
 
-        let mut result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+        let mut result = repack_all_objects(&git_dir, format)
+            .expect("test operation should succeed")
+            .expect("test operation should succeed");
 
         // A loose object that is NOT in the new pack, but mislabeled as packed.
         let stray = EncodedObject::new(ObjectType::Blob, b"never packed\n".to_vec());
-        let stray_oid = db.write_object(stray.clone()).unwrap();
+        let stray_oid = db
+            .write_object(stray.clone())
+            .expect("test operation should succeed");
         assert!(!result.packed_loose.contains(&stray_oid));
         result.packed_loose.push(stray_oid.clone());
 
-        install_repack_result(&git_dir, format, &result, true).unwrap();
+        install_repack_result(&git_dir, format, &result, true)
+            .expect("test operation should succeed");
 
         // The stray loose object is untouched because it is not in the new pack.
-        assert!(db.loose().object_path(&stray_oid).unwrap().exists());
-        assert_eq!(db.read_object(&stray_oid).unwrap(), stray);
+        assert!(
+            db.loose()
+                .object_path(&stray_oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
+        assert_eq!(
+            db.read_object(&stray_oid)
+                .expect("test operation should succeed"),
+            stray
+        );
         // Genuinely packed loose objects were still removed.
         for (oid, _) in &graph {
-            assert!(!db.loose().object_path(oid).unwrap().exists());
+            assert!(
+                !db.loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
         }
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn prune_unreachable_loose_reports_and_deletes_only_unreachable() {
         let root = temp_root("sley-prune-unreachable");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let graph = write_commit_graph(&mut db, b"reachable payload\n");
@@ -3288,37 +3674,57 @@ mod tests {
 
         // A dangling loose blob not referenced by the commit graph.
         let dangling = EncodedObject::new(ObjectType::Blob, b"dangling\n".to_vec());
-        let dangling_oid = db.write_object(dangling).unwrap();
+        let dangling_oid = db
+            .write_object(dangling)
+            .expect("test operation should succeed");
 
         // Report-only pass leaves everything on disk.
-        let reported =
-            prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], false).unwrap();
+        let reported = prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], false)
+            .expect("test operation should succeed");
         assert_eq!(reported, vec![dangling_oid.clone()]);
-        assert!(db.loose().object_path(&dangling_oid).unwrap().exists());
+        assert!(
+            db.loose()
+                .object_path(&dangling_oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
 
         // Deleting pass removes only the unreachable object.
-        let deleted =
-            prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], true).unwrap();
+        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], true)
+            .expect("test operation should succeed");
         assert_eq!(deleted, vec![dangling_oid.clone()]);
-        assert!(!db.loose().object_path(&dangling_oid).unwrap().exists());
+        assert!(
+            !db.loose()
+                .object_path(&dangling_oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
         for (oid, object) in &graph {
-            assert!(db.loose().object_path(oid).unwrap().exists());
-            assert_eq!(db.read_object(oid).unwrap(), *object);
+            assert!(
+                db.loose()
+                    .object_path(oid)
+                    .expect("test operation should succeed")
+                    .exists()
+            );
+            assert_eq!(
+                db.read_object(oid).expect("test operation should succeed"),
+                *object
+            );
         }
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]
     fn prune_unreachable_loose_ignores_gitlink_targets() {
         let root = temp_root("sley-prune-gitlink");
         let git_dir = root.join(".git");
-        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
-        let submodule_oid =
-            ObjectId::from_hex(format, "1111111111111111111111111111111111111111").unwrap();
+        let submodule_oid = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
+            .expect("test operation should succeed");
         let tree = EncodedObject::new(
             ObjectType::Tree,
             Tree {
@@ -3330,7 +3736,9 @@ mod tests {
             }
             .write(),
         );
-        let tree_oid = db.write_object(tree).unwrap();
+        let tree_oid = db
+            .write_object(tree)
+            .expect("test operation should succeed");
         let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
         let commit = EncodedObject::new(
             ObjectType::Commit,
@@ -3344,16 +3752,26 @@ mod tests {
             }
             .write(),
         );
-        let commit_oid = db.write_object(commit).unwrap();
+        let commit_oid = db
+            .write_object(commit)
+            .expect("test operation should succeed");
         let dangling = EncodedObject::new(ObjectType::Blob, b"dangling with gitlink\n".to_vec());
-        let dangling_oid = db.write_object(dangling).unwrap();
+        let dangling_oid = db
+            .write_object(dangling)
+            .expect("test operation should succeed");
 
-        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid], true).unwrap();
+        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid], true)
+            .expect("test operation should succeed");
 
         assert_eq!(deleted, vec![dangling_oid.clone()]);
-        assert!(!db.loose().object_path(&dangling_oid).unwrap().exists());
+        assert!(
+            !db.loose()
+                .object_path(&dangling_oid)
+                .expect("test operation should succeed")
+                .exists()
+        );
 
-        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     fn temp_root(prefix: &str) -> PathBuf {

@@ -1850,8 +1850,9 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        .expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
@@ -1866,16 +1867,18 @@ mod tests {
             new: RefTarget::Direct(oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD")
+                .expect("test operation should succeed"),
             oid
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "v1.0").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "v1.0")
+                .expect("test operation should succeed"),
             oid
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -1886,7 +1889,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
         let first_parent = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"main\n");
         let second_parent = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"side\n");
@@ -1898,20 +1901,20 @@ mod tests {
         );
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}^"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             first_parent
         );
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}^2"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             second_parent
         );
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}~2"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             base
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -1920,13 +1923,14 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"abbrev\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
 
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, &oid.to_hex()[..8]).unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, &oid.to_hex()[..8])
+                .expect("test operation should succeed"),
             oid
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -1938,12 +1942,12 @@ mod tests {
                 ObjectType::Blob,
                 b"abbrev conflict\n".to_vec(),
             ))
-            .unwrap();
+            .expect("test operation should succeed");
         let target = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
@@ -1952,35 +1956,38 @@ mod tests {
             new: RefTarget::Direct(target.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, &object.to_hex()[..4]).unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, &object.to_hex()[..4])
+                .expect("test operation should succeed"),
             target
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn resolve_revision_uses_commit_graph_for_parent_suffixes() {
         let git_dir = temp_git_dir();
-        fs::create_dir_all(git_dir.join("objects").join("info")).unwrap();
+        fs::create_dir_all(git_dir.join("objects").join("info"))
+            .expect("test operation should succeed");
         let parent = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let child = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
-        fs::write(git_dir.join("HEAD"), format!("{child}\n")).unwrap();
+        .expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), format!("{child}\n"))
+            .expect("test operation should succeed");
         fs::write(
             git_dir.join("objects").join("info").join("commit-graph"),
             test_commit_graph(ObjectFormat::Sha1, &parent, &child),
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         struct MissingReader;
         impl ObjectReader for MissingReader {
@@ -1993,10 +2000,10 @@ mod tests {
 
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &MissingReader, "HEAD^",)
-                .unwrap(),
+                .expect("test operation should succeed"),
             parent
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2006,9 +2013,9 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         db.write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
         let tag = Tag {
             object: commit.clone(),
@@ -2019,12 +2026,15 @@ mod tests {
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(
-            peel_to_tree(&db, ObjectFormat::Sha1, &commit).unwrap(),
+            peel_to_tree(&db, ObjectFormat::Sha1, &commit).expect("test operation should succeed"),
             tree
         );
-        assert_eq!(peel_to_tree(&db, ObjectFormat::Sha1, &tag).unwrap(), tree);
+        assert_eq!(
+            peel_to_tree(&db, ObjectFormat::Sha1, &tag).expect("test operation should succeed"),
+            tree
+        );
     }
 
     #[test]
@@ -2034,9 +2044,9 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         db.write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
         let tag = Tag {
             object: commit.clone(),
@@ -2047,9 +2057,9 @@ mod tests {
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(
-            peel_to_commit(&db, ObjectFormat::Sha1, &tag).unwrap(),
+            peel_to_commit(&db, ObjectFormat::Sha1, &tag).expect("test operation should succeed"),
             commit
         );
     }
@@ -2062,9 +2072,9 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         db.write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
         let tag = Tag {
             object: commit.clone(),
@@ -2075,10 +2085,10 @@ mod tests {
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{tag}^{{}}"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             commit
         );
         assert_eq!(
@@ -2088,7 +2098,7 @@ mod tests {
                 &db,
                 &format!("{tag}^{{commit}}")
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             commit
         );
         assert_eq!(
@@ -2098,7 +2108,7 @@ mod tests {
                 &db,
                 &format!("{tag}^{{tree}}")
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             tree
         );
         assert_eq!(
@@ -2108,10 +2118,10 @@ mod tests {
                 &db,
                 &format!("{tag}^{{tag}}")
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             tag
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2120,7 +2130,7 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let commit = Commit {
             tree,
             parents: Vec::new(),
@@ -2131,7 +2141,7 @@ mod tests {
         };
         let commit = db
             .write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         let tag = Tag {
             object: commit.clone(),
             object_type: ObjectType::Commit,
@@ -2141,7 +2151,7 @@ mod tests {
         };
         let tag = db
             .write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
-            .unwrap();
+            .expect("test operation should succeed");
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {
@@ -2150,20 +2160,22 @@ mod tests {
             new: RefTarget::Direct(tag.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
-        let packed = pack_refs_with_auto_peel(&git_dir, ObjectFormat::Sha1, true).unwrap();
+        let packed = pack_refs_with_auto_peel(&git_dir, ObjectFormat::Sha1, true)
+            .expect("test operation should succeed");
         let packed_tag = packed
             .iter()
             .find(|packed| packed.reference.name == "refs/tags/v1.0")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(packed_tag.peeled, Some(commit.clone()));
         assert_eq!(
-            refs.read_ref("refs/tags/v1.0").unwrap(),
+            refs.read_ref("refs/tags/v1.0")
+                .expect("test operation should succeed"),
             Some(RefTarget::Direct(tag))
         );
         assert!(!git_dir.join("refs").join("tags").join("v1.0").exists());
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2172,7 +2184,7 @@ mod tests {
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let sub = write_tree(&mut db, &[(0o100644, b"file.txt", &blob)]);
         let dir = write_tree(&mut db, &[(0o040000, b"sub", &sub)]);
         let root = write_tree(&mut db, &[(0o040000, b"dir", &dir)]);
@@ -2187,7 +2199,7 @@ mod tests {
                 &commit.to_hex(),
                 "dir/sub/file.txt"
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             blob
         );
         // Subtree path resolves to the subtree id.
@@ -2199,12 +2211,13 @@ mod tests {
                 &commit.to_hex(),
                 "dir/sub"
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             sub
         );
         // Empty path resolves to the commit's tree.
         assert_eq!(
-            resolve_rev_path(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "").unwrap(),
+            resolve_rev_path(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "")
+                .expect("test operation should succeed"),
             root
         );
         let entry = resolve_rev_path_entry(
@@ -2214,13 +2227,13 @@ mod tests {
             &commit.to_hex(),
             "dir/sub/file.txt",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(entry.oid, blob);
         assert_eq!(entry.mode, Some(0o100644));
         assert_eq!(entry.object_type, ObjectType::Blob);
         assert_eq!(entry.name, b"file.txt");
         let entry = resolve_rev_path_entry(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(entry.oid, root);
         assert_eq!(entry.mode, None);
         assert_eq!(entry.object_type, ObjectType::Tree);
@@ -2233,10 +2246,10 @@ mod tests {
                 &db,
                 &format!("{commit}:dir/sub/file.txt"),
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             blob
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2245,7 +2258,7 @@ mod tests {
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
         let blob = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"root\n".to_vec()))
-            .unwrap();
+            .expect("test operation should succeed");
         let root = write_tree(&mut db, &[(0o100644, b"root.txt", &blob)]);
         let commit = write_test_commit(&mut db, root, Vec::new(), b"init\n");
 
@@ -2257,7 +2270,7 @@ mod tests {
             &commit.to_hex(),
             "nope.txt",
         )
-        .unwrap_err();
+        .expect_err("test operation should fail");
         assert!(
             matches!(&missing, GitError::NotFound(msg) if msg.contains("does not exist")),
             "unexpected error: {missing:?}"
@@ -2271,12 +2284,12 @@ mod tests {
             &commit.to_hex(),
             "root.txt/x",
         )
-        .unwrap_err();
+        .expect_err("test operation should fail");
         assert!(
             matches!(&not_tree, GitError::NotFound(msg) if msg.contains("does not exist")),
             "unexpected error: {not_tree:?}"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2286,12 +2299,12 @@ mod tests {
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let oid_two = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "2222222222222222222222222222222222222222",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let index = Index {
             version: 2,
             entries: vec![
@@ -2303,9 +2316,11 @@ mod tests {
         };
         fs::write(
             git_dir.join("index"),
-            index.write(ObjectFormat::Sha1).unwrap(),
+            index
+                .write(ObjectFormat::Sha1)
+                .expect("test operation should succeed"),
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         // `:path` defaults to stage 0.
         assert_eq!(
@@ -2315,7 +2330,7 @@ mod tests {
                 &ObjectDatabase::new(ObjectFormat::Sha1),
                 ":file.txt",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             oid_zero
         );
         // `:N:path` selects a specific stage.
@@ -2326,7 +2341,7 @@ mod tests {
                 &ObjectDatabase::new(ObjectFormat::Sha1),
                 ":2:conflict.txt",
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             oid_two
         );
         // Wrong stage reports a stage-specific error.
@@ -2336,7 +2351,7 @@ mod tests {
             &ObjectDatabase::new(ObjectFormat::Sha1),
             ":1:conflict.txt",
         )
-        .unwrap_err();
+        .expect_err("test operation should fail");
         assert!(
             matches!(&wrong_stage, GitError::NotFound(msg) if msg.contains("not at stage 1")),
             "unexpected error: {wrong_stage:?}"
@@ -2348,12 +2363,12 @@ mod tests {
             &ObjectDatabase::new(ObjectFormat::Sha1),
             ":missing.txt",
         )
-        .unwrap_err();
+        .expect_err("test operation should fail");
         assert!(
             matches!(&unknown, GitError::NotFound(msg) if msg.contains("not in the index")),
             "unexpected error: {unknown:?}"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2362,7 +2377,7 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let first = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"add feature\n", 1000);
         let second = write_dated_commit(
             &mut db,
@@ -2386,11 +2401,11 @@ mod tests {
             new: RefTarget::Direct(third.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
 
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, ":/widget bug")
-                .unwrap(),
+                .expect("test operation should succeed"),
             second
         );
         // `^{/regex}` over first-parent history finds the same commit from the tip.
@@ -2401,17 +2416,17 @@ mod tests {
                 &db,
                 &format!("{third}^{{/widget bug}}"),
             )
-            .unwrap(),
+            .expect("test operation should succeed"),
             second
         );
         // No match is an error.
         let miss = resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, ":/zzznomatch")
-            .unwrap_err();
+            .expect_err("test operation should fail");
         assert!(
             matches!(miss, GitError::NotFound(_)),
             "unexpected: {miss:?}"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2455,7 +2470,7 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         // base -> a -> b   (left line)
         //   \--> c -> d    (right line)
         let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
@@ -2470,8 +2485,9 @@ mod tests {
             start: a.to_hex(),
             end: b.to_hex(),
         };
-        let mut got = resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &range).unwrap();
-        got.sort_by(|x, y| x.to_hex().cmp(&y.to_hex()));
+        let mut got = resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &range)
+            .expect("test operation should succeed");
+        got.sort_by_key(|x| x.to_hex());
         assert_eq!(got, vec![b.clone()]);
         assert!(!got.contains(&a), "A itself is excluded");
         assert!(!got.contains(&base), "A's ancestors are excluded");
@@ -2484,13 +2500,13 @@ mod tests {
         };
         let got_sym: HashSet<ObjectId> =
             resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &sym)
-                .unwrap()
+                .expect("test operation should succeed")
                 .into_iter()
                 .collect();
         let expected: HashSet<ObjectId> = [a, b, c, d].into_iter().collect();
         assert_eq!(got_sym, expected);
         assert!(!got_sym.contains(&base), "shared base excluded from ...");
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2502,18 +2518,21 @@ mod tests {
         let a = all[1].clone();
         let c = all[3].clone();
 
-        let selection = RevisionSelection::from_specs([format!("{a}..{c}")]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection = RevisionSelection::from_specs([format!("{a}..{c}")])
+            .expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert_eq!(resolved.starts, vec![c.clone()]);
         assert_eq!(resolved.excluded, oid_set([root, a]));
         assert_oid_set(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap(),
+                .expect("test operation should succeed"),
             [c],
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2524,21 +2543,25 @@ mod tests {
         let root = all[0].clone();
         let a = all[1].clone();
         let c = all[3].clone();
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &a);
 
-        let selection = RevisionSelection::from_specs([format!("..{c}")]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection = RevisionSelection::from_specs([format!("..{c}")])
+            .expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert_eq!(resolved.starts, vec![c.clone()]);
         assert_eq!(resolved.excluded, oid_set([root, a]));
         assert_oid_set(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap(),
+                .expect("test operation should succeed"),
             [c],
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2549,21 +2572,25 @@ mod tests {
         let root = all[0].clone();
         let a = all[1].clone();
         let c = all[3].clone();
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &c);
 
-        let selection = RevisionSelection::from_specs([format!("{a}..")]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection = RevisionSelection::from_specs([format!("{a}..")])
+            .expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert_eq!(resolved.starts, vec![c.clone()]);
         assert_eq!(resolved.excluded, oid_set([root, a]));
         assert_oid_set(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap(),
+                .expect("test operation should succeed"),
             [c],
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2575,18 +2602,21 @@ mod tests {
         let a = all[1].clone();
         let b = all[2].clone();
 
-        let selection = RevisionSelection::from_specs([format!("{a}...{b}")]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection = RevisionSelection::from_specs([format!("{a}...{b}")])
+            .expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert_eq!(resolved.starts, vec![a.clone(), b.clone()]);
         assert_eq!(resolved.excluded, oid_set([root]));
         assert_oid_set(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap(),
+                .expect("test operation should succeed"),
             [a, b],
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2597,18 +2627,21 @@ mod tests {
         let root = all[0].clone();
         let a = all[1].clone();
 
-        let selection = RevisionSelection::from_specs([format!("^{a}")]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection = RevisionSelection::from_specs([format!("^{a}")])
+            .expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert!(resolved.starts.is_empty());
         assert_eq!(resolved.excluded, oid_set([root, a]));
         assert!(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap()
+                .expect("test operation should succeed")
                 .is_empty()
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2620,18 +2653,21 @@ mod tests {
         let a = all[1].clone();
         let c = all[3].clone();
 
-        let selection = RevisionSelection::from_specs([c.to_hex()]).unwrap();
-        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+        let selection =
+            RevisionSelection::from_specs([c.to_hex()]).expect("test operation should succeed");
+        let resolved = selection
+            .resolve(&git_dir, format, &db)
+            .expect("test operation should succeed");
 
         assert_eq!(resolved.starts, vec![c.clone()]);
         assert!(resolved.excluded.is_empty());
         assert_oid_set(
             resolved
                 .selected_commit_oids(&git_dir, format, &db, false)
-                .unwrap(),
+                .expect("test operation should succeed"),
             [root, a, c],
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2642,28 +2678,31 @@ mod tests {
             ObjectFormat::Sha1,
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
         let left = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"left\n");
         let right = write_test_commit(&mut db, tree, vec![base.clone()], b"right\n");
         assert_eq!(
-            merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right).unwrap(),
+            merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right)
+                .expect("test operation should succeed"),
             vec![base]
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn resolve_bare_at_is_head() {
         let git_dir = temp_git_dir();
         let oid = test_oid(0xaa);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &oid);
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@")
+                .expect("test operation should succeed"),
             oid
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2672,7 +2711,8 @@ mod tests {
         let c0 = test_oid(0x10);
         let c1 = test_oid(0x11);
         let c2 = test_oid(0x12);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &c2);
         // Oldest-first reflog: c0 -> c1 -> c2 (c2 is the current value).
         write_head_reflog(
@@ -2686,24 +2726,28 @@ mod tests {
 
         // `@{0}` is the current value, `@{1}`/`@{2}` walk back through the log.
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}")
+                .expect("test operation should succeed"),
             c2
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{1}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{1}")
+                .expect("test operation should succeed"),
             c1
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{2}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{2}")
+                .expect("test operation should succeed"),
             c0
         );
         // Out-of-range reports a git-style "only has N entries" error.
-        let err = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{5}").unwrap_err();
+        let err = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{5}")
+            .expect_err("test operation should fail");
         assert!(
             matches!(&err, GitError::NotFound(msg) if msg.contains("only has 3 entries")),
             "unexpected error: {err:?}"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2721,37 +2765,41 @@ mod tests {
             ],
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{0}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{0}")
+                .expect("test operation should succeed"),
             new
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{1}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "topic@{1}")
+                .expect("test operation should succeed"),
             old
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn resolve_upstream_via_branch_config() {
         let git_dir = temp_git_dir();
         let tip = test_oid(0x30);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &tip);
         set_ref(&git_dir, "refs/remotes/origin/main", &tip);
         fs::write(
             git_dir.join("config"),
             b"[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
 
         for spec in ["@{u}", "@{upstream}", "main@{upstream}"] {
             assert_eq!(
-                resolve_revision(&git_dir, ObjectFormat::Sha1, spec).unwrap(),
+                resolve_revision(&git_dir, ObjectFormat::Sha1, spec)
+                    .expect("test operation should succeed"),
                 tip,
                 "spec {spec}"
             );
         }
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2759,7 +2807,8 @@ mod tests {
         let git_dir = temp_git_dir();
         let up = test_oid(0x40);
         let pushed = test_oid(0x41);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &up);
         set_ref(&git_dir, "refs/remotes/origin/main", &up);
 
@@ -2768,9 +2817,10 @@ mod tests {
             git_dir.join("config"),
             b"[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}")
+                .expect("test operation should succeed"),
             up
         );
 
@@ -2780,17 +2830,19 @@ mod tests {
             git_dir.join("config"),
             b"[branch \"main\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/main\n",
         )
-        .unwrap();
+        .expect("test operation should succeed");
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{push}")
+                .expect("test operation should succeed"),
             pushed
         );
         // `@{u}` still uses the upstream remote, not the push remote.
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{u}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{u}")
+                .expect("test operation should succeed"),
             up
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2798,7 +2850,8 @@ mod tests {
         let git_dir = temp_git_dir();
         let main_tip = test_oid(0x50);
         let feature_tip = test_oid(0x51);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/feature\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/feature\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &main_tip);
         set_branch(&git_dir, "feature", &feature_tip);
         // Checkout history: ... -> feature -> main -> feature (newest last).
@@ -2824,15 +2877,17 @@ mod tests {
         );
         // `@{-1}` = branch we left most recently (main) -> its current tip.
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-1}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-1}")
+                .expect("test operation should succeed"),
             main_tip
         );
         // `@{-2}` = the checkout before that (feature).
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-2}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{-2}")
+                .expect("test operation should succeed"),
             feature_tip
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -2843,10 +2898,11 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let parent = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"parent\n", 1000);
         let child = write_dated_commit(&mut db, tree, vec![parent.clone()], b"child\n", 2000);
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &child);
         write_head_reflog(
             &git_dir,
@@ -2856,47 +2912,54 @@ mod tests {
             ],
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}")
+                .expect("test operation should succeed"),
             child
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}^").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{0}^")
+                .expect("test operation should succeed"),
             parent
         );
         assert_eq!(
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{0}~1").unwrap(),
+            resolve_revision(&git_dir, ObjectFormat::Sha1, "HEAD@{0}~1")
+                .expect("test operation should succeed"),
             parent
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
     fn resolve_at_selector_rejects_unsupported_and_malformed() {
         let git_dir = temp_git_dir();
-        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
+            .expect("test operation should succeed");
         set_branch(&git_dir, "main", &test_oid(0x60));
         // Date-based selectors are not implemented.
-        let unsupported =
-            resolve_revision(&git_dir, ObjectFormat::Sha1, "@{yesterday}").unwrap_err();
+        let unsupported = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{yesterday}")
+            .expect_err("test operation should fail");
         assert!(
             matches!(&unsupported, GitError::Unsupported(_)),
             "unexpected error: {unsupported:?}"
         );
         // `@{-N}` only applies to a bare base.
-        let bad_base = resolve_revision(&git_dir, ObjectFormat::Sha1, "main@{-1}").unwrap_err();
+        let bad_base = resolve_revision(&git_dir, ObjectFormat::Sha1, "main@{-1}")
+            .expect_err("test operation should fail");
         assert!(
             matches!(&bad_base, GitError::InvalidFormat(_)),
             "unexpected error: {bad_base:?}"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     fn test_oid(byte: u8) -> ObjectId {
-        ObjectId::from_hex(ObjectFormat::Sha1, &format!("{byte:02x}").repeat(20)).unwrap()
+        ObjectId::from_hex(ObjectFormat::Sha1, &format!("{byte:02x}").repeat(20))
+            .expect("test operation should succeed")
     }
 
     fn zero_oid() -> ObjectId {
-        ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap()
+        ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40))
+            .expect("test operation should succeed")
     }
 
     fn oid_set(oids: impl IntoIterator<Item = ObjectId>) -> HashSet<ObjectId> {
@@ -2923,7 +2986,7 @@ mod tests {
             new: RefTarget::Direct(oid.clone()),
             reflog: None,
         });
-        tx.commit().unwrap();
+        tx.commit().expect("test operation should succeed");
     }
 
     fn write_head_reflog(git_dir: &Path, entries: &[(&ObjectId, &ObjectId, &str)]) {
@@ -2945,7 +3008,8 @@ mod tests {
                 message: message.as_bytes().to_vec(),
             })
             .collect();
-        refs.write_reflog(name, &entries).unwrap();
+        refs.write_reflog(name, &entries)
+            .expect("test operation should succeed");
     }
 
     fn write_test_commit(
@@ -2963,7 +3027,7 @@ mod tests {
             message: message.to_vec(),
         };
         db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
-            .unwrap()
+            .expect("test operation should succeed")
     }
 
     fn write_dated_commit<W: ObjectWriter>(
@@ -2983,7 +3047,7 @@ mod tests {
             message: message.to_vec(),
         };
         db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
-            .unwrap()
+            .expect("test operation should succeed")
     }
 
     fn write_tree(db: &mut ObjectDatabase, entries: &[(u32, &[u8], &ObjectId)]) -> ObjectId {
@@ -2998,7 +3062,7 @@ mod tests {
                 .collect(),
         };
         db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
-            .unwrap()
+            .expect("test operation should succeed")
     }
 
     fn test_index_entry(path: &[u8], oid: &ObjectId, stage: u16) -> sley_index::IndexEntry {
@@ -3026,7 +3090,7 @@ mod tests {
             std::process::id(),
             TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).expect("test operation should succeed");
         path
     }
 
@@ -3086,14 +3150,20 @@ mod tests {
     ) {
         let mut parents_map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for oid in commits {
-            parents_map.insert(oid.clone(), commit_parents(reader, format, oid).unwrap());
+            parents_map.insert(
+                oid.clone(),
+                commit_parents(reader, format, oid).expect("test operation should succeed"),
+            );
         }
         let generations = generation_numbers(&parents_map);
         let entries: Vec<sley_formats::CommitGraphWriteEntry> = commits
             .iter()
             .map(|oid| {
-                let object = reader.read_object(oid).unwrap();
-                let commit = Commit::parse_ref(format, &object.body).unwrap();
+                let object = reader
+                    .read_object(oid)
+                    .expect("test operation should succeed");
+                let commit =
+                    Commit::parse_ref(format, &object.body).expect("test operation should succeed");
                 let commit_time =
                     commit_committer_time(commit.committer).unwrap_or(0).max(0) as u64;
                 sley_formats::CommitGraphWriteEntry {
@@ -3105,16 +3175,16 @@ mod tests {
                 }
             })
             .collect();
-        let bytes = CommitGraph::write(format, &entries).unwrap();
+        let bytes = CommitGraph::write(format, &entries).expect("test operation should succeed");
         let info = git_dir.join("objects").join("info");
-        fs::create_dir_all(&info).unwrap();
-        fs::write(info.join("commit-graph"), bytes).unwrap();
+        fs::create_dir_all(&info).expect("test operation should succeed");
+        fs::write(info.join("commit-graph"), bytes).expect("test operation should succeed");
     }
 
     fn remove_commit_graph(git_dir: &Path) {
         let path = git_dir.join("objects").join("info").join("commit-graph");
         if path.exists() {
-            fs::remove_file(path).unwrap();
+            fs::remove_file(path).expect("test operation should succeed");
         }
     }
 
@@ -3141,7 +3211,7 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let mut t = 1000i64;
         let mut commit = |db: &mut FileObjectDatabase, parents: Vec<ObjectId>, msg: &[u8]| {
             t += 1;
@@ -3182,8 +3252,10 @@ mod tests {
             baseline, with_graph,
             "graph-backed walk diverged from object-only walk"
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
+
+    type WalkResult = (String, String, bool, Vec<String>, Vec<String>, Vec<String>);
 
     /// Run is_ancestor, merge_bases (both orders), and the `A..B`/`A...B` ranges
     /// over all pairs, returning a deterministic snapshot for comparison.
@@ -3192,13 +3264,14 @@ mod tests {
         format: ObjectFormat,
         reader: &impl ObjectReader,
         all: &[ObjectId],
-    ) -> Vec<(String, String, bool, Vec<String>, Vec<String>, Vec<String>)> {
+    ) -> Vec<WalkResult> {
         let mut out = Vec::new();
         for left in all {
             for right in all {
-                let anc = is_ancestor(git_dir, format, reader, left, right).unwrap();
+                let anc = is_ancestor(git_dir, format, reader, left, right)
+                    .expect("test operation should succeed");
                 let mut bases: Vec<String> = merge_bases(git_dir, format, reader, left, right)
-                    .unwrap()
+                    .expect("test operation should succeed")
                     .iter()
                     .map(|oid| oid.to_hex())
                     .collect();
@@ -3209,7 +3282,7 @@ mod tests {
                 };
                 let mut asym_set: Vec<String> =
                     resolve_revision_range(git_dir, format, reader, &asym)
-                        .unwrap()
+                        .expect("test operation should succeed")
                         .iter()
                         .map(|oid| oid.to_hex())
                         .collect();
@@ -3220,7 +3293,7 @@ mod tests {
                 };
                 let mut sym_set: Vec<String> =
                     resolve_revision_range(git_dir, format, reader, &sym)
-                        .unwrap()
+                        .expect("test operation should succeed")
                         .iter()
                         .map(|oid| oid.to_hex())
                         .collect();
@@ -3244,20 +3317,23 @@ mod tests {
         write_commit_graph_file(&git_dir, format, &db, &all);
 
         // Criss-cross: x1 = merge(a,b), x2 = merge(b,a) -> two merge bases {a,b}.
-        let mut xbases = merge_bases(&git_dir, format, &db, &x1, &x2).unwrap();
+        let mut xbases =
+            merge_bases(&git_dir, format, &db, &x1, &x2).expect("test operation should succeed");
         xbases.sort_by_key(|oid| oid.to_hex());
         let mut expected = vec![a.clone(), b.clone()];
         expected.sort_by_key(|oid| oid.to_hex());
         assert_eq!(xbases, expected, "criss-cross must yield two merge bases");
 
         // Octopus child reaches m1 along its first parent edge.
-        assert!(is_ancestor(&git_dir, format, &db, &m1, &oct).unwrap());
+        assert!(
+            is_ancestor(&git_dir, format, &db, &m1, &oct).expect("test operation should succeed")
+        );
         // m1 is a merge base of itself and the octopus.
         assert_eq!(
-            merge_bases(&git_dir, format, &db, &m1, &oct).unwrap(),
+            merge_bases(&git_dir, format, &db, &m1, &oct).expect("test operation should succeed"),
             vec![m1.clone()]
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3276,11 +3352,21 @@ mod tests {
 
         // With a complete graph, ancestry/merge-base queries must be answerable
         // without ever reading a commit object: PanicReader errors on any read.
-        assert!(is_ancestor(&git_dir, format, &PanicReader, &root, &oct).unwrap());
-        assert!(!is_ancestor(&git_dir, format, &PanicReader, &oct, &root).unwrap());
-        assert!(is_ancestor(&git_dir, format, &PanicReader, &a, &oct).unwrap());
+        assert!(
+            is_ancestor(&git_dir, format, &PanicReader, &root, &oct)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            !is_ancestor(&git_dir, format, &PanicReader, &oct, &root)
+                .expect("test operation should succeed")
+        );
+        assert!(
+            is_ancestor(&git_dir, format, &PanicReader, &a, &oct)
+                .expect("test operation should succeed")
+        );
 
-        let bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2).unwrap();
+        let bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2)
+            .expect("test operation should succeed");
         assert_eq!(bases.len(), 2, "criss-cross bases via graph only");
 
         // Range resolution peels its two endpoints from the odb (the graph does
@@ -3291,7 +3377,7 @@ mod tests {
             end: oct.to_hex(),
         };
         let mut included: Vec<String> = resolve_revision_range(&git_dir, format, &db, &range)
-            .unwrap()
+            .expect("test operation should succeed")
             .iter()
             .map(|oid| oid.to_hex())
             .collect();
@@ -3305,18 +3391,20 @@ mod tests {
         // Merge-base and range results via the graph still equal the object-only
         // walk for the same queries.
         remove_commit_graph(&git_dir);
-        let object_bases = merge_bases(&git_dir, format, &db, &x1, &x2).unwrap();
+        let object_bases =
+            merge_bases(&git_dir, format, &db, &x1, &x2).expect("test operation should succeed");
         let mut object_range: Vec<String> = resolve_revision_range(&git_dir, format, &db, &range)
-            .unwrap()
+            .expect("test operation should succeed")
             .iter()
             .map(|oid| oid.to_hex())
             .collect();
         object_range.sort();
         write_commit_graph_file(&git_dir, format, &db, &all);
-        let graph_bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2).unwrap();
+        let graph_bases = merge_bases(&git_dir, format, &PanicReader, &x1, &x2)
+            .expect("test operation should succeed");
         assert_eq!(object_bases, graph_bases);
         assert_eq!(object_range, included, "range walk diverged with graph");
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3329,14 +3417,14 @@ mod tests {
 
         // Object-only baseline for the octopus merge's parent navigation.
         remove_commit_graph(&git_dir);
-        let base_p1 =
-            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^1")).unwrap();
-        let base_p2 =
-            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^2")).unwrap();
-        let base_p3 =
-            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^3")).unwrap();
-        let base_first =
-            resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}~1")).unwrap();
+        let base_p1 = resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^1"))
+            .expect("test operation should succeed");
+        let base_p2 = resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^2"))
+            .expect("test operation should succeed");
+        let base_p3 = resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}^3"))
+            .expect("test operation should succeed");
+        let base_first = resolve_revision_with_reader(&git_dir, format, &db, &format!("{oct}~1"))
+            .expect("test operation should succeed");
         assert_eq!((&base_p1, &base_p2, &base_p3), (&m1, &g, &f));
         assert_eq!(base_first, m1);
 
@@ -3344,15 +3432,15 @@ mod tests {
         write_commit_graph_file(&git_dir, format, &db, &all);
         assert_eq!(
             resolve_revision_with_reader(&git_dir, format, &PanicReader, &format!("{oct}^2"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             base_p2
         );
         assert_eq!(
             resolve_revision_with_reader(&git_dir, format, &PanicReader, &format!("{oct}~1"))
-                .unwrap(),
+                .expect("test operation should succeed"),
             base_first
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3361,31 +3449,35 @@ mod tests {
         let format = ObjectFormat::Sha1;
         let (db, all) = build_history(&git_dir, format);
         let (a, oct) = (all[1].clone(), all[9].clone());
-        let object_answer = is_ancestor(&git_dir, format, &db, &a, &oct).unwrap();
+        let object_answer =
+            is_ancestor(&git_dir, format, &db, &a, &oct).expect("test operation should succeed");
 
         // A corrupt graph file must be ignored (not error), falling back to the
         // odb so the answer is unchanged.
         let info = git_dir.join("objects").join("info");
-        fs::create_dir_all(&info).unwrap();
-        fs::write(info.join("commit-graph"), b"not a real commit graph").unwrap();
+        fs::create_dir_all(&info).expect("test operation should succeed");
+        fs::write(info.join("commit-graph"), b"not a real commit graph")
+            .expect("test operation should succeed");
         assert_eq!(
-            is_ancestor(&git_dir, format, &db, &a, &oct).unwrap(),
+            is_ancestor(&git_dir, format, &db, &a, &oct).expect("test operation should succeed"),
             object_answer
         );
         // A graph that omits some commits must also fall back per-missing-commit.
         write_commit_graph_file(&git_dir, format, &db, &all[..3]);
         assert_eq!(
-            is_ancestor(&git_dir, format, &db, &a, &oct).unwrap(),
+            is_ancestor(&git_dir, format, &db, &a, &oct).expect("test operation should succeed"),
             object_answer
         );
         assert_eq!(
-            merge_bases(&git_dir, format, &db, &all[10], &all[11]).unwrap(),
+            merge_bases(&git_dir, format, &db, &all[10], &all[11])
+                .expect("test operation should succeed"),
             {
                 remove_commit_graph(&git_dir);
-                merge_bases(&git_dir, format, &db, &all[10], &all[11]).unwrap()
+                merge_bases(&git_dir, format, &db, &all[10], &all[11])
+                    .expect("test operation should succeed")
             }
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     #[test]
@@ -3397,15 +3489,20 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
-            .unwrap();
+            .expect("test operation should succeed");
         let root = write_dated_commit(&mut db, tree.clone(), vec![], b"root\n", 1000);
         let mid = write_dated_commit(&mut db, tree.clone(), vec![root.clone()], b"mid\n", 1001);
         let tip = write_dated_commit(&mut db, tree.clone(), vec![mid.clone()], b"tip\n", 1002);
-        let commits = vec![root.clone(), mid.clone(), tip.clone()];
+        let commits = [root.clone(), mid.clone(), tip.clone()];
 
         let parents_map: HashMap<ObjectId, Vec<ObjectId>> = commits
             .iter()
-            .map(|oid| (oid.clone(), commit_parents(&db, format, oid).unwrap()))
+            .map(|oid| {
+                (
+                    oid.clone(),
+                    commit_parents(&db, format, oid).expect("test operation should succeed"),
+                )
+            })
             .collect();
         let generations = generation_numbers(&parents_map);
         let entries: Vec<sley_formats::CommitGraphWriteEntry> = commits
@@ -3418,14 +3515,18 @@ mod tests {
                 commit_time: 0,
             })
             .collect();
-        let bytes = CommitGraph::write(format, &entries).unwrap();
+        let bytes = CommitGraph::write(format, &entries).expect("test operation should succeed");
 
         // Lay the bytes out as a one-layer chain.
         let graphs = git_dir.join("objects").join("info").join("commit-graphs");
-        fs::create_dir_all(&graphs).unwrap();
-        let hash = sley_core::digest_bytes(format, &bytes).unwrap().to_hex();
-        fs::write(graphs.join(format!("graph-{hash}.graph")), &bytes).unwrap();
-        fs::write(graphs.join("commit-graph-chain"), format!("{hash}\n")).unwrap();
+        fs::create_dir_all(&graphs).expect("test operation should succeed");
+        let hash = sley_core::digest_bytes(format, &bytes)
+            .expect("test operation should succeed")
+            .to_hex();
+        fs::write(graphs.join(format!("graph-{hash}.graph")), &bytes)
+            .expect("test operation should succeed");
+        fs::write(graphs.join("commit-graph-chain"), format!("{hash}\n"))
+            .expect("test operation should succeed");
 
         // No monolithic commit-graph present, only the chain: queries must be
         // answerable from the chain without reading objects.
@@ -3436,16 +3537,21 @@ mod tests {
                 .join("commit-graph")
                 .exists()
         );
-        assert!(is_ancestor(&git_dir, format, &PanicReader, &root, &tip).unwrap());
+        assert!(
+            is_ancestor(&git_dir, format, &PanicReader, &root, &tip)
+                .expect("test operation should succeed")
+        );
         assert_eq!(
-            merge_bases(&git_dir, format, &PanicReader, &mid, &tip).unwrap(),
+            merge_bases(&git_dir, format, &PanicReader, &mid, &tip)
+                .expect("test operation should succeed"),
             vec![mid.clone()]
         );
-        fs::remove_dir_all(git_dir).unwrap();
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
     fn test_commit_graph(format: ObjectFormat, parent: &ObjectId, child: &ObjectId) -> Vec<u8> {
-        let tree = ObjectId::from_hex(format, "4b825dc642cb6eb9a060e54bf8d69288fbee4904").unwrap();
+        let tree = ObjectId::from_hex(format, "4b825dc642cb6eb9a060e54bf8d69288fbee4904")
+            .expect("test operation should succeed");
         let mut oidf = vec![0u8; 256 * 4];
         let parent_first = parent.as_bytes()[0] as usize;
         let child_first = child.as_bytes()[0] as usize;
@@ -3510,7 +3616,8 @@ mod tests {
         for (_id, data) in chunks {
             out.extend_from_slice(data);
         }
-        let checksum = sley_core::digest_bytes(format, &out).unwrap();
+        let checksum =
+            sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
     }

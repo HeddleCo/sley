@@ -91,61 +91,58 @@ fn loose_ref_exists(root: &Path, name: &str) -> bool {
 #[test]
 fn pack_refs_modes_match_upstream_git() {
     let root = unique_temp_dir("pack-refs");
-    let result = (|| {
-        for args in [
-            vec!["pack-refs"],
-            vec!["pack-refs", "--all", "--prune"],
-            vec!["pack-refs", "--all", "--no-prune"],
-            vec!["pack-refs", "--no-all", "--prune"],
-            vec!["pack-refs", "--include", "refs/heads/topic"],
-            vec![
-                "pack-refs",
-                "--include=refs/heads/*",
-                "--exclude",
-                "refs/heads/main",
-            ],
-            vec!["pack-refs", "--include", "refs/heads/*", "--no-include"],
-            vec![
-                "pack-refs",
-                "--all",
-                "--exclude=refs/heads/topic",
-                "--no-exclude",
-            ],
-            vec!["pack-refs", "--bogus"],
-            vec!["pack-refs", "--no-include=refs/heads/*"],
-        ] {
-            let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
-            let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
-            prepare_pack_refs_repo(&upstream);
-            prepare_pack_refs_repo(&actual);
+    for args in [
+        vec!["pack-refs"],
+        vec!["pack-refs", "--all", "--prune"],
+        vec!["pack-refs", "--all", "--no-prune"],
+        vec!["pack-refs", "--no-all", "--prune"],
+        vec!["pack-refs", "--include", "refs/heads/topic"],
+        vec![
+            "pack-refs",
+            "--include=refs/heads/*",
+            "--exclude",
+            "refs/heads/main",
+        ],
+        vec!["pack-refs", "--include", "refs/heads/*", "--no-include"],
+        vec![
+            "pack-refs",
+            "--all",
+            "--exclude=refs/heads/topic",
+            "--no-exclude",
+        ],
+        vec!["pack-refs", "--bogus"],
+        vec!["pack-refs", "--no-include=refs/heads/*"],
+    ] {
+        let upstream = root.join(format!("upstream-{}", args.join("-").replace('/', "_")));
+        let actual = root.join(format!("actual-{}", args.join("-").replace('/', "_")));
+        prepare_pack_refs_repo(&upstream);
+        prepare_pack_refs_repo(&actual);
 
-            let expected = run("git", &upstream, &args);
-            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-            assert_same_output(actual_output, expected, &args);
+        let expected = run("git", &upstream, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected, &args);
+        assert_eq!(
+            read_packed_refs(&actual),
+            read_packed_refs(&upstream),
+            "packed-refs differed for {args:?}"
+        );
+        for name in [
+            "refs/heads/main",
+            "refs/heads/topic",
+            "refs/tags/light",
+            "refs/tags/ann",
+        ] {
             assert_eq!(
-                read_packed_refs(&actual),
-                read_packed_refs(&upstream),
-                "packed-refs differed for {args:?}"
-            );
-            for name in [
-                "refs/heads/main",
-                "refs/heads/topic",
-                "refs/tags/light",
-                "refs/tags/ann",
-            ] {
-                assert_eq!(
-                    loose_ref_exists(&actual, name),
-                    loose_ref_exists(&upstream, name),
-                    "loose ref {name} presence differed for {args:?}"
-                );
-            }
-            assert_eq!(
-                run(env!("CARGO_BIN_EXE_sley"), &actual, &["show-ref"]).stdout,
-                run("git", &upstream, &["show-ref"]).stdout,
-                "show-ref differed after {args:?}"
+                loose_ref_exists(&actual, name),
+                loose_ref_exists(&upstream, name),
+                "loose ref {name} presence differed for {args:?}"
             );
         }
-    })();
+        assert_eq!(
+            run(env!("CARGO_BIN_EXE_sley"), &actual, &["show-ref"]).stdout,
+            run("git", &upstream, &["show-ref"]).stdout,
+            "show-ref differed after {args:?}"
+        );
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }

@@ -5,7 +5,9 @@ use std::path::Path;
 use std::process::Command;
 
 use sley_core::{ObjectFormat, ObjectId};
-use sley_index::{Index, IndexEntry, Stage, INDEX_EXTENDED_FLAG_INTENT_TO_ADD, INDEX_FLAG_EXTENDED};
+use sley_index::{
+    INDEX_EXTENDED_FLAG_INTENT_TO_ADD, INDEX_FLAG_EXTENDED, Index, IndexEntry, Stage,
+};
 
 fn git_ok(cwd: &Path, args: &[&str]) -> bool {
     Command::new("git")
@@ -36,8 +38,8 @@ fn intent_to_add_entry_round_trips_from_scratch() {
     assert_eq!(entry.oid, ObjectId::empty_blob(format));
     assert_eq!(entry.flags & INDEX_FLAG_EXTENDED, INDEX_FLAG_EXTENDED);
 
-    let bytes = index.write(format).unwrap();
-    let parsed = Index::parse(&bytes, format).unwrap();
+    let bytes = index.write(format).expect("test operation should succeed");
+    let parsed = Index::parse(&bytes, format).expect("test operation should succeed");
     assert_eq!(parsed.version, index.version);
     assert_eq!(parsed.entries, index.entries);
     assert_eq!(parsed.extensions, index.extensions);
@@ -65,23 +67,23 @@ fn set_and_clear_intent_to_add_tracks_extended_bit() {
 fn parses_and_round_trips_git_add_dash_n_index_byte_for_byte() {
     let tmp = std::env::temp_dir().join(format!("sley-ita-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
-    std::fs::create_dir_all(&tmp).unwrap();
+    std::fs::create_dir_all(&tmp).expect("test operation should succeed");
     if !git_ok(&tmp, &["--version"]) {
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
 
     assert!(git_ok(&tmp, &["init", "-q"]));
-    std::fs::write(tmp.join("tracked.txt"), b"already\n").unwrap();
+    std::fs::write(tmp.join("tracked.txt"), b"already\n").expect("test operation should succeed");
     assert!(git_ok(&tmp, &["add", "tracked.txt"]));
-    std::fs::write(tmp.join("pending.txt"), b"pending\n").unwrap();
+    std::fs::write(tmp.join("pending.txt"), b"pending\n").expect("test operation should succeed");
     // `-N` records an intent-to-add placeholder for an otherwise-untracked file.
     assert!(git_ok(&tmp, &["add", "-N", "pending.txt"]));
 
     let index_path = tmp.join(".git").join("index");
-    let original = std::fs::read(&index_path).unwrap();
+    let original = std::fs::read(&index_path).expect("test operation should succeed");
     let format = ObjectFormat::Sha1;
-    let index = Index::parse(&original, format).unwrap();
+    let index = Index::parse(&original, format).expect("test operation should succeed");
 
     // git bumped the index to v3 to carry the extended (ITA) entry.
     assert!(index.version >= 3);
@@ -94,13 +96,15 @@ fn parses_and_round_trips_git_add_dash_n_index_byte_for_byte() {
     assert_eq!(ita[0].path, b"pending.txt");
     assert_eq!(ita[0].oid, ObjectId::empty_blob(format));
     // The pre-existing tracked entry is a normal, non-ITA entry.
-    assert!(index
-        .entries
-        .iter()
-        .any(|entry| entry.path == b"tracked.txt" && !entry.is_intent_to_add()));
+    assert!(
+        index
+            .entries
+            .iter()
+            .any(|entry| entry.path == b"tracked.txt" && !entry.is_intent_to_add())
+    );
 
     // Re-serializing git's index must reproduce it byte-for-byte.
-    let rewritten = index.write(format).unwrap();
+    let rewritten = index.write(format).expect("test operation should succeed");
     assert_eq!(
         rewritten, original,
         "intent-to-add index must round-trip byte-for-byte"

@@ -69,7 +69,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn archive_tar_matches_upstream_git_for_commit_tree() {
     let root = unique_temp_dir("archive-tar");
     fs::create_dir_all(root.join("dir")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -97,16 +97,15 @@ fn archive_tar_matches_upstream_git_for_commit_tree() {
         let expected = git(&root, &["archive", "--format=tar", "--prefix=pfx/", "HEAD"]);
         let actual = git_rs(&root, &["archive", "--format=tar", "--prefix=pfx/", "HEAD"]);
         assert_eq!(actual, expected);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn archive_output_option_writes_tar_file() {
     let root = unique_temp_dir("archive-output");
     fs::create_dir_all(&root).expect("create fixture dir");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -136,9 +135,8 @@ fn archive_output_option_writes_tar_file() {
         let actual = fs::read(&archive).expect("read sley archive");
         let expected = git(&root, &["archive", "--format=tar", "HEAD"]);
         assert_eq!(actual, expected);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -146,7 +144,7 @@ fn archive_tar_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("archive-pathspecs");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     fs::create_dir_all(root.join("other")).expect("create other dir");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -190,16 +188,15 @@ fn archive_tar_pathspecs_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "archive output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn archive_tar_cwd_relative_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("archive-cwd-pathspecs");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -234,16 +231,15 @@ fn archive_tar_cwd_relative_pathspecs_match_upstream_git() {
             let actual = git_rs(&cwd, &args);
             assert_eq!(actual, expected, "archive output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn archive_missing_pathspec_errors_match_upstream_git() {
     let root = unique_temp_dir("archive-missing-pathspec");
     fs::create_dir_all(&root).expect("create fixture dir");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -272,7 +268,6 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
             "stderr should mention missing pathspec, got {}",
             String::from_utf8_lossy(&actual.stderr)
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

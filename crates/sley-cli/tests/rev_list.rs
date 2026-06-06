@@ -180,7 +180,7 @@ fn current_branch(root: &Path) -> String {
 fn rev_list_linear_history_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-linear");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_file(&root, "file", "one\n", "one");
         commit_file(&root, "file", "two\n", "two");
@@ -680,16 +680,15 @@ fn rev_list_linear_history_matches_upstream_git() {
                 String::from_utf8_lossy(&stdin)
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_epoch_age_filters_match_upstream_git() {
     let root = unique_temp_dir("rev-list-age-filters");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_file_at(&root, "file", "old\n", "old", 1000);
         commit_file_at(&root, "file", "middle\n", "middle", 2000);
@@ -733,16 +732,15 @@ fn rev_list_epoch_age_filters_match_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_identity_and_message_filters_match_upstream_git() {
     let root = unique_temp_dir("rev-list-filters");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_empty_with_identities(
             &root,
@@ -858,16 +856,15 @@ fn rev_list_identity_and_message_filters_match_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_annotated_tag_start_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-tag");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_file(&root, "file", "one\n", "one");
         git(
@@ -908,16 +905,15 @@ fn rev_list_annotated_tag_start_matches_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_ref_selector_modes_match_upstream_git() {
     let root = unique_temp_dir("rev-list-ref-selectors");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_file(&root, "base-file", "base\n", "base");
         let main = current_branch(&root);
@@ -1092,16 +1088,15 @@ fn rev_list_ref_selector_modes_match_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_symmetric_branch_range_count_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-symmetric-branches");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         commit_file_at(&root, "file", "base\n", "base", 1000);
         git(&root, &["checkout", "-qb", "left-branch"]);
@@ -1205,16 +1200,15 @@ fn rev_list_symmetric_branch_range_count_matches_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn rev_list_first_parent_merge_history_matches_upstream_git() {
     let root = unique_temp_dir("rev-list-first-parent");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let main = current_branch(&root);
         commit_file(&root, "file", "base\n", "base");
@@ -1279,15 +1273,14 @@ fn rev_list_first_parent_merge_history_matches_upstream_git() {
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 fn assert_rev_list_date_order_merge_case(name: &str, side_timestamp: i64, main_timestamp: i64) {
     let root = unique_temp_dir(name);
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         let main = current_branch(&root);
         commit_file_at(&root, "file", "base\n", "base", 1000);
@@ -1329,9 +1322,8 @@ fn assert_rev_list_date_order_merge_case(name: &str, side_timestamp: i64, main_t
                 "rev-list output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]

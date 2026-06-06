@@ -84,7 +84,7 @@ fn config_get_set_add_and_unset_match_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
+    {
         git(&upstream, &["init", "-q"]);
         git(&rust, &["init", "-q"]);
 
@@ -339,7 +339,6 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             &rust,
             &["config", "--local", "--get-all", "remote.origin.fetch"],
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

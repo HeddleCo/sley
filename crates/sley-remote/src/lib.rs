@@ -27,22 +27,24 @@ use sley_transport::GitCredential;
 
 mod credentials;
 pub use credentials::{
-    credential_fill, credential_request_for_url, credential_store, http_credential_host,
-    http_protocol_name, http_url_credential, CredentialHelperProvider,
+    CredentialHelperProvider, credential_fill, credential_request_for_url, credential_store,
+    http_credential_host, http_protocol_name, http_url_credential,
 };
 
 mod http;
 pub use http::{
-    http_advertised_refs, http_authorization_headers, http_check_status, http_send_with_auth,
-    http_service_advertisements, http_upload_pack_advertisements, http_upload_pack_fetch_response,
-    http_upload_pack_shallow_fetch_response, http_validate_content_type,
-    install_fetch_pack_via_http_upload_pack, new_http_client, remote_url_is_http,
+    HttpFetchPackRequest, http_advertised_refs, http_authorization_headers, http_check_status,
+    http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
+    http_upload_pack_fetch_response, http_upload_pack_shallow_fetch_response,
+    http_validate_content_type, install_fetch_pack_via_http_upload_pack, new_http_client,
+    remote_url_is_http,
 };
 
 mod ssh;
 pub use ssh::{
-    install_fetch_pack_via_ssh_upload_pack, ssh_program, ssh_upload_pack_advertisements,
-    ssh_upload_pack_fetch_response, ssh_upload_pack_shallow_fetch_response,
+    SshFetchPackRequest, install_fetch_pack_via_ssh_upload_pack, ssh_program,
+    ssh_upload_pack_advertisements, ssh_upload_pack_fetch_response,
+    ssh_upload_pack_shallow_fetch_response,
 };
 
 mod local;
@@ -57,26 +59,27 @@ pub use local::{
 
 mod fetch;
 pub use fetch::{
+    FetchOptions, FetchOutcome, FetchRequest, FetchServices, FetchSource, PrunedRef,
     append_reachable_auto_follow_tags, apply_configured_fetch_prune_option,
     apply_configured_remote_tag_option, fetch, fetch_head_source_description,
     fetch_refspec_excludes, fetch_refspecs_for_source, mark_tag_refspec_updates_not_for_merge,
     order_bundle_fetch_all_tags_updates, prune_remote_tracking_refs_from_advertisements,
     retain_missing_auto_follow_tags, write_default_fetch_head, write_fetch_head,
-    write_fetch_head_records, FetchOptions, FetchOutcome, FetchSource, PrunedRef,
+    write_fetch_head_records,
 };
 
 mod push;
 pub use push::{
-    local_push_source_refs, normalize_push_refname, normalize_push_refspec, push,
-    reject_non_fast_forward_pushes, remote_advertisement_tips_known_to_local,
-    validate_receive_pack_report, PushDestination, PushOptions, PushOutcome,
+    PushDestination, PushOptions, PushOutcome, PushRequest, PushServices, local_push_source_refs,
+    normalize_push_refname, normalize_push_refspec, push, reject_non_fast_forward_pushes,
+    remote_advertisement_tips_known_to_local, validate_receive_pack_report,
 };
 
 mod ls_remote;
-pub use ls_remote::{ls_remote, LsRemoteFilter, LsRemoteRecord, LsRemoteSource};
+pub use ls_remote::{LsRemoteFilter, LsRemoteRecord, LsRemoteSource, ls_remote};
 
 mod clone;
-pub use clone::{clone, CloneOptions, CloneOutcome, CloneSource};
+pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
 
 mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
@@ -152,7 +155,12 @@ mod tests {
     fn no_credentials_never_fills() {
         let mut provider = NoCredentials;
         let request = GitCredential::default();
-        assert!(provider.fill(request).unwrap().is_none());
+        assert!(
+            provider
+                .fill(request)
+                .expect("test operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]

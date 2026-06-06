@@ -471,8 +471,7 @@ impl CacheTree {
     /// signature/length header).
     pub fn parse(format: ObjectFormat, body: &[u8]) -> Result<Self> {
         let mut offset = 0usize;
-        let (entry_count, oid, subtrees) =
-            parse_cache_tree_node(format, body, &mut offset, &[])?;
+        let (entry_count, oid, subtrees) = parse_cache_tree_node(format, body, &mut offset, &[])?;
         if offset != body.len() {
             return Err(GitError::InvalidFormat(
                 "trailing bytes after cache-tree root".into(),
@@ -515,9 +514,9 @@ fn cache_tree_estimate(tree: &CacheTree) -> usize {
                 .map(|oid| oid.as_bytes().len())
                 .unwrap_or(0)
             + 16;
-        tree.subtrees
-            .iter()
-            .fold(own, |acc, child| acc + child.name.len() + 1 + node(&child.tree))
+        tree.subtrees.iter().fold(own, |acc, child| {
+            acc + child.name.len() + 1 + node(&child.tree)
+        })
     }
     8 + node(tree)
 }
@@ -810,7 +809,7 @@ mod tests {
                     ObjectFormat::Sha1,
                     "ce013625030ba8dba906f756967f9e9ca394464a",
                 )
-                .unwrap(),
+                .expect("test operation should succeed"),
                 flags: 5,
                 flags_extended: 0,
                 path: b"a.txt".to_vec(),
@@ -818,8 +817,10 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write_v2_sha1().unwrap();
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let bytes = index
+            .write_v2_sha1()
+            .expect("test operation should succeed");
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.version, index.version);
         assert_eq!(parsed.entries, index.entries);
         assert_eq!(parsed.extensions, index.extensions);
@@ -842,7 +843,7 @@ mod tests {
                 gid: 8,
                 size: 6,
                 oid: sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello\n")
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                 flags: 5,
                 flags_extended: 0,
                 path: b"a.txt".to_vec(),
@@ -850,8 +851,11 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write(ObjectFormat::Sha256).unwrap();
-        let parsed = Index::parse(&bytes, ObjectFormat::Sha256).unwrap();
+        let bytes = index
+            .write(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+        let parsed =
+            Index::parse(&bytes, ObjectFormat::Sha256).expect("test operation should succeed");
         assert_eq!(parsed.version, index.version);
         assert_eq!(parsed.entries, index.entries);
         assert_eq!(parsed.extensions, index.extensions);
@@ -880,7 +884,7 @@ mod tests {
                         ObjectFormat::Sha1,
                         "ce013625030ba8dba906f756967f9e9ca394464a",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     flags: long_path.len() as u16,
                     flags_extended: 0,
                     path: long_path,
@@ -900,7 +904,7 @@ mod tests {
                         ObjectFormat::Sha1,
                         "2e65efe2a145dda7ee51d1741299f848e5bf752e",
                     )
-                    .unwrap(),
+                    .expect("test operation should succeed"),
                     flags: 1,
                     flags_extended: 0,
                     path: b"b".to_vec(),
@@ -909,9 +913,9 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write_sha1().unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
         assert!(bytes.windows(3).any(|window| window == [0x80, 0x0c, b'b']));
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.version, index.version);
         assert_eq!(parsed.entries, index.entries);
         assert_eq!(parsed.extensions, index.extensions);
@@ -926,7 +930,9 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let mut bytes = index.write_v2_sha1().unwrap();
+        let mut bytes = index
+            .write_v2_sha1()
+            .expect("test operation should succeed");
         let last = bytes.len() - 1;
         bytes[last] ^= 1;
         assert!(Index::parse_v2_sha1(&bytes).is_err());
@@ -947,7 +953,7 @@ mod tests {
             size: 9,
             oid: oid(hex),
             // git stores `min(path_len, 0xfff)` in the low 12 bits of `flags`.
-            flags: u16::try_from(path.len().min(0xfff)).unwrap(),
+            flags: u16::try_from(path.len().min(0xfff)).expect("test operation should succeed"),
             flags_extended: 0,
             path: path.to_vec(),
         }
@@ -979,11 +985,11 @@ mod tests {
     #[test]
     fn index_v3_round_trips_skip_worktree_extended_flags() {
         let index = sample_index(3);
-        let bytes = index.write_sha1().unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
         // Header advertises version 3.
         assert_eq!(&bytes[0..4], b"DIRC");
         assert_eq!(u32_be(&bytes[4..8]), 3);
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.version, 3);
         assert_eq!(parsed.entries, index.entries);
         assert_eq!(parsed.extensions, index.extensions);
@@ -992,7 +998,7 @@ mod tests {
             .entries
             .iter()
             .find(|entry| entry.path == b"src/lib.rs")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_ne!(skip.flags & INDEX_FLAG_EXTENDED, 0);
         assert_eq!(skip.flags_extended, INDEX_SKIP_WORKTREE_ON_DISK);
         // Plain entries stay v2-style (no extended bit, no extended field).
@@ -1000,7 +1006,7 @@ mod tests {
             .entries
             .iter()
             .find(|entry| entry.path == b"README.md")
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(plain.flags & INDEX_FLAG_EXTENDED, 0);
         assert_eq!(plain.flags_extended, 0);
     }
@@ -1018,9 +1024,9 @@ mod tests {
                     entry.flags_extended = 0;
                 }
             }
-            let bytes = index.write_sha1().unwrap();
+            let bytes = index.write_sha1().expect("test operation should succeed");
             assert_eq!(u32_be(&bytes[4..8]), version);
-            let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+            let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
             assert_eq!(parsed.version, version, "version {version}");
             assert_eq!(parsed.entries, index.entries, "entries for v{version}");
         }
@@ -1048,7 +1054,7 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write_sha1().unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
         // strip_len = 2 -> single varint byte 0x02, then "txt", then NUL.
         let needle = [0x02, b't', b'x', b't', 0x00];
         assert!(
@@ -1059,7 +1065,7 @@ mod tests {
         let first = [0x00, b's', b'r', b'c', b'/', b'm', b'a', b'i', b'n'];
         assert!(bytes.windows(first.len()).any(|window| window == first));
         // Round-trips.
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.entries, index.entries);
 
         // A long strip length uses the multi-byte offset varint git expects.
@@ -1073,7 +1079,7 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write_sha1().unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
         // strip_len = 200: encode_varint(200) = [0x80, 0x48] (offset form),
         // followed by suffix "b" and NUL.
         let needle = [0x80, 0x48, b'b', 0x00];
@@ -1081,7 +1087,12 @@ mod tests {
             bytes.windows(needle.len()).any(|window| window == needle),
             "expected multi-byte strip varint {needle:02x?}"
         );
-        assert_eq!(Index::parse_v2_sha1(&bytes).unwrap().entries, index.entries);
+        assert_eq!(
+            Index::parse_v2_sha1(&bytes)
+                .expect("test operation should succeed")
+                .entries,
+            index.entries
+        );
     }
 
     #[test]
@@ -1110,9 +1121,12 @@ mod tests {
                 },
             }],
         };
-        assert_eq!(cache_tree.write().unwrap(), expected);
         assert_eq!(
-            CacheTree::parse(ObjectFormat::Sha1, &expected).unwrap(),
+            cache_tree.write().expect("test operation should succeed"),
+            expected
+        );
+        assert_eq!(
+            CacheTree::parse(ObjectFormat::Sha1, &expected).expect("test operation should succeed"),
             cache_tree
         );
     }
@@ -1123,10 +1137,14 @@ mod tests {
         let mut body = Vec::new();
         body.push(0);
         body.extend_from_slice(b"-1 0\n");
-        let cache_tree = CacheTree::parse(ObjectFormat::Sha1, &body).unwrap();
+        let cache_tree =
+            CacheTree::parse(ObjectFormat::Sha1, &body).expect("test operation should succeed");
         assert_eq!(cache_tree.entry_count, -1);
         assert!(cache_tree.oid.is_none());
-        assert_eq!(cache_tree.write().unwrap(), body);
+        assert_eq!(
+            cache_tree.write().expect("test operation should succeed"),
+            body
+        );
         // A valid count with a missing id, or invalid count with an id, is rejected.
         let bad = CacheTree {
             entry_count: -1,
@@ -1155,22 +1173,43 @@ mod tests {
                 },
             }],
         };
-        index.set_cache_tree(Some(&cache_tree)).unwrap();
+        index
+            .set_cache_tree(Some(&cache_tree))
+            .expect("test operation should succeed");
         // Extensions now carry a TREE chunk that the generic walker can find.
-        assert!(index.extension(b"TREE").unwrap().is_some());
+        assert!(
+            index
+                .extension(b"TREE")
+                .expect("test operation should succeed")
+                .is_some()
+        );
         // It survives a full index write/parse cycle.
-        let bytes = index.write_sha1().unwrap();
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.extensions, index.extensions);
         assert_eq!(
-            parsed.cache_tree(ObjectFormat::Sha1).unwrap(),
+            parsed
+                .cache_tree(ObjectFormat::Sha1)
+                .expect("test operation should succeed"),
             Some(cache_tree)
         );
         // Removing it clears the chunk.
         let mut without = parsed.clone();
-        without.set_cache_tree(None).unwrap();
-        assert!(without.extension(b"TREE").unwrap().is_none());
-        assert!(without.cache_tree(ObjectFormat::Sha1).unwrap().is_none());
+        without
+            .set_cache_tree(None)
+            .expect("test operation should succeed");
+        assert!(
+            without
+                .extension(b"TREE")
+                .expect("test operation should succeed")
+                .is_none()
+        );
+        assert!(
+            without
+                .cache_tree(ObjectFormat::Sha1)
+                .expect("test operation should succeed")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1178,17 +1217,23 @@ mod tests {
         // An extension the typed layer does not understand must round-trip
         // untouched, and the generic walker must still locate it.
         let mut extensions = Vec::new();
-        encode_index_extension(&mut extensions, b"link", b"\x00\x01\x02opaque").unwrap();
+        encode_index_extension(&mut extensions, b"link", b"\x00\x01\x02opaque")
+            .expect("test operation should succeed");
         let mut index = sample_index(2);
         for entry in &mut index.entries {
             entry.flags &= !INDEX_FLAG_EXTENDED;
             entry.flags_extended = 0;
         }
         index.extensions = extensions.clone();
-        let bytes = index.write_sha1().unwrap();
-        let parsed = Index::parse_v2_sha1(&bytes).unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
+        let parsed = Index::parse_v2_sha1(&bytes).expect("test operation should succeed");
         assert_eq!(parsed.extensions, extensions);
-        assert_eq!(parsed.extension(b"link").unwrap(), Some(&b"\x00\x01\x02opaque"[..]));
+        assert_eq!(
+            parsed
+                .extension(b"link")
+                .expect("test operation should succeed"),
+            Some(&b"\x00\x01\x02opaque"[..])
+        );
         // Setting a cache tree leaves the unknown chunk intact.
         let mut updated = parsed.clone();
         updated
@@ -1197,9 +1242,11 @@ mod tests {
                 oid: None,
                 subtrees: Vec::new(),
             }))
-            .unwrap();
+            .expect("test operation should succeed");
         assert_eq!(
-            updated.extension(b"link").unwrap(),
+            updated
+                .extension(b"link")
+                .expect("test operation should succeed"),
             Some(&b"\x00\x01\x02opaque"[..])
         );
     }
@@ -1212,7 +1259,7 @@ mod tests {
             return;
         }
         let dir = unique_temp_dir("index-v4-git");
-        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&dir).expect("test operation should succeed");
         run_success("git", &dir, &["init", "-q"]);
 
         // Write two blobs via git so the object ids exist in the repo, then
@@ -1224,14 +1271,14 @@ mod tests {
             &["hash-object", "-w", "--stdin"],
             b"readme\n",
         ))
-        .unwrap();
+        .expect("test operation should succeed");
         let main_oid = String::from_utf8(run_success_with_stdin(
             "git",
             &dir,
             &["hash-object", "-w", "--stdin"],
             b"fn main() {}\n",
         ))
-        .unwrap();
+        .expect("test operation should succeed");
         let readme_oid = readme_oid.trim();
         let main_oid = main_oid.trim();
 
@@ -1244,24 +1291,23 @@ mod tests {
             extensions: Vec::new(),
             checksum: None,
         };
-        let bytes = index.write_sha1().unwrap();
-        fs::write(dir.join(".git").join("index"), &bytes).unwrap();
+        let bytes = index.write_sha1().expect("test operation should succeed");
+        fs::write(dir.join(".git").join("index"), &bytes).expect("test operation should succeed");
 
         let listed = run_success("git", &dir, &["ls-files"]);
-        let listed = String::from_utf8(listed).unwrap();
+        let listed = String::from_utf8(listed).expect("test operation should succeed");
         assert_eq!(listed, "README.md\nsrc/main.rs\n", "git ls-files output");
 
         // git must agree the on-disk version is 4.
         let version = run_success("git", &dir, &["update-index", "--show-index-version"]);
-        let version = String::from_utf8(version).unwrap();
+        let version = String::from_utf8(version).expect("test operation should succeed");
         assert_eq!(version.trim(), "4");
 
         fs::remove_dir_all(&dir).ok();
     }
 
-
     fn oid(hex: &str) -> ObjectId {
-        ObjectId::from_hex(ObjectFormat::Sha1, hex).unwrap()
+        ObjectId::from_hex(ObjectFormat::Sha1, hex).expect("test operation should succeed")
     }
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -1315,5 +1361,4 @@ mod tests {
         );
         output.stdout
     }
-
 }

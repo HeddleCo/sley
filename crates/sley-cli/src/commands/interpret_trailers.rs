@@ -494,33 +494,33 @@ fn load_trailer_config() -> TrailerConfig {
         comment_prefix: "#".to_string(),
     };
 
-    if let Some(value) = config_lookup("trailer.where") {
-        if let Some(w) = parse_where(&value) {
-            cfg.where_ = w;
+    if let Some(value) = config_lookup("trailer.where")
+        && let Some(w) = parse_where(&value)
+    {
+        cfg.where_ = w;
+    }
+    if let Some(value) = config_lookup("trailer.ifexists")
+        && let Some(v) = parse_if_exists(&value)
+    {
+        cfg.if_exists = v;
+    }
+    if let Some(value) = config_lookup("trailer.ifmissing")
+        && let Some(v) = parse_if_missing(&value)
+    {
+        cfg.if_missing = v;
+    }
+    if let Some(value) = config_lookup("trailer.separators")
+        && !value.is_empty()
+    {
+        cfg.separators = value.chars().collect();
+        if let Some(first) = value.chars().next() {
+            cfg.out_separator = first;
         }
     }
-    if let Some(value) = config_lookup("trailer.ifexists") {
-        if let Some(v) = parse_if_exists(&value) {
-            cfg.if_exists = v;
-        }
-    }
-    if let Some(value) = config_lookup("trailer.ifmissing") {
-        if let Some(v) = parse_if_missing(&value) {
-            cfg.if_missing = v;
-        }
-    }
-    if let Some(value) = config_lookup("trailer.separators") {
-        if !value.is_empty() {
-            cfg.separators = value.chars().collect();
-            if let Some(first) = value.chars().next() {
-                cfg.out_separator = first;
-            }
-        }
-    }
-    if let Some(value) = config_lookup("core.commentchar") {
-        if !value.is_empty() {
-            cfg.comment_prefix = value;
-        }
+    if let Some(value) = config_lookup("core.commentchar")
+        && !value.is_empty()
+    {
+        cfg.comment_prefix = value;
     }
 
     cfg
@@ -870,9 +870,9 @@ fn find_trailer_block_start(buf: &str, len: usize, opts: &Options) -> usize {
                 // Skip a trailing blank line and keep scanning upward.
             } else {
                 non_trailer_lines += possible_continuation;
-                if recognized_prefix && trailer_lines * 3 >= non_trailer_lines {
-                    return next_line(buf, bol);
-                } else if trailer_lines > 0 && non_trailer_lines == 0 {
+                if (recognized_prefix && trailer_lines * 3 >= non_trailer_lines)
+                    || (trailer_lines > 0 && non_trailer_lines == 0)
+                {
                     return next_line(buf, bol);
                 }
                 return len;
@@ -990,11 +990,12 @@ fn split_block_lines(block: &str, separators: &[char]) -> Vec<RawTrailerLine> {
     let mut last_has_sep = false;
     for raw in block.split_inclusive('\n') {
         let text = raw.strip_suffix('\n').unwrap_or(raw);
-        if text.starts_with([' ', '\t']) && last_has_sep {
-            if let Some(last) = lines.last_mut() {
-                last.continuation.push(text.to_string());
-                continue;
-            }
+        if text.starts_with([' ', '\t'])
+            && last_has_sep
+            && let Some(last) = lines.last_mut()
+        {
+            last.continuation.push(text.to_string());
+            continue;
         }
         let has_separator = find_separator(text, separators).is_some_and(|p| p >= 1);
         lines.push(RawTrailerLine {

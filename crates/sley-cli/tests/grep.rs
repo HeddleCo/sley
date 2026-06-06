@@ -92,13 +92,15 @@ fn assert_same_bytes(cwd: &Path, args: &[&str]) {
 fn build_repo(root: &Path) -> PathBuf {
     let repo = root.join("repo");
     git_ok(root, &["init", "-q", repo.to_str().unwrap_or(".")]);
-    fs::write(repo.join("a.txt"), "hello world\nfoo bar\nHELLO again\n").unwrap();
-    fs::write(repo.join("b.txt"), "nothing here\nbaz\n").unwrap();
-    fs::create_dir_all(repo.join("sub")).unwrap();
-    fs::write(repo.join("sub/c.txt"), "hello sub\nworld\n").unwrap();
-    fs::write(repo.join("re.txt"), "aaa\na+a\nfoo|bar\nfoobar\n").unwrap();
-    fs::write(repo.join("nums.txt"), "123\n456789\nx12y\n").unwrap();
-    fs::write(repo.join("bin.dat"), b"foo\x00bar match\n").unwrap();
+    fs::write(repo.join("a.txt"), "hello world\nfoo bar\nHELLO again\n")
+        .expect("test operation should succeed");
+    fs::write(repo.join("b.txt"), "nothing here\nbaz\n").expect("test operation should succeed");
+    fs::create_dir_all(repo.join("sub")).expect("test operation should succeed");
+    fs::write(repo.join("sub/c.txt"), "hello sub\nworld\n").expect("test operation should succeed");
+    fs::write(repo.join("re.txt"), "aaa\na+a\nfoo|bar\nfoobar\n")
+        .expect("test operation should succeed");
+    fs::write(repo.join("nums.txt"), "123\n456789\nx12y\n").expect("test operation should succeed");
+    fs::write(repo.join("bin.dat"), b"foo\x00bar match\n").expect("test operation should succeed");
     git_ok(&repo, &["add", "-A"]);
     git_ok(&repo, &["commit", "-qm", "init"]);
     repo
@@ -207,7 +209,7 @@ fn grep_cached_and_revision_match_git() {
         repo.join("a.txt"),
         "hello world\nfoo bar\nHELLO again\nWTONLY zz\n",
     )
-    .unwrap();
+    .expect("test operation should succeed");
     assert_same(&repo, &["grep", "WTONLY"]);
     assert_same(&repo, &["grep", "--cached", "WTONLY"]);
 

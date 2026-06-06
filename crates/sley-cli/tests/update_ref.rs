@@ -130,7 +130,7 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -518,9 +518,8 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
             actual.join(".git").join("refs/tags/zero-new").exists(),
             expected.join(".git").join("refs/tags/zero-new").exists()
         );
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -530,7 +529,7 @@ fn update_ref_reftable_repository_matches_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q", "--ref-format=reftable"]);
         run_success("git", &actual, &["init", "-q", "--ref-format=reftable"]);
 
@@ -548,9 +547,8 @@ fn update_ref_reftable_repository_matches_upstream_git() {
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -560,7 +558,7 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    let result = (|| {
+    {
         run_success("git", &expected, &["init", "-q"]);
         run_success("git", &actual, &["init", "-q"]);
 
@@ -576,12 +574,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let args = ["update-ref", "--stdin"];
         let input = format!("update refs/tags/stdin {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin"),
@@ -595,12 +589,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("create refs/tags/stdin-create {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-create"),
@@ -609,22 +599,14 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("verify refs/tags/stdin-create {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("verify refs/tags/stdin-create {wrong_oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         for input in [
@@ -633,45 +615,29 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "verify refs/tags/stdin-missing 0000000000000000000000000000000000000000\n".to_string(),
         ] {
             let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-            let actual_output = run_with_stdin(
-                env!("CARGO_BIN_EXE_sley"),
-                &actual,
-                &args,
-                input.as_bytes(),
-            );
+            let actual_output =
+                run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
             assert_same_output(actual_output, expected_output, &args);
         }
 
         let input = format!("update refs/heads/stdin-blob {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!("update refs/tags/stdin-missing-object {missing_oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         set_ref(&expected, "refs/tags/stdin-zero-new", &oid);
         set_ref(&actual, "refs/tags/stdin-zero-new", &oid);
         let input = format!("update refs/tags/stdin-zero-new {zero}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -686,24 +652,16 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("create refs/tags/stdin-create-zero {zero}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
 
         let input = format!(
             "update refs/tags/stdin-implicit-rollback {oid}\nverify refs/tags/stdin-implicit-missing {wrong_oid}\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -720,12 +678,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "update refs/tags/stdin-implicit-duplicate {oid}\nupdate refs/tags/stdin-implicit-duplicate {wrong_oid}\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -740,12 +694,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("start\nupdate refs/tags/stdin-transaction {oid}\nprepare\ncommit\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-transaction"),
@@ -772,12 +722,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         );
         let input = format!("option no-deref\nupdate refs/alias/stdin-no-deref {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/alias/stdin-no-deref"),
@@ -796,12 +742,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("start\nupdate refs/tags/stdin-aborted {oid}\nabort\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual.join(".git").join("refs/tags/stdin-aborted").exists(),
@@ -815,12 +757,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         set_ref(&actual, "refs/tags/stdin-aborted-restore", &oid);
         let input = format!("start\nupdate refs/tags/stdin-aborted-restore {wrong_oid}\nabort\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-aborted-restore"),
@@ -865,12 +803,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("start\nupdate refs/tags/stdin-start-eof {oid}\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -885,12 +819,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("start\nupdate refs/tags/stdin-prepare-eof {oid}\nprepare\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -907,12 +837,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "start\nupdate refs/tags/stdin-prepared-command {oid}\nprepare\nverify refs/tags/stdin-prepared-command {oid}\ncommit\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -932,12 +858,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("update refs/tags/stdin-prepare-eof {oid}\nprepare\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -952,12 +874,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("update refs/tags/stdin-prepare-commit {oid}\nprepare\ncommit\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-prepare-commit"),
@@ -966,12 +884,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
 
         let input = format!("update refs/tags/stdin-before-start {oid}\nstart\n");
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -988,12 +902,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "start\nupdate refs/tags/stdin-closed-kept {oid}\ncommit\nupdate refs/tags/stdin-closed-rejected {wrong_oid}\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             read_ref(&actual, "refs/tags/stdin-closed-kept"),
@@ -1014,12 +924,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "start\nupdate refs/tags/stdin-abort-closed {oid}\nabort\nupdate refs/tags/stdin-abort-closed-rejected {wrong_oid}\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1041,12 +947,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
             "start\nupdate refs/tags/stdin-duplicate {oid}\nupdate refs/tags/stdin-duplicate {wrong_oid}\nprepare\ncommit\n"
         );
         let expected_output = run_with_stdin("git", &expected, &args, input.as_bytes());
-        let actual_output = run_with_stdin(
-            env!("CARGO_BIN_EXE_sley"),
-            &actual,
-            &args,
-            input.as_bytes(),
-        );
+        let actual_output =
+            run_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, input.as_bytes());
         assert_same_output(actual_output, expected_output, &args);
         assert_eq!(
             actual
@@ -1708,7 +1610,6 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
         let expected_output = run("git", &expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

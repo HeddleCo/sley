@@ -81,7 +81,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
     let root = unique_temp_dir("for-each-ref-minimal");
     let linked = unique_temp_dir("for-each-ref-linked");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("file"), b"file\n").expect("write fixture");
         git(&root, &["add", "file"]);
@@ -1197,17 +1197,16 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
                 "sley unexpectedly accepted {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
     let _ = fs::remove_dir_all(&linked);
-    result
 }
 
 #[test]
 fn for_each_ref_direct_remote_refspecs_match_upstream_git() {
     let root = unique_temp_dir("for-each-ref-direct-refspecs");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("file"), b"file\n").expect("write fixture");
         git(&root, &["add", "file"]);
@@ -1261,7 +1260,6 @@ fn for_each_ref_direct_remote_refspecs_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }

@@ -63,7 +63,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 fn status_z_matches_upstream_git() {
     let root = unique_temp_dir("status-z");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write staged fixture");
         fs::write(root.join("extra.txt"), b"extra\n").expect("write untracked fixture");
@@ -234,16 +234,15 @@ fn status_z_matches_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_display_option_errors_match_upstream_git() {
     let root = unique_temp_dir("status-display-option-errors");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
 
@@ -284,16 +283,15 @@ fn status_display_option_errors_match_upstream_git() {
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_porcelain_v2_tracked_changes_match_upstream_git() {
     let root = unique_temp_dir("status-v2-tracked");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("staged-delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("worktree-delete.txt"), b"delete\n").expect("write delete fixture");
@@ -339,16 +337,15 @@ fn status_porcelain_v2_tracked_changes_match_upstream_git() {
             let actual = git_rs(&root, &args);
             assert_eq!(actual, expected, "sley output differed for {args:?}");
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_long_matches_upstream_git() {
     let root = unique_temp_dir("status-long");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(root.join("a.txt"), b"base\n").expect("write modify fixture");
         fs::write(root.join("d.txt"), b"delete\n").expect("write delete fixture");
@@ -390,16 +387,15 @@ fn status_long_matches_upstream_git() {
                 "sley long status output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_long_unborn_clean_matches_upstream_git() {
     let root = unique_temp_dir("status-long-unborn-clean");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         for args in [
             vec!["status"],
@@ -413,16 +409,15 @@ fn status_long_unborn_clean_matches_upstream_git() {
                 "sley unborn clean long status output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_show_stash_matches_upstream_git() {
     let root = unique_temp_dir("status-show-stash");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -449,9 +444,8 @@ fn status_show_stash_matches_upstream_git() {
                 "sley show-stash output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -464,7 +458,7 @@ fn status_branch_ahead_behind_matches_upstream_git() {
     let remote_arg = remote.to_string_lossy().into_owned();
     let work_arg = work.to_string_lossy().into_owned();
     let peer_arg = peer.to_string_lossy().into_owned();
-    let result = (|| {
+    {
         git(
             &root,
             &["init", "-q", "--bare", "--initial-branch=main", &remote_arg],
@@ -569,16 +563,15 @@ fn status_branch_ahead_behind_matches_upstream_git() {
                 "sley gone tracking header differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_detached_head_matches_upstream_git() {
     let root = unique_temp_dir("status-detached-head");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
@@ -603,16 +596,15 @@ fn status_detached_head_matches_upstream_git() {
                 "sley detached status output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::write(
             root.join(".gitignore"),
@@ -697,16 +689,15 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
                 "sley ignored-file output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("status-pathspecs");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::create_dir_all(root.join("dir")).expect("create dir fixture");
         fs::create_dir_all(root.join("other")).expect("create other fixture");
@@ -738,16 +729,15 @@ fn status_pathspecs_match_upstream_git() {
                 "sley pathspec output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_nested_cwd_paths_match_upstream_git() {
     let root = unique_temp_dir("status-nested-cwd");
     fs::create_dir_all(&root).expect("create temp repo");
-    let result = (|| {
+    {
         git(&root, &["init", "-q"]);
         fs::create_dir_all(root.join("dir")).expect("create dir fixture");
         fs::create_dir_all(root.join("other")).expect("create other fixture");
@@ -779,73 +769,69 @@ fn status_nested_cwd_paths_match_upstream_git() {
                 "sley nested-cwd output differed for {args:?}"
             );
         }
-    })();
+    };
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
 fn status_quoted_paths_match_upstream_git() {
     let root = unique_temp_dir("status-quoted-paths");
     fs::create_dir_all(&root).expect("create temp root");
-    let result = (|| {
-        for (case, path) in [
-            ("space", "space name.txt"),
-            ("quote", "quote\"name.txt"),
-            ("tab", "tab\tname.txt"),
+    for (case, path) in [
+        ("space", "space name.txt"),
+        ("quote", "quote\"name.txt"),
+        ("tab", "tab\tname.txt"),
+    ] {
+        let repo = root.join(case);
+        fs::create_dir_all(&repo).expect("create case repo");
+        git(&repo, &["init", "-q"]);
+        fs::write(repo.join(path), b"initial\n").expect("write untracked fixture");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--short", "-z"],
+            vec!["status", "--porcelain=v2", "-z"],
         ] {
-            let repo = root.join(case);
-            fs::create_dir_all(&repo).expect("create case repo");
-            git(&repo, &["init", "-q"]);
-            fs::write(repo.join(path), b"initial\n").expect("write untracked fixture");
-
-            for args in [
-                vec!["status", "--short"],
-                vec!["status", "--porcelain"],
-                vec!["status", "--porcelain=v2"],
-                vec!["status", "--short", "-z"],
-                vec!["status", "--porcelain=v2", "-z"],
-            ] {
-                let expected = git(&repo, &args);
-                let actual = git_rs(&repo, &args);
-                assert_eq!(
-                    actual, expected,
-                    "sley untracked output differed for {args:?} path {path:?}"
-                );
-            }
-
-            git(&repo, &["add", path]);
-            git(
-                &repo,
-                &[
-                    "-c",
-                    "user.name=Example User",
-                    "-c",
-                    "user.email=example@example.invalid",
-                    "commit",
-                    "-m",
-                    "base",
-                    "-q",
-                ],
+            let expected = git(&repo, &args);
+            let actual = git_rs(&repo, &args);
+            assert_eq!(
+                actual, expected,
+                "sley untracked output differed for {args:?} path {path:?}"
             );
-            fs::write(repo.join(path), b"modified\n").expect("modify tracked fixture");
-
-            for args in [
-                vec!["status", "--short"],
-                vec!["status", "--porcelain"],
-                vec!["status", "--porcelain=v2"],
-                vec!["status", "--short", "-z"],
-                vec!["status", "--porcelain=v2", "-z"],
-            ] {
-                let expected = git(&repo, &args);
-                let actual = git_rs(&repo, &args);
-                assert_eq!(
-                    actual, expected,
-                    "sley tracked output differed for {args:?} path {path:?}"
-                );
-            }
         }
-    })();
+
+        git(&repo, &["add", path]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "base",
+                "-q",
+            ],
+        );
+        fs::write(repo.join(path), b"modified\n").expect("modify tracked fixture");
+
+        for args in [
+            vec!["status", "--short"],
+            vec!["status", "--porcelain"],
+            vec!["status", "--porcelain=v2"],
+            vec!["status", "--short", "-z"],
+            vec!["status", "--porcelain=v2", "-z"],
+        ] {
+            let expected = git(&repo, &args);
+            let actual = git_rs(&repo, &args);
+            assert_eq!(
+                actual, expected,
+                "sley tracked output differed for {args:?} path {path:?}"
+            );
+        }
+    }
     let _ = fs::remove_dir_all(&root);
-    result
 }

@@ -5291,7 +5291,7 @@ fn init_repo_with_format(root: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
-    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+    Ok(ObjectId::null(format))
 }
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -5611,17 +5611,18 @@ mod tests {
 
     #[test]
     fn default_hash_object_cases_match_upstream_git() {
-        hash_object_parity(&default_hash_object_cases()).unwrap();
+        hash_object_parity(&default_hash_object_cases()).expect("test operation should succeed");
     }
 
     #[test]
     fn default_hash_object_cases_match_upstream_git_sha256() {
-        hash_object_parity_for_format(ObjectFormat::Sha256, &default_hash_object_cases()).unwrap();
+        hash_object_parity_for_format(ObjectFormat::Sha256, &default_hash_object_cases())
+            .expect("test operation should succeed");
     }
 
     #[test]
     fn reads_upstream_single_blob_pack() {
-        let result = single_blob_pack_read_parity().unwrap();
+        let result = single_blob_pack_read_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.object_type, "blob");
         assert_eq!(result.body, b"hello from pack\n");
@@ -5629,7 +5630,7 @@ mod tests {
 
     #[test]
     fn reads_upstream_single_blob_pack_sha256() {
-        let result = single_blob_pack_read_parity_sha256().unwrap();
+        let result = single_blob_pack_read_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.object_type, "blob");
         assert_eq!(result.body, b"hello from pack\n");
@@ -5637,7 +5638,7 @@ mod tests {
 
     #[test]
     fn reads_upstream_single_blob_pack_index() {
-        let result = single_blob_pack_index_parity().unwrap();
+        let result = single_blob_pack_index_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.entries, 1);
         assert_eq!(result.offset, 12);
@@ -5645,7 +5646,7 @@ mod tests {
 
     #[test]
     fn reads_upstream_single_blob_pack_index_sha256() {
-        let result = single_blob_pack_index_parity_sha256().unwrap();
+        let result = single_blob_pack_index_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.entries, 1);
         assert_eq!(result.offset, 12);
@@ -5653,7 +5654,7 @@ mod tests {
 
     #[test]
     fn reads_upstream_delta_pack() {
-        let result = delta_pack_read_parity().unwrap();
+        let result = delta_pack_read_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.entries, 2);
         assert!(result.delta_entries >= 1);
@@ -5661,7 +5662,7 @@ mod tests {
 
     #[test]
     fn reads_upstream_delta_pack_sha256() {
-        let result = delta_pack_read_parity_sha256().unwrap();
+        let result = delta_pack_read_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.entries, 2);
         assert!(result.delta_entries >= 1);
@@ -5669,14 +5670,14 @@ mod tests {
 
     #[test]
     fn reads_upstream_thin_pack_with_external_base() {
-        let result = thin_pack_read_parity().unwrap();
+        let result = thin_pack_read_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_thin_pack_read_parity(result);
     }
 
     #[test]
     fn reads_upstream_thin_pack_with_external_base_sha256() {
-        let result = thin_pack_read_parity_sha256().unwrap();
+        let result = thin_pack_read_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_thin_pack_read_parity(result);
     }
@@ -5689,14 +5690,14 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_loose_ref_written_by_rust_store() {
-        let result = loose_ref_interop_parity().unwrap();
+        let result = loose_ref_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_loose_sha256_ref_written_by_rust_store() {
-        let result = loose_ref_interop_parity_sha256().unwrap();
+        let result = loose_ref_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_ref_interop_parity(result);
     }
@@ -5710,42 +5711,45 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_packed_ref_written_by_rust_store() {
-        let result = packed_ref_interop_parity().unwrap();
+        let result = packed_ref_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_packed_sha256_ref_written_by_rust_store() {
-        let result = packed_ref_interop_parity_sha256().unwrap();
+        let result = packed_ref_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_compacted_packed_ref_written_by_rust_store() {
-        let result = packed_ref_compaction_interop_parity().unwrap();
+        let result = packed_ref_compaction_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_compacted_packed_sha256_ref_written_by_rust_store() {
-        let result = packed_ref_compaction_interop_parity_sha256().unwrap();
+        let result =
+            packed_ref_compaction_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_peeled_compacted_packed_ref_written_by_rust_store() {
-        let result = peeled_packed_ref_compaction_interop_parity().unwrap();
+        let result =
+            peeled_packed_ref_compaction_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_peeled_packed_ref_interop_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_peeled_compacted_packed_sha256_ref_written_by_rust_store() {
-        let result = peeled_packed_ref_compaction_interop_parity_sha256().unwrap();
+        let result = peeled_packed_ref_compaction_interop_parity_sha256()
+            .expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_peeled_packed_ref_interop_parity(result);
     }
@@ -5762,14 +5766,14 @@ mod tests {
 
     #[test]
     fn rust_show_ref_filters_match_upstream_git() {
-        let result = show_ref_filter_parity().unwrap();
+        let result = show_ref_filter_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_show_ref_filter_parity(result);
     }
 
     #[test]
     fn rust_show_ref_filters_match_upstream_git_sha256() {
-        let result = show_ref_filter_parity_sha256().unwrap();
+        let result = show_ref_filter_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_show_ref_filter_parity(result);
     }
@@ -5794,14 +5798,14 @@ mod tests {
 
     #[test]
     fn rust_show_ref_verify_matches_upstream_git() {
-        let result = show_ref_verify_parity().unwrap();
+        let result = show_ref_verify_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_show_ref_verify_parity(result);
     }
 
     #[test]
     fn rust_show_ref_verify_matches_upstream_git_sha256() {
-        let result = show_ref_verify_parity_sha256().unwrap();
+        let result = show_ref_verify_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_show_ref_verify_parity(result);
     }
@@ -5816,14 +5820,14 @@ mod tests {
 
     #[test]
     fn rust_symbolic_ref_matches_upstream_git() {
-        let result = symbolic_ref_parity().unwrap();
+        let result = symbolic_ref_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_symbolic_ref_parity(result);
     }
 
     #[test]
     fn rust_symbolic_ref_matches_upstream_git_sha256() {
-        let result = symbolic_ref_parity_sha256().unwrap();
+        let result = symbolic_ref_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_symbolic_ref_parity(result);
     }
@@ -5836,21 +5840,22 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_written_pack() {
-        let result = rust_pack_write_interop_parity().unwrap();
+        let result = rust_pack_write_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.upstream_body, b"hello from rust pack writer\n");
     }
 
     #[test]
     fn upstream_git_reads_rust_written_pack_sha256() {
-        let result = rust_pack_write_interop_parity_sha256().unwrap();
+        let result =
+            rust_pack_write_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.upstream_body, b"hello from rust pack writer\n");
     }
 
     #[test]
     fn upstream_git_reads_rust_written_bundle() {
-        let result = rust_bundle_write_interop_parity().unwrap();
+        let result = rust_bundle_write_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.heads.contains(" refs/heads/main\n"));
         assert!(
@@ -5863,7 +5868,8 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_written_bundle_sha256() {
-        let result = rust_bundle_write_interop_parity_sha256().unwrap();
+        let result =
+            rust_bundle_write_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert!(result.heads.contains(" refs/heads/main\n"));
         assert!(
@@ -5876,21 +5882,22 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_written_delta_pack() {
-        let result = rust_delta_pack_write_interop_parity().unwrap();
+        let result = rust_delta_pack_write_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.delta_entries >= 1);
     }
 
     #[test]
     fn upstream_git_reads_rust_written_delta_pack_sha256() {
-        let result = rust_delta_pack_write_interop_parity_sha256().unwrap();
+        let result =
+            rust_delta_pack_write_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert!(result.delta_entries >= 1);
     }
 
     #[test]
     fn upstream_git_reads_rust_written_sha256_loose_object() {
-        let result = sha256_loose_object_interop_parity().unwrap();
+        let result = sha256_loose_object_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.upstream_type, "blob");
         assert_eq!(result.upstream_body, b"hello from sha256 loose object\n");
@@ -5898,21 +5905,22 @@ mod tests {
 
     #[test]
     fn rust_odb_reads_upstream_git_pack() {
-        let result = packed_odb_read_interop_parity().unwrap();
+        let result = packed_odb_read_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.body, b"hello from upstream pack\n");
     }
 
     #[test]
     fn rust_odb_reads_upstream_git_pack_sha256() {
-        let result = packed_odb_read_interop_parity_sha256().unwrap();
+        let result =
+            packed_odb_read_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.body, b"hello from upstream pack\n");
     }
 
     #[test]
     fn rust_odb_reads_upstream_delta_pack() {
-        let result = delta_packed_odb_read_interop_parity().unwrap();
+        let result = delta_packed_odb_read_interop_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.entries, 2);
         assert!(result.delta_entries >= 1);
@@ -5920,7 +5928,8 @@ mod tests {
 
     #[test]
     fn rust_odb_reads_upstream_delta_pack_sha256() {
-        let result = delta_packed_odb_read_interop_parity_sha256().unwrap();
+        let result =
+            delta_packed_odb_read_interop_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.entries, 2);
         assert!(result.delta_entries >= 1);
@@ -5928,21 +5937,21 @@ mod tests {
 
     #[test]
     fn parses_upstream_git_repository_config() {
-        let result = repository_config_interop_parity().unwrap();
+        let result = repository_config_interop_parity().expect("test operation should succeed");
         assert_eq!(result.object_format, ObjectFormat::Sha256);
         assert_eq!(result.bare, Some(false));
     }
 
     #[test]
     fn rust_ls_tree_matches_upstream_git() {
-        let result = ls_tree_parity().unwrap();
+        let result = ls_tree_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_ls_tree_parity(result);
     }
 
     #[test]
     fn rust_ls_tree_matches_upstream_git_sha256() {
-        let result = ls_tree_parity_sha256().unwrap();
+        let result = ls_tree_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_ls_tree_parity(result);
     }
@@ -5983,21 +5992,21 @@ mod tests {
 
     #[test]
     fn rust_log_matches_minimal_upstream_git_format() {
-        let result = log_parity().unwrap();
+        let result = log_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_log_matches_minimal_upstream_git_format_sha256() {
-        let result = log_parity_sha256().unwrap();
+        let result = log_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_cat_file_resolves_revisions_like_upstream_git() {
-        let result = cat_file_revision_parity().unwrap();
+        let result = cat_file_revision_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
         assert_eq!(&result.revs[..2], ["HEAD", "refs/tags/v2.0"]);
@@ -6006,7 +6015,7 @@ mod tests {
 
     #[test]
     fn rust_cat_file_resolves_revisions_like_upstream_git_sha256() {
-        let result = cat_file_revision_parity_sha256().unwrap();
+        let result = cat_file_revision_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
         assert_eq!(&result.revs[..2], ["HEAD", "refs/tags/v2.0"]);
@@ -6015,7 +6024,7 @@ mod tests {
 
     #[test]
     fn upstream_index_round_trips_byte_for_byte() {
-        let result = index_round_trip_parity().unwrap();
+        let result = index_round_trip_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.entries, 1);
         assert!(result.byte_len > 20);
@@ -6023,7 +6032,7 @@ mod tests {
 
     #[test]
     fn upstream_sha256_index_round_trips_byte_for_byte() {
-        let result = index_round_trip_parity_sha256().unwrap();
+        let result = index_round_trip_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.entries, 1);
         assert!(result.byte_len > 32);
@@ -6031,28 +6040,28 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_update_index_add() {
-        let result = update_index_add_parity().unwrap();
+        let result = update_index_add_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.upstream, result.expected);
     }
 
     #[test]
     fn upstream_git_reads_rust_sha256_update_index_add() {
-        let result = update_index_add_parity_sha256().unwrap();
+        let result = update_index_add_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.upstream, result.expected);
     }
 
     #[test]
     fn rust_ls_files_stage_matches_upstream_git() {
-        let result = ls_files_stage_parity().unwrap();
+        let result = ls_files_stage_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_ls_files_stage_parity(result);
     }
 
     #[test]
     fn rust_ls_files_stage_matches_upstream_git_sha256() {
-        let result = ls_files_stage_parity_sha256().unwrap();
+        let result = ls_files_stage_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_ls_files_stage_parity(result);
     }
@@ -6103,7 +6112,7 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_update_ref_delete() {
-        let result = update_ref_delete_parity().unwrap();
+        let result = update_ref_delete_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
@@ -6112,7 +6121,7 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_update_ref_delete_sha256() {
-        let result = update_ref_delete_parity_sha256().unwrap();
+        let result = update_ref_delete_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
@@ -6121,7 +6130,7 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_update_ref_delete_packed() {
-        let result = update_ref_delete_packed_parity().unwrap();
+        let result = update_ref_delete_packed_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
@@ -6130,7 +6139,8 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_update_ref_delete_packed_sha256() {
-        let result = update_ref_delete_packed_parity_sha256().unwrap();
+        let result =
+            update_ref_delete_packed_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert!(result.before.contains("refs/heads/topic"));
         assert!(!result.after.contains("refs/heads/topic"));
@@ -6139,7 +6149,7 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_reflog_expire() {
-        let result = reflog_expire_parity().unwrap();
+        let result = reflog_expire_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.removed, 1);
         assert_eq!(result.before, "commit: second\ncommit: first\n");
@@ -6148,7 +6158,7 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_reflog_expire_sha256() {
-        let result = reflog_expire_parity_sha256().unwrap();
+        let result = reflog_expire_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.removed, 1);
         assert_eq!(result.before, "commit: second\ncommit: first\n");
@@ -6157,21 +6167,21 @@ mod tests {
 
     #[test]
     fn rust_write_tree_matches_upstream_git() {
-        let result = write_tree_parity().unwrap();
+        let result = write_tree_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_write_tree_matches_upstream_git_sha256() {
-        let result = write_tree_parity_sha256().unwrap();
+        let result = write_tree_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_commit_tree_matches_upstream_git() {
-        let result = commit_tree_parity().unwrap();
+        let result = commit_tree_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
         assert!(String::from_utf8_lossy(&result.body).contains("initial subject"));
@@ -6179,7 +6189,7 @@ mod tests {
 
     #[test]
     fn rust_commit_tree_matches_upstream_git_sha256() {
-        let result = commit_tree_parity_sha256().unwrap();
+        let result = commit_tree_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
         assert!(String::from_utf8_lossy(&result.body).contains("initial subject"));
@@ -6187,7 +6197,7 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_commit_index_result() {
-        let result = commit_index_parity().unwrap();
+        let result = commit_index_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.updated_ref, "refs/heads/main");
         assert!(result.log.contains("initial subject"));
@@ -6195,7 +6205,7 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_commit_index_result_sha256() {
-        let result = commit_index_parity_sha256().unwrap();
+        let result = commit_index_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.updated_ref, "refs/heads/main");
         assert!(result.log.contains("initial subject"));
@@ -6203,14 +6213,14 @@ mod tests {
 
     #[test]
     fn rust_add_status_matches_upstream_git_short_status() {
-        let result = add_status_parity().unwrap();
+        let result = add_status_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_add_status_parity(result);
     }
 
     #[test]
     fn rust_add_status_matches_upstream_git_short_status_sha256() {
-        let result = add_status_parity_sha256().unwrap();
+        let result = add_status_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_add_status_parity(result);
     }
@@ -6231,14 +6241,14 @@ mod tests {
 
     #[test]
     fn upstream_git_lists_rust_created_branch() {
-        let result = branch_create_parity().unwrap();
+        let result = branch_create_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_branch_create_parity(result);
     }
 
     #[test]
     fn upstream_git_lists_rust_created_branch_sha256() {
-        let result = branch_create_parity_sha256().unwrap();
+        let result = branch_create_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_branch_create_parity(result);
     }
@@ -6253,28 +6263,28 @@ mod tests {
 
     #[test]
     fn rust_branch_show_current_matches_upstream_git() {
-        let result = branch_show_current_parity().unwrap();
+        let result = branch_show_current_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_branch_show_current_matches_upstream_git_sha256() {
-        let result = branch_show_current_parity_sha256().unwrap();
+        let result = branch_show_current_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn upstream_git_observes_rust_deleted_branch() {
-        let result = branch_delete_parity().unwrap();
+        let result = branch_delete_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_branch_delete_parity(result);
     }
 
     #[test]
     fn upstream_git_observes_rust_deleted_branch_sha256() {
-        let result = branch_delete_parity_sha256().unwrap();
+        let result = branch_delete_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_branch_delete_parity(result);
     }
@@ -6287,14 +6297,14 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_checkout_branch_result() {
-        let result = checkout_branch_parity().unwrap();
+        let result = checkout_branch_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_checkout_branch_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_rust_checkout_branch_result_sha256() {
-        let result = checkout_branch_parity_sha256().unwrap();
+        let result = checkout_branch_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_checkout_branch_parity(result);
     }
@@ -6308,14 +6318,14 @@ mod tests {
 
     #[test]
     fn upstream_git_lists_rust_created_tag() {
-        let result = tag_create_parity().unwrap();
+        let result = tag_create_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_tag_create_parity(result);
     }
 
     #[test]
     fn upstream_git_lists_rust_created_tag_sha256() {
-        let result = tag_create_parity_sha256().unwrap();
+        let result = tag_create_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_tag_create_parity(result);
     }
@@ -6327,14 +6337,14 @@ mod tests {
 
     #[test]
     fn upstream_git_observes_rust_deleted_tag() {
-        let result = tag_delete_parity().unwrap();
+        let result = tag_delete_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_tag_delete_parity(result);
     }
 
     #[test]
     fn upstream_git_observes_rust_deleted_tag_sha256() {
-        let result = tag_delete_parity_sha256().unwrap();
+        let result = tag_delete_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_tag_delete_parity(result);
     }
@@ -6347,14 +6357,14 @@ mod tests {
 
     #[test]
     fn upstream_git_reads_rust_created_annotated_tag() {
-        let result = annotated_tag_create_parity().unwrap();
+        let result = annotated_tag_create_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_annotated_tag_create_parity(result);
     }
 
     #[test]
     fn upstream_git_reads_rust_created_annotated_tag_sha256() {
-        let result = annotated_tag_create_parity_sha256().unwrap();
+        let result = annotated_tag_create_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_annotated_tag_create_parity(result);
     }
@@ -6369,14 +6379,14 @@ mod tests {
 
     #[test]
     fn rust_diff_name_status_matches_upstream_git() {
-        let result = diff_name_status_parity().unwrap();
+        let result = diff_name_status_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_diff_name_status_parity(result);
     }
 
     #[test]
     fn rust_diff_name_status_matches_upstream_git_sha256() {
-        let result = diff_name_status_parity_sha256().unwrap();
+        let result = diff_name_status_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_diff_name_status_parity(result);
     }
@@ -6398,14 +6408,14 @@ mod tests {
 
     #[test]
     fn rust_rev_parse_matches_upstream_git() {
-        let result = rev_parse_parity().unwrap();
+        let result = rev_parse_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_rev_parse_parity(result);
     }
 
     #[test]
     fn rust_rev_parse_matches_upstream_git_sha256() {
-        let result = rev_parse_parity_sha256().unwrap();
+        let result = rev_parse_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_rev_parse_parity(result);
     }
@@ -6461,35 +6471,35 @@ mod tests {
 
     #[test]
     fn rust_rev_parse_object_format_matches_upstream_git() {
-        let result = rev_parse_object_format_parity().unwrap();
+        let result = rev_parse_object_format_parity().expect("test operation should succeed");
         assert_eq!(result.sha1_rust, result.sha1_upstream);
         assert_eq!(result.sha256_rust, result.sha256_upstream);
     }
 
     #[test]
     fn rust_rev_parse_parent_syntax_matches_upstream_git() {
-        let result = rev_parse_parent_parity().unwrap();
+        let result = rev_parse_parent_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_rev_parse_parent_syntax_matches_upstream_git_sha256() {
-        let result = rev_parse_parent_parity_sha256().unwrap();
+        let result = rev_parse_parent_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_rev_parse_peel_syntax_matches_upstream_git() {
-        let result = rev_parse_peel_parity().unwrap();
+        let result = rev_parse_peel_parity().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha1);
         assert_eq!(result.rust, result.upstream);
     }
 
     #[test]
     fn rust_rev_parse_peel_syntax_matches_upstream_git_sha256() {
-        let result = rev_parse_peel_parity_sha256().unwrap();
+        let result = rev_parse_peel_parity_sha256().expect("test operation should succeed");
         assert_eq!(result.format, ObjectFormat::Sha256);
         assert_eq!(result.rust, result.upstream);
     }

@@ -305,12 +305,14 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     let outcome = merge_trees(
         &git_dir,
         format,
-        &base_tree,
-        &ours_tree,
-        &theirs_tree,
-        branch1,
-        branch2,
-        strategy,
+        MergeTreeInputs {
+            base_tree: &base_tree,
+            ours_tree: &ours_tree,
+            theirs_tree: &theirs_tree,
+            ours_label: branch1,
+            theirs_label: branch2,
+            favor: strategy,
+        },
     )?;
 
     if options.quiet {
@@ -434,24 +436,27 @@ fn not_something_we_can_merge(rev: &str) -> GitError {
 /// Core 3-way tree merge. Reuses [`sley_diff_merge::merge_blobs`] for textual
 /// content merges and the crate-root flattening helper for tree traversal, then
 /// rebuilds a top-level tree from the merged leaves.
-#[allow(clippy::too_many_arguments)]
+struct MergeTreeInputs<'a> {
+    base_tree: &'a Option<ObjectId>,
+    ours_tree: &'a ObjectId,
+    theirs_tree: &'a ObjectId,
+    ours_label: &'a str,
+    theirs_label: &'a str,
+    favor: StrategyFavor,
+}
+
 fn merge_trees(
     git_dir: &Path,
     format: ObjectFormat,
-    base_tree: &Option<ObjectId>,
-    ours_tree: &ObjectId,
-    theirs_tree: &ObjectId,
-    ours_label: &str,
-    theirs_label: &str,
-    favor: StrategyFavor,
+    inputs: MergeTreeInputs<'_>,
 ) -> Result<MergeOutcome> {
     let read_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let base_map = match base_tree {
+    let base_map = match inputs.base_tree {
         Some(tree) => stash_tree_entry_map(&read_db, format, tree)?,
         None => MergeTreeMap::new(),
     };
-    let ours_map = stash_tree_entry_map(&read_db, format, ours_tree)?;
-    let theirs_map = stash_tree_entry_map(&read_db, format, theirs_tree)?;
+    let ours_map = stash_tree_entry_map(&read_db, format, inputs.ours_tree)?;
+    let theirs_map = stash_tree_entry_map(&read_db, format, inputs.theirs_tree)?;
 
     let mut write_db = FileObjectDatabase::from_git_dir(git_dir, format);
 
@@ -524,8 +529,8 @@ fn merge_trees(
                 &ours_bytes,
                 &theirs_bytes,
                 &sley_diff_merge::MergeBlobOptions {
-                    ours_label,
-                    theirs_label,
+                    ours_label: inputs.ours_label,
+                    theirs_label: inputs.theirs_label,
                     base_label: "merged common ancestors",
                     style: sley_diff_merge::ConflictStyle::Merge,
                 },
@@ -541,9 +546,9 @@ fn merge_trees(
                 let oid =
                     write_db.write_object(EncodedObject::new(ObjectType::Blob, result.content))?;
                 merged.insert(path, (resolved_mode, oid));
-            } else if favor != StrategyFavor::None && !mode_conflict {
+            } else if inputs.favor != StrategyFavor::None && !mode_conflict {
                 // `-Xours` / `-Xtheirs`: take one side's content wholesale.
-                let chosen = if favor == StrategyFavor::Ours {
+                let chosen = if inputs.favor == StrategyFavor::Ours {
                     ours.clone()
                 } else {
                     theirs.clone()
@@ -571,9 +576,9 @@ fn merge_trees(
             // modify/delete: present on exactly one side, modified relative to base.
             clean = false;
             let (deleted_side, modified_side, surviving) = if ours.is_none() {
-                (ours_label, theirs_label, theirs.clone())
+                (inputs.ours_label, inputs.theirs_label, theirs.clone())
             } else {
-                (theirs_label, ours_label, ours.clone())
+                (inputs.theirs_label, inputs.ours_label, ours.clone())
             };
             conflict_messages.push(InfoMessage {
                 paths: vec![path.clone()],
