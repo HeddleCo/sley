@@ -1549,11 +1549,15 @@ fn collect_untracked_directory_paths(
 }
 
 fn index_has_path_under(index: &BTreeMap<Vec<u8>, TrackedEntry>, directory: &[u8]) -> bool {
-    index.keys().any(|path| {
-        path.strip_prefix(directory)
-            .and_then(|rest| rest.strip_prefix(b"/"))
-            .is_some()
-    })
+    // The index map is sorted, so a single range query finds whether any tracked
+    // path lives under `directory/` in O(log n) — scanning every key was O(n) per
+    // untracked directory (quadratic over a deep untracked tree).
+    let mut prefix = directory.to_vec();
+    prefix.push(b'/');
+    index
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|(path, _)| path.starts_with(&prefix))
 }
 
 fn directory_has_file(
@@ -2376,6 +2380,28 @@ impl AttributeMatcher {
         Ok(matcher)
     }
 
+    /// Builds only the repository-wide attribute sources — `core.attributesFile`
+    /// (or the default global) and `$GIT_DIR/info/attributes` — *without* walking
+    /// the worktree for `.gitattributes`. The caller is expected to fold each
+    /// directory's `.gitattributes` into the matcher as it descends (see
+    /// [`read_dir_attribute_patterns`]), so status/diff read the tree exactly once
+    /// instead of doing a separate full-tree attribute pass. Lower-priority sources
+    /// are added first, so in-tree patterns added during the walk take precedence —
+    /// matching git's lookup order.
+    fn from_worktree_base(root: &Path) -> Self {
+        let mut matcher = Self::default();
+        if !matcher.read_configured_attributes(root) {
+            matcher.read_default_global_attributes();
+        }
+        read_attribute_patterns(
+            root.join(".git").join("info").join("attributes"),
+            &mut matcher,
+            &[],
+            b".git/info/attributes",
+        );
+        matcher
+    }
+
     fn attributes_for_path(
         &self,
         path: &[u8],
@@ -2456,7 +2482,10 @@ impl AttributeMatcher {
     }
 }
 
-fn collect_attribute_patterns(
+/// Fold `dir`'s `.gitattributes` (if any) into `matcher`, scoped to `dir`'s path
+/// within `root`. Used both by the eager full-tree pass and by the status/diff
+/// worktree walk as it descends, so the tree is read for attributes exactly once.
+fn read_dir_attribute_patterns(
     root: &Path,
     dir: &Path,
     matcher: &mut AttributeMatcher,
@@ -2471,6 +2500,15 @@ fn collect_attribute_patterns(
     }
     source.extend_from_slice(b".gitattributes");
     read_attribute_patterns(dir.join(".gitattributes"), matcher, &base, &source);
+    Ok(())
+}
+
+fn collect_attribute_patterns(
+    root: &Path,
+    dir: &Path,
+    matcher: &mut AttributeMatcher,
+) -> Result<()> {
+    read_dir_attribute_patterns(root, dir, matcher)?;
 
     let mut entries = fs::read_dir(dir)?.collect::<std::result::Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
@@ -5276,10 +5314,11 @@ fn worktree_entries_with_stat_cache(
     // as `git add` would store them. With no filter configured this is an exact
     // passthrough, so unfiltered repositories see identical OIDs.
     let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
-    // Build the attribute matcher (the .gitattributes chain) ONCE for the whole
-    // walk and reuse it for every file. Resolving attributes per file rebuilt the
-    // entire matcher on each call, which made status/diff O(n^2) in the file count.
-    let attr_matcher = AttributeMatcher::from_worktree_root(worktree_root)?;
+    // Seed the matcher with the repo-wide sources only; each directory's
+    // `.gitattributes` is folded in by `collect_worktree_entries` as it descends,
+    // so the worktree is read exactly once (a separate full-tree attribute pass was
+    // a second traversal of every directory).
+    let mut attr_matcher = AttributeMatcher::from_worktree_base(worktree_root);
     let attr_requested = filter_attribute_names();
     collect_worktree_entries(
         worktree_root,
@@ -5287,7 +5326,7 @@ fn worktree_entries_with_stat_cache(
         worktree_root,
         format,
         &config,
-        &attr_matcher,
+        &mut attr_matcher,
         &attr_requested,
         stat_cache,
         &mut entries,
@@ -5302,7 +5341,7 @@ fn collect_worktree_entries(
     dir: &Path,
     format: ObjectFormat,
     config: &GitConfig,
-    matcher: &AttributeMatcher,
+    matcher: &mut AttributeMatcher,
     requested: &[Vec<u8>],
     stat_cache: Option<&IndexStatCache>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
@@ -5310,6 +5349,10 @@ fn collect_worktree_entries(
     if is_same_path(dir, git_dir) {
         return Ok(());
     }
+    // Fold this directory's `.gitattributes` into the matcher before processing its
+    // files, so lookups for files here (and below) see it. This is what lets the
+    // walk read the tree once instead of doing a separate full-tree attribute pass.
+    read_dir_attribute_patterns(root, dir, matcher)?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
