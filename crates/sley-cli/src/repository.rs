@@ -6,6 +6,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use sley_config::GitConfig;
 use sley_core::{ObjectFormat, Result};
@@ -13,11 +14,10 @@ use sley_odb::FileObjectDatabase;
 use sley_refs::FileRefStore;
 
 use crate::{
-    common_git_dir_for_git_dir, discover_git_dir, read_repo_config, repository_object_format,
-    warn_ambiguous_refname_for_object_prefix,
+    common_git_dir_for_git_dir, discover_git_dir, read_repo_config, repository_abbrev,
+    repository_object_format, warn_ambiguous_refname_for_object_prefix, worktree_root_for_git_dir,
 };
 
-#[derive(Clone)]
 pub(crate) struct RepositoryContext {
     cwd: PathBuf,
     git_dir: PathBuf,
@@ -26,6 +26,8 @@ pub(crate) struct RepositoryContext {
     config: GitConfig,
     objects: FileObjectDatabase,
     refs: FileRefStore,
+    worktree_root: OnceLock<PathBuf>,
+    abbrev: OnceLock<Option<usize>>,
 }
 
 impl RepositoryContext {
@@ -53,6 +55,8 @@ impl RepositoryContext {
             config,
             objects,
             refs,
+            worktree_root: OnceLock::new(),
+            abbrev: OnceLock::new(),
         })
     }
 
@@ -82,6 +86,31 @@ impl RepositoryContext {
 
     pub(crate) fn refs(&self) -> &FileRefStore {
         &self.refs
+    }
+
+    pub(crate) fn worktree_root(&self) -> Result<&Path> {
+        if let Some(root) = self.worktree_root.get() {
+            return Ok(root);
+        }
+        let root = worktree_root_for_git_dir(&self.git_dir)?;
+        let _ = self.worktree_root.set(root);
+        Ok(self
+            .worktree_root
+            .get()
+            .expect("repository worktree root should be initialized")
+            .as_path())
+    }
+
+    pub(crate) fn abbrev(&self) -> Result<Option<usize>> {
+        if let Some(abbrev) = self.abbrev.get() {
+            return Ok(*abbrev);
+        }
+        let abbrev = repository_abbrev(&self.git_dir, self.format)?;
+        let _ = self.abbrev.set(abbrev);
+        Ok(*self
+            .abbrev
+            .get()
+            .expect("repository abbrev should be initialized"))
     }
 
     pub(crate) fn resolve_revision(&self, rev: &str) -> Result<sley_core::ObjectId> {

@@ -8,9 +8,8 @@
 //! text, the streams it lands on, and exit codes match upstream so the command
 //! is a drop-in replacement.
 
-// Pull shared plumbing (RepositoryContext, worktree_root_for_git_dir,
-// ObjectReader, Index/IndexEntry, GitError/Result, std::* re-exports, …) from
-// the crate root.
+// Pull shared plumbing (RepositoryContext, ObjectReader, Index/IndexEntry,
+// GitError/Result, std::* re-exports, …) from the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
 // with whatever the root exposes without re-listing each name.
 use crate::*;
@@ -198,7 +197,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
     let format = repo.format();
     let config = repo.config();
     let db = repo.objects();
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = repo.worktree_root()?;
 
     let mut index = match sley_worktree::read_repository_index(git_dir, format)? {
         Some(index) => index,
@@ -213,7 +212,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
     // The path prefix of the current directory relative to the worktree root is
     // prepended to explicit pathspecs for cache lookup (so `a.txt` from `sub/`
     // resolves to `sub/a.txt`), matching upstream.
-    let dir_prefix = checkout_index_dir_prefix(&worktree_root, &cwd)?;
+    let dir_prefix = checkout_index_dir_prefix(worktree_root, cwd)?;
 
     let stdin_paths = if options.stdin {
         read_checkout_index_stdin(options.nul)?
@@ -242,7 +241,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             .collect();
         for idx in targets {
             match checkout_one_index_entry(
-                &worktree_root,
+                worktree_root,
                 db,
                 config,
                 git_dir,
@@ -283,7 +282,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
                 continue;
             }
             match checkout_one_index_entry(
-                &worktree_root,
+                worktree_root,
                 db,
                 config,
                 git_dir,

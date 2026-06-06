@@ -1402,6 +1402,164 @@ fn default_range_side(side: &str) -> &str {
     if side.is_empty() { "HEAD" } else { side }
 }
 
+/// A small builder for rev-list-style revision selection arguments.
+///
+/// Specs added through [`RevisionSelection::add_spec`] understand bare includes
+/// (`B`), caret excludes (`^A`), asymmetric ranges (`A..B`), symmetric ranges
+/// (`A...B`), and the `HEAD` defaults accepted by [`parse_revision_range`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RevisionSelection {
+    items: Vec<RevisionSelectionItem>,
+}
+
+/// One item in a [`RevisionSelection`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionSelectionItem {
+    /// Include commits reachable from this revision.
+    Include(String),
+    /// Exclude commits reachable from this revision.
+    Exclude(String),
+    /// Include/exclude according to a parsed `A..B` or `A...B` range.
+    Range(RevisionRange),
+}
+
+/// Resolved commit starts plus the full set of excluded commits.
+///
+/// `excluded` contains the complete ancestry closure of each exclude tip (and
+/// symmetric-range merge base), so callers can walk from `starts` and filter any
+/// commit whose oid is present here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ResolvedRevisionSelection {
+    pub starts: Vec<ObjectId>,
+    pub excluded: HashSet<ObjectId>,
+}
+
+impl RevisionSelection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn from_specs<I, S>(specs: I) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut selection = Self::new();
+        for spec in specs {
+            selection.add_spec(spec.as_ref())?;
+        }
+        Ok(selection)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn items(&self) -> &[RevisionSelectionItem] {
+        &self.items
+    }
+
+    pub fn add_spec(&mut self, spec: impl AsRef<str>) -> Result<&mut Self> {
+        let spec = spec.as_ref();
+        if spec.is_empty() {
+            return Err(GitError::InvalidFormat("empty revision spec".into()));
+        }
+        if let Some(rev) = spec.strip_prefix('^') {
+            if rev.is_empty() {
+                return Err(GitError::InvalidFormat("empty exclude revision".into()));
+            }
+            return self.exclude(rev.to_string());
+        }
+        if let Some(range) = parse_revision_range(spec) {
+            self.range(range);
+            return Ok(self);
+        }
+        self.include(spec.to_string())
+    }
+
+    pub fn include(&mut self, rev: impl Into<String>) -> Result<&mut Self> {
+        let rev = RevisionSpec::parse(rev)?.raw;
+        self.items.push(RevisionSelectionItem::Include(rev));
+        Ok(self)
+    }
+
+    pub fn exclude(&mut self, rev: impl Into<String>) -> Result<&mut Self> {
+        let rev = RevisionSpec::parse(rev)?.raw;
+        self.items.push(RevisionSelectionItem::Exclude(rev));
+        Ok(self)
+    }
+
+    pub fn range(&mut self, range: RevisionRange) -> &mut Self {
+        self.items.push(RevisionSelectionItem::Range(range));
+        self
+    }
+
+    pub fn resolve<R: ObjectReader>(
+        &self,
+        git_dir: &Path,
+        format: sley_core::ObjectFormat,
+        reader: &R,
+    ) -> Result<ResolvedRevisionSelection> {
+        let mut resolved = ResolvedRevisionSelection::default();
+        for item in &self.items {
+            match item {
+                RevisionSelectionItem::Include(rev) => {
+                    resolved
+                        .starts
+                        .push(resolve_range_endpoint(git_dir, format, reader, rev)?);
+                }
+                RevisionSelectionItem::Exclude(rev) => {
+                    let oid = resolve_range_endpoint(git_dir, format, reader, rev)?;
+                    extend_excluded_ancestors(
+                        git_dir,
+                        format,
+                        reader,
+                        &mut resolved.excluded,
+                        &oid,
+                    )?;
+                }
+                RevisionSelectionItem::Range(range) => {
+                    resolve_selection_range(git_dir, format, reader, range, &mut resolved)?;
+                }
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+impl ResolvedRevisionSelection {
+    /// Walk from the resolved starts and return selected commit ids after
+    /// applying the excluded set.
+    pub fn selected_commit_oids<R: ObjectReader>(
+        &self,
+        git_dir: &Path,
+        format: sley_core::ObjectFormat,
+        reader: &R,
+        first_parent: bool,
+    ) -> Result<Vec<ObjectId>> {
+        let mut graph = CommitGraphContext::load(git_dir, format);
+        let mut seen = HashSet::new();
+        let mut pending: VecDeque<ObjectId> = self.starts.clone().into();
+        let mut out = Vec::new();
+        while let Some(oid) = pending.pop_front() {
+            if !seen.insert(oid.clone()) || self.excluded.contains(&oid) {
+                continue;
+            }
+            let (parents, _) = match graph.metadata(&oid) {
+                Some(metadata) => metadata,
+                None => commit_metadata_from_object(reader, format, &oid)?,
+            };
+            if first_parent {
+                pending.extend(parents.first().cloned());
+            } else {
+                pending.extend(parents);
+            }
+            out.push(oid);
+        }
+        Ok(out)
+    }
+}
+
 /// Resolve a parsed range to the set of commit oids it selects.
 ///
 /// `A..B` yields commits reachable from `B` but not `A`; `A...B` yields the
@@ -1446,6 +1604,33 @@ pub fn resolve_revision_range<R: ObjectReader>(
     }
 }
 
+fn resolve_selection_range<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    range: &RevisionRange,
+    resolved: &mut ResolvedRevisionSelection,
+) -> Result<()> {
+    match range {
+        RevisionRange::Asymmetric { start, end } => {
+            let start_oid = resolve_range_endpoint(git_dir, format, reader, start)?;
+            let end_oid = resolve_range_endpoint(git_dir, format, reader, end)?;
+            extend_excluded_ancestors(git_dir, format, reader, &mut resolved.excluded, &start_oid)?;
+            resolved.starts.push(end_oid);
+        }
+        RevisionRange::Symmetric { left, right } => {
+            let left_oid = resolve_range_endpoint(git_dir, format, reader, left)?;
+            let right_oid = resolve_range_endpoint(git_dir, format, reader, right)?;
+            resolved.starts.push(left_oid.clone());
+            resolved.starts.push(right_oid.clone());
+            for base in merge_bases(git_dir, format, reader, &left_oid, &right_oid)? {
+                extend_excluded_ancestors(git_dir, format, reader, &mut resolved.excluded, &base)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_range_endpoint<R: ObjectReader>(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
@@ -1454,6 +1639,17 @@ fn resolve_range_endpoint<R: ObjectReader>(
 ) -> Result<ObjectId> {
     let oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
     peel_to_commit(reader, format, &oid)
+}
+
+fn extend_excluded_ancestors<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    excluded: &mut HashSet<ObjectId>,
+    start: &ObjectId,
+) -> Result<()> {
+    excluded.extend(ancestor_set(git_dir, reader, format, start)?);
+    Ok(())
 }
 
 /// Compute the set of commits reachable from `start` (inclusive) following all
@@ -2279,6 +2475,147 @@ mod tests {
     }
 
     #[test]
+    fn revision_selection_resolves_asymmetric_range() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+        let c = all[3].clone();
+
+        let selection = RevisionSelection::from_specs([format!("{a}..{c}")]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert_eq!(resolved.starts, vec![c.clone()]);
+        assert_eq!(resolved.excluded, oid_set([root, a]));
+        assert_oid_set(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap(),
+            [c],
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn revision_selection_resolves_default_left_range() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+        let c = all[3].clone();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &a);
+
+        let selection = RevisionSelection::from_specs([format!("..{c}")]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert_eq!(resolved.starts, vec![c.clone()]);
+        assert_eq!(resolved.excluded, oid_set([root, a]));
+        assert_oid_set(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap(),
+            [c],
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn revision_selection_resolves_default_right_range() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+        let c = all[3].clone();
+        fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        set_branch(&git_dir, "main", &c);
+
+        let selection = RevisionSelection::from_specs([format!("{a}..")]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert_eq!(resolved.starts, vec![c.clone()]);
+        assert_eq!(resolved.excluded, oid_set([root, a]));
+        assert_oid_set(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap(),
+            [c],
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn revision_selection_resolves_symmetric_range() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+        let b = all[2].clone();
+
+        let selection = RevisionSelection::from_specs([format!("{a}...{b}")]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert_eq!(resolved.starts, vec![a.clone(), b.clone()]);
+        assert_eq!(resolved.excluded, oid_set([root]));
+        assert_oid_set(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap(),
+            [a, b],
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn revision_selection_resolves_caret_exclude() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+
+        let selection = RevisionSelection::from_specs([format!("^{a}")]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert!(resolved.starts.is_empty());
+        assert_eq!(resolved.excluded, oid_set([root, a]));
+        assert!(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap()
+                .is_empty()
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
+    fn revision_selection_resolves_bare_include() {
+        let git_dir = temp_git_dir();
+        let format = ObjectFormat::Sha1;
+        let (db, all) = build_history(&git_dir, format);
+        let root = all[0].clone();
+        let a = all[1].clone();
+        let c = all[3].clone();
+
+        let selection = RevisionSelection::from_specs([c.to_hex()]).unwrap();
+        let resolved = selection.resolve(&git_dir, format, &db).unwrap();
+
+        assert_eq!(resolved.starts, vec![c.clone()]);
+        assert!(resolved.excluded.is_empty());
+        assert_oid_set(
+            resolved
+                .selected_commit_oids(&git_dir, format, &db, false)
+                .unwrap(),
+            [root, a, c],
+        );
+        fs::remove_dir_all(git_dir).unwrap();
+    }
+
+    #[test]
     fn merge_bases_finds_common_ancestor() {
         let git_dir = temp_git_dir();
         let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
@@ -2541,6 +2878,17 @@ mod tests {
 
     fn zero_oid() -> ObjectId {
         ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap()
+    }
+
+    fn oid_set(oids: impl IntoIterator<Item = ObjectId>) -> HashSet<ObjectId> {
+        oids.into_iter().collect()
+    }
+
+    fn assert_oid_set(
+        actual: impl IntoIterator<Item = ObjectId>,
+        expected: impl IntoIterator<Item = ObjectId>,
+    ) {
+        assert_eq!(oid_set(actual), oid_set(expected));
     }
 
     fn set_branch(git_dir: &Path, branch: &str, oid: &ObjectId) {

@@ -7,7 +7,7 @@ use sley_core::{GitError, Result};
 
 use crate::{
     RepositoryContext, check_ignore_tracked_paths, normalize_ls_files_pathspec, resolve_cli_path,
-    worktree_prefix, worktree_root_for_git_dir, write_check_attr_state,
+    worktree_prefix, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
@@ -101,7 +101,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = repo.worktree_root()?;
     let prefix = worktree_prefix(cwd, git_dir)?;
     let tracked_paths = if no_index {
         BTreeSet::new()
@@ -119,7 +119,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         }
         let absolute = resolve_cli_path(cwd, &path_arg);
         let ignore_match =
-            sley_worktree::standard_ignore_match(&worktree_root, &git_path, absolute.is_dir())?;
+            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?;
         if let Some(ignore_match) = ignore_match {
             if verbose || ignore_match.ignored {
                 matched_any = true;
@@ -267,7 +267,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
     let cwd = repo.cwd();
     let git_dir = repo.git_dir();
     let format = repo.format();
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = repo.worktree_root()?;
     let prefix = worktree_prefix(cwd, git_dir)?;
     let source_tree = if let Some(source) = source.as_deref() {
         let oid = repo.resolve_revision(source)?;
@@ -281,7 +281,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
         let checks = if cached {
             sley_worktree::standard_attributes_for_path_from_index(
-                &worktree_root,
+                worktree_root,
                 git_dir,
                 format,
                 &git_path,
@@ -290,7 +290,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
             )?
         } else if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::standard_attributes_for_path_from_tree(
-                &worktree_root,
+                worktree_root,
                 repo.objects(),
                 format,
                 tree_oid,
@@ -299,7 +299,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
                 all,
             )?
         } else {
-            sley_worktree::standard_attributes_for_path(&worktree_root, &git_path, &requested, all)?
+            sley_worktree::standard_attributes_for_path(worktree_root, &git_path, &requested, all)?
         };
         for check in checks {
             if z {

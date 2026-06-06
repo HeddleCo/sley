@@ -2,6 +2,7 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{Index, IndexEntry};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
+use sley_object::TreeEntries;
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
 use std::cell::RefCell;
@@ -5395,13 +5396,13 @@ fn collect_tree_entries(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let mut path = prefix.clone();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             collect_tree_entries(db, format, &entry.oid, path, entries)?;
         } else {

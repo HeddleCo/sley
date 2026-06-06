@@ -21,8 +21,7 @@ use std::path::Path;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
 // Pull in the crate-root helpers this command shares with `cmd_diff`
-// (RepositoryContext, repository_abbrev, worktree_root_for_git_dir,
-// FileObjectDatabase, the
+// (RepositoryContext, FileObjectDatabase, the
 // DiffPathspec/DiffFilter/DiffStatOptions/DiffPatchOptions types, and every
 // write_diff_* renderer), matching the established `commands::*` pattern.
 use crate::*;
@@ -220,7 +219,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     // requested, but unlike porcelain `git diff` the plumbing `diff-index`
     // shows *full* oids in the raw listing unless `--abbrev` is given, and
     // `core.abbrev` alone never abbreviates the raw output.
-    let configured_abbrev = repository_abbrev(&git_dir, format)?.unwrap_or(DEFAULT_ABBREV);
+    let configured_abbrev = repo.abbrev()?.unwrap_or(DEFAULT_ABBREV);
     let raw_abbrev: Option<usize> = match abbrev {
         AbbrevRequest::Default | AbbrevRequest::None => None,
         AbbrevRequest::Auto => Some(configured_abbrev.min(format.hex_len())),
@@ -241,13 +240,16 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
     let worktree_root = if cached {
         None
     } else {
-        Some(worktree_root_for_git_dir(&git_dir)?)
+        Some(repo.worktree_root()?)
     };
     let pathspec = if path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-        DiffPathspec::new(&cwd, &worktree_root, &path_args)?
+        let worktree_root = match worktree_root {
+            Some(worktree_root) => worktree_root,
+            None => repo.worktree_root()?,
+        };
+        DiffPathspec::new(cwd, worktree_root, &path_args)?
     };
 
     let base_options = sley_diff_merge::DiffNameStatusOptions {
@@ -281,7 +283,6 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         }
     } else {
         let worktree_root = worktree_root
-            .as_ref()
             .ok_or_else(|| GitError::Command("diff-index requires a worktree".into()))?;
         if inexact_renames {
             sley_diff_merge::diff_name_status_tree_worktree_with_rename_options(
@@ -328,7 +329,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             &output,
             RenderContext {
                 db,
-                worktree_root: worktree_root.as_deref(),
+                worktree_root,
                 use_worktree_new: !cached,
                 format,
                 z,

@@ -86,45 +86,71 @@ pub struct TreeEntry {
     pub oid: ObjectId,
 }
 
+/// A borrowed parse-view of a single entry in a raw tree object.
+///
+/// The `name` slice points into the original tree body. The object id is a
+/// fixed-size value parsed from the raw bytes, so iterating does not allocate
+/// entry names or build an intermediate entry list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeEntryRef<'a> {
+    pub mode: u32,
+    pub name: &'a [u8],
+    pub oid: ObjectId,
+}
+
+/// Fallibly iterates raw tree-object bytes without allocating entry names.
+#[derive(Debug, Clone)]
+pub struct TreeEntries<'a> {
+    format: ObjectFormat,
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> TreeEntries<'a> {
+    pub const fn new(format: ObjectFormat, bytes: &'a [u8]) -> Self {
+        Self {
+            format,
+            bytes,
+            offset: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for TreeEntries<'a> {
+    type Item = Result<TreeEntryRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.offset >= self.bytes.len() {
+            return None;
+        }
+        match parse_tree_entry_ref(self.format, self.bytes, self.offset) {
+            Ok((entry, next_offset)) => {
+                self.offset = next_offset;
+                Some(Ok(entry))
+            }
+            Err(err) => {
+                self.offset = self.bytes.len();
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+impl<'a> From<TreeEntryRef<'a>> for TreeEntry {
+    fn from(entry: TreeEntryRef<'a>) -> Self {
+        Self {
+            mode: entry.mode,
+            name: entry.name.to_vec(),
+            oid: entry.oid,
+        }
+    }
+}
+
 impl Tree {
     pub fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<Self> {
-        let mut offset = 0usize;
-        let mut entries = Vec::new();
-        while offset < bytes.len() {
-            let mode_start = offset;
-            while bytes.get(offset).copied() != Some(b' ') {
-                offset += 1;
-                if offset >= bytes.len() {
-                    return Err(GitError::InvalidFormat("unterminated tree mode".into()));
-                }
-            }
-            let mode_text = std::str::from_utf8(&bytes[mode_start..offset])
-                .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
-            let mode = u32::from_str_radix(mode_text, 8)
-                .map_err(|_| GitError::InvalidFormat("invalid tree mode".into()))?;
-            offset += 1;
-            let name_start = offset;
-            while bytes.get(offset).copied() != Some(0) {
-                offset += 1;
-                if offset >= bytes.len() {
-                    return Err(GitError::InvalidFormat("unterminated tree path".into()));
-                }
-            }
-            if offset == name_start {
-                return Err(GitError::InvalidFormat("empty tree path".into()));
-            }
-            let name = bytes[name_start..offset].to_vec();
-            offset += 1;
-            let oid_end = offset
-                .checked_add(format.raw_len())
-                .ok_or_else(|| GitError::InvalidFormat("tree oid overflow".into()))?;
-            if oid_end > bytes.len() {
-                return Err(GitError::InvalidFormat("truncated tree object id".into()));
-            }
-            let oid = ObjectId::from_raw(format, &bytes[offset..oid_end])?;
-            offset = oid_end;
-            entries.push(TreeEntry { mode, name, oid });
-        }
+        let entries = TreeEntries::new(format, bytes)
+            .map(|entry| entry.map(TreeEntry::from))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self { entries })
     }
 
@@ -139,6 +165,49 @@ impl Tree {
         }
         out
     }
+}
+
+fn parse_tree_entry_ref<'a>(
+    format: ObjectFormat,
+    bytes: &'a [u8],
+    offset: usize,
+) -> Result<(TreeEntryRef<'a>, usize)> {
+    let mode_end = bytes[offset..]
+        .iter()
+        .position(|byte| *byte == b' ')
+        .map(|relative| offset + relative)
+        .ok_or_else(|| GitError::InvalidFormat("unterminated tree mode".into()))?;
+    let mode_text = std::str::from_utf8(&bytes[offset..mode_end])
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let mode = u32::from_str_radix(mode_text, 8)
+        .map_err(|_| GitError::InvalidFormat("invalid tree mode".into()))?;
+
+    let name_start = mode_end + 1;
+    let name_end = bytes[name_start..]
+        .iter()
+        .position(|byte| *byte == 0)
+        .map(|relative| name_start + relative)
+        .ok_or_else(|| GitError::InvalidFormat("unterminated tree path".into()))?;
+    if name_end == name_start {
+        return Err(GitError::InvalidFormat("empty tree path".into()));
+    }
+
+    let oid_start = name_end + 1;
+    let oid_end = oid_start
+        .checked_add(format.raw_len())
+        .ok_or_else(|| GitError::InvalidFormat("tree oid overflow".into()))?;
+    if oid_end > bytes.len() {
+        return Err(GitError::InvalidFormat("truncated tree object id".into()));
+    }
+
+    Ok((
+        TreeEntryRef {
+            mode,
+            name: &bytes[name_start..name_end],
+            oid: ObjectId::from_raw(format, &bytes[oid_start..oid_end])?,
+        },
+        oid_end,
+    ))
 }
 
 pub fn tree_entry_object_type(mode: u32) -> ObjectType {
@@ -231,6 +300,37 @@ impl TreeEntry {
 
     pub fn is_executable(&self) -> bool {
         self.mode == EntryKind::BlobExecutable.mode()
+    }
+}
+
+impl TreeEntryRef<'_> {
+    /// Classify this entry's mode, if it is one of Git's canonical kinds.
+    pub fn kind(&self) -> Option<EntryKind> {
+        EntryKind::from_mode(self.mode)
+    }
+
+    pub fn is_tree(&self) -> bool {
+        self.mode == EntryKind::Tree.mode()
+    }
+
+    pub fn is_symlink(&self) -> bool {
+        self.mode == EntryKind::Symlink.mode()
+    }
+
+    pub fn is_gitlink(&self) -> bool {
+        self.mode == EntryKind::Commit.mode()
+    }
+
+    pub fn is_executable(&self) -> bool {
+        self.mode == EntryKind::BlobExecutable.mode()
+    }
+
+    pub fn to_owned(&self) -> TreeEntry {
+        TreeEntry {
+            mode: self.mode,
+            name: self.name.to_vec(),
+            oid: self.oid.clone(),
+        }
     }
 }
 
@@ -597,6 +697,126 @@ mod tests {
     }
 
     #[test]
+    fn tree_entries_iterates_without_name_allocations() {
+        let format = ObjectFormat::Sha1;
+        let blob = ObjectId::from_hex(format, "ce013625030ba8dba906f756967f9e9ca394464a").unwrap();
+        let subtree = ObjectId::empty_tree(format);
+        let mut bytes = Vec::new();
+
+        let first_name_start = b"100644 ".len();
+        write_tree_entry(&mut bytes, EntryKind::Blob.mode(), b"hello.txt", &blob);
+        let second_name_start = bytes.len() + b"40000 ".len();
+        write_tree_entry(&mut bytes, EntryKind::Tree.mode(), b"src", &subtree);
+
+        let mut entries = TreeEntries::new(format, &bytes);
+        let first = entries.next().expect("first entry").unwrap();
+        assert_eq!(first.mode, EntryKind::Blob.mode());
+        assert_eq!(first.name, b"hello.txt");
+        assert_eq!(first.oid, blob);
+        assert_eq!(first.kind(), Some(EntryKind::Blob));
+        assert!(std::ptr::eq(
+            first.name.as_ptr(),
+            bytes[first_name_start..].as_ptr()
+        ));
+
+        let second = entries.next().expect("second entry").unwrap();
+        assert_eq!(second.mode, EntryKind::Tree.mode());
+        assert_eq!(second.name, b"src");
+        assert_eq!(second.oid, subtree);
+        assert!(second.is_tree());
+        assert!(std::ptr::eq(
+            second.name.as_ptr(),
+            bytes[second_name_start..].as_ptr()
+        ));
+        assert!(entries.next().is_none());
+
+        let owned = Tree::parse(format, &bytes).unwrap();
+        assert_eq!(owned.entries, vec![first.to_owned(), second.to_owned()]);
+    }
+
+    #[test]
+    fn tree_entries_reports_invalid_mode_path_and_truncated_oid() {
+        let format = ObjectFormat::Sha1;
+        let oid = ObjectId::empty_blob(format);
+
+        let mut invalid_mode = b"10088 bad\0".to_vec();
+        invalid_mode.extend_from_slice(oid.as_bytes());
+        assert_invalid_tree_entry(
+            TreeEntries::new(format, &invalid_mode)
+                .next()
+                .expect("invalid mode result"),
+            "invalid tree mode",
+        );
+
+        let mut empty_path = b"100644 \0".to_vec();
+        empty_path.extend_from_slice(oid.as_bytes());
+        assert_invalid_tree_entry(
+            TreeEntries::new(format, &empty_path)
+                .next()
+                .expect("empty path result"),
+            "empty tree path",
+        );
+
+        let mut truncated_oid = b"100644 bad\0".to_vec();
+        truncated_oid.extend_from_slice(&oid.as_bytes()[..format.raw_len() - 1]);
+        assert_invalid_tree_entry(
+            TreeEntries::new(format, &truncated_oid)
+                .next()
+                .expect("truncated oid result"),
+            "truncated tree object id",
+        );
+    }
+
+    #[test]
+    fn tree_entry_ref_kind_helpers_match_entry_kinds() {
+        let oid = ObjectId::null(ObjectFormat::Sha1);
+
+        let tree = TreeEntryRef {
+            mode: EntryKind::Tree.mode(),
+            name: b"dir",
+            oid: oid.clone(),
+        };
+        assert_eq!(tree.kind(), Some(EntryKind::Tree));
+        assert!(tree.is_tree());
+        assert!(!tree.is_symlink());
+        assert!(!tree.is_gitlink());
+        assert!(!tree.is_executable());
+
+        let symlink = TreeEntryRef {
+            mode: EntryKind::Symlink.mode(),
+            name: b"link",
+            oid: oid.clone(),
+        };
+        assert_eq!(symlink.kind(), Some(EntryKind::Symlink));
+        assert!(symlink.is_symlink());
+        assert!(!symlink.is_tree());
+        assert!(!symlink.is_gitlink());
+        assert!(!symlink.is_executable());
+
+        let executable = TreeEntryRef {
+            mode: EntryKind::BlobExecutable.mode(),
+            name: b"run",
+            oid: oid.clone(),
+        };
+        assert_eq!(executable.kind(), Some(EntryKind::BlobExecutable));
+        assert!(executable.is_executable());
+        assert!(!executable.is_tree());
+        assert!(!executable.is_symlink());
+        assert!(!executable.is_gitlink());
+
+        let gitlink = TreeEntryRef {
+            mode: EntryKind::Commit.mode(),
+            name: b"submodule",
+            oid,
+        };
+        assert_eq!(gitlink.kind(), Some(EntryKind::Commit));
+        assert!(gitlink.is_gitlink());
+        assert!(!gitlink.is_tree());
+        assert!(!gitlink.is_symlink());
+        assert!(!gitlink.is_executable());
+    }
+
+    #[test]
     fn commit_round_trips_headers_and_message() {
         let tree = ObjectId::from_hex(
             ObjectFormat::Sha1,
@@ -725,5 +945,20 @@ mod tests {
             message: b"x\n".to_vec(),
         };
         assert!(lightweight.tagger_signature().is_none());
+    }
+
+    fn write_tree_entry(body: &mut Vec<u8>, mode: u32, name: &[u8], oid: &ObjectId) {
+        body.extend_from_slice(format!("{:o}", mode).as_bytes());
+        body.push(b' ');
+        body.extend_from_slice(name);
+        body.push(0);
+        body.extend_from_slice(oid.as_bytes());
+    }
+
+    fn assert_invalid_tree_entry(result: Result<TreeEntryRef<'_>>, expected: &str) {
+        match result {
+            Err(GitError::InvalidFormat(message)) => assert_eq!(message, expected),
+            other => panic!("expected invalid format {expected:?}, got {other:?}"),
+        }
     }
 }

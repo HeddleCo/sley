@@ -405,7 +405,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let db = repo.objects();
-    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let worktree_root = repo.worktree_root()?;
 
     // Raw object names: diff-files (plumbing) prints full names by default, so a
     // `None` here means "full". `--abbrev`/`--abbrev=<n>` set an explicit width;
@@ -421,7 +421,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         format.hex_len()
     } else {
         o.patch_abbrev
-            .or(repository_abbrev(git_dir, format)?)
+            .or(repo.abbrev()?)
             .unwrap_or(7)
             .min(format.hex_len())
     };
@@ -429,7 +429,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     let pathspec = if o.path_args.is_empty() {
         DiffPathspec::default()
     } else {
-        DiffPathspec::new(&cwd, &worktree_root, &o.path_args)?
+        DiffPathspec::new(cwd, worktree_root, &o.path_args)?
     };
 
     let name_status_options = sley_diff_merge::DiffNameStatusOptions {
@@ -447,14 +447,14 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
 
     let entries = if o.inexact_renames {
         sley_diff_merge::diff_name_status_index_worktree_with_rename_options(
-            &worktree_root,
+            worktree_root,
             git_dir,
             format,
             rename_options,
         )?
     } else {
         sley_diff_merge::diff_name_status_index_worktree_with_options(
-            &worktree_root,
+            worktree_root,
             git_dir,
             format,
             name_status_options,
@@ -490,7 +490,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             &entries,
             &o,
             db,
-            &worktree_root,
+            worktree_root,
             raw_abbrev,
             patch_abbrev,
             format,
