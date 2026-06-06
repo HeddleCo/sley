@@ -3,7 +3,7 @@ use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
-use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, parse_framed_object};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
 use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -707,27 +707,37 @@ where
     let object = reader.read_object(&oid)?;
     match object.object_type {
         ObjectType::Commit => {
-            let commit = Commit::parse(format, &object.body)?;
+            let (tree, parents) = {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                (commit.tree, commit.parents)
+            };
             objects.push(object);
-            collect_reachable_object(reader, format, commit.tree, excluded, seen, objects)?;
-            for parent in commit.parents {
+            collect_reachable_object(reader, format, tree, excluded, seen, objects)?;
+            for parent in parents {
                 collect_reachable_object(reader, format, parent, excluded, seen, objects)?;
             }
         }
         ObjectType::Tree => {
-            let tree = Tree::parse(format, &object.body)?;
-            objects.push(object);
-            for entry in tree.entries {
+            let mut child_oids = Vec::new();
+            for entry in TreeEntries::new(format, &object.body) {
+                let entry = entry?;
                 if entry.is_gitlink() {
                     continue;
                 }
-                collect_reachable_object(reader, format, entry.oid, excluded, seen, objects)?;
+                child_oids.push(entry.oid);
+            }
+            objects.push(object);
+            for child_oid in child_oids {
+                collect_reachable_object(reader, format, child_oid, excluded, seen, objects)?;
             }
         }
         ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
+            let target = {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                tag.object
+            };
             objects.push(object);
-            collect_reachable_object(reader, format, tag.object, excluded, seen, objects)?;
+            collect_reachable_object(reader, format, target, excluded, seen, objects)?;
         }
         ObjectType::Blob => objects.push(object),
     }

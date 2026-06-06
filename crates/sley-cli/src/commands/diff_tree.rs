@@ -427,7 +427,7 @@ fn single_commit_request(
             skip: true,
         });
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     let left = match commit.parents.first() {
         Some(parent) => Some(sley_rev::peel_to_tree(db, format, parent)?),
         None => None,

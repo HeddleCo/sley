@@ -2,7 +2,7 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::CommitGraph;
 use sley_index::Index;
-use sley_object::{Commit, ObjectType, Tag, Tree};
+use sley_object::{Commit, ObjectType, Tag, TreeEntries};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use sley_refs::{FileRefStore, PackedRef, RefTarget};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1112,25 +1112,28 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
             // Cannot descend through a blob (or anything non-tree).
             return None;
         }
-        let tree = Tree::parse(format, &object.body).ok()?;
-        let entry = tree
-            .entries
-            .iter()
-            .find(|entry| entry.name == component.as_bytes())?;
-        let object_type = sley_object::tree_entry_object_type(entry.mode);
+        let mut found = None;
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry.ok()?;
+            if found.is_none() && entry.name == component.as_bytes() {
+                found = Some((entry.mode, entry.oid, entry.name.to_vec()));
+            }
+        }
+        let (mode, oid, name) = found?;
+        let object_type = sley_object::tree_entry_object_type(mode);
         if idx == last {
             return Some(ResolvedTreePath {
-                oid: entry.oid.clone(),
-                mode: Some(entry.mode),
+                oid,
+                mode: Some(mode),
                 object_type,
-                name: entry.name.clone(),
+                name,
             });
         }
         // Intermediate component must itself be a tree to keep descending.
         if object_type != ObjectType::Tree {
             return None;
         }
-        current = entry.oid.clone();
+        current = oid;
     }
     None
 }
@@ -2984,7 +2987,7 @@ mod tests {
     }
 
     fn write_tree(db: &mut ObjectDatabase, entries: &[(u32, &[u8], &ObjectId)]) -> ObjectId {
-        let tree = Tree {
+        let tree = sley_object::Tree {
             entries: entries
                 .iter()
                 .map(|(mode, name, oid)| sley_object::TreeEntry {

@@ -461,7 +461,7 @@ fn first_parent_diff_entries(
     match commit.parents.first() {
         Some(parent_oid) => {
             let parent_object = db.read_object(parent_oid)?;
-            let parent_commit = Commit::parse(format, &parent_object.body)?;
+            let parent_commit = Commit::parse_ref(format, &parent_object.body)?;
             sley_diff_merge::diff_name_status_trees_with_rename_options(
                 db,
                 format,

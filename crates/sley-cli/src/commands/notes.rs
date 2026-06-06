@@ -218,7 +218,7 @@ fn notes_tree_oid(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&commit_oid)?;
     match object.object_type {
-        ObjectType::Commit => Ok(Some(Commit::parse(format, &object.body)?.tree)),
+        ObjectType::Commit => Ok(Some(Commit::parse_ref(format, &object.body)?.tree)),
         ObjectType::Tree => Ok(Some(commit_oid)),
         _ => Ok(None),
     }

@@ -162,7 +162,7 @@ fn commit_tree_with_amend(
                 object.object_type.as_str()
             )));
         }
-        Commit::parse(format, &object.body)?.parents
+        Commit::parse_ref(format, &object.body)?.parents
     } else {
         parent.iter().cloned().collect()
     };

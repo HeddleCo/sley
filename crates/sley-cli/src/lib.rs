@@ -6,7 +6,8 @@ use sley_formats::{
 };
 use sley_index::{Index, IndexEntry};
 use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
+    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, TreeEntryRef,
+    tree_entry_object_type,
 };
 use sley_odb::{
     FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
@@ -12558,6 +12559,31 @@ struct TreePrintOptions<'a> {
     nul: bool,
 }
 
+trait TreeEntryView {
+    fn mode(&self) -> u32;
+    fn oid(&self) -> &ObjectId;
+}
+
+impl TreeEntryView for TreeEntry {
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn oid(&self) -> &ObjectId {
+        &self.oid
+    }
+}
+
+impl TreeEntryView for TreeEntryRef<'_> {
+    fn mode(&self) -> u32 {
+        self.mode
+    }
+
+    fn oid(&self) -> &ObjectId {
+        &self.oid
+    }
+}
+
 fn print_tree(
     db: Option<&FileObjectDatabase>,
     format: ObjectFormat,
@@ -12574,16 +12600,16 @@ fn print_tree_with_prefix(
     prefix: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    let tree = Tree::parse(format, body)?;
     let mut stdout = io::stdout();
-    for entry in &tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         if options.tree_only && entry.mode != 0o040000 {
             continue;
         }
         let mut path = Vec::with_capacity(prefix.len() + entry.name.len());
         path.extend_from_slice(prefix);
-        path.extend_from_slice(&entry.name);
-        print_tree_entry_to_writer(&mut stdout, db, entry, &path, options)?;
+        path.extend_from_slice(entry.name);
+        print_tree_entry_to_writer(&mut stdout, db, &entry, &path, options)?;
     }
     stdout.flush()?;
     Ok(())
@@ -12592,27 +12618,27 @@ fn print_tree_with_prefix(
 fn print_tree_entry_to_writer(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &sley_object::TreeEntry,
+    entry: &impl TreeEntryView,
     path: &[u8],
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
     if let Some(format) = options.format_spec {
         write_tree_entry_format(writer, db, entry, path, options, format)?;
     } else if options.object_only {
-        write_tree_oid(writer, &entry.oid, options)?;
+        write_tree_oid(writer, entry.oid(), options)?;
     } else if options.name_only {
         write_tree_path(writer, path, options)?;
     } else {
-        let object_type = tree_entry_object_type(entry.mode);
+        let object_type = tree_entry_object_type(entry.mode());
         write!(
             writer,
             "{:06o} {} {}",
-            entry.mode,
+            entry.mode(),
             object_type.as_str(),
-            format_tree_oid(&entry.oid, options)
+            format_tree_oid(entry.oid(), options)
         )?;
         if options.long {
-            let size = tree_entry_size_field(db, object_type, &entry.oid)?;
+            let size = tree_entry_size_field(db, object_type, entry.oid())?;
             write!(writer, " {size:>7}")?;
         }
         writer.write_all(b"\t")?;
@@ -12659,12 +12685,12 @@ fn write_tree_oid(
 fn write_tree_entry_format(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &sley_object::TreeEntry,
+    entry: &impl TreeEntryView,
     path: &[u8],
     options: TreePrintOptions<'_>,
     format: &str,
 ) -> Result<()> {
-    let object_type = tree_entry_object_type(entry.mode);
+    let object_type = tree_entry_object_type(entry.mode());
     let mut chars = format.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch != '%' {
@@ -12720,23 +12746,23 @@ fn write_tree_entry_format(
 fn write_tree_format_placeholder(
     writer: &mut impl Write,
     db: Option<&FileObjectDatabase>,
-    entry: &sley_object::TreeEntry,
+    entry: &impl TreeEntryView,
     object_type: ObjectType,
     path: &[u8],
     options: TreePrintOptions<'_>,
     placeholder: &str,
 ) -> Result<()> {
     match placeholder {
-        "objectmode" => write!(writer, "{:06o}", entry.mode)?,
+        "objectmode" => write!(writer, "{:06o}", entry.mode())?,
         "objecttype" => writer.write_all(object_type.as_str().as_bytes())?,
-        "objectname" => write_tree_oid(writer, &entry.oid, options)?,
+        "objectname" => write_tree_oid(writer, entry.oid(), options)?,
         "objectsize" => {
-            writer.write_all(tree_entry_size_field(db, object_type, &entry.oid)?.as_bytes())?
+            writer.write_all(tree_entry_size_field(db, object_type, entry.oid())?.as_bytes())?
         }
         "objectsize:padded" => write!(
             writer,
             "{:>7}",
-            tree_entry_size_field(db, object_type, &entry.oid)?
+            tree_entry_size_field(db, object_type, entry.oid())?
         )?,
         "path" => write_tree_path(writer, path, options)?,
         _ => {
@@ -12779,9 +12805,8 @@ fn print_tree_recursive(
     prefix: &str,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    let tree = Tree::parse(format, body)?;
     let mut stdout = io::stdout();
-    print_tree_recursive_to_writer(&mut stdout, db, format, &tree, prefix, options)?;
+    print_tree_recursive_to_writer(&mut stdout, db, format, body, prefix, options)?;
     stdout.flush()?;
     Ok(())
 }
@@ -12979,48 +13004,48 @@ fn find_tree_entry(
     body: &[u8],
     components: &[&str],
 ) -> Result<Option<sley_object::TreeEntry>> {
-    let tree = Tree::parse(format, body)?;
     let Some((component, rest)) = components.split_first() else {
         return Ok(None);
     };
-    let Some(entry) = tree
-        .entries
-        .into_iter()
-        .find(|entry| entry.name == component.as_bytes())
-    else {
-        return Ok(None);
-    };
-    if rest.is_empty() {
-        return Ok(Some(entry));
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        if entry.name != component.as_bytes() {
+            continue;
+        }
+        if rest.is_empty() {
+            return Ok(Some(TreeEntry::from(entry)));
+        }
+        if entry.mode != 0o040000 {
+            return Ok(None);
+        }
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Tree {
+            return Err(GitError::InvalidObject(format!(
+                "expected tree {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        return find_tree_entry(db, format, &object.body, rest);
     }
-    if entry.mode != 0o040000 {
-        return Ok(None);
-    }
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
-    find_tree_entry(db, format, &object.body, rest)
+    Ok(None)
 }
 
 fn print_tree_recursive_to_writer(
     writer: &mut impl Write,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    tree: &Tree,
+    body: &[u8],
     prefix: &str,
     options: TreePrintOptions<'_>,
 ) -> Result<()> {
-    for entry in &tree.entries {
-        let name = String::from_utf8_lossy(&entry.name);
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
         let path = format!("{prefix}{name}");
         if entry.mode == 0o040000 {
             if options.show_trees || options.tree_only {
-                print_tree_entry_to_writer(writer, Some(db), entry, path.as_bytes(), options)?;
+                print_tree_entry_to_writer(writer, Some(db), &entry, path.as_bytes(), options)?;
             }
             let object = db.read_object(&entry.oid)?;
             if object.object_type != ObjectType::Tree {
@@ -13030,19 +13055,18 @@ fn print_tree_recursive_to_writer(
                     object.object_type.as_str()
                 )));
             }
-            let subtree = Tree::parse(format, &object.body)?;
             print_tree_recursive_to_writer(
                 writer,
                 db,
                 format,
-                &subtree,
+                &object.body,
                 &format!("{path}/"),
                 options,
             )?;
         } else if options.tree_only {
             continue;
         } else {
-            print_tree_entry_to_writer(writer, Some(db), entry, path.as_bytes(), options)?;
+            print_tree_entry_to_writer(writer, Some(db), &entry, path.as_bytes(), options)?;
         }
     }
     Ok(())
