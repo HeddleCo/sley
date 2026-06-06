@@ -1,5 +1,5 @@
-use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_config::GitConfig;
+use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{Index, IndexEntry};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -124,6 +124,7 @@ pub enum StatusUntrackedMode {
     #[default]
     All,
     Normal,
+    None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1143,8 +1144,18 @@ pub fn short_status_with_options(
     // stat cache lets the worktree walk skip re-hashing files whose stat proves
     // they are unchanged since staging (git's racy-git shortcut).
     let (index, stat_cache) = read_index_entries_with_stat_cache(git_dir, format)?;
-    let worktree =
-        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache))?;
+    let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {
+        Some(index.keys().cloned().collect::<BTreeSet<_>>())
+    } else {
+        None
+    };
+    let worktree = worktree_entries_with_stat_cache(
+        worktree_root,
+        git_dir,
+        format,
+        Some(&stat_cache),
+        tracked_paths.as_ref(),
+    )?;
     let ignores = IgnoreMatcher::from_worktree_root(worktree_root)?;
     let mut paths = BTreeSet::new();
     paths.extend(head.keys().cloned());
@@ -1240,6 +1251,7 @@ pub fn short_status_with_options(
             )?;
             paths.into_iter().collect()
         }
+        StatusUntrackedMode::None => Vec::new(),
     };
     for path in untracked_paths {
         entries.push(ShortStatusEntry {
@@ -3061,7 +3073,10 @@ fn eol_from_config(config: &GitConfig) -> EolConversion {
     if config.get_bool("core", None, "autocrlf") == Some(true) {
         return EolConversion::Crlf;
     }
-    match config.get("core", None, "eol").map(|v| v.to_ascii_lowercase()) {
+    match config
+        .get("core", None, "eol")
+        .map(|v| v.to_ascii_lowercase())
+    {
         Some(ref v) if v == "crlf" => EolConversion::Crlf,
         Some(ref v) if v == "lf" => EolConversion::Lf,
         _ => EolConversion::None,
@@ -3405,7 +3420,7 @@ pub fn modified_index_entries(
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let worktree =
-        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache))?;
+        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache), None)?;
     let mut modified = Vec::new();
     for entry in index.entries {
         let Some(worktree_entry) = worktree.get(&entry.path) else {
@@ -5407,7 +5422,7 @@ fn worktree_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None)
+    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None, None)
 }
 
 /// Like [`worktree_entries`], but accepts the index's [`IndexStatCache`] so the
@@ -5419,6 +5434,7 @@ fn worktree_entries_with_stat_cache(
     git_dir: &Path,
     format: ObjectFormat,
     stat_cache: Option<&IndexStatCache>,
+    tracked_paths: Option<&BTreeSet<Vec<u8>>>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
     // Worktree blobs are compared to the index by OID, so they must be passed
@@ -5441,6 +5457,7 @@ fn worktree_entries_with_stat_cache(
         &mut attr_matcher,
         &attr_requested,
         stat_cache,
+        tracked_paths,
         &mut entries,
     )?;
     Ok(entries)
@@ -5456,6 +5473,7 @@ fn collect_worktree_entries(
     matcher: &mut AttributeMatcher,
     requested: &[Vec<u8>],
     stat_cache: Option<&IndexStatCache>,
+    tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     if is_same_path(dir, git_dir) {
@@ -5476,14 +5494,37 @@ fn collect_worktree_entries(
         }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
+            if let Some(tracked_paths) = tracked_paths {
+                let relative = path.strip_prefix(root).map_err(|_| {
+                    GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+                })?;
+                let git_path = git_path_bytes(relative)?;
+                if !tracked_paths_may_contain(tracked_paths, &git_path) {
+                    continue;
+                }
+            }
             collect_worktree_entries(
-                root, git_dir, &path, format, config, matcher, requested, stat_cache, entries,
+                root,
+                git_dir,
+                &path,
+                format,
+                config,
+                matcher,
+                requested,
+                stat_cache,
+                tracked_paths,
+                entries,
             )?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
             })?;
             let git_path = git_path_bytes(relative)?;
+            if let Some(tracked_paths) = tracked_paths
+                && !tracked_paths.contains(&git_path)
+            {
+                continue;
+            }
             // git's racy-git stat shortcut: when the index's cached stat proves
             // this file is unchanged since it was staged, reuse the staged oid
             // and skip the read+filter+hash entirely. `reuse_tracked_entry`
@@ -5532,6 +5573,19 @@ fn collect_worktree_entries(
         }
     }
     Ok(())
+}
+
+fn tracked_paths_may_contain(tracked_paths: &BTreeSet<Vec<u8>>, directory: &[u8]) -> bool {
+    if tracked_paths.contains(directory) {
+        return true;
+    }
+    let mut prefix = Vec::with_capacity(directory.len() + 1);
+    prefix.extend_from_slice(directory);
+    prefix.push(b'/');
+    tracked_paths
+        .range(prefix.clone()..)
+        .next()
+        .is_some_and(|path| path.starts_with(&prefix))
 }
 
 fn is_same_path(left: &Path, right: &Path) -> bool {
@@ -5952,12 +6006,7 @@ mod tests {
             .entries
             .iter()
             .find(|entry| entry.path == path)
-            .unwrap_or_else(|| {
-                panic!(
-                    "missing index entry for {}",
-                    String::from_utf8_lossy(path)
-                )
-            })
+            .unwrap_or_else(|| panic!("missing index entry for {}", String::from_utf8_lossy(path)))
     }
 
     fn read_index(git_dir: &Path) -> Index {
@@ -6020,11 +6069,7 @@ mod tests {
         fs::write(root.join("in").join("keep.txt"), b"keep\n").unwrap();
         fs::write(root.join("out").join("drop.txt"), b"drop\n").unwrap();
         fs::write(root.join("top.txt"), b"top\n").unwrap();
-        build_commit(
-            &root,
-            &git_dir,
-            &["in/keep.txt", "out/drop.txt", "top.txt"],
-        );
+        build_commit(&root, &git_dir, &["in/keep.txt", "out/drop.txt", "top.txt"]);
 
         // Full (non-cone) pattern: keep only the `in/` subtree.
         let sparse = full_sparse(&[b"/in/"]);
@@ -6045,12 +6090,17 @@ mod tests {
         assert!(result.skipped.contains(&b"top.txt".to_vec()));
 
         let index = read_index(&git_dir);
-        assert!(!index_entry_skip_worktree(index_entry_for(&index, b"in/keep.txt")));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"in/keep.txt"
+        )));
         assert!(index_entry_skip_worktree(index_entry_for(
             &index,
             b"out/drop.txt"
         )));
-        assert!(index_entry_skip_worktree(index_entry_for(&index, b"top.txt")));
+        assert!(index_entry_skip_worktree(index_entry_for(
+            &index, b"top.txt"
+        )));
         // Out-of-cone entries are preserved in the index, just not on disk.
         assert_eq!(index.entries.len(), 3);
         fs::remove_dir_all(root).unwrap();
@@ -6096,10 +6146,7 @@ mod tests {
         .unwrap();
         assert!(!root.join("a").join("file.txt").exists());
         assert!(root.join("b").join("file.txt").exists());
-        assert_eq!(
-            fs::read(root.join("b").join("file.txt")).unwrap(),
-            b"b\n"
-        );
+        assert_eq!(fs::read(root.join("b").join("file.txt")).unwrap(), b"b\n");
         let index = read_index(&git_dir);
         assert!(index_entry_skip_worktree(index_entry_for(
             &index,
@@ -6126,21 +6173,12 @@ mod tests {
         build_commit(
             &root,
             &git_dir,
-            &[
-                "kept/a.txt",
-                "kept/nested/b.txt",
-                "other/c.txt",
-                "root.txt",
-            ],
+            &["kept/a.txt", "kept/nested/b.txt", "other/c.txt", "root.txt"],
         );
 
         // Standard cone patterns: top-level files plus the whole `kept/` tree.
         let sparse = SparseCheckout {
-            patterns: vec![
-                b"/*".to_vec(),
-                b"!/*/".to_vec(),
-                b"/kept/".to_vec(),
-            ],
+            patterns: vec![b"/*".to_vec(), b"!/*/".to_vec(), b"/kept/".to_vec()],
             sparse_index: false,
         };
         // Auto mode should detect cone shape on its own.
@@ -6153,7 +6191,10 @@ mod tests {
         assert!(!root.join("other").join("c.txt").exists());
 
         let index = read_index(&git_dir);
-        assert!(!index_entry_skip_worktree(index_entry_for(&index, b"root.txt")));
+        assert!(!index_entry_skip_worktree(index_entry_for(
+            &index,
+            b"root.txt"
+        )));
         assert!(!index_entry_skip_worktree(index_entry_for(
             &index,
             b"kept/a.txt"
@@ -6239,10 +6280,7 @@ mod tests {
         assert_eq!(result.files, 2);
 
         assert!(root.join("keep").join("a.txt").exists());
-        assert_eq!(
-            fs::read(root.join("keep").join("a.txt")).unwrap(),
-            b"a\n"
-        );
+        assert_eq!(fs::read(root.join("keep").join("a.txt")).unwrap(), b"a\n");
         assert!(!root.join("skip").join("b.txt").exists());
 
         let index = read_index(&git_dir);
@@ -6293,11 +6331,11 @@ mod tests {
         let config = config_from("[core]\n\tautocrlf = true\n");
         let checks: Vec<AttributeCheck> = Vec::new();
         let worktree = b"line1\r\nline2\r\n";
-        let blob = apply_clean_filter_with_attributes(&config, &checks, b"file.txt", worktree)
-            .unwrap();
+        let blob =
+            apply_clean_filter_with_attributes(&config, &checks, b"file.txt", worktree).unwrap();
         assert_eq!(blob, b"line1\nline2\n", "clean must normalize CRLF to LF");
-        let restored = apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob)
-            .unwrap();
+        let restored =
+            apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob).unwrap();
         assert_eq!(
             restored, worktree,
             "smudge must restore CRLF from the LF blob"
@@ -6309,13 +6347,15 @@ mod tests {
         // autocrlf=input: clean normalizes to LF, smudge leaves LF as-is.
         let config = config_from("[core]\n\tautocrlf = input\n");
         let checks: Vec<AttributeCheck> = Vec::new();
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"file.txt", b"a\r\nb\r\n")
-                .unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"file.txt", b"a\r\nb\r\n")
+            .unwrap();
         assert_eq!(blob, b"a\nb\n");
         let smudged =
             apply_smudge_filter_with_attributes(&config, &checks, b"file.txt", &blob).unwrap();
-        assert_eq!(smudged, b"a\nb\n", "input mode must not add carriage returns");
+        assert_eq!(
+            smudged, b"a\nb\n",
+            "input mode must not add carriage returns"
+        );
     }
 
     #[test]
@@ -6349,7 +6389,10 @@ mod tests {
         assert_eq!(blob, content, "binary file must not be CRLF-normalized");
         let smudged =
             apply_smudge_filter_with_attributes(&config, &checks, b"data.bin", &blob).unwrap();
-        assert_eq!(smudged, content, "binary file must not gain carriage returns");
+        assert_eq!(
+            smudged, content,
+            "binary file must not gain carriage returns"
+        );
     }
 
     #[test]
@@ -6358,8 +6401,7 @@ mod tests {
         let config = config_from("[core]\n\tautocrlf = true\n");
         let checks: Vec<AttributeCheck> = Vec::new();
         let content = b"a\r\n\x00b\r\n".to_vec();
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"f", &content).unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"f", &content).unwrap();
         assert_eq!(blob, content, "binary-looking content stays untouched");
     }
 
@@ -6434,16 +6476,14 @@ mod tests {
     fn driver_filter_clean_and_smudge_transform_both_directions() {
         // filter=case: clean upper-cases (worktree -> blob), smudge lower-cases
         // (blob -> worktree).
-        let config = config_from(
-            "[filter \"case\"]\n\tclean = tr a-z A-Z\n\tsmudge = tr A-Z a-z\n",
-        );
+        let config =
+            config_from("[filter \"case\"]\n\tclean = tr a-z A-Z\n\tsmudge = tr A-Z a-z\n");
         let checks = vec![AttributeCheck {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"case".to_vec())),
         }];
         let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"Hello World")
-                .unwrap();
+            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"Hello World").unwrap();
         assert_eq!(blob, b"HELLO WORLD", "clean driver must upper-case");
         let worktree =
             apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", b"HELLO WORLD")
@@ -6459,12 +6499,10 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).unwrap();
         fs::write(root.join(".gitattributes"), b"*.dat filter=rot\n").unwrap();
-        let config = config_from(
-            "[filter \"rot\"]\n\tclean = sed s/a/b/g\n\tsmudge = sed s/b/a/g\n",
-        );
+        let config =
+            config_from("[filter \"rot\"]\n\tclean = sed s/a/b/g\n\tsmudge = sed s/b/a/g\n");
         // Clean reads attributes from the live worktree `.gitattributes`.
-        let blob =
-            apply_clean_filter(&root, &git_dir, &config, b"x.dat", b"banana").unwrap();
+        let blob = apply_clean_filter(&root, &git_dir, &config, b"x.dat", b"banana").unwrap();
         assert_eq!(blob, b"bbnbnb");
         // Smudge reads attributes from the index (the worktree file may not
         // exist yet during checkout), so stage `.gitattributes` first.
@@ -6493,9 +6531,7 @@ mod tests {
     #[test]
     fn required_filter_failure_is_fatal() {
         // A required filter whose command fails must surface an error.
-        let config = config_from(
-            "[filter \"boom\"]\n\tclean = false\n\trequired = true\n",
-        );
+        let config = config_from("[filter \"boom\"]\n\tclean = false\n\trequired = true\n");
         let checks = vec![AttributeCheck {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"boom".to_vec())),
@@ -6508,9 +6544,7 @@ mod tests {
     #[test]
     fn required_filter_missing_command_is_fatal() {
         // required=true but no clean command for this direction is also fatal.
-        let config = config_from(
-            "[filter \"need\"]\n\tsmudge = cat\n\trequired = true\n",
-        );
+        let config = config_from("[filter \"need\"]\n\tsmudge = cat\n\trequired = true\n");
         let checks = vec![AttributeCheck {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"need".to_vec())),
@@ -6529,9 +6563,11 @@ mod tests {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"opt".to_vec())),
         }];
-        let out =
-            apply_clean_filter_with_attributes(&config, &checks, b"f", b"keepme").unwrap();
-        assert_eq!(out, b"keepme", "optional filter failure passes content through");
+        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"keepme").unwrap();
+        assert_eq!(
+            out, b"keepme",
+            "optional filter failure passes content through"
+        );
     }
 
     #[test]
@@ -6542,8 +6578,7 @@ mod tests {
             attribute: b"filter".to_vec(),
             state: Some(AttributeState::Value(b"ghost".to_vec())),
         }];
-        let out =
-            apply_clean_filter_with_attributes(&config, &checks, b"f", b"unchanged").unwrap();
+        let out = apply_clean_filter_with_attributes(&config, &checks, b"f", b"unchanged").unwrap();
         assert_eq!(out, b"unchanged");
     }
 
@@ -6564,13 +6599,15 @@ mod tests {
                 state: Some(AttributeState::Set),
             },
         ];
-        let blob =
-            apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"ab\r\ncd\r\n")
-                .unwrap();
+        let blob = apply_clean_filter_with_attributes(&config, &checks, b"f.txt", b"ab\r\ncd\r\n")
+            .unwrap();
         assert_eq!(blob, b"AB\nCD\n", "clean: upper-case then CRLF->LF");
         let worktree =
             apply_smudge_filter_with_attributes(&config, &checks, b"f.txt", &blob).unwrap();
-        assert_eq!(worktree, b"ab\r\ncd\r\n", "smudge: LF->CRLF then lower-case");
+        assert_eq!(
+            worktree, b"ab\r\ncd\r\n",
+            "smudge: LF->CRLF then lower-case"
+        );
     }
 
     #[test]
@@ -6578,11 +6615,15 @@ mod tests {
         let root = temp_root();
         fs::write(root.join(".gitattributes"), b"*.txt text\n*.bin -text\n").unwrap();
         let text = attrs(&root, b"a.txt");
-        assert!(text.iter().any(|c| c.attribute == b"text"
-            && c.state == Some(AttributeState::Set)));
+        assert!(
+            text.iter()
+                .any(|c| c.attribute == b"text" && c.state == Some(AttributeState::Set))
+        );
         let bin = attrs(&root, b"a.bin");
-        assert!(bin.iter().any(|c| c.attribute == b"text"
-            && c.state == Some(AttributeState::Unset)));
+        assert!(
+            bin.iter()
+                .any(|c| c.attribute == b"text" && c.state == Some(AttributeState::Unset))
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6592,8 +6633,7 @@ mod tests {
     /// is `oid` and its mode is `mode`.
     fn stat_cache_for(file: &Path, oid: ObjectId, mode: u32) -> (IndexStatCache, IndexEntry) {
         let metadata = fs::metadata(file).unwrap();
-        let mut entry =
-            index_entry_from_metadata(b"f.txt".to_vec(), oid, &metadata);
+        let mut entry = index_entry_from_metadata(b"f.txt".to_vec(), oid, &metadata);
         entry.mode = mode;
         let index_mtime = Some((u64::from(entry.mtime_seconds) + 10, 0));
         let mut entries = BTreeMap::new();
@@ -6668,12 +6708,13 @@ mod tests {
         );
 
         // Unknown index mtime is treated as racy -> hash.
-        let (mut unknown_cache, _) = stat_cache_for(&file, EncodedObject::new(
-            ObjectType::Blob,
-            b"hello\n".to_vec(),
-        )
-        .object_id(ObjectFormat::Sha1)
-        .unwrap(), real_mode);
+        let (mut unknown_cache, _) = stat_cache_for(
+            &file,
+            EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec())
+                .object_id(ObjectFormat::Sha1)
+                .unwrap(),
+            real_mode,
+        );
         unknown_cache.index_mtime = None;
         assert_eq!(
             unknown_cache.reuse_tracked_entry(b"f.txt", &metadata),
@@ -6697,7 +6738,10 @@ mod tests {
         fs::write(root.join("f.txt"), b"bbbb\n").unwrap();
         let status = short_status(&root, &git_dir, ObjectFormat::Sha1).unwrap();
         assert_eq!(
-            status.iter().map(ShortStatusEntry::line).collect::<Vec<_>>(),
+            status
+                .iter()
+                .map(ShortStatusEntry::line)
+                .collect::<Vec<_>>(),
             vec![" M f.txt"],
             "a same-length content change must be reported modified"
         );
@@ -6737,7 +6781,10 @@ mod tests {
         let mut index = read_index(&git_dir);
         let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40)).unwrap();
         let real_oid = index_entry_for(&index, b"f.txt").oid.clone();
-        assert_ne!(real_oid, bogus, "fixture oid should differ from the bogus oid");
+        assert_ne!(
+            real_oid, bogus,
+            "fixture oid should differ from the bogus oid"
+        );
         index
             .entries
             .iter_mut()

@@ -151,11 +151,11 @@ impl ShowOptions {
 pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let options = parse_show_args(args)?;
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let config = repo.config();
+    let db = repo.objects();
 
     // Ref decorations feed the `commit`/oneline header and the `%d`/`%D`
     // placeholders. `git show` leaves them off unless `--decorate` is given, but a
@@ -173,7 +173,7 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let decorations: HashMap<ObjectId, Vec<String>> = if decoration_mode == LogDecorationMode::Off {
         HashMap::new()
     } else {
-        log_decoration_map(&git_dir, &db, format, decoration_mode)?
+        log_decoration_map(git_dir, db, format, decoration_mode)?
     };
 
     let specs = if options.specs.is_empty() {
@@ -185,16 +185,16 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     let mut shown_one = false;
     let mut stdout = io::stdout();
     for spec in &specs {
-        let oid = match resolve_revision(&git_dir, format, spec) {
+        let oid = match repo.resolve_revision(spec) {
             Ok(oid) => oid,
             Err(_) => return show_unknown_revision(spec),
         };
         show_object(
             &mut stdout,
-            &git_dir,
-            &db,
+            git_dir,
+            db,
             format,
-            &config,
+            config,
             &options,
             &decorations,
             spec,

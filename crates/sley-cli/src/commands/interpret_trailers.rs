@@ -822,11 +822,7 @@ fn ignored_log_message_bytes(buf: &str, len: usize, comment_prefix: &str) -> usi
         bol = nl;
     }
     // `boc ? len - boc : len - cutoff` — note boc == 0 is the falsy branch.
-    if boc != 0 {
-        len - boc
-    } else {
-        len - cutoff
-    }
+    if boc != 0 { len - boc } else { len - cutoff }
 }
 
 // ---------------------------------------------------------------------------
@@ -978,14 +974,12 @@ fn separator_index(line: &str, separators: &[char]) -> Option<usize> {
 
 /// A raw line of the trailer block after continuation-merging, mirroring git's
 /// `trailer_block_get`: the first physical line plus any continuation lines that
-/// attached to it. `has_separator` records whether the *first* physical line had
-/// a valid separator (which is what git's `last` anchor tracks).
+/// attached to it.
 struct RawTrailerLine {
     /// The first physical line (newline stripped).
     head: String,
     /// Continuation lines (leading whitespace preserved, newline stripped).
     continuation: Vec<String>,
-    has_separator: bool,
 }
 
 /// Phase 1 (`trailer_block_get`): split the block into logical lines, attaching
@@ -1006,7 +1000,6 @@ fn split_block_lines(block: &str, separators: &[char]) -> Vec<RawTrailerLine> {
         lines.push(RawTrailerLine {
             head: text.to_string(),
             continuation: Vec::new(),
-            has_separator,
         });
         last_has_sep = has_separator;
     }

@@ -1,9 +1,9 @@
+use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use flate2::Compression;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
-use sley_object::{parse_framed_object, Commit, EncodedObject, ObjectType, Tag, Tree};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, parse_framed_object};
 use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
@@ -61,6 +61,12 @@ pub enum ObjectPrefixResolution {
     Missing,
     Unique(ObjectId),
     Ambiguous(Vec<ObjectId>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStorageInfo {
+    pub disk_size: u64,
+    pub deltabase: ObjectId,
 }
 
 impl RawPackInstaller for FileObjectDatabase {
@@ -381,23 +387,27 @@ pub fn install_repack_result(
     // Recompute the pack checksum from the written bytes rather than trusting
     // the caller-provided name; this keeps the on-disk file name canonical and
     // lets us re-derive the object set the new pack actually contains.
-    let parsed_pack = PackFile::parse(&result.pack, format)?;
+    let canonical_index = PackIndex::write_v2_for_pack(&result.pack, format)?;
     // Validate the caller-supplied index against the pack *before* writing anything
-    // or pruning. `install_repack_result` is public, so a bad `RepackResult` could
-    // otherwise leave the repo with a new pack whose only index is unparseable —
-    // and the old packs already deleted. A parse failure or checksum mismatch aborts
-    // with the repo untouched.
+    // or pruning. `install_repack_result` is public, so a stale or forged index with
+    // the right pack trailer but wrong oid/offset/CRC table must not become the only
+    // index readers can trust.
     let parsed_index = PackIndex::parse(&result.idx, format)?;
-    if parsed_index.pack_checksum != parsed_pack.checksum {
+    if parsed_index.pack_checksum != canonical_index.pack_checksum {
         return Err(GitError::InvalidFormat(
             "repack index checksum does not match the new pack".into(),
         ));
     }
-    let pack_name = format!("pack-{}", parsed_pack.checksum.to_hex());
+    if result.idx != canonical_index.index {
+        return Err(GitError::InvalidFormat(
+            "repack index does not match the new pack contents".into(),
+        ));
+    }
+    let pack_name = format!("pack-{}", canonical_index.pack_checksum.to_hex());
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
     write_pack_component(&new_pack_path, &result.pack)?;
-    write_pack_component(&new_index_path, &result.idx)?;
+    write_pack_component(&new_index_path, &canonical_index.index)?;
 
     if !prune {
         return Ok(());
@@ -406,7 +416,7 @@ pub fn install_repack_result(
     // Prune based on the objects the new pack's *index* can resolve (what reads use
     // once the old packs are gone), not just what the pack contains — so a stale
     // pack is never removed for an object the new index cannot serve.
-    let present: HashSet<ObjectId> = parsed_index
+    let present: HashSet<ObjectId> = canonical_index
         .entries
         .iter()
         .map(|entry| entry.oid.clone())
@@ -486,8 +496,8 @@ fn existing_pack_files(pack_dir: &Path) -> Result<Vec<PathBuf>> {
 }
 
 /// Remove pre-existing packs whose every object is contained in `present`,
-/// skipping `keep` (the pack just written). A stale multi-pack-index that only
-/// references removed packs is removed too.
+/// skipping `keep` (the pack just written), `.keep` packs, and `.promisor` packs.
+/// A stale multi-pack-index that references any removed pack is removed too.
 fn prune_packs_contained_in(
     objects_dir: &Path,
     format: ObjectFormat,
@@ -508,6 +518,11 @@ fn prune_packs_contained_in(
         if Some(stem) == keep_stem.as_deref() {
             continue;
         }
+        if pack_path.with_extension("keep").exists()
+            || pack_path.with_extension("promisor").exists()
+        {
+            continue;
+        }
         let index_path = pack_path.with_extension("idx");
         if !index_path.exists() {
             // Without an index we cannot prove containment; leave it alone.
@@ -521,11 +536,12 @@ fn prune_packs_contained_in(
         {
             continue;
         }
-        // Every object in this pack is safely in the new pack: remove the pack,
-        // its index, and any known sidecar files.
+        // Every object in this pack is safely in the new pack and it has no Git
+        // policy sidecar that says to keep it: remove the pack, its index, and
+        // cache sidecars derived from them.
         remove_file_if_exists(&pack_path)?;
         remove_file_if_exists(&index_path)?;
-        for ext in ["promisor", "keep", "rev", "mtimes", "bitmap"] {
+        for ext in ["rev", "mtimes", "bitmap"] {
             remove_file_if_exists(&pack_path.with_extension(ext))?;
         }
         removed_stems.insert(stem.to_string_lossy().into_owned());
@@ -585,6 +601,83 @@ where
     Ok(())
 }
 
+enum PackDeltaBase {
+    Offset(u64),
+    Ref(ObjectId),
+}
+
+fn pack_entry_delta_base(
+    format: ObjectFormat,
+    pack: &[u8],
+    entry_offset: u64,
+) -> Result<Option<PackDeltaBase>> {
+    let mut cursor = usize::try_from(entry_offset)
+        .map_err(|_| GitError::InvalidFormat("pack entry offset overflows usize".into()))?;
+    let first = pack_next_byte(pack, &mut cursor)?;
+    let kind = (first >> 4) & 0x07;
+    let mut byte = first;
+    while byte & 0x80 != 0 {
+        byte = pack_next_byte(pack, &mut cursor)?;
+    }
+    match kind {
+        6 => Ok(Some(PackDeltaBase::Offset(parse_ofs_delta_base_offset(
+            pack,
+            &mut cursor,
+            entry_offset,
+        )?))),
+        7 => Ok(Some(PackDeltaBase::Ref(parse_ref_delta_base_oid(
+            format,
+            pack,
+            &mut cursor,
+        )?))),
+        _ => Ok(None),
+    }
+}
+
+fn parse_ref_delta_base_oid(
+    format: ObjectFormat,
+    pack: &[u8],
+    cursor: &mut usize,
+) -> Result<ObjectId> {
+    let raw_len = format.raw_len();
+    if *cursor + raw_len > pack.len() {
+        return Err(GitError::InvalidFormat(
+            "truncated ref-delta base object id".into(),
+        ));
+    }
+    let oid = ObjectId::from_raw(format, &pack[*cursor..*cursor + raw_len])?;
+    *cursor += raw_len;
+    Ok(oid)
+}
+
+fn parse_ofs_delta_base_offset(pack: &[u8], cursor: &mut usize, entry_offset: u64) -> Result<u64> {
+    let mut byte = pack_next_byte(pack, cursor)?;
+    let mut relative = u64::from(byte & 0x7f);
+    while byte & 0x80 != 0 {
+        byte = pack_next_byte(pack, cursor)?;
+        relative = relative
+            .checked_add(1)
+            .and_then(|value| value.checked_shl(7))
+            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
+            .ok_or_else(|| GitError::InvalidFormat("ofs-delta offset overflow".into()))?;
+    }
+    entry_offset
+        .checked_sub(relative)
+        .ok_or_else(|| GitError::InvalidFormat("ofs-delta points before pack start".into()))
+}
+
+fn pack_next_byte(pack: &[u8], cursor: &mut usize) -> Result<u8> {
+    let Some(byte) = pack.get(*cursor).copied() else {
+        return Err(GitError::InvalidFormat("truncated pack entry".into()));
+    };
+    *cursor += 1;
+    Ok(byte)
+}
+
+fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
+    ObjectId::from_raw(format, &vec![0; format.raw_len()])
+}
+
 /// Remove `path` if it exists, treating a missing file as success.
 fn remove_file_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
@@ -625,6 +718,9 @@ where
             let tree = Tree::parse(format, &object.body)?;
             objects.push(object);
             for entry in tree.entries {
+                if entry.is_gitlink() {
+                    continue;
+                }
                 collect_reachable_object(reader, format, entry.oid, excluded, seen, objects)?;
             }
         }
@@ -794,8 +890,9 @@ fn cache_budget_from_env(var: &str, default: usize) -> usize {
 /// that re-reading the variable each time showed up as per-object overhead.
 fn object_cache_budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
-    *BUDGET
-        .get_or_init(|| cache_budget_from_env("SLEY_OBJECT_CACHE_BYTES", DEFAULT_OBJECT_CACHE_BYTES))
+    *BUDGET.get_or_init(|| {
+        cache_budget_from_env("SLEY_OBJECT_CACHE_BYTES", DEFAULT_OBJECT_CACHE_BYTES)
+    })
 }
 
 /// Approximate byte budget for each per-pack delta-base cache (see
@@ -804,7 +901,10 @@ fn object_cache_budget() -> usize {
 fn delta_base_cache_budget() -> usize {
     static BUDGET: OnceLock<usize> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        cache_budget_from_env("SLEY_DELTA_BASE_CACHE_BYTES", DEFAULT_DELTA_BASE_CACHE_BYTES)
+        cache_budget_from_env(
+            "SLEY_DELTA_BASE_CACHE_BYTES",
+            DEFAULT_DELTA_BASE_CACHE_BYTES,
+        )
     })
 }
 
@@ -939,6 +1039,11 @@ impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
 /// each read.
 type PackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<PackIndex>>>>;
 
+/// Parsed multi-pack-index files keyed by path, shared across cloned handles.
+/// Caches the MIDX parse so object lookups in repositories with a MIDX avoid
+/// reparsing the same fanout/object tables for every read.
+type MultiPackIndexCache = Arc<Mutex<HashMap<PathBuf, Arc<MultiPackIndex>>>>;
+
 /// A `.idx`/`.pack` pair discovered in a pack directory.
 #[derive(Debug, Clone)]
 struct DiscoveredPack {
@@ -962,6 +1067,7 @@ pub struct FileObjectDatabase {
     format: ObjectFormat,
     pack_bytes: PackBytesCache,
     pack_indexes: PackIndexCache,
+    multi_pack_indexes: MultiPackIndexCache,
     pack_listing: PackListingCache,
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
@@ -995,7 +1101,7 @@ pub fn repository_object_ids(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
 ) -> Result<Vec<ObjectId>> {
-    object_ids_in_objects_dir(&repository_objects_dir(git_dir), format)
+    object_ids_in_objects_dir(repository_objects_dir(git_dir), format)
 }
 
 pub fn object_ids_in_objects_dir(
@@ -1084,6 +1190,7 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
@@ -1099,6 +1206,7 @@ impl FileObjectDatabase {
             format,
             pack_bytes: Arc::new(Mutex::new(HashMap::new())),
             pack_indexes: Arc::new(Mutex::new(HashMap::new())),
+            multi_pack_indexes: Arc::new(Mutex::new(HashMap::new())),
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
@@ -1139,11 +1247,18 @@ impl FileObjectDatabase {
                 )));
             }
         }
-        let parsed_pack = PackFile::parse(&pack.pack, self.format)?;
+        let canonical_index = PackIndex::write_v2_for_pack(&pack.pack, self.format)?;
         let parsed_index = PackIndex::parse(&pack.index, self.format)?;
-        if parsed_pack.checksum != pack.checksum || parsed_index.pack_checksum != pack.checksum {
+        if canonical_index.pack_checksum != pack.checksum
+            || parsed_index.pack_checksum != pack.checksum
+        {
             return Err(GitError::InvalidFormat(
                 "pack and index checksums do not match pack write".into(),
+            ));
+        }
+        if pack.index != canonical_index.index {
+            return Err(GitError::InvalidFormat(
+                "pack index does not match pack contents".into(),
             ));
         }
 
@@ -1162,7 +1277,11 @@ impl FileObjectDatabase {
             pack_path,
             index_path,
             promisor_path,
-            object_ids: pack.entries.iter().map(|entry| entry.oid.clone()).collect(),
+            object_ids: canonical_index
+                .entries
+                .iter()
+                .map(|entry| entry.oid.clone())
+                .collect(),
         })
     }
 
@@ -1226,6 +1345,26 @@ impl FileObjectDatabase {
         Ok(oids)
     }
 
+    pub fn object_storage_info(&self, oid: &ObjectId) -> Result<Option<ObjectStorageInfo>> {
+        if let Some(disk_size) = self.loose.disk_size(oid)? {
+            return Ok(Some(ObjectStorageInfo {
+                disk_size,
+                deltabase: zero_oid(self.format)?,
+            }));
+        }
+        if let Some(info) = self.packed_object_storage_info(oid)? {
+            return Ok(Some(info));
+        }
+        for alternate in &self.alternates {
+            if let Some(info) =
+                Self::without_alternates(alternate, self.format).object_storage_info(oid)?
+            {
+                return Ok(Some(info));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn resolve_prefix(&self, prefix: &str) -> Result<ObjectPrefixResolution> {
         validate_object_id_prefix(self.format, prefix)?;
         let mut matches = Vec::new();
@@ -1251,22 +1390,21 @@ impl FileObjectDatabase {
     /// stays cheap on huge blobs and deep delta chains. It does not populate the
     /// decoded-object cache (nothing is decoded).
     pub fn read_object_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
-        if let Ok(mut cache) = self.decoded.lock() {
-            if let Some(object) = cache.get(oid) {
-                return Ok(Some((object.object_type, object.body.len() as u64)));
-            }
+        if let Ok(mut cache) = self.decoded.lock()
+            && let Some(object) = cache.get(oid)
+        {
+            return Ok(Some((object.object_type, object.body.len() as u64)));
         }
         if let Some(header) = self.loose.read_header(oid)? {
             return Ok(Some(header));
         }
         if let Some(pack_paths) = self.find_pack_containing(oid)? {
             let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
-            let header = sley_pack::read_object_header_at(
-                &bytes,
-                pack_paths.offset,
-                self.format,
-                |base| self.read_object_header(base).ok().flatten().map(|(t, _)| t),
-            )?;
+            let header =
+                sley_pack::read_object_header_at(&bytes, pack_paths.offset, self.format, |base| {
+                    self.read_object_header(base)
+                        .map(|header| header.map(|(t, _)| t))
+                })?;
             return Ok(Some(header));
         }
         for alternate in &self.alternates {
@@ -1282,10 +1420,10 @@ impl FileObjectDatabase {
     fn read_packed_object(&self, oid: &ObjectId) -> Result<Option<EncodedObject>> {
         // Memory-capped decoded-object cache first (delta-base reuse for ref-delta
         // bases that resolve back through the store + repeated whole-object reads).
-        if let Ok(mut cache) = self.decoded.lock() {
-            if let Some(object) = cache.get(oid) {
-                return Ok(Some(object));
-            }
+        if let Ok(mut cache) = self.decoded.lock()
+            && let Some(object) = cache.get(oid)
+        {
+            return Ok(Some(object));
         }
         let Some(pack_paths) = self.find_pack_containing(oid)? else {
             return Ok(None);
@@ -1302,7 +1440,7 @@ impl FileObjectDatabase {
         // reuses the decoded-object cache. No cache lock is held across the decode,
         // so the recursive resolver re-entry (which may re-enter read_object) is
         // safe.
-        let resolve_ref_base = |base: &ObjectId| self.read_object(base).ok();
+        let resolve_ref_base = |base: &ObjectId| self.read_object(base).map(Some);
         let object = match &delta_adapter {
             Some(adapter) => sley_pack::read_object_at_with_cache(
                 &bytes,
@@ -1348,10 +1486,10 @@ impl FileObjectDatabase {
     /// otherwise read into the heap. On a poisoned lock it falls back to loading
     /// without caching, preserving correctness.
     fn cached_pack_bytes(&self, pack_path: &Path) -> Result<Arc<PackData>> {
-        if let Ok(cache) = self.pack_bytes.lock() {
-            if let Some(bytes) = cache.get(pack_path) {
-                return Ok(Arc::clone(bytes));
-            }
+        if let Ok(cache) = self.pack_bytes.lock()
+            && let Some(bytes) = cache.get(pack_path)
+        {
+            return Ok(Arc::clone(bytes));
         }
         let bytes = Arc::new(load_pack_data(pack_path)?);
         if let Ok(mut cache) = self.pack_bytes.lock() {
@@ -1364,16 +1502,35 @@ impl FileObjectDatabase {
     /// database handle. On a poisoned lock it falls back to parsing without
     /// caching, preserving correctness.
     fn cached_pack_index(&self, index_path: &Path) -> Result<Arc<PackIndex>> {
-        if let Ok(cache) = self.pack_indexes.lock() {
-            if let Some(index) = cache.get(index_path) {
-                return Ok(Arc::clone(index));
-            }
+        if let Ok(cache) = self.pack_indexes.lock()
+            && let Some(index) = cache.get(index_path)
+        {
+            return Ok(Arc::clone(index));
         }
         let index = Arc::new(PackIndex::parse(&fs::read(index_path)?, self.format)?);
         if let Ok(mut cache) = self.pack_indexes.lock() {
             cache.insert(index_path.to_path_buf(), Arc::clone(&index));
         }
         Ok(index)
+    }
+
+    /// Parsed multi-pack-index at `midx_path`, parsed at most once per database
+    /// handle. Returns `Ok(None)` when no MIDX exists. On a poisoned lock it
+    /// falls back to parsing without caching, preserving correctness.
+    fn cached_multi_pack_index(&self, midx_path: &Path) -> Result<Option<Arc<MultiPackIndex>>> {
+        if !midx_path.exists() {
+            return Ok(None);
+        }
+        if let Ok(cache) = self.multi_pack_indexes.lock()
+            && let Some(midx) = cache.get(midx_path)
+        {
+            return Ok(Some(Arc::clone(midx)));
+        }
+        let midx = Arc::new(MultiPackIndex::parse(&fs::read(midx_path)?, self.format)?);
+        if let Ok(mut cache) = self.multi_pack_indexes.lock() {
+            cache.insert(midx_path.to_path_buf(), Arc::clone(&midx));
+        }
+        Ok(Some(midx))
     }
 
     /// The discovered `.idx`/`.pack` pairs in `pack_dir`, cached and shared across
@@ -1458,16 +1615,62 @@ impl FileObjectDatabase {
         self.find_in_pack_listing(&refreshed, oid)
     }
 
+    fn packed_object_storage_info(&self, oid: &ObjectId) -> Result<Option<ObjectStorageInfo>> {
+        let Some(pack_paths) = self.find_pack_containing(oid)? else {
+            return Ok(None);
+        };
+        let pack_len = fs::metadata(&pack_paths.pack)?.len();
+        let trailer_offset = pack_len
+            .checked_sub(self.format.raw_len() as u64)
+            .ok_or_else(|| GitError::InvalidFormat("pack file shorter than checksum".into()))?;
+        let index_path = pack_paths.pack.with_extension("idx");
+        let index = self.cached_pack_index(&index_path)?;
+        let mut offset_entries = index.entries.iter().collect::<Vec<_>>();
+        offset_entries.sort_by_key(|entry| entry.offset);
+        let Some(position) = offset_entries
+            .iter()
+            .position(|entry| entry.offset == pack_paths.offset)
+        else {
+            return Err(GitError::InvalidFormat(format!(
+                "pack index offset {} not found",
+                pack_paths.offset
+            )));
+        };
+        let end_offset = offset_entries
+            .get(position + 1)
+            .map(|entry| entry.offset)
+            .unwrap_or(trailer_offset);
+        let disk_size = end_offset
+            .checked_sub(pack_paths.offset)
+            .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
+        let pack = self.cached_pack_bytes(&pack_paths.pack)?;
+        let delta_base = pack_entry_delta_base(self.format, &pack, pack_paths.offset)?;
+        let deltabase = match delta_base {
+            Some(PackDeltaBase::Offset(offset)) => offset_entries
+                .iter()
+                .find(|entry| entry.offset == offset)
+                .map(|entry| entry.oid.clone())
+                .ok_or_else(|| {
+                    GitError::InvalidFormat(format!("ofs-delta base offset {offset} not found"))
+                })?,
+            Some(PackDeltaBase::Ref(oid)) => oid,
+            None => zero_oid(self.format)?,
+        };
+        Ok(Some(ObjectStorageInfo {
+            disk_size,
+            deltabase,
+        }))
+    }
+
     fn find_midx_pack_containing(
         &self,
         pack_dir: &Path,
         oid: &ObjectId,
     ) -> Result<Option<PackPaths>> {
         let midx_path = pack_dir.join("multi-pack-index");
-        if !midx_path.exists() {
+        let Some(midx) = self.cached_multi_pack_index(&midx_path)? else {
             return Ok(None);
-        }
-        let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, self.format)?;
+        };
         let Some(entry) = midx.find(oid) else {
             return Ok(None);
         };
@@ -1590,7 +1793,7 @@ impl ObjectReader for FileObjectDatabase {
     fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
         match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
-            Err(GitError::Io(_)) | Err(GitError::NotFound(_)) => {}
+            Err(GitError::NotFound(_)) => {}
             Err(err) => return Err(err),
         }
         if let Some(object) = self.read_packed_object(oid)? {
@@ -1599,7 +1802,7 @@ impl ObjectReader for FileObjectDatabase {
         for alternate in &self.alternates {
             match Self::without_alternates(alternate, self.format).read_object(oid) {
                 Ok(object) => return Ok(object),
-                Err(GitError::Io(_)) | Err(GitError::NotFound(_)) => {}
+                Err(GitError::NotFound(_)) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -1699,17 +1902,26 @@ impl LooseObjectStore {
         Ok(self.object_path(oid)?.exists())
     }
 
+    pub fn disk_size(&self, oid: &ObjectId) -> Result<Option<u64>> {
+        match fs::metadata(self.object_path(oid)?) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(err) => Err(GitError::Io(err.to_string())),
+        }
+    }
+
     /// The object type and content size of `oid` from loose storage, inflating only
     /// the framing header (`"<type> <size>\0"`) and not the body. Output-limited
     /// reads keep miniz from inflating past the header even for large objects.
     /// Returns `Ok(None)` when the loose object is absent.
     pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         let path = self.object_path(oid)?;
-        if !path.exists() {
-            return Ok(None);
-        }
-        let compressed = fs::read(&path)?;
-        let mut decoder = ZlibDecoder::new(compressed.as_slice());
+        let file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        };
+        let mut decoder = ZlibDecoder::new(file);
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
         loop {
@@ -1728,8 +1940,8 @@ impl LooseObjectStore {
                 )));
             }
         }
-        let header = std::str::from_utf8(&header)
-            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+        let header =
+            std::str::from_utf8(&header).map_err(|err| GitError::InvalidObject(err.to_string()))?;
         let (kind, size) = header
             .split_once(' ')
             .ok_or_else(|| GitError::InvalidObject("missing object size".into()))?;
@@ -1744,10 +1956,13 @@ impl LooseObjectStore {
 impl ObjectReader for LooseObjectStore {
     fn read_object(&self, oid: &ObjectId) -> Result<EncodedObject> {
         let path = self.object_path(oid)?;
-        if !path.exists() {
-            return Err(GitError::NotFound(format!("object {oid}")));
-        }
-        let compressed = fs::read(&path)?;
+        let compressed = match fs::read(&path) {
+            Ok(compressed) => compressed,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(GitError::NotFound(format!("object {oid}")));
+            }
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();
         decoder.read_to_end(&mut framed)?;
@@ -1952,7 +2167,8 @@ mod tests {
         let mut child_body = vec![b'a'; 4096];
         child_body.extend_from_slice(b" plus a deltified tail\n");
         let child = EncodedObject::new(ObjectType::Blob, child_body);
-        let commitish = EncodedObject::new(ObjectType::Commit, b"header-only type probe\n".to_vec());
+        let commitish =
+            EncodedObject::new(ObjectType::Commit, b"header-only type probe\n".to_vec());
         let base_oid = base.object_id(format).unwrap();
         let child_oid = child.object_id(format).unwrap();
         let commit_oid = commitish.object_id(format).unwrap();
@@ -1987,6 +2203,51 @@ mod tests {
         let missing =
             ObjectId::from_hex(format, "0000000000000000000000000000000000000001").unwrap();
         assert_eq!(db.read_object_header(&missing).unwrap(), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn object_storage_info_reports_loose_packed_and_delta_metadata() {
+        let root = temp_root("sley-object-storage-info");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let loose = EncodedObject::new(ObjectType::Blob, b"loose storage object\n".to_vec());
+        let loose_oid = db.write_object(loose).unwrap();
+        let loose_size = fs::metadata(db.loose().object_path(&loose_oid).unwrap())
+            .unwrap()
+            .len();
+        let loose_info = db.object_storage_info(&loose_oid).unwrap().unwrap();
+        assert_eq!(loose_info.disk_size, loose_size);
+        assert_eq!(loose_info.deltabase, zero_oid(format).unwrap());
+
+        let base = EncodedObject::new(ObjectType::Blob, vec![b'a'; 4096]);
+        let mut child_body = vec![b'a'; 4096];
+        child_body.extend_from_slice(b" changed tail\n");
+        let child = EncodedObject::new(ObjectType::Blob, child_body);
+        let base_oid = base.object_id(format).unwrap();
+        let child_oid = child.object_id(format).unwrap();
+        let pack = PackFile::write_with_delta_strategy(
+            &[base, child],
+            format,
+            sley_pack::DeltaStrategy::OfsDelta,
+        )
+        .unwrap();
+        db.install_pack(&pack).unwrap();
+
+        let base_info = db.object_storage_info(&base_oid).unwrap().unwrap();
+        assert!(base_info.disk_size > 0);
+        assert_eq!(base_info.deltabase, zero_oid(format).unwrap());
+
+        let child_info = db.object_storage_info(&child_oid).unwrap().unwrap();
+        assert!(child_info.disk_size > 0);
+        assert_eq!(child_info.deltabase, base_oid);
+
+        let missing =
+            ObjectId::from_hex(format, "0000000000000000000000000000000000000001").unwrap();
+        assert_eq!(db.object_storage_info(&missing).unwrap(), None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2147,6 +2408,25 @@ mod tests {
         assert!(!db.loose().object_path(&oid).unwrap().exists());
         assert!(db.contains(&oid).unwrap());
         assert_eq!(db.read_object(&oid).unwrap(), object);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn file_database_rejects_noncanonical_pack_index() {
+        let root = temp_root("sley-file-odb-install-bad-index");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let object = EncodedObject::new(ObjectType::Blob, b"bad index crc\n".to_vec());
+        let pack =
+            PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha1).unwrap();
+        let mut entries = pack.entries.clone();
+        entries[0].crc32 ^= 1;
+        let mut bad_pack = pack.clone();
+        bad_pack.index = PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack.checksum).unwrap();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+
+        assert!(db.install_pack(&bad_pack).is_err());
+
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2332,14 +2612,16 @@ mod tests {
         assert_eq!(pack.entries[0].oid, oid.clone());
 
         let excluded = HashSet::from([oid]);
-        assert!(build_reachable_pack(
-            &db,
-            format,
-            pack.entries.into_iter().map(|entry| entry.oid),
-            &excluded
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            build_reachable_pack(
+                &db,
+                format,
+                pack.entries.into_iter().map(|entry| entry.oid),
+                &excluded
+            )
+            .unwrap()
+            .is_none()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2724,7 +3006,6 @@ mod tests {
     /// ids and their canonical encodings as `(oid, object)` pairs.
     fn write_commit_graph(
         db: &mut FileObjectDatabase,
-        format: ObjectFormat,
         payload: &[u8],
     ) -> Vec<(ObjectId, EncodedObject)> {
         let blob = EncodedObject::new(ObjectType::Blob, payload.to_vec());
@@ -2771,7 +3052,7 @@ mod tests {
             PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
         let existing = db.install_pack(&existing_pack).unwrap();
 
-        let graph = write_commit_graph(&mut db, format, b"repack payload\n");
+        let graph = write_commit_graph(&mut db, b"repack payload\n");
 
         let mut expected: HashMap<ObjectId, EncodedObject> = graph.iter().cloned().collect();
         expected.insert(packed_oid.clone(), packed_blob.clone());
@@ -2823,9 +3104,11 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).unwrap();
 
-        assert!(repack_all_objects(&git_dir, ObjectFormat::Sha1)
-            .unwrap()
-            .is_none());
+        assert!(
+            repack_all_objects(&git_dir, ObjectFormat::Sha1)
+                .unwrap()
+                .is_none()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2837,7 +3120,7 @@ mod tests {
         fs::create_dir_all(git_dir.join("objects")).unwrap();
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let graph = write_commit_graph(&mut db, format, b"install no prune\n");
+        let graph = write_commit_graph(&mut db, b"install no prune\n");
 
         let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
         install_repack_result(&git_dir, format, &result, false).unwrap();
@@ -2870,7 +3153,7 @@ mod tests {
         let existing_pack =
             PackFile::write_undeltified(std::slice::from_ref(&packed_blob), format).unwrap();
         let existing = db.install_pack(&existing_pack).unwrap();
-        let graph = write_commit_graph(&mut db, format, b"prune payload\n");
+        let graph = write_commit_graph(&mut db, b"prune payload\n");
 
         let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
         let new_pack_checksum = PackFile::parse(&result.pack, format).unwrap().checksum;
@@ -2885,9 +3168,11 @@ mod tests {
         }
         // The new consolidated pack remains and still serves every object.
         let pack_dir = git_dir.join("objects").join("pack");
-        assert!(pack_dir
-            .join(format!("pack-{}.pack", new_pack_checksum.to_hex()))
-            .exists());
+        assert!(
+            pack_dir
+                .join(format!("pack-{}.pack", new_pack_checksum.to_hex()))
+                .exists()
+        );
         let reopened = FileObjectDatabase::from_git_dir(&git_dir, format);
         for (oid, object) in &graph {
             assert!(reopened.contains(oid).unwrap());
@@ -2895,6 +3180,56 @@ mod tests {
         }
         let packed_oid = packed_blob.object_id(format).unwrap();
         assert_eq!(reopened.read_object(&packed_oid).unwrap(), packed_blob);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn install_repack_result_preserves_keep_and_promisor_packs() {
+        let root = temp_root("sley-repack-install-keep-promisor");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let keep_blob = EncodedObject::new(ObjectType::Blob, b"keep protected\n".to_vec());
+        let keep_pack =
+            PackFile::write_undeltified(std::slice::from_ref(&keep_blob), format).unwrap();
+        let keep_install = db.install_pack(&keep_pack).unwrap();
+        let keep_sidecar = keep_install.pack_path.with_extension("keep");
+        fs::write(&keep_sidecar, b"").unwrap();
+
+        let promisor_blob = EncodedObject::new(ObjectType::Blob, b"promisor protected\n".to_vec());
+        let promisor_pack =
+            PackFile::write_undeltified(std::slice::from_ref(&promisor_blob), format).unwrap();
+        let promisor_install = db
+            .install_pack_with_options(&promisor_pack, RawPackInstallOptions { promisor: true })
+            .unwrap();
+        let promisor_sidecar = promisor_install
+            .promisor_path
+            .clone()
+            .expect("promisor sidecar");
+
+        let graph = write_commit_graph(&mut db, b"new consolidated payload\n");
+        let result = repack_all_objects(&git_dir, format).unwrap().unwrap();
+        assert!(result.obsolete_packs.contains(&keep_install.pack_path));
+        assert!(result.obsolete_packs.contains(&promisor_install.pack_path));
+
+        install_repack_result(&git_dir, format, &result, true).unwrap();
+
+        for path in [
+            &keep_install.pack_path,
+            &keep_install.index_path,
+            &keep_sidecar,
+            &promisor_install.pack_path,
+            &promisor_install.index_path,
+            &promisor_sidecar,
+        ] {
+            assert!(path.exists(), "{} should be preserved", path.display());
+        }
+        for (oid, _) in &graph {
+            assert!(!db.loose().object_path(oid).unwrap().exists());
+        }
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -2908,7 +3243,7 @@ mod tests {
         fs::create_dir_all(git_dir.join("objects")).unwrap();
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let graph = write_commit_graph(&mut db, format, b"safety packed\n");
+        let graph = write_commit_graph(&mut db, b"safety packed\n");
 
         let mut result = repack_all_objects(&git_dir, format).unwrap().unwrap();
 
@@ -2938,7 +3273,7 @@ mod tests {
         fs::create_dir_all(git_dir.join("objects")).unwrap();
         let format = ObjectFormat::Sha1;
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let graph = write_commit_graph(&mut db, format, b"reachable payload\n");
+        let graph = write_commit_graph(&mut db, b"reachable payload\n");
         let commit_oid = graph[0].0.clone();
 
         // A dangling loose blob not referenced by the commit graph.
@@ -2960,6 +3295,53 @@ mod tests {
             assert!(db.loose().object_path(oid).unwrap().exists());
             assert_eq!(db.read_object(oid).unwrap(), *object);
         }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prune_unreachable_loose_ignores_gitlink_targets() {
+        let root = temp_root("sley-prune-gitlink");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        let format = ObjectFormat::Sha1;
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+
+        let submodule_oid =
+            ObjectId::from_hex(format, "1111111111111111111111111111111111111111").unwrap();
+        let tree = EncodedObject::new(
+            ObjectType::Tree,
+            Tree {
+                entries: vec![TreeEntry {
+                    mode: 0o160000,
+                    name: b"submodule".to_vec(),
+                    oid: submodule_oid,
+                }],
+            }
+            .write(),
+        );
+        let tree_oid = db.write_object(tree).unwrap();
+        let identity = b"Example <example@example.invalid> 0 +0000".to_vec();
+        let commit = EncodedObject::new(
+            ObjectType::Commit,
+            Commit {
+                tree: tree_oid,
+                parents: Vec::new(),
+                author: identity.clone(),
+                committer: identity,
+                encoding: None,
+                message: b"gitlink\n".to_vec(),
+            }
+            .write(),
+        );
+        let commit_oid = db.write_object(commit).unwrap();
+        let dangling = EncodedObject::new(ObjectType::Blob, b"dangling with gitlink\n".to_vec());
+        let dangling_oid = db.write_object(dangling).unwrap();
+
+        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid], true).unwrap();
+
+        assert_eq!(deleted, vec![dangling_oid.clone()]);
+        assert!(!db.loose().object_path(&dangling_oid).unwrap().exists());
 
         fs::remove_dir_all(root).unwrap();
     }

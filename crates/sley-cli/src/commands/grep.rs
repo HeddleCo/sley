@@ -6,8 +6,8 @@
 //! and the common reporting flags (`-n`, `-l`, `-c`, `-i`, `-w`, `-v`, `-F`, ...).
 //!
 //! As with the other extracted commands, a glob of the crate root pulls in the
-//! shared plumbing (`discover_git_dir`, `repository_object_format`,
-//! `resolve_revision`, `worktree_root_for_git_dir`, `FileObjectDatabase`, ...);
+//! shared plumbing (`RepositoryContext`, `worktree_root_for_git_dir`,
+//! `FileObjectDatabase`, ...);
 //! see `commands::stash` for the rationale.
 
 use crate::*;
@@ -182,9 +182,11 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         opts.patterns.push(positionals.remove(0));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     // Disambiguate remaining positionals into revs and pathspecs: each leading
     // positional that resolves to an object is a rev; the first one that does
@@ -196,7 +198,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 opts.pathspecs.push(value);
                 continue;
             }
-            match resolve_revision(&git_dir, format, &value) {
+            match repo.resolve_revision(&value) {
                 Ok(_) => opts.revs.push(value),
                 Err(_) => {
                     in_paths = true;
@@ -216,7 +218,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     // The cwd-relative prefix limits and renders results in every mode (working
     // tree, index, and tree-ish). Searching a tree-ish in a bare repository has
     // no worktree, so derive it best-effort and fall back to an empty prefix.
-    let worktree_root = match worktree_root_for_git_dir(&git_dir) {
+    let worktree_root = match worktree_root_for_git_dir(git_dir) {
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
@@ -234,21 +236,21 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             return Err(GitError::Command("grep: missing worktree".into()));
         };
         any_match = grep_index_source(
-            &git_dir,
+            git_dir,
             worktree_root,
             format,
+            db,
             &matcher,
             &opts,
             &pathspec,
             &mut out,
         )?;
     } else {
-        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
         for rev in &opts.revs {
-            let oid = resolve_revision(&git_dir, format, rev)?;
-            let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
+            let oid = repo.resolve_revision(rev)?;
+            let tree_oid = sley_rev::peel_to_tree(db, format, &oid)?;
             let matched = grep_tree_source(
-                &db, format, &tree_oid, rev, &matcher, &opts, &pathspec, &mut out,
+                db, format, &tree_oid, rev, &matcher, &opts, &pathspec, &mut out,
             )?;
             any_match = any_match || matched;
         }
@@ -335,6 +337,7 @@ fn grep_index_source(
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     matcher: &GrepMatcher,
     opts: &GrepOptions,
     pathspec: &GrepPathspec,
@@ -343,7 +346,6 @@ fn grep_index_source(
     let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
         return Ok(false);
     };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let mut any = false;
     for entry in &index.entries {
         // Skip the higher merge stages; grep reports each path once.

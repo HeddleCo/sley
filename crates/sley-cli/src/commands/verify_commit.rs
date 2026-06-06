@@ -27,10 +27,9 @@
 //! follows the same glob-import + private-helper structure as the other
 //! self-contained command modules (`commands::branch`, `commands::stash`).
 
-// Glob the crate root for shared plumbing (discover_git_dir,
-// repository_object_format, resolve_revision, FileObjectDatabase, the
-// ObjectReader trait, ObjectType, Commit, GitError, io, etc.); see
-// commands::stash for the rationale behind the wildcard import.
+// Glob the crate root for shared plumbing (RepositoryContext, the ObjectReader
+// trait, ObjectType, Commit, GitError, io, etc.); see commands::stash for the
+// rationale behind the wildcard import.
 use crate::*;
 
 /// Entry point for `git verify-commit`.
@@ -51,16 +50,14 @@ pub(crate) fn cmd_verify_commit(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
 
     // git verifies every argument and only then reports overall failure, so a bad
     // early argument never short-circuits a later one. Accumulate failures and map
     // them to a single exit-1 at the end.
     let mut failed = false;
     for commit in &options.commits {
-        if !verify_one_commit(&git_dir, format, &db, commit, &options)? {
+        if !verify_one_commit(&repo, commit, &options)? {
             failed = true;
         }
     }
@@ -144,15 +141,13 @@ fn parse_verify_commit_args(args: &[String]) -> Result<VerifyCommitInvocation> {
 /// real signatures) and `Ok(false)` for every git-reported failure so the caller
 /// can aggregate the exit code.
 fn verify_one_commit(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    repo: &RepositoryContext,
     commit: &str,
     options: &VerifyCommitOptions,
 ) -> Result<bool> {
     // git resolves the argument without peeling annotated tags: an annotated tag
     // surfaces as a non-commit object below, matching real `verify-commit`.
-    let oid = match resolve_revision(git_dir, format, commit) {
+    let oid = match repo.resolve_revision(commit) {
         Ok(oid) => oid,
         Err(
             GitError::NotFound(_)
@@ -174,7 +169,7 @@ fn verify_one_commit(
     // file" (echoing the argument as given), versus "not found" above. Any other
     // read error (corruption) is reported the same way, matching git's
     // parse-object failure path. Processing continues so every operand is tried.
-    let object = match db.read_object(&oid) {
+    let object = match repo.objects().read_object(&oid) {
         Ok(object) => object,
         Err(_) => {
             eprintln!("error: {commit}: unable to read file.");

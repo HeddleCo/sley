@@ -131,15 +131,16 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     // Resolve the effective abbreviation length once: an unset/`--abbrev`
     // sentinel falls back to the repository's `core.abbrev` (default 7).
-    let abbrev = resolve_describe_abbrev(&git_dir, format, options.abbrev)?;
+    let abbrev = resolve_describe_abbrev(git_dir, format, options.abbrev)?;
 
-    let tags = collect_describe_tags(&git_dir, format, &db, &options)?;
+    let tags = collect_describe_tags(git_dir, format, db, &options)?;
 
     // git refuses to resolve any commit-ish when the (filtered) ref universe is
     // empty and there is no `--always` fallback, reporting that no names exist
@@ -152,11 +153,11 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
     }
 
     if commits.is_empty() {
-        let dirty_suffix = describe_dirty_suffix(&git_dir, format, &options)?;
-        let head = resolve_describe_commit(&git_dir, format, &db, "HEAD")?;
+        let dirty_suffix = describe_dirty_suffix(git_dir, format, &options)?;
+        let head = resolve_describe_commit(&repo, "HEAD")?;
         describe_one(
             format,
-            &db,
+            db,
             &options,
             abbrev,
             &tags,
@@ -167,8 +168,8 @@ pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
         // git describes each commit-ish in order and dies on the first failure,
         // after printing the results of the commits already handled.
         for commit in &commits {
-            let target = resolve_describe_commit(&git_dir, format, &db, commit)?;
-            describe_one(format, &db, &options, abbrev, &tags, &target, None)?;
+            let target = resolve_describe_commit(&repo, commit)?;
+            describe_one(format, db, &options, abbrev, &tags, &target, None)?;
         }
         Ok(())
     }
@@ -446,7 +447,7 @@ fn describe_one(
             println!(
                 "{}-0-g{}{suffix}",
                 best.name,
-                describe_abbrev_oid(db, format, target, abbrev)?
+                describe_abbrev_oid(db, target, abbrev)?
             );
         } else {
             println!("{}{suffix}", best.name);
@@ -471,7 +472,6 @@ fn describe_one(
         // No candidate tag was reachable from the target.
         return describe_no_candidate(
             db,
-            format,
             options,
             abbrev,
             search.unannotated_cnt,
@@ -485,7 +485,7 @@ fn describe_one(
     }
 
     let suffix = dirty_suffix.unwrap_or("");
-    let short = describe_abbrev_oid(db, format, target, abbrev)?;
+    let short = describe_abbrev_oid(db, target, abbrev)?;
     if options.long || best.depth != 0 {
         if abbrev == 0 {
             // `--abbrev=0` without `--long`: print just the tag name.
@@ -732,7 +732,6 @@ fn finish_depth_computation(
 /// "unannotated tags exist, try --tags" case from the generic "no tags" case.
 fn describe_no_candidate(
     db: &FileObjectDatabase,
-    format: ObjectFormat,
     options: &DescribeOptions,
     abbrev: usize,
     unannotated_cnt: usize,
@@ -740,7 +739,7 @@ fn describe_no_candidate(
     dirty_suffix: Option<&str>,
 ) -> Result<()> {
     if options.always {
-        let short = describe_abbrev_oid(db, format, target, abbrev)?;
+        let short = describe_abbrev_oid(db, target, abbrev)?;
         println!("{short}{}", dirty_suffix.unwrap_or(""));
         return Ok(());
     }
@@ -827,13 +826,8 @@ fn describe_commit_parents(
 
 /// Resolve a commit-ish to the commit it names, peeling tags. On any resolution
 /// failure git prints `fatal: Not a valid object name <rev>` and exits 128.
-fn resolve_describe_commit(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    rev: &str,
-) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, rev) {
+fn resolve_describe_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
+    let oid = match repo.resolve_revision(rev) {
         Ok(oid) => oid,
         Err(GitError::Exit(code)) => return Err(GitError::Exit(code)),
         Err(_) => {
@@ -841,10 +835,10 @@ fn resolve_describe_commit(
             return Err(GitError::Exit(128));
         }
     };
-    let object = db.read_object(&oid)?;
+    let object = repo.objects().read_object(&oid)?;
     match object.object_type {
         ObjectType::Commit => Ok(oid),
-        ObjectType::Tag => sley_rev::peel_to_commit(db, format, &oid),
+        ObjectType::Tag => sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid),
         other => {
             eprintln!("fatal: {} is neither a commit nor blob", oid.to_hex());
             let _ = other;
@@ -924,12 +918,7 @@ fn clamp_describe_abbrev(width: usize, format: ObjectFormat) -> usize {
 /// Abbreviate a commit object name to at least `width` hex digits, growing the
 /// prefix until it uniquely identifies an object in the repository (mirroring
 /// git's `find_unique_abbrev`). A `width` of 0 yields an empty string.
-fn describe_abbrev_oid(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    oid: &ObjectId,
-    width: usize,
-) -> Result<String> {
+fn describe_abbrev_oid(db: &FileObjectDatabase, oid: &ObjectId, width: usize) -> Result<String> {
     let hex = oid.to_hex();
     if width == 0 {
         return Ok(String::new());

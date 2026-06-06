@@ -12,10 +12,10 @@
 //! emitted oldest-first.
 //!
 //! Like the other command modules this globs the crate root (`use crate::*`) so
-//! every shared plumbing helper — `discover_git_dir`, `repository_object_format`,
-//! `read_repo_config`, `resolve_revision`, `FileObjectDatabase`, `FileRefStore`,
-//! the `sley_rev`/`sley_diff_merge` re-exports, the identity/date helpers, and so
-//! on — is in scope without re-listing it. The diff/stat rendering in the shared
+//! every shared plumbing helper — `RepositoryContext`, `FileObjectDatabase`,
+//! `FileRefStore`, the `sley_rev`/`sley_diff_merge` re-exports, the
+//! identity/date helpers, and so on — is in scope without re-listing it. The
+//! diff/stat rendering in the shared
 //! crate writes only to `io::Stdout`; format-patch needs to direct output at a
 //! file too, so the unified-patch, diffstat, and summary rendering is reproduced
 //! here against an in-memory byte buffer using the same `sley_diff_merge` engine
@@ -110,13 +110,14 @@ impl Default for FormatPatchOptions {
 pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     let options = parse_format_patch_args(args)?;
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let config = repo.config();
+    let db = repo.objects();
 
-    let commits = select_commits(&git_dir, format, &db, &options)?;
+    let commits = select_commits(&repo, &options)?;
 
     let count = commits.len();
     let numbered = match options.number_mode {
@@ -132,11 +133,11 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     // yields `5/6` and `6/6`.
     let last_number = start_number + count.saturating_sub(1);
     let signoff_line = if options.signoff {
-        Some(format_patch_signoff(&config)?)
+        Some(format_patch_signoff(config)?)
     } else {
         None
     };
-    let abbrev = patch_index_abbrev(&git_dir, format, &options)?;
+    let abbrev = patch_index_abbrev(git_dir, format, &options)?;
 
     if options.stdout {
         let mut stdout = io::stdout();
@@ -147,7 +148,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
                 stdout.write_all(b"\n")?;
             }
             let buffer = render_patch(RenderContext {
-                db: &db,
+                db,
                 format,
                 options: &options,
                 record,
@@ -170,7 +171,7 @@ pub(crate) fn cmd_format_patch(args: &[String]) -> Result<()> {
     for (idx, record) in commits.iter().enumerate() {
         let seq = start_number + idx;
         let buffer = render_patch(RenderContext {
-            db: &db,
+            db,
             format,
             options: &options,
             record,
@@ -482,11 +483,11 @@ fn first_parent_diff_entries(
 /// git's oldest-first output order, with merge commits dropped (format-patch is
 /// `--no-merges` by default).
 fn select_commits(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    repo: &RepositoryContext,
     options: &FormatPatchOptions,
 ) -> Result<Vec<sley_rev::CommitRecord>> {
+    let format = repo.format();
+    let db = repo.objects();
     let mut includes: Vec<&str> = Vec::new();
     let mut excludes: Vec<&str> = Vec::new();
     let mut linear_ranges: Vec<(&str, &str, bool)> = Vec::new();
@@ -527,18 +528,18 @@ fn select_commits(
 
     let mut starts = Vec::new();
     for rev in &includes {
-        starts.push(resolve_format_patch_commit(git_dir, format, db, rev)?);
+        starts.push(resolve_format_patch_commit(repo, rev)?);
     }
     let mut range_excludes = Vec::new();
     for (left, right, _not) in &linear_ranges {
-        let left_oid = resolve_format_patch_commit(git_dir, format, db, left)?;
-        let right_oid = resolve_format_patch_commit(git_dir, format, db, right)?;
+        let left_oid = resolve_format_patch_commit(repo, left)?;
+        let right_oid = resolve_format_patch_commit(repo, right)?;
         range_excludes.push(left_oid);
         starts.push(right_oid);
     }
     for (left, right, _not) in &symmetric_ranges {
-        let left_oid = resolve_format_patch_commit(git_dir, format, db, left)?;
-        let right_oid = resolve_format_patch_commit(git_dir, format, db, right)?;
+        let left_oid = resolve_format_patch_commit(repo, left)?;
+        let right_oid = resolve_format_patch_commit(repo, right)?;
         let bases = merge_bases(db, format, &left_oid, &right_oid)?;
         starts.push(left_oid);
         starts.push(right_oid);
@@ -552,7 +553,7 @@ fn select_commits(
         }
     }
     for rev in &excludes {
-        let oid = resolve_format_patch_commit(git_dir, format, db, rev)?;
+        let oid = resolve_format_patch_commit(repo, rev)?;
         for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);
         }
@@ -576,14 +577,12 @@ fn select_commits(
 /// Resolve a revision string to a commit id, emitting git's exact
 /// "ambiguous argument ... unknown revision" fatal (exit 128) when it cannot be
 /// resolved or peeled — the same message `git format-patch <bad-rev>` prints.
-fn resolve_format_patch_commit(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    rev: &str,
-) -> Result<ObjectId> {
-    let oid = resolve_revision(git_dir, format, rev).map_err(|_| unknown_revision_error(rev))?;
-    sley_rev::peel_to_commit(db, format, &oid).map_err(|_| unknown_revision_error(rev))
+fn resolve_format_patch_commit(repo: &RepositoryContext, rev: &str) -> Result<ObjectId> {
+    let oid = repo
+        .resolve_revision(rev)
+        .map_err(|_| unknown_revision_error(rev))?;
+    sley_rev::peel_to_commit(repo.objects(), repo.format(), &oid)
+        .map_err(|_| unknown_revision_error(rev))
 }
 
 /// Print git's "unknown revision or path" fatal block and return an exit-128

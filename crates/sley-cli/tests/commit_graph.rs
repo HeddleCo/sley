@@ -331,8 +331,7 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
 
         let verify_args = ["commit-graph", "verify"];
         let expected_verify = run_with_env("git", &expected, &verify_args, &envs);
-        let actual_verify =
-            run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
+        let actual_verify = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
         assert_same_output(actual_verify, expected_verify, &verify_args);
         run_success_with_env("git", &actual, &verify_args, &envs);
     })();

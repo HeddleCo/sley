@@ -554,6 +554,16 @@ fn diff_index_usage_and_errors_match_git() {
     assert_same_all(&repo, &["diff-index", "--cached"]);
     assert_same_all(&repo, &["diff-index", "-h"]);
     assert_same_all(&repo, &["diff-index", "--bogus", "--cached", "HEAD"]);
+    assert_same_all(&repo, &["diff-index", "-Mfoo", "--cached", "HEAD"]);
+    assert_same_all(
+        &repo,
+        &["diff-index", "--find-renames=foo", "--cached", "HEAD"],
+    );
+    assert_same_all(&repo, &["diff-index", "-Cfoo", "--cached", "HEAD"]);
+    assert_same_all(
+        &repo,
+        &["diff-index", "--find-copies=foo", "--cached", "HEAD"],
+    );
     assert_same_all(&repo, &["diff-index", "--cached", "definitely-not-a-ref"]);
     assert_same_all(&repo, &["diff-index", "--cached", "HEAD~9"]);
 

@@ -1,10 +1,10 @@
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use std::cell::RefCell;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -531,6 +531,14 @@ impl PackFile {
         for object in objects {
             object_ids.push(object.object_id(format)?);
         }
+        let mut seen = HashSet::with_capacity(object_ids.len());
+        for oid in &object_ids {
+            if !seen.insert(oid) {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack contains duplicate object id {oid}"
+                )));
+            }
+        }
 
         // Validate external thin bases share the pack's hash format.
         for oid in options.thin_bases.keys() {
@@ -963,6 +971,14 @@ impl PackIndex {
         }
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+        for pair in entries.windows(2) {
+            if pair[0].oid.as_bytes() == pair[1].oid.as_bytes() {
+                return Err(GitError::InvalidFormat(format!(
+                    "pack index contains duplicate object id {}",
+                    pair[0].oid
+                )));
+            }
+        }
         let mut fanout = [0u32; 256];
         for entry in &entries {
             if entry.oid.format() != format {
@@ -1878,9 +1894,15 @@ pub fn read_object_at<F>(
     resolve_ref_base: F,
 ) -> Result<EncodedObject>
 where
-    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
 {
-    read_object_at_with_cache(pack_bytes, offset, format, resolve_ref_base, &NoopDeltaCache)
+    read_object_at_with_cache(
+        pack_bytes,
+        offset,
+        format,
+        resolve_ref_base,
+        &NoopDeltaCache,
+    )
 }
 
 /// Like [`read_object_at`], but reuses already-decoded objects from `cache`
@@ -1899,7 +1921,7 @@ pub fn read_object_at_with_cache<F, C>(
     cache: &C,
 ) -> Result<EncodedObject>
 where
-    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     C: PackDeltaCache + ?Sized,
 {
     read_object_at_inner(pack_bytes, offset, format, &mut resolve_ref_base, cache)
@@ -1913,7 +1935,7 @@ fn read_object_at_inner<F, C>(
     cache: &C,
 ) -> Result<EncodedObject>
 where
-    F: FnMut(&ObjectId) -> Option<EncodedObject>,
+    F: FnMut(&ObjectId) -> Result<Option<EncodedObject>>,
     C: PackDeltaCache + ?Sized,
 {
     // A warm cache entry for this exact offset is already the fully resolved
@@ -1932,7 +1954,9 @@ where
     let header = parse_entry_header(pack_bytes, &mut cursor)?;
     let base = match header.kind {
         PackObjectKind::OfsDelta => Some(DeltaBase::Offset(parse_ofs_delta_base_offset(
-            pack_bytes, &mut cursor, offset,
+            pack_bytes,
+            &mut cursor,
+            offset,
         )?)),
         PackObjectKind::RefDelta => {
             let hash_len = format.raw_len();
@@ -1982,9 +2006,8 @@ where
             EncodedObject::new(base.object_type, resolved)
         }
         Some(DeltaBase::Ref(base_oid)) => {
-            let base = resolve_ref_base(&base_oid).ok_or_else(|| {
-                GitError::NotFound(format!("ref-delta base object {base_oid}"))
-            })?;
+            let base = resolve_ref_base(&base_oid)?
+                .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {base_oid}")))?;
             let resolved = apply_pack_delta(&base.body, &body)?;
             EncodedObject::new(base.object_type, resolved)
         }
@@ -2012,7 +2035,7 @@ pub fn read_object_header_at<F>(
     mut resolve_ref_base_type: F,
 ) -> Result<(ObjectType, u64)>
 where
-    F: FnMut(&ObjectId) -> Option<ObjectType>,
+    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
 {
     read_object_header_at_inner(pack_bytes, offset, format, &mut resolve_ref_base_type)
 }
@@ -2024,7 +2047,7 @@ fn read_object_header_at_inner<F>(
     resolve_ref_base_type: &mut F,
 ) -> Result<(ObjectType, u64)>
 where
-    F: FnMut(&ObjectId) -> Option<ObjectType>,
+    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
 {
     let trailer_offset = pack_bytes
         .len()
@@ -2061,7 +2084,7 @@ where
             let oid = ObjectId::from_raw(format, &pack_bytes[cursor..cursor + hash_len])?;
             cursor += hash_len;
             let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
-            let base_type = resolve_ref_base_type(&oid)
+            let base_type = resolve_ref_base_type(&oid)?
                 .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {oid}")))?;
             Ok((base_type, size))
         }
@@ -3597,7 +3620,8 @@ impl PackBitmapWriter {
         // dedicated `write` path fills it in. `build` reports a placeholder of
         // the correct format so the struct is self-consistent for callers that
         // only need the decoded bitmaps.
-        let placeholder_checksum = ObjectId::from_raw(self.format, &vec![0u8; self.format.raw_len()])?;
+        let placeholder_checksum =
+            ObjectId::from_raw(self.format, &vec![0u8; self.format.raw_len()])?;
         Ok(PackBitmapIndex {
             version: 1,
             format: self.format,
@@ -3741,8 +3765,8 @@ mod tests {
     use flate2::Compression;
     use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
-    use std::io::Read;
     use std::fs;
+    use std::io::Read;
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -3798,7 +3822,8 @@ mod tests {
     #[test]
     fn rejects_bundle_pack_payload_with_wrong_object_format() {
         let pack = single_object_pack(ObjectFormat::Sha1, ObjectType::Blob, b"bundle\n");
-        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"bundle\n").unwrap();
+        let oid =
+            sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"bundle\n").unwrap();
         let bundle_bytes =
             format!("# v3 git bundle\n@object-format=sha256\n{oid} refs/heads/main\n\n")
                 .into_bytes()
@@ -3920,8 +3945,10 @@ mod tests {
         // Ground truth from a full parse; single-object decode must match at every offset.
         let parsed = PackFile::parse_sha1(&written.pack).unwrap();
         for po in &parsed.entries {
-            let got =
-                read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| None).unwrap();
+            let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
+                Ok(None)
+            })
+            .unwrap();
             assert_eq!(got, po.object, "offset {}", po.entry.offset);
         }
     }
@@ -3943,7 +3970,7 @@ mod tests {
             .collect();
         for po in &parsed.entries {
             let got = read_object_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |oid| {
-                by_oid.get(oid).cloned()
+                Ok(by_oid.get(oid).cloned())
             })
             .unwrap();
             assert_eq!(got, po.object);
@@ -4001,7 +4028,7 @@ mod tests {
                     &written.pack,
                     po.entry.offset,
                     ObjectFormat::Sha1,
-                    |_| None,
+                    |_| Ok(None),
                     &cache,
                 )
                 .unwrap();
@@ -4103,6 +4130,25 @@ mod tests {
         let last = pack.len() - 1;
         pack[last] ^= 1;
         assert!(PackIndex::write_v2_for_pack_sha1(&pack).is_err());
+    }
+
+    #[test]
+    fn pack_index_writer_rejects_duplicate_object_ids() {
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha1, "blob", b"same\n").unwrap();
+        let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack").unwrap();
+        let entries = vec![
+            PackIndexEntry {
+                oid: oid.clone(),
+                crc32: 1,
+                offset: 12,
+            },
+            PackIndexEntry {
+                oid,
+                crc32: 2,
+                offset: 24,
+            },
+        ];
+        assert!(PackIndex::write_v2(ObjectFormat::Sha1, &entries, &pack_checksum).is_err());
     }
 
     #[test]
@@ -4785,8 +4831,8 @@ mod tests {
 
     #[test]
     fn parses_single_entry_pack_index_sha256() {
-        let oid =
-            sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello sha256\n").unwrap();
+        let oid = sley_core::object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello sha256\n")
+            .unwrap();
         let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha256, b"pack").unwrap();
         let index = single_entry_index(
             ObjectFormat::Sha256,
@@ -4812,6 +4858,12 @@ mod tests {
     #[test]
     fn write_packed_deltifies_similar_blobs_and_round_trips_sha256() {
         write_packed_deltifies_similar_blobs_and_round_trips(ObjectFormat::Sha256);
+    }
+
+    #[test]
+    fn write_packed_rejects_duplicate_objects() {
+        let object = EncodedObject::new(ObjectType::Blob, b"same\n".to_vec());
+        assert!(PackFile::write_packed(&[object.clone(), object], ObjectFormat::Sha1,).is_err());
     }
 
     fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {
@@ -5871,9 +5923,12 @@ mod tests {
 
     #[test]
     fn pack_bitmap_writer_rejects_bad_name_hash_cache_len() {
-        let writer =
-            PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &[ObjectType::Commit])
-                .unwrap();
+        let writer = PackBitmapWriter::new(
+            ObjectFormat::Sha1,
+            pack_checksum_sha1(),
+            &[ObjectType::Commit],
+        )
+        .unwrap();
         assert!(writer.with_name_hash_cache(vec![1, 2]).is_err());
     }
 

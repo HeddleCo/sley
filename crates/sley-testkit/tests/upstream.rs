@@ -16,13 +16,16 @@
 //!
 //! # 2. Run this test against it:
 //! GIT_SRC_DIR=/tmp/git-src \
-//!     cargo test -p git-testkit --test upstream -- --ignored --nocapture
+//!     cargo test -p sley-testkit --test upstream -- --ignored --nocapture
+//!
+//! Set `SLEY_UPSTREAM_REQUIRE_PASS=1` to turn the measured parity run into a
+//! gating assertion that every selected upstream script passes.
 //! ```
 
 use sley_testkit::upstream::{self, UpstreamRunOutcome};
 
 #[test]
-#[ignore = "runs upstream git's t/*.sh suite; requires GIT_SRC_DIR or GIT_RS_UPSTREAM_T pointing at a built git checkout"]
+#[ignore = "runs upstream git's t/*.sh suite; requires GIT_SRC_DIR or SLEY_UPSTREAM_T pointing at a built git checkout"]
 fn upstream_default_subset_runs() {
     // `CARGO_BIN_EXE_sley` is injected by Cargo when this crate has the
     // git-cli binary in scope; fall back to letting the runner resolve it.
@@ -57,12 +60,12 @@ fn upstream_default_subset_runs() {
                 !results.is_empty(),
                 "runner produced no parseable per-script results"
             );
-            // We do NOT assert `all_passed`: sley is not yet at full upstream
-            // parity, so this test measures and reports the gap rather than
-            // gating on a green suite. Flip this to an assertion once parity is
-            // expected.
             if all_passed {
                 eprintln!("All selected upstream scripts passed.");
+            } else if std::env::var_os("SLEY_UPSTREAM_REQUIRE_PASS").is_some()
+                || std::env::var_os("GIT_RS_UPSTREAM_REQUIRE_PASS").is_some()
+            {
+                panic!("some selected upstream scripts failed; see the report above");
             } else {
                 eprintln!(
                     "Some upstream scripts did not fully pass (expected during \

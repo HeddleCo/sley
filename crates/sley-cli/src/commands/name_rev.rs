@@ -75,9 +75,10 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
         eprintln!("This option will be removed in a future release.");
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     let tips = collect_tips(&git_dir, format, &db, &options)?;
     let mut rev_names: HashMap<ObjectId, RevName> = HashMap::new();
@@ -89,7 +90,7 @@ pub(crate) fn cmd_name_rev(args: &[String]) -> Result<()> {
     if options.annotate_stdin {
         return annotate_stdin(&db, format, &tips, &rev_names, &options);
     }
-    emit_positional(&git_dir, format, &db, &tips, &rev_names, &options)
+    emit_positional(&repo, &tips, &rev_names, &options)
 }
 
 /// Parse `name-rev` flags into options, or an `Exit` error for `-h`/bad usage.
@@ -598,17 +599,17 @@ fn resolve_stdin_name(
 
 /// `<commit>...`: resolve each argument and print its name (or `undefined`).
 fn emit_positional(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
+    repo: &RepositoryContext,
     tips: &[Tip],
     rev_names: &HashMap<ObjectId, RevName>,
     options: &NameRevOptions,
 ) -> Result<()> {
+    let format = repo.format();
+    let db = repo.objects();
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for rev in &options.revs {
-        let oid = match resolve_revision(git_dir, format, rev) {
+        let oid = match repo.resolve_revision(rev) {
             Ok(oid) => oid,
             Err(_) => {
                 eprintln!("Could not get sha1 for {rev}. Skipping.");

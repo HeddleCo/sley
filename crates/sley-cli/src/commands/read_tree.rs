@@ -67,14 +67,14 @@ struct StagedEntry {
 pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     let parsed = parse_read_tree_args(args)?;
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     // `--empty` (and the deprecated no-argument spelling) just clears the index.
     if parsed.empty {
-        write_paired_entries(&git_dir, format, Vec::new())?;
+        write_paired_entries(git_dir, format, Vec::new())?;
         return Ok(());
     }
 
@@ -82,47 +82,47 @@ pub(crate) fn cmd_read_tree(args: &[String]) -> Result<()> {
     // invalid tree-ish aborts before any index mutation (matching git).
     let mut tree_oids = Vec::with_capacity(parsed.trees.len());
     for tree in &parsed.trees {
-        tree_oids.push(resolve_tree_ish(&git_dir, format, &db, tree)?);
+        tree_oids.push(resolve_tree_ish(&repo, tree)?);
     }
 
     match &parsed.mode {
         ReadTreeMode::Read => {
-            let entries = read_tree_overlay(&db, format, &tree_oids)?;
-            write_paired_entries(&git_dir, format, entries)?;
+            let entries = read_tree_overlay(db, format, &tree_oids)?;
+            write_paired_entries(git_dir, format, entries)?;
         }
         ReadTreeMode::Reset => {
             // `--reset` accepts up to three trees but only the resulting union
             // matters; higher-stage entries are simply dropped (we never create
             // them here). With `-u` the worktree is updated to match.
-            let entries = read_tree_overlay(&db, format, &tree_oids)?;
+            let entries = read_tree_overlay(db, format, &tree_oids)?;
             if parsed.update_worktree {
-                let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-                reset_worktree_to_entries(&worktree_root, &git_dir, format, &db, &entries)?;
+                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                reset_worktree_to_entries(&worktree_root, git_dir, format, db, &entries)?;
             }
-            write_paired_entries(&git_dir, format, entries)?;
+            write_paired_entries(git_dir, format, entries)?;
         }
         ReadTreeMode::Prefix(prefix) => {
-            let entries = read_tree_prefix(&git_dir, format, &db, &tree_oids, prefix)?;
+            let entries = read_tree_prefix(git_dir, format, db, &tree_oids, prefix)?;
             if parsed.update_worktree {
-                let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-                update_worktree_for_entries(&worktree_root, &git_dir, format, &db, &entries)?;
+                let worktree_root = worktree_root_for_git_dir(git_dir)?;
+                update_worktree_for_entries(&worktree_root, git_dir, format, db, &entries)?;
             }
-            write_paired_entries(&git_dir, format, entries)?;
+            write_paired_entries(git_dir, format, entries)?;
         }
         ReadTreeMode::Merge => {
             // The original index paths distinguish "added" entries (which `-u`
             // must not write over an untracked file) from those already tracked.
-            let original_paths = original_index_paths(&git_dir, format)?;
-            let entries = merge_trees(&git_dir, format, &db, &tree_oids)?;
+            let original_paths = original_index_paths(git_dir, format)?;
+            let entries = merge_trees(git_dir, format, db, &tree_oids)?;
             if parsed.update_worktree {
-                let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+                let worktree_root = worktree_root_for_git_dir(git_dir)?;
                 // git validates the whole worktree update before touching
                 // anything; refuse if a freshly added path would clobber an
                 // untracked file.
                 verify_no_untracked_overwrites(&worktree_root, &entries, &original_paths)?;
-                update_worktree_for_merge(&worktree_root, &git_dir, format, &db, &entries)?;
+                update_worktree_for_merge(&worktree_root, git_dir, format, db, &entries)?;
             }
-            write_paired_entries(&git_dir, format, entries)?;
+            write_paired_entries(git_dir, format, entries)?;
         }
     }
 
@@ -292,13 +292,9 @@ fn empty_tree_oid(format: ObjectFormat) -> Result<ObjectId> {
 
 /// Resolve a tree-ish CLI argument to the object id of its tree, peeling
 /// commits and tags. Reports git's `Not a valid object name` on failure.
-fn resolve_tree_ish(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    spec: &str,
-) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, spec) {
+fn resolve_tree_ish(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
+    let format = repo.format();
+    let oid = match repo.resolve_revision(spec) {
         Ok(oid) => oid,
         Err(_) => {
             eprintln!("fatal: Not a valid object name {spec}");
@@ -309,7 +305,7 @@ fn resolve_tree_ish(
     if oid == empty_tree_oid(format)? {
         return Ok(oid);
     }
-    match sley_rev::peel_to_tree(db, format, &oid) {
+    match sley_rev::peel_to_tree(repo.objects(), format, &oid) {
         Ok(tree) => Ok(tree),
         Err(_) => {
             eprintln!("fatal: Not a valid object name {spec}");

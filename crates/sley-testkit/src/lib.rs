@@ -1,5 +1,5 @@
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_config::GitConfig;
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_index::Index;
 use sley_object::{EncodedObject, ObjectType, Tree, tree_entry_object_type};
@@ -5320,7 +5320,8 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 /// Point the harness at an upstream git source checkout's `t/` directory via one
 /// of these environment variables:
 ///
-/// * `GIT_RS_UPSTREAM_T` — absolute path to the upstream git `t/` directory.
+/// * `SLEY_UPSTREAM_T` — absolute path to the upstream git `t/` directory.
+/// * `GIT_RS_UPSTREAM_T` — legacy alias for `SLEY_UPSTREAM_T`.
 /// * `GIT_SRC_DIR` — absolute path to a git source root (we use `$GIT_SRC_DIR/t`).
 ///
 /// The `t/` directory must come from a *built* checkout: `test-lib.sh` sources
@@ -5420,9 +5421,9 @@ pub mod upstream {
     /// Outcome of attempting to run the upstream suite.
     #[derive(Debug, Clone)]
     pub enum UpstreamRunOutcome {
-        /// No upstream `t/` directory was configured (neither `GIT_RS_UPSTREAM_T`
-        /// nor `GIT_SRC_DIR` is set). Holds a human-readable reason. This is a
-        /// clean skip, not a failure.
+        /// No upstream `t/` directory was configured (neither `SLEY_UPSTREAM_T`,
+        /// its legacy `GIT_RS_UPSTREAM_T` alias, nor `GIT_SRC_DIR` is set). Holds
+        /// a human-readable reason. This is a clean skip, not a failure.
         Skipped(String),
         /// The runner executed. Holds the parsed per-script results and the path
         /// to the full text report, plus whether every script passed.
@@ -5437,6 +5438,11 @@ pub mod upstream {
     /// `None` (rather than an error) when nothing is configured so callers can
     /// skip cleanly.
     pub fn upstream_t_dir() -> Option<PathBuf> {
+        if let Ok(dir) = std::env::var("SLEY_UPSTREAM_T")
+            && !dir.is_empty()
+        {
+            return Some(PathBuf::from(dir));
+        }
         if let Ok(dir) = std::env::var("GIT_RS_UPSTREAM_T")
             && !dir.is_empty()
         {
@@ -5461,14 +5467,12 @@ pub mod upstream {
     ///
     /// Returns [`UpstreamRunOutcome::Skipped`] when no upstream `t/` directory is
     /// configured; otherwise runs the suite and parses the per-script results.
-    /// `git_rs_bin`, when provided, is exported as `GIT_RS_BIN` so the runner
+    /// `sley_bin`, when provided, is exported as `SLEY_BIN` so the runner
     /// uses exactly that binary (handy from an integration test via
     /// `env!("CARGO_BIN_EXE_sley")`); otherwise the runner resolves the binary
     /// itself.
-    pub fn run_upstream_default_subset(
-        git_rs_bin: Option<&Path>,
-    ) -> Result<UpstreamRunOutcome> {
-        run_upstream_scripts(DEFAULT_SCRIPTS, git_rs_bin)
+    pub fn run_upstream_default_subset(sley_bin: Option<&Path>) -> Result<UpstreamRunOutcome> {
+        run_upstream_scripts(DEFAULT_SCRIPTS, sley_bin)
     }
 
     /// Like [`run_upstream_default_subset`] but with an explicit script list.
@@ -5477,9 +5481,9 @@ pub mod upstream {
     /// runner resolves it against the upstream `t/` directory.
     pub fn run_upstream_scripts(
         scripts: &[&str],
-        git_rs_bin: Option<&Path>,
+        sley_bin: Option<&Path>,
     ) -> Result<UpstreamRunOutcome> {
-        run_upstream_scripts_labeled(scripts, git_rs_bin, None)
+        run_upstream_scripts_labeled(scripts, sley_bin, None)
     }
 
     /// Run a single foundational command's upstream script by name (e.g.
@@ -5489,25 +5493,25 @@ pub mod upstream {
     /// are attributable across runs (e.g. a git short-SHA).
     pub fn run_upstream_command(
         command: &str,
-        git_rs_bin: Option<&Path>,
+        sley_bin: Option<&Path>,
         label: Option<&str>,
     ) -> Result<UpstreamRunOutcome> {
-        run_upstream_scripts_labeled(&[command], git_rs_bin, label)
+        run_upstream_scripts_labeled(&[command], sley_bin, label)
     }
 
     /// Like [`run_upstream_scripts`] but also records a caller-provided `label`
-    /// (passed through as `GIT_RS_RUN_LABEL`) in the report and history. The
+    /// (passed through as `SLEY_RUN_LABEL`) in the report and history. The
     /// library deliberately never reads a clock; when `label` is `None` the
     /// runner script supplies a UTC timestamp at the shell layer.
     pub fn run_upstream_scripts_labeled(
         scripts: &[&str],
-        git_rs_bin: Option<&Path>,
+        sley_bin: Option<&Path>,
         label: Option<&str>,
     ) -> Result<UpstreamRunOutcome> {
         if upstream_t_dir().is_none() {
             return Ok(UpstreamRunOutcome::Skipped(
                 "no upstream git t/ directory configured; \
-                 set GIT_RS_UPSTREAM_T (path to git's t/ dir) or \
+                 set SLEY_UPSTREAM_T (path to git's t/ dir) or \
                  GIT_SRC_DIR (a built git source root, we use $GIT_SRC_DIR/t)"
                     .into(),
             ));
@@ -5526,11 +5530,11 @@ pub mod upstream {
         for script in scripts {
             command.arg(script);
         }
-        if let Some(bin) = git_rs_bin {
-            command.env("GIT_RS_BIN", bin);
+        if let Some(bin) = sley_bin {
+            command.env("SLEY_BIN", bin);
         }
         if let Some(label) = label {
-            command.env("GIT_RS_RUN_LABEL", label);
+            command.env("SLEY_RUN_LABEL", label);
         }
 
         let output = command

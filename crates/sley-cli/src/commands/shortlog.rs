@@ -10,9 +10,9 @@
 // Command modules pull their shared plumbing from the crate root. A glob import
 // works because a submodule can access its ancestor module's items (including
 // private ones), so every helper, type, and re-export visible at the crate root
-// (discover_git_dir, repository_object_format, resolve_revision, read_repo_config,
-// FileObjectDatabase, rev_list_walk_commits, commit_identity_name_email, the
-// `std::*` re-exports, ...) is in scope here without re-listing it.
+// (RepositoryContext, read_repo_config, rev_list_walk_commits,
+// commit_identity_name_email, the `std::*` re-exports, ...) is in scope here
+// without re-listing it.
 use crate::*;
 
 /// Which identity a commit is grouped under.
@@ -266,9 +266,9 @@ fn read_shortlog_from_revisions(
     groups: &mut Vec<ShortlogEntry>,
     index: &mut HashMap<String, usize>,
 ) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let format = repo.format();
+    let db = repo.objects();
 
     let author_filters = parse_log_filter_patterns(&options.author_patterns, options.regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&options.grep_patterns, options.regexp_mode)?;
@@ -294,14 +294,14 @@ fn read_shortlog_from_revisions(
     let mut starts = Vec::new();
     let mut symmetric_excludes = Vec::new();
     for rev in includes {
-        let oid = resolve_revision(&git_dir, format, rev)?;
-        starts.push(sley_rev::peel_to_commit(&db, format, &oid)?);
+        let oid = repo.resolve_revision(rev)?;
+        starts.push(sley_rev::peel_to_commit(db, format, &oid)?);
     }
     for (left, right, not) in linear_ranges {
-        let left_oid = resolve_revision(&git_dir, format, left)?;
-        let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, right)?;
-        let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
+        let left_oid = repo.resolve_revision(left)?;
+        let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
+        let right_oid = repo.resolve_revision(right)?;
+        let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
         if not {
             starts.push(left_oid);
             symmetric_excludes.push(right_oid);
@@ -311,11 +311,11 @@ fn read_shortlog_from_revisions(
         }
     }
     for (left, right, not) in symmetric_ranges {
-        let left_oid = resolve_revision(&git_dir, format, left)?;
-        let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, right)?;
-        let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        let bases = merge_bases(&db, format, &left_oid, &right_oid)?;
+        let left_oid = repo.resolve_revision(left)?;
+        let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
+        let right_oid = repo.resolve_revision(right)?;
+        let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
+        let bases = merge_bases(db, format, &left_oid, &right_oid)?;
         if not {
             starts.extend(bases);
             symmetric_excludes.push(left_oid);
@@ -330,21 +330,21 @@ fn read_shortlog_from_revisions(
     // Everything reachable from a negative tip is removed from the result set.
     let mut excluded = HashSet::new();
     for oid in symmetric_excludes {
-        for record in rev_list_walk_commits(&db, format, [oid], false)? {
+        for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);
         }
     }
     for rev in excludes {
-        let oid = resolve_revision(&git_dir, format, rev)?;
-        let oid = sley_rev::peel_to_commit(&db, format, &oid)?;
-        for record in rev_list_walk_commits(&db, format, [oid], false)? {
+        let oid = repo.resolve_revision(rev)?;
+        let oid = sley_rev::peel_to_commit(db, format, &oid)?;
+        for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);
         }
     }
 
     // `walk_commits` yields newest-first; prepending into each bucket therefore
     // leaves subjects oldest-first, matching git's output ordering.
-    let commits = rev_list_walk_commits(&db, format, starts, false)?;
+    let commits = rev_list_walk_commits(db, format, starts, false)?;
     let mut emitted = 0usize;
     for record in &commits {
         if excluded.contains(&record.oid) {

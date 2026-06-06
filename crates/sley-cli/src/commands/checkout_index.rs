@@ -8,9 +8,9 @@
 //! text, the streams it lands on, and exit codes match upstream so the command
 //! is a drop-in replacement.
 
-// Pull shared plumbing (discover_git_dir, repository_object_format,
-// worktree_root_for_git_dir, read_repo_config, FileObjectDatabase, ObjectReader,
-// Index/IndexEntry, GitError/Result, std::* re-exports, …) from the crate root.
+// Pull shared plumbing (RepositoryContext, worktree_root_for_git_dir,
+// ObjectReader, Index/IndexEntry, GitError/Result, std::* re-exports, …) from
+// the crate root.
 // A submodule can see its ancestors' items, so the glob keeps this file in step
 // with whatever the root exposes without re-listing each name.
 use crate::*;
@@ -185,19 +185,22 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         return Err(GitError::Exit(128));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = match discover_git_dir(&cwd) {
-        Ok(dir) => dir,
-        Err(_) => {
+    let repo = match RepositoryContext::discover_current() {
+        Ok(repo) => repo,
+        Err(GitError::NotFound(_)) => {
             eprintln!("fatal: not a git repository (or any of the parent directories): .git");
             return Err(GitError::Exit(128));
         }
+        Err(err) => return Err(err),
     };
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let config = repo.config();
+    let db = repo.objects();
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
 
-    let mut index = match sley_worktree::read_repository_index(&git_dir, format)? {
+    let mut index = match sley_worktree::read_repository_index(git_dir, format)? {
         Some(index) => index,
         None => Index {
             version: 2,
@@ -218,7 +221,6 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         Vec::new()
     };
 
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut had_error = false;
     let mut wrote_index = false;
 
@@ -241,9 +243,9 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
         for idx in targets {
             match checkout_one_index_entry(
                 &worktree_root,
-                &db,
-                &config,
-                &git_dir,
+                db,
+                config,
+                git_dir,
                 format,
                 &options,
                 idx,
@@ -282,9 +284,9 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             }
             match checkout_one_index_entry(
                 &worktree_root,
-                &db,
-                &config,
-                &git_dir,
+                db,
+                config,
+                git_dir,
                 format,
                 &options,
                 idx,
@@ -304,7 +306,7 @@ fn run_checkout_index(options: CheckoutIndexOptions) -> Result<()> {
             })
         });
         fs::write(
-            sley_worktree::repository_index_path(&git_dir),
+            sley_worktree::repository_index_path(git_dir),
             index.write(format)?,
         )?;
     }

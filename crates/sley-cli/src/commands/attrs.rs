@@ -1,16 +1,13 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
 use std::collections::BTreeSet;
-use std::env;
 use std::io::{self, Read, Write};
 
 use sley_core::{GitError, Result};
-use sley_odb::FileObjectDatabase;
 
 use crate::{
-    check_ignore_tracked_paths, discover_git_dir, normalize_ls_files_pathspec,
-    repository_object_format, resolve_cli_path, resolve_revision, worktree_prefix,
-    worktree_root_for_git_dir, write_check_attr_state,
+    RepositoryContext, check_ignore_tracked_paths, normalize_ls_files_pathspec, resolve_cli_path,
+    worktree_prefix, worktree_root_for_git_dir, write_check_attr_state,
 };
 
 pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
@@ -100,15 +97,16 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         ));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let prefix = worktree_prefix(&cwd, &git_dir)?;
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let prefix = worktree_prefix(cwd, git_dir)?;
     let tracked_paths = if no_index {
         BTreeSet::new()
     } else {
-        check_ignore_tracked_paths(&git_dir, format)?
+        check_ignore_tracked_paths(git_dir, format)?
     };
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
@@ -119,7 +117,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         if tracked_paths.contains(&git_path) {
             continue;
         }
-        let absolute = resolve_cli_path(&cwd, &path_arg);
+        let absolute = resolve_cli_path(cwd, &path_arg);
         let ignore_match =
             sley_worktree::standard_ignore_match(&worktree_root, &git_path, absolute.is_dir())?;
         if let Some(ignore_match) = ignore_match {
@@ -265,16 +263,15 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         ));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let prefix = worktree_prefix(&cwd, &git_dir)?;
-    let format = repository_object_format(&git_dir)?;
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let prefix = worktree_prefix(cwd, git_dir)?;
     let source_tree = if let Some(source) = source.as_deref() {
-        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-        let oid = resolve_revision(&git_dir, format, source)?;
-        let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
-        Some((db, format, tree_oid))
+        let oid = repo.resolve_revision(source)?;
+        Some(sley_rev::peel_to_tree(repo.objects(), format, &oid)?)
     } else {
         None
     };
@@ -285,17 +282,17 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         let checks = if cached {
             sley_worktree::standard_attributes_for_path_from_index(
                 &worktree_root,
-                &git_dir,
+                git_dir,
                 format,
                 &git_path,
                 &requested,
                 all,
             )?
-        } else if let Some((db, format, tree_oid)) = source_tree.as_ref() {
+        } else if let Some(tree_oid) = source_tree.as_ref() {
             sley_worktree::standard_attributes_for_path_from_tree(
                 &worktree_root,
-                db,
-                *format,
+                repo.objects(),
+                format,
                 tree_oid,
                 &git_path,
                 &requested,

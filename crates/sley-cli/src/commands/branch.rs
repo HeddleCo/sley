@@ -7,9 +7,10 @@ use crate::*;
 
 pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let store = FileRefStore::new(&git_dir, format);
+    let repo = RepositoryContext::discover(&cwd)?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let store = repo.refs();
     if let Some(show_current) = parse_branch_show_current_options(args)? {
         if show_current {
             if let Some(branch) = store.current_branch()? {
@@ -8587,4 +8588,3 @@ fn branch_verbose_tracking(
         (_, None, _) => String::new(),
     }
 }
-

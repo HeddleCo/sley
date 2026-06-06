@@ -266,16 +266,16 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
 
     // We do not implement pathspec filtering for diff-tree; reject it clearly so
     // we never silently ignore a path restriction.
-    if !pathspecs.is_empty() {
+    if !pathspecs.is_empty() || options.revs.len() > 2 {
         return Err(GitError::Unsupported(
             "diff-tree pathspec filtering is not supported".into(),
         ));
     }
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     // Resolve the raw-mode abbreviation against core.abbrev only when the user
     // explicitly asked to abbreviate; otherwise diff-tree prints full ids.
@@ -320,7 +320,7 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             print_diff_tree_usage();
             return Err(GitError::Exit(129));
         }
-        let request = resolve_arg_request(&git_dir, format, &db, &options, &options.revs)?;
+        let request = resolve_arg_request(&repo, db, &options, &options.revs)?;
         if run_diff_request(
             &mut stdout,
             format,
@@ -371,22 +371,22 @@ struct DiffHeader {
 ///     becomes the (suppressible) header.
 ///   * Two operands: diff the two tree-ish objects directly; no header.
 fn resolve_arg_request(
-    git_dir: &Path,
-    format: ObjectFormat,
+    repo: &RepositoryContext,
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
     revs: &[String],
 ) -> Result<DiffRequest> {
+    let format = repo.format();
     if revs.len() == 1 {
-        let oid = resolve_tree_ish_arg(git_dir, format, &revs[0])?;
+        let oid = resolve_tree_ish_arg(repo, &revs[0])?;
         // The argument form prints the resolved commit id as its header.
         single_commit_request(format, db, options, &oid, oid.to_hex())
     } else {
         // git only ever uses the first two operands as trees; anything further
         // would be a pathspec, which we reject earlier when it reaches us via
         // `--`. Here we defensively use the first two.
-        let left = resolve_tree_ish_arg(git_dir, format, &revs[0])?;
-        let right = resolve_tree_ish_arg(git_dir, format, &revs[1])?;
+        let left = resolve_tree_ish_arg(repo, &revs[0])?;
+        let right = resolve_tree_ish_arg(repo, &revs[1])?;
         let left_tree = sley_rev::peel_to_tree(db, format, &left)?;
         let right_tree = sley_rev::peel_to_tree(db, format, &right)?;
         Ok(DiffRequest {
@@ -557,8 +557,8 @@ fn skip_silent() -> DiffRequest {
 /// Resolve a single tree-ish/commit spec to an object id, emitting git's
 /// `fatal: ambiguous argument ...` message (exit 128) when it does not name a
 /// known revision.
-fn resolve_tree_ish_arg(git_dir: &Path, format: ObjectFormat, spec: &str) -> Result<ObjectId> {
-    match resolve_revision(git_dir, format, spec) {
+fn resolve_tree_ish_arg(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
+    match repo.resolve_revision(spec) {
         Ok(oid) => Ok(oid),
         Err(_) => {
             eprintln!(
@@ -846,8 +846,12 @@ fn detect_top_level_renames(
     options: &DiffTreeOptions,
 ) -> Vec<sley_diff_merge::NameStatusEntry> {
     if options.detect_renames {
-        changes =
-            detect_top_level_rename_pass(changes, db, options.rename_threshold, options.rename_empty);
+        changes = detect_top_level_rename_pass(
+            changes,
+            db,
+            options.rename_threshold,
+            options.rename_empty,
+        );
     }
     if options.detect_copies {
         changes = detect_top_level_copy_pass(

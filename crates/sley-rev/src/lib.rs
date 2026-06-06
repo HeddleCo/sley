@@ -1,5 +1,5 @@
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectId, Result};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, ObjectType, Tag, Tree};
@@ -49,7 +49,7 @@ pub struct CommitMetadata {
 
 pub fn resolve_revision(
     git_dir: impl AsRef<Path>,
-    format: sley_core::ObjectFormat,
+    format: ObjectFormat,
     rev: &str,
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
@@ -59,7 +59,7 @@ pub fn resolve_revision(
 
 pub fn resolve_revision_with_reader<R: ObjectReader>(
     git_dir: &Path,
-    format: sley_core::ObjectFormat,
+    format: ObjectFormat,
     reader: &R,
     rev: &str,
 ) -> Result<ObjectId> {
@@ -96,6 +96,45 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
         return apply_revision_suffix(git_dir, reader, format, &base_oid, suffix, rev);
     }
     resolve_revision_name(git_dir, format, rev)
+}
+
+pub struct RevisionResolver<'a, R> {
+    git_dir: &'a Path,
+    format: ObjectFormat,
+    reader: &'a R,
+}
+
+impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
+    pub fn new(git_dir: &'a Path, format: ObjectFormat, reader: &'a R) -> Self {
+        Self {
+            git_dir,
+            format,
+            reader,
+        }
+    }
+
+    pub fn resolve(&self, rev: &str) -> Result<ObjectId> {
+        resolve_revision_with_reader(self.git_dir, self.format, self.reader, rev)
+    }
+
+    pub fn peel_to_blob(&self, rev: &str) -> Result<ObjectId> {
+        let oid = self.resolve(rev)?;
+        peel_tags(self.reader, self.format, &oid)
+    }
+
+    pub fn peel_to_tree(&self, rev: &str) -> Result<ObjectId> {
+        let oid = self.resolve(rev)?;
+        peel_to_tree(self.reader, self.format, &oid)
+    }
+
+    pub fn peel_to_commit(&self, rev: &str) -> Result<ObjectId> {
+        let oid = self.resolve(rev)?;
+        peel_to_commit(self.reader, self.format, &oid)
+    }
+
+    pub fn resolve_path(&self, rev: &str, path: &str) -> Result<ResolvedTreePath> {
+        resolve_rev_path_entry(self.git_dir, self.format, self.reader, rev, path)
+    }
 }
 
 fn resolve_revision_name(
@@ -1006,6 +1045,14 @@ pub fn walk_commits<R: ObjectReader>(
 // `<rev>:<path>` resolution
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedTreePath {
+    pub oid: ObjectId,
+    pub mode: Option<u32>,
+    pub object_type: ObjectType,
+    pub name: Vec<u8>,
+}
+
 /// Resolve `<rev>:<path>` to the object id of `<path>` within `<rev>`'s tree.
 ///
 /// `rev` is peeled to a tree (so a commit, tag, or tree id all work) and then
@@ -1021,27 +1068,42 @@ pub fn resolve_rev_path<R: ObjectReader>(
     rev: &str,
     path: &str,
 ) -> Result<ObjectId> {
+    resolve_rev_path_entry(git_dir, format, reader, rev, path).map(|entry| entry.oid)
+}
+
+pub fn resolve_rev_path_entry<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    path: &str,
+) -> Result<ResolvedTreePath> {
     let rev_oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
     let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
-    resolve_tree_path(reader, format, &tree_oid, path)
+    resolve_tree_path_entry(reader, format, &tree_oid, path)
         .ok_or_else(|| GitError::NotFound(format!("path '{path}' does not exist in '{rev}'")))
 }
 
 /// Walk `path` within the tree `tree_oid`, returning the id of the entry it
 /// names, or `None` if any component is missing or a component before the last
 /// is not a tree. An empty `path` returns `tree_oid` unchanged.
-fn resolve_tree_path<R: ObjectReader>(
+pub fn resolve_tree_path_entry<R: ObjectReader>(
     reader: &R,
-    format: sley_core::ObjectFormat,
+    format: ObjectFormat,
     tree_oid: &ObjectId,
     path: &str,
-) -> Option<ObjectId> {
+) -> Option<ResolvedTreePath> {
     let mut current = tree_oid.clone();
     // Split on '/', skipping empty components so leading/trailing/duplicate
     // separators ("a//b", "/a", "dir/") behave the way git's pathspec does.
     let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
     if components.is_empty() {
-        return Some(current);
+        return Some(ResolvedTreePath {
+            oid: current,
+            mode: None,
+            object_type: ObjectType::Tree,
+            name: Vec::new(),
+        });
     }
     let last = components.len() - 1;
     for (idx, component) in components.iter().enumerate() {
@@ -1055,16 +1117,22 @@ fn resolve_tree_path<R: ObjectReader>(
             .entries
             .iter()
             .find(|entry| entry.name == component.as_bytes())?;
+        let object_type = sley_object::tree_entry_object_type(entry.mode);
         if idx == last {
-            return Some(entry.oid.clone());
+            return Some(ResolvedTreePath {
+                oid: entry.oid.clone(),
+                mode: Some(entry.mode),
+                object_type,
+                name: entry.name.clone(),
+            });
         }
         // Intermediate component must itself be a tree to keep descending.
-        if sley_object::tree_entry_object_type(entry.mode) != ObjectType::Tree {
+        if object_type != ObjectType::Tree {
             return None;
         }
         current = entry.oid.clone();
     }
-    Some(current)
+    None
 }
 
 /// Split `<rev>:<path>` into its revision and path halves.
@@ -1073,6 +1141,10 @@ fn resolve_tree_path<R: ObjectReader>(
 /// colon, when the colon is part of a leading `:` index spec (handled
 /// elsewhere), or when the left side is empty. The split uses the first colon
 /// so paths may themselves contain colons.
+pub fn split_rev_path_spec(rev: &str) -> Option<(&str, &str)> {
+    split_rev_path(rev)
+}
+
 fn split_rev_path(rev: &str) -> Option<(&str, &str)> {
     let colon = rev.find(':')?;
     if colon == 0 {
@@ -1327,11 +1399,7 @@ pub fn parse_revision_range(spec: &str) -> Option<RevisionRange> {
 }
 
 fn default_range_side(side: &str) -> &str {
-    if side.is_empty() {
-        "HEAD"
-    } else {
-        side
-    }
+    if side.is_empty() { "HEAD" } else { side }
 }
 
 /// Resolve a parsed range to the set of commit oids it selects.
@@ -1924,6 +1992,24 @@ mod tests {
             resolve_rev_path(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "").unwrap(),
             root
         );
+        let entry = resolve_rev_path_entry(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            &commit.to_hex(),
+            "dir/sub/file.txt",
+        )
+        .unwrap();
+        assert_eq!(entry.oid, blob);
+        assert_eq!(entry.mode, Some(0o100644));
+        assert_eq!(entry.object_type, ObjectType::Blob);
+        assert_eq!(entry.name, b"file.txt");
+        let entry = resolve_rev_path_entry(&git_dir, ObjectFormat::Sha1, &db, &commit.to_hex(), "")
+            .unwrap();
+        assert_eq!(entry.oid, root);
+        assert_eq!(entry.mode, None);
+        assert_eq!(entry.object_type, ObjectType::Tree);
+        assert!(entry.name.is_empty());
         // Resolvable through the unified string resolver too.
         assert_eq!(
             resolve_revision_with_reader(
@@ -2592,9 +2678,7 @@ mod tests {
     /// Compute topological generation numbers for `parents` (a child -> parents
     /// map). A root commit has generation 1; every other commit is one greater
     /// than the maximum generation among its parents -- exactly git's definition.
-    fn generation_numbers(
-        parents: &HashMap<ObjectId, Vec<ObjectId>>,
-    ) -> HashMap<ObjectId, u32> {
+    fn generation_numbers(parents: &HashMap<ObjectId, Vec<ObjectId>>) -> HashMap<ObjectId, u32> {
         let mut generations: HashMap<ObjectId, u32> = HashMap::new();
         // Repeatedly relax until a fixpoint; histories here are tiny so a simple
         // loop is plenty and avoids an explicit topological sort.
@@ -2766,11 +2850,12 @@ mod tests {
                     left: left.to_hex(),
                     right: right.to_hex(),
                 };
-                let mut sym_set: Vec<String> = resolve_revision_range(git_dir, format, reader, &sym)
-                    .unwrap()
-                    .iter()
-                    .map(|oid| oid.to_hex())
-                    .collect();
+                let mut sym_set: Vec<String> =
+                    resolve_revision_range(git_dir, format, reader, &sym)
+                        .unwrap()
+                        .iter()
+                        .map(|oid| oid.to_hex())
+                        .collect();
                 sym_set.sort();
                 out.push((left.to_hex(), right.to_hex(), anc, bases, asym_set, sym_set));
             }
@@ -2813,8 +2898,13 @@ mod tests {
         let format = ObjectFormat::Sha1;
         let (db, all) = build_history(&git_dir, format);
         write_commit_graph_file(&git_dir, format, &db, &all);
-        let (root, a, oct, x1, x2) =
-            (all[0].clone(), all[1].clone(), all[9].clone(), all[10].clone(), all[11].clone());
+        let (root, a, oct, x1, x2) = (
+            all[0].clone(),
+            all[1].clone(),
+            all[9].clone(),
+            all[10].clone(),
+            all[11].clone(),
+        );
 
         // With a complete graph, ancestry/merge-base queries must be answerable
         // without ever reading a commit object: PanicReader errors on any read.
@@ -2971,11 +3061,13 @@ mod tests {
 
         // No monolithic commit-graph present, only the chain: queries must be
         // answerable from the chain without reading objects.
-        assert!(!git_dir
-            .join("objects")
-            .join("info")
-            .join("commit-graph")
-            .exists());
+        assert!(
+            !git_dir
+                .join("objects")
+                .join("info")
+                .join("commit-graph")
+                .exists()
+        );
         assert!(is_ancestor(&git_dir, format, &PanicReader, &root, &tip).unwrap());
         assert_eq!(
             merge_bases(&git_dir, format, &PanicReader, &mid, &tip).unwrap(),

@@ -400,11 +400,12 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
             "diff reverse output is not supported for this output mode".into(),
         ));
     }
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
 
     // Raw object names: diff-files (plumbing) prints full names by default, so a
     // `None` here means "full". `--abbrev`/`--abbrev=<n>` set an explicit width;
@@ -420,7 +421,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         format.hex_len()
     } else {
         o.patch_abbrev
-            .or(repository_abbrev(&git_dir, format)?)
+            .or(repository_abbrev(git_dir, format)?)
             .unwrap_or(7)
             .min(format.hex_len())
     };
@@ -447,14 +448,14 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
     let entries = if o.inexact_renames {
         sley_diff_merge::diff_name_status_index_worktree_with_rename_options(
             &worktree_root,
-            &git_dir,
+            git_dir,
             format,
             rename_options,
         )?
     } else {
         sley_diff_merge::diff_name_status_index_worktree_with_options(
             &worktree_root,
-            &git_dir,
+            git_dir,
             format,
             name_status_options,
         )?
@@ -488,7 +489,7 @@ fn run_diff_files(o: DiffFilesOptions) -> Result<()> {
         render_diff_files_entries(
             &entries,
             &o,
-            &db,
+            db,
             &worktree_root,
             raw_abbrev,
             patch_abbrev,

@@ -5,14 +5,13 @@
 //! modules' private items; the only items a submodule must expose are the
 //! `cmd_*` entry points the dispatcher in `run` calls, which are `pub(crate)`.
 
-pub(crate) mod attrs;
-pub(crate) mod branch;
-pub(crate) mod stash;
-pub(crate) mod tag;
-pub(crate) mod trees;
 pub(crate) mod am;
+pub(crate) mod args;
+pub(crate) mod attrs;
 pub(crate) mod bisect;
 pub(crate) mod blame;
+pub(crate) mod branch;
+pub(crate) mod cat_file;
 pub(crate) mod checkout_index;
 pub(crate) mod describe;
 pub(crate) mod diff_files;
@@ -20,6 +19,7 @@ pub(crate) mod diff_index;
 pub(crate) mod diff_tree;
 pub(crate) mod format_patch;
 pub(crate) mod grep;
+pub(crate) mod hash_object;
 pub(crate) mod interpret_trailers;
 pub(crate) mod merge_file;
 pub(crate) mod merge_tree;
@@ -32,5 +32,8 @@ pub(crate) mod shortlog;
 pub(crate) mod show;
 pub(crate) mod show_branch;
 pub(crate) mod sparse_checkout;
+pub(crate) mod stash;
+pub(crate) mod tag;
+pub(crate) mod trees;
 pub(crate) mod verify_commit;
 pub(crate) mod verify_tag;

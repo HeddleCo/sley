@@ -1,5 +1,5 @@
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
     Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry,
     RepositoryLayout,
@@ -9,23 +9,22 @@ use sley_object::{
     Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry, tree_entry_object_type,
 };
 use sley_odb::{
-    FileObjectDatabase, LooseObjectStore, ObjectPrefixResolution, ObjectReader, ObjectWriter,
-    build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
-    install_reachable_pack, repository_object_ids, repository_objects_dir,
-    verify_bundle_prerequisites,
+    FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
+    collect_reachable_object_ids, install_bundle_pack, install_reachable_pack,
+    repository_object_ids, repository_objects_dir, verify_bundle_prerequisites,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackIndex};
+use sley_protocol::{
+    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
+    RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec,
+    plan_fetch_ref_updates, read_receive_pack_push_options, read_receive_pack_request,
+    read_upload_pack_negotiation_request, read_upload_pack_request, refspec_map_source,
+    write_receive_pack_report_status, write_ref_advertisement_set,
+    write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
+};
 use sley_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry,
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
-};
-use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
-    RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, plan_fetch_ref_updates,
-    read_receive_pack_push_options, read_receive_pack_request, read_upload_pack_negotiation_request,
-    read_upload_pack_request, refspec_map_source, write_receive_pack_report_status,
-    write_ref_advertisement_set, write_upload_pack_packfile_response,
-    write_upload_pack_raw_packfile_response,
 };
 use sley_transport::{RemoteTransport, parse_remote_url};
 use std::cell::Cell;
@@ -45,6 +44,12 @@ static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 
 mod commands;
+mod repo_path;
+mod repository;
+pub(crate) use commands::args::{GitArgCursor, long_option_value};
+pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
+pub(crate) use repo_path::RepoPathBuf;
+pub(crate) use repository::RepositoryContext;
 use commands::tag::{parse_tag_trailer, tag_message_with_trailers, tag_stripspace_message};
 
 pub fn run(args: Vec<String>) -> Result<()> {
@@ -64,8 +69,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "archive" => cmd_archive(&args[1..]),
         "branch" => commands::branch::cmd_branch(&args[1..]),
         "bundle" => cmd_bundle(&args[1..]),
-        "hash-object" => cmd_hash_object(&args[1..]),
-        "cat-file" => cmd_cat_file(&args[1..]),
+        "hash-object" => commands::hash_object::cmd_hash_object(&args[1..]),
+        "cat-file" => commands::cat_file::cmd_cat_file(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(&args[1..]),
         "check-ignore" => commands::attrs::cmd_check_ignore(&args[1..]),
@@ -144,37 +149,6 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "interpret-trailers" => commands::interpret_trailers::cmd_interpret_trailers(&args[1..]),
         _ => Err(GitError::Command(format!("unsupported command {command}"))),
     }
-}
-
-struct GitArgCursor<'a> {
-    args: &'a [String],
-    position: usize,
-}
-
-impl<'a> GitArgCursor<'a> {
-    fn new(args: &'a [String]) -> Self {
-        Self { args, position: 0 }
-    }
-
-    fn next(&mut self) -> Option<&'a str> {
-        let value = self.args.get(self.position)?;
-        self.position += 1;
-        Some(value)
-    }
-
-    fn next_value(&mut self) -> Option<&'a str> {
-        self.next()
-    }
-
-    fn rest(&self) -> &'a [String] {
-        &self.args[self.position..]
-    }
-}
-
-fn long_option_value<'a>(arg: &'a str, option: &str) -> Option<&'a str> {
-    let value = arg.strip_prefix("--")?;
-    let (name, value) = value.split_once('=')?;
-    (name == option).then_some(value)
 }
 
 fn cmd_version() -> Result<()> {
@@ -2705,25 +2679,26 @@ fn cmd_clone(args: &[String]) -> Result<()> {
     // branch-tracking local clone: template, alternates, the origin remote (with
     // the given fetch refspec — `None` for `--revision`), `-c` overrides,
     // `submodule.active`, and any `--bundle-uri`. Returns the resulting config.
-    let configure_local_clone = |git_dir: &Path, fetch_refspec: Option<String>| -> Result<GitConfig> {
-        apply_clone_template(git_dir, template.as_deref(), template_config)?;
-        apply_clone_alternates(git_dir, &alternates, dissociate)?;
-        configure_clone_remote(
-            git_dir,
-            &origin,
-            &repository,
-            fetch_refspec,
-            false,
-            tag_opt.as_deref(),
-            partial_clone_filter.as_deref(),
-        )?;
-        apply_clone_config_overrides(git_dir, &config_overrides)?;
-        apply_clone_submodule_active(git_dir, &submodule_active)?;
-        if let Some(bundle_uri) = bundle_uri.as_ref() {
-            apply_clone_bundle_uri(git_dir, format, bundle_uri)?;
-        }
-        read_repo_config(git_dir)
-    };
+    let configure_local_clone =
+        |git_dir: &Path, fetch_refspec: Option<String>| -> Result<GitConfig> {
+            apply_clone_template(git_dir, template.as_deref(), template_config)?;
+            apply_clone_alternates(git_dir, &alternates, dissociate)?;
+            configure_clone_remote(
+                git_dir,
+                &origin,
+                &repository,
+                fetch_refspec,
+                false,
+                tag_opt.as_deref(),
+                partial_clone_filter.as_deref(),
+            )?;
+            apply_clone_config_overrides(git_dir, &config_overrides)?;
+            apply_clone_submodule_active(git_dir, &submodule_active)?;
+            if let Some(bundle_uri) = bundle_uri.as_ref() {
+                apply_clone_bundle_uri(git_dir, format, bundle_uri)?;
+            }
+            read_repo_config(git_dir)
+        };
 
     if let Some(revision_oid) = revision_oid.as_ref() {
         // `--revision` copies the object closure directly and checks out detached;
@@ -4262,10 +4237,14 @@ fn cmd_repack(args: &[String]) -> Result<()> {
             "-a" | "-A" | "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
             value if value.starts_with("--window") || value.starts_with("--depth") => {}
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!("unsupported repack option {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported repack option {value}"
+                )));
             }
             value => {
-                return Err(GitError::Command(format!("unsupported repack argument {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported repack argument {value}"
+                )));
             }
         }
     }
@@ -4286,14 +4265,23 @@ fn cmd_gc(args: &[String]) -> Result<()> {
             "-q" | "--quiet" => quiet = true,
             // Accepted no-ops for the M1 subset (we consolidate packs + drop
             // redundant ones; aggressive unreachable pruning is deferred).
-            "--auto" | "--aggressive" | "--force" | "--no-detach" | "--prune" | "--no-prune"
-            | "--progress" | "--no-progress" | "--keep-largest-pack" => {}
+            "--auto"
+            | "--aggressive"
+            | "--force"
+            | "--no-detach"
+            | "--prune"
+            | "--no-prune"
+            | "--progress"
+            | "--no-progress"
+            | "--keep-largest-pack" => {}
             value if value.starts_with("--prune=") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported gc option {value}")));
             }
             value => {
-                return Err(GitError::Command(format!("unsupported gc argument {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported gc argument {value}"
+                )));
             }
         }
     }
@@ -4330,10 +4318,14 @@ fn cmd_apply(args: &[String]) -> Result<()> {
             "--apply" | "--stat" | "--numstat" | "--summary" | "-q" | "--quiet" | "--recount"
             | "--allow-empty" | "--unsafe-paths" => {}
             "-R" | "--reverse" => {
-                return Err(GitError::Unsupported("apply --reverse is not supported yet".into()));
+                return Err(GitError::Unsupported(
+                    "apply --reverse is not supported yet".into(),
+                ));
             }
             "-3" | "--3way" | "--index" | "--cached" => {
-                return Err(GitError::Unsupported(format!("apply {arg} is not supported yet")));
+                return Err(GitError::Unsupported(format!(
+                    "apply {arg} is not supported yet"
+                )));
             }
             "-p" | "-C" | "--whitespace" | "--directory" | "--exclude" | "--include" => {
                 iter.next();
@@ -4349,7 +4341,9 @@ fn cmd_apply(args: &[String]) -> Result<()> {
                     || value.starts_with("--exclude=")
                     || value.starts_with("--include=") => {}
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!("unsupported apply option {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported apply option {value}"
+                )));
             }
             value => files.push(value.to_string()),
         }
@@ -4386,10 +4380,7 @@ fn cmd_apply(args: &[String]) -> Result<()> {
                     .as_deref()
                     .or(patch.old_path.as_deref())
                     .unwrap_or(b"");
-                eprintln!(
-                    "error: patch failed: {}",
-                    String::from_utf8_lossy(name)
-                );
+                eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
                 return Err(GitError::Exit(1));
             }
         };
@@ -4846,15 +4837,18 @@ fn cmd_merge(args: &[String]) -> Result<()> {
                 );
             }
             value if value.starts_with("--message=") => {
-                options.message =
-                    value.strip_prefix("--message=").map(|value| value.to_string());
+                options.message = value
+                    .strip_prefix("--message=")
+                    .map(|value| value.to_string());
             }
             "--" => {
                 positional.extend(iter.by_ref().map(|value| value.to_string()));
                 break;
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!("unsupported merge option {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported merge option {value}"
+                )));
             }
             value => positional.push(value.to_string()),
         }
@@ -5112,10 +5106,7 @@ fn cmd_merge(args: &[String]) -> Result<()> {
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
-                base,
-                ours,
-                theirs,
-                ..
+                base, ours, theirs, ..
             } => {
                 if let Some((mode, oid)) = base {
                     entries.push(merge_index_entry(path, *mode, oid.clone(), 1));
@@ -5296,7 +5287,12 @@ fn finalize_replay(
             }),
         });
         tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+        sley_worktree::reset_index_and_worktree_to_commit(
+            worktree_root,
+            git_dir,
+            format,
+            &new_oid,
+        )?;
         return Ok(());
     }
 
@@ -5308,10 +5304,7 @@ fn finalize_replay(
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
-                base,
-                ours,
-                theirs,
-                ..
+                base, ours, theirs, ..
             } => {
                 if let Some((mode, oid)) = base {
                     entries.push(merge_index_entry(path, *mode, oid.clone(), 1));
@@ -5357,7 +5350,10 @@ fn finalize_replay(
             },
         }
     }
-    fs::write(git_dir.join(plan.state_file), format!("{}\n", plan.state_oid))?;
+    fs::write(
+        git_dir.join(plan.state_file),
+        format!("{}\n", plan.state_oid),
+    )?;
     let mut merge_msg = plan.message.clone();
     merge_msg.extend_from_slice(b"\nConflicts:\n");
     for path in &conflicts {
@@ -5431,7 +5427,8 @@ fn cmd_cherry_pick(args: &[String]) -> Result<()> {
     };
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let pick = read_reused_commit(&git_dir, format, &target)?;
-    let pick_oid = sley_rev::peel_to_commit(&db, format, &resolve_revision(&git_dir, format, &target)?)?;
+    let pick_oid =
+        sley_rev::peel_to_commit(&db, format, &resolve_revision(&git_dir, format, &target)?)?;
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("cherry-pick onto unborn HEAD is not supported".into()))?;
     let theirs_map = stash_tree_entry_map(&db, format, &pick.tree)?;
@@ -5478,7 +5475,9 @@ fn cmd_revert(args: &[String]) -> Result<()> {
             "--abort" => abort = true,
             "--no-edit" => {}
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!("unsupported revert option {value}")));
+                return Err(GitError::Command(format!(
+                    "unsupported revert option {value}"
+                )));
             }
             value => positional.push(value.to_string()),
         }
@@ -5533,7 +5532,10 @@ fn cmd_revert(args: &[String]) -> Result<()> {
         ReplayPlan {
             base: base_map,
             theirs: theirs_map,
-            theirs_label: format!("parent of {} ({subject})", format_log_abbrev_oid(&revert_oid)),
+            theirs_label: format!(
+                "parent of {} ({subject})",
+                format_log_abbrev_oid(&revert_oid)
+            ),
             new_parents: vec![head_oid.clone()],
             author,
             committer: identity,
@@ -8317,8 +8319,9 @@ fn cmd_upload_pack(args: &[String]) -> Result<()> {
     }
 
     let sideband = sley_remote::upload_pack_request_uses_sideband(&request);
-    let response =
-        sley_remote::upload_pack_from_local_repository(&git_dir, format, &features, request, haves)?;
+    let response = sley_remote::upload_pack_from_local_repository(
+        &git_dir, format, &features, request, haves,
+    )?;
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     if sideband {
@@ -8634,7 +8637,15 @@ fn fetch_local_repository(
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
     };
-    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
+    run_fetch(
+        git_dir,
+        format,
+        &config,
+        source,
+        &fetch_source,
+        refspecs,
+        options,
+    )
 }
 
 /// A [`sley_remote::ProgressSink`] that prints each progress/summary line to
@@ -8697,7 +8708,15 @@ fn fetch_ssh_repository(
     let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Ssh(remote);
-    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
+    run_fetch(
+        git_dir,
+        format,
+        &config,
+        source,
+        &fetch_source,
+        refspecs,
+        options,
+    )
 }
 
 // ===== Transport dispatch =====
@@ -8729,7 +8748,15 @@ fn fetch_http_repository(
     let config = read_repo_config(git_dir)?;
     let remote = parse_remote_url(&ls_remote_resolved_url(source)?)?;
     let fetch_source = sley_remote::FetchSource::Http(remote);
-    run_fetch(git_dir, format, &config, source, &fetch_source, refspecs, options)
+    run_fetch(
+        git_dir,
+        format,
+        &config,
+        source,
+        &fetch_source,
+        refspecs,
+        options,
+    )
 }
 
 /// Resolve `repository` to an HTTP(S) remote and list its advertisements via
@@ -12518,892 +12545,6 @@ fn checkout_create_or_reset_branch(
     }
 }
 
-fn cmd_hash_object(args: &[String]) -> Result<()> {
-    let mut object_type = ObjectType::Blob;
-    let mut format = ObjectFormat::Sha1;
-    let mut explicit_format = false;
-    let mut read_stdin = false;
-    let mut read_stdin_paths = false;
-    let mut allow_no_input = false;
-    let mut write = false;
-    let mut paths = Vec::new();
-    let mut positional_only = false;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if positional_only {
-            paths.push(PathBuf::from(arg));
-            continue;
-        }
-        match arg.as_str() {
-            "--" => {
-                positional_only = true;
-                allow_no_input = true;
-            }
-            "--stdin" => read_stdin = true,
-            "--no-stdin" => {
-                read_stdin = false;
-                allow_no_input = true;
-            }
-            "--stdin-paths" => read_stdin_paths = true,
-            "--no-stdin-paths" => {
-                read_stdin_paths = false;
-                allow_no_input = true;
-            }
-            value if value.starts_with("--stdin=") => {
-                return hash_object_option_takes_no_value_error("stdin");
-            }
-            value if value.starts_with("--no-stdin=") => {
-                return hash_object_option_takes_no_value_error("no-stdin");
-            }
-            value if value.starts_with("--stdin-paths=") => {
-                return hash_object_option_takes_no_value_error("stdin-paths");
-            }
-            value if value.starts_with("--no-stdin-paths=") => {
-                return hash_object_option_takes_no_value_error("no-stdin-paths");
-            }
-            value if value.starts_with("--filters=") => {
-                return hash_object_option_takes_no_value_error("no-no-filters");
-            }
-            value if value.starts_with("--no-filters=") => {
-                return hash_object_option_takes_no_value_error("no-filters");
-            }
-            value if value.starts_with("--literally=") => {
-                return hash_object_option_takes_no_value_error("literally");
-            }
-            value if value.starts_with("--no-literally=") => {
-                return hash_object_option_takes_no_value_error("no-literally");
-            }
-            value if value.starts_with("--no-path=") => {
-                return hash_object_option_takes_no_value_error("no-path");
-            }
-            "--filters" | "--no-filters" | "--literally" | "--no-literally" => {}
-            "--no-path" => {}
-            "--path" => {
-                iter.next()
-                    .ok_or_else(hash_object_path_requires_value_error)?;
-            }
-            "-t" => {
-                let Some(value) = iter.next() else {
-                    return hash_object_type_requires_value_error();
-                };
-                object_type = value.parse()?;
-            }
-            value if value.starts_with("-t") && value.len() > 2 => {
-                object_type = value[2..].parse()?;
-            }
-            "-w" => write = true,
-            "--object-format=sha1" => {
-                format = ObjectFormat::Sha1;
-                explicit_format = true;
-            }
-            "--object-format=sha256" => {
-                format = ObjectFormat::Sha256;
-                explicit_format = true;
-            }
-            "--object-format" => {
-                format = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?
-                    .parse()?;
-                explicit_format = true;
-            }
-            value if value.starts_with("--path=") => {}
-            value => paths.push(PathBuf::from(value)),
-        }
-    }
-    if !read_stdin && !read_stdin_paths && paths.is_empty() {
-        if allow_no_input {
-            return Ok(());
-        }
-        return Err(GitError::Command(
-            "hash-object requires --stdin or a path".into(),
-        ));
-    }
-    let mut store = None;
-    let cwd = env::current_dir()?;
-    if write {
-        let git_dir = discover_git_dir(&cwd)?;
-        let repo_format = repository_object_format(&git_dir)?;
-        if !explicit_format {
-            format = repo_format;
-        }
-        store = Some(LooseObjectStore::from_git_dir(&git_dir, format));
-    } else if !explicit_format && let Ok(git_dir) = discover_git_dir(&cwd) {
-        format = repository_object_format(&git_dir)?;
-    }
-    if read_stdin {
-        let mut body = Vec::new();
-        io::stdin().read_to_end(&mut body)?;
-        print_hash_object(object_type, format, body, store.as_mut())?;
-    }
-    if read_stdin_paths {
-        let mut body = Vec::new();
-        io::stdin().read_to_end(&mut body)?;
-        for path in body.split(|byte| *byte == b'\n') {
-            if path.is_empty() {
-                continue;
-            }
-            let path = path.strip_suffix(b"\r").unwrap_or(path);
-            let path = String::from_utf8_lossy(path);
-            let body = read_hash_object_path(Path::new(path.as_ref()))?;
-            print_hash_object(object_type, format, body, store.as_mut())?;
-        }
-    }
-    for path in paths {
-        let body = read_hash_object_path(path)?;
-        print_hash_object(object_type, format, body, store.as_mut())?;
-    }
-    Ok(())
-}
-
-fn read_hash_object_path(path: impl AsRef<Path>) -> Result<Vec<u8>> {
-    let path = path.as_ref();
-    match fs::read(path) {
-        Ok(body) => Ok(body),
-        Err(err) => {
-            let reason = if err.kind() == io::ErrorKind::NotFound {
-                "No such file or directory".to_string()
-            } else {
-                err.to_string()
-            };
-            eprintln!(
-                "fatal: could not open '{}' for reading: {reason}",
-                path.display()
-            );
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
-fn hash_object_type_requires_value_error() -> Result<()> {
-    eprintln!("error: switch `t' requires a value");
-    Err(GitError::Exit(129))
-}
-
-fn hash_object_path_requires_value_error() -> GitError {
-    eprintln!("error: switch `path' requires a value");
-    GitError::Exit(129)
-}
-
-fn hash_object_option_takes_no_value_error(option: &str) -> Result<()> {
-    eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
-}
-
-fn print_hash_object(
-    object_type: ObjectType,
-    format: ObjectFormat,
-    body: Vec<u8>,
-    store: Option<&mut LooseObjectStore>,
-) -> Result<()> {
-    let object = sley_object::EncodedObject::new(object_type, body);
-    let oid = if let Some(store) = store {
-        store.write_object(object)?
-    } else {
-        object.object_id(format)?
-    };
-    println!("{oid}");
-    Ok(())
-}
-
-fn cmd_cat_file(args: &[String]) -> Result<()> {
-    let mut batch = None;
-    let mut batch_all_objects = false;
-    let mut buffer = false;
-    let mut input_nul = false;
-    let mut output_nul = false;
-    let mut positional = Vec::new();
-    let ordinary_args: Vec<String> = args
-        .iter()
-        .filter(|arg| !cat_file_is_mailmap_toggle(arg))
-        .cloned()
-        .collect();
-    for arg in args {
-        match arg.as_str() {
-            "--use-mailmap" | "--no-use-mailmap" | "--mailmap" | "--no-mailmap" => {}
-            value if value.starts_with("--use-mailmap=") => {
-                return cat_file_option_takes_no_value_error("use-mailmap");
-            }
-            value if value.starts_with("--no-use-mailmap=") => {
-                return cat_file_option_takes_no_value_error("no-use-mailmap");
-            }
-            value if value.starts_with("--mailmap=") => {
-                return cat_file_option_takes_no_value_error("mailmap");
-            }
-            value if value.starts_with("--no-mailmap=") => {
-                return cat_file_option_takes_no_value_error("no-mailmap");
-            }
-            "--batch" => set_cat_file_batch_mode(&mut batch, CatFileBatchMode::Batch, None)?,
-            "--batch-check" => {
-                set_cat_file_batch_mode(&mut batch, CatFileBatchMode::BatchCheck, None)?
-            }
-            "--batch-command" => {
-                set_cat_file_batch_mode(&mut batch, CatFileBatchMode::Command, None)?
-            }
-            "--batch-all-objects" => batch_all_objects = true,
-            "-z" => input_nul = true,
-            "-Z" => {
-                input_nul = true;
-                output_nul = true;
-            }
-            "--buffer" => buffer = true,
-            "--no-buffer" => buffer = false,
-            "--unordered" | "--no-unordered" | "--follow-symlinks" | "--no-follow-symlinks" => {}
-            value if value.starts_with("--batch=") => {
-                set_cat_file_batch_mode(
-                    &mut batch,
-                    CatFileBatchMode::Batch,
-                    value.strip_prefix("--batch=").map(str::to_string),
-                )?;
-            }
-            value if value.starts_with("--batch-check=") => {
-                set_cat_file_batch_mode(
-                    &mut batch,
-                    CatFileBatchMode::BatchCheck,
-                    value.strip_prefix("--batch-check=").map(str::to_string),
-                )?;
-            }
-            value if value.starts_with("--batch-command=") => {
-                set_cat_file_batch_mode(
-                    &mut batch,
-                    CatFileBatchMode::Command,
-                    value.strip_prefix("--batch-command=").map(str::to_string),
-                )?;
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-    if let Some((mode, format)) = batch {
-        if !positional.is_empty() {
-            return Err(GitError::Command(
-                "cat-file batch modes do not take object arguments".into(),
-            ));
-        }
-        return match mode {
-            CatFileBatchMode::Batch => cmd_cat_file_batch(
-                false,
-                format.as_deref(),
-                input_nul,
-                output_nul,
-                batch_all_objects,
-            ),
-            CatFileBatchMode::BatchCheck => cmd_cat_file_batch(
-                true,
-                format.as_deref(),
-                input_nul,
-                output_nul,
-                batch_all_objects,
-            ),
-            CatFileBatchMode::Command if batch_all_objects => {
-                cmd_cat_file_batch(true, format.as_deref(), input_nul, output_nul, true)
-            }
-            CatFileBatchMode::Command => {
-                cmd_cat_file_batch_command(format.as_deref(), input_nul, output_nul, buffer)
-            }
-        };
-    }
-    if batch_all_objects {
-        eprintln!("fatal: '--batch-all-objects' requires a batch mode");
-        return Err(GitError::Exit(129));
-    }
-    if input_nul || output_nul {
-        return Err(GitError::Command(
-            "cat-file -z requires a batch mode".into(),
-        ));
-    }
-    if ordinary_args.len() != 2 {
-        return Err(GitError::Command(
-            "cat-file requires --batch, --batch-check, or one mode (-e, -t, -s, or -p) and an object id".into(),
-        ));
-    }
-    let mode = ordinary_args[0].as_str();
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let oid = resolve_revision(&git_dir, format, &ordinary_args[1])?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let object = db.read_object(&oid)?;
-    match mode {
-        "-e" => {}
-        "-t" => println!("{}", object.object_type.as_str()),
-        "-s" => println!("{}", object.body.len()),
-        "-p" => {
-            if object.object_type == ObjectType::Tree {
-                print_tree(
-                    None,
-                    format,
-                    &object.body,
-                    TreePrintOptions {
-                        name_only: false,
-                        object_only: false,
-                        long: false,
-                        show_trees: false,
-                        tree_only: false,
-                        oid_abbrev: None,
-                        format_spec: None,
-                        nul: false,
-                    },
-                )?;
-            } else {
-                io::stdout().write_all(&object.body)?;
-                io::stdout().flush()?;
-            }
-        }
-        _ => {
-            return Err(GitError::Command(format!(
-                "unsupported cat-file mode {mode}; expected -e, -t, -s, or -p"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn cat_file_is_mailmap_toggle(arg: &str) -> bool {
-    matches!(
-        arg,
-        "--use-mailmap" | "--no-use-mailmap" | "--mailmap" | "--no-mailmap"
-    )
-}
-
-fn cat_file_option_takes_no_value_error(option: &str) -> Result<()> {
-    eprintln!("error: option `{option}' takes no value");
-    Err(GitError::Exit(129))
-}
-
-#[derive(Clone, Copy)]
-enum CatFileBatchMode {
-    Batch,
-    BatchCheck,
-    Command,
-}
-
-fn set_cat_file_batch_mode(
-    batch: &mut Option<(CatFileBatchMode, Option<String>)>,
-    mode: CatFileBatchMode,
-    format: Option<String>,
-) -> Result<()> {
-    if batch.replace((mode, format)).is_some() {
-        return Err(GitError::Command(
-            "cat-file supports only one batch mode".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn cmd_cat_file_batch(
-    check_only: bool,
-    batch_format: Option<&str>,
-    input_nul: bool,
-    output_nul: bool,
-    batch_all_objects: bool,
-) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let records = if batch_all_objects {
-        cat_file_all_object_ids(&git_dir, format)?
-            .into_iter()
-            .map(|oid| oid.to_string())
-            .collect()
-    } else {
-        let mut input = Vec::new();
-        io::stdin().read_to_end(&mut input)?;
-        cat_file_batch_input_records(&input, input_nul)
-    };
-    let mut stdout = io::stdout();
-    let terminator = if output_nul { b'\0' } else { b'\n' };
-    for line in records {
-        let (object_name, rest) = cat_file_batch_input(&line, batch_format);
-        print_cat_file_batch_record(
-            &mut stdout,
-            CatFileBatchRecord {
-                git_dir: &git_dir,
-                format,
-                db: &db,
-                object_name,
-                rest,
-                batch_format,
-                check_only,
-                terminator,
-            },
-        )?;
-    }
-    stdout.flush()?;
-    Ok(())
-}
-
-struct CatFileBatchRecord<'a> {
-    git_dir: &'a Path,
-    format: ObjectFormat,
-    db: &'a FileObjectDatabase,
-    object_name: &'a str,
-    rest: &'a str,
-    batch_format: Option<&'a str>,
-    check_only: bool,
-    terminator: u8,
-}
-
-fn print_cat_file_batch_record(
-    stdout: &mut io::Stdout,
-    record: CatFileBatchRecord<'_>,
-) -> Result<()> {
-    let Ok(oid) =
-        resolve_revision_with_reader(record.git_dir, record.format, record.db, record.object_name)
-    else {
-        write!(stdout, "{} missing", record.object_name)?;
-        stdout.write_all(&[record.terminator])?;
-        return Ok(());
-    };
-    if record.check_only {
-        // Metadata-only: report type + size via the header fast path, which never
-        // decodes the object body (git's --batch-check behavior).
-        let Ok(Some((object_type, size))) = record.db.read_object_header(&oid) else {
-            write!(stdout, "{} missing", record.object_name)?;
-            stdout.write_all(&[record.terminator])?;
-            return Ok(());
-        };
-        return print_cat_file_batch_header(stdout, &record, &oid, object_type, size);
-    }
-    let Ok(object) = record.db.read_object(&oid) else {
-        write!(stdout, "{} missing", record.object_name)?;
-        stdout.write_all(&[record.terminator])?;
-        return Ok(());
-    };
-    print_cat_file_batch_header(
-        stdout,
-        &record,
-        &oid,
-        object.object_type,
-        object.body.len() as u64,
-    )?;
-    stdout.write_all(&object.body)?;
-    stdout.write_all(&[record.terminator])?;
-    Ok(())
-}
-
-/// Write the `<oid> <type> <size>` (or custom-format) header line for one cat-file
-/// batch record, shared by the metadata-only (`--batch-check`) and full-content
-/// (`--batch`) paths so both emit byte-identical headers.
-fn print_cat_file_batch_header(
-    stdout: &mut io::Stdout,
-    record: &CatFileBatchRecord<'_>,
-    oid: &ObjectId,
-    object_type: ObjectType,
-    size: u64,
-) -> Result<()> {
-    if let Some(batch_format) = record.batch_format {
-        let storage = if cat_file_batch_format_needs_storage(batch_format) {
-            Some(cat_file_object_storage(record.git_dir, record.format, oid)?)
-        } else {
-            None
-        };
-        print_cat_file_batch_format(
-            stdout,
-            batch_format,
-            oid,
-            object_type,
-            size as usize,
-            storage.as_ref(),
-            record.rest,
-        )?;
-    } else {
-        write!(stdout, "{} {} {}", oid, object_type.as_str(), size)?;
-    }
-    stdout.write_all(&[record.terminator])?;
-    Ok(())
-}
-
-fn cmd_cat_file_batch_command(
-    batch_format: Option<&str>,
-    input_nul: bool,
-    output_nul: bool,
-    buffer: bool,
-) -> Result<()> {
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    let records = cat_file_batch_input_records(&input, input_nul);
-    let mut stdout = io::stdout();
-    let terminator = if output_nul { b'\0' } else { b'\n' };
-    for line in records {
-        if line == "flush" {
-            if !buffer {
-                eprintln!("fatal: flush is only for --buffer mode");
-                return Err(GitError::Exit(128));
-            }
-            stdout.flush()?;
-            continue;
-        }
-        if let Some(object_name) = line.strip_prefix("info ") {
-            print_cat_file_batch_record(
-                &mut stdout,
-                CatFileBatchRecord {
-                    git_dir: &git_dir,
-                    format,
-                    db: &db,
-                    object_name,
-                    rest: "",
-                    batch_format,
-                    check_only: true,
-                    terminator,
-                },
-            )?;
-            continue;
-        }
-        if let Some(object_name) = line.strip_prefix("contents ") {
-            print_cat_file_batch_record(
-                &mut stdout,
-                CatFileBatchRecord {
-                    git_dir: &git_dir,
-                    format,
-                    db: &db,
-                    object_name,
-                    rest: "",
-                    batch_format,
-                    check_only: false,
-                    terminator,
-                },
-            )?;
-            continue;
-        }
-        eprintln!("fatal: unknown command: '{line}'");
-        return Err(GitError::Exit(128));
-    }
-    stdout.flush()?;
-    Ok(())
-}
-
-fn cat_file_all_object_ids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
-    let objects_dir = repository_objects_dir(git_dir);
-    let mut oids = HashSet::new();
-    collect_loose_object_ids(&objects_dir, format, &mut oids)?;
-    collect_packed_object_ids(&objects_dir.join("pack"), format, &mut oids)?;
-    let mut oids = oids.into_iter().collect::<Vec<_>>();
-    oids.sort_by_key(ObjectId::to_hex);
-    Ok(oids)
-}
-
-fn collect_loose_object_ids(
-    objects_dir: &Path,
-    format: ObjectFormat,
-    oids: &mut HashSet<ObjectId>,
-) -> Result<()> {
-    if !objects_dir.exists() {
-        return Ok(());
-    }
-    let hex_len = format.hex_len();
-    for entry in fs::read_dir(objects_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name();
-        let Some(fanout) = name.to_str() else {
-            continue;
-        };
-        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        for object_entry in fs::read_dir(entry.path())? {
-            let object_entry = object_entry?;
-            if !object_entry.file_type()?.is_file() {
-                continue;
-            }
-            let name = object_entry.file_name();
-            let Some(suffix) = name.to_str() else {
-                continue;
-            };
-            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                continue;
-            }
-            oids.insert(ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?);
-        }
-    }
-    Ok(())
-}
-
-fn collect_packed_object_ids(
-    pack_dir: &Path,
-    format: ObjectFormat,
-    oids: &mut HashSet<ObjectId>,
-) -> Result<()> {
-    if !pack_dir.exists() {
-        return Ok(());
-    }
-    let midx_path = pack_dir.join("multi-pack-index");
-    if midx_path.exists() {
-        let midx = MultiPackIndex::parse(&fs::read(&midx_path)?, format)?;
-        oids.extend(midx.objects.into_iter().map(|entry| entry.oid));
-    }
-    for entry in fs::read_dir(pack_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-            continue;
-        }
-        let index = PackIndex::parse(&fs::read(path)?, format)?;
-        oids.extend(index.entries.into_iter().map(|entry| entry.oid));
-    }
-    Ok(())
-}
-
-fn cat_file_batch_input_records(input: &[u8], nul: bool) -> Vec<String> {
-    if !nul {
-        return String::from_utf8_lossy(input)
-            .lines()
-            .map(str::to_string)
-            .collect();
-    }
-    let separator = if nul { b'\0' } else { b'\n' };
-    input
-        .split(|byte| *byte == separator)
-        .filter(|record| !record.is_empty())
-        .map(|record| String::from_utf8_lossy(record).into_owned())
-        .collect()
-}
-
-fn cat_file_batch_input<'a>(line: &'a str, batch_format: Option<&str>) -> (&'a str, &'a str) {
-    if batch_format.is_some_and(|format| format.contains("%(rest)")) {
-        line.split_once(char::is_whitespace)
-            .map(|(object_name, rest)| (object_name, rest.trim_start()))
-            .unwrap_or((line, ""))
-    } else {
-        (line, "")
-    }
-}
-
-fn print_cat_file_batch_format(
-    stdout: &mut io::Stdout,
-    format: &str,
-    oid: &ObjectId,
-    object_type: ObjectType,
-    object_size: usize,
-    storage: Option<&CatFileObjectStorage>,
-    rest: &str,
-) -> Result<()> {
-    let mut cursor = 0;
-    while let Some(start) = format[cursor..].find("%(") {
-        let start = cursor + start;
-        stdout.write_all(&format.as_bytes()[cursor..start])?;
-        let Some(end) = format[start + 2..].find(')') else {
-            return Err(GitError::Command(
-                "unterminated cat-file batch placeholder".into(),
-            ));
-        };
-        let end = start + 2 + end;
-        let placeholder = &format[start + 2..end];
-        match placeholder {
-            "objectname" => write!(stdout, "{oid}")?,
-            "objecttype" => stdout.write_all(object_type.as_str().as_bytes())?,
-            "objectsize" => write!(stdout, "{object_size}")?,
-            "objectsize:disk" => {
-                let storage = storage.ok_or_else(|| {
-                    GitError::Command("cat-file batch storage metadata was not loaded".into())
-                })?;
-                write!(stdout, "{}", storage.disk_size)?
-            }
-            "deltabase" => {
-                let storage = storage.ok_or_else(|| {
-                    GitError::Command("cat-file batch storage metadata was not loaded".into())
-                })?;
-                write!(stdout, "{}", storage.deltabase)?
-            }
-            "rest" => stdout.write_all(rest.as_bytes())?,
-            other => {
-                return Err(GitError::Command(format!(
-                    "unsupported cat-file batch placeholder %({other})"
-                )));
-            }
-        }
-        cursor = end + 1;
-    }
-    stdout.write_all(&format.as_bytes()[cursor..])?;
-    Ok(())
-}
-
-fn cat_file_batch_format_needs_storage(format: &str) -> bool {
-    format.contains("%(objectsize:disk)") || format.contains("%(deltabase)")
-}
-
-#[derive(Debug, Clone)]
-struct CatFileObjectStorage {
-    disk_size: u64,
-    deltabase: ObjectId,
-}
-
-fn cat_file_object_storage(
-    git_dir: &Path,
-    format: ObjectFormat,
-    oid: &ObjectId,
-) -> Result<CatFileObjectStorage> {
-    if let Some(disk_size) = for_each_ref_loose_object_disk_size(git_dir, oid)? {
-        return Ok(CatFileObjectStorage {
-            disk_size,
-            deltabase: zero_oid(format)?,
-        });
-    }
-    cat_file_packed_object_storage(git_dir, format, oid)?.ok_or_else(|| {
-        GitError::NotFound(format!(
-            "object {oid} storage metadata in {}",
-            repository_objects_dir(git_dir).display()
-        ))
-    })
-}
-
-fn cat_file_packed_object_storage(
-    git_dir: &Path,
-    format: ObjectFormat,
-    oid: &ObjectId,
-) -> Result<Option<CatFileObjectStorage>> {
-    let pack_dir = repository_objects_dir(git_dir).join("pack");
-    if !pack_dir.exists() {
-        return Ok(None);
-    }
-    for entry in fs::read_dir(pack_dir)? {
-        let path = entry?.path();
-        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
-            continue;
-        }
-        let index = PackIndex::parse(&fs::read(&path)?, format)?;
-        let Some(index_entry) = index.find(oid) else {
-            continue;
-        };
-        let Some(stem) = path.file_stem() else {
-            continue;
-        };
-        let pack_path = path.with_file_name(format!("{}.pack", stem.to_string_lossy()));
-        if !pack_path.exists() {
-            return Err(GitError::NotFound(format!(
-                "pack file {} for index {}",
-                pack_path.display(),
-                path.display()
-            )));
-        }
-        return cat_file_pack_entry_storage(format, &pack_path, &index.entries, index_entry.offset)
-            .map(Some);
-    }
-    Ok(None)
-}
-
-fn cat_file_pack_entry_storage(
-    format: ObjectFormat,
-    pack_path: &Path,
-    entries: &[sley_pack::PackIndexEntry],
-    entry_offset: u64,
-) -> Result<CatFileObjectStorage> {
-    let pack_len = fs::metadata(pack_path)?.len();
-    let trailer_offset = pack_len
-        .checked_sub(format.raw_len() as u64)
-        .ok_or_else(|| GitError::InvalidFormat("pack file shorter than checksum".into()))?;
-    let mut offset_entries = entries.iter().collect::<Vec<_>>();
-    offset_entries.sort_by_key(|entry| entry.offset);
-    let Some(position) = offset_entries
-        .iter()
-        .position(|entry| entry.offset == entry_offset)
-    else {
-        return Err(GitError::InvalidFormat(format!(
-            "pack index offset {entry_offset} not found"
-        )));
-    };
-    let end_offset = offset_entries
-        .get(position + 1)
-        .map(|entry| entry.offset)
-        .unwrap_or(trailer_offset);
-    let disk_size = end_offset
-        .checked_sub(entry_offset)
-        .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
-    let pack = fs::read(pack_path)?;
-    let delta_base = cat_file_pack_entry_delta_base(format, &pack, entry_offset)?;
-    let deltabase = match delta_base {
-        Some(CatFilePackDeltaBase::Offset(offset)) => offset_entries
-            .iter()
-            .find(|entry| entry.offset == offset)
-            .map(|entry| entry.oid.clone())
-            .ok_or_else(|| {
-                GitError::InvalidFormat(format!("ofs-delta base offset {offset} not found"))
-            })?,
-        Some(CatFilePackDeltaBase::Ref(oid)) => oid,
-        None => zero_oid(format)?,
-    };
-    Ok(CatFileObjectStorage {
-        disk_size,
-        deltabase,
-    })
-}
-
-enum CatFilePackDeltaBase {
-    Offset(u64),
-    Ref(ObjectId),
-}
-
-fn cat_file_pack_entry_delta_base(
-    format: ObjectFormat,
-    pack: &[u8],
-    entry_offset: u64,
-) -> Result<Option<CatFilePackDeltaBase>> {
-    let mut cursor = usize::try_from(entry_offset)
-        .map_err(|_| GitError::InvalidFormat("pack entry offset overflows usize".into()))?;
-    let first = cat_file_pack_next_byte(pack, &mut cursor)?;
-    let kind = (first >> 4) & 0x07;
-    let mut byte = first;
-    while byte & 0x80 != 0 {
-        byte = cat_file_pack_next_byte(pack, &mut cursor)?;
-    }
-    match kind {
-        6 => Ok(Some(CatFilePackDeltaBase::Offset(
-            cat_file_parse_ofs_delta_base_offset(pack, &mut cursor, entry_offset)?,
-        ))),
-        7 => Ok(Some(CatFilePackDeltaBase::Ref(
-            cat_file_parse_ref_delta_base_oid(format, pack, &mut cursor)?,
-        ))),
-        _ => Ok(None),
-    }
-}
-
-fn cat_file_parse_ref_delta_base_oid(
-    format: ObjectFormat,
-    pack: &[u8],
-    cursor: &mut usize,
-) -> Result<ObjectId> {
-    let raw_len = format.raw_len();
-    if *cursor + raw_len > pack.len() {
-        return Err(GitError::InvalidFormat(
-            "truncated ref-delta base object id".into(),
-        ));
-    }
-    let oid = ObjectId::from_raw(format, &pack[*cursor..*cursor + raw_len])?;
-    *cursor += raw_len;
-    Ok(oid)
-}
-
-fn cat_file_parse_ofs_delta_base_offset(
-    pack: &[u8],
-    cursor: &mut usize,
-    entry_offset: u64,
-) -> Result<u64> {
-    let mut byte = cat_file_pack_next_byte(pack, cursor)?;
-    let mut relative = u64::from(byte & 0x7f);
-    while byte & 0x80 != 0 {
-        byte = cat_file_pack_next_byte(pack, cursor)?;
-        relative = relative
-            .checked_add(1)
-            .and_then(|value| value.checked_shl(7))
-            .and_then(|value| value.checked_add(u64::from(byte & 0x7f)))
-            .ok_or_else(|| GitError::InvalidFormat("ofs-delta offset overflow".into()))?;
-    }
-    entry_offset
-        .checked_sub(relative)
-        .ok_or_else(|| GitError::InvalidFormat("ofs-delta points before pack start".into()))
-}
-
-fn cat_file_pack_next_byte(pack: &[u8], cursor: &mut usize) -> Result<u8> {
-    let Some(byte) = pack.get(*cursor).copied() else {
-        return Err(GitError::InvalidFormat("truncated pack entry".into()));
-    };
-    *cursor += 1;
-    Ok(byte)
-}
-
 #[derive(Debug, Clone, Copy)]
 struct TreePrintOptions<'a> {
     name_only: bool,
@@ -14642,7 +13783,8 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     if let Some(cleanup_mode) = cleanup_mode {
         message = commit_cleanup_message(message, cleanup_mode);
     }
-    let message_with_trailers = commands::tag::tag_message_with_trailers(message.clone(), &trailers);
+    let message_with_trailers =
+        commands::tag::tag_message_with_trailers(message.clone(), &trailers);
     if !allow_empty_message && commit_message_is_empty(&message_with_trailers) {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
@@ -15444,11 +14586,11 @@ fn diff_split_revisions(
     let mut rest = Vec::new();
     let mut iter = path_args.into_iter();
     for token in iter.by_ref() {
-        if trees.len() < 2 {
-            if let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token) {
-                trees.push(tree);
-                continue;
-            }
+        if trees.len() < 2
+            && let Ok(tree) = diff_peel_rev_tree(git_dir, format, db, &token)
+        {
+            trees.push(tree);
+            continue;
         }
         rest.push(token);
         break;
@@ -17080,7 +16222,10 @@ enum DiffStatStats {
         new_size: usize,
         unchanged: bool,
     },
-    Text { inserted: usize, deleted: usize },
+    Text {
+        inserted: usize,
+        deleted: usize,
+    },
 }
 
 fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: bool) -> String {
@@ -21539,6 +20684,7 @@ fn path_component_count(path: &[u8]) -> usize {
 
 fn cmd_ls_tree(args: &[String]) -> Result<()> {
     let mut name_only = false;
+    let mut name_status = false;
     let mut object_only = false;
     let mut long = false;
     let mut show_trees = false;
@@ -21565,7 +20711,8 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
         }
         match arg.as_str() {
             "--" => positional_only = true,
-            "--name-only" | "--name-status" => name_only = true,
+            "--name-only" => name_only = true,
+            "--name-status" => name_status = true,
             "--object-only" => object_only = true,
             "--long" | "-l" => long = true,
             "-t" => show_trees = true,
@@ -21625,25 +20772,27 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
             }
         }
     }
-    if format_spec.is_some() && (name_only || object_only || long) {
-        return Err(GitError::Command(
-            "--format can't be combined with other format-altering options".into(),
-        ));
+    let name_output = name_only || name_status;
+    if format_spec.is_some() && (name_output || object_only || long) {
+        return ls_tree_usage_error(
+            "--format can't be combined with other format-altering options",
+        );
     }
-    if name_only && object_only {
-        return Err(GitError::Command(
-            "options '--object-only' and '--name-only' cannot be used together".into(),
-        ));
+    if name_only && name_status {
+        return ls_tree_usage_error(
+            "options '--name-status' and '--name-only' cannot be used together",
+        );
     }
-    if long && name_only {
-        return Err(GitError::Command(
-            "options '--name-only' and '--long' cannot be used together".into(),
-        ));
+    if name_output && object_only {
+        return ls_tree_usage_error(
+            "options '--object-only' and '--name-only' cannot be used together",
+        );
+    }
+    if long && name_output {
+        return ls_tree_usage_error("options '--name-only' and '--long' cannot be used together");
     }
     if long && object_only {
-        return Err(GitError::Command(
-            "options '--object-only' and '--long' cannot be used together".into(),
-        ));
+        return ls_tree_usage_error("options '--object-only' and '--long' cannot be used together");
     }
     let treeish = treeish.ok_or_else(|| GitError::Command("ls-tree requires a tree-ish".into()))?;
     let git_dir = discover_git_dir(env::current_dir()?)?;
@@ -21661,7 +20810,7 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let path_context = LsTreePathContext::new(&cwd, &git_dir, full_name, full_tree)?;
     let options = TreePrintOptions {
-        name_only,
+        name_only: name_output,
         object_only,
         long,
         show_trees,
@@ -22816,6 +21965,11 @@ fn cmd_log(args: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn ls_tree_usage_error<T>(message: &str) -> Result<T> {
+    eprintln!("error: {message}");
+    Err(GitError::Exit(129))
 }
 
 fn log_option_takes_no_value_error(option: &str) -> Result<()> {
@@ -30877,7 +30031,6 @@ fn cmd_status(args: &[String]) -> Result<()> {
     let mut z = false;
     let mut explicit_long = false;
     let mut branch = false;
-    let mut show_untracked = true;
     let mut untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
     let mut show_ignored = false;
     let mut show_stash = false;
@@ -30931,13 +30084,13 @@ fn cmd_status(args: &[String]) -> Result<()> {
                 porcelain_v2 = false;
             }
             "--no-branch" => branch = false,
-            "-uno" | "--untracked-files=no" | "--untracked-files=" => show_untracked = false,
+            "-uno" | "--untracked-files=no" | "--untracked-files=" => {
+                untracked_mode = sley_worktree::StatusUntrackedMode::None;
+            }
             "-unormal" | "--no-untracked-files" | "--untracked-files=normal" => {
-                show_untracked = true;
                 untracked_mode = sley_worktree::StatusUntrackedMode::Normal;
             }
             "-u" | "-uall" | "--untracked-files" | "--untracked-files=all" => {
-                show_untracked = true;
                 untracked_mode = sley_worktree::StatusUntrackedMode::All;
             }
             value if value.starts_with("-u") && value.len() > 2 => {
@@ -31099,9 +30252,6 @@ fn cmd_status(args: &[String]) -> Result<()> {
             untracked_mode,
         },
     )?;
-    if !show_untracked {
-        entries.retain(|entry| !(entry.index == b'?' && entry.worktree == b'?'));
-    }
     let pathspec = StatusPathspec::new(&cwd, &worktree_root, &path_args)?;
     if pathspec.has_filters() {
         entries.retain(|entry| pathspec.matches(&entry.path));
@@ -32709,20 +31859,6 @@ fn superproject_working_tree(git_dir: &Path) -> Result<Option<PathBuf>> {
 fn resolve_revision(git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<ObjectId> {
     warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
     sley_rev::resolve_revision(git_dir, format, rev)
-}
-
-/// Like [`resolve_revision`], but resolves through an already-open object reader
-/// instead of constructing a fresh `FileObjectDatabase` per call. Used by the
-/// cat-file batch loop, where building (and dropping) a database for every input
-/// line was measurable per-object overhead.
-fn resolve_revision_with_reader<R: sley_odb::ObjectReader>(
-    git_dir: &Path,
-    format: ObjectFormat,
-    reader: &R,
-    rev: &str,
-) -> Result<ObjectId> {
-    warn_ambiguous_refname_for_object_prefix(git_dir, format, rev);
-    sley_rev::resolve_revision_with_reader(git_dir, format, reader, rev)
 }
 
 fn warn_ambiguous_refname_for_object_prefix(git_dir: &Path, format: ObjectFormat, rev: &str) {

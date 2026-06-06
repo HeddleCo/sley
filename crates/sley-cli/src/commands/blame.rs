@@ -28,12 +28,11 @@
 //! is not implemented here, so for a *clean* working tree this matches
 //! `git blame` exactly, and for explicit revisions it always matches.
 
-// Glob the crate root for shared plumbing (discover_git_dir,
-// repository_object_format, repository_abbrev, resolve_revision,
-// FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date
-// formatting helpers, and so on). See commands::stash for the rationale: a
-// submodule can reach its ancestor module's private items, so everything
-// visible at the crate root is in scope here without re-listing it.
+// Glob the crate root for shared plumbing (RepositoryContext, repository_abbrev,
+// FileObjectDatabase, FileRefStore, Commit, Tree, the identity/date formatting
+// helpers, and so on). See commands::stash for the rationale: a submodule can
+// reach its ancestor module's private items, so everything visible at the crate
+// root is in scope here without re-listing it.
 use crate::*;
 
 /// What to print in the metadata column for each line's author.
@@ -111,20 +110,21 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
         }
     };
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
 
     // Resolve the requested revision (default HEAD) to a commit.
     let rev_spec = options.rev.as_deref().unwrap_or("HEAD");
-    let start_oid = resolve_revision(&git_dir, format, rev_spec)?;
-    let start_commit = sley_rev::peel_to_commit(&db, format, &start_oid)?;
+    let start_oid = repo.resolve_revision(rev_spec)?;
+    let start_commit = sley_rev::peel_to_commit(db, format, &start_oid)?;
 
     // Turn the cwd-relative path into a repository-root-relative path the way
     // git's pathspec handling does, then locate the blob at the start commit.
-    let repo_path = blame_repo_relative_path(&cwd, &git_dir, &options.path)?;
-    let final_blob = match read_path_blob(&db, format, &start_commit, &repo_path)? {
+    let repo_path = blame_repo_relative_path(cwd, git_dir, &options.path)?;
+    let final_blob = match read_path_blob(db, format, &start_commit, &repo_path)? {
         Some(blob) => blob,
         None => {
             // git reports the repository-relative path here, not the literal
@@ -135,7 +135,7 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
         }
     };
 
-    let lines = compute_blame(&db, format, &start_commit, &repo_path, &final_blob)?;
+    let lines = compute_blame(db, format, &start_commit, &repo_path, &final_blob)?;
 
     // Resolve the -L ranges against the real line count, then render. The
     // repo-relative path is used for any -L error message, matching git.
@@ -143,7 +143,7 @@ pub(crate) fn cmd_blame(args: &[String]) -> Result<()> {
     if selected.is_empty() {
         return Ok(());
     }
-    render_blame(&git_dir, format, &lines, &selected, &options)
+    render_blame(git_dir, format, db, &lines, &selected, &options)
 }
 
 /// Either run with parsed options or print help and exit successfully.
@@ -711,7 +711,10 @@ fn topo_order(
 /// Remove and return the newest commit from `ready` (treated as a priority
 /// queue keyed by descending timestamp, ties broken by ascending hex id for
 /// determinism).
-fn pop_newest(ready: &mut Vec<ObjectId>, timestamp_of: &HashMap<ObjectId, i64>) -> Option<ObjectId> {
+fn pop_newest(
+    ready: &mut Vec<ObjectId>,
+    timestamp_of: &HashMap<ObjectId, i64>,
+) -> Option<ObjectId> {
     if ready.is_empty() {
         return None;
     }
@@ -801,6 +804,7 @@ fn resolve_range(range: &RawRange, total: usize, path: &str) -> Result<(usize, u
 fn render_blame(
     git_dir: &Path,
     format: ObjectFormat,
+    db: &FileObjectDatabase,
     lines: &[LineBlame],
     selected: &[usize],
     options: &BlameOptions,
@@ -820,7 +824,7 @@ fn render_blame(
     if !options.suppress_author {
         for &line_no in selected {
             let blame = &lines[line_no - 1];
-            let (author, date) = author_and_date(git_dir, format, blame, options)?;
+            let (author, date) = author_and_date(db, format, blame, options)?;
             author_strings.push(author);
             date_strings.push(date);
         }
@@ -831,7 +835,13 @@ fn render_blame(
     let mut handle = stdout.lock();
     for (display_idx, &line_no) in selected.iter().enumerate() {
         let blame = &lines[line_no - 1];
-        let sha = render_sha(&blame.commit, abbrev, blame.boundary, options.show_root, hex_width);
+        let sha = render_sha(
+            &blame.commit,
+            abbrev,
+            blame.boundary,
+            options.show_root,
+            hex_width,
+        );
 
         // Strip the trailing newline from the stored content; we always emit a
         // newline ourselves, matching git which prints one line per entry even
@@ -904,12 +914,11 @@ fn render_sha(
 
 /// Produce the author and date strings for one entry given the active options.
 fn author_and_date(
-    git_dir: &Path,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     blame: &LineBlame,
     options: &BlameOptions,
 ) -> Result<(String, String)> {
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let object = db.read_object(&blame.commit)?;
     let commit = Commit::parse(format, &object.body)?;
     let identity = &commit.author;

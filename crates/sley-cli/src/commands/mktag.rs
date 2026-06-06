@@ -61,10 +61,10 @@
 //! self-contained command modules (`commands::verify_commit`, `commands::tag`,
 //! `commands::stash`).
 
-// Glob the crate root for shared plumbing (discover_git_dir,
-// repository_object_format, FileObjectDatabase, the ObjectReader/ObjectWriter
-// traits, EncodedObject, ObjectType, ObjectId, GitError, io, env, etc.); see
-// commands::stash for the rationale behind the wildcard import.
+// Glob the crate root for shared plumbing (RepositoryContext, the
+// ObjectReader/ObjectWriter traits, EncodedObject, ObjectType, ObjectId,
+// GitError, io, etc.); see commands::stash for the rationale behind the
+// wildcard import.
 use crate::*;
 
 /// Entry point for `git mktag`.
@@ -80,13 +80,13 @@ pub(crate) fn cmd_mktag(args: &[String]) -> Result<()> {
 
     // Discover the repository up front. git prints its standard
     // "not a git repository" fatal (exit 128) before inspecting stdin's contents.
-    let git_dir = match discover_git_dir(env::current_dir()?) {
-        Ok(dir) => dir,
+    let repo = match RepositoryContext::discover_current() {
+        Ok(repo) => repo,
         Err(GitError::NotFound(_)) => return mktag_not_a_repository(),
         Err(err) => return Err(err),
     };
-    let format = repository_object_format(&git_dir)?;
-    let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let format = repo.format();
+    let mut db = repo.objects().clone();
 
     // Read the entire payload. mktag is binary-safe: the buffer is stored exactly
     // as received once it passes validation.
@@ -554,7 +554,7 @@ fn ident_problem(ident: &[u8]) -> Option<(&'static str, &'static str)> {
                 return Some((
                     "missingEmail",
                     "invalid author/committer line - missing email",
-                ))
+                ));
             }
             Some(&b'>') => return Some(("badName", "invalid author/committer line - bad name")),
             Some(&b'<') => break,
@@ -916,7 +916,9 @@ mod tests {
     fn gpgsig_header_is_not_extra() {
         // A gpgsig header (with folded continuation) after the tagger is allowed.
         let p = payload(
-            &format!("object {OBJ}\ntype commit\ntag v1.0\n{TAGGER}\ngpgsig -----BEGIN-----\n -----END-----"),
+            &format!(
+                "object {OBJ}\ntype commit\ntag v1.0\n{TAGGER}\ngpgsig -----BEGIN-----\n -----END-----"
+            ),
             "m\n",
         );
         assert!(!run_fsck(&p, true).fatal);
@@ -1182,11 +1184,13 @@ mod tests {
             Some(sha1_oid(OBJ))
         );
         assert!(parse_oid_line(ObjectFormat::Sha1, b"1234").is_none());
-        assert!(parse_oid_line(
-            ObjectFormat::Sha1,
-            b"zzzz3b43d8b3916ee290e6416995e79a82583a80"
-        )
-        .is_none());
+        assert!(
+            parse_oid_line(
+                ObjectFormat::Sha1,
+                b"zzzz3b43d8b3916ee290e6416995e79a82583a80"
+            )
+            .is_none()
+        );
         // Uppercase parses to the same canonical id as lowercase.
         assert_eq!(
             parse_oid_line(ObjectFormat::Sha1, OBJ.to_ascii_uppercase().as_bytes()),

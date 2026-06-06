@@ -15,15 +15,14 @@
 //! `write_diff_stat`, etc.). This keeps every output mode byte-identical with
 //! `git diff` for the formats both commands share.
 
-use std::env;
 use std::io::{self, Write};
 use std::path::Path;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
 // Pull in the crate-root helpers this command shares with `cmd_diff`
-// (discover_git_dir, repository_object_format, resolve_revision,
-// repository_abbrev, worktree_root_for_git_dir, FileObjectDatabase, the
+// (RepositoryContext, repository_abbrev, worktree_root_for_git_dir,
+// FileObjectDatabase, the
 // DiffPathspec/DiffFilter/DiffStatOptions/DiffPatchOptions types, and every
 // write_diff_* renderer), matching the established `commands::*` pattern.
 use crate::*;
@@ -173,22 +172,26 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
                 dst_prefix = value.to_string();
             }
             value if let Some(value) = value.strip_prefix("-M") => {
+                log_validate_similarity_option(value, "find-renames")?;
                 detect_renames = true;
                 inexact_renames = true;
                 rename_threshold = parse_similarity_threshold(value);
             }
             value if let Some(value) = value.strip_prefix("--find-renames=") => {
+                log_validate_similarity_option(value, "find-renames")?;
                 detect_renames = true;
                 inexact_renames = true;
                 rename_threshold = parse_similarity_threshold(value);
             }
             value if let Some(value) = value.strip_prefix("-C") => {
+                log_validate_similarity_option(value, "find-copies")?;
                 detect_renames = true;
                 detect_copies = true;
                 inexact_renames = true;
                 copy_threshold = parse_similarity_threshold(value);
             }
             value if let Some(value) = value.strip_prefix("--find-copies=") => {
+                log_validate_similarity_option(value, "find-copies")?;
                 detect_renames = true;
                 detect_copies = true;
                 inexact_renames = true;
@@ -206,11 +209,12 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
         return diff_index_usage_error();
     };
 
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let tree_oid = resolve_tree_ish(&git_dir, format, &db, &tree_ish)?;
+    let repo = RepositoryContext::discover_current()?;
+    let cwd = repo.cwd();
+    let git_dir = repo.git_dir();
+    let format = repo.format();
+    let db = repo.objects();
+    let tree_oid = resolve_tree_ish(&repo, &tree_ish)?;
 
     // `core.abbrev` (defaulting to 7) is the width used when abbreviation is
     // requested, but unlike porcelain `git diff` the plumbing `diff-index`
@@ -323,7 +327,7 @@ pub(crate) fn cmd_diff_index(args: &[String]) -> Result<()> {
             &entries,
             &output,
             RenderContext {
-                db: &db,
+                db,
                 worktree_root: worktree_root.as_deref(),
                 use_worktree_new: !cached,
                 format,
@@ -545,13 +549,9 @@ fn take_value<'a>(args: &'a [String], idx: usize, option: &str) -> Result<&'a st
 /// Resolve a `<tree-ish>` argument to a tree oid, peeling commits/tags. A value
 /// that cannot be resolved produces git's `fatal: ambiguous argument` message on
 /// stderr and exit status 128.
-fn resolve_tree_ish(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    tree_ish: &str,
-) -> Result<ObjectId> {
-    let oid = match resolve_revision(git_dir, format, tree_ish) {
+fn resolve_tree_ish(repo: &RepositoryContext, tree_ish: &str) -> Result<ObjectId> {
+    let format = repo.format();
+    let oid = match repo.resolve_revision(tree_ish) {
         Ok(oid) => oid,
         Err(_) => return ambiguous_argument_error(tree_ish),
     };
@@ -561,7 +561,8 @@ fn resolve_tree_ish(
     if sley_core::object_id_for_bytes(format, "tree", b"").is_ok_and(|empty| empty == oid) {
         return Ok(oid);
     }
-    sley_rev::peel_to_tree(db, format, &oid).or_else(|_| ambiguous_argument_error(tree_ish))
+    sley_rev::peel_to_tree(repo.objects(), format, &oid)
+        .or_else(|_| ambiguous_argument_error(tree_ish))
 }
 
 fn ambiguous_argument_error<T>(value: &str) -> Result<T> {

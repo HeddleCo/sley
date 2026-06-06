@@ -33,10 +33,9 @@
 //! follows the same glob-import + private-helper structure as the other
 //! self-contained command modules (`commands::branch`, `commands::stash`).
 
-// Glob the crate root for shared plumbing (discover_git_dir,
-// repository_object_format, resolve_revision, FileObjectDatabase, the
-// ObjectReader trait, ObjectType, GitError, env, io, Path, etc.); see
-// commands::stash for the rationale behind the wildcard import.
+// Glob the crate root for shared plumbing (RepositoryContext, the ObjectReader
+// trait, ObjectType, GitError, io, etc.); see commands::stash for the rationale
+// behind the wildcard import.
 use crate::*;
 
 /// Entry point for `git verify-tag`.
@@ -57,16 +56,14 @@ pub(crate) fn cmd_verify_tag(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(129));
     }
 
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let repo = RepositoryContext::discover_current()?;
 
     // git verifies every argument and only then reports overall failure, so a bad
     // early argument never short-circuits a later one. Accumulate failures and map
     // them to a single exit-1 at the end.
     let mut failed = false;
     for tag in &options.tags {
-        if !verify_one_tag(&git_dir, format, &db, tag, &options)? {
+        if !verify_one_tag(&repo, tag, &options)? {
             failed = true;
         }
     }
@@ -166,17 +163,11 @@ fn parse_verify_tag_args(args: &[String]) -> Result<VerifyTagInvocation> {
 /// from the caller's perspective (which, lacking a signature backend, never
 /// happens for real signatures) and `Ok(false)` for every git-reported failure so
 /// the caller can aggregate the exit code.
-fn verify_one_tag(
-    git_dir: &Path,
-    format: ObjectFormat,
-    db: &FileObjectDatabase,
-    tag: &str,
-    options: &VerifyTagOptions,
-) -> Result<bool> {
+fn verify_one_tag(repo: &RepositoryContext, tag: &str, options: &VerifyTagOptions) -> Result<bool> {
     // git resolves the argument *without* peeling: a lightweight tag (a ref that
     // points straight at a commit) surfaces as that commit below and is reported
     // as a non-tag object, matching real `verify-tag`.
-    let oid = match resolve_revision(git_dir, format, tag) {
+    let oid = match repo.resolve_revision(tag) {
         Ok(oid) => oid,
         Err(
             GitError::NotFound(_)
@@ -199,7 +190,7 @@ fn verify_one_tag(
     // the object database for the type, gets "none", and reports it as a non-tag
     // object of type `(null)` rather than "tag not found" (the latter is reserved
     // for arguments that never resolve to an oid at all, handled above).
-    let object = match db.read_object(&oid) {
+    let object = match repo.objects().read_object(&oid) {
         Ok(object) => object,
         Err(_) => {
             eprintln!("error: {tag}: cannot verify a non-tag object of type (null).");
