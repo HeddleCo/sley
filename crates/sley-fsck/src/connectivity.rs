@@ -20,7 +20,7 @@
 //!   references.
 
 use sley_core::{ObjectFormat, ObjectId};
-use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -449,8 +449,8 @@ where
     }
 
     fn check_commit(&mut self, oid: ObjectId, body: &[u8]) {
-        let commit = match Commit::parse(self.format, body) {
-            Ok(commit) => commit,
+        let links = match commit_links(self.format, body) {
+            Ok(links) => links,
             Err(err) => {
                 self.findings.push(FsckFinding::CorruptObject {
                     reason: format!("invalid commit {oid}: {err}"),
@@ -459,29 +459,14 @@ where
                 return;
             }
         };
-        self.check_link(
-            ObjectType::Commit,
-            &oid,
-            ObjectLink {
-                object_type: ObjectType::Tree,
-                oid: commit.tree,
-            },
-        );
-        for parent in commit.parents {
-            self.check_link(
-                ObjectType::Commit,
-                &oid,
-                ObjectLink {
-                    object_type: ObjectType::Commit,
-                    oid: parent,
-                },
-            );
+        for link in links {
+            self.check_link(ObjectType::Commit, &oid, link);
         }
     }
 
     fn check_tree(&mut self, oid: ObjectId, body: &[u8]) {
-        let tree = match Tree::parse(self.format, body) {
-            Ok(tree) => tree,
+        let links = match tree_links(self.format, body) {
+            Ok(links) => links,
             Err(err) => {
                 self.findings.push(FsckFinding::CorruptObject {
                     reason: format!("invalid tree {oid}: {err}"),
@@ -490,21 +475,14 @@ where
                 return;
             }
         };
-        for entry in tree.entries {
-            self.check_link(
-                ObjectType::Tree,
-                &oid,
-                ObjectLink {
-                    object_type: tree_entry_object_type(entry.mode),
-                    oid: entry.oid,
-                },
-            );
+        for link in links {
+            self.check_link(ObjectType::Tree, &oid, link);
         }
     }
 
     fn check_tag(&mut self, oid: ObjectId, body: &[u8]) {
-        let tag = match Tag::parse(self.format, body) {
-            Ok(tag) => tag,
+        let links = match tag_links(self.format, body) {
+            Ok(links) => links,
             Err(err) => {
                 self.findings.push(FsckFinding::CorruptObject {
                     reason: format!("invalid tag {oid}: {err}"),
@@ -513,14 +491,9 @@ where
                 return;
             }
         };
-        self.check_link(
-            ObjectType::Tag,
-            &oid,
-            ObjectLink {
-                object_type: tag.object_type,
-                oid: tag.object,
-            },
-        );
+        for link in links {
+            self.check_link(ObjectType::Tag, &oid, link);
+        }
     }
 }
 
@@ -718,41 +691,45 @@ where
 
 fn object_links(format: ObjectFormat, object: &EncodedObject) -> Vec<ObjectLink> {
     match object.object_type {
-        ObjectType::Commit => Commit::parse(format, &object.body)
-            .map(|commit| {
-                let mut links = Vec::with_capacity(commit.parents.len() + 1);
-                links.push(ObjectLink {
-                    object_type: ObjectType::Tree,
-                    oid: commit.tree,
-                });
-                links.extend(commit.parents.into_iter().map(|parent| ObjectLink {
-                    object_type: ObjectType::Commit,
-                    oid: parent,
-                }));
-                links
-            })
-            .unwrap_or_default(),
-        ObjectType::Tree => Tree::parse(format, &object.body)
-            .map(|tree| {
-                tree.entries
-                    .into_iter()
-                    .map(|entry| ObjectLink {
-                        object_type: tree_entry_object_type(entry.mode),
-                        oid: entry.oid,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        ObjectType::Tag => Tag::parse(format, &object.body)
-            .map(|tag| {
-                vec![ObjectLink {
-                    object_type: tag.object_type,
-                    oid: tag.object,
-                }]
-            })
-            .unwrap_or_default(),
+        ObjectType::Commit => commit_links(format, &object.body).unwrap_or_default(),
+        ObjectType::Tree => tree_links(format, &object.body).unwrap_or_default(),
+        ObjectType::Tag => tag_links(format, &object.body).unwrap_or_default(),
         ObjectType::Blob => Vec::new(),
     }
+}
+
+fn commit_links(format: ObjectFormat, body: &[u8]) -> sley_core::Result<Vec<ObjectLink>> {
+    let commit = Commit::parse_ref(format, body)?;
+    let mut links = Vec::with_capacity(commit.parents.len() + 1);
+    links.push(ObjectLink {
+        object_type: ObjectType::Tree,
+        oid: commit.tree,
+    });
+    links.extend(commit.parents.into_iter().map(|parent| ObjectLink {
+        object_type: ObjectType::Commit,
+        oid: parent,
+    }));
+    Ok(links)
+}
+
+fn tree_links(format: ObjectFormat, body: &[u8]) -> sley_core::Result<Vec<ObjectLink>> {
+    let mut links = Vec::new();
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        links.push(ObjectLink {
+            object_type: tree_entry_object_type(entry.mode),
+            oid: entry.oid,
+        });
+    }
+    Ok(links)
+}
+
+fn tag_links(format: ObjectFormat, body: &[u8]) -> sley_core::Result<Vec<ObjectLink>> {
+    let tag = Tag::parse_ref(format, body)?;
+    Ok(vec![ObjectLink {
+        object_type: tag.object_type,
+        oid: tag.object,
+    }])
 }
 
 fn tree_entry_object_type(mode: u32) -> ObjectType {

@@ -7956,11 +7956,11 @@ fn print_reset_hard_head(
             object.object_type.as_str()
         )));
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     println!(
         "HEAD is now at {} {}",
         format_log_abbrev_oid(commit_oid),
-        commit_subject(&commit.message)
+        commit_subject(commit.message)
     );
     Ok(())
 }
@@ -14508,7 +14508,7 @@ fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<boo
     if object.object_type != ObjectType::Commit {
         return Ok(false);
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     Ok(commit.tree == tree)
 }
 
@@ -29333,7 +29333,7 @@ fn submodule_head_tree_oid(
             object.object_type.as_str()
         )));
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     let tree_object = db.read_object(&commit.tree)?;
     if tree_object.object_type != ObjectType::Tree {
         return Err(GitError::InvalidObject(format!(

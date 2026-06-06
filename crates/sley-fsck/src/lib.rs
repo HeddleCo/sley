@@ -1,5 +1,5 @@
 use sley_core::{ObjectFormat, ObjectId};
-use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::ObjectReader;
 use std::collections::{HashSet, VecDeque};
 
@@ -179,7 +179,7 @@ where
     }
 
     fn check_commit(&mut self, oid: ObjectId, body: &[u8]) {
-        let commit = match Commit::parse(self.format, body) {
+        let commit = match Commit::parse_ref(self.format, body) {
             Ok(commit) => commit,
             Err(err) => {
                 self.issues.push(FsckIssue {
@@ -211,8 +211,10 @@ where
     }
 
     fn check_tree(&mut self, oid: ObjectId, body: &[u8]) {
-        let tree = match Tree::parse(self.format, body) {
-            Ok(tree) => tree,
+        let entries = match TreeEntries::new(self.format, body)
+            .collect::<std::result::Result<Vec<_>, _>>()
+        {
+            Ok(entries) => entries,
             Err(err) => {
                 self.issues.push(FsckIssue {
                     message: format!("invalid tree {oid}: {err}"),
@@ -224,7 +226,7 @@ where
             object_type: ObjectType::Tree,
             oid,
         };
-        for entry in tree.entries {
+        for entry in entries {
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
@@ -236,7 +238,7 @@ where
     }
 
     fn check_tag(&mut self, oid: ObjectId, body: &[u8]) {
-        let tag = match Tag::parse(self.format, body) {
+        let tag = match Tag::parse_ref(self.format, body) {
             Ok(tag) => tag,
             Err(err) => {
                 self.issues.push(FsckIssue {
@@ -371,7 +373,7 @@ where
 
 fn object_links(format: ObjectFormat, object: &EncodedObject) -> Vec<ObjectLink> {
     match object.object_type {
-        ObjectType::Commit => Commit::parse(format, &object.body)
+        ObjectType::Commit => Commit::parse_ref(format, &object.body)
             .map(|commit| {
                 let mut links = Vec::with_capacity(commit.parents.len() + 1);
                 links.push(ObjectLink {
@@ -385,18 +387,16 @@ fn object_links(format: ObjectFormat, object: &EncodedObject) -> Vec<ObjectLink>
                 links
             })
             .unwrap_or_default(),
-        ObjectType::Tree => Tree::parse(format, &object.body)
-            .map(|tree| {
-                tree.entries
-                    .into_iter()
-                    .map(|entry| ObjectLink {
-                        object_type: fsck_tree_entry_object_type(entry.mode),
-                        oid: entry.oid,
-                    })
-                    .collect()
+        ObjectType::Tree => TreeEntries::new(format, &object.body)
+            .map(|entry| {
+                entry.map(|entry| ObjectLink {
+                    object_type: fsck_tree_entry_object_type(entry.mode),
+                    oid: entry.oid,
+                })
             })
+            .collect::<std::result::Result<Vec<_>, _>>()
             .unwrap_or_default(),
-        ObjectType::Tag => Tag::parse(format, &object.body)
+        ObjectType::Tag => Tag::parse_ref(format, &object.body)
             .map(|tag| {
                 vec![ObjectLink {
                     object_type: tag.object_type,

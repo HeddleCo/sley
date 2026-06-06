@@ -592,7 +592,7 @@ fn ancestor_depths(
                 object.object_type.as_str()
             )));
         }
-        let commit = Commit::parse(format, &object.body)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
         for parent in commit.parents {
             pending.push_back((parent, depth + 1));
         }
