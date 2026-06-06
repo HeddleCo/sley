@@ -8048,6 +8048,7 @@ fn print_branch_list_format_omit_empty(
     store: &FileRefStore,
     options: BranchFormatPrintOptions<'_>,
 ) -> Result<()> {
+    let format_spec = ForEachRefFormat::parse(options.format_spec)?;
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let config = read_repo_config(git_dir)?;
     let head_ref = store.current_branch_ref()?;
@@ -8120,7 +8121,7 @@ fn print_branch_list_format_omit_empty(
             peeled_object: None,
         };
         let mut line = Vec::new();
-        print_for_each_ref_format(&mut line, options.format_spec, &context)?;
+        print_for_each_ref_format(&mut line, &format_spec, &context)?;
         if options.omit_empty && line.is_empty() {
             continue;
         }

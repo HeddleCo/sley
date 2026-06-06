@@ -8,6 +8,172 @@
 use sley_core::{GitError, ObjectId, Result};
 use std::io::Write;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForEachRefFormat {
+    segments: Vec<ForEachRefFormatSegment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForEachRefFormatSegment {
+    Literal(Vec<u8>),
+    Atom(String),
+}
+
+impl ForEachRefFormat {
+    pub fn parse(format_spec: &str) -> Result<Self> {
+        let mut segments = Vec::new();
+        let mut cursor = 0;
+        while let Some(start) = format_spec[cursor..].find('%') {
+            let start = cursor + start;
+            push_for_each_ref_literal(
+                &mut segments,
+                format_spec.as_bytes()[cursor..start].to_vec(),
+            );
+            let bytes = format_spec.as_bytes();
+            match bytes.get(start + 1).copied() {
+                Some(b'%') => {
+                    push_for_each_ref_literal(&mut segments, b"%".to_vec());
+                    cursor = start + 2;
+                }
+                Some(b'(') => {
+                    let Some(end) = format_spec[start + 2..].find(')') else {
+                        return Err(GitError::Command(
+                            "unterminated for-each-ref format placeholder".into(),
+                        ));
+                    };
+                    let end = start + 2 + end;
+                    segments.push(ForEachRefFormatSegment::Atom(
+                        format_spec[start + 2..end].to_string(),
+                    ));
+                    cursor = end + 1;
+                }
+                Some(_) => {
+                    if let Some(byte) = for_each_ref_hex_escape(bytes.get(start + 1..start + 3)) {
+                        push_for_each_ref_literal(&mut segments, vec![byte]);
+                        cursor = start + 3;
+                    } else {
+                        push_for_each_ref_literal(&mut segments, b"%".to_vec());
+                        cursor = start + 1;
+                    }
+                }
+                None => {
+                    push_for_each_ref_literal(&mut segments, b"%".to_vec());
+                    cursor = start + 1;
+                }
+            }
+        }
+        push_for_each_ref_literal(&mut segments, format_spec.as_bytes()[cursor..].to_vec());
+        Ok(Self { segments })
+    }
+
+    pub fn segments(&self) -> &[ForEachRefFormatSegment] {
+        &self.segments
+    }
+}
+
+fn push_for_each_ref_literal(segments: &mut Vec<ForEachRefFormatSegment>, literal: Vec<u8>) {
+    if literal.is_empty() {
+        return;
+    }
+    if let Some(ForEachRefFormatSegment::Literal(previous)) = segments.last_mut() {
+        previous.extend_from_slice(&literal);
+    } else {
+        segments.push(ForEachRefFormatSegment::Literal(literal));
+    }
+}
+
+pub fn write_for_each_ref_format(
+    stdout: &mut impl Write,
+    format: &ForEachRefFormat,
+    quote: ForEachRefQuoteMode,
+    mut write_atom: impl FnMut(&mut Vec<u8>, &str) -> Result<()>,
+) -> Result<()> {
+    for segment in format.segments() {
+        match segment {
+            ForEachRefFormatSegment::Literal(literal) => stdout.write_all(literal)?,
+            ForEachRefFormatSegment::Atom(atom) => {
+                let mut value = Vec::new();
+                write_atom(&mut value, atom)?;
+                write_for_each_ref_quoted_atom(stdout, &value, quote)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn for_each_ref_hex_escape(value: Option<&[u8]>) -> Option<u8> {
+    let value = value?;
+    let [high, low] = value else {
+        return None;
+    };
+    Some(for_each_ref_hex_digit(*high)? << 4 | for_each_ref_hex_digit(*low)?)
+}
+
+fn for_each_ref_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum ForEachRefQuoteMode {
+    #[default]
+    None,
+    Shell,
+    Python,
+    Perl,
+    Tcl,
+}
+
+pub fn write_for_each_ref_quoted_atom(
+    stdout: &mut impl Write,
+    value: &[u8],
+    quote: ForEachRefQuoteMode,
+) -> Result<()> {
+    match quote {
+        ForEachRefQuoteMode::None => stdout.write_all(value)?,
+        ForEachRefQuoteMode::Shell => {
+            stdout.write_all(b"'")?;
+            for byte in value {
+                if *byte == b'\'' {
+                    stdout.write_all(br#"'\''"#)?;
+                } else {
+                    stdout.write_all(&[*byte])?;
+                }
+            }
+            stdout.write_all(b"'")?;
+        }
+        ForEachRefQuoteMode::Python | ForEachRefQuoteMode::Perl => {
+            stdout.write_all(b"'")?;
+            for byte in value {
+                match (*byte, quote) {
+                    (b'\\', _) => stdout.write_all(br#"\\"#)?,
+                    (b'\'', _) => stdout.write_all(br#"\'"#)?,
+                    (b'\n', ForEachRefQuoteMode::Python) => stdout.write_all(br#"\n"#)?,
+                    _ => stdout.write_all(&[*byte])?,
+                }
+            }
+            stdout.write_all(b"'")?;
+        }
+        ForEachRefQuoteMode::Tcl => {
+            stdout.write_all(b"\"")?;
+            for byte in value {
+                match *byte {
+                    b'\\' => stdout.write_all(br#"\\"#)?,
+                    b'"' => stdout.write_all(br#"\""#)?,
+                    b'\n' => stdout.write_all(br#"\n"#)?,
+                    _ => stdout.write_all(&[*byte])?,
+                }
+            }
+            stdout.write_all(b"\"")?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ForEachRefTrack {
     pub ahead: usize,
@@ -411,6 +577,45 @@ pub fn commit_identity_date(raw: &[u8], mode: ForEachRefDateMode) -> String {
 mod tests {
     use super::*;
     use sley_core::ObjectFormat;
+
+    #[test]
+    fn format_parser_decodes_literals_atoms_and_percent_escapes() {
+        let format =
+            ForEachRefFormat::parse("refs/%%/%(refname)%09%(objectname)%q").expect("valid format");
+        assert_eq!(
+            format.segments(),
+            &[
+                ForEachRefFormatSegment::Literal(b"refs/%/".to_vec()),
+                ForEachRefFormatSegment::Atom("refname".to_string()),
+                ForEachRefFormatSegment::Literal(b"\t".to_vec()),
+                ForEachRefFormatSegment::Atom("objectname".to_string()),
+                ForEachRefFormatSegment::Literal(b"%q".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_parser_rejects_unterminated_atoms() {
+        assert!(ForEachRefFormat::parse("%(refname").is_err());
+    }
+
+    #[test]
+    fn format_renderer_streams_literals_atoms_and_quotes() {
+        let format = ForEachRefFormat::parse("branch=%(refname)").expect("valid format");
+        let mut out = Vec::new();
+        write_for_each_ref_format(
+            &mut out,
+            &format,
+            ForEachRefQuoteMode::Shell,
+            |atom, name| {
+                assert_eq!(name, "refname");
+                atom.extend_from_slice(b"main's");
+                Ok(())
+            },
+        )
+        .expect("writes to in-memory buffer");
+        assert_eq!(out, b"branch='main'\\''s'");
+    }
 
     #[test]
     fn identity_parts_match_git_identity_layout() {

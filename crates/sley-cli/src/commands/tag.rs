@@ -1555,6 +1555,7 @@ fn print_tag_list(
     )?;
     sort_tag_entries(&mut entries, options.sorts, options.ignore_case);
     if let Some(format_spec) = options.format_spec {
+        let format_spec = ForEachRefFormat::parse(format_spec)?;
         let db = db.as_ref().expect("format listing creates object database");
         let objectname_abbrev = repository_abbrev(git_dir, format)?;
         let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
@@ -1594,7 +1595,7 @@ fn print_tag_list(
                 peeled_object,
             };
             let mut line = Vec::new();
-            print_for_each_ref_format(&mut line, format_spec, &format_context)?;
+            print_for_each_ref_format(&mut line, &format_spec, &format_context)?;
             if !options.omit_empty || !line.is_empty() {
                 stdout.write_all(&line)?;
                 stdout.write_all(b"\n")?;
