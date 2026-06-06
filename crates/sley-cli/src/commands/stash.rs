@@ -6,6 +6,7 @@
 // private ones), so every helper, type, and re-export visible at the crate root
 // is in scope here without re-listing it.
 use crate::*;
+use sley_object::TreeEntries;
 #[derive(Debug)]
 struct StashListOptions {
     format: StashListFormat,
@@ -447,13 +448,13 @@ fn restore_stash_tree_entries_to_worktree(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let mut path = prefix.clone();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             restore_stash_tree_entries_to_worktree(worktree_root, db, format, &entry.oid, path)?;
             continue;
@@ -3459,4 +3460,3 @@ fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> 
     Ok(options.max_age.is_none_or(|age| timestamp >= age)
         && options.min_age.is_none_or(|age| timestamp <= age))
 }
-

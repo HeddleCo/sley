@@ -488,10 +488,10 @@ fn select_commits(
 ) -> Result<Vec<sley_rev::CommitRecord>> {
     let format = repo.format();
     let db = repo.objects();
-    let mut includes: Vec<&str> = Vec::new();
-    let mut excludes: Vec<&str> = Vec::new();
-    let mut linear_ranges: Vec<(&str, &str, bool)> = Vec::new();
-    let mut symmetric_ranges: Vec<(&str, &str, bool)> = Vec::new();
+    let mut includes: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
+    let mut linear_ranges: Vec<(String, String, bool)> = Vec::new();
+    let mut symmetric_ranges: Vec<(String, String, bool)> = Vec::new();
 
     for rev in &options.revisions {
         if rev.contains("..") {
@@ -504,16 +504,16 @@ fn select_commits(
                 &mut symmetric_ranges,
             )?;
         } else if let Some(exclude) = rev.strip_prefix('^') {
-            excludes.push(exclude);
+            excludes.push(exclude.to_string());
         } else if options.count.is_some() {
             // With `-<n>`, a bare committish X is the *tip* of the walk (format
             // `n` commits ending at X), not the `X..HEAD` exclude it means on
             // its own.
-            includes.push(rev);
+            includes.push(rev.clone());
         } else {
             // A bare committish X means "X..HEAD" for format-patch.
-            includes.push("HEAD");
-            excludes.push(rev);
+            includes.push("HEAD".to_string());
+            excludes.push(rev.clone());
         }
     }
 
@@ -523,7 +523,7 @@ fn select_commits(
         && linear_ranges.is_empty()
         && symmetric_ranges.is_empty()
     {
-        includes.push("HEAD");
+        includes.push("HEAD".to_string());
     }
 
     let mut starts = Vec::new();

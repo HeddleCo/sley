@@ -451,42 +451,28 @@ pub struct Commit {
     pub message: Vec<u8>,
 }
 
+/// A borrowed parse-view of a raw commit object.
+///
+/// The identity, encoding, and message slices point into the original commit
+/// body. Object ids are parsed into fixed-size values while preserving the same
+/// validation behavior as [`Commit::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRef<'a> {
+    pub tree: ObjectId,
+    pub parents: Vec<ObjectId>,
+    pub author: &'a [u8],
+    pub committer: &'a [u8],
+    pub encoding: Option<&'a [u8]>,
+    pub message: &'a [u8],
+}
+
 impl Commit {
     pub fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<Self> {
-        let split = bytes
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .ok_or_else(|| GitError::InvalidObject("commit missing message separator".into()))?;
-        let headers = std::str::from_utf8(&bytes[..split])
-            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
-        let mut tree = None;
-        let mut parents = Vec::new();
-        let mut author = None;
-        let mut committer = None;
-        let mut encoding = None;
-        for line in headers.lines() {
-            if let Some(value) = line.strip_prefix("tree ") {
-                tree = Some(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("parent ") {
-                parents.push(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("author ") {
-                author = Some(value.as_bytes().to_vec());
-            } else if let Some(value) = line.strip_prefix("committer ") {
-                committer = Some(value.as_bytes().to_vec());
-            } else if let Some(value) = line.strip_prefix("encoding ") {
-                encoding = Some(value.as_bytes().to_vec());
-            }
-        }
-        Ok(Self {
-            tree: tree.ok_or_else(|| GitError::InvalidObject("commit missing tree".into()))?,
-            parents,
-            author: author
-                .ok_or_else(|| GitError::InvalidObject("commit missing author".into()))?,
-            committer: committer
-                .ok_or_else(|| GitError::InvalidObject("commit missing committer".into()))?,
-            encoding,
-            message: bytes[split + 2..].to_vec(),
-        })
+        Ok(Self::parse_ref(format, bytes)?.into())
+    }
+
+    pub fn parse_ref<'a>(format: ObjectFormat, bytes: &'a [u8]) -> Result<CommitRef<'a>> {
+        CommitRef::parse(format, bytes)
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -530,6 +516,89 @@ impl Commit {
     }
 }
 
+impl<'a> CommitRef<'a> {
+    pub fn parse(format: ObjectFormat, bytes: &'a [u8]) -> Result<Self> {
+        let split = bytes
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .ok_or_else(|| GitError::InvalidObject("commit missing message separator".into()))?;
+        let headers = std::str::from_utf8(&bytes[..split])
+            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+        let mut tree = None;
+        let mut parents = Vec::new();
+        let mut author = None;
+        let mut committer = None;
+        let mut encoding = None;
+        for line in headers.lines() {
+            if let Some(value) = line.strip_prefix("tree ") {
+                tree = Some(ObjectId::from_hex(format, value)?);
+            } else if let Some(value) = line.strip_prefix("parent ") {
+                parents.push(ObjectId::from_hex(format, value)?);
+            } else if let Some(value) = line.strip_prefix("author ") {
+                author = Some(value.as_bytes());
+            } else if let Some(value) = line.strip_prefix("committer ") {
+                committer = Some(value.as_bytes());
+            } else if let Some(value) = line.strip_prefix("encoding ") {
+                encoding = Some(value.as_bytes());
+            }
+        }
+        Ok(Self {
+            tree: tree.ok_or_else(|| GitError::InvalidObject("commit missing tree".into()))?,
+            parents,
+            author: author
+                .ok_or_else(|| GitError::InvalidObject("commit missing author".into()))?,
+            committer: committer
+                .ok_or_else(|| GitError::InvalidObject("commit missing committer".into()))?,
+            encoding,
+            message: &bytes[split + 2..],
+        })
+    }
+
+    pub fn to_owned(&self) -> Commit {
+        Commit {
+            tree: self.tree.clone(),
+            parents: self.parents.clone(),
+            author: self.author.to_vec(),
+            committer: self.committer.to_vec(),
+            encoding: self.encoding.map(<[u8]>::to_vec),
+            message: self.message.to_vec(),
+        }
+    }
+
+    /// Parse the raw [`author`](Commit::author) line into a typed
+    /// [`Signature`] parse-view, or `None` if the stored bytes are not a
+    /// well-formed git identity.
+    ///
+    /// This is a read-only lens: it does not touch the raw `author` bytes, which
+    /// remain the source of truth for [`Commit::write`]. The returned signature
+    /// re-serializes byte-identically to `author` (see
+    /// [`Signature::to_ident_bytes`]).
+    pub fn author_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(self.author)
+    }
+
+    /// Parse the raw [`committer`](Commit::committer) line into a typed
+    /// [`Signature`] parse-view, or `None` if the stored bytes are not a
+    /// well-formed git identity. Read-only over the raw bytes, exactly like
+    /// [`Commit::author_signature`].
+    pub fn committer_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(self.committer)
+    }
+}
+
+impl<'a> From<CommitRef<'a>> for Commit {
+    fn from(commit: CommitRef<'a>) -> Self {
+        Self {
+            tree: commit.tree,
+            parents: commit.parents,
+            author: commit.author.to_vec(),
+            committer: commit.committer.to_vec(),
+            encoding: commit.encoding.map(<[u8]>::to_vec),
+            message: commit.message.to_vec(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tag {
     pub object: ObjectId,
@@ -539,37 +608,27 @@ pub struct Tag {
     pub message: Vec<u8>,
 }
 
+/// A borrowed parse-view of a raw annotated tag object.
+///
+/// The tag name, tagger identity, and message slices point into the original
+/// tag body. The object id and object type are parsed into owned values while
+/// preserving the same validation behavior as [`Tag::parse`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagRef<'a> {
+    pub object: ObjectId,
+    pub object_type: ObjectType,
+    pub name: &'a [u8],
+    pub tagger: Option<&'a [u8]>,
+    pub message: &'a [u8],
+}
+
 impl Tag {
     pub fn parse(format: ObjectFormat, bytes: &[u8]) -> Result<Self> {
-        let split = bytes
-            .windows(2)
-            .position(|window| window == b"\n\n")
-            .ok_or_else(|| GitError::InvalidObject("tag missing message separator".into()))?;
-        let headers = std::str::from_utf8(&bytes[..split])
-            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
-        let mut object = None;
-        let mut object_type = None;
-        let mut name = None;
-        let mut tagger = None;
-        for line in headers.lines() {
-            if let Some(value) = line.strip_prefix("object ") {
-                object = Some(ObjectId::from_hex(format, value)?);
-            } else if let Some(value) = line.strip_prefix("type ") {
-                object_type = Some(value.parse()?);
-            } else if let Some(value) = line.strip_prefix("tag ") {
-                name = Some(value.as_bytes().to_vec());
-            } else if let Some(value) = line.strip_prefix("tagger ") {
-                tagger = Some(value.as_bytes().to_vec());
-            }
-        }
-        Ok(Self {
-            object: object.ok_or_else(|| GitError::InvalidObject("tag missing object".into()))?,
-            object_type: object_type
-                .ok_or_else(|| GitError::InvalidObject("tag missing type".into()))?,
-            name: name.ok_or_else(|| GitError::InvalidObject("tag missing name".into()))?,
-            tagger,
-            message: bytes[split + 2..].to_vec(),
-        })
+        Ok(Self::parse_ref(format, bytes)?.into())
+    }
+
+    pub fn parse_ref<'a>(format: ObjectFormat, bytes: &'a [u8]) -> Result<TagRef<'a>> {
+        TagRef::parse(format, bytes)
     }
 
     pub fn write(&self) -> Vec<u8> {
@@ -600,6 +659,75 @@ impl Tag {
     /// the stored `tagger` line.
     pub fn tagger_signature(&self) -> Option<Signature> {
         Signature::from_ident_line(self.tagger.as_deref()?)
+    }
+}
+
+impl<'a> TagRef<'a> {
+    pub fn parse(format: ObjectFormat, bytes: &'a [u8]) -> Result<Self> {
+        let split = bytes
+            .windows(2)
+            .position(|window| window == b"\n\n")
+            .ok_or_else(|| GitError::InvalidObject("tag missing message separator".into()))?;
+        let headers = std::str::from_utf8(&bytes[..split])
+            .map_err(|err| GitError::InvalidObject(err.to_string()))?;
+        let mut object = None;
+        let mut object_type = None;
+        let mut name = None;
+        let mut tagger = None;
+        for line in headers.lines() {
+            if let Some(value) = line.strip_prefix("object ") {
+                object = Some(ObjectId::from_hex(format, value)?);
+            } else if let Some(value) = line.strip_prefix("type ") {
+                object_type = Some(value.parse()?);
+            } else if let Some(value) = line.strip_prefix("tag ") {
+                name = Some(value.as_bytes());
+            } else if let Some(value) = line.strip_prefix("tagger ") {
+                tagger = Some(value.as_bytes());
+            }
+        }
+        Ok(Self {
+            object: object.ok_or_else(|| GitError::InvalidObject("tag missing object".into()))?,
+            object_type: object_type
+                .ok_or_else(|| GitError::InvalidObject("tag missing type".into()))?,
+            name: name.ok_or_else(|| GitError::InvalidObject("tag missing name".into()))?,
+            tagger,
+            message: &bytes[split + 2..],
+        })
+    }
+
+    pub fn to_owned(&self) -> Tag {
+        Tag {
+            object: self.object.clone(),
+            object_type: self.object_type,
+            name: self.name.to_vec(),
+            tagger: self.tagger.map(<[u8]>::to_vec),
+            message: self.message.to_vec(),
+        }
+    }
+
+    /// Parse the raw [`tagger`](Tag::tagger) line into a typed [`Signature`]
+    /// parse-view.
+    ///
+    /// Returns `None` when the tag has no tagger header *or* when the stored
+    /// bytes are not a well-formed git identity — callers that need to tell
+    /// those apart should inspect [`Tag::tagger`] directly. This is a read-only
+    /// lens over the raw bytes, which stay the source of truth for
+    /// [`Tag::write`]; the returned signature re-serializes byte-identically to
+    /// the stored `tagger` line.
+    pub fn tagger_signature(&self) -> Option<Signature> {
+        Signature::from_ident_line(self.tagger?)
+    }
+}
+
+impl<'a> From<TagRef<'a>> for Tag {
+    fn from(tag: TagRef<'a>) -> Self {
+        Self {
+            object: tag.object,
+            object_type: tag.object_type,
+            name: tag.name.to_vec(),
+            tagger: tag.tagger.map(<[u8]>::to_vec),
+            message: tag.message.to_vec(),
+        }
     }
 }
 
@@ -838,6 +966,73 @@ mod tests {
     }
 
     #[test]
+    fn commit_ref_borrows_headers_and_message() {
+        let format = ObjectFormat::Sha1;
+        let tree_hex = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let parent_hex = "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15";
+        let body = format!(
+            "tree {tree_hex}\n\
+             parent {parent_hex}\n\
+             author A U Thor <a@example.invalid> 0 +0000\n\
+             committer C O Mitter <c@example.invalid> 1 -0000\n\
+             encoding UTF-8\n\
+             \n\
+             subject\n\nbody\n"
+        )
+        .into_bytes();
+
+        let commit = CommitRef::parse(format, &body).unwrap();
+        assert_eq!(commit.tree, ObjectId::from_hex(format, tree_hex).unwrap());
+        assert_eq!(
+            commit.parents,
+            vec![ObjectId::from_hex(format, parent_hex).unwrap()]
+        );
+        assert_borrows_from(
+            &body,
+            commit.author,
+            b"A U Thor <a@example.invalid> 0 +0000",
+        );
+        assert_borrows_from(
+            &body,
+            commit.committer,
+            b"C O Mitter <c@example.invalid> 1 -0000",
+        );
+        assert_borrows_from(&body, commit.encoding.unwrap(), b"UTF-8");
+        assert_borrows_from(&body, commit.message, b"subject\n\nbody\n");
+
+        assert_eq!(Commit::parse_ref(format, &body).unwrap(), commit);
+        assert_eq!(commit.to_owned(), Commit::parse(format, &body).unwrap());
+    }
+
+    #[test]
+    fn commit_ref_rejects_missing_or_malformed_required_headers() {
+        let format = ObjectFormat::Sha1;
+        let valid_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+        let valid_idents =
+            b"author A U Thor <a@example.invalid> 0 +0000\ncommitter C O Mitter <c@example.invalid> 0 +0000\n\nmessage\n";
+        let mut missing_tree = Vec::new();
+        missing_tree.extend_from_slice(valid_idents);
+        assert_invalid_object(
+            CommitRef::parse(format, &missing_tree),
+            "commit missing tree",
+        );
+
+        let malformed_tree = b"tree not-an-object-id\nauthor A U Thor <a@example.invalid> 0 +0000\ncommitter C O Mitter <c@example.invalid> 0 +0000\n\nmessage\n";
+        assert!(matches!(
+            CommitRef::parse(format, malformed_tree),
+            Err(GitError::InvalidObjectId(_))
+        ));
+
+        let missing_committer =
+            format!("tree {valid_tree}\nauthor A U Thor <a@example.invalid> 0 +0000\n\nmessage\n")
+                .into_bytes();
+        assert_invalid_object(
+            CommitRef::parse(format, &missing_committer),
+            "commit missing committer",
+        );
+    }
+
+    #[test]
     fn tag_round_trips_headers_and_message() {
         let object = ObjectId::from_hex(
             ObjectFormat::Sha1,
@@ -852,6 +1047,57 @@ mod tests {
             message: b"release\n".to_vec(),
         };
         assert_eq!(Tag::parse(ObjectFormat::Sha1, &tag.write()).unwrap(), tag);
+    }
+
+    #[test]
+    fn tag_ref_borrows_name_tagger_and_message() {
+        let format = ObjectFormat::Sha1;
+        let object_hex = "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15";
+        let body = format!(
+            "object {object_hex}\n\
+             type commit\n\
+             tag v1.0-borrowed\n\
+             tagger Example User <example@example.invalid> 0 +0000\n\
+             \n\
+             release notes\n"
+        )
+        .into_bytes();
+
+        let tag = TagRef::parse(format, &body).unwrap();
+        assert_eq!(tag.object, ObjectId::from_hex(format, object_hex).unwrap());
+        assert_eq!(tag.object_type, ObjectType::Commit);
+        assert_borrows_from(&body, tag.name, b"v1.0-borrowed");
+        assert_borrows_from(
+            &body,
+            tag.tagger.unwrap(),
+            b"Example User <example@example.invalid> 0 +0000",
+        );
+        assert_borrows_from(&body, tag.message, b"release notes\n");
+
+        assert_eq!(Tag::parse_ref(format, &body).unwrap(), tag);
+        assert_eq!(tag.to_owned(), Tag::parse(format, &body).unwrap());
+    }
+
+    #[test]
+    fn tag_ref_rejects_missing_or_malformed_required_headers() {
+        let format = ObjectFormat::Sha1;
+        let object_hex = "e7556fb3ba7b8f5b1f4772180772a4d6a7323e15";
+
+        let missing_name = format!("object {object_hex}\ntype commit\n\nmessage\n").into_bytes();
+        assert_invalid_object(TagRef::parse(format, &missing_name), "tag missing name");
+
+        let malformed_object = b"object not-an-object-id\ntype commit\ntag v1.0\n\nmessage\n";
+        assert!(matches!(
+            TagRef::parse(format, malformed_object),
+            Err(GitError::InvalidObjectId(_))
+        ));
+
+        let malformed_type =
+            format!("object {object_hex}\ntype mystery\ntag v1.0\n\nmessage\n").into_bytes();
+        assert_invalid_object(
+            TagRef::parse(format, &malformed_type),
+            "unknown object type mystery",
+        );
     }
 
     #[test]
@@ -960,5 +1206,21 @@ mod tests {
             Err(GitError::InvalidFormat(message)) => assert_eq!(message, expected),
             other => panic!("expected invalid format {expected:?}, got {other:?}"),
         }
+    }
+
+    fn assert_invalid_object<T: std::fmt::Debug>(result: Result<T>, expected: &str) {
+        match result {
+            Err(GitError::InvalidObject(message)) => assert_eq!(message, expected),
+            other => panic!("expected invalid object {expected:?}, got {other:?}"),
+        }
+    }
+
+    fn assert_borrows_from(body: &[u8], slice: &[u8], expected: &[u8]) {
+        assert_eq!(slice, expected);
+        let offset = body
+            .windows(expected.len())
+            .position(|window| window == expected)
+            .expect("expected slice appears in body");
+        assert!(std::ptr::eq(slice.as_ptr(), body[offset..].as_ptr()));
     }
 }

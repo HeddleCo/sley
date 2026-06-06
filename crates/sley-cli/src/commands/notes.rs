@@ -10,6 +10,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
+use sley_object::TreeEntries;
 
 /// Default notes ref when none is selected via `--ref`, `GIT_NOTES_REF`, or
 /// `core.notesRef`.
@@ -151,9 +152,9 @@ fn collect_notes(
     if object.object_type != ObjectType::Tree {
         return Ok(());
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
-        let Ok(name) = std::str::from_utf8(&entry.name) else {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let Ok(name) = std::str::from_utf8(entry.name) else {
             continue;
         };
         if !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -174,7 +175,7 @@ fn collect_notes(
             };
             out.push(NoteEntry {
                 annotated,
-                blob: entry.oid.clone(),
+                blob: entry.oid,
             });
         }
     }

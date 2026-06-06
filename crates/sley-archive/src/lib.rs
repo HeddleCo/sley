@@ -1,5 +1,5 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_object::{ObjectType, Tree, tree_entry_object_type};
+use sley_object::{ObjectType, TreeEntries, tree_entry_object_type};
 use sley_odb::ObjectReader;
 use std::collections::HashSet;
 use std::io::Write;
@@ -113,9 +113,9 @@ where
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
-        let relative_path = join_path(relative_prefix, &entry.name);
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let relative_path = join_path(relative_prefix, entry.name);
         match tree_entry_object_type(entry.mode) {
             ObjectType::Tree => {
                 let selection = if force_include {
@@ -175,9 +175,9 @@ where
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
-        let relative_path = join_path(relative_prefix, &entry.name);
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let relative_path = join_path(relative_prefix, entry.name);
         match tree_entry_object_type(entry.mode) {
             ObjectType::Tree => {
                 let selection = if force_include {
@@ -569,7 +569,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sley_object::EncodedObject;
+    use sley_object::{EncodedObject, Tree};
     use sley_odb::{ObjectDatabase, ObjectWriter};
 
     #[test]

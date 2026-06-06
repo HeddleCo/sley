@@ -16,6 +16,7 @@
 //! re-listing them.
 
 use crate::*;
+use sley_object::TreeEntries;
 
 /// How the per-object diff (for commits) is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,9 +771,9 @@ fn show_tag_header(
 fn show_tree(stdout: &mut io::Stdout, format: ObjectFormat, name: &str, body: &[u8]) -> Result<()> {
     writeln!(stdout, "tree {name}")?;
     writeln!(stdout)?;
-    let tree = Tree::parse(format, body)?;
-    for entry in &tree.entries {
-        stdout.write_all(&entry.name)?;
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        stdout.write_all(entry.name)?;
         if tree_entry_object_type(entry.mode) == ObjectType::Tree {
             stdout.write_all(b"/")?;
         }

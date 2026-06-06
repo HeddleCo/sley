@@ -11,6 +11,7 @@
 //! see `commands::stash` for the rationale.
 
 use crate::*;
+use sley_object::TreeEntries;
 
 /// How the regular expression text is interpreted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,14 +417,14 @@ fn collect_tree_blobs(
     if object.object_type != ObjectType::Tree {
         return Ok(());
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in &tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let object_type = tree_entry_object_type(entry.mode);
         let base_len = prefix.len();
         if !prefix.is_empty() {
             prefix.push(b'/');
         }
-        prefix.extend_from_slice(&entry.name);
+        prefix.extend_from_slice(entry.name);
         match object_type {
             ObjectType::Tree => {
                 collect_tree_blobs(db, format, &entry.oid, prefix, out)?;

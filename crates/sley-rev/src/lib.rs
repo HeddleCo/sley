@@ -831,7 +831,7 @@ fn commit_parents<R: ObjectReader>(
             object.object_type.as_str()
         )));
     }
-    Ok(Commit::parse(format, &object.body)?.parents)
+    Ok(Commit::parse_ref(format, &object.body)?.parents)
 }
 
 fn peel_revision<R: ObjectReader>(
@@ -871,7 +871,7 @@ pub fn peel_tags<R: ObjectReader>(
     if object.object_type != ObjectType::Tag {
         return Ok(oid.clone());
     }
-    let tag = Tag::parse(format, &object.body)?;
+    let tag = Tag::parse_ref(format, &object.body)?;
     peel_tags(reader, format, &tag.object)
 }
 
@@ -883,9 +883,9 @@ pub fn peel_to_tree<R: ObjectReader>(
     let object = reader.read_object(oid)?;
     match object.object_type {
         ObjectType::Tree => Ok(oid.clone()),
-        ObjectType::Commit => Ok(Commit::parse(format, &object.body)?.tree),
+        ObjectType::Commit => Ok(Commit::parse_ref(format, &object.body)?.tree),
         ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
+            let tag = Tag::parse_ref(format, &object.body)?;
             peel_to_tree(reader, format, &tag.object)
         }
         other => Err(GitError::InvalidObject(format!(
@@ -904,7 +904,7 @@ pub fn peel_to_commit<R: ObjectReader>(
     match object.object_type {
         ObjectType::Commit => Ok(oid.clone()),
         ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
+            let tag = Tag::parse_ref(format, &object.body)?;
             peel_to_commit(reader, format, &tag.object)
         }
         other => Err(GitError::InvalidObject(format!(
@@ -1002,12 +1002,12 @@ fn commit_metadata_from_object<R: ObjectReader>(
             object.object_type.as_str()
         )));
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     let commit_time = commit
         .committer_signature()
         .map(|signature| signature.time.seconds)
         .unwrap_or(0);
-    Ok((commit.parents.clone(), commit_time))
+    Ok((commit.parents, commit_time))
 }
 
 pub fn walk_commits<R: ObjectReader>(
@@ -1249,20 +1249,33 @@ fn search_commit_message_all<R: ObjectReader>(
 ) -> Result<ObjectId> {
     let starts = all_ref_commit_starts(git_dir, format, reader)?;
     let mut graph = CommitGraphContext::load(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
     let mut best: Option<(i64, ObjectId)> = None;
-    for record in walk_commits(reader, format, starts)? {
-        if !commit_message_contains(&record.commit, text) {
+    while let Some(oid) = pending.pop_front() {
+        if !seen.insert(oid.clone()) {
             continue;
         }
-        let when = graph
-            .commit_time(&record.oid)
-            .or_else(|| commit_committer_time(&record.commit))
-            .unwrap_or(i64::MIN);
-        if best
-            .as_ref()
-            .is_none_or(|(best_when, _)| when >= *best_when)
-        {
-            best = Some((when, record.oid));
+        let object = reader.read_object(&oid)?;
+        if object.object_type != ObjectType::Commit {
+            return Err(GitError::InvalidObject(format!(
+                "expected commit {oid}, found {}",
+                object.object_type.as_str()
+            )));
+        }
+        let commit = Commit::parse_ref(format, &object.body)?;
+        pending.extend(commit.parents.iter().cloned());
+        if commit_message_contains(commit.message, text) {
+            let when = graph
+                .commit_time(&oid)
+                .or_else(|| commit_committer_time(commit.committer))
+                .unwrap_or(i64::MIN);
+            if best
+                .as_ref()
+                .is_none_or(|(best_when, _)| when >= *best_when)
+            {
+                best = Some((when, oid));
+            }
         }
     }
     best.map(|(_, oid)| oid)
@@ -1296,32 +1309,35 @@ fn search_commit_message_first_parent<R: ObjectReader>(
                 object.object_type.as_str()
             )));
         }
-        let commit = Commit::parse(format, &object.body)?;
-        if commit_message_contains(&commit, text) {
+        let commit = Commit::parse_ref(format, &object.body)?;
+        if commit_message_contains(commit.message, text) {
             return Ok(oid);
         }
-        current = graph.commit_parents(reader, &oid)?.into_iter().next();
+        current = graph
+            .parents(&oid)
+            .unwrap_or_else(|| commit.parents.clone())
+            .into_iter()
+            .next();
     }
     Err(GitError::NotFound(format!(
         "no commit matching '^{{/{text}}}' in first-parent history"
     )))
 }
 
-fn commit_message_contains(commit: &Commit, text: &str) -> bool {
+fn commit_message_contains(message: &[u8], text: &str) -> bool {
     if text.is_empty() {
         return true;
     }
     // Search the raw bytes so non-UTF-8 messages still match where possible.
-    commit
-        .message
+    message
         .windows(text.len())
         .any(|window| window == text.as_bytes())
 }
 
 /// Best-effort committer timestamp (seconds since epoch) from a commit's
 /// committer line, used only to order `:/text` candidates.
-fn commit_committer_time(commit: &Commit) -> Option<i64> {
-    let line = std::str::from_utf8(&commit.committer).ok()?;
+fn commit_committer_time(committer: &[u8]) -> Option<i64> {
+    let line = std::str::from_utf8(committer).ok()?;
     // Format: "Name <email> <seconds> <tz>"; the timestamp is the
     // second-to-last whitespace-separated field.
     let mut fields = line.rsplit(' ');
@@ -3074,12 +3090,13 @@ mod tests {
             .iter()
             .map(|oid| {
                 let object = reader.read_object(oid).unwrap();
-                let commit = Commit::parse(format, &object.body).unwrap();
-                let commit_time = commit_committer_time(&commit).unwrap_or(0).max(0) as u64;
+                let commit = Commit::parse_ref(format, &object.body).unwrap();
+                let commit_time =
+                    commit_committer_time(commit.committer).unwrap_or(0).max(0) as u64;
                 sley_formats::CommitGraphWriteEntry {
                     oid: oid.clone(),
-                    tree: commit.tree.clone(),
-                    parents: commit.parents.clone(),
+                    tree: commit.tree,
+                    parents: commit.parents,
                     generation: generations.get(oid).copied().unwrap_or(1),
                     commit_time,
                 }

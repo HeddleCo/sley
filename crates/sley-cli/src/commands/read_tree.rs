@@ -27,6 +27,7 @@
 //! pattern.
 
 use crate::*;
+use sley_object::TreeEntries;
 
 /// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
 type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
@@ -334,13 +335,13 @@ fn collect_tree_leaves(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let mut path = prefix.to_vec();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             collect_tree_leaves(db, format, &entry.oid, &path, out)?;
         } else {

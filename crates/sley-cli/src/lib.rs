@@ -6,7 +6,7 @@ use sley_formats::{
 };
 use sley_index::{Index, IndexEntry};
 use sley_object::{
-    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry, tree_entry_object_type,
+    Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
 };
 use sley_odb::{
     FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
@@ -48,9 +48,9 @@ mod repo_path;
 mod repository;
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
+use commands::tag::{parse_tag_trailer, tag_message_with_trailers, tag_stripspace_message};
 pub(crate) use repo_path::RepoPathBuf;
 pub(crate) use repository::RepositoryContext;
-use commands::tag::{parse_tag_trailer, tag_message_with_trailers, tag_stripspace_message};
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let global = apply_global_options(&args)?;
@@ -21634,9 +21634,9 @@ fn cmd_log(args: &[String]) -> Result<()> {
             }
             value if value.starts_with('^') && value.len() > 1 => {
                 if not {
-                    includes.push(&value[1..]);
+                    includes.push(value[1..].to_string());
                 } else {
-                    excludes.push(&value[1..]);
+                    excludes.push(value[1..].to_string());
                 }
             }
             value if value.starts_with('-') => {
@@ -21719,7 +21719,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
         && symmetric_ranges.is_empty()
         && !has_ref_selectors
     {
-        includes.push("HEAD");
+        includes.push("HEAD".to_string());
     }
     let log_format_source = if !has_ref_selectors
         && includes.len() == 1
@@ -21732,14 +21732,14 @@ fn cmd_log(args: &[String]) -> Result<()> {
     };
     let mut starts = Vec::new();
     for rev in includes {
-        let start = resolve_revision(&git_dir, format, rev)?;
+        let start = resolve_revision(&git_dir, format, &rev)?;
         starts.push(sley_rev::peel_to_commit(&db, format, &start)?);
     }
     let mut symmetric_excludes = Vec::new();
     for (left, right, not) in linear_ranges {
-        let left_oid = resolve_revision(&git_dir, format, left)?;
+        let left_oid = resolve_revision(&git_dir, format, &left)?;
         let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, right)?;
+        let right_oid = resolve_revision(&git_dir, format, &right)?;
         let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
         if not {
             starts.push(left_oid);
@@ -21750,9 +21750,9 @@ fn cmd_log(args: &[String]) -> Result<()> {
         }
     }
     for (left, right, not) in symmetric_ranges {
-        let left_oid = resolve_revision(&git_dir, format, left)?;
+        let left_oid = resolve_revision(&git_dir, format, &left)?;
         let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
-        let right_oid = resolve_revision(&git_dir, format, right)?;
+        let right_oid = resolve_revision(&git_dir, format, &right)?;
         let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
         let merge_bases = merge_bases(&db, format, &left_oid, &right_oid)?;
         if not {
@@ -21813,7 +21813,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
         }
     }
     for rev in excludes {
-        let oid = resolve_revision(&git_dir, format, rev)?;
+        let oid = resolve_revision(&git_dir, format, &rev)?;
         let oid = sley_rev::peel_to_commit(&db, format, &oid)?;
         for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
             excluded.insert(record.oid);
@@ -22838,9 +22838,9 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
             value if value.starts_with('^') && value.len() > 1 => {
                 if not {
-                    includes.push(&value[1..]);
+                    includes.push(value[1..].to_string());
                 } else {
-                    excludes.push(&value[1..]);
+                    excludes.push(value[1..].to_string());
                 }
             }
             value if value.starts_with('-') => {
@@ -22935,7 +22935,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut include_commits = Vec::new();
     let mut start_tag_objects = Vec::new();
     for rev in includes {
-        if let Some(start) = resolve_rev_list_start(&git_dir, &db, format, rev, ignore_missing)? {
+        if let Some(start) = resolve_rev_list_start(&git_dir, &db, format, &rev, ignore_missing)? {
             include_commits.push(start.commit.clone());
             if let Some(tag_object) = start.tag_object {
                 start_tag_objects.push(RevListTagObject {
@@ -22947,12 +22947,12 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     let mut symmetric_excludes = Vec::new();
     for (left, right, not) in linear_ranges {
-        let Some(left_oid) = resolve_rev_list_commit(&git_dir, &db, format, left, ignore_missing)?
+        let Some(left_oid) = resolve_rev_list_commit(&git_dir, &db, format, &left, ignore_missing)?
         else {
             continue;
         };
         let Some(right_oid) =
-            resolve_rev_list_commit(&git_dir, &db, format, right, ignore_missing)?
+            resolve_rev_list_commit(&git_dir, &db, format, &right, ignore_missing)?
         else {
             continue;
         };
@@ -22966,12 +22966,12 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     let mut left_right_sides = HashMap::new();
     for (left, right, not) in symmetric_ranges {
-        let Some(left_oid) = resolve_rev_list_commit(&git_dir, &db, format, left, ignore_missing)?
+        let Some(left_oid) = resolve_rev_list_commit(&git_dir, &db, format, &left, ignore_missing)?
         else {
             continue;
         };
         let Some(right_oid) =
-            resolve_rev_list_commit(&git_dir, &db, format, right, ignore_missing)?
+            resolve_rev_list_commit(&git_dir, &db, format, &right, ignore_missing)?
         else {
             continue;
         };
@@ -23036,7 +23036,8 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
     }
     for rev in excludes {
-        let Some(oid) = resolve_rev_list_commit(&git_dir, &db, format, rev, ignore_missing)? else {
+        let Some(oid) = resolve_rev_list_commit(&git_dir, &db, format, &rev, ignore_missing)?
+        else {
             continue;
         };
         for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
@@ -23675,7 +23676,7 @@ fn rev_list_objects(
         if object.object_type != ObjectType::Commit {
             continue;
         }
-        let commit = Commit::parse(format, &object.body)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
         rev_list_mark_tree_objects(db, format, &commit.tree, &mut seen)?;
     }
     let mut objects = Vec::new();
@@ -23723,8 +23724,8 @@ fn rev_list_mark_tree_objects(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         if tree_entry_object_type(entry.mode) == ObjectType::Tree {
             rev_list_mark_tree_objects(db, format, &entry.oid, seen)?;
         } else {
@@ -23761,9 +23762,9 @@ fn rev_list_collect_tree_objects(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(walk.format, &object.body)?;
-    for entry in tree.entries {
-        let entry_path = rev_list_join_object_path(&path, &entry.name);
+    for entry in TreeEntries::new(walk.format, &object.body) {
+        let entry = entry?;
+        let entry_path = rev_list_join_object_path(&path, entry.name);
         let entry_type = tree_entry_object_type(entry.mode);
         if entry_type == ObjectType::Tree {
             rev_list_collect_tree_objects(
@@ -24160,51 +24161,64 @@ fn read_rev_list_commit_record(
     })
 }
 
-fn add_rev_list_revision_arg<'a>(
-    value: &'a str,
+fn add_rev_list_revision_arg(
+    value: &str,
     not: bool,
-    includes: &mut Vec<&'a str>,
-    excludes: &mut Vec<&'a str>,
-    linear_ranges: &mut Vec<(&'a str, &'a str, bool)>,
-    symmetric_ranges: &mut Vec<(&'a str, &'a str, bool)>,
+    includes: &mut Vec<String>,
+    excludes: &mut Vec<String>,
+    linear_ranges: &mut Vec<(String, String, bool)>,
+    symmetric_ranges: &mut Vec<(String, String, bool)>,
 ) -> Result<()> {
     if let Some(exclude) = value.strip_prefix('^')
         && !exclude.is_empty()
     {
         if not {
-            includes.push(exclude);
+            includes.push(exclude.to_string());
         } else {
-            excludes.push(exclude);
+            excludes.push(exclude.to_string());
         }
         return Ok(());
     }
-    if let Some((left, right)) = value.split_once("...") {
-        if right.contains("..") {
+    let selection = if value.contains("..") {
+        let Some(range) = sley_rev::parse_revision_range(value) else {
             return Err(GitError::Command(format!(
                 "unsupported rev-list range {value}"
             )));
-        }
-        symmetric_ranges.push((
-            if left.is_empty() { "HEAD" } else { left },
-            if right.is_empty() { "HEAD" } else { right },
-            not,
-        ));
-        return Ok(());
-    }
-    if let Some((left, right)) = value.split_once("..") {
-        if right.contains("..") {
-            return Err(GitError::Command(format!(
-                "unsupported rev-list range {value}"
-            )));
-        }
-        let left = if left.is_empty() { "HEAD" } else { left };
-        let right = if right.is_empty() { "HEAD" } else { right };
-        linear_ranges.push((left, right, not));
+        };
+        let mut selection = sley_rev::RevisionSelection::new();
+        selection.range(range);
+        selection
     } else {
-        if not {
-            excludes.push(value);
-        } else {
-            includes.push(value);
+        sley_rev::RevisionSelection::from_specs([value])?
+    };
+    for item in selection.items() {
+        match item {
+            sley_rev::RevisionSelectionItem::Include(rev) => {
+                if not {
+                    excludes.push(rev.clone());
+                } else {
+                    includes.push(rev.clone());
+                }
+            }
+            sley_rev::RevisionSelectionItem::Exclude(rev) => {
+                if not {
+                    includes.push(rev.clone());
+                } else {
+                    excludes.push(rev.clone());
+                }
+            }
+            sley_rev::RevisionSelectionItem::Range(sley_rev::RevisionRange::Asymmetric {
+                start,
+                end,
+            }) => {
+                linear_ranges.push((start.clone(), end.clone(), not));
+            }
+            sley_rev::RevisionSelectionItem::Range(sley_rev::RevisionRange::Symmetric {
+                left,
+                right,
+            }) => {
+                symmetric_ranges.push((left.clone(), right.clone(), not));
+            }
         }
     }
     Ok(())

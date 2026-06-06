@@ -2,7 +2,7 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_index::Index;
-use sley_object::{EncodedObject, ObjectType, Tree, tree_entry_object_type};
+use sley_object::{EncodedObject, ObjectType, TreeEntries, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, LooseObjectStore, ObjectReader, ObjectWriter};
 use sley_pack::{DeltaStrategy, PackFile, PackIndex};
 use sley_refs::{FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry};
@@ -2218,33 +2218,33 @@ pub fn ls_tree_parity_for_format(format: ObjectFormat) -> Result<LsTreeParity> {
 }
 
 fn format_tree_entries(format: ObjectFormat, body: &[u8]) -> Result<String> {
-    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         out.push_str(&format!(
             "{:06o} {} {}\t{}\n",
             entry.mode,
             tree_entry_object_type(entry.mode).as_str(),
             entry.oid,
-            String::from_utf8_lossy(&entry.name)
+            String::from_utf8_lossy(entry.name)
         ));
     }
     Ok(out)
 }
 
 fn format_tree_names(format: ObjectFormat, body: &[u8]) -> Result<String> {
-    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
-    for entry in tree.entries {
-        out.push_str(&format!("{}\n", String::from_utf8_lossy(&entry.name)));
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        out.push_str(&format!("{}\n", String::from_utf8_lossy(entry.name)));
     }
     Ok(out)
 }
 
 fn format_tree_entries_z(format: ObjectFormat, body: &[u8]) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         write!(
             out,
             "{:06o} {} {}\t",
@@ -2252,26 +2252,26 @@ fn format_tree_entries_z(format: ObjectFormat, body: &[u8]) -> Result<Vec<u8>> {
             tree_entry_object_type(entry.mode).as_str(),
             entry.oid
         )?;
-        out.extend_from_slice(&entry.name);
+        out.extend_from_slice(entry.name);
         out.push(0);
     }
     Ok(out)
 }
 
 fn format_tree_names_z(format: ObjectFormat, body: &[u8]) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
-        out.extend_from_slice(&entry.name);
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        out.extend_from_slice(entry.name);
         out.push(0);
     }
     Ok(out)
 }
 
 fn format_tree_object_ids(format: ObjectFormat, body: &[u8], terminator: u8) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         write!(out, "{}", entry.oid)?;
         out.push(terminator);
     }
@@ -2284,9 +2284,9 @@ fn format_tree_entries_long(
     body: &[u8],
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         let object_type = tree_entry_object_type(entry.mode);
         let size = tree_entry_size_field(db, object_type, &entry.oid)?;
         write!(
@@ -2296,7 +2296,7 @@ fn format_tree_entries_long(
             object_type.as_str(),
             entry.oid
         )?;
-        out.extend_from_slice(&entry.name);
+        out.extend_from_slice(entry.name);
         out.push(terminator);
     }
     Ok(out)
@@ -2320,10 +2320,10 @@ fn format_tree_entries_recursive(
     prefix: &str,
     name_only: bool,
 ) -> Result<String> {
-    let tree = Tree::parse(format, body)?;
     let mut out = String::new();
-    for entry in tree.entries {
-        let name = String::from_utf8_lossy(&entry.name);
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
         let path = format!("{prefix}{name}");
         if entry.mode == 0o040000 {
             let object = db.read_object(&entry.oid)?;
@@ -2361,10 +2361,10 @@ fn format_tree_entries_recursive_long(
     prefix: &str,
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
-        let name = String::from_utf8_lossy(&entry.name);
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
         let path = format!("{prefix}{name}");
         if entry.mode == 0o040000 {
             let object = db.read_object(&entry.oid)?;
@@ -2404,9 +2404,9 @@ fn format_tree_object_ids_recursive(
     prefix: &str,
     terminator: u8,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
         if entry.mode == 0o040000 {
             let object = db.read_object(&entry.oid)?;
             if object.object_type != ObjectType::Tree {
@@ -2414,7 +2414,7 @@ fn format_tree_object_ids_recursive(
                     "recursive ls-tree entry was not a tree".into(),
                 ));
             }
-            let name = String::from_utf8_lossy(&entry.name);
+            let name = String::from_utf8_lossy(entry.name);
             out.extend_from_slice(&format_tree_object_ids_recursive(
                 db,
                 format,
@@ -2437,10 +2437,10 @@ fn format_tree_entries_recursive_z(
     prefix: &str,
     name_only: bool,
 ) -> Result<Vec<u8>> {
-    let tree = Tree::parse(format, body)?;
     let mut out = Vec::new();
-    for entry in tree.entries {
-        let name = String::from_utf8_lossy(&entry.name);
+    for entry in TreeEntries::new(format, body) {
+        let entry = entry?;
+        let name = String::from_utf8_lossy(entry.name);
         let path = format!("{prefix}{name}");
         if entry.mode == 0o040000 {
             let object = db.read_object(&entry.oid)?;

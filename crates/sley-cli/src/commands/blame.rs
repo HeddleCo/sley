@@ -34,6 +34,7 @@
 // reach its ancestor module's private items, so everything visible at the crate
 // root is in scope here without re-listing it.
 use crate::*;
+use sley_object::TreeEntries;
 
 /// What to print in the metadata column for each line's author.
 #[derive(Clone, Copy)]
@@ -432,21 +433,23 @@ fn lookup_tree_path(
         if object.object_type != ObjectType::Tree {
             return Ok(None);
         }
-        let tree = Tree::parse(format, &object.body)?;
-        let Some(entry) = tree
-            .entries
-            .iter()
-            .find(|entry| entry.name == component.as_bytes())
-        else {
+        let mut matched = None;
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if matched.is_none() && entry.name == component.as_bytes() {
+                matched = Some((entry.mode, entry.oid));
+            }
+        }
+        let Some((mode, oid)) = matched else {
             return Ok(None);
         };
         if idx == last {
-            return Ok(Some(entry.oid.clone()));
+            return Ok(Some(oid));
         }
-        if sley_object::tree_entry_object_type(entry.mode) != ObjectType::Tree {
+        if sley_object::tree_entry_object_type(mode) != ObjectType::Tree {
             return Ok(None);
         }
-        current = entry.oid.clone();
+        current = oid;
     }
     Ok(None)
 }

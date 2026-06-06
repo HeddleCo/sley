@@ -276,10 +276,10 @@ fn read_shortlog_from_revisions(
     // Split the revision arguments into positive tips, negative tips, and ranges
     // exactly as the rev-list/log machinery does, so `A..B`, `A...B`, and `^X`
     // forms all behave identically to upstream.
-    let mut includes: Vec<&str> = Vec::new();
-    let mut excludes: Vec<&str> = Vec::new();
-    let mut linear_ranges: Vec<(&str, &str, bool)> = Vec::new();
-    let mut symmetric_ranges: Vec<(&str, &str, bool)> = Vec::new();
+    let mut includes: Vec<String> = Vec::new();
+    let mut excludes: Vec<String> = Vec::new();
+    let mut linear_ranges: Vec<(String, String, bool)> = Vec::new();
+    let mut symmetric_ranges: Vec<(String, String, bool)> = Vec::new();
     for rev in &options.revisions {
         add_rev_list_revision_arg(
             rev,
@@ -294,13 +294,13 @@ fn read_shortlog_from_revisions(
     let mut starts = Vec::new();
     let mut symmetric_excludes = Vec::new();
     for rev in includes {
-        let oid = repo.resolve_revision(rev)?;
+        let oid = repo.resolve_revision(&rev)?;
         starts.push(sley_rev::peel_to_commit(db, format, &oid)?);
     }
     for (left, right, not) in linear_ranges {
-        let left_oid = repo.resolve_revision(left)?;
+        let left_oid = repo.resolve_revision(&left)?;
         let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
-        let right_oid = repo.resolve_revision(right)?;
+        let right_oid = repo.resolve_revision(&right)?;
         let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
         if not {
             starts.push(left_oid);
@@ -311,9 +311,9 @@ fn read_shortlog_from_revisions(
         }
     }
     for (left, right, not) in symmetric_ranges {
-        let left_oid = repo.resolve_revision(left)?;
+        let left_oid = repo.resolve_revision(&left)?;
         let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
-        let right_oid = repo.resolve_revision(right)?;
+        let right_oid = repo.resolve_revision(&right)?;
         let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
         let bases = merge_bases(db, format, &left_oid, &right_oid)?;
         if not {
@@ -335,7 +335,7 @@ fn read_shortlog_from_revisions(
         }
     }
     for rev in excludes {
-        let oid = repo.resolve_revision(rev)?;
+        let oid = repo.resolve_revision(&rev)?;
         let oid = sley_rev::peel_to_commit(db, format, &oid)?;
         for record in rev_list_walk_commits(db, format, [oid], false)? {
             excluded.insert(record.oid);

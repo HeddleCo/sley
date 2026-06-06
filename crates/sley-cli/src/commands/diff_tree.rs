@@ -27,6 +27,7 @@
 //! A glob of the crate root brings every shared helper/type into scope via
 //! descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_object::TreeEntries;
 
 /// Which family of output git should produce. `diff-tree` defaults to `Raw`
 /// (the `:mode mode oid oid STATUS\tpath` form), which is *not* the default for
@@ -786,11 +787,11 @@ fn top_level_entries(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
     let mut map = BTreeMap::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         map.insert(
-            entry.name,
+            entry.name.to_vec(),
             TopEntry {
                 mode: entry.mode,
                 oid: entry.oid,
@@ -1226,11 +1227,11 @@ fn subtree_children(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
     let mut map = BTreeMap::new();
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         if entry.mode == 0o040000 {
-            map.insert(entry.name, entry.oid);
+            map.insert(entry.name.to_vec(), entry.oid);
         }
     }
     Ok(map)
