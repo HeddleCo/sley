@@ -14,7 +14,7 @@ use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::LooseObjectStore;
 
 use super::args::{
-    GitArgCursor, LongOption, option_takes_no_value, switch_requires_value, usage_error,
+    GitArgCursor, LongOption, Terminator, option_takes_no_value, switch_requires_value, usage_error,
 };
 use crate::*;
 
@@ -59,12 +59,68 @@ impl HashObjectInvocation {
                 invocation.paths.push(PathBuf::from(arg));
                 continue;
             }
-            if arg == "--" {
+            if Terminator::is(arg) {
                 positional_only = true;
                 invocation.allow_no_input = true;
                 continue;
             }
             if let Some(option) = LongOption::parse(arg) {
+                if let Some(negated) = option.negated() {
+                    match negated.name() {
+                        "stdin" => {
+                            if negated.has_value() {
+                                return option_takes_no_value(negated.option_name());
+                            }
+                            invocation.read_stdin = false;
+                            invocation.allow_no_input = true;
+                            continue;
+                        }
+                        "stdin-paths" => {
+                            if negated.has_value() {
+                                return option_takes_no_value(negated.option_name());
+                            }
+                            invocation.read_stdin_paths = false;
+                            invocation.allow_no_input = true;
+                            continue;
+                        }
+                        "filters" => {
+                            if negated.has_value() {
+                                return option_takes_no_value(negated.option_name());
+                            }
+                            invocation.filters = HashObjectFilterPolicy::Disabled {
+                                path: invocation.filters.path().map(PathBuf::from),
+                            };
+                            continue;
+                        }
+                        "literally" => {
+                            if negated.has_value() {
+                                return option_takes_no_value(negated.option_name());
+                            }
+                            invocation.literally = false;
+                            continue;
+                        }
+                        "path" => {
+                            if negated.has_value() {
+                                return option_takes_no_value(negated.option_name());
+                            }
+                            invocation.filters.clear_path();
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(path) =
+                    args.resolve_value_for(option, "path", || switch_requires_value("path"))?
+                {
+                    invocation.filters.set_path(PathBuf::from(path.value()));
+                    continue;
+                }
+                if let Some(value) = args.resolve_value_for(option, "object-format", || {
+                    GitError::Command("--object-format requires a value".into())
+                })? {
+                    invocation.set_format(value.value().parse()?);
+                    continue;
+                }
                 match option.name() {
                     "stdin" => {
                         if option.has_value() {

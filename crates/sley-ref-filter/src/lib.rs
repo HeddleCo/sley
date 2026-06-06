@@ -16,7 +16,277 @@ pub struct ForEachRefFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ForEachRefFormatSegment {
     Literal(Vec<u8>),
-    Atom(String),
+    Atom(ForEachRefAtom),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForEachRefAtom {
+    Raw(String),
+    Color(String),
+    RefName {
+        source: ForEachRefNameSource,
+        format: ForEachRefNameFormat,
+    },
+    ObjectName {
+        peeled: bool,
+        abbrev: Option<usize>,
+    },
+    Identity {
+        peeled: bool,
+        role: ForEachRefAtomIdentityRole,
+        part: ForEachRefAtomIdentityPart,
+    },
+    ContentsLines {
+        peeled: bool,
+        count: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachRefNameSource {
+    Ref,
+    Upstream,
+    Push,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachRefNameFormat {
+    Full,
+    Short,
+    Strip(ForEachRefStrip),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForEachRefStrip {
+    pub direction: ForEachRefStripDirection,
+    pub count: isize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachRefStripDirection {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachRefAtomIdentityRole {
+    Author,
+    Committer,
+    Tagger,
+    Creator,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForEachRefAtomIdentityPart {
+    Full,
+    Name,
+    Email(ForEachRefEmailMode),
+    Date(ForEachRefDateMode),
+    DateRaw,
+}
+
+impl ForEachRefAtom {
+    fn parse(value: &str) -> Result<Self> {
+        if let Some(color) = value.strip_prefix("color:") {
+            return Ok(Self::Color(color.to_string()));
+        }
+        if let Some(atom) = parse_for_each_ref_refname_atom(value)? {
+            return Ok(atom);
+        }
+        if let Some(atom) = parse_for_each_ref_objectname_atom(value)? {
+            return Ok(atom);
+        }
+        if let Some(atom) = parse_for_each_ref_identity_atom(value) {
+            return Ok(atom);
+        }
+        if let Some(count) = value.strip_prefix("contents:lines=") {
+            return Ok(Self::ContentsLines {
+                peeled: false,
+                count: parse_for_each_ref_contents_lines_count(count)?,
+            });
+        }
+        if let Some(count) = value.strip_prefix("*contents:lines=") {
+            return Ok(Self::ContentsLines {
+                peeled: true,
+                count: parse_for_each_ref_contents_lines_count(count)?,
+            });
+        }
+        Ok(Self::Raw(value.to_string()))
+    }
+}
+
+fn parse_for_each_ref_refname_atom(value: &str) -> Result<Option<ForEachRefAtom>> {
+    for (prefix, source) in [
+        ("refname", ForEachRefNameSource::Ref),
+        ("upstream", ForEachRefNameSource::Upstream),
+        ("push", ForEachRefNameSource::Push),
+    ] {
+        if value == prefix {
+            return Ok(Some(ForEachRefAtom::RefName {
+                source,
+                format: ForEachRefNameFormat::Full,
+            }));
+        }
+        let Some(modifier) = value
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_prefix(':'))
+        else {
+            continue;
+        };
+        let format = if modifier == "short" {
+            ForEachRefNameFormat::Short
+        } else if let Some(count) = modifier
+            .strip_prefix("lstrip=")
+            .or_else(|| modifier.strip_prefix("strip="))
+        {
+            ForEachRefNameFormat::Strip(ForEachRefStrip {
+                direction: ForEachRefStripDirection::Left,
+                count: parse_for_each_ref_strip_count(count)?,
+            })
+        } else if let Some(count) = modifier.strip_prefix("rstrip=") {
+            ForEachRefNameFormat::Strip(ForEachRefStrip {
+                direction: ForEachRefStripDirection::Right,
+                count: parse_for_each_ref_strip_count(count)?,
+            })
+        } else {
+            continue;
+        };
+        return Ok(Some(ForEachRefAtom::RefName { source, format }));
+    }
+    Ok(None)
+}
+
+fn parse_for_each_ref_objectname_atom(value: &str) -> Result<Option<ForEachRefAtom>> {
+    for (prefix, peeled) in [("objectname", false), ("*objectname", true)] {
+        if value == prefix {
+            return Ok(Some(ForEachRefAtom::ObjectName {
+                peeled,
+                abbrev: None,
+            }));
+        }
+        if value.strip_prefix(prefix) == Some(":short") {
+            return Ok(Some(ForEachRefAtom::ObjectName {
+                peeled,
+                abbrev: Some(0),
+            }));
+        }
+        if let Some(width) = value
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_prefix(":short="))
+        {
+            return Ok(Some(ForEachRefAtom::ObjectName {
+                peeled,
+                abbrev: Some(parse_for_each_ref_abbrev_width(width)?),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn parse_for_each_ref_identity_atom(value: &str) -> Option<ForEachRefAtom> {
+    let (value, peeled) = value
+        .strip_prefix('*')
+        .map(|value| (value, true))
+        .unwrap_or((value, false));
+    let (atom, modifier) = value.split_once(':').unwrap_or((value, ""));
+    let (role, part) = match atom {
+        "author" => (
+            ForEachRefAtomIdentityRole::Author,
+            ForEachRefAtomIdentityPart::Full,
+        ),
+        "authorname" => (
+            ForEachRefAtomIdentityRole::Author,
+            ForEachRefAtomIdentityPart::Name,
+        ),
+        "authoremail" => (
+            ForEachRefAtomIdentityRole::Author,
+            parse_for_each_ref_email_part(modifier)?,
+        ),
+        "authordate" => (
+            ForEachRefAtomIdentityRole::Author,
+            parse_for_each_ref_date_part(modifier)?,
+        ),
+        "committer" => (
+            ForEachRefAtomIdentityRole::Committer,
+            ForEachRefAtomIdentityPart::Full,
+        ),
+        "committername" => (
+            ForEachRefAtomIdentityRole::Committer,
+            ForEachRefAtomIdentityPart::Name,
+        ),
+        "committeremail" => (
+            ForEachRefAtomIdentityRole::Committer,
+            parse_for_each_ref_email_part(modifier)?,
+        ),
+        "committerdate" => (
+            ForEachRefAtomIdentityRole::Committer,
+            parse_for_each_ref_date_part(modifier)?,
+        ),
+        "tagger" => (
+            ForEachRefAtomIdentityRole::Tagger,
+            ForEachRefAtomIdentityPart::Full,
+        ),
+        "taggername" => (
+            ForEachRefAtomIdentityRole::Tagger,
+            ForEachRefAtomIdentityPart::Name,
+        ),
+        "taggeremail" => (
+            ForEachRefAtomIdentityRole::Tagger,
+            parse_for_each_ref_email_part(modifier)?,
+        ),
+        "taggerdate" => (
+            ForEachRefAtomIdentityRole::Tagger,
+            parse_for_each_ref_date_part(modifier)?,
+        ),
+        "creator" => (
+            ForEachRefAtomIdentityRole::Creator,
+            ForEachRefAtomIdentityPart::Full,
+        ),
+        "creatordate" => (
+            ForEachRefAtomIdentityRole::Creator,
+            parse_for_each_ref_date_part(modifier)?,
+        ),
+        _ => return None,
+    };
+    Some(ForEachRefAtom::Identity { peeled, role, part })
+}
+
+fn parse_for_each_ref_email_part(modifier: &str) -> Option<ForEachRefAtomIdentityPart> {
+    match modifier {
+        "" => Some(ForEachRefAtomIdentityPart::Email(
+            ForEachRefEmailMode::Bracketed,
+        )),
+        "trim" => Some(ForEachRefAtomIdentityPart::Email(ForEachRefEmailMode::Trim)),
+        "localpart" => Some(ForEachRefAtomIdentityPart::Email(
+            ForEachRefEmailMode::LocalPart,
+        )),
+        _ => None,
+    }
+}
+
+fn parse_for_each_ref_date_part(modifier: &str) -> Option<ForEachRefAtomIdentityPart> {
+    match modifier {
+        "" => Some(ForEachRefAtomIdentityPart::Date(
+            ForEachRefDateMode::Default,
+        )),
+        "raw" => Some(ForEachRefAtomIdentityPart::DateRaw),
+        "unix" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Unix)),
+        "short" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Short)),
+        "iso" | "iso8601" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Iso)),
+        "iso8601-strict" => Some(ForEachRefAtomIdentityPart::Date(
+            ForEachRefDateMode::IsoStrict,
+        )),
+        "rfc2822" => Some(ForEachRefAtomIdentityPart::Date(
+            ForEachRefDateMode::Rfc2822,
+        )),
+        _ => None,
+    }
+}
+
+pub fn parse_for_each_ref_contents_lines_count(value: &str) -> Result<usize> {
+    value
+        .parse::<usize>()
+        .map_err(|_| GitError::Command(format!("invalid for-each-ref contents line count {value}")))
 }
 
 impl ForEachRefFormat {
@@ -42,9 +312,9 @@ impl ForEachRefFormat {
                         ));
                     };
                     let end = start + 2 + end;
-                    segments.push(ForEachRefFormatSegment::Atom(
-                        format_spec[start + 2..end].to_string(),
-                    ));
+                    segments.push(ForEachRefFormatSegment::Atom(ForEachRefAtom::parse(
+                        &format_spec[start + 2..end],
+                    )?));
                     cursor = end + 1;
                 }
                 Some(_) => {
@@ -86,7 +356,7 @@ pub fn write_for_each_ref_format(
     stdout: &mut impl Write,
     format: &ForEachRefFormat,
     quote: ForEachRefQuoteMode,
-    mut write_atom: impl FnMut(&mut Vec<u8>, &str) -> Result<()>,
+    mut write_atom: impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
 ) -> Result<()> {
     for segment in format.segments() {
         match segment {
@@ -524,36 +794,18 @@ pub fn for_each_ref_abbrev_oid(
     candidates: &[ObjectId],
 ) -> String {
     let hex = oid.to_hex();
-    let mut width = width.unwrap_or(hex.len()).min(hex.len());
+    let mut width = oid.abbrev_hex_len(width.unwrap_or(hex.len()));
     while width < hex.len() {
         let prefix = &hex.as_bytes()[..width];
         if !candidates
             .iter()
-            .any(|candidate| candidate != oid && object_id_hex_starts_with(candidate, prefix))
+            .any(|candidate| candidate != oid && candidate.hex_prefix_matches(prefix))
         {
             break;
         }
         width += 1;
     }
     hex[..width].to_string()
-}
-
-fn object_id_hex_starts_with(oid: &ObjectId, prefix: &[u8]) -> bool {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    if prefix.len() > oid.format().hex_len() {
-        return false;
-    }
-
-    prefix.iter().enumerate().all(|(index, expected)| {
-        let byte = oid.as_bytes()[index / 2];
-        let nibble = if index % 2 == 0 {
-            byte >> 4
-        } else {
-            byte & 0x0f
-        };
-        HEX[nibble as usize] == *expected
-    })
 }
 
 pub fn parse_for_each_ref_abbrev_width(value: &str) -> Result<usize> {
@@ -586,10 +838,63 @@ mod tests {
             format.segments(),
             &[
                 ForEachRefFormatSegment::Literal(b"refs/%/".to_vec()),
-                ForEachRefFormatSegment::Atom("refname".to_string()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::RefName {
+                    source: ForEachRefNameSource::Ref,
+                    format: ForEachRefNameFormat::Full
+                }),
                 ForEachRefFormatSegment::Literal(b"\t".to_vec()),
-                ForEachRefFormatSegment::Atom("objectname".to_string()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::ObjectName {
+                    peeled: false,
+                    abbrev: None
+                }),
                 ForEachRefFormatSegment::Literal(b"%q".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn format_parser_decodes_typed_ref_filter_atoms() {
+        let format = ForEachRefFormat::parse(
+            "%(refname:short) %(upstream:lstrip=2) %(*objectname:short=7) %(authoremail:trim) %(authordate:iso8601-strict) %(*contents:lines=2)",
+        )
+        .expect("valid format");
+        assert_eq!(
+            format.segments(),
+            &[
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::RefName {
+                    source: ForEachRefNameSource::Ref,
+                    format: ForEachRefNameFormat::Short,
+                }),
+                ForEachRefFormatSegment::Literal(b" ".to_vec()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::RefName {
+                    source: ForEachRefNameSource::Upstream,
+                    format: ForEachRefNameFormat::Strip(ForEachRefStrip {
+                        direction: ForEachRefStripDirection::Left,
+                        count: 2,
+                    }),
+                }),
+                ForEachRefFormatSegment::Literal(b" ".to_vec()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::ObjectName {
+                    peeled: true,
+                    abbrev: Some(7),
+                }),
+                ForEachRefFormatSegment::Literal(b" ".to_vec()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::Identity {
+                    peeled: false,
+                    role: ForEachRefAtomIdentityRole::Author,
+                    part: ForEachRefAtomIdentityPart::Email(ForEachRefEmailMode::Trim),
+                }),
+                ForEachRefFormatSegment::Literal(b" ".to_vec()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::Identity {
+                    peeled: false,
+                    role: ForEachRefAtomIdentityRole::Author,
+                    part: ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::IsoStrict),
+                }),
+                ForEachRefFormatSegment::Literal(b" ".to_vec()),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::ContentsLines {
+                    peeled: true,
+                    count: 2,
+                }),
             ]
         );
     }
@@ -597,6 +902,13 @@ mod tests {
     #[test]
     fn format_parser_rejects_unterminated_atoms() {
         assert!(ForEachRefFormat::parse("%(refname").is_err());
+    }
+
+    #[test]
+    fn format_parser_rejects_invalid_typed_atom_numbers() {
+        assert!(ForEachRefFormat::parse("%(contents:lines=nope)").is_err());
+        assert!(ForEachRefFormat::parse("%(objectname:short=0)").is_err());
+        assert!(ForEachRefFormat::parse("%(refname:lstrip=nope)").is_err());
     }
 
     #[test]
@@ -608,7 +920,13 @@ mod tests {
             &format,
             ForEachRefQuoteMode::Shell,
             |atom, name| {
-                assert_eq!(name, "refname");
+                assert_eq!(
+                    name,
+                    &ForEachRefAtom::RefName {
+                        source: ForEachRefNameSource::Ref,
+                        format: ForEachRefNameFormat::Full
+                    }
+                );
                 atom.extend_from_slice(b"main's");
                 Ok(())
             },

@@ -89,7 +89,38 @@ impl ObjectId {
     }
 
     pub fn to_hex(&self) -> String {
-        to_hex(self.as_bytes())
+        let mut out = String::with_capacity(self.format.hex_len());
+        self.write_hex(&mut out)
+            .expect("writing object id hex to a String cannot fail");
+        out
+    }
+
+    pub fn write_hex(&self, out: &mut impl fmt::Write) -> fmt::Result {
+        write_hex_bytes(self.as_bytes(), out)
+    }
+
+    pub fn hex_prefix_matches(&self, prefix: &[u8]) -> bool {
+        if prefix.len() > self.format.hex_len() {
+            return false;
+        }
+
+        prefix.iter().enumerate().all(|(index, expected)| {
+            let Some(expected) = hex_nibble_value(*expected) else {
+                return false;
+            };
+            let byte = self.as_bytes()[index / 2];
+            let actual = if index % 2 == 0 {
+                byte >> 4
+            } else {
+                byte & 0x0f
+            };
+            actual == expected
+        })
+    }
+
+    pub const fn abbrev_hex_len(&self, width: usize) -> usize {
+        let hex_len = self.format.hex_len();
+        if width < hex_len { width } else { hex_len }
     }
 
     /// The all-zero ("null") object id for `format`.
@@ -142,7 +173,7 @@ impl fmt::Debug for ObjectId {
 
 impl fmt::Display for ObjectId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_hex())
+        self.write_hex(f)
     }
 }
 
@@ -511,25 +542,32 @@ pub fn digest_bytes(format: ObjectFormat, bytes: &[u8]) -> Result<ObjectId> {
 }
 
 pub fn to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
+    write_hex_bytes(bytes, &mut out).expect("writing hex to a String cannot fail");
     out
 }
 
-fn hex_nibble(byte: u8) -> Result<u8> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(GitError::InvalidObjectId(format!(
-            "non-hex byte {:?}",
-            byte as char
-        ))),
+fn write_hex_bytes(bytes: &[u8], out: &mut impl fmt::Write) -> fmt::Result {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in bytes {
+        out.write_char(HEX[(byte >> 4) as usize] as char)?;
+        out.write_char(HEX[(byte & 0x0f) as usize] as char)?;
     }
+    Ok(())
+}
+
+fn hex_nibble_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    hex_nibble_value(byte)
+        .ok_or_else(|| GitError::InvalidObjectId(format!("non-hex byte {:?}", byte as char)))
 }
 
 // ---------------------------------------------------------------------------
@@ -809,13 +847,15 @@ mod tests {
 
     #[test]
     fn sha1_blob_matches_git_known_value() {
-        let oid = object_id_for_bytes(ObjectFormat::Sha1, "blob", b"hello\n").unwrap();
+        let oid = object_id_for_bytes(ObjectFormat::Sha1, "blob", b"hello\n")
+            .expect("known blob should hash as sha1");
         assert_eq!(oid.to_hex(), "ce013625030ba8dba906f756967f9e9ca394464a");
     }
 
     #[test]
     fn sha256_blob_matches_git_known_value() {
-        let oid = object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello\n").unwrap();
+        let oid = object_id_for_bytes(ObjectFormat::Sha256, "blob", b"hello\n")
+            .expect("known blob should hash as sha256");
         assert_eq!(
             oid.to_hex(),
             "2cf8d83d9ee29543b34a87727421fdecb7e3f3a183d337639025de576db9ebb4"
@@ -828,8 +868,59 @@ mod tests {
             ObjectFormat::Sha1,
             "ce013625030ba8dba906f756967f9e9ca394464a",
         )
-        .unwrap();
+        .expect("valid sha1 hex");
         assert_eq!(oid.to_hex(), "ce013625030ba8dba906f756967f9e9ca394464a");
+    }
+
+    #[test]
+    fn object_id_writes_hex_without_allocating_in_the_writer() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "CE013625030BA8DBA906F756967F9E9CA394464A",
+        )
+        .expect("valid uppercase sha1 hex");
+
+        let mut out = String::new();
+        oid.write_hex(&mut out)
+            .expect("writing object id hex to a String should not fail");
+
+        assert_eq!(out, "ce013625030ba8dba906f756967f9e9ca394464a");
+        assert_eq!(oid.to_hex(), out);
+        assert_eq!(format!("{oid}"), out);
+    }
+
+    #[test]
+    fn object_id_matches_hex_prefixes_by_nibble() {
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("valid sha1 hex");
+
+        assert!(oid.hex_prefix_matches(b""));
+        assert!(oid.hex_prefix_matches(b"c"));
+        assert!(oid.hex_prefix_matches(b"ce013"));
+        assert!(oid.hex_prefix_matches(b"CE013625"));
+        assert!(oid.hex_prefix_matches(b"ce013625030ba8dba906f756967f9e9ca394464a"));
+
+        assert!(!oid.hex_prefix_matches(b"d"));
+        assert!(!oid.hex_prefix_matches(b"ce014"));
+        assert!(!oid.hex_prefix_matches(b"ce01x"));
+
+        let mut too_long = oid.to_hex();
+        too_long.push('0');
+        assert!(!oid.hex_prefix_matches(too_long.as_bytes()));
+    }
+
+    #[test]
+    fn object_id_abbrev_hex_len_clamps_to_format_width() {
+        let sha1 = ObjectId::null(ObjectFormat::Sha1);
+        let sha256 = ObjectId::null(ObjectFormat::Sha256);
+
+        assert_eq!(sha1.abbrev_hex_len(0), 0);
+        assert_eq!(sha1.abbrev_hex_len(12), 12);
+        assert_eq!(sha1.abbrev_hex_len(80), ObjectFormat::Sha1.hex_len());
+        assert_eq!(sha256.abbrev_hex_len(80), ObjectFormat::Sha256.hex_len());
     }
 
     #[test]

@@ -29,6 +29,7 @@ use sley_refs::{
     branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use sley_transport::{RemoteTransport, parse_remote_url};
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -17303,43 +17304,47 @@ fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             .flatten();
         let object = db.read_object(&oid)?;
         let contents = for_each_ref_contents(format, &object)?;
-        let peeled_object = if let Some(peeled_oid) = contents
+        let peeled_encoded_object = if let Some(peeled_oid) = contents
             .as_ref()
             .and_then(|contents| contents.tag_object.as_ref())
         {
-            let peeled_object = db.read_object(peeled_oid)?;
-            let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, peeled_oid)?;
-            let (tree, parents, message, author, committer, creator) =
-                if peeled_object.object_type == ObjectType::Commit {
-                    let commit = Commit::parse(format, &peeled_object.body)?;
-                    let committer = commit.committer;
-                    (
-                        Some(commit.tree),
-                        commit.parents,
-                        Some(commit.message),
-                        Some(commit.author),
-                        Some(committer.clone()),
-                        Some(committer),
-                    )
-                } else {
-                    (None, Vec::new(), None, None, None, None)
-                };
-            Some(ForEachRefPeeledObject {
-                oid: peeled_oid.clone(),
-                object_type: peeled_object.object_type,
-                object_size: peeled_object.body.len(),
-                object_disk_size,
-                object_body: peeled_object.body,
-                tree,
-                parents,
-                message,
-                author,
-                committer,
-                creator,
-            })
+            Some((peeled_oid.clone(), db.read_object(peeled_oid)?))
         } else {
             None
         };
+        let peeled_object =
+            if let Some((peeled_oid, peeled_encoded_object)) = peeled_encoded_object.as_ref() {
+                let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, peeled_oid)?;
+                let (tree, parents, message, author, committer, creator) =
+                    if peeled_encoded_object.object_type == ObjectType::Commit {
+                        let commit = Commit::parse_ref(format, &peeled_encoded_object.body)?;
+                        (
+                            Some(commit.tree),
+                            commit.parents,
+                            Some(Cow::Borrowed(commit.message)),
+                            Some(Cow::Borrowed(commit.author)),
+                            Some(Cow::Borrowed(commit.committer)),
+                            Some(Cow::Borrowed(commit.committer)),
+                        )
+                    } else {
+                        (None, Vec::new(), None, None, None, None)
+                    };
+                Some(ForEachRefPeeledObject {
+                    oid: peeled_oid.clone(),
+                    object_type: peeled_encoded_object.object_type,
+                    object_size: peeled_encoded_object.body.len(),
+                    object_disk_size,
+                    object_body: Cow::Borrowed(&peeled_encoded_object.body),
+                    tree,
+                    parents,
+                    message,
+                    author,
+                    committer,
+                    creator,
+                })
+            } else {
+                None
+            };
         let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &oid)?;
         let deltabase = zero_oid(format)?;
         let worktree_path =
@@ -18045,7 +18050,7 @@ fn for_each_ref_sort_key(
 fn for_each_ref_sort_tag_contents(
     reference: &sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
-) -> Result<Option<ForEachRefContents>> {
+) -> Result<Option<ForEachRefContents<'static>>> {
     let Some(contents) = for_each_ref_sort_contents(reference, context)? else {
         return Ok(None);
     };
@@ -18058,12 +18063,12 @@ fn for_each_ref_sort_tag_contents(
 fn for_each_ref_sort_contents(
     reference: &sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
-) -> Result<Option<ForEachRefContents>> {
+) -> Result<Option<ForEachRefContents<'static>>> {
     let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? else {
         return Ok(None);
     };
     let object = context.db.read_object(&oid)?;
-    for_each_ref_contents(context.format, &object)
+    for_each_ref_contents_owned(context.format, &object)
 }
 
 fn for_each_ref_sort_peeled_object(
@@ -18083,15 +18088,15 @@ fn for_each_ref_sort_peeled_object(
 fn for_each_ref_sort_peeled_contents(
     reference: &sley_refs::Ref,
     context: &ForEachRefSortContext<'_>,
-) -> Result<Option<ForEachRefContents>> {
+) -> Result<Option<ForEachRefContents<'static>>> {
     let Some((_, object)) = for_each_ref_sort_peeled_object(reference, context)? else {
         return Ok(None);
     };
-    for_each_ref_contents(context.format, &object)
+    for_each_ref_contents_owned(context.format, &object)
 }
 
 fn for_each_ref_sort_identity_key(
-    contents: Option<&ForEachRefContents>,
+    contents: Option<&ForEachRefContents<'_>>,
     field: ForEachRefIdentitySortField,
 ) -> String {
     let identity = match field.role {
@@ -18215,7 +18220,7 @@ enum ForEachRefDateSortField {
 }
 
 fn for_each_ref_sort_date_key(
-    contents: Option<ForEachRefContents>,
+    contents: Option<ForEachRefContents<'_>>,
     field: ForEachRefDateSortField,
 ) -> i128 {
     let contents = contents.as_ref();
@@ -18591,57 +18596,83 @@ fn for_each_ref_ahead_behind(
     Ok(Some(ForEachRefTrack { ahead, behind }))
 }
 
-struct ForEachRefContents {
-    message: Vec<u8>,
+struct ForEachRefContents<'a> {
+    message: Cow<'a, [u8]>,
     tree: Option<ObjectId>,
     parents: Vec<ObjectId>,
-    tag: Option<Vec<u8>>,
+    tag: Option<Cow<'a, [u8]>>,
     tag_object_type: Option<ObjectType>,
     tag_object: Option<ObjectId>,
-    author: Option<Vec<u8>>,
-    committer: Option<Vec<u8>>,
-    tagger: Option<Vec<u8>>,
-    creator: Option<Vec<u8>>,
+    author: Option<Cow<'a, [u8]>>,
+    committer: Option<Cow<'a, [u8]>>,
+    tagger: Option<Cow<'a, [u8]>>,
+    creator: Option<Cow<'a, [u8]>>,
 }
 
-fn for_each_ref_contents(
+impl ForEachRefContents<'_> {
+    fn into_owned(self) -> ForEachRefContents<'static> {
+        ForEachRefContents {
+            message: Cow::Owned(self.message.into_owned()),
+            tree: self.tree,
+            parents: self.parents,
+            tag: self.tag.map(|tag| Cow::Owned(tag.into_owned())),
+            tag_object_type: self.tag_object_type,
+            tag_object: self.tag_object,
+            author: self.author.map(|author| Cow::Owned(author.into_owned())),
+            committer: self
+                .committer
+                .map(|committer| Cow::Owned(committer.into_owned())),
+            tagger: self.tagger.map(|tagger| Cow::Owned(tagger.into_owned())),
+            creator: self.creator.map(|creator| Cow::Owned(creator.into_owned())),
+        }
+    }
+}
+
+fn for_each_ref_contents<'a>(
     format: ObjectFormat,
-    object: &sley_object::EncodedObject,
-) -> Result<Option<ForEachRefContents>> {
+    object: &'a sley_object::EncodedObject,
+) -> Result<Option<ForEachRefContents<'a>>> {
     let contents = match object.object_type {
         ObjectType::Commit => {
-            let commit = Commit::parse(format, &object.body)?;
+            let commit = Commit::parse_ref(format, &object.body)?;
             ForEachRefContents {
-                message: commit.message,
+                message: Cow::Borrowed(commit.message),
                 tree: Some(commit.tree),
                 parents: commit.parents,
                 tag: None,
                 tag_object_type: None,
                 tag_object: None,
-                author: Some(commit.author),
-                committer: Some(commit.committer.clone()),
+                author: Some(Cow::Borrowed(commit.author)),
+                committer: Some(Cow::Borrowed(commit.committer)),
                 tagger: None,
-                creator: Some(commit.committer),
+                creator: Some(Cow::Borrowed(commit.committer)),
             }
         }
         ObjectType::Tag => {
-            let tag = Tag::parse(format, &object.body)?;
+            let tag = Tag::parse_ref(format, &object.body)?;
             ForEachRefContents {
-                message: tag.message,
+                message: Cow::Borrowed(tag.message),
                 tree: None,
                 parents: Vec::new(),
-                tag: Some(tag.name),
+                tag: Some(Cow::Borrowed(tag.name)),
                 tag_object_type: Some(tag.object_type),
                 tag_object: Some(tag.object),
                 author: None,
                 committer: None,
-                tagger: tag.tagger.clone(),
-                creator: tag.tagger,
+                tagger: tag.tagger.map(Cow::Borrowed),
+                creator: tag.tagger.map(Cow::Borrowed),
             }
         }
         _ => return Ok(None),
     };
     Ok(Some(contents))
+}
+
+fn for_each_ref_contents_owned(
+    format: ObjectFormat,
+    object: &sley_object::EncodedObject,
+) -> Result<Option<ForEachRefContents<'static>>> {
+    Ok(for_each_ref_contents(format, object)?.map(ForEachRefContents::into_owned))
 }
 
 struct ForEachRefFormatContext<'a> {
@@ -18666,22 +18697,22 @@ struct ForEachRefFormatContext<'a> {
     push: Option<ForEachRefPush>,
     upstream_track: Option<ForEachRefTrack>,
     push_track: Option<ForEachRefTrack>,
-    contents: Option<ForEachRefContents>,
-    peeled_object: Option<ForEachRefPeeledObject>,
+    contents: Option<ForEachRefContents<'a>>,
+    peeled_object: Option<ForEachRefPeeledObject<'a>>,
 }
 
-struct ForEachRefPeeledObject {
+struct ForEachRefPeeledObject<'a> {
     oid: ObjectId,
     object_type: ObjectType,
-    object_body: Vec<u8>,
+    object_body: Cow<'a, [u8]>,
     object_size: usize,
     object_disk_size: Option<u64>,
     tree: Option<ObjectId>,
     parents: Vec<ObjectId>,
-    message: Option<Vec<u8>>,
-    author: Option<Vec<u8>>,
-    committer: Option<Vec<u8>>,
-    creator: Option<Vec<u8>>,
+    message: Option<Cow<'a, [u8]>>,
+    author: Option<Cow<'a, [u8]>>,
+    committer: Option<Cow<'a, [u8]>>,
+    creator: Option<Cow<'a, [u8]>>,
 }
 
 fn print_for_each_ref_format(
@@ -18689,7 +18720,14 @@ fn print_for_each_ref_format(
     format_spec: &ForEachRefFormat,
     context: &ForEachRefFormatContext<'_>,
 ) -> Result<()> {
-    write_for_each_ref_format(stdout, format_spec, context.quote, |stdout, placeholder| {
+    write_for_each_ref_format(stdout, format_spec, context.quote, |stdout, atom| {
+        let placeholder = match atom {
+            ForEachRefAtom::Raw(placeholder) => placeholder.as_str(),
+            atom => {
+                write_for_each_ref_typed_atom(stdout, atom, context)?;
+                return Ok(());
+            }
+        };
         match placeholder {
             "HEAD" => stdout.write_all(if context.is_head { b"*" } else { b" " })?,
             "refname" => stdout.write_all(context.refname.as_bytes())?,
@@ -18760,17 +18798,13 @@ fn print_for_each_ref_format(
                     write!(stdout, "{size}")?;
                 }
             }
-            "objecttype" => {
-                stdout.write_all(context.object_type.as_str().as_bytes())?
-            }
+            "objecttype" => stdout.write_all(context.object_type.as_str().as_bytes())?,
             "*objecttype" => {
                 if let Some(peeled) = &context.peeled_object {
                     stdout.write_all(peeled.object_type.as_str().as_bytes())?;
                 }
             }
-            "worktreepath" => {
-                stdout.write_all(context.worktree_path.unwrap_or("").as_bytes())?
-            }
+            "worktreepath" => stdout.write_all(context.worktree_path.unwrap_or("").as_bytes())?,
             "symref" => stdout.write_all(context.symref.unwrap_or("").as_bytes())?,
             "symref:short" => stdout.write_all(
                 context
@@ -19256,14 +19290,12 @@ fn print_for_each_ref_format(
                     .or_else(|| other.strip_prefix("refname:strip="))
                 {
                     let count = parse_for_each_ref_strip_count(value)?;
-                    stdout.write_all(
-                        for_each_ref_lstrip_name(context.refname, count).as_bytes(),
-                    )?;
+                    stdout
+                        .write_all(for_each_ref_lstrip_name(context.refname, count).as_bytes())?;
                 } else if let Some(value) = other.strip_prefix("refname:rstrip=") {
                     let count = parse_for_each_ref_strip_count(value)?;
-                    stdout.write_all(
-                        for_each_ref_rstrip_name(context.refname, count).as_bytes(),
-                    )?;
+                    stdout
+                        .write_all(for_each_ref_rstrip_name(context.refname, count).as_bytes())?;
                 } else if let Some(value) = other
                     .strip_prefix("upstream:lstrip=")
                     .or_else(|| other.strip_prefix("upstream:strip="))
@@ -19274,9 +19306,7 @@ fn print_for_each_ref_format(
                         .as_ref()
                         .map(|upstream| upstream.refname.as_str())
                         .unwrap_or("");
-                    stdout.write_all(
-                        for_each_ref_lstrip_name(upstream, count).as_bytes(),
-                    )?;
+                    stdout.write_all(for_each_ref_lstrip_name(upstream, count).as_bytes())?;
                 } else if let Some(value) = other.strip_prefix("upstream:rstrip=") {
                     let count = parse_for_each_ref_strip_count(value)?;
                     let upstream = context
@@ -19284,9 +19314,7 @@ fn print_for_each_ref_format(
                         .as_ref()
                         .map(|upstream| upstream.refname.as_str())
                         .unwrap_or("");
-                    stdout.write_all(
-                        for_each_ref_rstrip_name(upstream, count).as_bytes(),
-                    )?;
+                    stdout.write_all(for_each_ref_rstrip_name(upstream, count).as_bytes())?;
                 } else if let Some(value) = other
                     .strip_prefix("push:lstrip=")
                     .or_else(|| other.strip_prefix("push:strip="))
@@ -19297,8 +19325,7 @@ fn print_for_each_ref_format(
                         .as_ref()
                         .and_then(|push| push.refname.as_deref())
                         .unwrap_or("");
-                    stdout
-                        .write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
+                    stdout.write_all(for_each_ref_lstrip_name(push, count).as_bytes())?;
                 } else if let Some(value) = other.strip_prefix("push:rstrip=") {
                     let count = parse_for_each_ref_strip_count(value)?;
                     let push = context
@@ -19306,8 +19333,7 @@ fn print_for_each_ref_format(
                         .as_ref()
                         .and_then(|push| push.refname.as_deref())
                         .unwrap_or("");
-                    stdout
-                        .write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
+                    stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
                 } else if let Some(width) = other.strip_prefix("objectname:short=") {
                     let width = parse_for_each_ref_abbrev_width(width)?;
                     stdout.write_all(
@@ -19330,33 +19356,21 @@ fn print_for_each_ref_format(
                             .as_bytes(),
                         )?;
                     }
-                } else if let Some((identity, mode)) =
-                    for_each_ref_date_modifier(other, context)
-                {
+                } else if let Some((identity, mode)) = for_each_ref_date_modifier(other, context) {
                     write_for_each_ref_identity_date_mode(stdout, identity, mode)?;
-                } else if let Some((identity, mode)) =
-                    for_each_ref_email_modifier(other, context)
-                {
+                } else if let Some((identity, mode)) = for_each_ref_email_modifier(other, context) {
                     write_for_each_ref_identity_email_mode(stdout, identity, mode)?;
                 } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
-                    let target =
-                        resolve_revision(context.git_dir, context.format, rev)?;
-                    if let Some(track) = for_each_ref_ahead_behind(
-                        context.db,
-                        context.format,
-                        context.oid,
-                        &target,
-                    )? {
+                    let target = resolve_revision(context.git_dir, context.format, rev)?;
+                    if let Some(track) =
+                        for_each_ref_ahead_behind(context.db, context.format, context.oid, &target)?
+                    {
                         write!(stdout, "{} {}", track.ahead, track.behind)?;
                     }
                 } else if let Some(value) = other.strip_prefix("contents:lines=") {
                     let count = parse_for_each_ref_contents_lines_count(value)?;
                     if let Some(contents) = &context.contents {
-                        write_for_each_ref_contents_lines(
-                            stdout,
-                            &contents.message,
-                            count,
-                        )?;
+                        write_for_each_ref_contents_lines(stdout, &contents.message, count)?;
                     }
                 } else if let Some(value) = other.strip_prefix("*contents:lines=") {
                     let count = parse_for_each_ref_contents_lines_count(value)?;
@@ -19373,15 +19387,161 @@ fn print_for_each_ref_format(
                     )));
                 }
             }
-        };
+        }
         Ok(())
     })
 }
 
-fn parse_for_each_ref_contents_lines_count(value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
-        .map_err(|_| GitError::Command(format!("invalid for-each-ref contents line count {value}")))
+fn write_for_each_ref_typed_atom(
+    stdout: &mut impl Write,
+    atom: &ForEachRefAtom,
+    context: &ForEachRefFormatContext<'_>,
+) -> Result<()> {
+    match atom {
+        ForEachRefAtom::Raw(_) => unreachable!("raw atoms are handled by the compatibility path"),
+        ForEachRefAtom::Color(value) => {
+            let color = for_each_ref_color_escape(value)?;
+            if context.color {
+                stdout.write_all(color.as_bytes())?;
+            }
+        }
+        ForEachRefAtom::RefName { source, format } => {
+            let refname = for_each_ref_typed_refname(context, *source);
+            match format {
+                ForEachRefNameFormat::Full => stdout.write_all(refname.as_bytes())?,
+                ForEachRefNameFormat::Short => {
+                    stdout.write_all(for_each_ref_short_name(refname).as_bytes())?
+                }
+                ForEachRefNameFormat::Strip(strip) => {
+                    let refname = match strip.direction {
+                        ForEachRefStripDirection::Left => {
+                            for_each_ref_lstrip_name(refname, strip.count)
+                        }
+                        ForEachRefStripDirection::Right => {
+                            for_each_ref_rstrip_name(refname, strip.count)
+                        }
+                    };
+                    stdout.write_all(refname.as_bytes())?;
+                }
+            }
+        }
+        ForEachRefAtom::ObjectName { peeled, abbrev } => {
+            let oid = if *peeled {
+                context.peeled_object.as_ref().map(|peeled| &peeled.oid)
+            } else {
+                Some(context.oid)
+            };
+            if let Some(oid) = oid {
+                match abbrev {
+                    None => write!(stdout, "{oid}")?,
+                    Some(0) => stdout.write_all(
+                        for_each_ref_abbrev_oid(
+                            oid,
+                            context.objectname_abbrev,
+                            context.objectname_candidates,
+                        )
+                        .as_bytes(),
+                    )?,
+                    Some(width) => stdout.write_all(
+                        for_each_ref_abbrev_oid(oid, Some(*width), context.objectname_candidates)
+                            .as_bytes(),
+                    )?,
+                }
+            }
+        }
+        ForEachRefAtom::Identity { peeled, role, part } => {
+            let identity = for_each_ref_typed_identity(context, *peeled, *role);
+            match part {
+                ForEachRefAtomIdentityPart::Full => write_for_each_ref_identity(stdout, identity)?,
+                ForEachRefAtomIdentityPart::Name => {
+                    write_for_each_ref_identity_name(stdout, identity)?
+                }
+                ForEachRefAtomIdentityPart::Email(mode) => {
+                    write_for_each_ref_identity_email_mode(stdout, identity, *mode)?
+                }
+                ForEachRefAtomIdentityPart::Date(mode) => {
+                    write_for_each_ref_identity_date_mode(stdout, identity, *mode)?
+                }
+                ForEachRefAtomIdentityPart::DateRaw => {
+                    write_for_each_ref_identity_date_raw(stdout, identity)?
+                }
+            }
+        }
+        ForEachRefAtom::ContentsLines { peeled, count } => {
+            let message = if *peeled {
+                context
+                    .peeled_object
+                    .as_ref()
+                    .and_then(|peeled| peeled.message.as_deref())
+            } else {
+                context
+                    .contents
+                    .as_ref()
+                    .map(|contents| contents.message.as_ref())
+            };
+            if let Some(message) = message {
+                write_for_each_ref_contents_lines(stdout, message, *count)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn for_each_ref_typed_refname<'a>(
+    context: &'a ForEachRefFormatContext<'_>,
+    source: ForEachRefNameSource,
+) -> &'a str {
+    match source {
+        ForEachRefNameSource::Ref => context.refname,
+        ForEachRefNameSource::Upstream => context
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.refname.as_str())
+            .unwrap_or(""),
+        ForEachRefNameSource::Push => context
+            .push
+            .as_ref()
+            .and_then(|push| push.refname.as_deref())
+            .unwrap_or(""),
+    }
+}
+
+fn for_each_ref_typed_identity<'a>(
+    context: &'a ForEachRefFormatContext<'_>,
+    peeled: bool,
+    role: ForEachRefAtomIdentityRole,
+) -> Option<&'a [u8]> {
+    if peeled {
+        let peeled = context.peeled_object.as_ref();
+        return match role {
+            ForEachRefAtomIdentityRole::Author => {
+                peeled.and_then(|peeled| peeled.author.as_deref())
+            }
+            ForEachRefAtomIdentityRole::Committer => {
+                peeled.and_then(|peeled| peeled.committer.as_deref())
+            }
+            ForEachRefAtomIdentityRole::Tagger => None,
+            ForEachRefAtomIdentityRole::Creator => {
+                peeled.and_then(|peeled| peeled.creator.as_deref())
+            }
+        };
+    }
+
+    let contents = context.contents.as_ref();
+    match role {
+        ForEachRefAtomIdentityRole::Author => {
+            contents.and_then(|contents| contents.author.as_deref())
+        }
+        ForEachRefAtomIdentityRole::Committer => {
+            contents.and_then(|contents| contents.committer.as_deref())
+        }
+        ForEachRefAtomIdentityRole::Tagger => {
+            contents.and_then(|contents| contents.tagger.as_deref())
+        }
+        ForEachRefAtomIdentityRole::Creator => {
+            contents.and_then(|contents| contents.creator.as_deref())
+        }
+    }
 }
 
 fn write_for_each_ref_contents_lines(

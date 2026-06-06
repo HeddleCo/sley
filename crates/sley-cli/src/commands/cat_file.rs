@@ -68,15 +68,15 @@ impl CatFileOptions {
                     }
                     "batch" => options.set_batch_mode(
                         CatFileBatchMode::Batch,
-                        option.value().map(str::to_string),
+                        option.optional_value().value().map(str::to_string),
                     )?,
                     "batch-check" => options.set_batch_mode(
                         CatFileBatchMode::BatchCheck,
-                        option.value().map(str::to_string),
+                        option.optional_value().value().map(str::to_string),
                     )?,
                     "batch-command" => options.set_batch_mode(
                         CatFileBatchMode::Command,
-                        option.value().map(str::to_string),
+                        option.optional_value().value().map(str::to_string),
                     )?,
                     "textconv" => {
                         if option.has_value() {

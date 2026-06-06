@@ -1,9 +1,12 @@
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_config::GitConfig;
+use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Reftable, ReftableRefRecord, ReftableRefValue};
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::Write;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1472,36 +1475,570 @@ fn restore_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     write_locked(path, bytes)
 }
 
-pub fn branch_ref_name(branch: &str) -> Result<String> {
-    if branch.is_empty()
-        || branch.starts_with('-')
-        || branch.starts_with('/')
-        || branch.ends_with('/')
-        || branch.contains(' ')
-        || branch.contains('\\')
-    {
-        return Err(GitError::InvalidPath(format!(
-            "invalid branch name {branch}"
-        )));
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FullRefName<'a> {
+    name: &'a str,
+}
+
+impl<'a> FullRefName<'a> {
+    pub fn new(name: &'a str) -> Result<Self> {
+        validate_ref_name(name)?;
+        Ok(Self { name })
     }
-    let name = format!("refs/heads/{branch}");
-    validate_ref_name(&name)?;
-    Ok(name)
+
+    pub fn as_str(&self) -> &str {
+        self.name
+    }
+
+    pub fn into_str(self) -> &'a str {
+        self.name
+    }
+
+    pub fn to_owned(&self) -> FullRefNameBuf {
+        FullRefNameBuf {
+            name: self.name.to_string(),
+        }
+    }
+
+    pub fn as_branch(&self) -> Result<BranchRefName<'a>> {
+        BranchRefName::from_full_ref(*self)
+    }
+
+    pub fn as_tag(&self) -> Result<TagRefName<'a>> {
+        TagRefName::from_full_ref(*self)
+    }
+
+    pub fn as_remote(&self) -> Result<RemoteRefName<'a>> {
+        RemoteRefName::from_full_ref(*self)
+    }
+}
+
+impl AsRef<str> for FullRefName<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for FullRefName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FullRefNameBuf {
+    name: String,
+}
+
+impl FullRefNameBuf {
+    pub fn new(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_ref_name(&name)?;
+        Ok(Self { name })
+    }
+
+    pub fn as_ref_name(&self) -> FullRefName<'_> {
+        FullRefName { name: &self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    pub fn into_string(self) -> String {
+        self.name
+    }
+
+    pub fn as_branch(&self) -> Result<BranchRefName<'_>> {
+        self.as_ref_name().as_branch()
+    }
+
+    pub fn as_tag(&self) -> Result<TagRefName<'_>> {
+        self.as_ref_name().as_tag()
+    }
+
+    pub fn as_remote(&self) -> Result<RemoteRefName<'_>> {
+        self.as_ref_name().as_remote()
+    }
+}
+
+impl AsRef<str> for FullRefNameBuf {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for FullRefNameBuf {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for FullRefNameBuf {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for FullRefNameBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BranchRefName<'a> {
+    name: &'a str,
+}
+
+impl<'a> BranchRefName<'a> {
+    pub const PREFIX: &'static str = "refs/heads/";
+
+    pub fn from_full(name: &'a str) -> Result<Self> {
+        let full = FullRefName::new(name)?;
+        Self::from_full_ref(full)
+    }
+
+    pub fn from_full_ref(name: FullRefName<'a>) -> Result<Self> {
+        validate_namespaced_ref(name.as_str(), Self::PREFIX, "branch")?;
+        Ok(Self {
+            name: name.into_str(),
+        })
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'a> {
+        FullRefName { name: self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.name
+    }
+
+    pub fn branch_name(&self) -> &str {
+        self.short_name()
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[Self::PREFIX.len()..]
+    }
+
+    pub fn into_str(self) -> &'a str {
+        self.name
+    }
+
+    pub fn to_owned(&self) -> BranchRefNameBuf {
+        BranchRefNameBuf {
+            name: self.name.to_string(),
+        }
+    }
+}
+
+impl AsRef<str> for BranchRefName<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for BranchRefName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'a> From<BranchRefName<'a>> for FullRefName<'a> {
+    fn from(name: BranchRefName<'a>) -> Self {
+        name.as_full_ref_name()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BranchRefNameBuf {
+    name: String,
+}
+
+impl BranchRefNameBuf {
+    pub fn from_branch_name(branch: &str) -> Result<Self> {
+        validate_short_ref_name("branch", branch)?;
+        let name = format!("{}{}", BranchRefName::PREFIX, branch);
+        Self::from_full(name)
+    }
+
+    pub fn from_full(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        BranchRefName::from_full(&name)?;
+        Ok(Self { name })
+    }
+
+    pub fn as_ref_name(&self) -> BranchRefName<'_> {
+        BranchRefName { name: &self.name }
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'_> {
+        FullRefName { name: &self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    pub fn branch_name(&self) -> &str {
+        self.short_name()
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[BranchRefName::PREFIX.len()..]
+    }
+
+    pub fn into_string(self) -> String {
+        self.name
+    }
+}
+
+impl AsRef<str> for BranchRefNameBuf {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for BranchRefNameBuf {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for BranchRefNameBuf {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for BranchRefNameBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<BranchRefNameBuf> for FullRefNameBuf {
+    fn from(name: BranchRefNameBuf) -> Self {
+        Self { name: name.name }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TagRefName<'a> {
+    name: &'a str,
+}
+
+impl<'a> TagRefName<'a> {
+    pub const PREFIX: &'static str = "refs/tags/";
+
+    pub fn from_full(name: &'a str) -> Result<Self> {
+        let full = FullRefName::new(name)?;
+        Self::from_full_ref(full)
+    }
+
+    pub fn from_full_ref(name: FullRefName<'a>) -> Result<Self> {
+        validate_namespaced_ref(name.as_str(), Self::PREFIX, "tag")?;
+        Ok(Self {
+            name: name.into_str(),
+        })
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'a> {
+        FullRefName { name: self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.name
+    }
+
+    pub fn tag_name(&self) -> &str {
+        self.short_name()
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[Self::PREFIX.len()..]
+    }
+
+    pub fn into_str(self) -> &'a str {
+        self.name
+    }
+
+    pub fn to_owned(&self) -> TagRefNameBuf {
+        TagRefNameBuf {
+            name: self.name.to_string(),
+        }
+    }
+}
+
+impl AsRef<str> for TagRefName<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for TagRefName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'a> From<TagRefName<'a>> for FullRefName<'a> {
+    fn from(name: TagRefName<'a>) -> Self {
+        name.as_full_ref_name()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TagRefNameBuf {
+    name: String,
+}
+
+impl TagRefNameBuf {
+    pub fn from_tag_name(tag: &str) -> Result<Self> {
+        validate_short_ref_name("tag", tag)?;
+        let name = format!("{}{}", TagRefName::PREFIX, tag);
+        Self::from_full(name)
+    }
+
+    pub fn from_full(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        TagRefName::from_full(&name)?;
+        Ok(Self { name })
+    }
+
+    pub fn as_ref_name(&self) -> TagRefName<'_> {
+        TagRefName { name: &self.name }
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'_> {
+        FullRefName { name: &self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tag_name(&self) -> &str {
+        self.short_name()
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[TagRefName::PREFIX.len()..]
+    }
+
+    pub fn into_string(self) -> String {
+        self.name
+    }
+}
+
+impl AsRef<str> for TagRefNameBuf {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for TagRefNameBuf {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for TagRefNameBuf {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for TagRefNameBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<TagRefNameBuf> for FullRefNameBuf {
+    fn from(name: TagRefNameBuf) -> Self {
+        Self { name: name.name }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteRefName<'a> {
+    name: &'a str,
+}
+
+impl<'a> RemoteRefName<'a> {
+    pub const PREFIX: &'static str = "refs/remotes/";
+
+    pub fn from_full(name: &'a str) -> Result<Self> {
+        let full = FullRefName::new(name)?;
+        Self::from_full_ref(full)
+    }
+
+    pub fn from_full_ref(name: FullRefName<'a>) -> Result<Self> {
+        validate_namespaced_ref(name.as_str(), Self::PREFIX, "remote")?;
+        Ok(Self {
+            name: name.into_str(),
+        })
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'a> {
+        FullRefName { name: self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.name
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[Self::PREFIX.len()..]
+    }
+
+    pub fn remote_name(&self) -> &str {
+        match self.short_name().split_once('/') {
+            Some((remote, _branch)) => remote,
+            None => self.short_name(),
+        }
+    }
+
+    pub fn remote_branch(&self) -> Option<&str> {
+        self.short_name()
+            .split_once('/')
+            .map(|(_remote, branch)| branch)
+    }
+
+    pub fn into_str(self) -> &'a str {
+        self.name
+    }
+
+    pub fn to_owned(&self) -> RemoteRefNameBuf {
+        RemoteRefNameBuf {
+            name: self.name.to_string(),
+        }
+    }
+}
+
+impl AsRef<str> for RemoteRefName<'_> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for RemoteRefName<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl<'a> From<RemoteRefName<'a>> for FullRefName<'a> {
+    fn from(name: RemoteRefName<'a>) -> Self {
+        name.as_full_ref_name()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RemoteRefNameBuf {
+    name: String,
+}
+
+impl RemoteRefNameBuf {
+    pub fn from_short_name(name: &str) -> Result<Self> {
+        validate_short_ref_name("remote ref", name)?;
+        let name = format!("{}{}", RemoteRefName::PREFIX, name);
+        Self::from_full(name)
+    }
+
+    pub fn from_remote_branch(remote: &str, branch: &str) -> Result<Self> {
+        validate_remote_name(remote)?;
+        validate_short_ref_name("remote branch", branch)?;
+        let name = format!("{}{}/{}", RemoteRefName::PREFIX, remote, branch);
+        Self::from_full(name)
+    }
+
+    pub fn from_full(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        RemoteRefName::from_full(&name)?;
+        Ok(Self { name })
+    }
+
+    pub fn as_ref_name(&self) -> RemoteRefName<'_> {
+        RemoteRefName { name: &self.name }
+    }
+
+    pub fn as_full_ref_name(&self) -> FullRefName<'_> {
+        FullRefName { name: &self.name }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    pub fn short_name(&self) -> &str {
+        &self.name[RemoteRefName::PREFIX.len()..]
+    }
+
+    pub fn remote_name(&self) -> &str {
+        match self.short_name().split_once('/') {
+            Some((remote, _branch)) => remote,
+            None => self.short_name(),
+        }
+    }
+
+    pub fn remote_branch(&self) -> Option<&str> {
+        self.short_name()
+            .split_once('/')
+            .map(|(_remote, branch)| branch)
+    }
+
+    pub fn into_string(self) -> String {
+        self.name
+    }
+}
+
+impl AsRef<str> for RemoteRefNameBuf {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Borrow<str> for RemoteRefNameBuf {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl Deref for RemoteRefNameBuf {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl fmt::Display for RemoteRefNameBuf {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RemoteRefNameBuf> for FullRefNameBuf {
+    fn from(name: RemoteRefNameBuf) -> Self {
+        Self { name: name.name }
+    }
+}
+
+pub fn branch_ref_name(branch: &str) -> Result<String> {
+    BranchRefNameBuf::from_branch_name(branch).map(BranchRefNameBuf::into_string)
 }
 
 pub fn tag_ref_name(tag: &str) -> Result<String> {
-    if tag.is_empty()
-        || tag.starts_with('-')
-        || tag.starts_with('/')
-        || tag.ends_with('/')
-        || tag.contains(' ')
-        || tag.contains('\\')
-    {
-        return Err(GitError::InvalidPath(format!("invalid tag name {tag}")));
-    }
-    let name = format!("refs/tags/{tag}");
-    validate_ref_name(&name)?;
-    Ok(name)
+    TagRefNameBuf::from_tag_name(tag).map(TagRefNameBuf::into_string)
 }
 
 fn write_locked(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -1551,6 +2088,42 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
         })
     {
         return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+    }
+    Ok(())
+}
+
+fn validate_namespaced_ref(name: &str, prefix: &str, kind: &str) -> Result<()> {
+    validate_ref_name(name)?;
+    if name
+        .strip_prefix(prefix)
+        .is_none_or(|short_name| short_name.is_empty())
+    {
+        return Err(GitError::InvalidPath(format!(
+            "invalid {kind} ref name {name}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_short_ref_name(kind: &str, name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.starts_with('-')
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.contains(' ')
+        || name.contains('\\')
+    {
+        return Err(GitError::InvalidPath(format!("invalid {kind} name {name}")));
+    }
+    Ok(())
+}
+
+fn validate_remote_name(remote: &str) -> Result<()> {
+    validate_short_ref_name("remote", remote)?;
+    if remote.contains('/') {
+        return Err(GitError::InvalidPath(format!(
+            "invalid remote name {remote}"
+        )));
     }
     Ok(())
 }
@@ -1707,6 +2280,115 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let parsed = parse_packed_refs(ObjectFormat::Sha1, &bytes).unwrap();
         assert_eq!(parsed[0], refs[1]);
         assert_eq!(parsed[1], refs[0]);
+    }
+
+    #[test]
+    fn full_ref_name_validates_and_round_trips_owned() {
+        let full = FullRefName::new("refs/heads/main").expect("valid full branch ref");
+        assert_eq!(full.as_str(), "refs/heads/main");
+        assert_eq!(full.to_string(), "refs/heads/main");
+        assert_eq!(full.to_owned().into_string(), "refs/heads/main");
+
+        let head = FullRefNameBuf::new("HEAD").expect("valid HEAD ref");
+        assert_eq!(head.as_ref_name().into_str(), "HEAD");
+
+        assert!(FullRefName::new("main").is_err());
+        assert!(FullRefNameBuf::new("refs/heads/bad.lock").is_err());
+    }
+
+    #[test]
+    fn branch_ref_name_helpers_validate_short_and_full_names() {
+        let branch =
+            BranchRefNameBuf::from_branch_name("feature/topic").expect("valid branch short name");
+        assert_eq!(branch.as_str(), "refs/heads/feature/topic");
+        assert_eq!(branch.branch_name(), "feature/topic");
+        assert_eq!(
+            branch.as_full_ref_name().as_str(),
+            "refs/heads/feature/topic"
+        );
+        assert_eq!(
+            branch_ref_name("feature/topic").expect("valid branch short name"),
+            branch.as_str()
+        );
+
+        let borrowed = BranchRefName::from_full("refs/heads/main").expect("valid full branch ref");
+        assert_eq!(borrowed.branch_name(), "main");
+        assert_eq!(borrowed.to_owned().into_string(), "refs/heads/main");
+        assert_eq!(
+            FullRefName::new("refs/heads/main")
+                .expect("valid full branch ref")
+                .as_branch()
+                .expect("full ref is a branch")
+                .branch_name(),
+            "main"
+        );
+
+        assert!(BranchRefName::from_full("refs/tags/main").is_err());
+        assert!(BranchRefName::from_full("refs/heads").is_err());
+        assert!(BranchRefNameBuf::from_branch_name("-bad").is_err());
+    }
+
+    #[test]
+    fn tag_ref_name_helpers_validate_short_and_full_names() {
+        let tag = TagRefNameBuf::from_tag_name("v1.0").expect("valid tag short name");
+        assert_eq!(tag.as_str(), "refs/tags/v1.0");
+        assert_eq!(tag.tag_name(), "v1.0");
+        assert_eq!(tag.as_full_ref_name().as_str(), "refs/tags/v1.0");
+        assert_eq!(
+            tag_ref_name("v1.0").expect("valid tag short name"),
+            tag.as_str()
+        );
+
+        let borrowed = TagRefName::from_full("refs/tags/release/1").expect("valid full tag ref");
+        assert_eq!(borrowed.tag_name(), "release/1");
+        assert_eq!(borrowed.to_owned().into_string(), "refs/tags/release/1");
+        assert_eq!(
+            FullRefName::new("refs/tags/release/1")
+                .expect("valid full tag ref")
+                .as_tag()
+                .expect("full ref is a tag")
+                .tag_name(),
+            "release/1"
+        );
+
+        assert!(TagRefName::from_full("refs/heads/v1.0").is_err());
+        assert!(TagRefName::from_full("refs/tags").is_err());
+        assert!(TagRefNameBuf::from_tag_name("bad tag").is_err());
+    }
+
+    #[test]
+    fn remote_ref_name_helpers_validate_namespace_and_components() {
+        let remote = RemoteRefNameBuf::from_remote_branch("origin", "feature/topic")
+            .expect("valid remote branch ref");
+        assert_eq!(remote.as_str(), "refs/remotes/origin/feature/topic");
+        assert_eq!(remote.short_name(), "origin/feature/topic");
+        assert_eq!(remote.remote_name(), "origin");
+        assert_eq!(remote.remote_branch(), Some("feature/topic"));
+        assert_eq!(
+            remote.as_full_ref_name().as_str(),
+            "refs/remotes/origin/feature/topic"
+        );
+
+        let head =
+            RemoteRefName::from_full("refs/remotes/origin/HEAD").expect("valid remote HEAD ref");
+        assert_eq!(head.remote_name(), "origin");
+        assert_eq!(head.remote_branch(), Some("HEAD"));
+        assert_eq!(
+            FullRefName::new("refs/remotes/upstream/main")
+                .expect("valid full remote ref")
+                .as_remote()
+                .expect("full ref is remote-tracking")
+                .remote_name(),
+            "upstream"
+        );
+
+        let short =
+            RemoteRefNameBuf::from_short_name("origin/main").expect("valid remote short ref");
+        assert_eq!(short.as_str(), "refs/remotes/origin/main");
+
+        assert!(RemoteRefName::from_full("refs/heads/origin/main").is_err());
+        assert!(RemoteRefName::from_full("refs/remotes/").is_err());
+        assert!(RemoteRefNameBuf::from_remote_branch("origin/fork", "main").is_err());
     }
 
     #[test]
@@ -2692,8 +3374,10 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             reflog_entry(&unreachable, 100, "unreachable"),
             reflog_entry(&tip, 200, "tip"),
         ];
-        let retained = expire_reflog(&entries, 50, Some(150), |oid| oid == &reachable || oid == &tip)
-            .unwrap();
+        let retained = expire_reflog(&entries, 50, Some(150), |oid| {
+            oid == &reachable || oid == &tip
+        })
+        .unwrap();
         assert_eq!(retained.len(), 2);
         assert_eq!(retained[0].message, b"reachable");
         assert_eq!(retained[1].message, b"tip");
@@ -2818,7 +3502,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert_eq!(main_log.len(), 1);
         assert_eq!(main_log[0].new_oid, main_oid);
         // No lock files survive a successful commit.
-        assert!(!git_dir.join("refs").join("heads").join("main.lock").exists());
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
         assert!(
             !git_dir
                 .join("refs")
@@ -2902,7 +3592,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         assert!(store.read_reflog("refs/heads/main").unwrap().is_empty());
 
         // All lock files were released.
-        assert!(!git_dir.join("refs").join("heads").join("main.lock").exists());
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
         assert!(
             !git_dir
                 .join("refs")

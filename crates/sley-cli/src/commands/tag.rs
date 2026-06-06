@@ -2,6 +2,7 @@
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
+use std::borrow::Cow;
 
 pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
@@ -1669,7 +1670,7 @@ struct TagListObjectMetadata {
     object_size: usize,
     object_disk_size: u64,
     deltabase: String,
-    peeled_object: Option<ForEachRefPeeledObject>,
+    peeled_object: Option<ForEachRefPeeledObject<'static>>,
     authordate: i128,
     committerdate: i128,
     taggerdate: i128,
@@ -1678,7 +1679,7 @@ struct TagListObjectMetadata {
     peeled_committerdate: i128,
     peeled_taggerdate: i128,
     peeled_creatordate: i128,
-    contents: Option<ForEachRefContents>,
+    contents: Option<ForEachRefContents<'static>>,
 }
 
 fn populate_tag_sort_metadata(
@@ -1724,14 +1725,14 @@ fn populate_tag_sort_metadata(
             peeled_committerdate,
             peeled_taggerdate,
             peeled_creatordate,
-            contents,
+            contents: contents.map(ForEachRefContents::into_owned),
         });
     }
     Ok(())
 }
 
 fn tag_sort_date_key(
-    contents: Option<&ForEachRefContents>,
+    contents: Option<&ForEachRefContents<'_>>,
     field: ForEachRefDateSortField,
 ) -> i128 {
     let identity = match field {
@@ -1751,7 +1752,7 @@ fn tag_sort_date_key(
 }
 
 fn tag_sort_peeled_date_key(
-    peeled_object: Option<&ForEachRefPeeledObject>,
+    peeled_object: Option<&ForEachRefPeeledObject<'_>>,
     field: ForEachRefDateSortField,
 ) -> i128 {
     let identity = match field {
@@ -1782,7 +1783,7 @@ fn tag_list_annotation_message(
         return Ok(None);
     };
     let object = db.read_object(&oid)?;
-    Ok(for_each_ref_contents(format, &object)?.map(|contents| contents.message))
+    Ok(for_each_ref_contents(format, &object)?.map(|contents| contents.message.into_owned()))
 }
 
 fn write_tag_list_annotation(
@@ -1812,8 +1813,8 @@ fn tag_format_peeled_object(
     git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
-    contents: Option<&ForEachRefContents>,
-) -> Result<Option<ForEachRefPeeledObject>> {
+    contents: Option<&ForEachRefContents<'_>>,
+) -> Result<Option<ForEachRefPeeledObject<'static>>> {
     let Some(peeled_oid) = contents.and_then(|contents| contents.tag_object.as_ref()) else {
         return Ok(None);
     };
@@ -1821,15 +1822,14 @@ fn tag_format_peeled_object(
     let object_disk_size = for_each_ref_loose_object_disk_size(git_dir, peeled_oid)?;
     let (tree, parents, message, author, committer, creator) =
         if peeled_object.object_type == ObjectType::Commit {
-            let commit = Commit::parse(format, &peeled_object.body)?;
-            let committer = commit.committer;
+            let commit = Commit::parse_ref(format, &peeled_object.body)?;
             (
                 Some(commit.tree),
                 commit.parents,
-                Some(commit.message),
-                Some(commit.author),
-                Some(committer.clone()),
-                Some(committer),
+                Some(Cow::Owned(commit.message.to_vec())),
+                Some(Cow::Owned(commit.author.to_vec())),
+                Some(Cow::Owned(commit.committer.to_vec())),
+                Some(Cow::Owned(commit.committer.to_vec())),
             )
         } else {
             (None, Vec::new(), None, None, None, None)
@@ -1839,7 +1839,7 @@ fn tag_format_peeled_object(
         object_type: peeled_object.object_type,
         object_size: peeled_object.body.len(),
         object_disk_size,
-        object_body: peeled_object.body,
+        object_body: Cow::Owned(peeled_object.body),
         tree,
         parents,
         message,
@@ -2215,7 +2215,7 @@ fn tag_identity_key(entry: &TagListEntry, field: ForEachRefIdentitySortField) ->
 }
 
 fn tag_peeled_identity_key(
-    peeled_object: Option<&ForEachRefPeeledObject>,
+    peeled_object: Option<&ForEachRefPeeledObject<'_>>,
     field: ForEachRefIdentitySortField,
 ) -> String {
     let identity = match field.role {
@@ -2464,7 +2464,7 @@ fn tag_peeled_contents_size_key(entry: &TagListEntry) -> usize {
         .as_ref()
         .and_then(|metadata| metadata.peeled_object.as_ref())
         .and_then(|peeled| peeled.message.as_ref())
-        .map(Vec::len)
+        .map(|message| message.len())
         .unwrap_or_default()
 }
 
