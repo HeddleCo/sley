@@ -236,12 +236,9 @@ fn cmd_archive(args: &[String]) -> Result<()> {
     let object = db.read_object(&oid)?;
     let (tree_oid, mtime, commit_id) = match object.object_type {
         ObjectType::Commit => {
-            let commit = Commit::parse(format, &object.body)?;
-            (
-                commit.tree.clone(),
-                commit_graph_commit_time(&commit)?,
-                Some(oid),
-            )
+            let commit = Commit::parse_ref(format, &object.body)?;
+            let mtime = commit_graph_commit_time_from_committer(commit.committer)?;
+            (commit.tree, mtime, Some(oid))
         }
         ObjectType::Tree => (oid.clone(), current_unix_seconds().max(0) as u64, None),
         ObjectType::Tag => {
@@ -1458,7 +1455,7 @@ fn write_linked_worktree_checkout(
                 object.object_type.as_str()
             )));
         }
-        let commit = Commit::parse(format, &object.body)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
         let mut entries = BTreeMap::new();
         collect_worktree_head_tree_entries(&db, format, &commit.tree, Vec::new(), &mut entries)?;
         for (path, entry) in entries {
@@ -1588,7 +1585,7 @@ fn worktree_head_tree_entries(
             "HEAD {head_oid} is not a commit"
         )));
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     let mut entries = BTreeMap::new();
     collect_worktree_head_tree_entries(&db, format, &commit.tree, Vec::new(), &mut entries)?;
     Ok(entries)
@@ -1622,13 +1619,13 @@ fn collect_worktree_head_tree_entries(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let mut path = prefix.clone();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             collect_worktree_head_tree_entries(db, format, &entry.oid, path, entries)?;
         } else {
@@ -5185,7 +5182,7 @@ fn commit_tree_oid(
             object.object_type.as_str()
         )));
     }
-    Ok(Commit::parse(format, &object.body)?.tree)
+    Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
 
 // ===== cherry-pick / revert (single-commit 3-way replay) =====
@@ -6908,13 +6905,13 @@ fn collect_stash_tree_entry_map(
             object.object_type.as_str()
         )));
     }
-    let tree = Tree::parse(format, &object.body)?;
-    for entry in tree.entries {
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
         let mut path = prefix.clone();
         if !path.is_empty() {
             path.push(b'/');
         }
-        path.extend_from_slice(&entry.name);
+        path.extend_from_slice(entry.name);
         if entry.mode == 0o040000 {
             collect_stash_tree_entry_map(db, format, &entry.oid, path, entries)?;
         } else {
@@ -6943,7 +6940,7 @@ fn ancestor_depths(
                 object.object_type.as_str()
             )));
         }
-        let commit = Commit::parse(format, &object.body)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
         for parent in commit.parents {
             pending.push_back((parent, depth + 1));
         }
@@ -9669,8 +9666,12 @@ fn commit_graph_generation(
 }
 
 fn commit_graph_commit_time(commit: &Commit) -> Result<u64> {
-    let committer = std::str::from_utf8(&commit.committer)
-        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    commit_graph_commit_time_from_committer(&commit.committer)
+}
+
+fn commit_graph_commit_time_from_committer(committer: &[u8]) -> Result<u64> {
+    let committer =
+        std::str::from_utf8(committer).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
     let Some((before_tz, _tz)) = committer.rsplit_once(' ') else {
         return Err(GitError::InvalidFormat(
             "commit committer is missing timezone".into(),

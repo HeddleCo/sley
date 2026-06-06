@@ -2267,7 +2267,7 @@ fn head_tree_entries(
             "HEAD {commit_oid} is not a commit"
         )));
     }
-    let commit = Commit::parse(format, &object.body)?;
+    let commit = Commit::parse_ref(format, &object.body)?;
     let mut entries = BTreeMap::new();
     collect_tree_entries(db, format, &commit.tree, Vec::new(), &mut entries)?;
     Ok(entries)
