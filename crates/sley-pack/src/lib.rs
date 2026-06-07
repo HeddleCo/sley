@@ -1,12 +1,10 @@
-use flate2::Compression;
-use flate2::write::ZlibEncoder;
+use flate2::{Compress, Compression, FlushCompress, Status};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::Bundle;
 use sley_object::{EncodedObject, ObjectType};
 use std::borrow::Borrow;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +28,16 @@ pub const DEFAULT_PACK_WINDOW: usize = 10;
 /// such chains may grow so that reconstructing any object stays cheap and the
 /// reader's recursion stays shallow. Matches git's default `pack.depth`.
 pub const DEFAULT_PACK_DEPTH: usize = 50;
+
+/// Object-count threshold before pack payload compression is fanned out across
+/// worker threads. Below this, thread setup and extra buffering cost more than
+/// they save.
+const PACK_PARALLEL_COMPRESSION_MIN_OBJECTS: usize = 64;
+
+/// Keep parallel compression bounded. Git gets much of its wall-clock win from
+/// using several cores, but unbounded threads can steal cache from delta
+/// planning and inflate peak memory on large packs.
+const PACK_PARALLEL_COMPRESSION_MAX_THREADS: usize = 4;
 
 /// Options controlling sliding-window delta selection during pack generation.
 ///
@@ -139,6 +147,12 @@ pub struct PackWrite {
     pub index: Vec<u8>,
     pub checksum: ObjectId,
     pub entries: Vec<PackIndexEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackInput<'a> {
+    pub oid: &'a ObjectId,
+    pub object: &'a EncodedObject,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -479,6 +493,48 @@ impl PackFile {
         Self::write_packed_impl(objects, format, options)
     }
 
+    /// Like [`PackFile::write_packed`], but uses caller-supplied object ids
+    /// instead of re-hashing each object before pack planning.
+    ///
+    /// This is intended for object-database paths that reached each object by
+    /// its id and already trust that id/object mapping. The function validates
+    /// id formats and duplicate ids, but it does not re-hash object bodies; use
+    /// [`PackFile::write_packed`] when the ids are not already known to be
+    /// canonical.
+    pub fn write_packed_with_known_ids(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+    ) -> Result<PackWrite> {
+        Self::write_packed_with_known_ids_and_options(inputs, format, &PackWriteOptions::new())
+    }
+
+    /// Like [`PackFile::write_packed_with_known_ids`] but with caller-supplied
+    /// [`PackWriteOptions`].
+    pub fn write_packed_with_known_ids_and_options(
+        inputs: &[PackInput<'_>],
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+    ) -> Result<PackWrite> {
+        if inputs.len() > u32::MAX as usize {
+            return Err(GitError::InvalidFormat("too many pack objects".into()));
+        }
+        let mut objects = Vec::with_capacity(inputs.len());
+        let mut object_ids = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            if input.oid.format() != format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "pack object id {} uses {}, pack uses {}",
+                    input.oid,
+                    input.oid.format().name(),
+                    format.name()
+                )));
+            }
+            objects.push(input.object);
+            object_ids.push(input.oid.clone());
+        }
+        Self::write_packed_from_parts(objects, object_ids, format, options)
+    }
+
     /// Write a thin pack: objects may be deltified against `external_bases`
     /// that are *not* included in the pack, referenced by ref-delta to their
     /// object id.
@@ -518,6 +574,15 @@ impl PackFile {
         for object in &objects {
             object_ids.push(object.object_id(format)?);
         }
+        Self::write_packed_from_parts(objects, object_ids, format, options)
+    }
+
+    fn write_packed_from_parts(
+        objects: Vec<&EncodedObject>,
+        object_ids: Vec<ObjectId>,
+        format: ObjectFormat,
+        options: &PackWriteOptions,
+    ) -> Result<PackWrite> {
         let mut seen = HashSet::with_capacity(object_ids.len());
         for oid in &object_ids {
             if !seen.insert(oid) {
@@ -553,12 +618,18 @@ impl PackFile {
         // `None` until it has been emitted.
         let mut written_offsets: Vec<Option<u64>> = vec![None; objects.len()];
 
-        for &idx in &order {
+        let compressed_payloads = compress_planned_payloads(&objects, &plan, &order)?;
+
+        for (order_pos, &idx) in order.iter().enumerate() {
             let offset = pack.len() as u64;
             let mut entry_bytes = Vec::new();
             match &plan[idx].base {
                 PlannedBase::None => {
-                    write_undeltified_entry(&mut entry_bytes, objects[idx])?;
+                    write_entry_header(
+                        &mut entry_bytes,
+                        objects[idx].object_type,
+                        objects[idx].body.len() as u64,
+                    );
                 }
                 PlannedBase::InPack { base_idx, delta } => {
                     let base_offset = written_offsets[*base_idx].ok_or_else(|| {
@@ -576,14 +647,13 @@ impl PackFile {
                         write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
                         entry_bytes.extend_from_slice(object_ids[*base_idx].as_bytes());
                     }
-                    write_compressed_payload(&mut entry_bytes, delta)?;
                 }
                 PlannedBase::External { base_oid, delta } => {
                     write_pack_entry_header_kind(&mut entry_bytes, 7, delta.len() as u64);
                     entry_bytes.extend_from_slice(base_oid.as_bytes());
-                    write_compressed_payload(&mut entry_bytes, delta)?;
                 }
             }
+            entry_bytes.extend_from_slice(&compressed_payloads[order_pos]);
             let crc32 = crc32fast::hash(&entry_bytes);
             pack.extend_from_slice(&entry_bytes);
             written_offsets[idx] = Some(offset);
@@ -2358,48 +2428,106 @@ fn decoded_delta_result_size(delta: &[u8]) -> Result<u64> {
 }
 
 /// Size, in bytes, of the fixed blocks used to index a base object for delta
-/// compression. Matches git's `diff-delta.c` block size so copy regions can be
-/// discovered anywhere in the base, not just at a shared prefix.
+/// compression. Matches git's `diff-delta.c` block size.
 const DELTA_BLOCK_SIZE: usize = 16;
+
+/// Distance between indexed base anchors. Delta generation still scans target
+/// objects byte-by-byte once there is evidence of shared content; anchoring the
+/// base at block boundaries keeps the index compact and avoids per-object
+/// hash-table allocation storms on unrelated blobs.
+const DELTA_INDEX_STRIDE: usize = DELTA_BLOCK_SIZE;
+
+/// Number of hash buckets used by [`DeltaIndex`]. Bucketing avoids sorting each
+/// base object's anchors while keeping exact-hash candidate scans short.
+const DELTA_BUCKET_BITS: usize = 12;
+const DELTA_BUCKET_COUNT: usize = 1 << DELTA_BUCKET_BITS;
+const DELTA_BUCKET_MASK: usize = DELTA_BUCKET_COUNT - 1;
 
 /// An index over a base object's content used to generate deltas against it.
 ///
-/// The index hashes every aligned [`DELTA_BLOCK_SIZE`]-byte block of the base
-/// and maps that hash to the block's starting offsets. Building it once and
-/// reusing it across many candidate targets (as the sliding window does) keeps
-/// delta generation close to linear in the combined input size.
+/// The index hashes block-sized anchors of the base, groups them into fixed
+/// buckets, and verifies exact byte matches before copying. This avoids both
+/// per-bucket allocation storms and the per-object sort needed by a single
+/// sorted vector.
 struct DeltaIndex<'a> {
     base: &'a [u8],
-    blocks: HashMap<u32, Vec<usize>>,
+    blocks: Vec<DeltaBlock>,
+    buckets: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeltaBlock {
+    hash: u32,
+    offset: usize,
 }
 
 impl<'a> DeltaIndex<'a> {
     fn new(base: &'a [u8]) -> Self {
-        let mut blocks: HashMap<u32, Vec<usize>> = HashMap::new();
-        if base.len() >= DELTA_BLOCK_SIZE {
-            // Index every aligned block. Iterate from the end so that the
-            // earliest offsets end up last; callers prefer lower offsets which
-            // keep copy commands compact, and they scan the bucket in order.
-            let mut offset = base.len() - DELTA_BLOCK_SIZE;
-            loop {
-                let hash = block_hash(&base[offset..offset + DELTA_BLOCK_SIZE]);
-                let bucket = blocks.entry(hash).or_default();
-                // Bound the chain length per hash bucket so a pathological base
-                // (many identical blocks) cannot make generation quadratic.
-                if bucket.len() < DELTA_MAX_CHAIN {
-                    bucket.push(offset);
-                }
-                if offset == 0 {
-                    break;
-                }
-                offset -= 1;
+        let mut buckets = vec![0usize; DELTA_BUCKET_COUNT + 1];
+        let mut anchors = Vec::with_capacity(delta_anchor_count(base.len()));
+        for_each_delta_anchor(base.len(), |offset| {
+            let hash = block_hash(&base[offset..offset + DELTA_BLOCK_SIZE]);
+            buckets[delta_bucket(hash) + 1] += 1;
+            anchors.push(DeltaBlock { hash, offset });
+        });
+        for idx in 1..buckets.len() {
+            buckets[idx] += buckets[idx - 1];
+        }
+
+        let mut next_offsets = buckets[..DELTA_BUCKET_COUNT].to_vec();
+        let mut blocks = vec![DeltaBlock { hash: 0, offset: 0 }; anchors.len()];
+        for anchor in anchors {
+            let bucket = delta_bucket(anchor.hash);
+            let next = &mut next_offsets[bucket];
+            blocks[*next] = anchor;
+            *next += 1;
+        }
+
+        Self {
+            base,
+            blocks,
+            buckets,
+        }
+    }
+
+    fn candidate_blocks(&self, hash: u32) -> impl Iterator<Item = &DeltaBlock> {
+        let bucket = delta_bucket(hash);
+        let start = self.buckets[bucket];
+        let end = self.buckets[bucket + 1];
+        self.blocks[start..end]
+            .iter()
+            .filter(move |block| block.hash == hash)
+    }
+
+    fn has_hash(&self, hash: u32) -> bool {
+        self.candidate_blocks(hash).next().is_some()
+    }
+
+    fn has_shared_anchor(&self, target: &[u8]) -> bool {
+        if target.len() < DELTA_BLOCK_SIZE || self.blocks.is_empty() {
+            return false;
+        }
+        let last = target.len() - DELTA_BLOCK_SIZE;
+        for offset in (0..=last).step_by(DELTA_INDEX_STRIDE) {
+            let hash = block_hash(&target[offset..offset + DELTA_BLOCK_SIZE]);
+            if self.has_hash(hash) {
+                return true;
             }
         }
-        Self { base, blocks }
+        if !last.is_multiple_of(DELTA_INDEX_STRIDE) {
+            let hash = block_hash(&target[last..last + DELTA_BLOCK_SIZE]);
+            if self.has_hash(hash) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Generate a delta that reconstructs `target` from this index's base.
-    fn delta(&self, target: &[u8]) -> Vec<u8> {
+    fn delta(&self, target: &[u8]) -> Option<Vec<u8>> {
+        if !self.has_shared_anchor(target) {
+            return None;
+        }
         let base = self.base;
         let mut delta = Vec::new();
         write_delta_varint(&mut delta, base.len() as u64);
@@ -2412,19 +2540,18 @@ impl<'a> DeltaIndex<'a> {
             let mut best_offset = 0usize;
             if pos + DELTA_BLOCK_SIZE <= target.len() {
                 let hash = block_hash(&target[pos..pos + DELTA_BLOCK_SIZE]);
-                if let Some(candidates) = self.blocks.get(&hash) {
-                    for &candidate in candidates {
-                        // Confirm the block actually matches (hash collisions are
-                        // possible) before measuring how far it extends.
-                        let max_len = (base.len() - candidate).min(target.len() - pos);
-                        let mut len = 0usize;
-                        while len < max_len && base[candidate + len] == target[pos + len] {
-                            len += 1;
-                        }
-                        if len > best_len {
-                            best_len = len;
-                            best_offset = candidate;
-                        }
+                for candidate in self.candidate_blocks(hash).take(DELTA_MAX_CHAIN) {
+                    // Confirm the block actually matches (hash collisions are
+                    // possible) before measuring how far it extends.
+                    let candidate = candidate.offset;
+                    let max_len = (base.len() - candidate).min(target.len() - pos);
+                    let mut len = 0usize;
+                    while len < max_len && base[candidate + len] == target[pos + len] {
+                        len += 1;
+                    }
+                    if len > best_len {
+                        best_len = len;
+                        best_offset = candidate;
                     }
                 }
             }
@@ -2443,8 +2570,33 @@ impl<'a> DeltaIndex<'a> {
         if pending_insert_start < target.len() {
             write_delta_insert(&mut delta, &target[pending_insert_start..]);
         }
-        delta
+        Some(delta)
     }
+}
+
+fn for_each_delta_anchor(mut len: usize, mut visit: impl FnMut(usize)) {
+    if len < DELTA_BLOCK_SIZE {
+        return;
+    }
+    len -= DELTA_BLOCK_SIZE;
+    for offset in (0..=len).step_by(DELTA_INDEX_STRIDE) {
+        visit(offset);
+    }
+    if !len.is_multiple_of(DELTA_INDEX_STRIDE) {
+        visit(len);
+    }
+}
+
+fn delta_anchor_count(len: usize) -> usize {
+    if len < DELTA_BLOCK_SIZE {
+        return 0;
+    }
+    let last = len - DELTA_BLOCK_SIZE;
+    (last / DELTA_INDEX_STRIDE) + 1 + usize::from(!last.is_multiple_of(DELTA_INDEX_STRIDE))
+}
+
+fn delta_bucket(hash: u32) -> usize {
+    (hash as usize) & DELTA_BUCKET_MASK
 }
 
 /// Maximum number of base offsets retained per block-hash bucket. Caps the work
@@ -2480,6 +2632,92 @@ enum PlannedBase {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PlannedEntry {
     base: PlannedBase,
+}
+
+fn compress_planned_payloads(
+    objects: &[&EncodedObject],
+    plan: &[PlannedEntry],
+    order: &[usize],
+) -> Result<Vec<Vec<u8>>> {
+    if order.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(1)
+        .min(PACK_PARALLEL_COMPRESSION_MAX_THREADS)
+        .min(order.len());
+    if worker_count <= 1 || order.len() < PACK_PARALLEL_COMPRESSION_MIN_OBJECTS {
+        let mut payloads = Vec::with_capacity(order.len());
+        for &idx in order {
+            payloads.push(compressed_payload(planned_payload(objects, plan, idx))?);
+        }
+        return Ok(payloads);
+    }
+
+    let chunk_len = order.len().div_ceil(worker_count);
+    let mut payloads: Vec<Vec<u8>> = std::iter::repeat_with(Vec::new).take(order.len()).collect();
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (chunk_idx, chunk) in order.chunks(chunk_len).enumerate() {
+            let chunk_start = chunk_idx * chunk_len;
+            handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<u8>)>> {
+                let mut chunk_payloads = Vec::with_capacity(chunk.len());
+                for (offset, &idx) in chunk.iter().enumerate() {
+                    chunk_payloads.push((
+                        chunk_start + offset,
+                        compressed_payload(planned_payload(objects, plan, idx))?,
+                    ));
+                }
+                Ok(chunk_payloads)
+            }));
+        }
+
+        let mut first_error = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(chunk_payloads)) => {
+                    if first_error.is_none() {
+                        for (pos, payload) in chunk_payloads {
+                            payloads[pos] = payload;
+                        }
+                    }
+                }
+                Ok(Err(err)) => {
+                    first_error.get_or_insert(err);
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        GitError::InvalidObject("pack compression worker panicked".into())
+                    });
+                }
+            }
+        }
+
+        match first_error {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    })?;
+    Ok(payloads)
+}
+
+fn planned_payload<'a>(
+    objects: &'a [&'a EncodedObject],
+    plan: &'a [PlannedEntry],
+    idx: usize,
+) -> &'a [u8] {
+    match &plan[idx].base {
+        PlannedBase::None => &objects[idx].body,
+        PlannedBase::InPack { delta, .. } | PlannedBase::External { delta, .. } => delta,
+    }
+}
+
+fn compressed_payload(body: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    write_compressed_payload(&mut out, body)?;
+    Ok(out)
 }
 
 /// Maximum number of external thin-pack bases compared against any single
@@ -2601,7 +2839,9 @@ fn plan_pack_deltas(
             if depth[base_idx] + 1 > options.depth {
                 continue;
             }
-            let delta = base_entry.index.delta(target);
+            let Some(delta) = base_entry.index.delta(target) else {
+                continue;
+            };
             if !delta_is_acceptable(&delta, target.len()) {
                 continue;
             }
@@ -2625,7 +2865,9 @@ fn plan_pack_deltas(
             if *base_type != target_type {
                 continue;
             }
-            let delta = base_index.delta(target);
+            let Some(delta) = base_index.delta(target) else {
+                continue;
+            };
             if !delta_is_acceptable(&delta, target.len()) {
                 continue;
             }
@@ -2695,23 +2937,26 @@ fn write_delta_copy(out: &mut Vec<u8>, mut offset: u64, mut size: u64) {
         let chunk = size.min(0x10000);
         let encoded_size = if chunk == 0x10000 { 0 } else { chunk };
         let mut command = 0x80u8;
-        let mut payload = Vec::new();
+        let mut payload = [0u8; 7];
+        let mut payload_len = 0usize;
         for idx in 0..4 {
             let byte = ((offset >> (idx * 8)) & 0xff) as u8;
             if byte != 0 {
                 command |= 1 << idx;
-                payload.push(byte);
+                payload[payload_len] = byte;
+                payload_len += 1;
             }
         }
         for idx in 0..3 {
             let byte = ((encoded_size >> (idx * 8)) & 0xff) as u8;
             if byte != 0 {
                 command |= 0x10 << idx;
-                payload.push(byte);
+                payload[payload_len] = byte;
+                payload_len += 1;
             }
         }
         out.push(command);
-        out.extend_from_slice(&payload);
+        out.extend_from_slice(&payload[..payload_len]);
         offset += chunk;
         size -= chunk;
     }
@@ -2771,16 +3016,32 @@ fn read_delta_copy_value(
     Ok(value)
 }
 
-fn write_undeltified_entry(out: &mut Vec<u8>, object: &EncodedObject) -> Result<()> {
-    write_entry_header(out, object.object_type, object.body.len() as u64);
-    write_compressed_payload(out, &object.body)
+thread_local! {
+    static DEFLATE: RefCell<Compress> = RefCell::new(Compress::new(Compression::default(), true));
 }
 
 fn write_compressed_payload(out: &mut Vec<u8>, body: &[u8]) -> Result<()> {
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-    encoder.write_all(body)?;
-    out.extend_from_slice(&encoder.finish()?);
-    Ok(())
+    DEFLATE.with(|cell| {
+        let mut compressor = cell.borrow_mut();
+        compressor.reset();
+        out.reserve(zlib_compress_bound(body.len()));
+        let status = compressor
+            .compress_vec(body, out, FlushCompress::Finish)
+            .map_err(|err| GitError::InvalidObject(format!("zlib compression failed: {err}")))?;
+        if status != Status::StreamEnd || compressor.total_in() != body.len() as u64 {
+            return Err(GitError::InvalidObject(
+                "zlib compression did not finish pack entry".into(),
+            ));
+        }
+        Ok(())
+    })
+}
+
+fn zlib_compress_bound(len: usize) -> usize {
+    len.saturating_add(len >> 12)
+        .saturating_add(len >> 14)
+        .saturating_add(len >> 25)
+        .saturating_add(13)
 }
 
 fn write_entry_header(out: &mut Vec<u8>, object_type: ObjectType, size: u64) {
@@ -5068,6 +5329,34 @@ mod tests {
     fn write_packed_rejects_duplicate_objects() {
         let object = EncodedObject::new(ObjectType::Blob, b"same\n".to_vec());
         assert!(PackFile::write_packed(&[object.clone(), object], ObjectFormat::Sha1,).is_err());
+    }
+
+    #[test]
+    fn write_packed_with_known_ids_validates_ids_before_trusting_them() {
+        let object = EncodedObject::new(ObjectType::Blob, b"same\n".to_vec());
+        let sha1 = object
+            .object_id(ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        let sha256 = object
+            .object_id(ObjectFormat::Sha256)
+            .expect("test operation should succeed");
+        let duplicate = [
+            PackInput {
+                oid: &sha1,
+                object: &object,
+            },
+            PackInput {
+                oid: &sha1,
+                object: &object,
+            },
+        ];
+        assert!(PackFile::write_packed_with_known_ids(&duplicate, ObjectFormat::Sha1).is_err());
+
+        let wrong_format = [PackInput {
+            oid: &sha256,
+            object: &object,
+        }];
+        assert!(PackFile::write_packed_with_known_ids(&wrong_format, ObjectFormat::Sha1).is_err());
     }
 
     fn write_packed_deltifies_similar_blobs_and_round_trips(format: ObjectFormat) {

@@ -323,14 +323,17 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
     let starts = commands
         .iter()
         .filter(|command| !command.new_id.is_null())
-        .map(|command| command.new_id.clone());
+        .map(|command| command.new_id.clone())
+        .collect::<Vec<_>>();
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
     reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
-    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
-        .map(|pack| pack.pack)
-        .unwrap_or_default();
+    let packfile = if starts.is_empty() {
+        Vec::new()
+    } else {
+        b"PACK".to_vec()
+    };
     let request = ReceivePackPushRequest {
         commands: ReceivePackRequest {
             shallow: Vec::new(),
@@ -340,7 +343,14 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
         push_options: None,
         packfile,
     };
-    crate::local::receive_pack_into_local_repository(remote_git_dir, format, &request)?;
+    crate::local::receive_pack_reachable_pack_into_local_repository(
+        remote_git_dir,
+        format,
+        &request,
+        &local_db,
+        starts,
+        remote_excluded,
+    )?;
     Ok(PushOutcome {
         commands,
         report: None,

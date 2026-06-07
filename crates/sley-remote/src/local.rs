@@ -13,17 +13,18 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
-use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
+use sley_odb::{
+    FileObjectDatabase, RawPackInstallOptions, build_and_install_reachable_pack,
+    build_reachable_pack, collect_reachable_object_ids,
+};
 use sley_protocol::{
     PKT_LINE_MAX_PAYLOAD_LEN, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
     ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
     UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
-    read_upload_pack_negotiation_request, read_upload_pack_raw_packfile_response,
-    read_upload_pack_request, write_upload_pack_negotiation_request,
-    write_upload_pack_raw_packfile_response, write_upload_pack_request,
+    read_upload_pack_negotiation_request, read_upload_pack_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate};
 
@@ -222,6 +223,62 @@ pub fn receive_pack_into_local_repository(
     )
 }
 
+/// Apply a local receive-pack request whose pack can be built from `source_db`
+/// after receive-pack preflight checks pass.
+///
+/// This keeps local push on the same validation path as raw receive-pack while
+/// avoiding a raw-pack round trip: the install closure builds the reachable
+/// pack and installs the generated pack/index directly.
+pub fn receive_pack_reachable_pack_into_local_repository(
+    remote_git_dir: &Path,
+    format: ObjectFormat,
+    request: &ReceivePackPushRequest,
+    source_db: &FileObjectDatabase,
+    starts: Vec<ObjectId>,
+    excluded: HashSet<ObjectId>,
+) -> Result<ReceivePackReportStatus> {
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    let mut starts = Some(starts);
+    apply_receive_pack_push_request(
+        &receive_pack_features(format),
+        request,
+        |name| match remote_store.read_ref(name)? {
+            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
+            Some(RefTarget::Symbolic(_)) | None => Ok(None),
+        },
+        |_| {
+            let starts = starts.take().ok_or_else(|| {
+                GitError::InvalidFormat("receive-pack attempted to install pack twice".into())
+            })?;
+            build_and_install_reachable_pack(
+                source_db,
+                &remote_db,
+                format,
+                starts,
+                &excluded,
+                RawPackInstallOptions { promisor: false },
+            )?;
+            Ok(())
+        },
+        |oid| remote_db.contains(oid),
+        |commands| {
+            let mut tx = remote_store.transaction();
+            for command in commands {
+                tx.update(RefUpdate {
+                    name: command.name.clone(),
+                    expected: (!command.old_id.is_null())
+                        .then(|| RefTarget::Direct(command.old_id.clone())),
+                    new: RefTarget::Direct(command.new_id.clone()),
+                    reflog: None,
+                });
+            }
+            tx.commit()
+        },
+        |name| remote_store.delete_ref(name).map(|_| ()),
+    )
+}
+
 /// The ref advertisements a local repository would send to a fetching client:
 /// `HEAD` (if resolvable) followed by every ref, each resolved to its object id.
 pub fn local_fetch_advertisements(
@@ -295,7 +352,6 @@ pub fn install_fetch_pack_via_local_upload_pack(
         return Ok(());
     }
 
-    let features = upload_pack_features(remote_git_dir, format)?;
     let request = UploadPackRequest {
         wants,
         ..UploadPackRequest::default()
@@ -312,21 +368,31 @@ pub fn install_fetch_pack_via_local_upload_pack(
     let decoded_negotiation =
         read_upload_pack_negotiation_request(format, &mut encoded_negotiation.as_slice())?;
 
-    let response = upload_pack_from_local_repository(
-        remote_git_dir,
-        format,
-        &features,
-        decoded_request,
-        decoded_negotiation.haves.into_iter().collect(),
-    )?;
-    let mut encoded_response = Vec::new();
-    write_upload_pack_raw_packfile_response(&mut encoded_response, &response)?;
-    let decoded_response =
-        read_upload_pack_raw_packfile_response(format, &mut encoded_response.as_slice())?;
-    if promisor {
-        install_upload_pack_raw_promisor_response(&decoded_response, &local_db)?;
-    } else {
-        install_upload_pack_raw_response(&decoded_response, &local_db)?;
+    let remote_db = FileObjectDatabase::from_git_dir(remote_git_dir, format);
+    for want in &decoded_request.wants {
+        if !remote_db.contains(want)? {
+            return Err(GitError::InvalidObject(format!(
+                "upload-pack requested missing object {want}"
+            )));
+        }
     }
+    let known_haves = decoded_negotiation
+        .haves
+        .into_iter()
+        .filter_map(|oid| match remote_db.contains(&oid) {
+            Ok(true) => Some(Ok(oid)),
+            Ok(false) => None,
+            Err(err) => Some(Err(err)),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let excluded = collect_reachable_object_ids(&remote_db, format, known_haves)?;
+    build_and_install_reachable_pack(
+        &remote_db,
+        &local_db,
+        format,
+        decoded_request.wants,
+        &excluded,
+        RawPackInstallOptions { promisor },
+    )?;
     Ok(())
 }

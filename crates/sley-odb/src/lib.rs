@@ -4,7 +4,7 @@ use flate2::write::ZlibEncoder;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
-use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackWrite};
+use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackIndexEntry, PackInput, PackWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -192,7 +192,7 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    walk_reachable_objects(reader, format, starts, &HashSet::new(), |_| {})
+    walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
 }
 
 pub fn collect_reachable_objects<R, I>(
@@ -206,10 +206,46 @@ where
     I: IntoIterator<Item = ObjectId>,
 {
     let mut objects = Vec::new();
-    walk_reachable_objects(reader, format, starts, excluded, |object| {
+    walk_reachable_objects(reader, format, starts, excluded, |_, object| {
         objects.push(Arc::clone(object));
     })?;
     Ok(objects)
+}
+
+#[derive(Debug, Clone)]
+struct ReachablePackObject {
+    oid: ObjectId,
+    object: Arc<EncodedObject>,
+}
+
+fn collect_reachable_pack_objects<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<Vec<ReachablePackObject>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let mut objects = Vec::new();
+    walk_reachable_objects(reader, format, starts, excluded, |oid, object| {
+        objects.push(ReachablePackObject {
+            oid: oid.clone(),
+            object: Arc::clone(object),
+        });
+    })?;
+    Ok(objects)
+}
+
+fn pack_inputs(objects: &[ReachablePackObject]) -> Vec<PackInput<'_>> {
+    objects
+        .iter()
+        .map(|entry| PackInput {
+            oid: &entry.oid,
+            object: &entry.object,
+        })
+        .collect()
 }
 
 pub fn install_reachable_pack<I>(
@@ -251,7 +287,7 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let objects = collect_reachable_objects(reader, format, starts, excluded)?;
+    let objects = collect_reachable_pack_objects(reader, format, starts, excluded)?;
     if objects.is_empty() {
         return Ok(None);
     }
@@ -259,7 +295,28 @@ where
     // sliding-window selection. Self-contained, ofs-delta by default; round-trips
     // through the existing parser. PackWrite shape is unchanged, so callers are
     // unaffected.
-    PackFile::write_packed(&objects, format).map(Some)
+    let inputs = pack_inputs(&objects);
+    PackFile::write_packed_with_known_ids(&inputs, format).map(Some)
+}
+
+pub fn build_and_install_reachable_pack<R, I>(
+    source: &R,
+    destination: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: RawPackInstallOptions,
+) -> Result<Option<PackInstallResult>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let Some(pack) = build_reachable_pack(source, format, starts, excluded)? else {
+        return Ok(None);
+    };
+    destination
+        .install_generated_pack_unchecked(&pack, options)
+        .map(Some)
 }
 
 /// Outcome of consolidating every object in a repository into a single pack.
@@ -283,6 +340,8 @@ pub struct RepackResult {
     /// Loose object ids that are now also present in the new pack and therefore
     /// redundant on disk.
     pub packed_loose: Vec<ObjectId>,
+    pack_checksum: ObjectId,
+    index_entries: Vec<PackIndexEntry>,
 }
 
 /// Gather every object in `git_dir` (loose objects and every existing pack) and
@@ -312,10 +371,14 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
     // `FileObjectDatabase::read_object`, but both decode to the same bytes.
     let mut objects = Vec::with_capacity(all_oids.len());
     for oid in &all_oids {
-        objects.push(database.read_object(oid)?);
+        objects.push(ReachablePackObject {
+            oid: oid.clone(),
+            object: database.read_object(oid)?,
+        });
     }
 
-    let written = PackFile::write_packed(&objects, format)?;
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
     let object_count = written.entries.len();
 
     // The new pack contains every object on disk, so every pre-existing pack is
@@ -336,7 +399,7 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         .into_iter()
         .filter(|oid| packed_oid_set.contains(oid))
         .collect();
-    packed_loose.sort_by_key(ObjectId::to_hex);
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
     Ok(Some(RepackResult {
         pack: written.pack,
@@ -344,6 +407,8 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         object_count,
         obsolete_packs,
         packed_loose,
+        pack_checksum: written.checksum,
+        index_entries: written.entries,
     }))
 }
 
@@ -371,30 +436,27 @@ pub fn install_repack_result(
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
 
-    // Recompute the pack checksum from the written bytes rather than trusting
-    // the caller-provided name; this keeps the on-disk file name canonical and
-    // lets us re-derive the object set the new pack actually contains.
-    let canonical_index = PackIndex::write_v2_for_pack(&result.pack, format)?;
-    // Validate the caller-supplied index against the pack *before* writing anything
-    // or pruning. `install_repack_result` is public, so a stale or forged index with
-    // the right pack trailer but wrong oid/offset/CRC table must not become the only
-    // index readers can trust.
+    // Validate the public bytes against the private provenance that
+    // `repack_all_objects` captured from `PackFile::write_packed`. This avoids
+    // inflating and resolving the freshly-written pack a second time while still
+    // catching caller mutations before anything is written or pruned.
+    validate_pack_checksum(&result.pack, format, &result.pack_checksum, "repack")?;
     let parsed_index = PackIndex::parse(&result.idx, format)?;
-    if parsed_index.pack_checksum != canonical_index.pack_checksum {
+    if parsed_index.pack_checksum != result.pack_checksum {
         return Err(GitError::InvalidFormat(
             "repack index checksum does not match the new pack".into(),
         ));
     }
-    if result.idx != canonical_index.index {
+    if !pack_index_entries_match_writer(&parsed_index.entries, &result.index_entries) {
         return Err(GitError::InvalidFormat(
             "repack index does not match the new pack contents".into(),
         ));
     }
-    let pack_name = format!("pack-{}", canonical_index.pack_checksum.to_hex());
+    let pack_name = format!("pack-{}", result.pack_checksum.to_hex());
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
     write_pack_component(&new_pack_path, &result.pack)?;
-    write_pack_component(&new_index_path, &canonical_index.index)?;
+    write_pack_component(&new_index_path, &result.idx)?;
 
     if !prune {
         return Ok(());
@@ -403,7 +465,7 @@ pub fn install_repack_result(
     // Prune based on the objects the new pack's *index* can resolve (what reads use
     // once the old packs are gone), not just what the pack contains — so a stale
     // pack is never removed for an object the new index cannot serve.
-    let present: HashSet<ObjectId> = canonical_index
+    let present: HashSet<ObjectId> = parsed_index
         .entries
         .iter()
         .map(|entry| entry.oid.clone())
@@ -412,6 +474,53 @@ pub fn install_repack_result(
     prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
     prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
     Ok(())
+}
+
+fn validate_pack_checksum(
+    pack: &[u8],
+    format: ObjectFormat,
+    expected: &ObjectId,
+    context: &str,
+) -> Result<()> {
+    if expected.format() != format {
+        return Err(GitError::InvalidObjectId(format!(
+            "{context} checksum format does not match object format"
+        )));
+    }
+    let hash_len = format.raw_len();
+    if pack.len() < 12 + hash_len {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack file too short"
+        )));
+    }
+    if &pack[..4] != b"PACK" {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack file missing PACK signature"
+        )));
+    }
+    let trailer_offset = pack.len() - hash_len;
+    let actual = sley_core::digest_bytes(format, &pack[..trailer_offset])?;
+    let trailer = ObjectId::from_raw(format, &pack[trailer_offset..])?;
+    if &actual != expected || trailer != *expected {
+        return Err(GitError::InvalidFormat(format!(
+            "{context} pack checksum does not match generated pack"
+        )));
+    }
+    Ok(())
+}
+
+fn pack_index_entries_match_writer(
+    parsed: &[PackIndexEntry],
+    writer_entries: &[PackIndexEntry],
+) -> bool {
+    if parsed.len() != writer_entries.len() {
+        return false;
+    }
+    let mut writer_entries = writer_entries.iter().collect::<Vec<_>>();
+    writer_entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
+    parsed.iter().zip(writer_entries).all(|(left, right)| {
+        left.oid == right.oid && left.crc32 == right.crc32 && left.offset == right.offset
+    })
 }
 
 /// List loose objects under `git_dir` that are *not* reachable from `roots`,
@@ -440,7 +549,7 @@ where
         .into_iter()
         .filter(|oid| !reachable.contains(oid))
         .collect();
-    pruned.sort_by_key(ObjectId::to_hex);
+    pruned.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
 
     if delete {
         for oid in &pruned {
@@ -461,7 +570,7 @@ fn loose_object_ids(objects_dir: &Path, format: ObjectFormat) -> Result<Vec<Obje
     let mut oids = HashSet::new();
     collect_loose_object_ids(objects_dir, format, &mut oids)?;
     let mut oids = oids.into_iter().collect::<Vec<_>>();
-    oids.sort_by_key(ObjectId::to_hex);
+    oids.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
     Ok(oids)
 }
 
@@ -738,7 +847,7 @@ fn walk_reachable_objects<R, I, F>(
 where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
-    F: FnMut(&Arc<EncodedObject>),
+    F: FnMut(&ObjectId, &Arc<EncodedObject>),
 {
     let mut seen = HashSet::new();
     let mut pending = Vec::new();
@@ -758,7 +867,7 @@ where
                         let commit = Commit::parse_ref(format, &object.body)?;
                         (commit.tree, commit.parents)
                     };
-                    visit(&object);
+                    visit(&oid, &object);
                     for parent in parents.into_iter().rev() {
                         pending.push(parent);
                     }
@@ -773,7 +882,7 @@ where
                         }
                         child_oids.push(entry.oid);
                     }
-                    visit(&object);
+                    visit(&oid, &object);
                     pending.extend(child_oids.into_iter().rev());
                 }
                 ObjectType::Tag => {
@@ -781,10 +890,10 @@ where
                         let tag = Tag::parse_ref(format, &object.body)?;
                         tag.object
                     };
-                    visit(&object);
+                    visit(&oid, &object);
                     pending.push(target);
                 }
-                ObjectType::Blob => visit(&object),
+                ObjectType::Blob => visit(&oid, &object),
             }
         }
     }
@@ -1341,6 +1450,61 @@ impl FileObjectDatabase {
                 .iter()
                 .map(|entry| entry.oid.clone())
                 .collect(),
+        })
+    }
+
+    /// Install a pack that was produced in this process by [`PackFile::write_packed`].
+    ///
+    /// Unlike [`Self::install_raw_pack_with_options`], this does not re-inflate
+    /// every pack entry to rebuild the index. It validates the generated pack
+    /// trailer and generated index against the writer's object ids, CRCs, and
+    /// offsets, then writes those bytes directly. Use the raw installer for
+    /// arbitrary pack bytes received from an untrusted transport.
+    pub fn install_written_pack(&self, pack: &PackWrite) -> Result<PackInstallResult> {
+        self.install_written_pack_with_options(pack, RawPackInstallOptions::default())
+    }
+
+    pub fn install_written_pack_with_options(
+        &self,
+        pack: &PackWrite,
+        options: RawPackInstallOptions,
+    ) -> Result<PackInstallResult> {
+        validate_pack_checksum(&pack.pack, self.format, &pack.checksum, "pack write")?;
+        let parsed_index = PackIndex::parse(&pack.index, self.format)?;
+        if parsed_index.pack_checksum != pack.checksum {
+            return Err(GitError::InvalidFormat(
+                "pack write index checksum does not match pack".into(),
+            ));
+        }
+        if !pack_index_entries_match_writer(&parsed_index.entries, &pack.entries) {
+            return Err(GitError::InvalidFormat(
+                "pack write index does not match generated entries".into(),
+            ));
+        }
+        self.install_generated_pack_unchecked(pack, options)
+    }
+
+    fn install_generated_pack_unchecked(
+        &self,
+        pack: &PackWrite,
+        options: RawPackInstallOptions,
+    ) -> Result<PackInstallResult> {
+        let pack_dir = self.objects_dir.join("pack");
+        fs::create_dir_all(&pack_dir)?;
+        let pack_name = format!("pack-{}", pack.checksum.to_hex());
+        let pack_path = pack_dir.join(format!("{pack_name}.pack"));
+        let index_path = pack_dir.join(format!("{pack_name}.idx"));
+        if !pack_path.exists() || !index_path.exists() {
+            write_pack_component(&pack_path, &pack.pack)?;
+            write_pack_component(&index_path, &pack.index)?;
+        }
+        let promisor_path = write_promisor_pack_sidecar(&pack_dir, &pack_name, options.promisor)?;
+        Ok(PackInstallResult {
+            pack_name,
+            pack_path,
+            index_path,
+            promisor_path,
+            object_ids: pack.entries.iter().map(|entry| entry.oid.clone()).collect(),
         })
     }
 
