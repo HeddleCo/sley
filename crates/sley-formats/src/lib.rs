@@ -1724,14 +1724,17 @@ impl RepositoryLayout {
                             }
                             .into(),
                         ),
+                        comment: None,
                     },
                     ConfigEntry {
                         key: "filemode".into(),
                         value: Some("true".into()),
+                        comment: None,
                     },
                     ConfigEntry {
                         key: "bare".into(),
                         value: Some(if bare { "true" } else { "false" }.into()),
+                        comment: None,
                     },
                 ],
             }],
@@ -1743,6 +1746,7 @@ impl RepositoryLayout {
                 entries: vec![ConfigEntry {
                     key: "objectformat".into(),
                     value: Some("sha256".into()),
+                    comment: None,
                 }],
             });
         }

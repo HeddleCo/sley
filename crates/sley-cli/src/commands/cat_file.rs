@@ -313,6 +313,10 @@ impl RepositoryObjectView {
         self.repo.resolve_revision(name)
     }
 
+    fn replacement_oid(&self, oid: &ObjectId) -> Result<ObjectId> {
+        apply_replace_object(self.repo.refs(), oid)
+    }
+
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         self.repo.resolve_path(rev, path)
     }
@@ -330,7 +334,8 @@ struct ObjectQuery<'a> {
 impl ObjectQuery<'_> {
     fn print_command_mode(&self, mode: CatFileCmdMode) -> Result<()> {
         let oid = self.view.resolve(self.name)?;
-        let object = self.view.db().read_object(&oid)?;
+        let read_oid = self.view.replacement_oid(&oid)?;
+        let object = self.view.db().read_object(&read_oid)?;
         match mode {
             CatFileCmdMode::Exists => {}
             CatFileCmdMode::Type => println!("{}", object.object_type.as_str()),
@@ -369,6 +374,7 @@ impl ObjectQuery<'_> {
 
     fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
         let oid = self.view.resolve(self.name)?;
+        let oid = self.view.replacement_oid(&oid)?;
         let oid = match object_type {
             ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid)?,
             ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid)?,
@@ -532,6 +538,7 @@ fn print_cat_file_batch_record(
         stdout.write_all(&[record.terminator])?;
         return Ok(());
     };
+    let read_oid = record.view.replacement_oid(&oid)?;
     let object_mode = if record
         .batch_format
         .is_some_and(|format| format.needs_object_mode())
@@ -541,7 +548,7 @@ fn print_cat_file_batch_record(
         None
     };
     if record.check_only {
-        let Ok(Some((object_type, size))) = record.view.db().read_object_header(&oid) else {
+        let Ok(Some((object_type, size))) = record.view.db().read_object_header(&read_oid) else {
             write!(stdout, "{} missing", record.object_name)?;
             stdout.write_all(&[record.terminator])?;
             return Ok(());
@@ -555,7 +562,7 @@ fn print_cat_file_batch_record(
             object_mode.as_deref(),
         );
     }
-    let Ok(object) = record.view.db().read_object(&oid) else {
+    let Ok(object) = record.view.db().read_object(&read_oid) else {
         write!(stdout, "{} missing", record.object_name)?;
         stdout.write_all(&[record.terminator])?;
         return Ok(());

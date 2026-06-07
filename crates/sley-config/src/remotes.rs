@@ -99,17 +99,20 @@ pub fn add_remote_with_fetch(
     let mut entries = vec![ConfigEntry {
         key: "url".into(),
         value: Some(url.to_string()),
+        comment: None,
     }];
     if fetch_refspecs.is_empty() {
         entries.push(ConfigEntry {
             key: "fetch".into(),
             value: Some(default_fetch_refspec(name)),
+            comment: None,
         });
     } else {
         for refspec in fetch_refspecs {
             entries.push(ConfigEntry {
                 key: "fetch".into(),
                 value: Some(refspec.clone()),
+                comment: None,
             });
         }
     }
@@ -257,6 +260,7 @@ pub fn set_url(
             section.entries.push(ConfigEntry {
                 key: key.into(),
                 value: Some(url.to_string()),
+                comment: None,
             });
             Ok(())
         }
@@ -341,6 +345,7 @@ fn set_url_set(section: &mut ConfigSection, key: &str, url: &str) -> Result<(), 
             ConfigEntry {
                 key: key.into(),
                 value: Some(url.to_string()),
+                comment: None,
             },
         );
     }

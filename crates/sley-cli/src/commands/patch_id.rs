@@ -50,7 +50,7 @@
 //! other self-contained command modules (`commands::stash`, `commands::branch`,
 //! `commands::verify_commit`); the wildcard pulls in shared crate-root plumbing
 //! such as `discover_git_dir`, `repository_object_format`, `read_repo_config`,
-//! `global_config_value`, and `parse_config_bool_value`.
+//! `global_config_value`, and `sley_config::parse_config_bool`.
 use crate::*;
 
 /// Exact usage text git's `patch-id` prints for `-h` and on option errors. A raw
@@ -289,7 +289,7 @@ fn patch_id_config_stable() -> Result<bool> {
 /// Parse a `patchid.stable` value, emitting git's fatal diagnostic for a
 /// non-boolean string.
 fn interpret_patch_id_stable(value: &str) -> Result<bool> {
-    match parse_config_bool_value(value) {
+    match sley_config::parse_config_bool(value) {
         Some(flag) => Ok(flag),
         None => {
             eprintln!("fatal: bad boolean config value '{value}' for 'patchid.stable'");

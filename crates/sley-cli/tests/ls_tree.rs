@@ -1,6 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn unique_temp_dir(name: &str) -> PathBuf {
@@ -27,12 +27,68 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     output.stdout
 }
 
+fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
+    Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
 fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(env!("CARGO_BIN_EXE_sley"), cwd, args)
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run("git", cwd, args)
+}
+
+fn init_basic_repo(root: &Path) {
+    git(root, &["init", "-q"]);
+    fs::write(root.join("a.txt"), b"a\n").expect("write a");
+    git(root, &["add", "."]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+            "-q",
+        ],
+    );
+}
+
+#[test]
+fn ls_tree_usage_and_option_errors_exit_like_upstream_git() {
+    let root = unique_temp_dir("ls-tree-usage");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        init_basic_repo(&root);
+        for args in [
+            vec!["ls-tree"],
+            vec!["ls-tree", "--format"],
+            vec!["ls-tree", "--bogus", "HEAD"],
+            vec!["ls-tree", "--abbrev=bad", "HEAD"],
+            vec!["ls-tree", "--name-only", "--name-status", "HEAD"],
+            vec!["ls-tree", "--format=%(path)", "--long", "HEAD"],
+            vec!["ls-tree", "--object-only", "--name-only", "HEAD"],
+        ] {
+            let expected = run_output("git", &root, &args);
+            let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "sley exit status differed for {args:?}\nexpected stderr:\n{}\nactual stderr:\n{}",
+                String::from_utf8_lossy(&expected.stderr),
+                String::from_utf8_lossy(&actual.stderr)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

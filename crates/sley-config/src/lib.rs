@@ -32,6 +32,7 @@ pub struct ConfigSection {
 pub struct ConfigEntry {
     pub key: String,
     pub value: Option<String>,
+    pub comment: Option<String>,
 }
 
 impl GitConfig {
@@ -152,6 +153,10 @@ impl GitConfig {
                 if let Some(value) = &entry.value {
                     out.extend_from_slice(b" = ");
                     out.extend_from_slice(quote_config_value(value).as_bytes());
+                }
+                if let Some(comment) = &entry.comment {
+                    out.extend_from_slice(b" # ");
+                    out.extend_from_slice(comment.as_bytes());
                 }
                 out.extend_from_slice(b"\n");
             }
@@ -634,9 +639,10 @@ fn class_matches(items: &[ClassItem], ch: char) -> bool {
 /// This mirrors git's own `git_parse_source`: it scans the input as a stream of
 /// characters rather than independent lines, because both line continuations
 /// (a trailing `\`) and quoted strings (in values *and* subsection headers) may
-/// span physical lines. Section/variable names are lower-cased (they are
-/// case-insensitive); subsection names in the quoted form keep their case, while
-/// the deprecated dotted form lower-cases the subsection.
+/// span physical lines. Section/variable names are matched case-insensitively
+/// but stored with their original spelling so rewrites preserve git's casing
+/// behavior; subsection names in the quoted form keep their case, while the
+/// deprecated dotted form lower-cases the subsection.
 struct ConfigParser<'a> {
     chars: std::iter::Peekable<std::str::Chars<'a>>,
     /// 1-based physical line number, advanced on every consumed `\n`.
@@ -759,7 +765,7 @@ impl<'a> ConfigParser<'a> {
             Some(']') => {
                 self.bump();
                 Ok(ConfigSection {
-                    name: name.to_ascii_lowercase(),
+                    name,
                     subsection: None,
                     entries: Vec::new(),
                 })
@@ -776,7 +782,7 @@ impl<'a> ConfigParser<'a> {
                     _ => return Err(self.err("missing ']' after subsection name")),
                 }
                 Ok(ConfigSection {
-                    name: name.to_ascii_lowercase(),
+                    name,
                     // Subsection names are case-sensitive in the quoted form.
                     subsection: Some(subsection),
                     entries: Vec::new(),
@@ -827,22 +833,25 @@ impl<'a> ConfigParser<'a> {
         match self.peek() {
             // Bare variable: boolean true. Nothing but a comment or EOL may follow.
             None => Ok(ConfigEntry {
-                key: key.to_ascii_lowercase(),
+                key,
                 value: None,
+                comment: None,
             }),
             Some('\n') => {
                 self.bump();
                 Ok(ConfigEntry {
-                    key: key.to_ascii_lowercase(),
+                    key,
                     value: None,
+                    comment: None,
                 })
             }
             Some('=') => {
                 self.bump();
-                let value = self.parse_value()?;
+                let (value, comment) = self.parse_value()?;
                 Ok(ConfigEntry {
-                    key: key.to_ascii_lowercase(),
+                    key,
                     value: Some(value),
+                    comment,
                 })
             }
             Some(ch) => Err(self.err(format!("expected '=' after variable name, found {ch:?}"))),
@@ -855,8 +864,9 @@ impl<'a> ConfigParser<'a> {
     /// quotes that preserve spaces, the escapes `\n \t \b \" \\`, line
     /// continuation via a trailing `\`, and inline `#`/`;` comments (outside
     /// quotes). Quoted runs and unquoted runs may be mixed within one value.
-    fn parse_value(&mut self) -> Result<String> {
+    fn parse_value(&mut self) -> Result<(String, Option<String>)> {
         let mut out = String::new();
+        let mut comment = None;
         // Number of trailing whitespace chars currently buffered in `out` that
         // should be dropped if the value ends here (outside quotes).
         let mut trailing_ws = 0usize;
@@ -918,7 +928,8 @@ impl<'a> ConfigParser<'a> {
                 }
                 // Comments terminate an unquoted value.
                 Some('#') | Some(';') if !in_quotes => {
-                    self.skip_to_eol();
+                    self.bump();
+                    comment = Some(self.parse_comment_text());
                     break;
                 }
                 Some(ch @ (' ' | '\t' | '\r')) if !in_quotes => {
@@ -943,7 +954,23 @@ impl<'a> ConfigParser<'a> {
         }
         // Trim trailing unquoted whitespace that was buffered.
         out.truncate(out.len() - trailing_ws);
-        Ok(out)
+        Ok((out, comment))
+    }
+
+    fn parse_comment_text(&mut self) -> String {
+        while matches!(self.peek(), Some(' ') | Some('\t')) {
+            self.bump();
+        }
+        let mut comment = String::new();
+        while let Some(ch) = self.peek() {
+            if ch == '\n' {
+                self.bump();
+                break;
+            }
+            comment.push(ch);
+            self.bump();
+        }
+        comment
     }
 }
 
@@ -1276,6 +1303,7 @@ mod tests {
                 entries: vec![ConfigEntry {
                     key: "url".into(),
                     value: Some("https://example.invalid/repo.git".into()),
+                    comment: None,
                 }],
             }],
         };
@@ -1301,9 +1329,9 @@ mod tests {
             GitConfig::parse(b"[Core]\n\tBar = value\n").expect("test operation should succeed");
         assert_eq!(config.get("core", None, "bar"), Some("value"));
         assert_eq!(config.get("CORE", None, "BAR"), Some("value"));
-        // Stored names are lower-cased.
-        assert_eq!(config.sections[0].name, "core");
-        assert_eq!(config.sections[0].entries[0].key, "bar");
+        // Stored names preserve spelling for faithful rewrites.
+        assert_eq!(config.sections[0].name, "Core");
+        assert_eq!(config.sections[0].entries[0].key, "Bar");
     }
 
     #[test]
@@ -1670,6 +1698,7 @@ mod tests {
                     entries: vec![ConfigEntry {
                         key: "x".into(),
                         value: Some(value.to_string()),
+                        comment: None,
                     }],
                 }],
             };
@@ -1692,6 +1721,7 @@ mod tests {
                 entries: vec![ConfigEntry {
                     key: "url".into(),
                     value: Some("x".into()),
+                    comment: None,
                 }],
             }],
         };
@@ -1728,11 +1758,13 @@ mod tests {
                         ConfigEntry {
                             key: "x".into(),
                             value: Some(value.to_string()),
+                            comment: None,
                         },
                         // A bare boolean-true key should survive the round trip.
                         ConfigEntry {
                             key: "flag".into(),
                             value: None,
+                            comment: None,
                         },
                     ],
                 }],
@@ -1759,14 +1791,17 @@ mod tests {
                     ConfigEntry {
                         key: "x".into(),
                         value: Some("first".into()),
+                        comment: None,
                     },
                     ConfigEntry {
                         key: "x".into(),
                         value: Some("second".into()),
+                        comment: None,
                     },
                     ConfigEntry {
                         key: "x".into(),
                         value: Some("first".into()),
+                        comment: None,
                     },
                 ],
             }],

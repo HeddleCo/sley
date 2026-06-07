@@ -1,4 +1,4 @@
-use sley_config::{ConfigEntry, ConfigSection, GitConfig};
+use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
     Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry,
@@ -12,9 +12,10 @@ use sley_object::{
 use sley_odb::{
     FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
     collect_reachable_object_ids, install_bundle_pack, install_reachable_pack,
-    repository_object_ids, repository_objects_dir, verify_bundle_prerequisites,
+    prune_unreachable_loose, repository_object_ids, repository_objects_dir,
+    verify_bundle_prerequisites,
 };
-use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackIndex};
+use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
     RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec,
@@ -25,8 +26,8 @@ use sley_protocol::{
 };
 pub(crate) use sley_ref_filter::*;
 use sley_refs::{
-    BundleRefUpdate, FileRefStore, PackedRef, Ref, RefTarget, RefUpdate, ReflogEntry,
-    branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
+    BundleRefUpdate, FileRefStore, PackedRef, Ref, RefPrecondition, RefTarget, RefUpdate,
+    ReflogEntry, branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
 };
 use sley_transport::{RemoteTransport, parse_remote_url};
 use std::borrow::Cow;
@@ -45,6 +46,7 @@ static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Ve
 static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
+static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
 
 mod commands;
 mod repo_path;
@@ -61,6 +63,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_git_dir(global.git_dir.clone());
     set_global_work_tree(global.work_tree.clone());
     set_global_bare(global.bare);
+    set_global_replace_objects(global.replace_objects);
     let args = global.args;
     let Some(command) = args.first().map(String::as_str) else {
         print_usage();
@@ -73,10 +76,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "branch" => commands::branch::cmd_branch(&args[1..]),
         "bundle" => cmd_bundle(&args[1..]),
         "hash-object" => commands::hash_object::cmd_hash_object(&args[1..]),
+        "index-pack" => cmd_index_pack(&args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(&args[1..]),
         "check-ignore" => commands::attrs::cmd_check_ignore(&args[1..]),
+        "check-mailmap" => cmd_check_mailmap(&args[1..]),
+        "check-ref-format" => cmd_check_ref_format(&args[1..]),
         "clean" => cmd_clean(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "config" => cmd_config(&args[1..]),
@@ -91,6 +97,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "fetch" => cmd_fetch(&args[1..]),
         "for-each-ref" => cmd_for_each_ref(&args[1..]),
         "fsck" => cmd_fsck(&args[1..]),
+        "get-tar-commit-id" => cmd_get_tar_commit_id(&args[1..]),
         "ls-remote" => cmd_ls_remote(&args[1..]),
         "ls-files" => cmd_ls_files(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
@@ -103,6 +110,8 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "multi-pack-index" => cmd_multi_pack_index(&args[1..]),
         "mv" => cmd_mv(&args[1..]),
         "pack-refs" => cmd_pack_refs(&args[1..]),
+        "prune" => cmd_prune(&args[1..]),
+        "prune-packed" => cmd_prune_packed(&args[1..]),
         "push" => cmd_push(&args[1..]),
         "receive-pack" => cmd_receive_pack(&args[1..]),
         "upload-pack" => cmd_upload_pack(&args[1..]),
@@ -114,10 +123,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "rev-list" => cmd_rev_list(&args[1..]),
         "reflog" => cmd_reflog(&args[1..]),
         "remote" => cmd_remote(&args[1..]),
+        "replace" => cmd_replace(&args[1..]),
         "reset" => cmd_reset(&args[1..]),
         "restore" => cmd_restore(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "show-ref" => cmd_show_ref(&args[1..]),
+        "show-index" => cmd_show_index(&args[1..]),
+        "stripspace" => cmd_stripspace(&args[1..]),
         "stash" => commands::stash::cmd_stash(&args[1..]),
         "submodule" => cmd_submodule(&args[1..]),
         "symbolic-ref" => cmd_symbolic_ref(&args[1..]),
@@ -125,6 +137,10 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "switch" => cmd_switch(&args[1..]),
         "tag" => commands::tag::cmd_tag(&args[1..]),
         "testkit" => cmd_testkit(&args[1..]),
+        "unpack-file" => cmd_unpack_file(&args[1..]),
+        "update-server-info" => cmd_update_server_info(&args[1..]),
+        "var" => cmd_var(&args[1..]),
+        "verify-pack" => cmd_verify_pack(&args[1..]),
         "version" | "-v" | "--version" => cmd_version(),
         "show" => commands::show::cmd_show(&args[1..]),
         "blame" => commands::blame::cmd_blame(&args[1..]),
@@ -156,6 +172,1051 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 fn cmd_version() -> Result<()> {
     println!("git version {}", sley_core::UPSTREAM_GIT_COMPAT_VERSION);
+    Ok(())
+}
+
+fn cmd_var(args: &[String]) -> Result<()> {
+    match args {
+        [name] if name == "-l" => {
+            var_list()?;
+            Ok(())
+        }
+        [name] => {
+            let value = var_value(name)?;
+            println!("{value}");
+            Ok(())
+        }
+        _ => var_usage(),
+    }
+}
+
+fn var_list() -> Result<()> {
+    if let Some(config) = identity_effective_config() {
+        var_print_config(&config)?;
+    }
+    for entry in environment_config_overrides()? {
+        println!("{}={}", entry.key.to_ascii_lowercase(), entry.value);
+    }
+    if let Ok(overrides) = GLOBAL_CONFIG_OVERRIDES.lock() {
+        for entry in overrides.iter() {
+            println!("{}={}", entry.key.to_ascii_lowercase(), entry.value);
+        }
+    }
+    for name in [
+        "GIT_COMMITTER_IDENT",
+        "GIT_AUTHOR_IDENT",
+        "GIT_EDITOR",
+        "GIT_SEQUENCE_EDITOR",
+        "GIT_PAGER",
+        "GIT_DEFAULT_BRANCH",
+        "GIT_SHELL_PATH",
+    ] {
+        if let Ok(value) = var_value(name) {
+            println!("{name}={value}");
+        }
+    }
+    Ok(())
+}
+
+fn var_print_config(config: &GitConfig) -> Result<()> {
+    for section in &config.sections {
+        for entry in &section.entries {
+            let name = config_entry_name(section, &entry.key).to_ascii_lowercase();
+            if let Some(value) = &entry.value {
+                println!("{name}={value}");
+            } else {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn var_value(name: &str) -> Result<String> {
+    match name {
+        "GIT_AUTHOR_IDENT" => var_identity("AUTHOR"),
+        "GIT_COMMITTER_IDENT" => var_identity("COMMITTER"),
+        "GIT_EDITOR" => var_editor(None),
+        "GIT_SEQUENCE_EDITOR" => var_editor(Some("sequence.editor")),
+        "GIT_PAGER" => Ok(var_pager()),
+        "GIT_DEFAULT_BRANCH" => Ok(var_default_branch()),
+        "GIT_SHELL_PATH" => Ok("/bin/sh".into()),
+        _ => var_usage(),
+    }
+}
+
+fn var_identity(role: &str) -> Result<String> {
+    let identity = commit_identity_from_env(role)?;
+    Ok(String::from_utf8_lossy(&identity).into_owned())
+}
+
+fn var_editor(specific_key: Option<&str>) -> Result<String> {
+    if let Some(key) = specific_key {
+        if let Ok(value) = env::var("GIT_SEQUENCE_EDITOR") {
+            return Ok(value);
+        }
+        if let Some(value) = var_effective_config_value(key) {
+            return Ok(value);
+        }
+    }
+    if let Ok(value) = env::var("GIT_EDITOR") {
+        return Ok(value);
+    }
+    if let Some(value) = var_effective_config_value("core.editor") {
+        return Ok(value);
+    }
+    if let Ok(value) = env::var("VISUAL")
+        && !value.is_empty()
+        && env::var("TERM").is_ok_and(|term| term != "dumb")
+    {
+        return Ok(value);
+    }
+    if let Ok(value) = env::var("EDITOR") {
+        return Ok(value);
+    }
+    Err(GitError::Exit(1))
+}
+
+fn var_pager() -> String {
+    env::var("GIT_PAGER")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| var_effective_config_value("core.pager"))
+        .unwrap_or_else(|| "cat".into())
+}
+
+fn var_default_branch() -> String {
+    var_effective_config_value("init.defaultBranch").unwrap_or_else(|| "master".into())
+}
+
+fn var_effective_config_value(key: &str) -> Option<String> {
+    if let Ok(Some(value)) = global_config_value(key) {
+        return Some(value);
+    }
+    let (section, key) = key.split_once('.')?;
+    identity_effective_config().and_then(|config| config.get(section, None, key).map(str::to_owned))
+}
+
+fn var_usage<T>() -> Result<T> {
+    eprintln!("usage: git var (-l | <variable>)");
+    Err(GitError::Exit(129))
+}
+
+fn cmd_get_tar_commit_id(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        eprintln!("usage: git get-tar-commit-id");
+        return Err(GitError::Exit(129));
+    }
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    match tar_commit_id(&input)? {
+        Some(commit_id) => {
+            println!("{commit_id}");
+            Ok(())
+        }
+        None => Err(GitError::Exit(1)),
+    }
+}
+
+fn tar_commit_id(input: &[u8]) -> Result<Option<String>> {
+    let mut offset = 0usize;
+    loop {
+        if input.len().saturating_sub(offset) < 512 {
+            eprintln!(
+                "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
+            );
+            return Err(GitError::Exit(128));
+        }
+        let header = &input[offset..offset + 512];
+        offset += 512;
+        if header.iter().all(|byte| *byte == 0) {
+            return Ok(None);
+        }
+        let size = tar_header_size(header)?;
+        let typeflag = header[156];
+        if input.len().saturating_sub(offset) < size {
+            eprintln!(
+                "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
+            );
+            return Err(GitError::Exit(128));
+        }
+        let body = &input[offset..offset + size];
+        if typeflag == b'g'
+            && let Some(commit_id) = pax_comment_commit_id(body)
+        {
+            return Ok(Some(commit_id));
+        }
+        let padded = size.div_ceil(512) * 512;
+        if input.len().saturating_sub(offset) < padded {
+            eprintln!(
+                "fatal: git get-tar-commit-id: EOF before reading tar header: No such file or directory"
+            );
+            return Err(GitError::Exit(128));
+        }
+        offset += padded;
+    }
+}
+
+fn tar_header_size(header: &[u8]) -> Result<usize> {
+    let field = &header[124..136];
+    let text = String::from_utf8_lossy(field);
+    let digits = text
+        .trim_matches(char::from(0))
+        .trim()
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    if digits.is_empty() {
+        return Ok(0);
+    }
+    usize::from_str_radix(&digits, 8)
+        .map_err(|_| GitError::InvalidFormat("invalid tar size".into()))
+}
+
+fn pax_comment_commit_id(body: &[u8]) -> Option<String> {
+    let mut offset = 0usize;
+    while offset < body.len() {
+        let relative_space = body[offset..].iter().position(|byte| *byte == b' ')?;
+        let space = offset + relative_space;
+        let length = std::str::from_utf8(&body[offset..space])
+            .ok()?
+            .parse::<usize>()
+            .ok()?;
+        if length == 0 || offset + length > body.len() {
+            return None;
+        }
+        let record = &body[space + 1..offset + length];
+        if let Some(value) = record
+            .strip_prefix(b"comment=")
+            .and_then(|value| value.strip_suffix(b"\n"))
+            && value.iter().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Some(String::from_utf8_lossy(value).into_owned());
+        }
+        offset += length;
+    }
+    None
+}
+
+fn cmd_unpack_file(args: &[String]) -> Result<()> {
+    let [name] = args else {
+        eprintln!("usage: git unpack-file <blob>");
+        return Err(GitError::Exit(129));
+    };
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let oid = match resolve_revision(&git_dir, format, name) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("fatal: Not a valid object name {name}");
+            return Err(GitError::Exit(128));
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let object = db.read_object(&oid)?;
+    if object.object_type != ObjectType::Blob {
+        eprintln!("fatal: unable to read blob object {oid}");
+        return Err(GitError::Exit(128));
+    }
+    let path = write_unpack_file_temp(&object.body)?;
+    println!("{}", path.display());
+    Ok(())
+}
+
+fn write_unpack_file_temp(contents: &[u8]) -> Result<PathBuf> {
+    let cwd = env::current_dir()?;
+    for attempt in 0..1024u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let name = format!(
+            ".merge_file_{:x}{:x}{:x}",
+            std::process::id(),
+            nanos,
+            attempt
+        );
+        let path = cwd.join(&name);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        };
+        file.write_all(contents)?;
+        return Ok(PathBuf::from(name));
+    }
+    Err(GitError::Io(
+        "unable to create temporary unpack file".into(),
+    ))
+}
+
+fn cmd_show_index(args: &[String]) -> Result<()> {
+    let mut format = ObjectFormat::Sha1;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--object-format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `object-format' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                format = parse_show_index_object_format(value)?;
+            }
+            "--no-object-format" => format = ObjectFormat::Sha1,
+            value if value.starts_with("--object-format=") => {
+                format = parse_show_index_object_format(&value["--object-format=".len()..])?;
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return show_index_usage();
+            }
+            _ => {}
+        }
+    }
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    if input.len() < 8 {
+        eprintln!("fatal: unable to read header");
+        return Err(GitError::Exit(128));
+    }
+    let index = match PackIndex::parse(&input, format) {
+        Ok(index) => index,
+        Err(_) => {
+            eprintln!("fatal: unable to read header");
+            return Err(GitError::Exit(128));
+        }
+    };
+    for entry in index.entries {
+        println!("{} {} ({:08x})", entry.offset, entry.oid, entry.crc32);
+    }
+    Ok(())
+}
+
+fn parse_show_index_object_format(value: &str) -> Result<ObjectFormat> {
+    match value {
+        "sha1" => Ok(ObjectFormat::Sha1),
+        "sha256" => Ok(ObjectFormat::Sha256),
+        _ => {
+            eprintln!("fatal: Unknown hash algorithm");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn show_index_usage<T>() -> Result<T> {
+    eprintln!("usage: git show-index [--object-format=<hash-algorithm>] < <pack-idx-file>");
+    eprintln!();
+    eprintln!("    --[no-]object-format <hash-algorithm>");
+    eprintln!("                          specify the hash algorithm to use");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+#[derive(Debug)]
+struct IndexPackOptions {
+    verbose: bool,
+    output: Option<PathBuf>,
+    keep: bool,
+    rev_index: bool,
+    verify: bool,
+    stdin: bool,
+    fix_thin: bool,
+    pack_file: Option<PathBuf>,
+}
+
+fn cmd_index_pack(args: &[String]) -> Result<()> {
+    let options = parse_index_pack_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    if options.stdin {
+        let mut pack = Vec::new();
+        io::stdin().read_to_end(&mut pack)?;
+        let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+        let install = db.install_raw_pack(&pack)?;
+        if options.keep {
+            let keep_path = install.pack_path.with_extension("keep");
+            fs::write(keep_path, b"")?;
+        }
+        if options.rev_index {
+            let rev_path = install.pack_path.with_extension("rev");
+            let _ = fs::write(rev_path, b"");
+        }
+        println!("pack\t{}", install.pack_name.trim_start_matches("pack-"));
+        return Ok(());
+    }
+
+    let Some(pack_file) = options.pack_file else {
+        return index_pack_usage();
+    };
+    let pack = fs::read(&pack_file)?;
+    let indexed = PackFile::index_pack(&pack, format)?;
+    if options.verify {
+        return Ok(());
+    }
+    let index_path = options
+        .output
+        .unwrap_or_else(|| pack_file.with_extension("idx"));
+    write_index_pack_output(&index_path, &indexed.index)?;
+    if options.keep {
+        fs::write(pack_file.with_extension("keep"), b"")?;
+    }
+    if options.rev_index {
+        let _ = fs::write(pack_file.with_extension("rev"), b"");
+    }
+    if options.verbose {
+        eprintln!(
+            "Indexing objects: 100% ({}/{})",
+            indexed.entries.len(),
+            indexed.entries.len()
+        );
+    }
+    println!("{}", indexed.checksum);
+    Ok(())
+}
+
+fn parse_index_pack_options(args: &[String]) -> Result<IndexPackOptions> {
+    let mut options = IndexPackOptions {
+        verbose: false,
+        output: None,
+        keep: false,
+        rev_index: true,
+        verify: false,
+        stdin: false,
+        fix_thin: false,
+        pack_file: None,
+    };
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                for value in iter {
+                    index_pack_add_pack_file(&mut options, value)?;
+                }
+                break;
+            }
+            "-v" => options.verbose = true,
+            "-o" => {
+                let Some(value) = iter.next() else {
+                    return index_pack_usage();
+                };
+                options.output = Some(PathBuf::from(value));
+            }
+            "--stdin" => options.stdin = true,
+            "--fix-thin" => options.fix_thin = true,
+            "--keep" => options.keep = true,
+            value if value.starts_with("--keep=") => options.keep = true,
+            "--rev-index" => options.rev_index = true,
+            "--no-rev-index" => options.rev_index = false,
+            "--verify" => options.verify = true,
+            value if value.starts_with("--strict") || value.starts_with("--fsck-objects") => {}
+            value if value.starts_with('-') => return index_pack_usage(),
+            value => index_pack_add_pack_file(&mut options, value)?,
+        }
+    }
+    if options.output.is_some() && options.verify {
+        return Err(GitError::Exit(128));
+    }
+    if !options.stdin && options.pack_file.is_none() {
+        return index_pack_usage();
+    }
+    Ok(options)
+}
+
+fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Result<()> {
+    if options.pack_file.is_some() {
+        return index_pack_usage();
+    }
+    options.pack_file = Some(PathBuf::from(value));
+    Ok(())
+}
+
+fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            eprintln!("fatal: unable to create '{}': File exists", path.display());
+            return Err(GitError::Exit(128));
+        }
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    };
+    file.write_all(index)?;
+    Ok(())
+}
+
+fn index_pack_usage<T>() -> Result<T> {
+    eprintln!(
+        "usage: git index-pack [-v] [-o <index-file>] [--keep | --keep=<msg>] [--[no-]rev-index] [--verify] [--strict[=<msg-id>=<severity>...]] [--fsck-objects[=<msg-id>=<severity>...]] (<pack-file> | --stdin [--fix-thin] [<pack-file>])"
+    );
+    Err(GitError::Exit(129))
+}
+
+#[derive(Debug)]
+struct VerifyPackOptions {
+    verbose: bool,
+    stat_only: bool,
+    format: ObjectFormat,
+    index_paths: Vec<PathBuf>,
+}
+
+fn cmd_verify_pack(args: &[String]) -> Result<()> {
+    let options = parse_verify_pack_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, options.format);
+    for index_path in &options.index_paths {
+        verify_pack_one(
+            &db,
+            options.format,
+            index_path,
+            options.verbose,
+            options.stat_only,
+        )?;
+    }
+    Ok(())
+}
+
+fn parse_verify_pack_options(args: &[String]) -> Result<VerifyPackOptions> {
+    let mut verbose = false;
+    let mut stat_only = false;
+    let mut format = ObjectFormat::Sha1;
+    let mut index_paths = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                index_paths.extend(iter.map(PathBuf::from));
+                break;
+            }
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            "-s" | "--stat-only" => stat_only = true,
+            "--no-stat-only" => stat_only = false,
+            "--object-format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `object-format' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                format = parse_verify_pack_object_format(value)?;
+            }
+            "--no-object-format" => format = ObjectFormat::Sha1,
+            value if let Some(value) = long_option_value(value, "object-format") => {
+                format = parse_verify_pack_object_format(value)?;
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return verify_pack_usage();
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                for option in value[1..].chars() {
+                    match option {
+                        'v' => verbose = true,
+                        's' => stat_only = true,
+                        other => {
+                            eprintln!("error: unknown switch `{other}'");
+                            return verify_pack_usage();
+                        }
+                    }
+                }
+            }
+            value => index_paths.push(PathBuf::from(value)),
+        }
+    }
+    if index_paths.is_empty() {
+        return verify_pack_usage();
+    }
+    Ok(VerifyPackOptions {
+        verbose,
+        stat_only,
+        format,
+        index_paths,
+    })
+}
+
+fn verify_pack_one(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    index_path: &Path,
+    verbose: bool,
+    stat_only: bool,
+) -> Result<()> {
+    let index = PackIndex::parse(&fs::read(index_path)?, format)?;
+    let mut entries = index.entries;
+    entries.sort_by_key(|entry| entry.offset);
+    let mut non_delta = 0usize;
+    for entry in &entries {
+        let Some((object_type, size)) = db.read_object_header(&entry.oid)? else {
+            eprintln!("fatal: cannot read object {}", entry.oid);
+            return Err(GitError::Exit(1));
+        };
+        let Some(storage) = db.object_storage_info(&entry.oid)? else {
+            eprintln!("fatal: cannot locate object {}", entry.oid);
+            return Err(GitError::Exit(1));
+        };
+        if storage.deltabase == ObjectId::null(format) {
+            non_delta += 1;
+        }
+        if verbose && !stat_only {
+            println!(
+                "{} {:<6} {} {} {}",
+                entry.oid,
+                object_type.as_str(),
+                size,
+                storage.disk_size,
+                entry.offset
+            );
+        }
+    }
+    if verbose || stat_only {
+        println!("non delta: {non_delta} objects");
+        if verbose && !stat_only {
+            println!("{}: ok", index_path.with_extension("pack").display());
+        }
+    }
+    Ok(())
+}
+
+fn parse_verify_pack_object_format(value: &str) -> Result<ObjectFormat> {
+    match value {
+        "sha1" => Ok(ObjectFormat::Sha1),
+        "sha256" => Ok(ObjectFormat::Sha256),
+        _ => {
+            eprintln!("fatal: unknown hash algorithm '{value}'");
+            Err(GitError::Exit(1))
+        }
+    }
+}
+
+fn verify_pack_usage<T>() -> Result<T> {
+    eprintln!("usage: git verify-pack [-v | --verbose] [-s | --stat-only] [--] <pack>.idx...");
+    eprintln!();
+    eprintln!("    -v, --[no-]verbose    verbose");
+    eprintln!("    -s, --[no-]stat-only  show statistics only");
+    eprintln!("    --[no-]object-format <hash>");
+    eprintln!("                          specify the hash algorithm to use");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn cmd_check_mailmap(args: &[String]) -> Result<()> {
+    let mut stdin = false;
+    let mut source_specs = Vec::new();
+    let mut contacts = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--stdin" => stdin = true,
+            "--no-stdin" => stdin = false,
+            "--mailmap-file" => {
+                let Some(path) = iter.next() else {
+                    eprintln!("error: option `mailmap-file' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                source_specs.push(MailmapSourceSpec::File(PathBuf::from(path)));
+            }
+            "--no-mailmap-file" => {}
+            "--mailmap-blob" => {
+                let Some(rev) = iter.next() else {
+                    eprintln!("error: option `mailmap-blob' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                source_specs.push(MailmapSourceSpec::Blob(rev.to_string()));
+            }
+            "--no-mailmap-blob" => {}
+            value if value.starts_with("--mailmap-file=") => {
+                source_specs.push(MailmapSourceSpec::File(PathBuf::from(
+                    &value["--mailmap-file=".len()..],
+                )));
+            }
+            value if value.starts_with("--mailmap-blob=") => {
+                source_specs.push(MailmapSourceSpec::Blob(
+                    value["--mailmap-blob=".len()..].to_string(),
+                ));
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return check_mailmap_usage();
+            }
+            value => contacts.push(value.to_string()),
+        }
+    }
+    if stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        contacts.extend(input.lines().map(str::to_string));
+    }
+    if contacts.is_empty() {
+        eprintln!("fatal: no contacts specified");
+        return Err(GitError::Exit(128));
+    }
+
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let mailmap = Mailmap::load(&git_dir, format, &source_specs)?;
+    for contact in contacts {
+        println!("{}", mailmap.resolve_contact(&contact).display());
+    }
+    Ok(())
+}
+
+fn check_mailmap_usage<T>() -> Result<T> {
+    eprintln!("usage: git check-mailmap [<options>] <contact>...");
+    eprintln!();
+    eprintln!("    --[no-]stdin          also read contacts from stdin");
+    eprintln!("    --[no-]mailmap-file <file>");
+    eprintln!("                          read additional mailmap entries from file");
+    eprintln!("    --[no-]mailmap-blob <blob>");
+    eprintln!("                          read additional mailmap entries from blob");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+#[derive(Debug)]
+enum MailmapSourceSpec {
+    File(PathBuf),
+    Blob(String),
+}
+
+#[derive(Debug, Default)]
+struct Mailmap {
+    entries: Vec<MailmapEntry>,
+}
+
+#[derive(Debug)]
+struct MailmapEntry {
+    old_name: Option<String>,
+    old_email: String,
+    new_name: Option<String>,
+    new_email: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MailmapContact {
+    name: Option<String>,
+    email: String,
+}
+
+impl Mailmap {
+    fn load(
+        git_dir: &Path,
+        format: ObjectFormat,
+        source_specs: &[MailmapSourceSpec],
+    ) -> Result<Self> {
+        let mut mailmap = Self::default();
+        let worktree_root = worktree_root_for_git_dir(git_dir).ok();
+        if let Some(root) = &worktree_root {
+            mailmap.add_file(&root.join(".mailmap"))?;
+        }
+        if let Some(config) = identity_effective_config() {
+            if let Some(path) = config.get("mailmap", None, "file") {
+                let path = mailmap_config_path(worktree_root.as_deref(), path);
+                mailmap.add_file(&path)?;
+            }
+            if let Some(blob) = config.get("mailmap", None, "blob") {
+                mailmap.add_blob(git_dir, format, blob)?;
+            }
+        }
+        for source in source_specs {
+            match source {
+                MailmapSourceSpec::File(path) => mailmap.add_file(path)?,
+                MailmapSourceSpec::Blob(rev) => mailmap.add_blob(git_dir, format, rev)?,
+            }
+        }
+        Ok(mailmap)
+    }
+
+    fn add_file(&mut self, path: &Path) -> Result<()> {
+        match fs::read(path) {
+            Ok(bytes) => self.add_bytes(&bytes),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(GitError::Io(err.to_string())),
+        }
+    }
+
+    fn add_blob(&mut self, git_dir: &Path, format: ObjectFormat, rev: &str) -> Result<()> {
+        let oid = resolve_revision(git_dir, format, rev)?;
+        let db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let object = db.read_object(&oid)?;
+        if object.object_type != ObjectType::Blob {
+            eprintln!("error: unable to read mailmap object at {rev}");
+            return Err(GitError::Exit(128));
+        }
+        self.add_bytes(&object.body)
+    }
+
+    fn add_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let text = String::from_utf8_lossy(bytes);
+        self.entries
+            .extend(text.lines().filter_map(parse_mailmap_line));
+        Ok(())
+    }
+
+    fn resolve_contact(&self, contact: &str) -> MailmapContact {
+        let mut resolved = parse_mailmap_contact(contact);
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.matches(&resolved))
+        {
+            if let Some(name) = &entry.new_name {
+                resolved.name = Some(name.clone());
+            }
+            resolved.email.clone_from(&entry.new_email);
+        }
+        resolved
+    }
+}
+
+impl MailmapEntry {
+    fn matches(&self, contact: &MailmapContact) -> bool {
+        self.old_email.eq_ignore_ascii_case(&contact.email)
+            && self.old_name.as_ref().is_none_or(|name| {
+                contact
+                    .name
+                    .as_deref()
+                    .is_some_and(|contact_name| contact_name == name)
+            })
+    }
+}
+
+impl MailmapContact {
+    fn display(&self) -> String {
+        match &self.name {
+            Some(name) if !name.is_empty() => format!("{name} <{}>", self.email),
+            _ => format!("<{}>", self.email),
+        }
+    }
+}
+
+fn mailmap_config_path(worktree_root: Option<&Path>, value: &str) -> PathBuf {
+    let path = PathBuf::from(value);
+    if path.is_absolute() {
+        path
+    } else if let Some(root) = worktree_root {
+        root.join(path)
+    } else {
+        path
+    }
+}
+
+fn parse_mailmap_line(line: &str) -> Option<MailmapEntry> {
+    let line = strip_mailmap_comment(line).trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (new_contact, rest) = parse_mailmap_contact_prefix(line)?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return None;
+    }
+    let old_contact = parse_mailmap_contact(rest);
+    Some(MailmapEntry {
+        old_name: old_contact.name,
+        old_email: old_contact.email,
+        new_name: new_contact.name,
+        new_email: new_contact.email,
+    })
+}
+
+fn strip_mailmap_comment(line: &str) -> &str {
+    line.split_once('#')
+        .map(|(before, _)| before)
+        .unwrap_or(line)
+}
+
+fn parse_mailmap_contact_prefix(value: &str) -> Option<(MailmapContact, &str)> {
+    let end = value.find('>')?;
+    let head = &value[..=end];
+    let rest = &value[end + 1..];
+    Some((parse_mailmap_contact(head), rest))
+}
+
+fn parse_mailmap_contact(value: &str) -> MailmapContact {
+    let value = value.trim();
+    if let Some(start) = value.rfind('<')
+        && let Some(end) = value[start + 1..].find('>')
+    {
+        let email = value[start + 1..start + 1 + end].trim().to_string();
+        let name = value[..start].trim();
+        return MailmapContact {
+            name: (!name.is_empty()).then(|| name.to_string()),
+            email,
+        };
+    }
+    MailmapContact {
+        name: None,
+        email: value.to_string(),
+    }
+}
+
+fn cmd_stripspace(args: &[String]) -> Result<()> {
+    let mut strip_comments = false;
+    let mut comment_lines = false;
+    for arg in args {
+        match arg.as_str() {
+            "-s" | "--strip-comments" => strip_comments = true,
+            "--no-strip-comments" => strip_comments = false,
+            "-c" | "--comment-lines" => comment_lines = true,
+            "--no-comment-lines" => comment_lines = false,
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return stripspace_usage();
+            }
+            _ => return stripspace_usage(),
+        }
+    }
+    if strip_comments && comment_lines {
+        eprintln!(
+            "error: options '--comment-lines' and '--strip-comments' cannot be used together"
+        );
+        return Err(GitError::Exit(129));
+    }
+    let mut input = Vec::new();
+    io::stdin().read_to_end(&mut input)?;
+    let output = if comment_lines {
+        stripspace_comment_lines(&input)
+    } else {
+        tag_stripspace_message(&input, strip_comments)
+    };
+    io::stdout().write_all(&output)?;
+    Ok(())
+}
+
+fn stripspace_comment_lines(input: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for line in input.split_inclusive(|byte| *byte == b'\n') {
+        if matches!(line, b"\n" | b"\r\n") {
+            out.extend_from_slice(b"#");
+        } else {
+            out.extend_from_slice(b"# ");
+        }
+        out.extend_from_slice(line);
+    }
+    if !input.ends_with(b"\n") && !input.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn stripspace_usage<T>() -> Result<T> {
+    eprintln!("usage: git stripspace [-s | --strip-comments]");
+    eprintln!("   or: git stripspace [-c | --comment-lines]");
+    eprintln!();
+    eprintln!(
+        "    -s, --strip-comments  skip and remove all lines starting with comment character"
+    );
+    eprintln!("    -c, --comment-lines   prepend comment character and space to each line");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn cmd_check_ref_format(args: &[String]) -> Result<()> {
+    let mut allow_onelevel = false;
+    let mut branch = false;
+    let mut normalize = false;
+    let mut refspec_pattern = false;
+    let mut positional = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--allow-onelevel" => allow_onelevel = true,
+            "--no-allow-onelevel" => allow_onelevel = false,
+            "--branch" => branch = true,
+            "--normalize" | "--print" => normalize = true,
+            "--no-normalize" | "--no-print" => normalize = false,
+            "--refspec-pattern" => refspec_pattern = true,
+            "--no-refspec-pattern" => refspec_pattern = false,
+            value if value.starts_with('-') && !branch => return check_ref_format_usage(),
+            value => positional.push(value),
+        }
+    }
+    if positional.len() != 1 {
+        return check_ref_format_usage();
+    }
+    let mut name = positional[0].to_string();
+    if normalize {
+        name = normalize_check_ref_format_name(&name);
+    }
+    if branch {
+        if check_branch_format_name(&name).is_ok() {
+            println!("{name}");
+            return Ok(());
+        }
+        eprintln!("fatal: '{name}' is not a valid branch name");
+        return Err(GitError::Exit(128));
+    }
+    if check_ref_format_name(&name, allow_onelevel, refspec_pattern).is_ok() {
+        if normalize {
+            println!("{name}");
+        }
+        Ok(())
+    } else {
+        Err(GitError::Exit(1))
+    }
+}
+
+fn check_ref_format_usage<T>() -> Result<T> {
+    eprintln!("usage: git check-ref-format [--normalize] [<options>] <refname>");
+    eprintln!("   or: git check-ref-format --branch <branchname-shorthand>");
+    Err(GitError::Exit(129))
+}
+
+fn normalize_check_ref_format_name(name: &str) -> String {
+    name.split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn check_branch_format_name(name: &str) -> Result<()> {
+    if name.starts_with('-') {
+        return Err(GitError::InvalidPath(format!("invalid branch name {name}")));
+    }
+    check_ref_format_name(name, true, false)
+}
+
+fn check_ref_format_name(name: &str, allow_onelevel: bool, refspec_pattern: bool) -> Result<()> {
+    if name.is_empty()
+        || name == "@"
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || (!allow_onelevel && !name.contains('/'))
+    {
+        return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+    }
+    let mut stars = 0usize;
+    for component in name.split('/') {
+        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
+            return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+        }
+        for byte in component.bytes() {
+            if byte == b'*' {
+                stars += 1;
+                if !refspec_pattern || stars > 1 {
+                    return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+                }
+                continue;
+            }
+            if byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'[' | b'\\')
+            {
+                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1790,6 +2851,7 @@ struct GlobalOptions<'a> {
     git_dir: Option<PathBuf>,
     work_tree: Option<PathBuf>,
     bare: bool,
+    replace_objects: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1804,6 +2866,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     let mut git_dir = None;
     let mut work_tree = None;
     let mut bare = false;
+    let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-C" => {
@@ -1841,10 +2904,13 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
             | "--paginate"
             | "-P"
             | "--no-pager"
-            | "--no-replace-objects"
             | "--no-lazy-fetch"
             | "--no-optional-locks"
             | "--no-advice" => {
+                index += 1;
+            }
+            "--no-replace-objects" => {
+                replace_objects = false;
                 index += 1;
             }
             "--git-dir" => {
@@ -1892,6 +2958,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
         git_dir,
         work_tree,
         bare,
+        replace_objects,
     })
 }
 
@@ -1955,6 +3022,12 @@ fn set_global_work_tree(work_tree: Option<PathBuf>) {
 fn set_global_bare(bare: bool) {
     if let Ok(mut value) = GLOBAL_BARE.lock() {
         *value = bare;
+    }
+}
+
+fn set_global_replace_objects(replace_objects: bool) {
+    if let Ok(mut value) = GLOBAL_REPLACE_OBJECTS.lock() {
+        *value = replace_objects;
     }
 }
 
@@ -2036,6 +3109,30 @@ fn explicit_work_tree() -> Option<PathBuf> {
 
 fn global_bare() -> bool {
     GLOBAL_BARE.lock().is_ok_and(|value| *value)
+}
+
+fn global_replace_objects() -> bool {
+    GLOBAL_REPLACE_OBJECTS.lock().map_or(true, |value| *value)
+        && env::var_os("GIT_NO_REPLACE_OBJECTS").is_none()
+}
+
+pub(crate) fn apply_replace_object(refs: &FileRefStore, oid: &ObjectId) -> Result<ObjectId> {
+    if !global_replace_objects() {
+        return Ok(oid.clone());
+    }
+    let mut current = oid.clone();
+    let mut seen = HashSet::new();
+    for _ in 0..5 {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+        let name = format!("refs/replace/{current}");
+        match refs.read_ref(&name)? {
+            Some(RefTarget::Direct(next)) => current = next,
+            _ => break,
+        }
+    }
+    Ok(current)
 }
 
 fn print_global_usage() {
@@ -3429,10 +4526,12 @@ fn apply_clone_sparse_checkout(
                 ConfigEntry {
                     key: "sparsecheckout".into(),
                     value: Some("true".into()),
+                    comment: None,
                 },
                 ConfigEntry {
                     key: "sparsecheckoutcone".into(),
                     value: Some("true".into()),
+                    comment: None,
                 },
             ],
         }],
@@ -3600,33 +4699,39 @@ fn configure_clone_remote(
     let mut entries = vec![ConfigEntry {
         key: "url".into(),
         value: Some(url.to_string()),
+        comment: None,
     }];
     if let Some(fetch_refspec) = fetch_refspec {
         entries.push(ConfigEntry {
             key: "fetch".into(),
             value: Some(fetch_refspec),
+            comment: None,
         });
     }
     if mirror {
         entries.push(ConfigEntry {
             key: "mirror".into(),
             value: Some("true".into()),
+            comment: None,
         });
     }
     if let Some(tag_opt) = tag_opt {
         entries.push(ConfigEntry {
             key: "tagopt".into(),
             value: Some(tag_opt.to_string()),
+            comment: None,
         });
     }
     if let Some(filter) = partial_clone_filter {
         entries.push(ConfigEntry {
             key: "promisor".into(),
             value: Some("true".into()),
+            comment: None,
         });
         entries.push(ConfigEntry {
             key: "partialclonefilter".into(),
             value: Some(filter.to_string()),
+            comment: None,
         });
     }
     config.sections.push(ConfigSection {
@@ -3646,10 +4751,12 @@ fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<
             ConfigEntry {
                 key: "remote".into(),
                 value: Some(remote.to_string()),
+                comment: None,
             },
             ConfigEntry {
                 key: "merge".into(),
                 value: Some(format!("refs/heads/{branch}")),
+                comment: None,
             },
         ],
     });
@@ -6134,6 +7241,323 @@ fn pack_refs_peeled_oid(
     Ok((peeled != *oid).then_some(peeled))
 }
 
+#[derive(Debug)]
+enum ReplaceMode {
+    Create { object: String, replacement: String },
+    List { pattern: Option<String> },
+    Delete { objects: Vec<String> },
+}
+
+#[derive(Debug)]
+struct ReplaceOptions {
+    force: bool,
+    format: ReplaceListFormat,
+    mode: ReplaceMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReplaceListFormat {
+    Short,
+    Medium,
+    Long,
+}
+
+fn cmd_replace(args: &[String]) -> Result<()> {
+    let options = parse_replace_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    match options.mode {
+        ReplaceMode::List { pattern } => {
+            replace_list(&store, &db, format, pattern.as_deref(), options.format)
+        }
+        ReplaceMode::Delete { objects } => {
+            replace_delete(&store, &common_git_dir, format, &objects)
+        }
+        ReplaceMode::Create {
+            object,
+            replacement,
+        } => replace_create(
+            &store,
+            &db,
+            &common_git_dir,
+            format,
+            &object,
+            &replacement,
+            options.force,
+        ),
+    }
+}
+
+fn parse_replace_options(args: &[String]) -> Result<ReplaceOptions> {
+    let mut force = false;
+    let mut format = ReplaceListFormat::Short;
+    let mut list = false;
+    let mut delete = false;
+    let mut unsupported_mode = None::<&str>;
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                positional.extend(iter.cloned());
+                break;
+            }
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            "-l" | "--list" => list = true,
+            "-d" | "--delete" => delete = true,
+            "-e" | "--edit" => unsupported_mode = Some("--edit"),
+            "-g" | "--graft" => unsupported_mode = Some("--graft"),
+            "--convert-graft-file" => unsupported_mode = Some("--convert-graft-file"),
+            "--raw" | "--no-raw" => {}
+            "--format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `format' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                format = parse_replace_list_format(value)?;
+            }
+            "--no-format" => format = ReplaceListFormat::Short,
+            value if let Some(value) = long_option_value(value, "format") => {
+                format = parse_replace_list_format(value)?;
+            }
+            value if value.starts_with("--no-force=") => {
+                eprintln!("error: option `no-force' takes no value");
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return replace_usage();
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                for option in value[1..].chars() {
+                    match option {
+                        'f' => force = true,
+                        'l' => list = true,
+                        'd' => delete = true,
+                        'e' => unsupported_mode = Some("--edit"),
+                        'g' => unsupported_mode = Some("--graft"),
+                        other => {
+                            eprintln!("error: unknown switch `{other}'");
+                            return replace_usage();
+                        }
+                    }
+                }
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if let Some(mode) = unsupported_mode {
+        return Err(GitError::Unsupported(format!("replace {mode}")));
+    }
+    if delete {
+        if positional.is_empty() {
+            return replace_usage();
+        }
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::Delete {
+                objects: positional,
+            },
+        });
+    }
+    if list || positional.len() <= 1 {
+        if positional.len() > 1 {
+            return replace_usage();
+        }
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::List {
+                pattern: positional.pop(),
+            },
+        });
+    }
+    if positional.len() == 2 {
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::Create {
+                object: positional.remove(0),
+                replacement: positional.remove(0),
+            },
+        });
+    }
+    replace_usage()
+}
+
+fn parse_replace_list_format(value: &str) -> Result<ReplaceListFormat> {
+    match value {
+        "short" => Ok(ReplaceListFormat::Short),
+        "medium" => Ok(ReplaceListFormat::Medium),
+        "long" => Ok(ReplaceListFormat::Long),
+        other => {
+            eprintln!("error: invalid replace format '{other}'");
+            eprintln!("valid formats are 'short', 'medium' and 'long'");
+            Err(GitError::Exit(255))
+        }
+    }
+}
+
+fn replace_list(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    object_format: ObjectFormat,
+    pattern: Option<&str>,
+    format: ReplaceListFormat,
+) -> Result<()> {
+    for reference in store.list_refs()? {
+        let Some(object) = reference.name.strip_prefix("refs/replace/") else {
+            continue;
+        };
+        if pattern.is_some_and(|pattern| !refname_pattern_matches(pattern, object)) {
+            continue;
+        }
+        let RefTarget::Direct(replacement) = reference.target else {
+            continue;
+        };
+        match format {
+            ReplaceListFormat::Short => println!("{object}"),
+            ReplaceListFormat::Medium => println!("{object} -> {replacement}"),
+            ReplaceListFormat::Long => {
+                let object_type = replace_object_type(db, object_format, object)?;
+                let replacement_type = db
+                    .read_object_header(&replacement)?
+                    .map(|(object_type, _)| object_type.as_str())
+                    .unwrap_or("unknown");
+                println!("{object} ({object_type}) -> {replacement} ({replacement_type})");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_delete(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    objects: &[String],
+) -> Result<()> {
+    let mut failed = false;
+    for object in objects {
+        let oid = match ObjectId::from_hex(format, object) {
+            Ok(oid) => oid,
+            Err(_) => match resolve_revision(git_dir, format, object) {
+                Ok(oid) => oid,
+                Err(_) => {
+                    eprintln!("error: failed to resolve '{object}' as a valid ref");
+                    failed = true;
+                    continue;
+                }
+            },
+        };
+        let name = format!("refs/replace/{oid}");
+        match store.delete_ref(&name) {
+            Ok(_) => println!("Deleted replace ref '{oid}'"),
+            Err(_) => {
+                eprintln!("error: replace ref '{oid}' not found");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_create(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    object: &str,
+    replacement: &str,
+    force: bool,
+) -> Result<()> {
+    let object_oid = resolve_revision(git_dir, format, object)?;
+    let replacement_oid = resolve_revision(git_dir, format, replacement)?;
+    let object_type = db
+        .read_object_header(&object_oid)?
+        .map(|(object_type, _)| object_type)
+        .ok_or_else(|| GitError::NotFound(format!("object {object_oid}")))?;
+    let replacement_type = db
+        .read_object_header(&replacement_oid)?
+        .map(|(object_type, _)| object_type)
+        .ok_or_else(|| GitError::NotFound(format!("object {replacement_oid}")))?;
+    if object_type != replacement_type {
+        eprintln!("error: Objects must be of the same type.");
+        eprintln!(
+            "'{object}' points to a replaced object of type '{}'",
+            object_type.as_str()
+        );
+        eprintln!(
+            "while '{replacement}' points to a replacement object of type '{}'.",
+            replacement_type.as_str()
+        );
+        return Err(GitError::Exit(255));
+    }
+    let name = format!("refs/replace/{object_oid}");
+    let precondition = if force {
+        RefPrecondition::Any
+    } else {
+        RefPrecondition::MustNotExist
+    };
+    let mut tx = store.transaction();
+    tx.update_to(
+        name.clone(),
+        RefTarget::Direct(replacement_oid),
+        precondition,
+        None,
+    );
+    match tx.commit() {
+        Ok(()) => Ok(()),
+        Err(_) if !force => {
+            eprintln!("error: replace ref '{name}' already exists");
+            Err(GitError::Exit(255))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn replace_object_type(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    object: &str,
+) -> Result<&'static str> {
+    let oid = ObjectId::from_hex(format, object)?;
+    Ok(db
+        .read_object_header(&oid)?
+        .map(|(object_type, _)| object_type.as_str())
+        .unwrap_or("unknown"))
+}
+
+fn replace_usage<T>() -> Result<T> {
+    eprintln!("usage: git replace [-f] <object> <replacement>");
+    eprintln!("   or: git replace [-f] --edit <object>");
+    eprintln!("   or: git replace [-f] --graft <commit> [<parent>...]");
+    eprintln!("   or: git replace [-f] --convert-graft-file");
+    eprintln!("   or: git replace -d <object>...");
+    eprintln!("   or: git replace [--format=<format>] [-l [<pattern>]]");
+    eprintln!();
+    eprintln!("    -l, --list            list replace refs");
+    eprintln!("    -d, --delete          delete replace refs");
+    eprintln!("    -e, --edit            edit existing object");
+    eprintln!("    -g, --graft           change a commit's parents");
+    eprintln!("    --convert-graft-file  convert existing graft file");
+    eprintln!("    -f, --[no-]force      replace the ref if it exists");
+    eprintln!("    --[no-]raw            do not pretty-print contents for --edit");
+    eprintln!("    --[no-]format <format>");
+    eprintln!("                          use this format");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
 fn cmd_reflog_exists(args: &[String]) -> Result<()> {
     let Some(reference) = args.first() else {
         eprintln!("usage: git reflog exists <ref>");
@@ -7286,6 +8710,423 @@ fn count_pack_objects(
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct PruneOptions {
+    dry_run: bool,
+    verbose: bool,
+    expire: i64,
+    heads: Vec<String>,
+}
+
+fn cmd_prune(args: &[String]) -> Result<()> {
+    let options = parse_prune_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let roots = prune_roots(&common_git_dir, format, &options.heads)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let mut candidates = Vec::new();
+    for oid in prune_unreachable_loose(&common_git_dir, format, roots, false)? {
+        if prune_object_is_expired(&db, &oid, options.expire)? {
+            candidates.push(oid);
+        }
+    }
+
+    for oid in candidates {
+        let object_type = db
+            .loose()
+            .read_header(&oid)?
+            .map(|(object_type, _size)| object_type);
+        if options.dry_run || options.verbose {
+            let type_name = object_type.map(ObjectType::as_str).unwrap_or("unknown");
+            println!("{oid} {type_name}");
+        }
+        if !options.dry_run {
+            let path = db.loose().object_path(&oid)?;
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(GitError::Io(err.to_string())),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_prune_options(args: &[String]) -> Result<PruneOptions> {
+    let mut dry_run = false;
+    let mut verbose = false;
+    let mut expire = current_unix_seconds();
+    let mut heads = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                heads.extend(iter.cloned());
+                break;
+            }
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            "--progress"
+            | "--no-progress"
+            | "--exclude-promisor-objects"
+            | "--no-exclude-promisor-objects" => {}
+            "--expire" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `expire' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                expire = parse_prune_expire(value, "--expire")?;
+            }
+            "--no-expire" => expire = i64::MIN,
+            value if let Some(value) = long_option_value(value, "expire") => {
+                expire = parse_prune_expire(value, "--expire")?;
+            }
+            value if value.starts_with("--no-expire=") => {
+                eprintln!("error: option `no-expire' takes no value");
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return prune_usage();
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                for option in value[1..].chars() {
+                    match option {
+                        'n' => dry_run = true,
+                        'v' => verbose = true,
+                        other => {
+                            eprintln!("error: unknown switch `{other}'");
+                            return prune_usage();
+                        }
+                    }
+                }
+            }
+            value => heads.push(value.to_string()),
+        }
+    }
+    Ok(PruneOptions {
+        dry_run,
+        verbose,
+        expire,
+        heads,
+    })
+}
+
+fn parse_prune_expire(value: &str, option: &str) -> Result<i64> {
+    match value {
+        "now" | "all" => Ok(i64::MAX),
+        "never" => Ok(i64::MIN),
+        _ => parse_reflog_expire_time(value, option),
+    }
+}
+
+fn prune_roots(git_dir: &Path, format: ObjectFormat, heads: &[String]) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut roots = BTreeSet::new();
+    if let Some(oid) = resolve_ref_to_oid(&store, "HEAD")? {
+        roots.insert(oid);
+    }
+    for reference in store.list_refs()? {
+        if let Some(oid) = resolve_ref_to_oid(&store, &reference.name)? {
+            roots.insert(oid);
+        }
+    }
+    for head in heads {
+        roots.insert(resolve_revision(git_dir, format, head)?);
+    }
+    Ok(roots.into_iter().collect())
+}
+
+fn prune_object_is_expired(db: &FileObjectDatabase, oid: &ObjectId, expire: i64) -> Result<bool> {
+    if expire == i64::MIN {
+        return Ok(false);
+    }
+    if expire == i64::MAX {
+        return Ok(true);
+    }
+    let path = db.loose().object_path(oid)?;
+    let modified = fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0);
+    Ok(modified <= expire)
+}
+
+fn prune_usage<T>() -> Result<T> {
+    eprintln!("usage: git prune [-n] [-v] [--progress] [--expire <time>] [--] [<head>...]");
+    eprintln!();
+    eprintln!("    -n, --[no-]dry-run    do not remove, show only");
+    eprintln!("    -v, --[no-]verbose    report pruned objects");
+    eprintln!("    --[no-]progress       show progress");
+    eprintln!("    --[no-]expire <expiry-date>");
+    eprintln!("                          expire objects older than <time>");
+    eprintln!("    --[no-]exclude-promisor-objects");
+    eprintln!("                          limit traversal to objects outside promisor packfiles");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn cmd_prune_packed(args: &[String]) -> Result<()> {
+    let mut dry_run = false;
+    let mut positional = 0usize;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-q" | "--quiet" | "--no-quiet" => {}
+            "--" => {
+                positional += iter.count();
+                break;
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return prune_packed_usage();
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown switch `{}'", value.trim_start_matches('-'));
+                return prune_packed_usage();
+            }
+            _ => positional += 1,
+        }
+    }
+    if positional > 0 {
+        eprintln!("fatal: too many arguments");
+        eprintln!();
+        return prune_packed_usage();
+    }
+
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let objects_dir = repository_objects_dir(&git_dir);
+    let packed = prune_packed_object_ids(&objects_dir.join("pack"), format)?;
+    if packed.is_empty() {
+        return Ok(());
+    }
+    for (oid, path) in prune_packed_loose_object_paths(&objects_dir, format)? {
+        if !packed.contains(&oid) {
+            continue;
+        }
+        if dry_run {
+            println!("rm -f {}", prune_packed_display_path(&path)?);
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_packed_usage<T>() -> Result<T> {
+    eprintln!("usage: git prune-packed [-n | --dry-run] [-q | --quiet]");
+    eprintln!();
+    eprintln!("    -n, --[no-]dry-run    dry run");
+    eprintln!("    -q, --[no-]quiet      be quiet");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn prune_packed_object_ids(pack_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+    let mut packed = HashSet::new();
+    if !pack_dir.exists() {
+        return Ok(packed);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        packed.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(packed)
+}
+
+fn prune_packed_loose_object_paths(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<(ObjectId, PathBuf)>> {
+    let mut objects = Vec::new();
+    if !objects_dir.exists() {
+        return Ok(objects);
+    }
+    let hex_len = format.hex_len();
+    for entry in fs::read_dir(objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let fanout = entry.file_name();
+        let Some(fanout) = fanout.to_str() else {
+            continue;
+        };
+        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        for object_entry in fs::read_dir(entry.path())? {
+            let object_entry = object_entry?;
+            if !object_entry.file_type()?.is_file() {
+                continue;
+            }
+            let suffix = object_entry.file_name();
+            let Some(suffix) = suffix.to_str() else {
+                continue;
+            };
+            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let oid = ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?;
+            objects.push((oid, object_entry.path()));
+        }
+    }
+    objects.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    Ok(objects)
+}
+
+fn prune_packed_display_path(path: &Path) -> Result<String> {
+    let cwd = env::current_dir()?;
+    let display = path.strip_prefix(&cwd).unwrap_or(path);
+    Ok(display.to_string_lossy().replace('\\', "/"))
+}
+
+fn cmd_update_server_info(args: &[String]) -> Result<()> {
+    parse_update_server_info_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+
+    let info_dir = common_git_dir.join("info");
+    fs::create_dir_all(&info_dir)?;
+    fs::write(
+        info_dir.join("refs"),
+        update_server_info_refs(&store, &db, format)?,
+    )?;
+
+    let objects_info_dir = repository_objects_dir(&common_git_dir).join("info");
+    fs::create_dir_all(&objects_info_dir)?;
+    fs::write(
+        objects_info_dir.join("packs"),
+        update_server_info_packs(
+            &repository_objects_dir(&common_git_dir).join("pack"),
+            format,
+        )?,
+    )?;
+    Ok(())
+}
+
+fn parse_update_server_info_options(args: &[String]) -> Result<()> {
+    let mut after_delimiter = false;
+    for arg in args {
+        if after_delimiter {
+            return update_server_info_usage();
+        }
+        match arg.as_str() {
+            "-f" | "--force" | "--no-force" => {}
+            "--" => after_delimiter = true,
+            value if value.starts_with("--force=") => {
+                eprintln!("error: option `force' takes no value");
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--no-force=") => {
+                eprintln!("error: option `no-force' takes no value");
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return update_server_info_usage();
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                for option in value[1..].chars() {
+                    if option != 'f' {
+                        eprintln!("error: unknown switch `{option}'");
+                        return update_server_info_usage();
+                    }
+                }
+            }
+            _ => return update_server_info_usage(),
+        }
+    }
+    Ok(())
+}
+
+fn update_server_info_refs(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<Vec<u8>> {
+    let refs = store.list_refs()?;
+    let mut out = Vec::with_capacity(refs.len() * (format.hex_len() + 32));
+    for reference in refs {
+        let Some(oid) = resolve_ref_to_oid(store, &reference.name)? else {
+            continue;
+        };
+        update_server_info_refs_line(&mut out, &oid, &reference.name);
+        if let Some(peeled) = pack_refs_peeled_oid(db, format, &oid)? {
+            update_server_info_refs_line(&mut out, &peeled, &format!("{}^{{}}", reference.name));
+        }
+    }
+    Ok(out)
+}
+
+fn update_server_info_refs_line(out: &mut Vec<u8>, oid: &ObjectId, name: &str) {
+    out.extend_from_slice(oid.to_hex().as_bytes());
+    out.push(b'\t');
+    out.extend_from_slice(name.as_bytes());
+    out.push(b'\n');
+}
+
+fn update_server_info_packs(pack_dir: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
+    let mut packs = Vec::new();
+    if pack_dir.exists() {
+        for entry in fs::read_dir(pack_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            if let Some(name) = update_server_info_pack_name(&entry.path(), format) {
+                packs.push(name);
+            }
+        }
+    }
+    packs.sort();
+
+    let mut out = Vec::with_capacity(packs.len() * (format.hex_len() + 9));
+    for name in packs {
+        out.extend_from_slice(b"P ");
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    Ok(out)
+}
+
+fn update_server_info_pack_name(path: &Path, format: ObjectFormat) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let hash = name.strip_prefix("pack-")?.strip_suffix(".pack")?;
+    if hash.len() == format.hex_len()
+        && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && path.with_extension("idx").is_file()
+    {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+fn update_server_info_usage<T>() -> Result<T> {
+    eprintln!("usage: git update-server-info [-f | --force]");
+    eprintln!();
+    eprintln!("    -f, --[no-]force      update the info files from scratch");
+    eprintln!();
+    Err(GitError::Exit(129))
 }
 
 fn count_objects_size(size_kib: u64, human_readable: bool) -> String {
@@ -9930,6 +11771,9 @@ fn cmd_remote(args: &[String]) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConfigAction {
     Get,
+    GetColor,
+    GetColorBool,
+    GetUrlMatch,
     GetAll,
     GetRegexp,
     List,
@@ -9947,12 +11791,84 @@ enum ConfigValueType {
     Raw,
     Bool,
     Int,
+    BoolOrInt,
+    ExpiryDate,
+    Color,
+    Path,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSubcommand {
+    Get,
+    Set,
+    Unset,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigSource {
+    Repository(PathBuf),
+    File(PathBuf),
+    Stdin,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ConfigDisplayOptions {
+    show_origin: bool,
+    show_scope: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigEntryWriteOptions {
+    display: ConfigDisplayOptions,
+    name_only: bool,
+    value_type: ConfigValueType,
+    null_terminate: bool,
+    equals_separator: bool,
 }
 
 fn cmd_config(args: &[String]) -> Result<()> {
     let mut action = None;
+    let mut subcommand = None;
+    let args = if let Some((first, rest)) = args.split_first() {
+        match first.as_str() {
+            "list" => {
+                action = Some(ConfigAction::List);
+                rest
+            }
+            "get" => {
+                action = Some(ConfigAction::Get);
+                subcommand = Some(ConfigSubcommand::Get);
+                rest
+            }
+            "set" => {
+                action = Some(ConfigAction::Set);
+                subcommand = Some(ConfigSubcommand::Set);
+                rest
+            }
+            "unset" => {
+                action = Some(ConfigAction::Unset);
+                subcommand = Some(ConfigSubcommand::Unset);
+                rest
+            }
+            "rename-section" => {
+                action = Some(ConfigAction::RenameSection);
+                rest
+            }
+            "remove-section" => {
+                action = Some(ConfigAction::RemoveSection);
+                rest
+            }
+            _ => args,
+        }
+    } else {
+        args
+    };
     let mut name_only = false;
+    let mut comment = None;
+    let mut config_file = None;
     let mut default_value = None;
+    let mut display = ConfigDisplayOptions::default();
+    let mut fixed_value = false;
     let mut null_terminate = false;
     let mut value_type = ConfigValueType::Raw;
     let mut positional = Vec::new();
@@ -9960,18 +11876,51 @@ fn cmd_config(args: &[String]) -> Result<()> {
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--local" => {}
+            "-f" | "--file" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--file requires a value".into()))?;
+                config_file = Some(value.to_string());
+            }
+            value if value.starts_with("--file=") => {
+                config_file = Some(value["--file=".len()..].to_string());
+            }
             "--get" => action = Some(ConfigAction::Get),
+            "--get-color" => {
+                action = Some(ConfigAction::GetColor);
+                value_type = ConfigValueType::Color;
+            }
+            "--get-colorbool" => action = Some(ConfigAction::GetColorBool),
+            "--get-urlmatch" => action = Some(ConfigAction::GetUrlMatch),
             "--get-all" => action = Some(ConfigAction::GetAll),
             "--get-regexp" | "--get-regex" => action = Some(ConfigAction::GetRegexp),
             "--list" | "-l" => action = Some(ConfigAction::List),
+            "--all" if subcommand == Some(ConfigSubcommand::Get) => {
+                action = Some(ConfigAction::GetAll);
+            }
+            "--all" if subcommand == Some(ConfigSubcommand::Unset) => {
+                action = Some(ConfigAction::UnsetAll);
+            }
             "--name-only" => name_only = true,
+            "--show-origin" => display.show_origin = true,
+            "--show-scope" => display.show_scope = true,
+            "--fixed-value" => fixed_value = true,
+            "--comment" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--comment requires a value".into()))?;
+                comment = Some(parse_config_comment(value)?);
+            }
+            value if value.starts_with("--comment=") => {
+                comment = Some(parse_config_comment(&value["--comment=".len()..])?);
+            }
             "-z" | "--null" => null_terminate = true,
             "--default" => {
-                default_value = Some(
-                    iter.next()
-                        .ok_or_else(|| GitError::Command("--default requires a value".into()))?
-                        .to_string(),
-                );
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `default' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                default_value = Some(value.to_string());
             }
             value if value.starts_with("--default=") => {
                 default_value = Some(
@@ -9983,6 +11932,9 @@ fn cmd_config(args: &[String]) -> Result<()> {
             }
             "--bool" => value_type = ConfigValueType::Bool,
             "--int" => value_type = ConfigValueType::Int,
+            "--bool-or-int" => value_type = ConfigValueType::BoolOrInt,
+            "--expiry-date" => value_type = ConfigValueType::ExpiryDate,
+            "--path" => value_type = ConfigValueType::Path,
             "--type" => {
                 let kind = iter
                     .next()
@@ -9994,6 +11946,9 @@ fn cmd_config(args: &[String]) -> Result<()> {
                     .strip_prefix("--type=")
                     .ok_or_else(|| GitError::Command("--type requires a value".into()))?;
                 value_type = parse_config_value_type(kind)?;
+            }
+            "--append" if subcommand == Some(ConfigSubcommand::Set) => {
+                action = Some(ConfigAction::Add);
             }
             "--add" => action = Some(ConfigAction::Add),
             "--replace-all" => action = Some(ConfigAction::ReplaceAll),
@@ -10038,31 +11993,84 @@ fn cmd_config(args: &[String]) -> Result<()> {
                 "config --remove-section requires <name>".into(),
             ));
         }
-        ConfigAction::Get | ConfigAction::GetAll | ConfigAction::Unset | ConfigAction::UnsetAll
-            if positional.len() != 1 =>
-        {
+        ConfigAction::Get | ConfigAction::GetAll if positional.len() != 1 => {
             return Err(GitError::Command(
                 "config action requires exactly one key".into(),
             ));
         }
-        ConfigAction::Set | ConfigAction::ReplaceAll | ConfigAction::Add
-            if positional.len() != 2 =>
-        {
+        ConfigAction::GetColor if !(1..=2).contains(&positional.len()) => {
+            eprintln!("error: wrong number of arguments, should be from 1 to 2");
+            return Err(GitError::Exit(129));
+        }
+        ConfigAction::GetColorBool if !(1..=2).contains(&positional.len()) => {
+            eprintln!("error: wrong number of arguments, should be from 1 to 2");
+            return Err(GitError::Exit(129));
+        }
+        ConfigAction::GetUrlMatch if positional.len() != 2 => {
+            eprintln!("error: wrong number of arguments, should be 2");
+            return Err(GitError::Exit(129));
+        }
+        ConfigAction::Unset | ConfigAction::UnsetAll if !(1..=2).contains(&positional.len()) => {
+            return Err(GitError::Command(
+                "config action requires <key> [<value-pattern>]".into(),
+            ));
+        }
+        ConfigAction::Set | ConfigAction::Add if positional.len() != 2 => {
             return Err(GitError::Command(
                 "config write action requires <key> <value>".into(),
+            ));
+        }
+        ConfigAction::ReplaceAll if !(2..=3).contains(&positional.len()) => {
+            return Err(GitError::Command(
+                "config --replace-all requires <key> <value> [<value-pattern>]".into(),
             ));
         }
         _ => {}
     }
     if default_value.is_some() && action != ConfigAction::Get {
-        return Err(GitError::Command(
-            "config --default is only applicable to --get".into(),
-        ));
+        eprintln!("error: --default is only applicable to --get");
+        return Err(GitError::Exit(129));
     }
+    if matches!(
+        action,
+        ConfigAction::GetColor | ConfigAction::GetColorBool | ConfigAction::GetUrlMatch
+    ) && (display.show_origin || display.show_scope)
+    {
+        eprintln!(
+            "error: --show-origin is only applicable to --get, --get-all, --get-regexp, and --list"
+        );
+        return Err(GitError::Exit(129));
+    }
+    if action == ConfigAction::GetUrlMatch && name_only {
+        eprintln!("error: --name-only is only applicable to --list or --get-regexp");
+        return Err(GitError::Exit(129));
+    }
+    if comment.is_some()
+        && !matches!(
+            action,
+            ConfigAction::Set | ConfigAction::ReplaceAll | ConfigAction::Add
+        )
+    {
+        eprintln!("error: --comment is only applicable to add/set/replace operations");
+        return Err(GitError::Exit(129));
+    }
+    let value_matcher = match action {
+        ConfigAction::ReplaceAll if positional.len() == 3 => {
+            Some(ConfigValueMatcher::parse(positional[2], fixed_value))
+        }
+        ConfigAction::Unset | ConfigAction::UnsetAll if positional.len() == 2 => {
+            Some(ConfigValueMatcher::parse(positional[1], fixed_value))
+        }
+        _ => None,
+    };
+    let value_matcher = value_matcher.as_ref();
 
     let key = if matches!(
         action,
         ConfigAction::List
+            | ConfigAction::GetColor
+            | ConfigAction::GetColorBool
+            | ConfigAction::GetUrlMatch
             | ConfigAction::GetRegexp
             | ConfigAction::RenameSection
             | ConfigAction::RemoveSection
@@ -10071,11 +12079,15 @@ fn cmd_config(args: &[String]) -> Result<()> {
     } else {
         Some(parse_config_key(positional[0])?)
     };
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let mut config = read_repo_config(&git_dir)?;
+    let source = match config_file {
+        Some(value) if value == "-" => ConfigSource::Stdin,
+        Some(value) => ConfigSource::File(PathBuf::from(value)),
+        None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
+    };
+    let mut config = read_config_source(&source, action)?;
     match action {
         ConfigAction::List => {
-            config_list(&config, name_only, null_terminate)?;
+            config_list(&config, &source, display, name_only, null_terminate)?;
         }
         ConfigAction::Get => {
             let key = key.expect("validated config key");
@@ -10085,21 +12097,69 @@ fn cmd_config(args: &[String]) -> Result<()> {
                 .ok_or(GitError::Exit(1))?;
             write_config_value(
                 &mut io::stdout(),
+                &source,
+                display,
                 &format_config_value(value, value_type)?,
                 null_terminate,
             )?;
         }
+        ConfigAction::GetColor => {
+            let key = parse_config_key(positional[0])?;
+            if let Some(value) = config.get(&key.section, key.subsection.as_deref(), &key.key) {
+                write!(io::stdout(), "{}", format_config_value(value, value_type)?)?;
+            } else if let Some(default) = positional.get(1) {
+                write!(
+                    io::stdout(),
+                    "{}",
+                    format_config_default_color_value(default)?
+                )?;
+            }
+        }
+        ConfigAction::GetColorBool => {
+            let key = parse_config_key(positional[0])?;
+            if let Some(stdout_is_tty) = positional.get(1) {
+                if sley_config::parse_config_bool(stdout_is_tty).is_none() {
+                    eprintln!(
+                        "fatal: bad boolean config value '{stdout_is_tty}' for 'command line'"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                let enabled = config
+                    .get(&key.section, key.subsection.as_deref(), &key.key)
+                    .map(|value| config_colorbool_enabled(&key, value))
+                    .transpose()?
+                    .unwrap_or(false);
+                writeln!(io::stdout(), "{enabled}")?;
+            } else {
+                let enabled = config
+                    .get(&key.section, key.subsection.as_deref(), &key.key)
+                    .map(|value| config_colorbool_enabled(&key, value))
+                    .transpose()?
+                    .unwrap_or(false);
+                if !enabled {
+                    return Err(GitError::Exit(1));
+                }
+            }
+        }
+        ConfigAction::GetUrlMatch => {
+            let target = parse_config_urlmatch_target(positional[0])?;
+            if !config_get_urlmatch(&config, &target, positional[1], null_terminate)? {
+                return Err(GitError::Exit(1));
+            }
+        }
         ConfigAction::GetAll => {
             let key = key.expect("validated config key");
-            let values = config_values(&config, &key);
-            if values.is_empty() {
+            let mut values = config_values(&config, &key).peekable();
+            if values.peek().is_none() {
                 return Err(GitError::Exit(1));
             }
             let mut stdout = io::stdout();
             for value in values {
                 write_config_value(
                     &mut stdout,
-                    &format_config_value(&value, value_type)?,
+                    &source,
+                    display,
+                    &format_config_value(value, value_type)?,
                     null_terminate,
                 )?;
             }
@@ -10107,7 +12167,9 @@ fn cmd_config(args: &[String]) -> Result<()> {
         ConfigAction::GetRegexp => {
             if !config_get_regexp(
                 &config,
+                &source,
                 positional[0],
+                display,
                 name_only,
                 value_type,
                 null_terminate,
@@ -10120,35 +12182,53 @@ fn cmd_config(args: &[String]) -> Result<()> {
             if config_value_count(&config, &key) > 1 {
                 return Err(GitError::Exit(5));
             }
-            config_set_value(&mut config, &key, positional[1], false);
-            write_repo_config(&git_dir, &config)?;
+            config_set_value_with_comment(
+                &mut config,
+                &key,
+                positional[1],
+                false,
+                comment.as_deref(),
+            );
+            write_config_source(&source, &config)?;
         }
         ConfigAction::ReplaceAll => {
             let key = key.expect("validated config key");
-            config_set_value(&mut config, &key, positional[1], false);
-            write_repo_config(&git_dir, &config)?;
+            config_replace_all_value(
+                &mut config,
+                &key,
+                positional[1],
+                value_matcher,
+                comment.as_deref(),
+            );
+            write_config_source(&source, &config)?;
         }
         ConfigAction::Add => {
             let key = key.expect("validated config key");
-            config_set_value(&mut config, &key, positional[1], true);
-            write_repo_config(&git_dir, &config)?;
+            config_set_value_with_comment(
+                &mut config,
+                &key,
+                positional[1],
+                true,
+                comment.as_deref(),
+            );
+            write_config_source(&source, &config)?;
         }
         ConfigAction::Unset => {
             let key = key.expect("validated config key");
-            if config_value_count(&config, &key) > 1 {
+            if value_matcher.is_none() && config_value_count(&config, &key) > 1 {
                 return Err(GitError::Exit(5));
             }
-            if !config_unset_value(&mut config, &key, false) {
+            if !config_unset_value(&mut config, &key, false, value_matcher) {
                 return Err(GitError::Exit(5));
             }
-            write_repo_config(&git_dir, &config)?;
+            write_config_source(&source, &config)?;
         }
         ConfigAction::UnsetAll => {
             let key = key.expect("validated config key");
-            if !config_unset_value(&mut config, &key, true) {
+            if !config_unset_value(&mut config, &key, true, value_matcher) {
                 return Err(GitError::Exit(5));
             }
-            write_repo_config(&git_dir, &config)?;
+            write_config_source(&source, &config)?;
         }
         ConfigAction::RenameSection => {
             let old = parse_config_section_name(positional[0])?;
@@ -10156,23 +12236,66 @@ fn cmd_config(args: &[String]) -> Result<()> {
             if !config_rename_section(&mut config, &old, &new) {
                 return Err(GitError::Exit(128));
             }
-            write_repo_config(&git_dir, &config)?;
+            write_config_source(&source, &config)?;
         }
         ConfigAction::RemoveSection => {
             let section = parse_config_section_name(positional[0])?;
             if !config_remove_section(&mut config, &section) {
                 return Err(GitError::Exit(128));
             }
-            write_repo_config(&git_dir, &config)?;
+            write_config_source(&source, &config)?;
         }
     }
     Ok(())
+}
+
+fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<GitConfig> {
+    match source {
+        ConfigSource::Repository(git_dir) => read_repo_config(git_dir),
+        ConfigSource::File(path) => match GitConfig::read(path) {
+            Ok(config) => Ok(config),
+            Err(GitError::Io(_)) | Err(GitError::NotFound(_)) if action != ConfigAction::List => {
+                Ok(GitConfig::default())
+            }
+            Err(GitError::Io(err)) | Err(GitError::NotFound(err)) => {
+                eprintln!(
+                    "fatal: unable to read config file '{}': {err}",
+                    path.display()
+                );
+                Err(GitError::Exit(128))
+            }
+            Err(err) => Err(err),
+        },
+        ConfigSource::Stdin => {
+            let mut bytes = Vec::new();
+            io::stdin().read_to_end(&mut bytes)?;
+            GitConfig::parse(&bytes)
+        }
+    }
+}
+
+fn write_config_source(source: &ConfigSource, config: &GitConfig) -> Result<()> {
+    match source {
+        ConfigSource::Repository(git_dir) => write_repo_config(git_dir, config),
+        ConfigSource::File(path) => {
+            fs::write(path, config.to_canonical_bytes())?;
+            Ok(())
+        }
+        ConfigSource::Stdin => {
+            eprintln!("fatal: writing to stdin is not supported");
+            Err(GitError::Exit(128))
+        }
+    }
 }
 
 fn parse_config_value_type(value: &str) -> Result<ConfigValueType> {
     match value {
         "bool" => Ok(ConfigValueType::Bool),
         "int" => Ok(ConfigValueType::Int),
+        "bool-or-int" => Ok(ConfigValueType::BoolOrInt),
+        "expiry-date" => Ok(ConfigValueType::ExpiryDate),
+        "color" => Ok(ConfigValueType::Color),
+        "path" => Ok(ConfigValueType::Path),
         "string" => Ok(ConfigValueType::Raw),
         other => Err(GitError::Unsupported(format!(
             "config value type {other} is not supported"
@@ -10183,46 +12306,191 @@ fn parse_config_value_type(value: &str) -> Result<ConfigValueType> {
 fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<String> {
     match value_type {
         ConfigValueType::Raw => Ok(value.to_string()),
-        ConfigValueType::Bool => match parse_config_bool_value(value) {
+        ConfigValueType::Bool => match sley_config::parse_config_bool(value) {
             Some(true) => Ok("true".into()),
             Some(false) => Ok("false".into()),
-            None => Err(GitError::InvalidFormat(format!(
-                "bad boolean config value {value}"
-            ))),
+            None => config_bad_bool_value(value),
         },
-        ConfigValueType::Int => parse_config_int_value(value)
+        ConfigValueType::Int => sley_config::parse_config_int(value)
             .map(|value| value.to_string())
-            .ok_or_else(|| GitError::InvalidFormat(format!("bad numeric config value {value}"))),
+            .ok_or_else(|| config_bad_numeric_value(value)),
+        ConfigValueType::BoolOrInt => match sley_config::parse_config_bool_or_int(value) {
+            Some(ConfigBoolOrInt::Bool(true)) => Ok("true".into()),
+            Some(ConfigBoolOrInt::Bool(false)) => Ok("false".into()),
+            Some(ConfigBoolOrInt::Int(value)) => Ok(value.to_string()),
+            None => Err(config_bad_numeric_value(value)),
+        },
+        ConfigValueType::ExpiryDate => format_config_expiry_date_value(value),
+        ConfigValueType::Color => format_config_color_value(value),
+        ConfigValueType::Path => Ok(format_config_path_value(value)),
     }
 }
 
-fn parse_config_bool_value(value: &str) -> Option<bool> {
-    match value.trim() {
-        "" => Some(true),
-        value if value.eq_ignore_ascii_case("true") => Some(true),
-        value if value.eq_ignore_ascii_case("yes") => Some(true),
-        value if value.eq_ignore_ascii_case("on") => Some(true),
-        "1" => Some(true),
-        value if value.eq_ignore_ascii_case("false") => Some(false),
-        value if value.eq_ignore_ascii_case("no") => Some(false),
-        value if value.eq_ignore_ascii_case("off") => Some(false),
-        "0" => Some(false),
+fn config_bad_bool_value<T>(value: &str) -> Result<T> {
+    eprintln!("fatal: bad boolean config value '{value}'");
+    Err(GitError::Exit(128))
+}
+
+fn config_bad_numeric_value(value: &str) -> GitError {
+    eprintln!("fatal: bad numeric config value '{value}': invalid unit");
+    GitError::Exit(128)
+}
+
+fn format_config_expiry_date_value(value: &str) -> Result<String> {
+    match value {
+        "now" => Ok(u64::MAX.to_string()),
+        "never" => Ok("0".into()),
+        value if value.bytes().all(|byte| byte.is_ascii_digit()) => value
+            .parse::<u64>()
+            .map(|value| value.to_string())
+            .map_err(|_| config_bad_expiry_date_value(value)),
+        _ => Err(config_bad_expiry_date_value(value)),
+    }
+}
+
+fn config_bad_expiry_date_value(value: &str) -> GitError {
+    eprintln!("error: '{value}' is not a valid timestamp");
+    GitError::Exit(128)
+}
+
+fn format_config_default_color_value(value: &str) -> Result<String> {
+    format_config_color_value(value).map_err(|_| {
+        eprintln!("error: unable to parse default color value");
+        GitError::Exit(255)
+    })
+}
+
+fn config_colorbool_enabled(key: &ConfigKey, value: &str) -> Result<bool> {
+    if value.eq_ignore_ascii_case("always") {
+        return Ok(true);
+    }
+    if value.eq_ignore_ascii_case("auto") || sley_config::parse_config_bool(value).is_some() {
+        return Ok(false);
+    }
+    eprintln!(
+        "fatal: bad boolean config value '{value}' for '{}'",
+        config_key_name(key)
+    );
+    Err(GitError::Exit(128))
+}
+
+fn format_config_color_value(value: &str) -> Result<String> {
+    let mut codes = Vec::new();
+    let mut color_slot = 0usize;
+    for token in value.split_whitespace() {
+        if token.eq_ignore_ascii_case("normal") {
+            continue;
+        }
+        if let Some(code) = config_color_attribute_code(token) {
+            codes.push(code.to_string());
+            continue;
+        }
+        if color_slot >= 2 {
+            return Err(config_bad_color_value(value));
+        }
+        let foreground = color_slot == 0;
+        codes.extend(
+            config_color_code(token, foreground).ok_or_else(|| config_bad_color_value(value))?,
+        );
+        color_slot += 1;
+    }
+    if codes.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!("\x1b[{}m", codes.join(";")))
+}
+
+fn config_color_attribute_code(token: &str) -> Option<u8> {
+    match token.to_ascii_lowercase().as_str() {
+        "bold" => Some(1),
+        "dim" => Some(2),
+        "italic" => Some(3),
+        "ul" | "underline" => Some(4),
+        "blink" => Some(5),
+        "reverse" => Some(7),
+        "strike" => Some(9),
         _ => None,
     }
 }
 
-fn parse_config_int_value(value: &str) -> Option<i64> {
-    let value = value.trim();
-    if value.is_empty() {
+fn config_color_code(token: &str, foreground: bool) -> Option<Vec<String>> {
+    if let Some((red, green, blue)) = parse_config_hex_color(token) {
+        let prefix = if foreground { "38" } else { "48" };
+        return Some(vec![
+            prefix.into(),
+            "2".into(),
+            red.to_string(),
+            green.to_string(),
+            blue.to_string(),
+        ]);
+    }
+    if let Ok(value) = token.parse::<u8>() {
+        if value < 16 {
+            let base = match (foreground, value < 8) {
+                (true, true) => 30,
+                (false, true) => 40,
+                (true, false) => 90 - 8,
+                (false, false) => 100 - 8,
+            };
+            return Some(vec![(base + value).to_string()]);
+        }
+        let prefix = if foreground { "38" } else { "48" };
+        return Some(vec![prefix.into(), "5".into(), value.to_string()]);
+    }
+    let color = match token.to_ascii_lowercase().as_str() {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "white" => 7,
+        "brightblack" | "bright-black" | "gray" | "grey" => 8,
+        "brightred" | "bright-red" => 9,
+        "brightgreen" | "bright-green" => 10,
+        "brightyellow" | "bright-yellow" => 11,
+        "brightblue" | "bright-blue" => 12,
+        "brightmagenta" | "bright-magenta" => 13,
+        "brightcyan" | "bright-cyan" => 14,
+        "brightwhite" | "bright-white" => 15,
+        _ => return None,
+    };
+    let base = match (foreground, color < 8) {
+        (true, true) => 30,
+        (false, true) => 40,
+        (true, false) => 90 - 8,
+        (false, false) => 100 - 8,
+    };
+    Some(vec![(base + color).to_string()])
+}
+
+fn parse_config_hex_color(token: &str) -> Option<(u8, u8, u8)> {
+    let hex = token.strip_prefix('#')?;
+    if hex.len() != 6 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    let (digits, multiplier) = match value.as_bytes().last().copied() {
-        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024_i64),
-        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024_i64.pow(2)),
-        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024_i64.pow(3)),
-        _ => (value, 1_i64),
-    };
-    digits.trim().parse::<i64>().ok()?.checked_mul(multiplier)
+    let red = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let green = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let blue = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((red, green, blue))
+}
+
+fn config_bad_color_value(value: &str) -> GitError {
+    eprintln!("error: invalid color value: {value}");
+    GitError::Exit(128)
+}
+
+fn format_config_path_value(value: &str) -> String {
+    if value == "~" {
+        return env::var("HOME").unwrap_or_else(|_| value.to_string());
+    }
+    if let Some(rest) = value.strip_prefix("~/")
+        && let Ok(home) = env::var("HOME")
+    {
+        return PathBuf::from(home).join(rest).display().to_string();
+    }
+    value.to_string()
 }
 
 #[derive(Debug)]
@@ -10238,13 +12506,19 @@ struct ConfigSectionName {
     subsection: Option<String>,
 }
 
+#[derive(Debug)]
+struct ConfigUrlMatchTarget {
+    section: String,
+    key: Option<String>,
+}
+
 fn parse_config_key(value: &str) -> Result<ConfigKey> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() < 2 {
         return Err(GitError::InvalidFormat("config key is invalid".into()));
     }
-    let section = parts[0].to_ascii_lowercase();
-    let key = parts[parts.len() - 1].to_ascii_lowercase();
+    let section = parts[0].to_string();
+    let key = parts[parts.len() - 1].to_string();
     validate_config_name(&section)?;
     validate_config_name(&key)?;
     let subsection = if parts.len() > 2 {
@@ -10269,12 +12543,23 @@ fn parse_config_key(value: &str) -> Result<ConfigKey> {
     })
 }
 
+fn parse_config_urlmatch_target(value: &str) -> Result<ConfigUrlMatchTarget> {
+    let mut parts = value.splitn(2, '.');
+    let section = parts.next().unwrap_or_default().to_string();
+    validate_config_name(&section)?;
+    let key = parts.next().map(str::to_string);
+    if let Some(key) = &key {
+        validate_config_name(key)?;
+    }
+    Ok(ConfigUrlMatchTarget { section, key })
+}
+
 fn parse_config_section_name(value: &str) -> Result<ConfigSectionName> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.is_empty() {
         return Err(GitError::InvalidFormat("config section is invalid".into()));
     }
-    let section = parts[0].to_ascii_lowercase();
+    let section = parts[0].to_string();
     validate_config_name(&section)?;
     let subsection = if parts.len() > 1 {
         let subsection = parts[1..].join(".");
@@ -10318,7 +12603,7 @@ fn config_section_name_matches(section: &ConfigSection, name: &ConfigSectionName
         && section.subsection.as_deref() == name.subsection.as_deref()
 }
 
-fn config_values(config: &GitConfig, key: &ConfigKey) -> Vec<String> {
+fn config_values<'a>(config: &'a GitConfig, key: &'a ConfigKey) -> impl Iterator<Item = &'a str> {
     config
         .sections
         .iter()
@@ -10328,9 +12613,218 @@ fn config_values(config: &GitConfig, key: &ConfigKey) -> Vec<String> {
                 .entries
                 .iter()
                 .filter(|entry| entry.key.eq_ignore_ascii_case(&key.key))
-                .filter_map(|entry| entry.value.clone())
+                .filter_map(|entry| entry.value.as_deref())
         })
-        .collect()
+}
+
+fn config_get_urlmatch(
+    config: &GitConfig,
+    target: &ConfigUrlMatchTarget,
+    url: &str,
+    null_terminate: bool,
+) -> Result<bool> {
+    let mut values = BTreeMap::<String, (usize, String)>::new();
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case(&target.section) {
+            continue;
+        }
+        let match_len = match section.subsection.as_deref() {
+            None => 0,
+            Some(base) => match config_urlmatch_score(base, url) {
+                Some(score) => score,
+                None => continue,
+            },
+        };
+        for entry in &section.entries {
+            if let Some(key) = &target.key
+                && !entry.key.eq_ignore_ascii_case(key)
+            {
+                continue;
+            }
+            let Some(value) = entry.value.as_deref() else {
+                continue;
+            };
+            let name = format!(
+                "{}.{}",
+                target.section.to_ascii_lowercase(),
+                entry.key.to_ascii_lowercase()
+            );
+            let replace = values
+                .get(&name)
+                .is_none_or(|(previous_len, _)| match_len >= *previous_len);
+            if replace {
+                values.insert(name, (match_len, value.to_string()));
+            }
+        }
+    }
+    if values.is_empty() {
+        return Ok(false);
+    }
+    let mut stdout = io::stdout();
+    if target.key.is_some() {
+        if let Some((_, value)) = values.values().next() {
+            if null_terminate {
+                write!(stdout, "{value}\0")?;
+            } else {
+                writeln!(stdout, "{value}")?;
+            }
+        }
+        return Ok(true);
+    }
+    for (name, (_, value)) in values {
+        if null_terminate {
+            write!(stdout, "{name}\n{value}\0")?;
+        } else {
+            writeln!(stdout, "{name} {value}")?;
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigUrlParts {
+    scheme: String,
+    user: Option<String>,
+    host: String,
+    port: Option<u16>,
+    path: String,
+}
+
+fn config_urlmatch_score(base: &str, url: &str) -> Option<usize> {
+    let Some(base_url) = parse_config_url(base) else {
+        return url.starts_with(base).then_some(base.len());
+    };
+    let url = parse_config_url(url)?;
+    if base_url.scheme != url.scheme
+        || base_url.host != url.host
+        || base_url.port != url.port
+        || (base_url.user.is_some() && base_url.user != url.user)
+    {
+        return None;
+    }
+    let base_path = normalize_config_url_path_for_match(&base_url.path);
+    let url_path = normalize_config_url_path_for_match(&url.path);
+    if base_path != "/" && url_path != base_path && !url_path.starts_with(&format!("{base_path}/"))
+    {
+        return None;
+    }
+    Some(
+        base_url.scheme.len()
+            + base_url.host.len()
+            + base_url.user.as_ref().map_or(0, |user| user.len() + 1)
+            + base_path.len(),
+    )
+}
+
+fn parse_config_url(value: &str) -> Option<ConfigUrlParts> {
+    let (scheme, rest) = value.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() {
+        return None;
+    }
+    let (user, authority) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(user, host)| (Some(user), host));
+    let (host, port) = parse_config_url_authority(authority)?;
+    let mut path = &rest[authority_end..];
+    if let Some(end) = path.find(['?', '#']) {
+        path = &path[..end];
+    }
+    if path.is_empty() {
+        path = "/";
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    Some(ConfigUrlParts {
+        port: normalize_config_url_port(&scheme, port),
+        scheme,
+        user: user.map(|user| user.to_ascii_lowercase()),
+        host: host.to_ascii_lowercase(),
+        path: decode_config_url_path(path),
+    })
+}
+
+fn parse_config_url_authority(authority: &str) -> Option<(&str, Option<u16>)> {
+    if let Some(rest) = authority.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = if rest.is_empty() {
+            None
+        } else {
+            let port = rest.strip_prefix(':')?;
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            port.parse().ok()
+        };
+        return Some((host, port));
+    }
+    if let Some((host, port)) = authority.rsplit_once(':')
+        && !host.is_empty()
+        && !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some((host, port.parse().ok()));
+    }
+    Some((authority, None))
+}
+
+fn normalize_config_url_port(scheme: &str, port: Option<u16>) -> Option<u16> {
+    match (scheme, port) {
+        ("http", Some(80)) | ("https", Some(443)) => None,
+        _ => port,
+    }
+}
+
+fn normalize_config_url_path_for_match(path: &str) -> String {
+    let path = if path.is_empty() { "/" } else { path };
+    if path == "/" {
+        return "/".into();
+    }
+    path.trim_end_matches('/').to_string()
+}
+
+fn decode_config_url_path(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut out = String::with_capacity(path.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%'
+            && idx + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (
+                config_url_hex_value(bytes[idx + 1]),
+                config_url_hex_value(bytes[idx + 2]),
+            )
+        {
+            let decoded = (high << 4) | low;
+            if decoded == b'/' {
+                out.push('%');
+                out.push((bytes[idx + 1] as char).to_ascii_uppercase());
+                out.push((bytes[idx + 2] as char).to_ascii_uppercase());
+            } else {
+                out.push(decoded as char);
+            }
+            idx += 3;
+            continue;
+        }
+        out.push(bytes[idx] as char);
+        idx += 1;
+    }
+    out
+}
+
+fn config_url_hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn config_value_count(config: &GitConfig, key: &ConfigKey) -> usize {
@@ -10350,7 +12844,9 @@ fn config_value_count(config: &GitConfig, key: &ConfigKey) -> usize {
 
 fn config_get_regexp(
     config: &GitConfig,
+    source: &ConfigSource,
     pattern: &str,
+    display: ConfigDisplayOptions,
     name_only: bool,
     value_type: ConfigValueType,
     null_terminate: bool,
@@ -10367,12 +12863,16 @@ fn config_get_regexp(
             matched = true;
             write_config_entry(
                 &mut stdout,
+                source,
                 &name,
                 entry.value.as_deref(),
-                name_only,
-                value_type,
-                null_terminate,
-                false,
+                ConfigEntryWriteOptions {
+                    display,
+                    name_only,
+                    value_type,
+                    null_terminate,
+                    equals_separator: false,
+                },
             )?;
         }
     }
@@ -10391,6 +12891,29 @@ enum SimpleConfigRegexToken {
     Literal(u8),
     Any,
     AnyString,
+}
+
+#[derive(Debug)]
+enum ConfigValueMatcher {
+    Regex(SimpleConfigRegex),
+    Fixed(String),
+}
+
+impl ConfigValueMatcher {
+    fn parse(pattern: &str, fixed_value: bool) -> Self {
+        if fixed_value {
+            Self::Fixed(pattern.to_string())
+        } else {
+            Self::Regex(SimpleConfigRegex::parse(pattern))
+        }
+    }
+
+    fn is_match(&self, value: &str) -> bool {
+        match self {
+            Self::Regex(regex) => regex.is_match(value),
+            Self::Fixed(pattern) => value == pattern,
+        }
+    }
 }
 
 impl SimpleConfigRegex {
@@ -10473,26 +12996,43 @@ fn has_unescaped_trailing_dollar(bytes: &[u8]) -> bool {
     backslashes % 2 == 0
 }
 
-fn config_list(config: &GitConfig, name_only: bool, null_terminate: bool) -> Result<()> {
+fn config_list(
+    config: &GitConfig,
+    source: &ConfigSource,
+    display: ConfigDisplayOptions,
+    name_only: bool,
+    null_terminate: bool,
+) -> Result<()> {
     let mut stdout = io::stdout();
     for section in &config.sections {
         for entry in &section.entries {
             let name = config_entry_name(section, &entry.key);
             write_config_entry(
                 &mut stdout,
+                source,
                 &name,
                 entry.value.as_deref(),
-                name_only,
-                ConfigValueType::Raw,
-                null_terminate,
-                true,
+                ConfigEntryWriteOptions {
+                    display,
+                    name_only,
+                    value_type: ConfigValueType::Raw,
+                    null_terminate,
+                    equals_separator: true,
+                },
             )?;
         }
     }
     Ok(())
 }
 
-fn write_config_value(stdout: &mut impl Write, value: &str, null_terminate: bool) -> Result<()> {
+fn write_config_value(
+    stdout: &mut impl Write,
+    source: &ConfigSource,
+    display: ConfigDisplayOptions,
+    value: &str,
+    null_terminate: bool,
+) -> Result<()> {
+    write_config_metadata(stdout, source, display, null_terminate)?;
     if null_terminate {
         write!(stdout, "{value}\0")?;
     } else {
@@ -10503,15 +13043,14 @@ fn write_config_value(stdout: &mut impl Write, value: &str, null_terminate: bool
 
 fn write_config_entry(
     stdout: &mut impl Write,
+    source: &ConfigSource,
     name: &str,
     value: Option<&str>,
-    name_only: bool,
-    value_type: ConfigValueType,
-    null_terminate: bool,
-    equals_separator: bool,
+    options: ConfigEntryWriteOptions,
 ) -> Result<()> {
-    if name_only {
-        if null_terminate {
+    write_config_metadata(stdout, source, options.display, options.null_terminate)?;
+    if options.name_only {
+        if options.null_terminate {
             write!(stdout, "{name}\0")?;
         } else {
             writeln!(stdout, "{name}")?;
@@ -10519,17 +13058,65 @@ fn write_config_entry(
         return Ok(());
     }
     let Some(value) = value else {
-        return write_config_value(stdout, name, null_terminate);
+        if options.null_terminate {
+            write!(stdout, "{name}\0")?;
+        } else {
+            writeln!(stdout, "{name}")?;
+        }
+        return Ok(());
     };
-    let value = format_config_value(value, value_type)?;
-    if null_terminate {
+    let value = format_config_value(value, options.value_type)?;
+    if options.null_terminate {
         write!(stdout, "{name}\n{value}\0")?;
-    } else if equals_separator {
+    } else if options.equals_separator {
         writeln!(stdout, "{name}={value}")?;
     } else {
         writeln!(stdout, "{name} {value}")?;
     }
     Ok(())
+}
+
+fn write_config_metadata(
+    stdout: &mut impl Write,
+    source: &ConfigSource,
+    display: ConfigDisplayOptions,
+    null_terminate: bool,
+) -> Result<()> {
+    if display.show_scope {
+        write_config_metadata_field(stdout, config_source_scope(source), null_terminate)?;
+    }
+    if display.show_origin {
+        write_config_metadata_field(stdout, &config_source_origin(source), null_terminate)?;
+    }
+    Ok(())
+}
+
+fn write_config_metadata_field(
+    stdout: &mut impl Write,
+    value: &str,
+    null_terminate: bool,
+) -> Result<()> {
+    if null_terminate {
+        write!(stdout, "{value}\0")?;
+    } else {
+        write!(stdout, "{value}\t")?;
+    }
+    Ok(())
+}
+
+fn config_source_scope(source: &ConfigSource) -> &'static str {
+    match source {
+        ConfigSource::Repository(_) => "local",
+        ConfigSource::File(_) | ConfigSource::Stdin => "command",
+    }
+}
+
+fn config_source_origin(source: &ConfigSource) -> String {
+    match source {
+        ConfigSource::Repository(_) => "file:.git/config".to_string(),
+        ConfigSource::File(path) => format!("file:{}", path.display()),
+        ConfigSource::Stdin => "standard input:".to_string(),
+    }
 }
 
 fn config_entry_name(section: &ConfigSection, key: &str) -> String {
@@ -10539,7 +13126,36 @@ fn config_entry_name(section: &ConfigSection, key: &str) -> String {
     }
 }
 
+fn config_key_name(key: &ConfigKey) -> String {
+    match &key.subsection {
+        Some(subsection) => format!("{}.{}.{}", key.section, subsection, key.key),
+        None => format!("{}.{}", key.section, key.key),
+    }
+}
+
+fn parse_config_comment(value: &str) -> Result<String> {
+    if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+        eprintln!("fatal: no multi-line comment allowed: '{value}'");
+        return Err(GitError::Exit(128));
+    }
+    let value = value
+        .strip_prefix('#')
+        .map(|rest| rest.trim_start_matches([' ', '\t']))
+        .unwrap_or(value);
+    Ok(value.to_string())
+}
+
 fn config_set_value(config: &mut GitConfig, key: &ConfigKey, value: &str, add: bool) {
+    config_set_value_with_comment(config, key, value, add, None);
+}
+
+fn config_set_value_with_comment(
+    config: &mut GitConfig,
+    key: &ConfigKey,
+    value: &str,
+    add: bool,
+    comment: Option<&str>,
+) {
     let section_idx = config
         .sections
         .iter()
@@ -10554,17 +13170,83 @@ fn config_set_value(config: &mut GitConfig, key: &ConfigKey, value: &str, add: b
         });
     let section = &mut config.sections[section_idx];
     if !add {
-        section
-            .entries
-            .retain(|entry| !entry.key.eq_ignore_ascii_case(&key.key));
+        let mut replaced = false;
+        section.entries.retain_mut(|entry| {
+            if !entry.key.eq_ignore_ascii_case(&key.key) {
+                return true;
+            }
+            if replaced {
+                return false;
+            }
+            entry.key = key.key.clone();
+            entry.value = Some(value.to_string());
+            entry.comment = comment.map(str::to_string);
+            replaced = true;
+            true
+        });
+        if replaced {
+            return;
+        }
     }
     section.entries.push(ConfigEntry {
         key: key.key.clone(),
         value: Some(value.to_string()),
+        comment: comment.map(str::to_string),
     });
 }
 
-fn config_unset_value(config: &mut GitConfig, key: &ConfigKey, all: bool) -> bool {
+fn config_replace_all_value(
+    config: &mut GitConfig,
+    key: &ConfigKey,
+    value: &str,
+    value_pattern: Option<&ConfigValueMatcher>,
+    comment: Option<&str>,
+) {
+    let Some(value_pattern) = value_pattern else {
+        config_set_value_with_comment(config, key, value, false, comment);
+        return;
+    };
+
+    let mut replaced = false;
+    let mut matched = false;
+    for section in &mut config.sections {
+        if !config_section_matches(section, key) {
+            continue;
+        }
+        section.entries.retain_mut(|entry| {
+            if !entry.key.eq_ignore_ascii_case(&key.key)
+                || !entry
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| value_pattern.is_match(value))
+            {
+                return true;
+            }
+            matched = true;
+            if replaced {
+                return false;
+            }
+            entry.key = key.key.clone();
+            entry.value = Some(value.to_string());
+            entry.comment = comment.map(str::to_string);
+            replaced = true;
+            true
+        });
+    }
+    if !matched {
+        config_set_value_with_comment(config, key, value, true, comment);
+    }
+}
+
+fn config_unset_value(
+    config: &mut GitConfig,
+    key: &ConfigKey,
+    all: bool,
+    value_pattern: Option<&ConfigValueMatcher>,
+) -> bool {
+    if let Some(value_pattern) = value_pattern {
+        return config_unset_value_matching(config, key, all, value_pattern);
+    }
     let mut removed = false;
     for section in &mut config.sections {
         if !config_section_matches(section, key) {
@@ -10591,6 +13273,46 @@ fn config_unset_value(config: &mut GitConfig, key: &ConfigKey, all: bool) -> boo
             .retain(|section| !config_section_matches(section, key) || !section.entries.is_empty());
     }
     removed
+}
+
+fn config_unset_value_matching(
+    config: &mut GitConfig,
+    key: &ConfigKey,
+    all: bool,
+    value_pattern: &ConfigValueMatcher,
+) -> bool {
+    let matches = config
+        .sections
+        .iter()
+        .filter(|section| config_section_matches(section, key))
+        .flat_map(|section| section.entries.iter())
+        .filter(|entry| entry.key.eq_ignore_ascii_case(&key.key))
+        .filter(|entry| {
+            entry
+                .value
+                .as_deref()
+                .is_some_and(|value| value_pattern.is_match(value))
+        })
+        .count();
+    if matches == 0 || (!all && matches != 1) {
+        return false;
+    }
+    for section in &mut config.sections {
+        if !config_section_matches(section, key) {
+            continue;
+        }
+        section.entries.retain(|entry| {
+            !entry.key.eq_ignore_ascii_case(&key.key)
+                || !entry
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| value_pattern.is_match(value))
+        });
+    }
+    config
+        .sections
+        .retain(|section| !config_section_matches(section, key) || !section.entries.is_empty());
+    true
 }
 
 fn config_rename_section(
@@ -10706,18 +13428,21 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
     let mut entries = vec![ConfigEntry {
         key: "url".into(),
         value: Some(url.to_string()),
+        comment: None,
     }];
     match mirror {
         RemoteAddMirror::Fetch | RemoteAddMirror::Both => {
             entries.push(ConfigEntry {
                 key: "fetch".into(),
                 value: Some("+refs/*:refs/*".into()),
+                comment: None,
             });
         }
         RemoteAddMirror::Push => {
             entries.push(ConfigEntry {
                 key: "mirror".into(),
                 value: Some("true".into()),
+                comment: None,
             });
         }
         RemoteAddMirror::None => {
@@ -10725,12 +13450,14 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
                 entries.push(ConfigEntry {
                     key: "fetch".into(),
                     value: Some(sley_config::remotes::default_fetch_refspec(name)),
+                    comment: None,
                 });
             } else {
                 for branch in &branches {
                     entries.push(ConfigEntry {
                         key: "fetch".into(),
                         value: Some(remote_branch_fetch_refspec(name, branch)),
+                        comment: None,
                     });
                 }
             }
@@ -10740,12 +13467,14 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
         entries.push(ConfigEntry {
             key: "tagopt".into(),
             value: Some(tag_opt),
+            comment: None,
         });
     }
     if mirror == RemoteAddMirror::Both {
         entries.push(ConfigEntry {
             key: "mirror".into(),
             value: Some("true".into()),
+            comment: None,
         });
     }
     match sley_config::remotes::add_remote(&mut config, name, entries) {
@@ -11161,6 +13890,7 @@ fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
         section.entries.push(ConfigEntry {
             key: "fetch".into(),
             value: Some(remote_branch_fetch_refspec(name, branch)),
+            comment: None,
         });
     }
     write_repo_config(&git_dir, &config)
@@ -20460,9 +23190,9 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
                 }
             }
             "--format" => {
-                let value = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("ls-tree --format requires a value".into()))?;
+                let Some(value) = iter.next() else {
+                    return ls_tree_usage_error("option `format' requires a value");
+                };
                 format_spec = Some(value.as_str());
             }
             "-r" | "--recursive" => recursive = true,
@@ -20472,14 +23202,14 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--abbrev=") => {
                 let width = value["--abbrev=".len()..].parse::<usize>().map_err(|_| {
-                    GitError::Command(format!("invalid ls-tree abbreviation width {value}"))
+                    eprintln!("error: invalid ls-tree abbreviation width {value}");
+                    GitError::Exit(129)
                 })?;
                 oid_abbrev = (width != 0).then_some(width);
             }
             value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported ls-tree option {value}"
-                )));
+                let option = value.trim_start_matches('-');
+                return ls_tree_usage_error(&format!("unknown option `{option}'"));
             }
             value => {
                 if treeish.is_none() {
@@ -20512,7 +23242,9 @@ fn cmd_ls_tree(args: &[String]) -> Result<()> {
     if long && object_only {
         return ls_tree_usage_error("options '--object-only' and '--long' cannot be used together");
     }
-    let treeish = treeish.ok_or_else(|| GitError::Command("ls-tree requires a tree-ish".into()))?;
+    let Some(treeish) = treeish else {
+        return ls_tree_usage();
+    };
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -21687,6 +24419,11 @@ fn cmd_log(args: &[String]) -> Result<()> {
 
 fn ls_tree_usage_error<T>(message: &str) -> Result<T> {
     eprintln!("error: {message}");
+    Err(GitError::Exit(129))
+}
+
+fn ls_tree_usage<T>() -> Result<T> {
+    eprintln!("usage: git ls-tree [<options>] <tree-ish> [<path>...]");
     Err(GitError::Exit(129))
 }
 
@@ -27064,7 +29801,7 @@ fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
     if value.eq_ignore_ascii_case("always") {
         return true;
     }
-    if !parse_config_bool_value(value).unwrap_or(false) {
+    if !sley_config::parse_config_bool(value).unwrap_or(false) {
         return false;
     }
     name == "HEAD"
@@ -28746,6 +31483,7 @@ fn set_config_value(
     section.entries.push(ConfigEntry {
         key: key.to_string(),
         value: Some(value.to_string()),
+        comment: None,
     });
 }
 
