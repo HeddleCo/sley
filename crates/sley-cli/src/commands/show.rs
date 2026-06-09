@@ -43,7 +43,10 @@ enum ShowCommitFormat {
     /// `--format=<string>` / `--pretty=format:<string>`. `final_newline`
     /// distinguishes `--format=` (trailing newline) from `--pretty=format:`
     /// (separator-style, newline only between entries).
-    Custom { format: String, final_newline: bool },
+    Custom {
+        compiled: CompiledLogFormat,
+        final_newline: bool,
+    },
 }
 
 /// Parsed `git show` invocation state.
@@ -179,9 +182,8 @@ pub(crate) fn cmd_show(args: &[String]) -> Result<()> {
     // custom format that references `%d`/`%D` auto-enables them (in short form
     // unless `--decorate=full`), mirroring `git log`.
     let decoration_mode = match &options.commit_format {
-        ShowCommitFormat::Custom { format, .. }
-            if options.decorate == LogDecorationMode::Off
-                && log_format_uses_decorations(format) =>
+        ShowCommitFormat::Custom { compiled, .. }
+            if options.decorate == LogDecorationMode::Off && compiled.uses_decorations() =>
         {
             LogDecorationMode::Short
         }
@@ -368,10 +370,10 @@ fn show_commit(
             print_log_decorations(oid, decorations);
             writeln!(stdout, " {}", commit_subject(&commit.message))?;
         }
-        ShowCommitFormat::Custom { format: fmt, .. } => {
+        ShowCommitFormat::Custom { compiled, .. } => {
             print_log_format(
                 &record,
-                fmt,
+                compiled,
                 LogFormatContext {
                     abbrev_len: options.abbrev_len,
                     decorations,
@@ -975,13 +977,13 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
 fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
     if let Some(spec) = value.strip_prefix("format:") {
         return Ok(ShowCommitFormat::Custom {
-            format: spec.to_string(),
+            compiled: CompiledLogFormat::compile(spec, LogFormatDialect::Log)?,
             final_newline: false,
         });
     }
     if let Some(spec) = value.strip_prefix("tformat:") {
         return Ok(ShowCommitFormat::Custom {
-            format: spec.to_string(),
+            compiled: CompiledLogFormat::compile(spec, LogFormatDialect::Log)?,
             final_newline: true,
         });
     }
@@ -994,7 +996,7 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
             GitError::Unsupported(format!("show does not support --pretty={value}")),
         ),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
-            format: other.to_string(),
+            compiled: CompiledLogFormat::compile(other, LogFormatDialect::Log)?,
             final_newline: true,
         }),
         other => {

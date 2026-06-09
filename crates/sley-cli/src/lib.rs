@@ -49,9 +49,14 @@ static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
 
 mod commands;
+mod log_format;
 mod remote;
 mod repo_path;
 mod repository;
+
+pub(crate) use log_format::{
+    CompiledLogFormat, FormatToken, LogFormatDialect, consume_log_format_color,
+};
 
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
@@ -15943,13 +15948,19 @@ fn cmd_log(args: &[String]) -> Result<()> {
             }
             value if value.starts_with("--format=") => {
                 output = LogOutput::Custom {
-                    format: value["--format=".len()..].to_string(),
+                    compiled: CompiledLogFormat::compile(
+                        &value["--format=".len()..],
+                        LogFormatDialect::Log,
+                    )?,
                     final_newline: true,
                 };
             }
             value if value.starts_with("--pretty=format:") => {
                 output = LogOutput::Custom {
-                    format: value["--pretty=format:".len()..].to_string(),
+                    compiled: CompiledLogFormat::compile(
+                        &value["--pretty=format:".len()..],
+                        LogFormatDialect::Log,
+                    )?,
                     final_newline: false,
                 };
             }
@@ -16151,7 +16162,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
     }
     if walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
-        && matches!(&output, LogOutput::Custom { format, .. } if log_format_is_oid_only(format))
+        && matches!(&output, LogOutput::Custom { compiled, .. } if compiled.is_oid_only())
         && decoration == LogDecorationMode::Off
         && !show_parents
         && !show_children
@@ -16254,7 +16265,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
         selected.reverse();
     }
     let custom_decoration_mode = match &output {
-        LogOutput::Custom { format, .. } if log_format_uses_decorations(format) => {
+        LogOutput::Custom { compiled, .. } if compiled.uses_decorations() => {
             Some(if decoration == LogDecorationMode::Full {
                 LogDecorationMode::Full
             } else {
@@ -16320,7 +16331,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
                 println!(" {}", commit_subject(&record.commit.message));
             }
             LogOutput::Custom {
-                ref format,
+                ref compiled,
                 final_newline,
             } => {
                 if index > 0 && !final_newline {
@@ -16328,7 +16339,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
                 }
                 print_log_format(
                     record,
-                    format,
+                    compiled,
                     LogFormatContext {
                         abbrev_len,
                         decorations: &decorations,
@@ -17107,12 +17118,18 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--pretty=short" | "--format=short" => pretty = RevListPretty::Short,
             value if value.starts_with("--format=") => {
                 pretty = RevListPretty::Custom {
-                    format: value["--format=".len()..].to_string(),
+                    compiled: CompiledLogFormat::compile(
+                        &value["--format=".len()..],
+                        LogFormatDialect::RevList,
+                    )?,
                 };
             }
             value if value.starts_with("--pretty=format:") => {
                 pretty = RevListPretty::Custom {
-                    format: value["--pretty=format:".len()..].to_string(),
+                    compiled: CompiledLogFormat::compile(
+                        &value["--pretty=format:".len()..],
+                        LogFormatDialect::RevList,
+                    )?,
                 };
             }
             value if value.starts_with("--abbrev=") => {
@@ -17571,9 +17588,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         selected.reverse();
     }
     let decorations = match &pretty {
-        RevListPretty::Custom {
-            format: custom_format,
-        } if log_format_uses_decorations(custom_format) => {
+        RevListPretty::Custom { compiled } if compiled.uses_decorations() => {
             log_decoration_map(&git_dir, &db, format, LogDecorationMode::Short)?
         }
         _ => HashMap::new(),
@@ -17726,7 +17741,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                 abbrev_len,
                 timestamp,
             )?,
-            RevListPretty::Custom { format } => {
+            RevListPretty::Custom { compiled } => {
                 write_rev_list_commit_header_line(
                     record,
                     left_right.then_some(left_right_prefix),
@@ -17737,7 +17752,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                 )?;
                 print_log_format(
                     record,
-                    format,
+                    compiled,
                     LogFormatContext {
                         abbrev_len,
                         decorations: &decorations,
@@ -17780,7 +17795,7 @@ enum RevListPretty {
     Default,
     Oneline,
     Short,
-    Custom { format: String },
+    Custom { compiled: CompiledLogFormat },
 }
 
 fn write_rev_list_header(record: &sley_rev::CommitRecord) -> Result<()> {
@@ -17948,7 +17963,7 @@ fn write_rev_list_boundary_record(
             abbrev_len,
             timestamp,
         ),
-        RevListPretty::Custom { format } => {
+        RevListPretty::Custom { compiled } => {
             write_rev_list_commit_header_line(
                 record,
                 Some('-'),
@@ -17959,7 +17974,7 @@ fn write_rev_list_boundary_record(
             )?;
             print_log_format(
                 record,
-                format,
+                compiled,
                 LogFormatContext {
                     abbrev_len,
                     decorations,
@@ -18895,7 +18910,10 @@ enum LogOutput {
     Default,
     AbbrevOneline,
     FullOneline,
-    Custom { format: String, final_newline: bool },
+    Custom {
+        compiled: CompiledLogFormat,
+        final_newline: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19480,12 +19498,6 @@ fn commit_body(message: &[u8]) -> &[u8] {
     body
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogFormatDialect {
-    Log,
-    RevList,
-}
-
 struct LogFormatContext<'a> {
     abbrev_len: Option<usize>,
     decorations: &'a HashMap<ObjectId, Vec<String>>,
@@ -19497,8 +19509,21 @@ struct LogFormatContext<'a> {
 
 fn print_log_format(
     record: &sley_rev::CommitRecord,
-    format: &str,
+    compiled: &CompiledLogFormat,
     context: LogFormatContext<'_>,
+) -> Result<()> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(record, compiled, &context, &mut line)?;
+    io::stdout().write_all(&line)?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn emit_compiled_log_format(
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
 ) -> Result<()> {
     let LogFormatContext {
         abbrev_len,
@@ -19507,237 +19532,181 @@ fn print_log_format(
         dialect,
         source,
         date_mode,
-    } = context;
+    } = *context;
     let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
     let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
     let author_timestamp = commit_identity_timestamp(&record.commit.author);
     let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
-    let mut chars = format.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            print!("{ch}");
-            continue;
-        }
-        match chars.next() {
-            Some('%') => print!("%"),
-            Some('H') => print!("{}", record.oid),
-            Some('h') => print!("{}", format_log_oid(&record.oid, abbrev_len)),
-            Some('T') => print!("{}", record.commit.tree),
-            Some('t') => print!("{}", format_log_oid(&record.commit.tree, abbrev_len)),
-            Some('P') => print!("{}", format_log_parent_oids(record, None)),
-            Some('p') => print!("{}", format_log_parent_oids(record, abbrev_len)),
-            Some('m') => print!("{marker}"),
-            Some('s') => print!("{}", commit_subject(&record.commit.message)),
-            Some('f') => print!("{}", log_sanitized_subject(&record.commit.message)),
-            Some('e') => print!("{}", commit_encoding(&record.commit)),
-            Some('N') if dialect == LogFormatDialect::Log => {}
-            Some('N') => print!("%N"),
-            Some('S') if dialect == LogFormatDialect::Log => {
+
+    for token in &compiled.tokens {
+        match token {
+            FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
+            FormatToken::Percent => out.push(b'%'),
+            FormatToken::OidFull => write!(out, "{}", record.oid).map_err(io::Error::from)?,
+            FormatToken::OidAbbrev => {
+                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::TreeFull => write!(out, "{}", record.commit.tree).map_err(io::Error::from)?,
+            FormatToken::TreeAbbrev => {
+                write!(out, "{}", format_log_oid(&record.commit.tree, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsFull => {
+                write!(out, "{}", format_log_parent_oids(record, None)).map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsAbbrev => {
+                write!(out, "{}", format_log_parent_oids(record, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::Marker => out.push(marker as u8),
+            FormatToken::Subject => {
+                write!(out, "{}", commit_subject(&record.commit.message)).map_err(io::Error::from)?;
+            }
+            FormatToken::SanitizedSubject => {
+                write!(out, "{}", log_sanitized_subject(&record.commit.message))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::Encoding => {
+                write!(out, "{}", commit_encoding(&record.commit)).map_err(io::Error::from)?;
+            }
+            FormatToken::NoteName if dialect == LogFormatDialect::Log => {}
+            FormatToken::NoteName => out.extend_from_slice(b"%N"),
+            FormatToken::RevisionSource if dialect == LogFormatDialect::Log => {
                 if let Some(source) = source {
-                    print!("{source}");
+                    out.extend_from_slice(source.as_bytes());
                 }
             }
-            Some('S') => print!("%S"),
-            Some('C') => consume_log_format_color(&mut chars)?,
-            Some('b') => io::stdout().write_all(commit_body(&record.commit.message))?,
-            Some('B') => io::stdout().write_all(&record.commit.message)?,
-            Some('d') => print!(
-                "{}",
-                format_log_format_decorations(&record.oid, decorations, true)
-            ),
-            Some('D') => print!(
-                "{}",
-                format_log_format_decorations(&record.oid, decorations, false)
-            ),
-            Some('G') => match chars.next() {
-                Some('?') => print!("N"),
-                Some('T') => print!("undefined"),
-                Some('G' | 'S' | 'K' | 'F' | 'P') => {}
-                Some(other) => {
-                    return Err(GitError::Command(format!(
-                        "unsupported log format placeholder %G{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Command(
-                        "unterminated log format placeholder %G".into(),
-                    ));
-                }
-            },
-            Some('g') => match chars.next() {
-                Some('D' | 'd' | 'n' | 'N' | 'e' | 'E' | 's') => {}
-                Some(other) => {
-                    return Err(GitError::Command(format!(
-                        "unsupported log format placeholder %g{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Command(
-                        "unterminated log format placeholder %g".into(),
-                    ));
-                }
-            },
-            Some('a') => match chars.next() {
-                Some('n') => print!("{author_name}"),
-                Some('N') => print!("{author_name}"),
-                Some('e') => print!("{author_email}"),
-                Some('E') => print!("{author_email}"),
-                Some('l') => print!("{}", log_email_local_part(&author_email)),
-                Some('L') => print!("{}", log_email_local_part(&author_email)),
-                Some('t') => print!("{author_timestamp}"),
-                Some('d') => print!("{}", commit_identity_date(&record.commit.author, date_mode)),
-                Some('i') => print!(
+            FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
+            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::Body => out.extend_from_slice(commit_body(&record.commit.message)),
+            FormatToken::FullMessage => out.extend_from_slice(&record.commit.message),
+            FormatToken::DecorationsParen => {
+                write!(
+                    out,
+                    "{}",
+                    format_log_format_decorations(&record.oid, decorations, true)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::DecorationsBare => {
+                write!(
+                    out,
+                    "{}",
+                    format_log_format_decorations(&record.oid, decorations, false)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::GRefname => out.push(b'N'),
+            FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
+            FormatToken::GPlaceholder
+            | FormatToken::GSignature
+            | FormatToken::GKey
+            | FormatToken::GFingerprint
+            | FormatToken::GPassthrough
+            | FormatToken::GDate
+            | FormatToken::GDateShort
+            | FormatToken::GDateIso
+            | FormatToken::GDateIsoStrict
+            | FormatToken::GDateRfc2822 => {}
+            FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
+            FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
+            FormatToken::AuthorEmailLocal => {
+                write!(out, "{}", log_email_local_part(&author_email)).map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
+            FormatToken::AuthorDate => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&record.commit.author, date_mode)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateIso => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.author, ForEachRefDateMode::Iso)
-                ),
-                Some('I') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateIsoStrict => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.author, ForEachRefDateMode::IsoStrict)
-                ),
-                Some('s') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateShort => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.author, ForEachRefDateMode::Short)
-                ),
-                Some('D') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateRfc2822 => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.author, ForEachRefDateMode::Rfc2822)
-                ),
-                Some(other) => {
-                    return Err(GitError::Command(format!(
-                        "unsupported log format placeholder %a{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Command(
-                        "unterminated log format placeholder %a".into(),
-                    ));
-                }
-            },
-            Some('c') => match chars.next() {
-                Some('n') => print!("{committer_name}"),
-                Some('N') => print!("{committer_name}"),
-                Some('e') => print!("{committer_email}"),
-                Some('E') => print!("{committer_email}"),
-                Some('l') => print!("{}", log_email_local_part(&committer_email)),
-                Some('L') => print!("{}", log_email_local_part(&committer_email)),
-                Some('t') => print!("{committer_timestamp}"),
-                Some('d') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
+            FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
+            FormatToken::CommitterEmailLocal => {
+                write!(out, "{}", log_email_local_part(&committer_email))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterTimestamp => out.extend_from_slice(committer_timestamp.as_bytes()),
+            FormatToken::CommitterDate => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.committer, date_mode)
-                ),
-                Some('i') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateIso => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.committer, ForEachRefDateMode::Iso)
-                ),
-                Some('I') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateIsoStrict => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.committer, ForEachRefDateMode::IsoStrict)
-                ),
-                Some('s') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateShort => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.committer, ForEachRefDateMode::Short)
-                ),
-                Some('D') => print!(
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateRfc2822 => {
+                write!(
+                    out,
                     "{}",
                     commit_identity_date(&record.commit.committer, ForEachRefDateMode::Rfc2822)
-                ),
-                Some(other) => {
-                    return Err(GitError::Command(format!(
-                        "unsupported log format placeholder %c{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Command(
-                        "unterminated log format placeholder %c".into(),
-                    ));
-                }
-            },
-            Some('n') => println!(),
-            Some('x') => {
-                let mut lookahead = chars.clone();
-                if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
-                    && let (Some(high), Some(low)) = (high.to_digit(16), low.to_digit(16))
-                {
-                    chars = lookahead;
-                    io::stdout().write_all(&[((high << 4) | low) as u8])?;
-                } else {
-                    print!("%x");
-                }
+                )
+                .map_err(io::Error::from)?;
             }
-            Some(other) => {
-                return Err(GitError::Command(format!(
-                    "unsupported log format placeholder %{other}"
-                )));
-            }
-            None => {
-                return Err(GitError::Command(
-                    "unterminated log format placeholder %".into(),
-                ));
-            }
+            FormatToken::Newline => out.push(b'\n'),
+            FormatToken::HexByte(byte) => out.push(*byte),
         }
     }
-    io::stdout().flush()?;
     Ok(())
-}
-
-fn consume_log_format_color(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Result<()> {
-    if chars.peek().copied() == Some('(') {
-        chars.next();
-        for ch in chars.by_ref() {
-            if ch == ')' {
-                return Ok(());
-            }
-        }
-        return Err(GitError::Command(
-            "unterminated log format placeholder %C".into(),
-        ));
-    }
-
-    for name in [
-        "reset", "normal", "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
-        "bold", "dim", "ul", "blink", "reverse", "italic", "strike",
-    ] {
-        if consume_log_format_literal(chars, name) {
-            return Ok(());
-        }
-    }
-
-    Err(GitError::Command(
-        "unsupported log format placeholder %C".into(),
-    ))
-}
-
-fn consume_log_format_literal(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    literal: &str,
-) -> bool {
-    let mut lookahead = chars.clone();
-    for expected in literal.chars() {
-        if lookahead.next() != Some(expected) {
-            return false;
-        }
-    }
-    *chars = lookahead;
-    true
-}
-
-fn log_format_is_oid_only(format: &str) -> bool {
-    format.trim() == "%H"
-}
-
-fn log_format_uses_decorations(format: &str) -> bool {
-    let mut chars = format.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            continue;
-        }
-        match chars.next() {
-            Some('d' | 'D') => return true,
-            Some(_) => {}
-            None => break,
-        }
-    }
-    false
 }
 
 fn format_log_format_decorations(
