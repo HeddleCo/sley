@@ -25,11 +25,11 @@ pub fn remote_advertisement_tips_known_to_local(
     let mut tips = Vec::new();
     let mut seen = HashSet::new();
     for advertisement in advertisements {
-        if advertisement.oid.is_null() || !seen.insert(advertisement.oid.clone()) {
+        if advertisement.oid.is_null() || !seen.insert(advertisement.oid) {
             continue;
         }
         if local_db.contains(&advertisement.oid)? {
-            tips.push(advertisement.oid.clone());
+            tips.push(advertisement.oid);
         }
     }
     Ok(tips)
@@ -102,7 +102,7 @@ fn build_thin_push_packfile(
     let mut thin_bases = HashMap::with_capacity(remote_excluded.len());
     for oid in remote_excluded {
         let object = req.local_db.read_object(oid)?;
-        thin_bases.insert(oid.clone(), (*object).clone());
+        thin_bases.insert(*oid, (*object).clone());
     }
 
     let mut oids = Vec::with_capacity(to_send.len());
@@ -173,7 +173,7 @@ mod tests {
 
     fn advertisement(oid: &ObjectId, name: &str) -> RefAdvertisement {
         RefAdvertisement {
-            oid: oid.clone(),
+            oid: *oid,
             name: name.into(),
             capabilities: Vec::new(),
         }

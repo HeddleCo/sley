@@ -145,34 +145,31 @@ fn rebase_clean_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_diverged_repos(&upstream, &rust);
-        let args = ["rebase", "master"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_eq!(
-            actual.status.code(),
-            expected.status.code(),
-            "status differed for clean rebase"
-        );
-        assert!(
-            actual.status.success(),
-            "sley rebase failed: {}",
-            String::from_utf8_lossy(&actual.stderr)
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after clean rebase"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "--oneline"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
-            "log order differed after clean rebase"
-        );
-    })();
+    prepare_diverged_repos(&upstream, &rust);
+    let args = ["rebase", "master"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "status differed for clean rebase"
+    );
+    assert!(
+        actual.status.success(),
+        "sley rebase failed: {}",
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after clean rebase"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "--oneline"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        "log order differed after clean rebase"
+    );
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -182,18 +179,15 @@ fn rebase_already_up_to_date_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_up_to_date_repos(&upstream, &rust);
-        let args = ["rebase", "master"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after up-to-date rebase"
-        );
-    })();
+    prepare_up_to_date_repos(&upstream, &rust);
+    let args = ["rebase", "master"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after up-to-date rebase"
+    );
     let _ = fs::remove_dir_all(&root);
-    result
 }

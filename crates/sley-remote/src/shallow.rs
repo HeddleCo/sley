@@ -83,7 +83,7 @@ pub fn apply_shallow_info(
         match entry {
             ProtocolV2FetchShallowInfo::Shallow(oid) => {
                 if !oids.contains(oid) {
-                    oids.push(oid.clone());
+                    oids.push(*oid);
                 }
             }
             ProtocolV2FetchShallowInfo::Unshallow(oid) => oids.retain(|existing| existing != oid),

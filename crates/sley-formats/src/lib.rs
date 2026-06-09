@@ -696,7 +696,7 @@ impl CommitGraph {
         validate_commit_graph_write_entries(format, &entries)?;
         let object_ids = entries
             .iter()
-            .map(|entry| entry.oid.clone())
+            .map(|entry| entry.oid)
             .collect::<Vec<_>>();
         let (cdat, edge) = write_commit_graph_commit_data(&entries)?;
         let mut chunks = vec![
@@ -1061,7 +1061,7 @@ fn parse_commit_graph_oids(
         counts[oid.as_bytes()[0] as usize] = counts[oid.as_bytes()[0] as usize]
             .checked_add(1)
             .ok_or_else(|| GitError::InvalidFormat("commit-graph fanout overflow".into()))?;
-        previous_oid = Some(oid.clone());
+        previous_oid = Some(oid);
         oids.push(oid);
     }
 
@@ -1804,7 +1804,7 @@ mod tests {
                 name: "refs/tags/v1".into(),
                 update_index: 7,
                 value: ReftableRefValue::Peeled {
-                    target: tag.clone(),
+                    target: tag,
                     peeled: peeled.clone(),
                 },
             },
@@ -1861,7 +1861,7 @@ mod tests {
         let refs = vec![ReftableRefRecord {
             name: "refs/heads/main".into(),
             update_index: 3,
-            value: ReftableRefValue::Direct(oid.clone()),
+            value: ReftableRefValue::Direct(oid),
         }];
 
         let bytes = Reftable::write_ref_only(ObjectFormat::Sha256, 3, 3, &refs)
@@ -1905,7 +1905,7 @@ mod tests {
                 &[ReftableRefRecord {
                     name: "refs/heads/main".into(),
                     update_index: 1,
-                    value: ReftableRefValue::Direct(oid.clone()),
+                    value: ReftableRefValue::Direct(oid),
                 }],
             )
             .expect("test operation should succeed");
@@ -1928,21 +1928,21 @@ mod tests {
         let commits = vec![
             (
                 oid("1111111111111111111111111111111111111111"),
-                tree.clone(),
+                tree,
                 Vec::new(),
                 1,
                 1,
             ),
             (
                 oid("2222222222222222222222222222222222222222"),
-                tree.clone(),
+                tree,
                 vec![0],
                 2,
                 2,
             ),
             (
                 oid("3333333333333333333333333333333333333333"),
-                tree.clone(),
+                tree,
                 vec![1],
                 3,
                 3,
@@ -1987,29 +1987,29 @@ mod tests {
             &[
                 CommitGraphWriteEntry {
                     oid: merge.clone(),
-                    tree: tree.clone(),
+                    tree,
                     parents: vec![main.clone(), side.clone()],
                     generation: 3,
                     commit_time: 30,
                 },
                 CommitGraphWriteEntry {
-                    oid: base.clone(),
-                    tree: tree.clone(),
+                    oid: base,
+                    tree,
                     parents: Vec::new(),
                     generation: 1,
                     commit_time: 10,
                 },
                 CommitGraphWriteEntry {
                     oid: main.clone(),
-                    tree: tree.clone(),
-                    parents: vec![base.clone()],
+                    tree,
+                    parents: vec![base],
                     generation: 2,
                     commit_time: 20,
                 },
                 CommitGraphWriteEntry {
                     oid: side.clone(),
                     tree,
-                    parents: vec![base.clone()],
+                    parents: vec![base],
                     generation: 2,
                     commit_time: 21,
                 },
@@ -2070,7 +2070,7 @@ mod tests {
         let commits = vec![
             (
                 oid("1111111111111111111111111111111111111111"),
-                tree.clone(),
+                tree,
                 Vec::new(),
                 1,
                 1,
@@ -2107,7 +2107,7 @@ mod tests {
         let commits = vec![
             (
                 oid("1111111111111111111111111111111111111111"),
-                tree.clone(),
+                tree,
                 Vec::new(),
                 1,
                 1,
@@ -2445,7 +2445,7 @@ mod tests {
             }],
             prerequisites: Vec::new(),
             references: vec![BundleReference {
-                oid: oid.clone(),
+                oid,
                 name: "refs/heads/main".into(),
             }],
             pack: b"PACKv3".to_vec(),
@@ -2632,7 +2632,7 @@ mod tests {
     ) -> Vec<([u8; 4], Vec<u8>)> {
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-        let object_ids: Vec<ObjectId> = entries.iter().map(|entry| entry.0.clone()).collect();
+        let object_ids: Vec<ObjectId> = entries.iter().map(|entry| entry.0).collect();
         let (cdat, edge) = commit_graph_cdat(&entries);
         let mut chunks = vec![
             (*b"OIDF", commit_graph_fanout(&object_ids)),

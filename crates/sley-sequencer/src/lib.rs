@@ -177,16 +177,16 @@ fn commit_tree_with_amend(
             message: options.message,
         },
     )?;
-    let expected = parent.clone().map(RefTarget::Direct);
-    let old_oid = parent.clone().unwrap_or(zero_oid(format)?);
+    let expected = parent.map(RefTarget::Direct);
+    let old_oid = parent.unwrap_or(zero_oid(format)?);
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: updated_ref.clone(),
         expected,
-        new: RefTarget::Direct(oid.clone()),
+        new: RefTarget::Direct(oid),
         reflog: Some(ReflogEntry {
             old_oid,
-            new_oid: oid.clone(),
+            new_oid: oid,
             committer: options.committer,
             message: options.reflog_message,
         }),

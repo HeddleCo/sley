@@ -90,7 +90,7 @@ fn index_from_tree_matches_git_read_tree() {
         assert_eq!(entry.size, 0);
         assert_eq!(entry.mtime_seconds, 0);
         got.insert(
-            entry.path.clone(),
+            entry.path.as_bytes().to_vec(),
             (format!("{:o}", entry.mode), entry.oid.to_string()),
         );
     }

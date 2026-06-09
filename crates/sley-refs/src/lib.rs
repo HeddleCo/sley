@@ -2215,7 +2215,7 @@ mod tests {
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -2262,14 +2262,14 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             PackedRef {
                 reference: Ref {
                     name: "refs/tags/v1".into(),
-                    target: RefTarget::Direct(tag_oid.clone()),
+                    target: RefTarget::Direct(tag_oid),
                 },
-                peeled: Some(peeled_oid.clone()),
+                peeled: Some(peeled_oid),
             },
             PackedRef {
                 reference: Ref {
                     name: "refs/heads/main".into(),
-                    target: RefTarget::Direct(head_oid.clone()),
+                    target: RefTarget::Direct(head_oid),
                 },
                 peeled: None,
             },
@@ -2413,10 +2413,10 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
                 old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
-                new_oid: oid.clone(),
+                new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
             }),
@@ -2473,7 +2473,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     },
                     BundleRefUpdate {
                         name: "refs/tags/v1.0".into(),
-                        oid: tag_oid.clone(),
+                        oid: tag_oid,
                     },
                 ],
                 Some(BundleRefUpdateReflog {
@@ -2494,7 +2494,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 AppliedBundleRefUpdate {
                     name: "refs/tags/v1.0".into(),
                     old_oid: None,
-                    new_oid: tag_oid.clone(),
+                    new_oid: tag_oid,
                 }
             ]
         );
@@ -2508,7 +2508,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             store
                 .read_ref("refs/tags/v1.0")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(tag_oid.clone()))
+            Some(RefTarget::Direct(tag_oid))
         );
         let main_log = store
             .read_reflog("refs/heads/main")
@@ -2543,7 +2543,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             &[
                 BundleRefUpdate {
                     name: "refs/heads/main".into(),
-                    oid: oid.clone(),
+                    oid,
                 },
                 BundleRefUpdate {
                     name: "refs/heads/bad.lock".into(),
@@ -2671,7 +2671,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let branch = store
             .create_branch(
                 "feature",
-                oid.clone(),
+                oid,
                 b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 b"branch: Created from main".to_vec(),
             )
@@ -2698,7 +2698,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         store
             .create_branch(
                 "feature",
-                oid.clone(),
+                oid,
                 b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 b"branch: Created from main".to_vec(),
             )
@@ -2739,10 +2739,10 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/topic".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
                 old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
-                new_oid: oid.clone(),
+                new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"update by test".to_vec(),
             }),
@@ -2840,7 +2840,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         )
         .expect("test operation should succeed");
         let tag = store
-            .create_tag("v1.0", oid.clone())
+            .create_tag("v1.0", oid)
             .expect("test operation should succeed");
         assert_eq!(tag.name, "refs/tags/v1.0");
         assert_eq!(
@@ -2868,7 +2868,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         )
         .expect("test operation should succeed");
         store
-            .create_tag("v1.0", oid.clone())
+            .create_tag("v1.0", oid)
             .expect("test operation should succeed");
         let deleted = store
             .delete_tag("v1.0")
@@ -2921,7 +2921,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -2944,7 +2944,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             .write_packed_refs(&[PackedRef {
                 reference: Ref {
                     name: "refs/heads/main".into(),
-                    target: RefTarget::Direct(oid.clone()),
+                    target: RefTarget::Direct(oid),
                 },
                 peeled: None,
             }])
@@ -2953,7 +2953,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             store
                 .read_ref("refs/heads/main")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(oid.clone()))
+            Some(RefTarget::Direct(oid))
         );
         let refs = store.list_refs().expect("test operation should succeed");
         assert_eq!(refs.len(), 1);
@@ -2997,13 +2997,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     sley_formats::ReftableRefRecord {
                         name: "refs/heads/main".into(),
                         update_index: 1,
-                        value: ReftableRefValue::Direct(head_oid.clone()),
+                        value: ReftableRefValue::Direct(head_oid),
                     },
                     sley_formats::ReftableRefRecord {
                         name: "refs/tags/v1.0".into(),
                         update_index: 1,
                         value: ReftableRefValue::Peeled {
-                            target: tag_oid.clone(),
+                            target: tag_oid,
                             peeled: peeled_oid,
                         },
                     },
@@ -3022,13 +3022,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             store
                 .read_ref("refs/heads/main")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(head_oid.clone()))
+            Some(RefTarget::Direct(head_oid))
         );
         assert_eq!(
             store
                 .read_ref("refs/tags/v1.0")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(tag_oid.clone()))
+            Some(RefTarget::Direct(tag_oid))
         );
         let refs = store.list_refs().expect("test operation should succeed");
         assert_eq!(
@@ -3216,7 +3216,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                     sley_formats::ReftableRefRecord {
                         name: "refs/heads/main".into(),
                         update_index: 1,
-                        value: ReftableRefValue::Direct(oid.clone()),
+                        value: ReftableRefValue::Direct(oid),
                     },
                     sley_formats::ReftableRefRecord {
                         name: "refs/alias/main".into(),
@@ -3281,14 +3281,14 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 PackedRef {
                     reference: Ref {
                         name: "refs/heads/feature".into(),
-                        target: RefTarget::Direct(branch_oid.clone()),
+                        target: RefTarget::Direct(branch_oid),
                     },
                     peeled: None,
                 },
                 PackedRef {
                     reference: Ref {
                         name: "refs/tags/v1.0".into(),
-                        target: RefTarget::Direct(tag_oid.clone()),
+                        target: RefTarget::Direct(tag_oid),
                     },
                     peeled: None,
                 },
@@ -3328,7 +3328,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             .write_packed_refs(&[PackedRef {
                 reference: Ref {
                     name: "refs/tags/v1.0".into(),
-                    target: RefTarget::Direct(oid.clone()),
+                    target: RefTarget::Direct(oid),
                 },
                 peeled: None,
             }])
@@ -3366,13 +3366,13 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(main_oid.clone()),
+            new: RefTarget::Direct(main_oid),
             reflog: None,
         });
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
             expected: None,
-            new: RefTarget::Direct(tag_oid.clone()),
+            new: RefTarget::Direct(tag_oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -3413,7 +3413,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -3450,7 +3450,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
             expected: None,
-            new: RefTarget::Direct(tag_oid.clone()),
+            new: RefTarget::Direct(tag_oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -3458,14 +3458,14 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         let packed = store
             .pack_refs_with_peeler(true, |name, oid| {
                 if name == "refs/tags/v1.0" && oid == &tag_oid {
-                    Ok(Some(peeled_oid.clone()))
+                    Ok(Some(peeled_oid))
                 } else {
                     Ok(None)
                 }
             })
             .expect("test operation should succeed");
         assert_eq!(packed.len(), 1);
-        assert_eq!(packed[0].peeled, Some(peeled_oid.clone()));
+        assert_eq!(packed[0].peeled, Some(peeled_oid));
         let bytes =
             fs::read_to_string(git_dir.join("packed-refs")).expect("test operation should succeed");
         assert!(bytes.contains(&format!("^{peeled_oid}\n")));
@@ -3476,7 +3476,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     fn reflog_entry(new_oid: &ObjectId, timestamp: i64, message: &str) -> ReflogEntry {
         ReflogEntry {
             old_oid: zero_oid(new_oid.format()).expect("test operation should succeed"),
-            new_oid: new_oid.clone(),
+            new_oid: *new_oid,
             committer: format!("Git Rs <sley@example.invalid> {timestamp} +0000").into_bytes(),
             message: message.as_bytes().to_vec(),
         }
@@ -3642,19 +3642,19 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(main_oid.clone()),
+            new: RefTarget::Direct(main_oid),
             reflog: Some(reflog_entry(&main_oid, 0, "create main")),
         });
         tx.update(RefUpdate {
             name: "refs/heads/topic".into(),
             expected: None,
-            new: RefTarget::Direct(topic_oid.clone()),
+            new: RefTarget::Direct(topic_oid),
             reflog: None,
         });
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
             expected: None,
-            new: RefTarget::Direct(tag_oid.clone()),
+            new: RefTarget::Direct(tag_oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -3663,7 +3663,7 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
             store
                 .read_ref("refs/heads/main")
                 .expect("test operation should succeed"),
-            Some(RefTarget::Direct(main_oid.clone()))
+            Some(RefTarget::Direct(main_oid))
         );
         assert_eq!(
             store

@@ -461,7 +461,7 @@ fn collect_tree_blobs(
                 collect_tree_blobs(db, format, &entry.oid, prefix, out)?;
             }
             ObjectType::Blob if entry.mode != 0o160000 => {
-                out.push((prefix.clone(), entry.oid.clone()));
+                out.push((prefix.clone(), entry.oid));
             }
             _ => {}
         }

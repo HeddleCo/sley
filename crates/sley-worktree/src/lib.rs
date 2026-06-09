@@ -1,5 +1,5 @@
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{Index, IndexEntry};
 use sley_object::TreeEntries;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
@@ -452,7 +452,7 @@ fn update_index_paths_impl(
             odb.write_object(object)?
         };
         let metadata = fs::metadata(&absolute)?;
-        let mut entry = index_entry_from_metadata(git_path.clone(), oid.clone(), &metadata);
+        let mut entry = index_entry_from_metadata(git_path.clone(), oid, &metadata);
         if let Some(executable) = options.chmod {
             entry.mode = if executable { 0o100755 } else { 0o100644 };
         }
@@ -512,27 +512,27 @@ pub fn refresh_index_paths(
             continue;
         }
         let selected_for_update =
-            !selected_paths.is_empty() && selected_paths.contains(&entry.path);
+            !selected_paths.is_empty() && selected_paths.contains(entry.path.as_bytes());
         if entry.flags & INDEX_FLAG_ASSUME_UNCHANGED != 0 {
             if !really_refresh {
                 continue;
             }
             entry.flags &= !INDEX_FLAG_ASSUME_UNCHANGED;
         }
-        let absolute = worktree_root.join(repo_path_to_os_path(&entry.path)?);
+        let absolute = worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?);
         let Ok(metadata) = fs::metadata(&absolute) else {
             if ignore_missing {
                 continue;
             }
             if !quiet {
-                print_update_index_needs_update(&entry.path);
+                print_update_index_needs_update(entry.path.as_bytes());
             }
             needs_update = true;
             continue;
         };
         if !metadata.is_file() {
             if !quiet {
-                print_update_index_needs_update(&entry.path);
+                print_update_index_needs_update(entry.path.as_bytes());
             }
             needs_update = true;
             continue;
@@ -542,7 +542,7 @@ pub fn refresh_index_paths(
         let oid = object.object_id(format)?;
         if oid != entry.oid || file_mode(&metadata) != entry.mode {
             if !quiet {
-                print_update_index_needs_update(&entry.path);
+                print_update_index_needs_update(entry.path.as_bytes());
             }
             needs_update = true;
             if selected_for_update {
@@ -587,15 +587,15 @@ pub fn update_index_again(
         if index_entry_stage(entry) != 0 {
             continue;
         }
-        if !selected_paths.is_empty() && !git_path_selected(&entry.path, &selected_paths) {
+        if !selected_paths.is_empty() && !git_path_selected(entry.path.as_bytes(), &selected_paths) {
             continue;
         }
-        let differs_from_head = match head_entries.get(&entry.path) {
+        let differs_from_head = match head_entries.get(entry.path.as_bytes()) {
             Some(head_entry) => head_entry.oid != entry.oid || head_entry.mode != entry.mode,
             None => true,
         };
         if differs_from_head {
-            again_paths.push(worktree_root.join(repo_path_to_os_path(&entry.path)?));
+            again_paths.push(worktree_root.join(repo_path_to_os_path(entry.path.as_bytes())?));
         }
     }
     if again_paths.is_empty() {
@@ -909,16 +909,16 @@ pub fn update_index_cacheinfo(
             uid: 0,
             gid: 0,
             size: 0,
-            oid: cacheinfo.oid.clone(),
+            oid: cacheinfo.oid,
             flags,
             flags_extended: 0,
-            path: cacheinfo.path.clone(),
+            path: BString::from(cacheinfo.path.as_slice()),
         };
         index.entries.retain(|existing| {
             existing.path != cacheinfo.path || index_entry_stage(existing) != cacheinfo.stage
         });
         index.entries.push(entry);
-        updated.push(cacheinfo.oid.clone());
+        updated.push(cacheinfo.oid);
     }
     index
         .entries
@@ -966,10 +966,10 @@ pub fn update_index_index_info(
                     uid: 0,
                     gid: 0,
                     size: 0,
-                    oid: cacheinfo.oid.clone(),
+                    oid: cacheinfo.oid,
                     flags,
                     flags_extended: 0,
-                    path: cacheinfo.path.clone(),
+                    path: BString::from(cacheinfo.path.as_slice()),
                 };
                 if cacheinfo.stage == 0 {
                     index
@@ -982,7 +982,7 @@ pub fn update_index_index_info(
                     });
                 }
                 index.entries.push(entry);
-                updated.push(cacheinfo.oid.clone());
+                updated.push(cacheinfo.oid);
             }
         }
     }
@@ -1061,7 +1061,7 @@ pub fn write_tree_from_index_with_options(
                     "error: invalid object {:o} {} for '{}'",
                     entry.mode,
                     entry.oid,
-                    String::from_utf8_lossy(&entry.path)
+                    String::from_utf8_lossy(entry.path.as_bytes())
                 );
                 missing = true;
             }
@@ -1096,7 +1096,7 @@ fn write_tree_entries_for_prefix(
     }
     let mut prefixed = Vec::new();
     for entry in entries {
-        let Some(remainder) = entry.path.strip_prefix(trimmed) else {
+        let Some(remainder) = entry.path.as_bytes().strip_prefix(trimmed) else {
             continue;
         };
         let Some(stripped) = remainder.strip_prefix(b"/") else {
@@ -1106,7 +1106,7 @@ fn write_tree_entries_for_prefix(
             continue;
         }
         let mut entry = entry.clone();
-        entry.path = stripped.to_vec();
+        entry.path = BString::from(stripped);
         prefixed.push(entry);
     }
     if prefixed.is_empty() {
@@ -1207,8 +1207,8 @@ pub fn short_status_with_options(
                 head_mode: head_entry.map(|entry| entry.mode),
                 index_mode: index_entry.map(|entry| entry.mode),
                 worktree_mode: worktree_entry.map(|entry| entry.mode),
-                head_oid: head_entry.map(|entry| entry.oid.clone()),
-                index_oid: index_entry.map(|entry| entry.oid.clone()),
+                head_oid: head_entry.map(|entry| entry.oid),
+                index_oid: index_entry.map(|entry| entry.oid),
             });
         }
     }
@@ -1502,7 +1502,7 @@ pub fn ignored_index_entries<'a>(
     )?;
     Ok(entries
         .iter()
-        .filter(|entry| ignores.is_ignored(&entry.path, false))
+        .filter(|entry| ignores.is_ignored(entry.path.as_bytes(), false))
         .collect())
 }
 
@@ -2720,7 +2720,7 @@ fn collect_attribute_patterns_from_tree(
         if !child_base.is_empty() {
             child_base.push(b'/');
         }
-        child_base.extend_from_slice(&entry.name);
+        child_base.extend_from_slice(entry.name.as_bytes());
         collect_attribute_patterns_from_tree(db, format, &entry.oid, child_base, matcher)?;
     }
     Ok(())
@@ -2740,14 +2740,15 @@ fn collect_attribute_patterns_from_index(
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let is_attributes_file =
-            entry.path == b".gitattributes" || entry.path.ends_with(b"/.gitattributes");
+            entry.path == b".gitattributes"
+                || entry.path.as_bytes().ends_with(b"/.gitattributes");
         if index_entry_stage(&entry) != 0
             || tree_entry_object_type(entry.mode) != ObjectType::Blob
             || !is_attributes_file
         {
             continue;
         }
-        let base = match entry.path.strip_suffix(b".gitattributes") {
+        let base = match entry.path.as_bytes().strip_suffix(b".gitattributes") {
             Some(b"") => Vec::new(),
             Some(parent) => parent.strip_suffix(b"/").unwrap_or(parent).to_vec(),
             None => continue,
@@ -3440,7 +3441,7 @@ pub fn deleted_index_entries(
     let index = Index::parse(&fs::read(index_path)?, format)?;
     let mut deleted = Vec::new();
     for entry in index.entries {
-        if !worktree_path(worktree_root, &entry.path)?.exists() {
+        if !worktree_path(worktree_root, entry.path.as_bytes())?.exists() {
             deleted.push(entry);
         }
     }
@@ -3468,7 +3469,7 @@ pub fn modified_index_entries(
         worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache), None)?;
     let mut modified = Vec::new();
     for entry in index.entries {
-        let Some(worktree_entry) = worktree.get(&entry.path) else {
+        let Some(worktree_entry) = worktree.get(entry.path.as_bytes()) else {
             modified.push(entry);
             continue;
         };
@@ -3506,8 +3507,8 @@ pub fn checkout_branch(
         expected: None,
         new: RefTarget::Symbolic(branch_ref),
         reflog: Some(ReflogEntry {
-            old_oid: target.clone(),
-            new_oid: target.clone(),
+            old_oid: target,
+            new_oid: target,
             committer,
             message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
         }),
@@ -3537,10 +3538,10 @@ pub fn checkout_detached(
     tx.update(RefUpdate {
         name: "HEAD".into(),
         expected: None,
-        new: RefTarget::Direct(target.clone()),
+        new: RefTarget::Direct(*target),
         reflog: Some(ReflogEntry {
             old_oid: zero,
-            new_oid: target.clone(),
+            new_oid: *target,
             committer,
             message,
         }),
@@ -3548,7 +3549,7 @@ pub fn checkout_detached(
     tx.commit()?;
     Ok(CheckoutResult {
         branch: target.to_string(),
-        oid: target.clone(),
+        oid: *target,
         files,
     })
 }
@@ -3591,8 +3592,8 @@ pub fn checkout_branch_filtered(
         expected: None,
         new: RefTarget::Symbolic(branch_ref),
         reflog: Some(ReflogEntry {
-            old_oid: target.clone(),
-            new_oid: target.clone(),
+            old_oid: target,
+            new_oid: target,
             committer,
             message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
         }),
@@ -3631,10 +3632,10 @@ pub fn checkout_detached_filtered(
     tx.update(RefUpdate {
         name: "HEAD".into(),
         expected: None,
-        new: RefTarget::Direct(target.clone()),
+        new: RefTarget::Direct(*target),
         reflog: Some(ReflogEntry {
             old_oid: zero,
-            new_oid: target.clone(),
+            new_oid: *target,
             committer,
             message,
         }),
@@ -3642,7 +3643,7 @@ pub fn checkout_detached_filtered(
     tx.commit()?;
     Ok(CheckoutResult {
         branch: target.to_string(),
-        oid: target.clone(),
+        oid: *target,
         files,
     })
 }
@@ -3711,7 +3712,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
         }
         fs::write(&file_path, &body)?;
         let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
         index_entry.mode = entry.mode;
         index_entries.push(index_entry);
     }
@@ -3775,7 +3776,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
     let status = short_status(worktree_root, git_dir, format)?;
     if status
         .iter()
-        .any(|entry| !previously_skipped.contains(&entry.path))
+        .any(|entry| !previously_skipped.contains(entry.path.as_slice()))
     {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
@@ -3822,7 +3823,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
             fs::write(&file_path, &object.body)?;
             let metadata = fs::metadata(&file_path)?;
             let mut index_entry =
-                index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+                index_entry_from_metadata(path.clone(), entry.oid, &metadata);
             index_entry.mode = entry.mode;
             // `index_entry_from_metadata` leaves flags_extended at 0, so the
             // skip-worktree bit is already clear for in-cone paths.
@@ -3860,7 +3861,7 @@ fn skip_worktree_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet<
         .entries
         .into_iter()
         .filter(index_entry_skip_worktree)
-        .map(|entry| entry.path)
+        .map(|entry| entry.path.into_bytes())
         .collect())
 }
 
@@ -3895,8 +3896,8 @@ pub fn restore_worktree_paths(
             || index_has_entry_under(&index.entries, &git_path);
         let mut matched = false;
         for entry in &index.entries {
-            if entry.path == git_path
-                || (recursive && index_entry_is_under_path(&entry.path, &git_path))
+            if entry.path.as_bytes() == git_path.as_slice()
+                || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path))
             {
                 restore_index_entry(worktree_root, &db, entry)?;
                 restored.insert(entry.path.clone());
@@ -3993,7 +3994,7 @@ fn restore_index_paths_from_entries(
     let mut index_entries = index
         .entries
         .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -4136,7 +4137,7 @@ fn restore_index_and_worktree_paths_from_entries(
     let mut index_entries = index
         .entries
         .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -4238,7 +4239,7 @@ pub fn reset_index_and_worktree_to_commit(
         }
         fs::write(&file_path, &object.body)?;
         let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
         index_entry.mode = entry.mode;
         index_entries.push(index_entry);
     }
@@ -4293,7 +4294,7 @@ pub fn checkout_tree_to_index_and_worktree(
         }
         fs::write(&file_path, &object.body)?;
         let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
         index_entry.mode = entry.mode;
         index_entries.push(index_entry);
     }
@@ -4380,7 +4381,7 @@ pub fn index_from_tree(
                 oid: entry.oid,
                 flags: name_len,
                 flags_extended: 0,
-                path,
+                path: path.into(),
             });
         }
     }
@@ -4455,13 +4456,13 @@ pub fn apply_sparse_checkout_with_mode(
         if index_entry_stage(entry) != 0 {
             continue;
         }
-        if matcher.includes_file(&entry.path) {
+        if matcher.includes_file(entry.path.as_bytes()) {
             clear_skip_worktree(entry);
-            let file_path = worktree_path(worktree_root, &entry.path)?;
+            let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             if !file_path.exists() {
                 materialize_index_entry_file(&db, &file_path, entry)?;
             }
-            materialized.push(entry.path.clone());
+            materialized.push(entry.path.as_bytes().to_vec());
         } else {
             // The path is out of cone, so its worktree file should be removed and
             // the entry marked skip-worktree. But git refuses to delete a file
@@ -4469,16 +4470,16 @@ pub fn apply_sparse_checkout_with_mode(
             // the worktree after the path was already sparse): it leaves the file,
             // leaves the skip-worktree bit clear, and reports the path in its "not
             // up to date" warning. Mirror that to avoid silent data loss.
-            let file_path = worktree_path(worktree_root, &entry.path)?;
+            let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
             match fs::symlink_metadata(&file_path) {
                 Ok(metadata) if !worktree_entry_is_uptodate(entry, &metadata) => {
                     clear_skip_worktree(entry);
-                    not_up_to_date.push(entry.path.clone());
+                    not_up_to_date.push(entry.path.as_bytes().to_vec());
                 }
                 _ => {
                     set_skip_worktree(entry);
-                    remove_worktree_file(worktree_root, &entry.path)?;
-                    skipped.push(entry.path.clone());
+                    remove_worktree_file(worktree_root, entry.path.as_bytes())?;
+                    skipped.push(entry.path.as_bytes().to_vec());
                 }
             }
         }
@@ -4553,10 +4554,10 @@ pub fn checkout_detached_sparse(
     tx.update(RefUpdate {
         name: "HEAD".into(),
         expected: None,
-        new: RefTarget::Direct(target.clone()),
+        new: RefTarget::Direct(*target),
         reflog: Some(ReflogEntry {
             old_oid: zero,
-            new_oid: target.clone(),
+            new_oid: *target,
             committer,
             message,
         }),
@@ -4564,7 +4565,7 @@ pub fn checkout_detached_sparse(
     tx.commit()?;
     Ok(CheckoutResult {
         branch: target.to_string(),
-        oid: target.clone(),
+        oid: *target,
         files,
     })
 }
@@ -4660,7 +4661,7 @@ fn restore_worktree_paths_from_entries(
     let index_entries = index
         .entries
         .into_iter()
-        .map(|entry| entry.path)
+        .map(|entry| entry.path.into_bytes())
         .collect::<BTreeSet<_>>();
     let mut restored = BTreeSet::new();
     for path in paths {
@@ -4736,7 +4737,7 @@ pub fn remove_index_and_worktree_paths(
     let mut index_entries = index
         .entries
         .into_iter()
-        .map(|entry| (entry.path.clone(), entry))
+        .map(|entry| (entry.path.as_bytes().to_vec(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut selected = BTreeSet::new();
     for path in paths {
@@ -4983,18 +4984,18 @@ pub fn move_index_and_worktree_path(
     let directory_entries: Vec<_> = index
         .entries
         .iter()
-        .filter(|entry| entry.path.starts_with(&directory_prefix))
+        .filter(|entry| entry.path.as_bytes().starts_with(&directory_prefix))
         .cloned()
         .collect();
     if !directory_entries.is_empty() {
         let details: Vec<_> = directory_entries
             .iter()
             .map(|entry| {
-                let suffix = &entry.path[source_path.len()..];
+                let suffix = &entry.path.as_bytes()[source_path.len()..];
                 let mut destination = destination_path.clone();
                 destination.extend_from_slice(suffix);
                 MoveDetail {
-                    source: entry.path.clone(),
+                    source: entry.path.as_bytes().to_vec(),
                     destination,
                     skipped: false,
                 }
@@ -5015,7 +5016,7 @@ pub fn move_index_and_worktree_path(
             .map(|detail| detail.destination.clone())
             .collect();
         index.entries.retain(|entry| {
-            !entry.path.starts_with(&directory_prefix) && !moved_paths.contains(&entry.path)
+            !entry.path.as_bytes().starts_with(&directory_prefix) && !moved_paths.iter().any(|m| m.as_slice() == entry.path.as_bytes())
         });
         for (source_entry, detail) in directory_entries.into_iter().zip(details.iter()) {
             let relative_path = git_path_to_relative_path(&detail.destination)?;
@@ -5141,7 +5142,7 @@ fn restore_index_entry(
             object.object_type.as_str()
         )));
     }
-    let file_path = worktree_path(worktree_root, &entry.path)?;
+    let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -5189,10 +5190,10 @@ fn restored_head_index_entry(
         uid: 0,
         gid: 0,
         size,
-        oid: entry.oid.clone(),
+        oid: entry.oid,
         flags: path.len().min(0x0fff) as u16,
         flags_extended: 0,
-        path: path.to_vec(),
+        path: BString::from(path),
     })
 }
 
@@ -5238,7 +5239,7 @@ fn restore_head_entry_to_worktree_and_index(
     }
     fs::write(&file_path, &object.body)?;
     let metadata = fs::metadata(&file_path)?;
-    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid.clone(), &metadata);
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
     index_entry.mode = entry.mode;
     Ok(index_entry)
 }
@@ -5246,7 +5247,7 @@ fn restore_head_entry_to_worktree_and_index(
 fn index_has_entry_under(entries: &[IndexEntry], directory: &[u8]) -> bool {
     entries
         .iter()
-        .any(|entry| index_entry_is_under_path(&entry.path, directory))
+        .any(|entry| index_entry_is_under_path(entry.path.as_bytes(), directory))
 }
 
 fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
@@ -5259,12 +5260,13 @@ fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
         .is_some()
 }
 
-fn index_entry_from_metadata(path: Vec<u8>, oid: ObjectId, metadata: &fs::Metadata) -> IndexEntry {
+fn index_entry_from_metadata(path: impl Into<BString>, oid: ObjectId, metadata: &fs::Metadata) -> IndexEntry {
     let modified = metadata.modified().ok();
     let duration = modified
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .unwrap_or_default();
     let mode = file_mode(metadata);
+    let path = path.into();
     let flags = path.len().min(0x0fff) as u16;
     IndexEntry {
         ctime_seconds: duration.as_secs().min(u32::MAX as u64) as u32,
@@ -5331,7 +5333,7 @@ impl IndexStatCache {
             if index_entry_stage(entry) != 0 {
                 continue;
             }
-            entries.insert(entry.path.clone(), entry.clone());
+            entries.insert(entry.path.as_bytes().to_vec(), entry.clone());
         }
         let index_mtime = fs::metadata(index_path)
             .ok()
@@ -5399,7 +5401,7 @@ impl IndexStatCache {
         }
         Some(TrackedEntry {
             mode: entry.mode,
-            oid: entry.oid.clone(),
+            oid: entry.oid,
         })
     }
 }
@@ -5429,7 +5431,7 @@ fn read_index_entries_with_stat_cache(
         .into_iter()
         .map(|entry| {
             (
-                entry.path,
+                entry.path.into_bytes(),
                 TrackedEntry {
                     mode: entry.mode,
                     oid: entry.oid,
@@ -5764,11 +5766,11 @@ struct TreeFile {
 
 impl TreeNode {
     fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
-        let components = entry.path.split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let components = entry.path.as_bytes().split(|byte| *byte == b'/').collect::<Vec<_>>();
         if components.iter().any(|component| component.is_empty()) {
             return Err(GitError::InvalidPath(format!(
                 "invalid index path {}",
-                String::from_utf8_lossy(&entry.path)
+                String::from_utf8_lossy(entry.path.as_bytes())
             )));
         }
         self.insert_components(&components, entry)
@@ -5781,7 +5783,7 @@ impl TreeNode {
                 self.files.push(TreeFile {
                     name: name.to_vec(),
                     mode: entry.mode,
-                    oid: entry.oid.clone(),
+                    oid: entry.oid,
                 });
                 Ok(())
             }
@@ -5799,20 +5801,20 @@ fn write_tree_node(node: &TreeNode, odb: &mut FileObjectDatabase) -> Result<Obje
     for file in &node.files {
         entries.push(TreeEntry {
             mode: file.mode,
-            name: file.name.clone(),
-            oid: file.oid.clone(),
+            name: BString::from(file.name.as_slice()),
+            oid: file.oid,
         });
     }
     for (name, child) in &node.directories {
         let oid = write_tree_node(child, odb)?;
         entries.push(TreeEntry {
             mode: 0o040000,
-            name: name.clone(),
+            name: BString::from(name.as_slice()),
             oid,
         });
     }
     entries
-        .sort_by(|left, right| git_tree_entry_cmp(&left.name, left.mode, &right.name, right.mode));
+        .sort_by(|left, right| git_tree_entry_cmp(left.name.as_bytes(), left.mode, right.name.as_bytes(), right.mode));
     odb.write_object(EncodedObject::new(
         ObjectType::Tree,
         Tree { entries }.write(),
@@ -6176,7 +6178,7 @@ mod tests {
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(commit.clone()),
+            new: RefTarget::Direct(commit),
             reflog: None,
         });
         tx.update(RefUpdate {
@@ -6600,7 +6602,7 @@ mod tests {
         tx.update(RefUpdate {
             name: "HEAD".into(),
             expected: None,
-            new: RefTarget::Direct(commit.clone()),
+            new: RefTarget::Direct(commit),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -6797,7 +6799,7 @@ mod tests {
         entry.mode = mode;
         let index_mtime = Some((u64::from(entry.mtime_seconds) + 10, 0));
         let mut entries = BTreeMap::new();
-        entries.insert(entry.path.clone(), entry.clone());
+        entries.insert(entry.path.as_bytes().to_vec(), entry.clone());
         (
             IndexStatCache {
                 entries,
@@ -6819,13 +6821,13 @@ mod tests {
             .expect("test operation should succeed");
 
         // Clean, non-racy, matching stat + mode -> reuse the cached oid.
-        let (cache, _) = stat_cache_for(&file, oid.clone(), real_mode);
+        let (cache, _) = stat_cache_for(&file, oid, real_mode);
         let reused = cache.reuse_tracked_entry(b"f.txt", &metadata);
         assert_eq!(
             reused,
             Some(TrackedEntry {
                 mode: real_mode,
-                oid: oid.clone(),
+                oid,
             }),
             "a clean non-racy stat+mode match must reuse the staged oid"
         );
@@ -6838,9 +6840,9 @@ mod tests {
         );
 
         // Size differs from the file -> must hash.
-        let (mut size_cache, mut shrunk) = stat_cache_for(&file, oid.clone(), real_mode);
+        let (mut size_cache, mut shrunk) = stat_cache_for(&file, oid, real_mode);
         shrunk.size = shrunk.size.saturating_sub(1);
-        size_cache.entries.insert(shrunk.path.clone(), shrunk);
+        size_cache.entries.insert(shrunk.path.to_vec(), shrunk);
         assert_eq!(
             size_cache.reuse_tracked_entry(b"f.txt", &metadata),
             None,
@@ -6848,7 +6850,7 @@ mod tests {
         );
 
         // Mode differs (e.g. a chmod that did not move mtime) -> must hash.
-        let (mode_cache, _) = stat_cache_for(&file, oid.clone(), 0o100755);
+        let (mode_cache, _) = stat_cache_for(&file, oid, 0o100755);
         assert_eq!(
             mode_cache.reuse_tracked_entry(b"f.txt", &metadata),
             None,
@@ -6943,7 +6945,7 @@ mod tests {
         let mut index = read_index(&git_dir);
         let bogus = ObjectId::from_hex(ObjectFormat::Sha1, &"0".repeat(40))
             .expect("test operation should succeed");
-        let real_oid = index_entry_for(&index, b"f.txt").oid.clone();
+        let real_oid = index_entry_for(&index, b"f.txt").oid;
         assert_ne!(
             real_oid, bogus,
             "fixture oid should differ from the bogus oid"

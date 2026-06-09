@@ -530,7 +530,7 @@ impl PackFile {
                 )));
             }
             objects.push(input.object);
-            object_ids.push(input.oid.clone());
+            object_ids.push(*input.oid);
         }
         Self::write_packed_from_parts(objects, object_ids, format, options)
     }
@@ -799,7 +799,7 @@ impl PackIndex {
             .iter()
             .zip(raw_entries)
             .map(|(object, (offset, crc32))| PackIndexEntry {
-                oid: object.entry.oid.clone(),
+                oid: object.entry.oid,
                 crc32,
                 offset,
             })
@@ -989,7 +989,7 @@ impl PackIndex {
                     "pack index object ids are not strictly sorted".into(),
                 ));
             }
-            previous_oid = Some(oid.clone());
+            previous_oid = Some(oid);
             entries.push(PackIndexEntry {
                 oid,
                 crc32: 0,
@@ -2227,7 +2227,7 @@ where
     for (idx, entry) in parsed.iter().enumerate() {
         match entry {
             ParsedPackEntry::Resolved(object) => {
-                oid_to_index.insert(object.entry.oid.clone(), idx);
+                oid_to_index.insert(object.entry.oid, idx);
                 resolved[idx] = Some(object.clone());
             }
             ParsedPackEntry::Delta { .. } => unresolved += 1,
@@ -2265,7 +2265,7 @@ where
             let oid = object.object_id(format)?;
             let pack_object = PackObject {
                 entry: PackEntry {
-                    oid: oid.clone(),
+                    oid,
                     compressed_size: *compressed_size,
                     uncompressed_size: object.body.len() as u64,
                     offset: *offset,
@@ -2808,7 +2808,7 @@ fn plan_pack_deltas(
         Vec::with_capacity(options.thin_bases.len());
     for (oid, object) in &options.thin_bases {
         external_indexes.push((
-            oid.clone(),
+            *oid,
             object.object_type,
             DeltaIndex::new(&object.body),
         ));
@@ -2877,7 +2877,7 @@ fn plan_pack_deltas(
             {
                 best_delta = Some(delta);
                 best_base = PlannedBase::External {
-                    base_oid: base_oid.clone(),
+                    base_oid: *base_oid,
                     delta: Vec::new(),
                 };
             }
@@ -3257,7 +3257,7 @@ fn parse_midx_object_ids(
         counts[oid.as_bytes()[0] as usize] = counts[oid.as_bytes()[0] as usize]
             .checked_add(1)
             .ok_or_else(|| GitError::InvalidFormat("multi-pack-index fanout overflow".into()))?;
-        previous_oid = Some(oid.clone());
+        previous_oid = Some(oid);
         ids.push(oid);
     }
 
@@ -4190,7 +4190,7 @@ mod tests {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(true);
         let written = PackFile::write_packed_with_options(
-            &[base.clone(), changed.clone()],
+            &[base, changed.clone()],
             ObjectFormat::Sha1,
             &options,
         )
@@ -4260,7 +4260,7 @@ mod tests {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(true);
         let written = PackFile::write_packed_with_options(
-            &[base.clone(), changed.clone()],
+            &[base, changed.clone()],
             ObjectFormat::Sha1,
             &options,
         )
@@ -4290,7 +4290,7 @@ mod tests {
         let (base, changed) = similar_blob_objects();
         let options = delta_pack_options(false);
         let written = PackFile::write_packed_with_options(
-            &[base.clone(), changed.clone()],
+            &[base, changed.clone()],
             ObjectFormat::Sha1,
             &options,
         )
@@ -4299,7 +4299,7 @@ mod tests {
         let by_oid: HashMap<ObjectId, Arc<EncodedObject>> = parsed
             .entries
             .iter()
-            .map(|po| (po.entry.oid.clone(), Arc::new(po.object.clone())))
+            .map(|po| (po.entry.oid, Arc::new(po.object.clone())))
             .collect();
         for po in &parsed.entries {
             let got =
@@ -4486,7 +4486,7 @@ mod tests {
             .expect("test operation should succeed");
         let entries = vec![
             PackIndexEntry {
-                oid: oid.clone(),
+                oid,
                 crc32: 1,
                 offset: 12,
             },
@@ -4510,7 +4510,7 @@ mod tests {
             .expect("test operation should succeed");
         let index = single_entry_index(
             ObjectFormat::Sha1,
-            oid.clone(),
+            oid,
             0x1234_5678,
             12,
             pack_checksum.clone(),
@@ -4546,7 +4546,7 @@ mod tests {
             .expect("test operation should succeed");
         let index = single_entry_index_v1(
             ObjectFormat::Sha1,
-            oid.clone(),
+            oid,
             0x1234_5678,
             pack_checksum.clone(),
         );
@@ -5021,7 +5021,7 @@ mod tests {
                 2,
                 &["pack-a.idx".into()],
                 &[MultiPackIndexEntry {
-                    oid: oid.clone(),
+                    oid,
                     pack_int_id: 1,
                     offset: 12,
                 }],
@@ -5035,7 +5035,7 @@ mod tests {
                 &["pack-a.idx".into()],
                 &[
                     MultiPackIndexEntry {
-                        oid: oid.clone(),
+                        oid,
                         pack_int_id: 0,
                         offset: 12,
                     },
@@ -5288,7 +5288,7 @@ mod tests {
             .expect("test operation should succeed");
         let index = single_entry_index(
             ObjectFormat::Sha256,
-            oid.clone(),
+            oid,
             0x1234_5678,
             12,
             pack_checksum.clone(),
@@ -5527,7 +5527,7 @@ mod tests {
             .expect("test operation should succeed");
 
         let mut external = HashMap::new();
-        external.insert(base_oid.clone(), base.clone());
+        external.insert(base_oid, base.clone());
         let packed = PackFile::write_thin(std::slice::from_ref(&target), format, external)
             .expect("test operation should succeed");
 
@@ -6061,7 +6061,7 @@ mod tests {
     ) -> Vec<([u8; 4], Vec<u8>)> {
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
-        let object_ids: Vec<ObjectId> = entries.iter().map(|entry| entry.0.clone()).collect();
+        let object_ids: Vec<ObjectId> = entries.iter().map(|entry| entry.0).collect();
         let mut large_offsets = Vec::new();
         let mut chunks = vec![
             (*b"PNAM", pack_names),

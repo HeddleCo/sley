@@ -32,7 +32,7 @@ fn must_not_exist_is_create_only() {
     let mut tx = s.transaction();
     tx.update_to(
         "refs/heads/x",
-        RefTarget::Direct(a.clone()),
+        RefTarget::Direct(a),
         RefPrecondition::MustNotExist,
         None,
     );
@@ -40,7 +40,7 @@ fn must_not_exist_is_create_only() {
     assert_eq!(
         s.read_ref("refs/heads/x")
             .expect("test operation should succeed"),
-        Some(RefTarget::Direct(a.clone()))
+        Some(RefTarget::Direct(a))
     );
 
     // A second create must fail and leave the value intact.
@@ -71,8 +71,8 @@ fn existing_must_match_allows_absent_or_equal() {
     let mut tx = s.transaction();
     tx.update_to(
         "refs/heads/y",
-        RefTarget::Direct(a.clone()),
-        RefPrecondition::ExistingMustMatch(RefTarget::Direct(a.clone())),
+        RefTarget::Direct(a),
+        RefPrecondition::ExistingMustMatch(RefTarget::Direct(a)),
         None,
     );
     tx.commit().expect("test operation should succeed");
@@ -82,15 +82,15 @@ fn existing_must_match_allows_absent_or_equal() {
     let mut tx = s.transaction();
     tx.update_to(
         "refs/heads/y",
-        RefTarget::Direct(b.clone()),
-        RefPrecondition::ExistingMustMatch(RefTarget::Direct(a.clone())),
+        RefTarget::Direct(b),
+        RefPrecondition::ExistingMustMatch(RefTarget::Direct(a)),
         None,
     );
     tx.commit().expect("test operation should succeed");
     assert_eq!(
         s.read_ref("refs/heads/y")
             .expect("test operation should succeed"),
-        Some(RefTarget::Direct(b.clone()))
+        Some(RefTarget::Direct(b))
     );
 
     // Present but differing -> rejected.
@@ -142,7 +142,7 @@ fn failed_precondition_rolls_back_whole_batch() {
     let mut tx = s.transaction();
     tx.update_to(
         "refs/heads/keep",
-        RefTarget::Direct(a.clone()),
+        RefTarget::Direct(a),
         RefPrecondition::MustNotExist,
         None,
     );
@@ -190,7 +190,7 @@ fn refupdate_expected_still_behaves_as_must_match() {
     tx.update(RefUpdate {
         name: "refs/heads/c".into(),
         expected: None,
-        new: RefTarget::Direct(a.clone()),
+        new: RefTarget::Direct(a),
         reflog: None,
     });
     tx.commit().expect("test operation should succeed");
@@ -200,8 +200,8 @@ fn refupdate_expected_still_behaves_as_must_match() {
     let mut tx = s.transaction();
     tx.update(RefUpdate {
         name: "refs/heads/c".into(),
-        expected: Some(RefTarget::Direct(a.clone())),
-        new: RefTarget::Direct(b.clone()),
+        expected: Some(RefTarget::Direct(a)),
+        new: RefTarget::Direct(b),
         reflog: None,
     });
     tx.commit().expect("test operation should succeed");

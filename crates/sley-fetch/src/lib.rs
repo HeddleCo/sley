@@ -94,7 +94,7 @@ mod tests {
         let result = install_upload_pack_raw_response(&response, &destination)
             .expect("test operation should succeed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);
     }
@@ -118,7 +118,7 @@ mod tests {
         let result = install_upload_pack_raw_promisor_response(&response, &destination)
             .expect("test operation should succeed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         assert_promisor_sidecar(&root.join("objects"));
         let _ = fs::remove_dir_all(&root);
@@ -146,7 +146,7 @@ mod tests {
         let result = install_protocol_v2_fetch_packfile(&packfile, &destination)
             .expect("test operation should succeed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);
     }
@@ -179,7 +179,7 @@ mod tests {
             .expect("test operation should succeed")
             .expect("packfile should be installed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         let _ = fs::remove_dir_all(&root);
     }
@@ -207,7 +207,7 @@ mod tests {
             .expect("test operation should succeed")
             .expect("packfile should be installed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_pack_install(&root.join("objects"), &destination, &oid, &object);
         assert_promisor_sidecar(&root.join("objects"));
         let _ = fs::remove_dir_all(&root);
@@ -274,7 +274,7 @@ mod tests {
         let result = install_upload_pack_raw_response(&response, &destination)
             .expect("test operation should succeed");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert_eq!(
             destination
                 .borrow()

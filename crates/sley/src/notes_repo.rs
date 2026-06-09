@@ -1,8 +1,8 @@
 //! Repository-level git notes helpers.
 
 use sley_notes::{
-    Note, NotesCommitIdentity, NotesRef, list_notes, read_note, read_note_bytes,
-    resolve_notes_ref, write_notes,
+    Note, NotesCommitIdentity, NotesIter, NotesRef, iter_notes, list_notes,
+    read_note_bytes, read_note_for, resolve_notes_ref, write_notes,
 };
 
 use crate::{ObjectId, Repository, Result};
@@ -23,15 +23,34 @@ impl Repository {
         )
     }
 
-    /// Return the note blob oid for `annotated`, if any.
-    pub fn read_note(&self, notes_ref: &NotesRef, annotated: &ObjectId) -> Result<Option<ObjectId>> {
-        read_note(
+    /// Stream notes from `notes_ref` without loading the full list.
+    pub fn iter_notes(&self, notes_ref: &NotesRef) -> Result<NotesIter> {
+        iter_notes(
+            self.git_dir(),
+            self.object_format(),
+            &self.references(),
+            notes_ref,
+        )
+    }
+
+    /// Return the note blob oid for `annotated`, if any (fanout-aware lookup).
+    pub fn read_note_for(
+        &self,
+        notes_ref: &NotesRef,
+        annotated: &ObjectId,
+    ) -> Result<Option<ObjectId>> {
+        read_note_for(
             self.git_dir(),
             self.object_format(),
             &self.references(),
             notes_ref,
             annotated,
         )
+    }
+
+    /// Return the note blob oid for `annotated`, if any.
+    pub fn read_note(&self, notes_ref: &NotesRef, annotated: &ObjectId) -> Result<Option<ObjectId>> {
+        self.read_note_for(notes_ref, annotated)
     }
 
     /// Return decoded note bytes for `annotated`, if a note exists.

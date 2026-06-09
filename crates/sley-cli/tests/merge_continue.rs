@@ -29,6 +29,8 @@ fn run_output_with_identity(program: &str, cwd: &Path, args: &[&str]) -> Output 
         .env("GIT_COMMITTER_NAME", "Example User")
         .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
         .env("GIT_COMMITTER_DATE", "@0 +0000")
+        // Prevent system git from opening an interactive editor during merge --continue.
+        .env("GIT_EDITOR", "true")
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -148,8 +150,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         start_conflict_merge("git", &upstream);
         start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
         resolve_conflict(&upstream);
@@ -196,9 +197,7 @@ fn merge_continue_after_resolving_conflict_matches_upstream_git() {
             fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
             "worktree content differed after merge --continue"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -208,8 +207,7 @@ fn merge_continue_with_unmerged_entries_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         start_conflict_merge("git", &upstream);
         start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
 
@@ -217,9 +215,7 @@ fn merge_continue_with_unmerged_entries_fails() {
         let expected = run_output_with_identity("git", &upstream, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -229,8 +225,7 @@ fn merge_continue_without_merge_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        for repo in [&upstream, &rust] {
+            for repo in [&upstream, &rust] {
             git(repo, &["init", "-q", "-b", "master"]);
             prepare_identity(repo);
             fs::write(repo.join("hello.txt"), b"hello\n").expect("write hello file");
@@ -242,7 +237,5 @@ fn merge_continue_without_merge_fails() {
         let expected = run_output_with_identity("git", &upstream, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

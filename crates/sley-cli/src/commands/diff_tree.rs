@@ -413,7 +413,7 @@ fn single_commit_request(
         );
         return Ok(DiffRequest {
             left: None,
-            right: Some(oid.clone()),
+            right: Some(*oid),
             header: None,
             skip: true,
         });
@@ -831,12 +831,12 @@ fn top_level_changes(
         };
         changes.push(sley_diff_merge::NameStatusEntry {
             status,
-            path: name,
+            path: BString::from(name),
             old_path: None,
             old_mode: l.map(|entry| entry.mode),
             new_mode: r.map(|entry| entry.mode),
-            old_oid: l.map(|entry| entry.oid.clone()),
-            new_oid: r.map(|entry| entry.oid.clone()),
+            old_oid: l.map(|entry| entry.oid),
+            new_oid: r.map(|entry| entry.oid),
         });
     }
     changes
@@ -916,7 +916,7 @@ fn detect_top_level_rename_pass(
 
     // Exact-OID renames first (score 100), in source order then dest order.
     for (si, &src_idx) in deleted.iter().enumerate() {
-        let Some(src_oid) = changes[src_idx].old_oid.clone() else {
+        let Some(src_oid) = changes[src_idx].old_oid else {
             continue;
         };
         if !rename_empty && is_empty_blob_oid(&src_oid) {
@@ -1008,7 +1008,7 @@ fn apply_rename_assignments(
             RenameSourceMeta {
                 path: src_entry.path.clone(),
                 mode: src_entry.old_mode,
-                oid: src_entry.old_oid.clone(),
+                oid: src_entry.old_oid,
             },
         );
     }
@@ -1040,7 +1040,7 @@ fn apply_rename_assignments(
 /// entry is consumed so it can be attached to the renamed destination.
 #[derive(Clone, Default)]
 struct RenameSourceMeta {
-    path: Vec<u8>,
+    path: BString,
     mode: Option<u32>,
     oid: Option<ObjectId>,
 }
@@ -1069,7 +1069,7 @@ fn detect_top_level_copy_pass(
             (Some(mode), Some(oid)) if mode != 0o040000 => Some(CopySource {
                 path: entry.path.clone(),
                 mode,
-                oid: oid.clone(),
+                oid: *oid,
             }),
             _ => None,
         })
@@ -1082,7 +1082,7 @@ fn detect_top_level_copy_pass(
         if entry.status != sley_diff_merge::NameStatus::Added || !entry_is_blob_new(entry) {
             continue;
         }
-        let Some(dst_oid) = entry.new_oid.clone() else {
+        let Some(dst_oid) = entry.new_oid else {
             continue;
         };
         if !rename_empty && is_empty_blob_oid(&dst_oid) {
@@ -1093,7 +1093,7 @@ fn detect_top_level_copy_pass(
             entry.status = sley_diff_merge::NameStatus::Copied(100);
             entry.old_path = Some(source.path.clone());
             entry.old_mode = Some(source.mode);
-            entry.old_oid = Some(source.oid.clone());
+            entry.old_oid = Some(source.oid);
             continue;
         }
         let Some(dst_bytes) = read_blob_for_similarity(db, &dst_oid) else {
@@ -1116,7 +1116,7 @@ fn detect_top_level_copy_pass(
             entry.status = sley_diff_merge::NameStatus::Copied(score);
             entry.old_path = Some(source.path.clone());
             entry.old_mode = Some(source.mode);
-            entry.old_oid = Some(source.oid.clone());
+            entry.old_oid = Some(source.oid);
         }
     }
     changes
@@ -1124,7 +1124,7 @@ fn detect_top_level_copy_pass(
 
 /// A candidate copy source: the old-side path/mode/oid of a left-side blob.
 struct CopySource {
-    path: Vec<u8>,
+    path: BString,
     mode: u32,
     oid: ObjectId,
 }
@@ -1206,7 +1206,7 @@ fn collect_changed_tree_nodes(
         };
         out.push(sley_diff_merge::NameStatusEntry {
             status,
-            path: path.clone(),
+            path: BString::from(path.clone()),
             old_path: None,
             old_mode: l.map(|_| 0o040000),
             new_mode: r.map(|_| 0o040000),

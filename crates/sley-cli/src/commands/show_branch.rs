@@ -248,7 +248,7 @@ fn sort_seen_by_date(state: &mut TraversalState) -> Result<()> {
     let mut keyed: Vec<(i64, usize, ObjectId)> = Vec::with_capacity(state.seen.len());
     for (idx, oid) in state.seen.clone().iter().enumerate() {
         let time = state.committer_time(oid)?;
-        keyed.push((time, idx, oid.clone()));
+        keyed.push((time, idx, *oid));
     }
     keyed.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
     state.seen = keyed.into_iter().map(|(_, _, oid)| oid).collect();
@@ -312,7 +312,7 @@ impl<'a> TraversalState<'a> {
             )));
         }
         let commit = std::rc::Rc::new(Commit::parse(self.format, &object.body)?);
-        self.parsed.insert(oid.clone(), commit.clone());
+        self.parsed.insert(*oid, commit.clone());
         Ok(commit)
     }
 
@@ -330,7 +330,7 @@ impl<'a> TraversalState<'a> {
         if self.flags(oid) == 0 && !self.seen.contains(oid) {
             // git front-inserts into `seen`; preserve that so the pre-sort
             // display order matches.
-            self.seen.insert(0, oid.clone());
+            self.seen.insert(0, *oid);
             return Ok(true);
         }
         Ok(false)
@@ -338,13 +338,13 @@ impl<'a> TraversalState<'a> {
 
     /// OR `flag` into a commit's flags, returning the new combined value.
     fn add_flag(&mut self, oid: &ObjectId, flag: u32) -> Result<u32> {
-        let entry = self.flags.entry(oid.clone()).or_insert(0);
+        let entry = self.flags.entry(*oid).or_insert(0);
         *entry |= flag;
         Ok(*entry)
     }
 
     fn queue_push(&mut self, oid: &ObjectId) -> Result<()> {
-        self.queue.push(oid.clone());
+        self.queue.push(*oid);
         Ok(())
     }
 
@@ -726,7 +726,7 @@ fn name_commits(
         }
         if let Some(sref) = selected.iter().find(|s| &s.oid == oid) {
             state.names.insert(
-                oid.clone(),
+                *oid,
                 CommitName {
                     head_name: sref.name.clone(),
                     generation: 0,
@@ -770,7 +770,7 @@ fn name_commits(
                     format!("{base}^{nth}")
                 };
                 state.names.insert(
-                    parent.clone(),
+                    *parent,
                     CommitName {
                         head_name: new_name,
                         generation: 0,
@@ -813,7 +813,7 @@ fn name_first_parent_chain(state: &mut TraversalState, start: &ObjectId) -> Resu
             None => break,
         };
         state.names.insert(
-            parent.clone(),
+            parent,
             CommitName {
                 head_name: child.head_name,
                 generation: child.generation + 1,
@@ -849,7 +849,7 @@ fn sort_for_display(state: &mut TraversalState, order: SortOrder) -> Result<Vec<
     // child that has it as a parent. A commit with indegree 1 is a "ready" tip.
     let mut indegree: HashMap<ObjectId, i64> = HashMap::new();
     for oid in &nodes {
-        indegree.insert(oid.clone(), 1);
+        indegree.insert(*oid, 1);
     }
     for oid in &nodes {
         let parents = state.parents(oid)?;
@@ -918,7 +918,7 @@ fn sort_for_display(state: &mut TraversalState, order: SortOrder) -> Result<Vec<
     if out.len() != nodes.len() {
         for oid in &nodes {
             if !out.contains(oid) {
-                out.push(oid.clone());
+                out.push(*oid);
             }
         }
     }

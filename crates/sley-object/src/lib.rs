@@ -10,6 +10,8 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, Result, Signature};
 use std::str::FromStr;
 
+pub use sley_core::BString;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ObjectType {
     Blob,
@@ -82,7 +84,7 @@ pub struct Tree {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeEntry {
     pub mode: u32,
-    pub name: Vec<u8>,
+    pub name: BString,
     pub oid: ObjectId,
 }
 
@@ -140,7 +142,7 @@ impl<'a> From<TreeEntryRef<'a>> for TreeEntry {
     fn from(entry: TreeEntryRef<'a>) -> Self {
         Self {
             mode: entry.mode,
-            name: entry.name.to_vec(),
+            name: entry.name.into(),
             oid: entry.oid,
         }
     }
@@ -159,7 +161,7 @@ impl Tree {
         for entry in &self.entries {
             out.extend_from_slice(format!("{:o}", entry.mode).as_bytes());
             out.push(b' ');
-            out.extend_from_slice(&entry.name);
+            out.extend_from_slice(entry.name.as_bytes());
             out.push(0);
             out.extend_from_slice(entry.oid.as_bytes());
         }
@@ -328,7 +330,7 @@ impl TreeEntryRef<'_> {
     pub fn to_owned(&self) -> TreeEntry {
         TreeEntry {
             mode: self.mode,
-            name: self.name.to_vec(),
+            name: self.name.into(),
             oid: self.oid,
         }
     }
@@ -390,15 +392,19 @@ impl TreeBuilder {
 
     /// Insert or replace the entry named `name` with one of Git's canonical
     /// kinds.
-    pub fn upsert(&mut self, name: impl Into<Vec<u8>>, kind: EntryKind, oid: ObjectId) {
+    pub fn upsert(&mut self, name: impl Into<BString>, kind: EntryKind, oid: ObjectId) {
         self.upsert_raw(name, kind.mode(), oid);
     }
 
     /// Insert or replace using a raw mode (for round-tripping non-canonical
     /// modes); prefer [`upsert`](TreeBuilder::upsert) for normal entries.
-    pub fn upsert_raw(&mut self, name: impl Into<Vec<u8>>, mode: u32, oid: ObjectId) {
+    pub fn upsert_raw(&mut self, name: impl Into<BString>, mode: u32, oid: ObjectId) {
         let name = name.into();
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.name == name) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == name.as_bytes())
+        {
             entry.mode = mode;
             entry.oid = oid;
         } else {
@@ -427,8 +433,14 @@ impl TreeBuilder {
     /// Collect into a [`Tree`] with entries in Git's canonical order.
     pub fn build(self) -> Tree {
         let mut entries = self.entries;
-        entries
-            .sort_by(|left, right| tree_entry_cmp(&left.name, left.mode, &right.name, right.mode));
+        entries.sort_by(|left, right| {
+            tree_entry_cmp(
+                left.name.as_bytes(),
+                left.mode,
+                right.name.as_bytes(),
+                right.mode,
+            )
+        });
         Tree { entries }
     }
 
@@ -780,7 +792,7 @@ mod tests {
         builder.upsert("a.txt", EntryKind::BlobExecutable, blob);
 
         let tree = builder.build();
-        let names: Vec<&[u8]> = tree.entries.iter().map(|e| e.name.as_slice()).collect();
+        let names: Vec<&[u8]> = tree.entries.iter().map(|e| e.name.as_bytes()).collect();
         assert_eq!(names, vec![&b"a.txt"[..], &b"foo.txt"[..], &b"foo"[..]]);
         assert_eq!(tree.entries[0].mode, EntryKind::BlobExecutable.mode());
         assert!(tree.entries[2].is_tree());
@@ -819,7 +831,7 @@ mod tests {
         let tree = Tree {
             entries: vec![TreeEntry {
                 mode: 0o100644,
-                name: b"hello.txt".to_vec(),
+                name: BString::from(b"hello.txt"),
                 oid: blob,
             }],
         };
@@ -914,7 +926,7 @@ mod tests {
         let tree = TreeEntryRef {
             mode: EntryKind::Tree.mode(),
             name: b"dir",
-            oid: oid.clone(),
+            oid,
         };
         assert_eq!(tree.kind(), Some(EntryKind::Tree));
         assert!(tree.is_tree());
@@ -925,7 +937,7 @@ mod tests {
         let symlink = TreeEntryRef {
             mode: EntryKind::Symlink.mode(),
             name: b"link",
-            oid: oid.clone(),
+            oid,
         };
         assert_eq!(symlink.kind(), Some(EntryKind::Symlink));
         assert!(symlink.is_symlink());
@@ -936,7 +948,7 @@ mod tests {
         let executable = TreeEntryRef {
             mode: EntryKind::BlobExecutable.mode(),
             name: b"run",
-            oid: oid.clone(),
+            oid,
         };
         assert_eq!(executable.kind(), Some(EntryKind::BlobExecutable));
         assert!(executable.is_executable());

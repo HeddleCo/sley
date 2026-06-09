@@ -421,7 +421,7 @@ fn current_index_stage0(git_dir: &Path, format: ObjectFormat) -> Result<LeafMap>
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in index.entries {
             if entry_stage(&entry) == 0 {
-                out.insert(entry.path, (entry.mode, entry.oid));
+                out.insert(entry.path.into_bytes(), (entry.mode, entry.oid));
             }
         }
     }
@@ -441,7 +441,7 @@ fn original_index_paths(git_dir: &Path, format: ObjectFormat) -> Result<BTreeSet
     let mut out = BTreeSet::new();
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in index.entries {
-            out.insert(entry.path);
+            out.insert(entry.path.into_bytes());
         }
     }
     Ok(out)
@@ -585,7 +585,7 @@ fn merge_two_trees(
             (None, None) => {
                 // Only present locally (a local addition): keep it.
                 if let Some((mode, oid)) = in_index {
-                    result.push((path.clone(), stage0(*mode, oid.clone())));
+                    result.push((path.clone(), stage0(*mode, *oid)));
                 }
             }
         }
@@ -653,13 +653,13 @@ fn merge_three_trees(
                 // silently clobber local work.
                 verify_uptodate(&worktree_root, db, format, path, in_index)?;
                 if let Some((mode, oid)) = o {
-                    result.push((path.clone(), staged(*mode, oid.clone(), 1)));
+                    result.push((path.clone(), staged(*mode, *oid, 1)));
                 }
                 if let Some((mode, oid)) = a {
-                    result.push((path.clone(), staged(*mode, oid.clone(), 2)));
+                    result.push((path.clone(), staged(*mode, *oid, 2)));
                 }
                 if let Some((mode, oid)) = b {
-                    result.push((path.clone(), staged(*mode, oid.clone(), 3)));
+                    result.push((path.clone(), staged(*mode, *oid, 3)));
                 }
             }
         }
@@ -777,7 +777,7 @@ fn make_index_entry(path: Vec<u8>, entry: StagedEntry) -> Result<IndexEntry> {
         oid: entry.oid,
         flags: name_len | stage_bits,
         flags_extended: 0,
-        path,
+        path: BString::from(path),
     })
 }
 
@@ -812,7 +812,7 @@ fn update_worktree_for_entries(
         if entry.stage != 0 {
             continue;
         }
-        if original.get(path) == Some(&(entry.mode, entry.oid.clone())) {
+        if original.get(path) == Some(&(entry.mode, entry.oid)) {
             continue;
         }
         write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;
@@ -832,7 +832,7 @@ fn reset_worktree_to_entries(
     let target: BTreeSet<&Vec<u8>> = entries.iter().map(|(path, _)| path).collect();
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in &index.entries {
-            if !target.contains(&entry.path) {
+            if !target.iter().any(|p| p.as_slice() == entry.path.as_bytes()) {
                 remove_worktree_path(worktree_root, &entry.path)?;
             }
         }
@@ -863,7 +863,7 @@ fn update_worktree_for_merge(
     let original = current_index_stage0(git_dir, format)?;
     if let Some(index) = sley_worktree::read_repository_index(git_dir, format)? {
         for entry in &index.entries {
-            if !kept.contains(&entry.path) {
+            if !kept.iter().any(|p| p.as_slice() == entry.path.as_bytes()) {
                 remove_worktree_path(worktree_root, &entry.path)?;
             }
         }
@@ -873,7 +873,7 @@ fn update_worktree_for_merge(
             continue;
         }
         // Skip paths the merge left identical to the prior index entry.
-        if original.get(path) == Some(&(entry.mode, entry.oid.clone())) {
+        if original.get(path) == Some(&(entry.mode, entry.oid)) {
             continue;
         }
         write_blob_to_worktree(worktree_root, db, path, &entry.oid)?;

@@ -24,7 +24,7 @@ sley-remote = { path = "../sley-remote", optional = true }
 default = ["remote"]
 # Callable fetch/push/clone/ls-remote orchestration (heddle transport surface).
 # Enabled by default; disable with `default-features = false` for a smaller dep tree.
-remote = ["dep:sley-remote"]
+remote = ["dep:sley-remote", "sley-remote/http"]
 # Opt into the zlib-ng C backend for object (de)compression (forwarded to
 # sley-odb / sley-pack). Default builds stay pure-Rust (miniz_oxide).
 zlib-ng = ["sley-odb/zlib-ng"]

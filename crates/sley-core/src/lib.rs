@@ -1,6 +1,7 @@
 use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -297,10 +298,7 @@ fn validate_full_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(GitError::InvalidFormat("ref name must not be empty".into()));
     }
-    if name
-        .chars()
-        .next()
-        .is_some_and(|ch| ch.is_whitespace())
+    if name.chars().next().is_some_and(|ch| ch.is_whitespace())
         || name.chars().last().is_some_and(|ch| ch.is_whitespace())
     {
         return Err(GitError::InvalidFormat(
@@ -321,20 +319,78 @@ fn validate_full_name(name: &str) -> Result<()> {
 }
 
 /// A byte string for git paths and similar on-disk identifiers.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BString(Vec<u8>);
 
 impl BString {
     pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
         Self(bytes.into())
     }
-
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Self(bytes.to_vec())
     }
-
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<&str> for BString {
+    fn from(v: &str) -> Self {
+        Self::from_bytes(v.as_bytes())
+    }
+}
+impl From<&[u8]> for BString {
+    fn from(v: &[u8]) -> Self {
+        Self::from_bytes(v)
+    }
+}
+impl<const N: usize> From<&[u8; N]> for BString {
+    fn from(v: &[u8; N]) -> Self {
+        Self::from_bytes(v.as_slice())
+    }
+}
+impl From<Vec<u8>> for BString {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+impl PartialEq<&[u8]> for BString {
+    fn eq(&self, o: &&[u8]) -> bool {
+        self.0.as_slice() == *o
+    }
+}
+impl<const N: usize> PartialEq<&[u8; N]> for BString {
+    fn eq(&self, o: &&[u8; N]) -> bool {
+        self.as_bytes() == o.as_slice()
+    }
+}
+impl PartialEq<BString> for &[u8] {
+    fn eq(&self, o: &BString) -> bool {
+        *self == o.as_bytes()
+    }
+}
+impl<const N: usize> PartialEq<BString> for &[u8; N] {
+    fn eq(&self, o: &BString) -> bool {
+        self.as_slice() == o.as_bytes()
+    }
+}
+impl PartialEq<Vec<u8>> for BString {
+    fn eq(&self, o: &Vec<u8>) -> bool {
+        self.0 == *o
+    }
+}
+impl PartialEq<BString> for Vec<u8> {
+    fn eq(&self, o: &BString) -> bool {
+        *self == o.0
     }
 }
 
@@ -346,7 +402,21 @@ impl fmt::Display for BString {
 
 impl Borrow<[u8]> for BString {
     fn borrow(&self) -> &[u8] {
-        &self.0
+        self.as_bytes()
+    }
+}
+
+impl Deref for BString {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl AsRef<[u8]> for BString {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
     }
 }
 
@@ -668,9 +738,7 @@ impl GitError {
     }
 
     pub fn remote_not_found(name: impl Into<String>) -> Self {
-        Self::NotFound(NotFoundKind::Remote {
-            name: name.into(),
-        })
+        Self::NotFound(NotFoundKind::Remote { name: name.into() })
     }
 
     pub fn object_not_found(oid: ObjectId) -> Self {
@@ -678,15 +746,11 @@ impl GitError {
     }
 
     pub fn reference_not_found(name: impl Into<String>) -> Self {
-        Self::NotFound(NotFoundKind::Reference {
-            name: name.into(),
-        })
+        Self::NotFound(NotFoundKind::Reference { name: name.into() })
     }
 
     pub fn repository_not_found(path: impl Into<String>) -> Self {
-        Self::NotFound(NotFoundKind::Repository {
-            path: path.into(),
-        })
+        Self::NotFound(NotFoundKind::Repository { path: path.into() })
     }
 
     pub fn not_found_kind(&self) -> Option<&NotFoundKind> {
@@ -1262,5 +1326,7 @@ mod tests {
         let borrowed: &[u8] = path.borrow();
         assert_eq!(borrowed, b"src/\xFF.txt".as_slice());
         assert_eq!(format!("{path}"), "src/\u{FFFD}.txt");
+        assert_eq!(path, b"src/\xFF.txt");
+        assert_eq!(path.clone().into_bytes(), b"src/\xFF.txt".to_vec());
     }
 }

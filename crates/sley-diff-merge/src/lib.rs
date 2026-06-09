@@ -1,4 +1,6 @@
 use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_for_bytes};
+
+pub use sley_core::BString;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
 use sley_odb::{FileObjectDatabase, ObjectReader};
@@ -1075,8 +1077,8 @@ impl NameStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NameStatusEntry {
     pub status: NameStatus,
-    pub path: Vec<u8>,
-    pub old_path: Option<Vec<u8>>,
+    pub path: BString,
+    pub old_path: Option<BString>,
     pub old_mode: Option<u32>,
     pub new_mode: Option<u32>,
     pub old_oid: Option<ObjectId>,
@@ -1089,14 +1091,14 @@ impl NameStatusEntry {
             format!(
                 "{}\t{}\t{}",
                 self.status.label(),
-                String::from_utf8_lossy(old_path),
-                String::from_utf8_lossy(&self.path)
+                String::from_utf8_lossy(old_path.as_bytes()),
+                String::from_utf8_lossy(self.path.as_bytes())
             )
         } else {
             format!(
                 "{}\t{}",
                 self.status.label(),
-                String::from_utf8_lossy(&self.path)
+                String::from_utf8_lossy(self.path.as_bytes())
             )
         }
     }
@@ -1578,12 +1580,12 @@ fn raw_name_status_changes<'a>(
         if let Some(status) = status {
             changes.push(NameStatusEntry {
                 status,
-                path,
+                path: path.into(),
                 old_path: None,
                 old_mode: left.map(|entry| entry.mode),
                 new_mode: right.map(|entry| entry.mode),
-                old_oid: left.map(|entry| entry.oid.clone()),
-                new_oid: right.map(|entry| entry.oid.clone()),
+                old_oid: left.map(|entry| entry.oid),
+                new_oid: right.map(|entry| entry.oid),
             });
         }
     }
@@ -1675,26 +1677,26 @@ fn detect_exact_renames(
     let mut result = Vec::new();
 
     for old_path in deleted {
-        let Some(left) = left_entries.get(&old_path) else {
+        let Some(left) = left_entries.get(old_path.as_bytes()) else {
             continue;
         };
         if let Some((idx, new_path)) = added.iter().find(|(idx, new_path)| {
             !consumed.contains(idx)
-                && right_entries.get(new_path).is_some_and(|right| {
+                && right_entries.get(new_path.as_bytes()).is_some_and(|right| {
                     right.oid == left.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
                 })
         }) {
             consumed.insert(*idx);
             renamed_old_paths.insert(old_path.clone());
-            let right = right_entries.get(new_path);
+            let right = right_entries.get(new_path.as_bytes());
             result.push(NameStatusEntry {
                 status: NameStatus::Renamed(100),
                 path: new_path.clone(),
                 old_path: Some(old_path),
                 old_mode: Some(left.mode),
                 new_mode: right.map(|entry| entry.mode),
-                old_oid: Some(left.oid.clone()),
-                new_oid: right.map(|entry| entry.oid.clone()),
+                old_oid: Some(left.oid),
+                new_oid: right.map(|entry| entry.oid),
             });
         }
     }
@@ -1726,7 +1728,7 @@ fn detect_exact_copies(
         .collect::<BTreeSet<_>>();
     let source_paths = left_entries
         .keys()
-        .filter(|path| find_copies_harder || changed_sources.contains(*path))
+        .filter(|path| find_copies_harder || changed_sources.contains(path.as_slice()))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -1736,12 +1738,12 @@ fn detect_exact_copies(
             result.push(entry);
             continue;
         }
-        let Some(right) = right_entries.get(&entry.path) else {
+        let Some(right) = right_entries.get(entry.path.as_bytes()) else {
             result.push(entry);
             continue;
         };
         if let Some(old_path) = source_paths.iter().find(|old_path| {
-            old_path.as_slice() != entry.path.as_slice()
+            old_path.as_slice() != entry.path.as_bytes()
                 && left_entries.get(*old_path).is_some_and(|left| {
                     left.oid == right.oid && (rename_empty || !is_empty_blob_oid(&left.oid))
                 })
@@ -1749,10 +1751,10 @@ fn detect_exact_copies(
             result.push(NameStatusEntry {
                 status: NameStatus::Copied(100),
                 path: entry.path,
-                old_path: Some(old_path.clone()),
-                old_mode: left_entries.get(old_path).map(|entry| entry.mode),
+                old_path: Some(old_path.clone().into()),
+                old_mode: left_entries.get(old_path.as_slice()).map(|entry| entry.mode),
                 new_mode: entry.new_mode,
-                old_oid: left_entries.get(old_path).map(|entry| entry.oid.clone()),
+                old_oid: left_entries.get(old_path.as_slice()).map(|entry| entry.oid),
                 new_oid: entry.new_oid,
             });
         } else {
@@ -1765,9 +1767,9 @@ fn detect_exact_copies(
 
 /// Old-side metadata of a rename source, snapshotted before the source delete
 /// entry is consumed so it can be attached to the renamed destination.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct RenameSourceMeta {
-    path: Vec<u8>,
+    path: BString,
     mode: Option<u32>,
     oid: Option<ObjectId>,
 }
@@ -1896,7 +1898,7 @@ fn detect_inexact_renames(
                 RenameSourceMeta {
                     path: src.path.clone(),
                     mode: src.old_mode,
-                    oid: src.old_oid.clone(),
+                    oid: src.old_oid,
                 },
             )
         })
@@ -1912,7 +1914,7 @@ fn detect_inexact_renames(
             // The destination becomes a rename from the matched source. Pull the
             // old-side metadata from the snapshot; the new-side metadata stays as
             // the destination's.
-            let meta = source_meta.get(src_idx).cloned().unwrap_or_default();
+            let meta = source_meta.get(src_idx).cloned().unwrap_or(RenameSourceMeta { path: BString::default(), mode: None, oid: None });
             result.push(NameStatusEntry {
                 status: NameStatus::Renamed(*score),
                 path: entry.path,
@@ -1959,7 +1961,7 @@ fn detect_inexact_copies(
     // Eligible source paths, paired with their bytes (fetched lazily/once).
     let mut sources: Vec<(Vec<u8>, &TrackedEntry, Vec<u8>)> = Vec::new();
     for (path, tracked) in left_entries {
-        if !(options.base.find_copies_harder || changed_sources.contains(path)) {
+        if !(options.base.find_copies_harder || changed_sources.contains(path.as_slice())) {
             continue;
         }
         if !options.base.rename_empty && is_empty_blob_oid(&tracked.oid) {
@@ -1993,7 +1995,7 @@ fn detect_inexact_copies(
         // deterministic.
         let mut best: Option<(usize, u8)> = None;
         for (i, (src_path, _, src_bytes)) in sources.iter().enumerate() {
-            if src_path.as_slice() == entry.path.as_slice() {
+            if src_path.as_slice() == entry.path.as_bytes() {
                 continue;
             }
             let score = blob_similarity(src_bytes, &dst_bytes);
@@ -2011,10 +2013,10 @@ fn detect_inexact_copies(
             result.push(NameStatusEntry {
                 status: NameStatus::Copied(score),
                 path: entry.path,
-                old_path: Some(src_path.clone()),
+                old_path: Some(src_path.clone().into()),
                 old_mode: Some(src_tracked.mode),
                 new_mode: entry.new_mode,
-                old_oid: Some(src_tracked.oid.clone()),
+                old_oid: Some(src_tracked.oid),
                 new_oid: entry.new_oid,
             });
         } else {
@@ -2171,9 +2173,9 @@ fn common_span_bytes(src: &BTreeMap<u64, usize>, dst: &BTreeMap<u64, usize>) -> 
 
 fn diff_entry_sort_path(entry: &NameStatusEntry) -> &[u8] {
     if matches!(entry.status, NameStatus::Copied(_)) {
-        &entry.path
+        entry.path.as_bytes()
     } else {
-        entry.old_path.as_deref().unwrap_or(&entry.path)
+        entry.old_path.as_ref().map(|p| p.as_bytes()).unwrap_or_else(|| entry.path.as_bytes())
     }
 }
 
@@ -2185,8 +2187,8 @@ fn mark_unstaged_worktree_oids_unresolved(
     changes
         .into_iter()
         .map(|mut entry| {
-            let worktree_entry = worktree_entries.get(&entry.path);
-            if worktree_entry != index_entries.get(&entry.path) {
+            let worktree_entry = worktree_entries.get(entry.path.as_bytes());
+            if worktree_entry != index_entries.get(entry.path.as_bytes()) {
                 entry.new_oid = None;
             }
             entry
@@ -2221,7 +2223,7 @@ fn read_index_entries(
         .into_iter()
         .map(|entry| {
             (
-                entry.path,
+                entry.path.into_bytes(),
                 TrackedEntry {
                     mode: entry.mode,
                     oid: entry.oid,
@@ -2406,11 +2408,11 @@ fn diff_tree_pair(
     // entry order.)
     let mut right_by_name: HashMap<&[u8], &TreeEntry> = HashMap::with_capacity(right_entries.len());
     for entry in &right_entries {
-        right_by_name.insert(entry.name.as_slice(), entry);
+        right_by_name.insert(entry.name.as_bytes(), entry);
     }
 
     for left_entry in &left_entries {
-        match right_by_name.remove(left_entry.name.as_slice()) {
+        match right_by_name.remove(left_entry.name.as_bytes()) {
             Some(right_entry) => {
                 merge_tree_entry(
                     db,
@@ -2429,7 +2431,7 @@ fn diff_tree_pair(
     }
     // Names only present on the right are pure additions.
     for right_entry in &right_entries {
-        if right_by_name.contains_key(right_entry.name.as_slice()) {
+        if right_by_name.contains_key(right_entry.name.as_bytes()) {
             merge_tree_entry(db, format, prefix, None, Some(right_entry), left, right)?;
         }
     }
@@ -2466,7 +2468,7 @@ fn merge_tree_entry(
             if left_entry.oid == right_entry.oid {
                 return Ok(());
             }
-            let path = join_tree_path(prefix, &left_entry.name);
+            let path = join_tree_path(prefix, left_entry.name.as_bytes());
             return diff_tree_pair(
                 db,
                 format,
@@ -2484,19 +2486,19 @@ fn merge_tree_entry(
             if left_entry.mode == right_entry.mode && left_entry.oid == right_entry.oid {
                 return Ok(());
             }
-            let path = join_tree_path(prefix, &left_entry.name);
+            let path = join_tree_path(prefix, left_entry.name.as_bytes());
             left.insert(
                 path.clone(),
                 TrackedEntry {
                     mode: left_entry.mode,
-                    oid: left_entry.oid.clone(),
+                    oid: left_entry.oid,
                 },
             );
             right.insert(
                 path,
                 TrackedEntry {
                     mode: right_entry.mode,
-                    oid: right_entry.oid.clone(),
+                    oid: right_entry.oid,
                 },
             );
             return Ok(());
@@ -2507,7 +2509,7 @@ fn merge_tree_entry(
 
     // Left side (if any): record as deletions.
     if let Some(left_entry) = left_entry {
-        let path = join_tree_path(prefix, &left_entry.name);
+        let path = join_tree_path(prefix, left_entry.name.as_bytes());
         if left_is_tree {
             collect_tree_entries(db, format, &left_entry.oid, path, left)?;
         } else {
@@ -2515,14 +2517,14 @@ fn merge_tree_entry(
                 path,
                 TrackedEntry {
                     mode: left_entry.mode,
-                    oid: left_entry.oid.clone(),
+                    oid: left_entry.oid,
                 },
             );
         }
     }
     // Right side (if any): record as additions.
     if let Some(right_entry) = right_entry {
-        let path = join_tree_path(prefix, &right_entry.name);
+        let path = join_tree_path(prefix, right_entry.name.as_bytes());
         if right_is_tree {
             collect_tree_entries(db, format, &right_entry.oid, path, right)?;
         } else {
@@ -2530,7 +2532,7 @@ fn merge_tree_entry(
                 path,
                 TrackedEntry {
                     mode: right_entry.mode,
-                    oid: right_entry.oid.clone(),
+                    oid: right_entry.oid,
                 },
             );
         }
@@ -3444,7 +3446,7 @@ mod tests {
                 oid,
                 flags: "hello.txt".len() as u16,
                 flags_extended: 0,
-                path: b"hello.txt".to_vec(),
+                path: BString::from(b"hello.txt"),
             }],
             extensions: Vec::new(),
             checksum: None,
@@ -4164,8 +4166,8 @@ new mode 100755
             .iter()
             .map(|(name, mode, oid)| TreeEntry {
                 mode: *mode,
-                name: name.to_vec(),
-                oid: oid.clone(),
+                name: BString::from(*name),
+                oid: *oid,
             })
             .collect();
         tree_entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -4216,7 +4218,10 @@ new mode 100755
             "expected a single rename entry: {entries:?}"
         );
         assert_eq!(entries[0].status, NameStatus::Renamed(75));
-        assert_eq!(entries[0].old_path.as_deref(), Some(b"a.txt".as_slice()));
+        assert_eq!(
+            entries[0].old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"a.txt".as_slice())
+        );
         assert_eq!(entries[0].path, b"b.txt");
         assert_eq!(entries[0].line(), "R075\ta.txt\tb.txt");
         fs::remove_dir_all(root).expect("test operation should succeed");
@@ -4295,7 +4300,7 @@ new mode 100755
         let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
 
         let oid = write_blob(&mut db, b"identical\ncontent\nhere\n");
-        let left = write_tree(&mut db, &[(b"old.txt", 0o100644, oid.clone())]);
+        let left = write_tree(&mut db, &[(b"old.txt", 0o100644, oid)]);
         let right = write_tree(&mut db, &[(b"new.txt", 0o100644, oid)]);
 
         for inexact in [false, true] {
@@ -4320,7 +4325,10 @@ new mode 100755
             .expect("test operation should succeed");
             assert_eq!(entries.len(), 1, "inexact={inexact}: {entries:?}");
             assert_eq!(entries[0].status, NameStatus::Renamed(100));
-            assert_eq!(entries[0].old_path.as_deref(), Some(b"old.txt".as_slice()));
+            assert_eq!(
+                entries[0].old_path.as_ref().map(|p| p.as_bytes()),
+                Some(b"old.txt".as_slice())
+            );
             assert_eq!(entries[0].path, b"new.txt");
         }
         fs::remove_dir_all(root).expect("test operation should succeed");
@@ -4370,7 +4378,10 @@ new mode 100755
             .find(|e| e.path == b"copy.txt")
             .unwrap_or_else(|| panic!("no copy.txt entry: {entries:?}"));
         assert_eq!(copy_entry.status, NameStatus::Copied(80));
-        assert_eq!(copy_entry.old_path.as_deref(), Some(b"orig.txt".as_slice()));
+        assert_eq!(
+            copy_entry.old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"orig.txt".as_slice())
+        );
         // The source remains present (copies do not consume the original).
         assert!(
             entries.iter().all(|e| e.status != NameStatus::Deleted),
@@ -4416,7 +4427,10 @@ new mode 100755
 
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(entries[0].status, NameStatus::Renamed(88));
-        assert_eq!(entries[0].old_path.as_deref(), Some(b"src.txt".as_slice()));
+        assert_eq!(
+            entries[0].old_path.as_ref().map(|p| p.as_bytes()),
+            Some(b"src.txt".as_slice())
+        );
         assert_eq!(entries[0].path, b"dst.txt");
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
@@ -4962,7 +4976,7 @@ new mode 100755
         // Every path the full diff reports as changed must survive pruning on
         // whichever side(s) it lives.
         for entry in &reference {
-            let path = &entry.path;
+            let path = entry.path.as_bytes();
             match entry.status {
                 NameStatus::Added => assert!(
                     pruned_right.contains_key(path),
@@ -5417,7 +5431,8 @@ new mode 100755
             public
                 .iter()
                 .any(|entry| matches!(entry.status, NameStatus::Copied(_))
-                    && entry.old_path.as_deref() == Some(b"lib/template.txt".as_slice())
+                    && entry.old_path.as_ref().map(|p| p.as_bytes())
+                        == Some(b"lib/template.txt".as_slice())
                     && entry.path == b"copy.txt"),
             "copy from unchanged source must be found with find_copies_harder: {public:?}"
         );

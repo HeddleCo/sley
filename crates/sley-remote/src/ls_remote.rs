@@ -204,7 +204,7 @@ fn ls_remote_local(
             continue;
         };
         records.push(LsRemoteRecord {
-            oid: oid.clone(),
+            oid,
             name: reference.name.clone(),
             symref,
         });

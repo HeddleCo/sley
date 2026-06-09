@@ -7254,7 +7254,7 @@ fn force_update_branch(
     tx.update(RefUpdate {
         name,
         expected: None,
-        new: RefTarget::Direct(new_oid.clone()),
+        new: RefTarget::Direct(new_oid),
         reflog: Some(ReflogEntry {
             old_oid,
             new_oid,

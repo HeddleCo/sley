@@ -59,26 +59,6 @@ fn git_with_identity(cwd: &Path, args: &[&str]) {
     );
 }
 
-fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
-    assert_eq!(
-        actual.status.code(),
-        expected.status.code(),
-        "status differed for {args:?}"
-    );
-    assert_eq!(
-        actual.stdout, expected.stdout,
-        "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
-        String::from_utf8_lossy(&actual.stdout),
-        String::from_utf8_lossy(&expected.stdout)
-    );
-    assert_eq!(
-        actual.stderr, expected.stderr,
-        "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
-        String::from_utf8_lossy(&actual.stderr),
-        String::from_utf8_lossy(&expected.stderr)
-    );
-}
-
 fn prepare_identity(root: &Path) {
     git(
         root,
@@ -165,8 +145,7 @@ fn pull_fast_forward_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
-        prepare_fast_forward_upstream(&upstream);
+            prepare_fast_forward_upstream(&upstream);
         prepare_fast_forward_clone(&upstream, &expected);
         prepare_fast_forward_clone(&upstream, &actual);
         let args = ["pull"];
@@ -189,9 +168,7 @@ fn pull_fast_forward_matches_upstream_git() {
             run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
             "HEAD differed after fast-forward pull"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -203,8 +180,7 @@ fn pull_three_way_clean_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-    let result = (|| {
-        prepare_three_way_upstream(&upstream);
+            prepare_three_way_upstream(&upstream);
         prepare_three_way_clone(&upstream, &expected);
         prepare_three_way_clone(&upstream, &actual);
         let args = ["pull"];
@@ -229,7 +205,5 @@ fn pull_three_way_clean_matches_upstream_git() {
             run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
             "HEAD differed after three-way pull"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

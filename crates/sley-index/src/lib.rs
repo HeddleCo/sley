@@ -8,6 +8,8 @@
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
+pub use sley_core::BString;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Index {
     pub version: u32,
@@ -31,7 +33,7 @@ pub struct IndexEntry {
     pub oid: ObjectId,
     pub flags: u16,
     pub flags_extended: u16,
-    pub path: Vec<u8>,
+    pub path: BString,
 }
 
 impl IndexEntry {
@@ -40,7 +42,8 @@ impl IndexEntry {
     /// the intent-to-add + extended flags set, and the name length encoded. The
     /// containing [`Index`] must be version 3+ (see
     /// [`Index::upgrade_version_for_flags`]).
-    pub fn intent_to_add(format: ObjectFormat, path: Vec<u8>) -> Self {
+    pub fn intent_to_add(format: ObjectFormat, path: impl Into<BString>) -> Self {
+        let path = path.into();
         let name_len = (path.len().min(INDEX_FLAG_NAME_LENGTH_MASK as usize)) as u16;
         Self {
             ctime_seconds: 0,
@@ -147,7 +150,7 @@ impl Index {
             let path = if version == 4 {
                 let previous_path = entries
                     .last()
-                    .map(|entry: &IndexEntry| entry.path.as_slice())
+                    .map(|entry: &IndexEntry| entry.path.as_bytes())
                     .unwrap_or(&[]);
                 let strip_len =
                     decode_index_v4_path_strip_len(bytes, &mut offset, checksum_offset)?;
@@ -166,7 +169,7 @@ impl Index {
                 let mut path = previous_path[..previous_path.len() - strip_len].to_vec();
                 path.extend_from_slice(&bytes[path_start..offset]);
                 offset += 1;
-                path
+                BString::from(path)
             } else {
                 let path_start = offset;
                 while bytes.get(offset).copied() != Some(0) {
@@ -175,7 +178,7 @@ impl Index {
                         return Err(GitError::InvalidFormat("unterminated index path".into()));
                     }
                 }
-                let path = bytes[path_start..offset].to_vec();
+                let path = BString::from_bytes(&bytes[path_start..offset]);
                 offset += 1;
                 while (offset - start) % 8 != 0 {
                     offset += 1;
@@ -283,14 +286,14 @@ impl Index {
                 out.extend_from_slice(&entry.flags_extended.to_be_bytes());
             }
             if self.version == 4 {
-                let common_prefix_len = common_prefix_len(&previous_path, &entry.path);
+                let common_prefix_len = common_prefix_len(&previous_path, entry.path.as_bytes());
                 let strip_len = previous_path.len() - common_prefix_len;
                 encode_index_v4_path_strip_len(strip_len, &mut out);
-                out.extend_from_slice(&entry.path[common_prefix_len..]);
+                out.extend_from_slice(&entry.path.as_bytes()[common_prefix_len..]);
                 out.push(0);
-                previous_path = entry.path.clone();
+                previous_path = entry.path.as_bytes().to_vec();
             } else {
-                out.extend_from_slice(&entry.path);
+                out.extend_from_slice(entry.path.as_bytes());
                 out.push(0);
                 while (out.len() - start) % 8 != 0 {
                     out.push(0);
@@ -812,7 +815,7 @@ mod tests {
                 .expect("test operation should succeed"),
                 flags: 5,
                 flags_extended: 0,
-                path: b"a.txt".to_vec(),
+                path: BString::from(b"a.txt"),
             }],
             extensions: Vec::new(),
             checksum: None,
@@ -846,7 +849,7 @@ mod tests {
                     .expect("test operation should succeed"),
                 flags: 5,
                 flags_extended: 0,
-                path: b"a.txt".to_vec(),
+                path: BString::from(b"a.txt"),
             }],
             extensions: Vec::new(),
             checksum: None,
@@ -887,7 +890,7 @@ mod tests {
                     .expect("test operation should succeed"),
                     flags: long_path.len() as u16,
                     flags_extended: 0,
-                    path: long_path,
+                    path: BString::from(long_path.as_slice()),
                 },
                 IndexEntry {
                     ctime_seconds: 9,
@@ -907,7 +910,7 @@ mod tests {
                     .expect("test operation should succeed"),
                     flags: 1,
                     flags_extended: 0,
-                    path: b"b".to_vec(),
+                    path: BString::from(b"b"),
                 },
             ],
             extensions: Vec::new(),
@@ -955,7 +958,7 @@ mod tests {
             // git stores `min(path_len, 0xfff)` in the low 12 bits of `flags`.
             flags: u16::try_from(path.len().min(0xfff)).expect("test operation should succeed"),
             flags_extended: 0,
-            path: path.to_vec(),
+            path: BString::from(path),
         }
     }
 

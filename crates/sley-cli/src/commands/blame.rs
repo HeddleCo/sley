@@ -426,7 +426,7 @@ fn lookup_tree_path(
     if components.is_empty() {
         return Ok(None);
     }
-    let mut current = tree_oid.clone();
+    let mut current = *tree_oid;
     let last = components.len() - 1;
     for (idx, component) in components.iter().enumerate() {
         let object = db.read_object(&current)?;
@@ -523,11 +523,11 @@ fn compute_blame(
                 Some(parent_blob) => {
                     let parent_lines = sley_diff_merge::split_lines(&parent_blob);
                     let map = child_to_parent_map(&parent_lines, &child_lines);
-                    parent_maps.push((parent.clone(), map));
+                    parent_maps.push((*parent, map));
                 }
                 None => {
                     // Path absent in this parent: it preserves nothing.
-                    parent_maps.push((parent.clone(), vec![None; child_lines.len()]));
+                    parent_maps.push((*parent, vec![None; child_lines.len()]));
                 }
             }
         }
@@ -538,7 +538,7 @@ fn compute_blame(
             for (parent_oid, map) in &parent_maps {
                 if let Some(Some(parent_index)) = map.get(child_index) {
                     pending
-                        .entry(parent_oid.clone())
+                        .entry(*parent_oid)
                         .or_default()
                         .insert(final_line, *parent_index);
                     routed = true;
@@ -586,7 +586,7 @@ fn assign_lines(
             && slot.is_none()
         {
             *slot = Some(LineBlame {
-                commit: commit_oid.clone(),
+                commit: *commit_oid,
                 boundary,
                 content: final_lines[final_line].content.to_vec(),
             });
@@ -654,10 +654,10 @@ fn topo_order(
         }
         let commit = Commit::parse(format, &object.body)?;
         let ts = for_each_ref_identity_timestamp(&commit.committer).unwrap_or(0);
-        timestamp_of.insert(oid.clone(), ts);
+        timestamp_of.insert(oid, ts);
         let parents = commit.parents.clone();
         for parent in &parents {
-            stack.push(parent.clone());
+            stack.push(*parent);
         }
         parents_of.insert(oid, parents);
     }
@@ -665,12 +665,12 @@ fn topo_order(
     // child_count[parent] = number of in-subgraph children pointing at it.
     let mut child_count: HashMap<ObjectId, usize> = HashMap::new();
     for oid in parents_of.keys() {
-        child_count.entry(oid.clone()).or_insert(0);
+        child_count.entry(*oid).or_insert(0);
     }
     for parents in parents_of.values() {
         for parent in parents {
             if parents_of.contains_key(parent) {
-                *child_count.entry(parent.clone()).or_insert(0) += 1;
+                *child_count.entry(*parent).or_insert(0) += 1;
             }
         }
     }
@@ -681,7 +681,7 @@ fn topo_order(
     let mut ready: Vec<ObjectId> = child_count
         .iter()
         .filter(|(_, count)| **count == 0)
-        .map(|(oid, _)| oid.clone())
+        .map(|(oid, _)| *oid)
         .collect();
 
     let mut order = Vec::with_capacity(parents_of.len());
@@ -704,7 +704,7 @@ fn topo_order(
     if order.len() < parents_of.len() {
         for oid in parents_of.keys() {
             if !order.contains(oid) {
-                order.push(oid.clone());
+                order.push(*oid);
             }
         }
     }

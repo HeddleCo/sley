@@ -284,7 +284,7 @@ fn show_commit(
     let options = context.options;
     let decorations = context.decorations;
     let record = sley_rev::CommitRecord {
-        oid: oid.clone(),
+        oid: *oid,
         parents: commit.parents.clone(),
         commit: commit.clone(),
     };

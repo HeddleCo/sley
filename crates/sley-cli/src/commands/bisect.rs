@@ -817,7 +817,7 @@ fn bisect_step(repo: &BisectRepo, terms: &BisectTerms, no_checkout: bool) -> Res
         if excluded.contains(&record.oid) {
             continue;
         }
-        candidate_ids.insert(record.oid.clone());
+        candidate_ids.insert(record.oid);
         candidates.push(record);
     }
 
@@ -853,7 +853,7 @@ fn bisect_step(repo: &BisectRepo, terms: &BisectTerms, no_checkout: bool) -> Res
         }
         let weight = *weights.get(&record.oid).unwrap_or(&0);
         let choice = BisectChoice {
-            oid: record.oid.clone(),
+            oid: record.oid,
             key: bisect_reaches_key(weight, reaches),
         };
         if bisect_choice_better(&choice, &best_unskipped) {
@@ -1020,7 +1020,7 @@ fn compute_candidate_weights(
                 }
             }
         }
-        weights.insert(record.oid.clone(), touched.len());
+        weights.insert(record.oid, touched.len());
     }
     weights
 }

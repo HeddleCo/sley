@@ -198,7 +198,6 @@ impl Repository {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::Repository;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};

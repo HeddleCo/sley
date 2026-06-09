@@ -127,13 +127,11 @@ pub(crate) fn cmd_patch_id(args: &[String]) -> Result<()> {
         // junk while still letting that preamble seed the next patch's commit id.
         if patch.patchlen > 0 {
             let result = ObjectId::from_raw(format, &patch.result)?;
-            let commit = match &pending_commit {
-                Some(oid) => oid.clone(),
-                None => vec![b'0'; format.hex_len()],
-            };
+            let default_commit = vec![b'0'; format.hex_len()];
+            let commit = pending_commit.as_deref().unwrap_or(&default_commit);
             out.write_all(result.to_hex().as_bytes())?;
             out.write_all(b" ")?;
-            out.write_all(&commit)?;
+            out.write_all(commit)?;
             out.write_all(b"\n")?;
         }
         pending_commit = patch.next_commit;

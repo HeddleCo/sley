@@ -102,7 +102,7 @@ pub fn fetch_bundle(request: FetchBundleRequest<'_>) -> Result<()> {
         .filter_map(|fetched| {
             fetched.dst.as_ref().map(|dst| BundleRefUpdate {
                 name: dst.clone(),
-                oid: fetched.oid.clone(),
+                oid: fetched.oid,
             })
         })
         .collect::<Vec<_>>();
@@ -124,7 +124,7 @@ fn write_bundle_default_fetch_head(
     append: bool,
 ) -> Result<()> {
     let records = [FetchHeadRecord {
-        oid: reference.oid.clone(),
+        oid: reference.oid,
         not_for_merge: false,
         description: bundle_path.to_string(),
     }];
@@ -140,7 +140,7 @@ fn bundle_fetch_refs(
     let refs = references
         .iter()
         .map(|reference| RefAdvertisement {
-            oid: reference.oid.clone(),
+            oid: reference.oid,
             name: reference.name.clone(),
             capabilities: Vec::new(),
         })

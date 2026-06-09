@@ -114,7 +114,7 @@ pub type RefChangeResult<T> = std::result::Result<T, RefConflict>;
 mod tests {
     use super::*;
     use crate::RefTarget;
-    use sley_object::{Commit, EncodedObject, ObjectType, Tree};
+    use sley_object::{BString, Commit, EncodedObject, ObjectType, Tree};
     use sley_odb::ObjectWriter;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -151,7 +151,7 @@ mod tests {
         let tree = Tree {
             entries: vec![sley_object::TreeEntry {
                 mode: 0o100644,
-                name: b"x.txt".to_vec(),
+                name: BString::from(b"x.txt"),
                 oid: blob_oid,
             }],
         };

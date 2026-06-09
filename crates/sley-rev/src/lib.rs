@@ -1,5 +1,7 @@
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+
+pub use sley_core::BString;
 use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, ObjectType, Tag, TreeEntries};
@@ -322,7 +324,7 @@ fn resolve_reflog_nth(
             reflog_display_name(base)
         )));
     }
-    Ok(entries[len - 1 - n].new_oid.clone())
+    Ok(entries[len - 1 - n].new_oid)
 }
 
 /// Human-facing name for a reflog target in error messages (HEAD, or the branch
@@ -588,7 +590,7 @@ fn apply_revision_suffix<R: ObjectReader>(
         }
         RevisionSuffix::FirstParent(count) => {
             let mut graph = CommitGraphContext::load(git_dir, format);
-            let mut current = base.clone();
+            let mut current = *base;
             for _ in 0..count {
                 current = graph
                     .commit_first_parent(reader, &current)?
@@ -824,10 +826,10 @@ fn graph_to_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphCommit>> {
             let parent_entry = graph.commits.get(parent).ok_or_else(|| {
                 GitError::InvalidFormat("commit-graph parent points past commit table".into())
             })?;
-            parents.push(parent_entry.oid.clone());
+            parents.push(parent_entry.oid);
         }
         map.insert(
-            entry.oid.clone(),
+            entry.oid,
             GraphCommit {
                 parents,
                 generation: entry.generation,
@@ -863,14 +865,14 @@ fn peel_revision<R: ObjectReader>(
         PeelKind::AnyNonTag => peel_tags(reader, format, oid),
         PeelKind::Object => {
             reader.read_object(oid)?;
-            Ok(oid.clone())
+            Ok(*oid)
         }
         PeelKind::Commit => peel_to_commit(reader, format, oid),
         PeelKind::Tree => peel_to_tree(reader, format, oid),
         PeelKind::Tag => {
             let object = reader.read_object(oid)?;
             if object.object_type == ObjectType::Tag {
-                Ok(oid.clone())
+                Ok(*oid)
             } else {
                 Err(GitError::InvalidObject(format!(
                     "expected tag {oid}, found {}",
@@ -888,7 +890,7 @@ pub fn peel_tags<R: ObjectReader>(
 ) -> Result<ObjectId> {
     let object = reader.read_object(oid)?;
     if object.object_type != ObjectType::Tag {
-        return Ok(oid.clone());
+        return Ok(*oid);
     }
     let tag = Tag::parse_ref(format, &object.body)?;
     peel_tags(reader, format, &tag.object)
@@ -901,7 +903,7 @@ pub fn peel_to_tree<R: ObjectReader>(
 ) -> Result<ObjectId> {
     let object = reader.read_object(oid)?;
     match object.object_type {
-        ObjectType::Tree => Ok(oid.clone()),
+        ObjectType::Tree => Ok(*oid),
         ObjectType::Commit => Ok(Commit::parse_ref(format, &object.body)?.tree),
         ObjectType::Tag => {
             let tag = Tag::parse_ref(format, &object.body)?;
@@ -921,7 +923,7 @@ pub fn peel_to_commit<R: ObjectReader>(
 ) -> Result<ObjectId> {
     let object = reader.read_object(oid)?;
     match object.object_type {
-        ObjectType::Commit => Ok(oid.clone()),
+        ObjectType::Commit => Ok(*oid),
         ObjectType::Tag => {
             let tag = Tag::parse_ref(format, &object.body)?;
             peel_to_commit(reader, format, &tag.object)
@@ -984,7 +986,7 @@ pub fn walk_commit_metadata<R: ObjectReader>(
     let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
     let mut out = Vec::new();
     while let Some(oid) = pending.pop_front() {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             continue;
         }
         let (parents, commit_time) = match graph.metadata(&oid) {
@@ -1038,7 +1040,7 @@ pub fn walk_commits<R: ObjectReader>(
     let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
     let mut out = Vec::new();
     while let Some(oid) = pending.pop_front() {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             continue;
         }
         let object = reader.read_object(&oid)?;
@@ -1069,7 +1071,7 @@ pub struct ResolvedTreePath {
     pub oid: ObjectId,
     pub mode: Option<u32>,
     pub object_type: ObjectType,
-    pub name: Vec<u8>,
+    pub name: BString,
 }
 
 /// Resolve `<rev>:<path>` to the object id of `<path>` within `<rev>`'s tree.
@@ -1112,7 +1114,7 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
     tree_oid: &ObjectId,
     path: &str,
 ) -> Option<ResolvedTreePath> {
-    let mut current = tree_oid.clone();
+    let mut current = *tree_oid;
     // Split on '/', skipping empty components so leading/trailing/duplicate
     // separators ("a//b", "/a", "dir/") behave the way git's pathspec does.
     let components: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
@@ -1121,7 +1123,7 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
             oid: current,
             mode: None,
             object_type: ObjectType::Tree,
-            name: Vec::new(),
+            name: BString::default(),
         });
     }
     let last = components.len() - 1;
@@ -1135,7 +1137,7 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
         for entry in TreeEntries::new(format, &object.body) {
             let entry = entry.ok()?;
             if found.is_none() && entry.name == component.as_bytes() {
-                found = Some((entry.mode, entry.oid, entry.name.to_vec()));
+                found = Some((entry.mode, entry.oid, entry.name.into()));
             }
         }
         let (mode, oid, name) = found?;
@@ -1219,7 +1221,7 @@ fn resolve_index_path(
         }
         path_exists = true;
         if index_entry_stage(entry) == stage {
-            return Ok(entry.oid.clone());
+            return Ok(entry.oid);
         }
     }
     if path_exists {
@@ -1275,7 +1277,7 @@ fn search_commit_message_all<R: ObjectReader>(
     let mut pending: VecDeque<ObjectId> = starts.into_iter().collect();
     let mut best: Option<(i64, ObjectId)> = None;
     while let Some(oid) = pending.pop_front() {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             continue;
         }
         let object = reader.read_object(&oid)?;
@@ -1321,7 +1323,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
     let mut current = Some(start);
     let mut seen = HashSet::new();
     while let Some(oid) = current {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             break;
         }
         let object = reader.read_object(&oid)?;
@@ -1385,7 +1387,7 @@ fn all_ref_commit_starts<R: ObjectReader>(
         let Ok(commit) = peel_to_commit(reader, format, &oid) else {
             continue;
         };
-        if seen.insert(commit.clone()) {
+        if seen.insert(commit) {
             starts.push(commit);
         }
     }
@@ -1579,7 +1581,7 @@ impl ResolvedRevisionSelection {
         let mut pending: VecDeque<ObjectId> = self.starts.clone().into();
         let mut out = Vec::new();
         while let Some(oid) = pending.pop_front() {
-            if !seen.insert(oid.clone()) || self.excluded.contains(&oid) {
+            if !seen.insert(oid) || self.excluded.contains(&oid) {
                 continue;
             }
             if first_parent {
@@ -1629,12 +1631,12 @@ pub fn resolve_revision_range<R: ObjectReader>(
             let mut out = Vec::new();
             for oid in &left_set {
                 if !right_set.contains(oid) {
-                    out.push(oid.clone());
+                    out.push(*oid);
                 }
             }
             for oid in &right_set {
                 if !left_set.contains(oid) {
-                    out.push(oid.clone());
+                    out.push(*oid);
                 }
             }
             Ok(out)
@@ -1659,8 +1661,8 @@ fn resolve_selection_range<R: ObjectReader>(
         RevisionRange::Symmetric { left, right } => {
             let left_oid = resolve_range_endpoint(git_dir, format, reader, left)?;
             let right_oid = resolve_range_endpoint(git_dir, format, reader, right)?;
-            resolved.starts.push(left_oid.clone());
-            resolved.starts.push(right_oid.clone());
+            resolved.starts.push(left_oid);
+            resolved.starts.push(right_oid);
             for base in merge_bases(git_dir, format, reader, &left_oid, &right_oid)? {
                 extend_excluded_ancestors(git_dir, format, reader, &mut resolved.excluded, &base)?;
             }
@@ -1713,9 +1715,9 @@ fn ancestor_set_with_graph<R: ObjectReader>(
     start: &ObjectId,
 ) -> Result<HashSet<ObjectId>> {
     let mut seen = HashSet::new();
-    let mut pending = VecDeque::from([start.clone()]);
+    let mut pending = VecDeque::from([*start]);
     while let Some(oid) = pending.pop_front() {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             continue;
         }
         for parent in graph.commit_parents(reader, &oid)? {
@@ -1752,9 +1754,9 @@ pub fn is_ancestor<R: ObjectReader>(
     }
 
     let mut seen = HashSet::new();
-    let mut pending = VecDeque::from([descendant.clone()]);
+    let mut pending = VecDeque::from([*descendant]);
     while let Some(oid) = pending.pop_front() {
-        if !seen.insert(oid.clone()) {
+        if !seen.insert(oid) {
             continue;
         }
         // Prune: if `oid`'s generation is below `ancestor`'s, then `oid` and all
@@ -1837,12 +1839,12 @@ fn ancestor_depths_with_graph<R: ObjectReader>(
     start: &ObjectId,
 ) -> Result<HashMap<ObjectId, usize>> {
     let mut depths = HashMap::new();
-    let mut pending = VecDeque::from([(start.clone(), 0usize)]);
+    let mut pending = VecDeque::from([(*start, 0usize)]);
     while let Some((oid, depth)) = pending.pop_front() {
         if depths.get(&oid).is_some_and(|existing| *existing <= depth) {
             continue;
         }
-        depths.insert(oid.clone(), depth);
+        depths.insert(oid, depth);
         for parent in graph.commit_parents(reader, &oid)? {
             pending.push_back((parent, depth + 1));
         }
@@ -1877,13 +1879,13 @@ mod tests {
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -1909,13 +1911,13 @@ mod tests {
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
         .expect("test operation should succeed");
-        let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
-        let first_parent = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"main\n");
-        let second_parent = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"side\n");
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let first_parent = write_test_commit(&mut db, tree, vec![base], b"main\n");
+        let second_parent = write_test_commit(&mut db, tree, vec![base], b"side\n");
         let merge = write_test_commit(
             &mut db,
             tree,
-            vec![first_parent.clone(), second_parent.clone()],
+            vec![first_parent, second_parent],
             b"merge\n",
         );
         assert_eq!(
@@ -1972,7 +1974,7 @@ mod tests {
         tx.update(RefUpdate {
             name: format!("refs/heads/{}", &object.to_hex()[..4]),
             expected: None,
-            new: RefTarget::Direct(target.clone()),
+            new: RefTarget::Direct(target),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -2035,9 +2037,9 @@ mod tests {
         .expect("test operation should succeed");
         db.write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
-        let commit = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
+        let commit = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
         let tag = Tag {
-            object: commit.clone(),
+            object: commit,
             object_type: ObjectType::Commit,
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
@@ -2068,7 +2070,7 @@ mod tests {
             .expect("test operation should succeed");
         let commit = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
         let tag = Tag {
-            object: commit.clone(),
+            object: commit,
             object_type: ObjectType::Commit,
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
@@ -2094,9 +2096,9 @@ mod tests {
         .expect("test operation should succeed");
         db.write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
-        let commit = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
+        let commit = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
         let tag = Tag {
-            object: commit.clone(),
+            object: commit,
             object_type: ObjectType::Commit,
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
@@ -2162,7 +2164,7 @@ mod tests {
             .write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
             .expect("test operation should succeed");
         let tag = Tag {
-            object: commit.clone(),
+            object: commit,
             object_type: ObjectType::Commit,
             name: b"v1.0".to_vec(),
             tagger: Some(b"Example User <example@example.invalid> 0 +0000".to_vec()),
@@ -2176,7 +2178,7 @@ mod tests {
         tx.update(RefUpdate {
             name: "refs/tags/v1.0".into(),
             expected: None,
-            new: RefTarget::Direct(tag.clone()),
+            new: RefTarget::Direct(tag),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -2187,7 +2189,7 @@ mod tests {
             .iter()
             .find(|packed| packed.reference.name == "refs/tags/v1.0")
             .expect("test operation should succeed");
-        assert_eq!(packed_tag.peeled, Some(commit.clone()));
+        assert_eq!(packed_tag.peeled, Some(commit));
         assert_eq!(
             refs.read_ref("refs/tags/v1.0")
                 .expect("test operation should succeed"),
@@ -2207,7 +2209,7 @@ mod tests {
         let sub = write_tree(&mut db, &[(0o100644, b"file.txt", &blob)]);
         let dir = write_tree(&mut db, &[(0o040000, b"sub", &sub)]);
         let root = write_tree(&mut db, &[(0o040000, b"dir", &dir)]);
-        let commit = write_test_commit(&mut db, root.clone(), Vec::new(), b"init\n");
+        let commit = write_test_commit(&mut db, root, Vec::new(), b"init\n");
 
         // Nested blob via `<rev>:<path>`.
         assert_eq!(
@@ -2397,18 +2399,18 @@ mod tests {
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
-        let first = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"add feature\n", 1000);
+        let first = write_dated_commit(&mut db, tree, Vec::new(), b"add feature\n", 1000);
         let second = write_dated_commit(
             &mut db,
-            tree.clone(),
-            vec![first.clone()],
+            tree,
+            vec![first],
             b"fix the widget bug\n",
             2000,
         );
         let third = write_dated_commit(
             &mut db,
             tree,
-            vec![second.clone()],
+            vec![second],
             b"unrelated change\n",
             3000,
         );
@@ -2417,7 +2419,7 @@ mod tests {
         tx.update(RefUpdate {
             name: "refs/heads/main".into(),
             expected: None,
-            new: RefTarget::Direct(third.clone()),
+            new: RefTarget::Direct(third),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -2492,10 +2494,10 @@ mod tests {
         .expect("test operation should succeed");
         // base -> a -> b   (left line)
         //   \--> c -> d    (right line)
-        let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
-        let a = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"a\n");
-        let b = write_test_commit(&mut db, tree.clone(), vec![a.clone()], b"b\n");
-        let c = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"c\n");
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let a = write_test_commit(&mut db, tree, vec![base], b"a\n");
+        let b = write_test_commit(&mut db, tree, vec![a], b"b\n");
+        let c = write_test_commit(&mut db, tree, vec![base], b"c\n");
         let d = write_test_commit(&mut db, tree, vec![c.clone()], b"d\n");
 
         // A..B: reachable from B (a..b line) but not from A (base only here) ->
@@ -2507,7 +2509,7 @@ mod tests {
         let mut got = resolve_revision_range(&git_dir, ObjectFormat::Sha1, &db, &range)
             .expect("test operation should succeed");
         got.sort_by_key(|x| x.to_hex());
-        assert_eq!(got, vec![b.clone()]);
+        assert_eq!(got, vec![b]);
         assert!(!got.contains(&a), "A itself is excluded");
         assert!(!got.contains(&base), "A's ancestors are excluded");
 
@@ -2627,7 +2629,7 @@ mod tests {
             .resolve(&git_dir, format, &db)
             .expect("test operation should succeed");
 
-        assert_eq!(resolved.starts, vec![a.clone(), b.clone()]);
+        assert_eq!(resolved.starts, vec![a, b]);
         assert_eq!(resolved.excluded, oid_set([root]));
         assert_oid_set(
             resolved
@@ -2698,9 +2700,9 @@ mod tests {
             "4b825dc642cb6eb9a060e54bf8d69288fbee4904",
         )
         .expect("test operation should succeed");
-        let base = write_test_commit(&mut db, tree.clone(), Vec::new(), b"base\n");
-        let left = write_test_commit(&mut db, tree.clone(), vec![base.clone()], b"left\n");
-        let right = write_test_commit(&mut db, tree, vec![base.clone()], b"right\n");
+        let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
+        let left = write_test_commit(&mut db, tree, vec![base], b"left\n");
+        let right = write_test_commit(&mut db, tree, vec![base], b"right\n");
         assert_eq!(
             merge_bases(&git_dir, ObjectFormat::Sha1, &db, &left, &right)
                 .expect("test operation should succeed"),
@@ -2918,8 +2920,8 @@ mod tests {
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
-        let parent = write_dated_commit(&mut db, tree.clone(), Vec::new(), b"parent\n", 1000);
-        let child = write_dated_commit(&mut db, tree, vec![parent.clone()], b"child\n", 2000);
+        let parent = write_dated_commit(&mut db, tree, Vec::new(), b"parent\n", 1000);
+        let child = write_dated_commit(&mut db, tree, vec![parent], b"child\n", 2000);
         fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
             .expect("test operation should succeed");
         set_branch(&git_dir, "main", &child);
@@ -3002,7 +3004,7 @@ mod tests {
         tx.update(RefUpdate {
             name: name.to_string(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(*oid),
             reflog: None,
         });
         tx.commit().expect("test operation should succeed");
@@ -3075,7 +3077,7 @@ mod tests {
                 .iter()
                 .map(|(mode, name, oid)| sley_object::TreeEntry {
                     mode: *mode,
-                    name: name.to_vec(),
+                    name: BString::from(*name),
                     oid: (*oid).clone(),
                 })
                 .collect(),
@@ -3096,10 +3098,10 @@ mod tests {
             uid: 0,
             gid: 0,
             size: 0,
-            oid: oid.clone(),
+            oid: *oid,
             flags: (stage & 0x3) << 12,
             flags_extended: 0,
-            path: path.to_vec(),
+            path: BString::from(path),
         }
     }
 
@@ -3145,7 +3147,7 @@ mod tests {
                     // Only advance upward so the fixpoint is monotone.
                     let current = generations.get(oid).copied().unwrap_or(0);
                     if candidate > current {
-                        generations.insert(oid.clone(), candidate);
+                        generations.insert(*oid, candidate);
                         changed = true;
                     }
                 }
@@ -3170,7 +3172,7 @@ mod tests {
         let mut parents_map: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
         for oid in commits {
             parents_map.insert(
-                oid.clone(),
+                *oid,
                 commit_parents(reader, format, oid).expect("test operation should succeed"),
             );
         }
@@ -3186,7 +3188,7 @@ mod tests {
                 let commit_time =
                     commit_committer_time(commit.committer).unwrap_or(0).max(0) as u64;
                 sley_formats::CommitGraphWriteEntry {
-                    oid: oid.clone(),
+                    oid: *oid,
                     tree: commit.tree,
                     parents: commit.parents,
                     generation: generations.get(oid).copied().unwrap_or(1),
@@ -3234,20 +3236,20 @@ mod tests {
         let mut t = 1000i64;
         let mut commit = |db: &mut FileObjectDatabase, parents: Vec<ObjectId>, msg: &[u8]| {
             t += 1;
-            write_dated_commit(db, tree.clone(), parents, msg, t)
+            write_dated_commit(db, tree, parents, msg, t)
         };
         let root = commit(&mut db, vec![], b"root\n");
-        let a = commit(&mut db, vec![root.clone()], b"a\n");
-        let b = commit(&mut db, vec![root.clone()], b"b\n");
-        let c = commit(&mut db, vec![a.clone()], b"c\n");
-        let d = commit(&mut db, vec![b.clone()], b"d\n");
-        let e = commit(&mut db, vec![b.clone()], b"e\n");
+        let a = commit(&mut db, vec![root], b"a\n");
+        let b = commit(&mut db, vec![root], b"b\n");
+        let c = commit(&mut db, vec![a], b"c\n");
+        let d = commit(&mut db, vec![b], b"d\n");
+        let e = commit(&mut db, vec![b], b"e\n");
         let m1 = commit(&mut db, vec![c.clone(), d.clone()], b"m1\n");
         let f = commit(&mut db, vec![d.clone(), e.clone()], b"f\n");
         let g = commit(&mut db, vec![f.clone()], b"g\n");
         let oct = commit(&mut db, vec![m1.clone(), g.clone(), f.clone()], b"oct\n");
-        let x1 = commit(&mut db, vec![a.clone(), b.clone()], b"x1\n");
-        let x2 = commit(&mut db, vec![b.clone(), a.clone()], b"x2\n");
+        let x1 = commit(&mut db, vec![a, b], b"x1\n");
+        let x2 = commit(&mut db, vec![b, a], b"x2\n");
         let all = vec![root, a, b, c, d, e, m1, f, g, oct, x1, x2];
         (db, all)
     }
@@ -3339,7 +3341,7 @@ mod tests {
         let mut xbases =
             merge_bases(&git_dir, format, &db, &x1, &x2).expect("test operation should succeed");
         xbases.sort_by_key(|oid| oid.to_hex());
-        let mut expected = vec![a.clone(), b.clone()];
+        let mut expected = vec![a, b];
         expected.sort_by_key(|oid| oid.to_hex());
         assert_eq!(xbases, expected, "criss-cross must yield two merge bases");
 
@@ -3509,16 +3511,16 @@ mod tests {
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
-        let root = write_dated_commit(&mut db, tree.clone(), vec![], b"root\n", 1000);
-        let mid = write_dated_commit(&mut db, tree.clone(), vec![root.clone()], b"mid\n", 1001);
-        let tip = write_dated_commit(&mut db, tree.clone(), vec![mid.clone()], b"tip\n", 1002);
-        let commits = [root.clone(), mid.clone(), tip.clone()];
+        let root = write_dated_commit(&mut db, tree, vec![], b"root\n", 1000);
+        let mid = write_dated_commit(&mut db, tree, vec![root], b"mid\n", 1001);
+        let tip = write_dated_commit(&mut db, tree, vec![mid.clone()], b"tip\n", 1002);
+        let commits = [root, mid.clone(), tip.clone()];
 
         let parents_map: HashMap<ObjectId, Vec<ObjectId>> = commits
             .iter()
             .map(|oid| {
                 (
-                    oid.clone(),
+                    *oid,
                     commit_parents(&db, format, oid).expect("test operation should succeed"),
                 )
             })
@@ -3527,8 +3529,8 @@ mod tests {
         let entries: Vec<sley_formats::CommitGraphWriteEntry> = commits
             .iter()
             .map(|oid| sley_formats::CommitGraphWriteEntry {
-                oid: oid.clone(),
-                tree: tree.clone(),
+                oid: *oid,
+                tree,
                 parents: parents_map[oid].clone(),
                 generation: generations[oid],
                 commit_time: 0,

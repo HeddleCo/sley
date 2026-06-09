@@ -601,7 +601,7 @@ pub fn plan_fetch_ref_updates(
                     updates.push(FetchRefUpdate {
                         src: reference.name.clone(),
                         dst: Some(dst),
-                        oid: reference.oid.clone(),
+                        oid: reference.oid,
                         not_for_merge: false,
                     });
                 }
@@ -621,14 +621,14 @@ pub fn plan_fetch_ref_updates(
         updates.push(FetchRefUpdate {
             src: reference.name.clone(),
             dst: refspec.dst.clone(),
-            oid: reference.oid.clone(),
+            oid: reference.oid,
             not_for_merge: false,
         });
     }
     if auto_follow_tags && updates.iter().any(|update| update.dst.is_some()) {
         let fetched_oids = updates
             .iter()
-            .map(|update| update.oid.clone())
+            .map(|update| update.oid)
             .collect::<Vec<_>>();
         let fetched_srcs = updates
             .iter()
@@ -643,7 +643,7 @@ pub fn plan_fetch_ref_updates(
                 updates.push(FetchRefUpdate {
                     src: reference.name.clone(),
                     dst: Some(reference.name.clone()),
-                    oid: reference.oid.clone(),
+                    oid: reference.oid,
                     not_for_merge: true,
                 });
             }
@@ -660,7 +660,7 @@ pub fn fetch_ref_updates_to_fetch_head(
         .iter()
         .map(|update| {
             Ok(FetchHeadRecord {
-                oid: update.oid.clone(),
+                oid: update.oid,
                 not_for_merge: update.not_for_merge,
                 description: fetch_head_remote_description(&update.src, remote)?,
             })
@@ -689,8 +689,8 @@ pub fn plan_push_commands(
                     validate_push_source_ref(format, local)?;
                     if let Some(remote) = remote_ref(remote_refs, &local.name) {
                         commands.push(ReceivePackCommand {
-                            old_id: remote.oid.clone(),
-                            new_id: local.oid.clone(),
+                            old_id: remote.oid,
+                            new_id: local.oid,
                             name: local.name.clone(),
                         });
                     }
@@ -701,7 +701,7 @@ pub fn plan_push_commands(
                 let remote = remote_ref(remote_refs, dst)
                     .ok_or_else(|| GitError::reference_not_found(format!("remote ref {dst}")))?;
                 commands.push(ReceivePackCommand {
-                    old_id: remote.oid.clone(),
+                    old_id: remote.oid,
                     new_id: zero.clone(),
                     name: dst.to_string(),
                 });
@@ -731,11 +731,11 @@ pub fn plan_push_commands(
                     };
                     let name = format!("{dst_prefix}{middle}{dst_suffix}");
                     let old_id = remote_ref(remote_refs, &name)
-                        .map(|reference| reference.oid.clone())
+                        .map(|reference| reference.oid)
                         .unwrap_or_else(|| zero.clone());
                     commands.push(ReceivePackCommand {
                         old_id,
-                        new_id: local.oid.clone(),
+                        new_id: local.oid,
                         name,
                     });
                 }
@@ -748,11 +748,11 @@ pub fn plan_push_commands(
                 let name = dst.unwrap_or(src);
                 validate_refspec_endpoint("push destination", name)?;
                 let old_id = remote_ref(remote_refs, name)
-                    .map(|reference| reference.oid.clone())
+                    .map(|reference| reference.oid)
                     .unwrap_or_else(|| zero.clone());
                 commands.push(ReceivePackCommand {
                     old_id,
-                    new_id: local.oid.clone(),
+                    new_id: local.oid,
                     name: name.to_string(),
                 });
             }
@@ -2381,7 +2381,7 @@ pub fn protocol_v2_ls_refs_records_to_ref_advertisement_set(
             ProtocolV2LsRefsRecord::Ref(reference) => {
                 validate_protocol_v2_token("ls-refs ref name", &reference.name)?;
                 refs.push(RefAdvertisement {
-                    oid: reference.oid.clone(),
+                    oid: reference.oid,
                     name: reference.name.clone(),
                     capabilities: Vec::new(),
                 });
@@ -10071,7 +10071,7 @@ mod tests {
             validate_upload_pack_request_features(
                 &features,
                 &UploadPackRequest {
-                    wants: vec![want.clone()],
+                    wants: vec![want],
                     capabilities: vec![Capability {
                         name: "ofs-delta".into(),
                         value: None,
@@ -10085,8 +10085,8 @@ mod tests {
             validate_upload_pack_request_features(
                 &features,
                 &UploadPackRequest {
-                    wants: vec![want.clone()],
-                    shallow: vec![want.clone()],
+                    wants: vec![want],
+                    shallow: vec![want],
                     ..UploadPackRequest::default()
                 },
             )
@@ -10096,7 +10096,7 @@ mod tests {
             validate_upload_pack_request_features(
                 &features,
                 &UploadPackRequest {
-                    wants: vec![want.clone()],
+                    wants: vec![want],
                     filter: Some("blob:none".into()),
                     ..UploadPackRequest::default()
                 },
@@ -10111,7 +10111,7 @@ mod tests {
                     ..UploadPackFeatures::default()
                 },
                 &UploadPackRequest {
-                    wants: vec![want.clone()],
+                    wants: vec![want],
                     capabilities: vec![
                         Capability {
                             name: "side-band".into(),
@@ -10170,19 +10170,19 @@ mod tests {
             "3333333333333333333333333333333333333333",
         )
         .expect("test operation should succeed");
-        let existing = std::collections::HashSet::from([want.clone(), known_have.clone()]);
+        let existing = std::collections::HashSet::from([want, known_have]);
 
         let response = build_upload_pack_raw_packfile_response(
             &UploadPackFeatures::default(),
             UploadPackRequest {
-                wants: vec![want.clone()],
+                wants: vec![want],
                 ..UploadPackRequest::default()
             },
-            [known_have.clone(), unknown_have],
+            [known_have, unknown_have],
             |oid| Ok(existing.contains(oid)),
             |wants, haves| {
-                assert_eq!(wants, vec![want.clone()]);
-                assert_eq!(haves, vec![known_have.clone()]);
+                assert_eq!(wants, vec![want]);
+                assert_eq!(haves, vec![known_have]);
                 Ok(Some(b"PACKmock".to_vec()))
             },
         )
@@ -10207,7 +10207,7 @@ mod tests {
             build_upload_pack_raw_packfile_response(
                 &UploadPackFeatures::default(),
                 UploadPackRequest {
-                    wants: vec![want.clone()],
+                    wants: vec![want],
                     ..UploadPackRequest::default()
                 },
                 Vec::<ObjectId>::new(),
@@ -10539,7 +10539,7 @@ mod tests {
         assert_eq!(
             request,
             UploadPackNegotiationRequest {
-                haves: vec![have.clone(), second_have],
+                haves: vec![have, second_have],
                 done: false,
             }
         );
@@ -10678,7 +10678,7 @@ mod tests {
             assert_eq!(
                 acknowledgment,
                 UploadPackAcknowledgment::Ack {
-                    oid: oid.clone(),
+                    oid,
                     status,
                 }
             );

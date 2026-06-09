@@ -161,8 +161,7 @@ fn commit_during_resolved_rebase_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         let upstream_pre_rebase = topic_head("git", &upstream);
         let rust_pre_rebase = topic_head(env!("CARGO_BIN_EXE_sley"), &rust);
         assert_eq!(upstream_pre_rebase, rust_pre_rebase, "pre-rebase topic differed");
@@ -217,9 +216,7 @@ fn commit_during_resolved_rebase_matches_upstream_git() {
             fs::read(rust.join("c.txt")).expect("read rust c file"),
             "worktree content differed after commit during rebase"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -229,8 +226,7 @@ fn commit_during_rebase_with_unmerged_entries_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         start_conflict_rebase("git", &upstream);
         start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
 
@@ -238,7 +234,5 @@ fn commit_during_rebase_with_unmerged_entries_fails() {
         let expected = run_output_with_identity("git", &upstream, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

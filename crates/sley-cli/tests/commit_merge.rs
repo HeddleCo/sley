@@ -148,8 +148,7 @@ fn commit_during_resolved_merge_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         start_conflict_merge("git", &upstream);
         start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
         resolve_conflict(&upstream);
@@ -196,9 +195,7 @@ fn commit_during_resolved_merge_matches_upstream_git() {
             fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
             "worktree content differed after commit during merge"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -208,8 +205,7 @@ fn commit_during_merge_with_unmerged_entries_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_repos(&upstream, &rust);
+            prepare_conflict_repos(&upstream, &rust);
         start_conflict_merge("git", &upstream);
         start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
 
@@ -217,7 +213,5 @@ fn commit_during_merge_with_unmerged_entries_fails() {
         let expected = run_output_with_identity("git", &upstream, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

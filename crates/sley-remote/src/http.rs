@@ -449,15 +449,9 @@ pub fn http_protocol_v2_fetch_response(
     remote: &RemoteUrl,
     format: ObjectFormat,
     handshake: &TransportHandshake,
-    wants: Vec<ObjectId>,
-    haves: Vec<ObjectId>,
-    shallow: Vec<ObjectId>,
-    deepen: Option<u32>,
+    fetch: ProtocolV2FetchRequest,
     credentials: &mut dyn CredentialProvider,
 ) -> Result<Vec<ProtocolV2FetchResponseSection>> {
-    let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
-        wants, haves, shallow, deepen, handshake,
-    )?;
     let command = protocol_v2_fetch_command_request(format, handshake, &fetch)?;
     let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
     let mut body = Vec::new();
@@ -578,15 +572,19 @@ pub fn install_fetch_pack_via_http_protocol_v2_fetch(
         return Ok(Vec::new());
     }
     let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+        request.wants,
+        haves,
+        request.shallow,
+        request.deepen,
+        handshake,
+    )?;
     let sections = http_protocol_v2_fetch_response(
         request.client,
         request.remote,
         request.format,
         handshake,
-        request.wants,
-        haves,
-        request.shallow,
-        request.deepen,
+        fetch,
         credentials,
     )?;
     let shallow_info = shallow_info_from_protocol_v2_fetch_sections(&sections);

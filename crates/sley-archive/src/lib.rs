@@ -562,6 +562,7 @@ impl<W: Write> Write for CountingWriter<'_, W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_core::BString;
     use sley_object::{EncodedObject, Tree};
     use sley_odb::{ObjectDatabase, ObjectWriter};
 
@@ -582,17 +583,17 @@ mod tests {
             entries: vec![
                 sley_object::TreeEntry {
                     mode: 0o100644,
-                    name: b"regular.txt".to_vec(),
+                    name: BString::from(b"regular.txt"),
                     oid: regular,
                 },
                 sley_object::TreeEntry {
                     mode: 0o100755,
-                    name: b"run".to_vec(),
+                    name: BString::from(b"run"),
                     oid: executable,
                 },
                 sley_object::TreeEntry {
                     mode: 0o120000,
-                    name: b"link".to_vec(),
+                    name: BString::from(b"link"),
                     oid: symlink,
                 },
             ],

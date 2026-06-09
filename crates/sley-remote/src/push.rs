@@ -327,7 +327,7 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
 
     let remote_excluded_tips = remote_refs
         .iter()
-        .map(|reference| reference.oid.clone())
+        .map(|reference| reference.oid)
         .collect::<Vec<_>>();
     let starts = commands
         .iter()
@@ -498,12 +498,12 @@ pub fn local_push_source_refs(
         }
         refs.push(PushSourceRef {
             name: reference.name.clone(),
-            oid: oid.clone(),
+            oid,
         });
         if let Some(short) = reference.name.strip_prefix("refs/heads/") {
             refs.push(PushSourceRef {
                 name: short.to_string(),
-                oid: oid.clone(),
+                oid,
             });
         }
         if let Some(short) = reference.name.strip_prefix("refs/tags/") {
@@ -603,7 +603,7 @@ fn ancestor_depths(
         if depths.get(&oid).is_some_and(|existing| *existing <= depth) {
             continue;
         }
-        depths.insert(oid.clone(), depth);
+        depths.insert(oid, depth);
         let object = db.read_object(&oid)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(

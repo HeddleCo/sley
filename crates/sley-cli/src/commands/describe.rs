@@ -384,7 +384,7 @@ fn describe_peel_commit(
             let commit = Commit::parse(format, &object.body)?;
             let date = commit_identity_timestamp_i64(&commit.committer).unwrap_or(0);
             Ok(DescribePeel::Lightweight {
-                commit: oid.clone(),
+                commit: *oid,
                 date,
             })
         }
@@ -526,9 +526,9 @@ fn describe_search<'a>(
     let target_date = describe_commit_date(db, format, target)?;
     queue.push(DescribeQueueItem {
         date: target_date,
-        oid: target.clone(),
+        oid: *target,
     });
-    seen.insert(target.clone());
+    seen.insert(*target);
 
     let effective_max = options.max_candidates.min(MAX_FLAG_CANDIDATES);
     let names_size = tags.len();
@@ -566,7 +566,7 @@ fn describe_search<'a>(
                 let found_order = candidates.len() + 1;
                 let flag = 1u32 << found_order;
                 let depth = (seen_commits - 1) as u32;
-                *flags.entry(oid.clone()).or_insert(0) |= flag;
+                *flags.entry(oid).or_insert(0) |= flag;
                 if options.debug {
                     eprintln!(" annotated {depth:>10} {}", best.name);
                 }
@@ -610,8 +610,8 @@ fn describe_search<'a>(
 
         let parents = describe_commit_parents(db, format, &oid, options.first_parent)?;
         for parent in parents {
-            *flags.entry(parent.clone()).or_insert(0) |= commit_flags;
-            if seen.insert(parent.clone()) {
+            *flags.entry(parent).or_insert(0) |= commit_flags;
+            if seen.insert(parent) {
                 let date = describe_commit_date(db, format, &parent)?;
                 queue.push(DescribeQueueItem { date, oid: parent });
             }
@@ -682,7 +682,7 @@ fn finish_depth_computation(
     let mut unflagged: HashSet<ObjectId> = queue
         .iter()
         .filter(|item| flags.get(&item.oid).copied().unwrap_or(0) & best_flag == 0)
-        .map(|item| item.oid.clone())
+        .map(|item| item.oid)
         .collect();
     let mut extra = 0u32;
     while let Some(item) = queue.pop() {
@@ -703,15 +703,15 @@ fn finish_depth_computation(
             let flag_before = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             let was_seen = seen.contains(&parent);
             if !was_seen {
-                seen.insert(parent.clone());
+                seen.insert(parent);
             }
-            *flags.entry(parent.clone()).or_insert(0) |= commit_flags;
+            *flags.entry(parent).or_insert(0) |= commit_flags;
             let flag_after = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             if !was_seen {
                 let date = describe_commit_date(db, format, &parent)?;
                 queue.push(DescribeQueueItem {
                     date,
-                    oid: parent.clone(),
+                    oid: parent,
                 });
                 if flag_after == 0 {
                     unflagged.insert(parent);

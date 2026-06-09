@@ -1127,7 +1127,7 @@ fn create_am_commit(
         &mut db,
         sley_sequencer::CommitCreate {
             tree,
-            parents: vec![head_oid.clone()],
+            parents: vec![head_oid],
             author,
             committer: committer.clone(),
             message,
@@ -1141,11 +1141,11 @@ fn create_am_commit(
     let mut tx = refs.transaction();
     tx.update(RefUpdate {
         name: target_ref,
-        expected: Some(RefTarget::Direct(head_oid.clone())),
-        new: RefTarget::Direct(new_oid.clone()),
+        expected: Some(RefTarget::Direct(head_oid)),
+        new: RefTarget::Direct(new_oid),
         reflog: Some(ReflogEntry {
             old_oid: head_oid,
-            new_oid: new_oid.clone(),
+            new_oid,
             committer,
             message: format!("am: {}", patch.subject).into_bytes(),
         }),
@@ -1406,20 +1406,20 @@ fn write_merge_index_and_worktree(
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                entries.push(merge_index_entry(path, *mode, oid.clone(), 0));
+                entries.push(merge_index_entry(path, *mode, *oid, 0));
             }
             MergePathResult::Resolved(None) => {}
             MergePathResult::Conflict {
                 base, ours, theirs, ..
             } => {
                 if let Some((mode, oid)) = base {
-                    entries.push(merge_index_entry(path, *mode, oid.clone(), 1));
+                    entries.push(merge_index_entry(path, *mode, *oid, 1));
                 }
                 if let Some((mode, oid)) = ours {
-                    entries.push(merge_index_entry(path, *mode, oid.clone(), 2));
+                    entries.push(merge_index_entry(path, *mode, *oid, 2));
                 }
                 if let Some((mode, oid)) = theirs {
-                    entries.push(merge_index_entry(path, *mode, oid.clone(), 3));
+                    entries.push(merge_index_entry(path, *mode, *oid, 3));
                 }
             }
         }
@@ -1443,7 +1443,7 @@ fn write_merge_index_and_worktree(
     for (path, result) in results {
         match result {
             MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, oid.clone())) {
+                if ours_map.get(path) != Some(&(*mode, *oid)) {
                     let content = merge_read_blob(db, oid)?;
                     merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                 }
@@ -1530,10 +1530,10 @@ fn am_abort(
         tx.update(RefUpdate {
             name: target_ref,
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
                 old_oid: current.unwrap_or(zero_oid(format)?),
-                new_oid: oid.clone(),
+                new_oid: oid,
                 committer: commit_identity_from_env("COMMITTER")?,
                 message: b"am --abort".to_vec(),
             }),

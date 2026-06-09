@@ -29,6 +29,8 @@ fn run_output_with_identity(program: &str, cwd: &Path, args: &[&str]) -> Output 
         .env("GIT_COMMITTER_NAME", "Example User")
         .env("GIT_COMMITTER_EMAIL", "example@example.invalid")
         .env("GIT_COMMITTER_DATE", "@0 +0000")
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
         .output()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
 }
@@ -174,8 +176,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_origin(&origin);
+            prepare_conflict_origin(&origin);
         prepare_conflict_clone(&origin, &upstream);
         prepare_conflict_clone(&origin, &rust);
 
@@ -237,7 +238,5 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
             1,
             "rebased commit should have a single parent"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

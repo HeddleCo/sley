@@ -119,7 +119,7 @@ fn cmd_stash_branch(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let entry_index = entries.len() - 1 - selector;
-    let stash_oid = entries[entry_index].new_oid.clone();
+    let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, &stash_oid)?;
     let stash_object = db.read_object(&stash_oid)?;
@@ -263,7 +263,7 @@ fn apply_stash_entry(options: StashApplyOptions) -> Result<AppliedStash> {
         ));
     }
     let entry_index = entries.len() - 1 - options.selector;
-    let stash_oid = entries[entry_index].new_oid.clone();
+    let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     validate_stash_like_commit(&db, format, &stash_oid)?;
     let stash_object = db.read_object(&stash_oid)?;
@@ -584,7 +584,7 @@ fn drop_stash_entry(
     } else {
         let new_top = entries
             .last()
-            .map(|entry| entry.new_oid.clone())
+            .map(|entry| entry.new_oid)
             .ok_or_else(|| GitError::InvalidFormat("stash reflog has no top entry".into()))?;
         let mut tx = store.transaction();
         tx.update(RefUpdate {
@@ -1049,10 +1049,10 @@ fn store_created_stash(created: CreatedStash, quiet: bool, keep_index: bool) -> 
     tx.update(RefUpdate {
         name: "refs/stash".to_string(),
         expected: None,
-        new: RefTarget::Direct(created.oid.clone()),
+        new: RefTarget::Direct(created.oid),
         reflog: Some(ReflogEntry {
             old_oid,
-            new_oid: created.oid.clone(),
+            new_oid: created.oid,
             committer: created.committer.clone(),
             message: created.message.as_bytes().to_vec(),
         }),
@@ -1251,7 +1251,7 @@ fn create_stash_commit(
         &mut db,
         sley_sequencer::CommitCreate {
             tree: index_tree.clone(),
-            parents: vec![head_oid.clone()],
+            parents: vec![head_oid],
             author: author.clone(),
             committer: committer.clone(),
             message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
@@ -1277,7 +1277,7 @@ fn create_stash_commit(
     } else {
         format!("On {branch}: {}", args.join(" "))
     };
-    let mut parents = vec![head_oid.clone(), index_commit.clone()];
+    let mut parents = vec![head_oid, index_commit.clone()];
     if let Some(untracked_commit) = untracked_commit {
         parents.push(untracked_commit);
     }
@@ -1358,8 +1358,8 @@ impl StashTreeNode {
             [name] => {
                 self.files.push(TreeEntry {
                     mode: entry.mode,
-                    name: name.to_vec(),
-                    oid: entry.oid.clone(),
+                    name: BString::from(*name),
+                    oid: entry.oid,
                 });
                 Ok(())
             }
@@ -1389,7 +1389,7 @@ fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> R
     for (name, child) in &node.directories {
         entries.push(TreeEntry {
             mode: 0o040000,
-            name: name.clone(),
+            name: BString::from(name.clone()),
             oid: stash_write_tree_node(db, child)?,
         });
     }
@@ -1402,7 +1402,7 @@ fn stash_write_tree_node(db: &mut FileObjectDatabase, node: &StashTreeNode) -> R
 fn stash_index_entry_map(entries: &[IndexEntry]) -> BTreeMap<Vec<u8>, (u32, ObjectId)> {
     entries
         .iter()
-        .map(|entry| (entry.path.clone(), (entry.mode, entry.oid.clone())))
+        .map(|entry| (entry.path.as_bytes().to_vec(), (entry.mode, entry.oid)))
         .collect()
 }
 
@@ -1518,10 +1518,11 @@ fn stash_repo_path_to_os_path(path: &[u8]) -> Result<PathBuf> {
 }
 
 fn stash_index_entry_from_metadata(
-    path: Vec<u8>,
+    path: impl Into<BString>,
     oid: ObjectId,
     metadata: &fs::Metadata,
 ) -> IndexEntry {
+    let path = path.into();
     let modified = metadata.modified().ok();
     let duration = modified
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1624,7 +1625,7 @@ fn cmd_stash_store(args: &[String]) -> Result<()> {
     tx.update(RefUpdate {
         name: "refs/stash".to_string(),
         expected: None,
-        new: RefTarget::Direct(stash_oid.clone()),
+        new: RefTarget::Direct(stash_oid),
         reflog: Some(ReflogEntry {
             old_oid,
             new_oid: stash_oid,
@@ -2081,7 +2082,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
         return Err(GitError::Exit(128));
     }
     let entry_index = entries.len() - 1 - selector;
-    let stash_oid = entries[entry_index].new_oid.clone();
+    let stash_oid = entries[entry_index].new_oid;
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let object = db.read_object(&stash_oid)?;
     if object.object_type != ObjectType::Commit {

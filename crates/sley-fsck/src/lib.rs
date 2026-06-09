@@ -143,7 +143,7 @@ where
     }
 
     fn check_loaded_object(&mut self, oid: ObjectId, object: &EncodedObject) {
-        if !self.checked.insert(oid.clone()) {
+        if !self.checked.insert(oid) {
             return;
         }
         match object.object_id(self.format) {
@@ -275,7 +275,7 @@ where
     let mut pending = VecDeque::new();
     pending.extend(roots.iter().cloned());
     while let Some(oid) = pending.pop_front() {
-        if !reachable.insert(oid.clone()) {
+        if !reachable.insert(oid) {
             continue;
         }
         let Ok(object) = reader.read_object(&oid) else {
@@ -307,7 +307,7 @@ where
             continue;
         };
         unreachable.push((
-            oid.clone(),
+            *oid,
             object.object_type,
             object_links(format, &object),
         ));
@@ -344,13 +344,13 @@ where
     let unreachable = unreachable_objects(reader, format, roots, object_ids);
     let unreachable_ids = unreachable
         .iter()
-        .map(|(oid, _, _)| oid.clone())
+        .map(|(oid, _, _)| oid)
         .collect::<HashSet<_>>();
     let referenced_by_unreachable = unreachable
         .iter()
         .flat_map(|(_, _, links)| links.iter())
         .filter(|link| unreachable_ids.contains(&link.oid))
-        .map(|link| link.oid.clone())
+        .map(|link| link.oid)
         .collect::<HashSet<_>>();
     unreachable
         .into_iter()
@@ -409,6 +409,7 @@ fn fsck_tree_entry_object_type(mode: u32) -> ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_core::BString;
     use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry};
     use sley_odb::{ObjectDatabase, ObjectWriter};
 
@@ -425,7 +426,7 @@ mod tests {
                 Tree {
                     entries: vec![TreeEntry {
                         mode: 0o100644,
-                        name: b"payload.txt".to_vec(),
+                        name: BString::from(b"payload.txt"),
                         oid: blob,
                     }],
                 }
@@ -526,7 +527,7 @@ mod tests {
                 Tree {
                     entries: vec![TreeEntry {
                         mode: 0o100644,
-                        name: b"lost.txt".to_vec(),
+                        name: BString::from(b"lost.txt"),
                         oid: blob.clone(),
                     }],
                 }

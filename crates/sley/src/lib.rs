@@ -736,8 +736,8 @@ mod tests {
         let tree = Tree {
             entries: vec![sley_object::TreeEntry {
                 mode: 0o100644,
-                name: b"hello.txt".to_vec(),
-                oid: blob_oid.clone(),
+                name: BString::from(b"hello.txt"),
+                oid: blob_oid,
             }],
         };
         let tree_oid = db
@@ -745,7 +745,7 @@ mod tests {
             .expect("write tree");
 
         let commit = Commit {
-            tree: tree_oid.clone(),
+            tree: tree_oid,
             parents: Vec::new(),
             author: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
             committer: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
@@ -759,7 +759,7 @@ mod tests {
         let refs = repo.references();
         refs.create_branch(
             "main",
-            commit_oid.clone(),
+            commit_oid,
             b"Tester <test@example.com> 1700000000 +0000".to_vec(),
             b"commit (initial): initial".to_vec(),
         )
@@ -890,10 +890,10 @@ mod tests {
             .expect("find branch")
             .expect("branch exists");
         assert_eq!(branch.name, "refs/heads/main");
-        assert_eq!(branch.target, RefTarget::Direct(commit_oid.clone()));
+        assert_eq!(branch.target, RefTarget::Direct(commit_oid));
         assert_eq!(
             branch.peeled_oid(&repo).expect("peel"),
-            Some(commit_oid.clone())
+            Some(commit_oid)
         );
 
         let head = repo
@@ -1194,7 +1194,7 @@ mod tests {
 
         let tag_oid = repo
             .write_annotated_tag(TagCreate {
-                object: commit_oid.clone(),
+                object: commit_oid,
                 object_type: ObjectType::Commit,
                 name: b"v1".to_vec(),
                 tagger: b"Tagger <t@e.com> 1 +0000".to_vec(),

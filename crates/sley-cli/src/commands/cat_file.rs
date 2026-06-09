@@ -555,7 +555,7 @@ fn print_cat_file_batch_record(
     let read_oid = if record.apply_replace {
         record.view.replacement_oid(&oid)?
     } else {
-        oid.clone()
+        oid
     };
     let object_mode = if record
         .batch_format

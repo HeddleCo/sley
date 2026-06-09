@@ -231,7 +231,7 @@ where
     let mut objects = Vec::new();
     walk_reachable_objects(reader, format, starts, excluded, |oid, object| {
         objects.push(ReachablePackObject {
-            oid: oid.clone(),
+            oid: *oid,
             object: Arc::clone(object),
         });
     })?;
@@ -372,7 +372,7 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
     let mut objects = Vec::with_capacity(all_oids.len());
     for oid in &all_oids {
         objects.push(ReachablePackObject {
-            oid: oid.clone(),
+            oid: *oid,
             object: database.read_object(oid)?,
         });
     }
@@ -468,7 +468,7 @@ pub fn install_repack_result(
     let present: HashSet<ObjectId> = parsed_index
         .entries
         .iter()
-        .map(|entry| entry.oid.clone())
+        .map(|entry| entry.oid)
         .collect();
 
     prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
@@ -727,7 +727,7 @@ fn scan_pack_index_offsets(
             }
         }
         if Some(entry.offset) == delta_base_offset {
-            delta_base_oid = Some(entry.oid.clone());
+            delta_base_oid = Some(entry.oid);
         }
     }
 
@@ -857,7 +857,7 @@ where
             if excluded.contains(&oid) {
                 continue;
             }
-            if !seen.insert(oid.clone()) {
+            if !seen.insert(oid) {
                 continue;
             }
             let object = reader.read_object(&oid)?;
@@ -951,7 +951,7 @@ impl ObjectWriter for ObjectDatabase {
     fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
         self.objects
-            .entry(oid.clone())
+            .entry(oid)
             .or_insert_with(|| Arc::new(object));
         Ok(oid)
     }
@@ -1479,7 +1479,7 @@ impl FileObjectDatabase {
             object_ids: canonical_index
                 .entries
                 .iter()
-                .map(|entry| entry.oid.clone())
+                .map(|entry| entry.oid)
                 .collect(),
         })
     }
@@ -1535,7 +1535,7 @@ impl FileObjectDatabase {
             pack_path,
             index_path,
             promisor_path,
-            object_ids: pack.entries.iter().map(|entry| entry.oid.clone()).collect(),
+            object_ids: pack.entries.iter().map(|entry| entry.oid).collect(),
         })
     }
 
@@ -1567,7 +1567,7 @@ impl FileObjectDatabase {
             object_ids: built
                 .entries
                 .iter()
-                .map(|entry| entry.oid.clone())
+                .map(|entry| entry.oid)
                 .collect(),
         })
     }
@@ -1722,7 +1722,7 @@ impl FileObjectDatabase {
             }
         }
         if let Ok(mut cache) = self.decoded.lock() {
-            cache.put(oid.clone(), Arc::clone(&object));
+            cache.put(*oid, Arc::clone(&object));
         }
         Ok(Some(object))
     }
@@ -2277,6 +2277,7 @@ fn unique_temp_path(parent: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_core::BString;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use sley_pack::{PackFile, PackWriteOptions};
 
@@ -2580,7 +2581,7 @@ mod tests {
         assert_eq!(
             db.resolve_prefix(prefix)
                 .expect("test operation should succeed"),
-            ObjectPrefixResolution::Unique(oid.clone())
+            ObjectPrefixResolution::Unique(oid)
         );
         assert!(
             db.object_ids()
@@ -2629,7 +2630,7 @@ mod tests {
                     .write_object(object)
                     .expect("test operation should succeed");
                 let prefix = oid.to_hex()[..4].to_string();
-                seen.insert(prefix.clone(), oid.clone())
+                seen.insert(prefix.clone(), oid)
                     .map(|first| (prefix, first, oid))
             })
             .expect("test should find a 4-hex collision");
@@ -2710,7 +2711,7 @@ mod tests {
             .expect("test operation should succeed");
 
         assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert!(result.pack_path.exists());
         assert!(result.index_path.exists());
         assert_eq!(result.promisor_path, None);
@@ -2743,7 +2744,7 @@ mod tests {
             .expect("test operation should succeed");
 
         assert_eq!(result.pack_name, format!("pack-{}", pack.checksum.to_hex()));
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert!(result.pack_path.exists());
         assert!(result.index_path.exists());
         assert_eq!(result.promisor_path, None);
@@ -2854,8 +2855,8 @@ mod tests {
             Tree {
                 entries: vec![TreeEntry {
                     mode: 0o100644,
-                    name: b"payload.txt".to_vec(),
-                    oid: blob_oid.clone(),
+                    name: BString::from(b"payload.txt"),
+                    oid: blob_oid,
                 }],
             }
             .write(),
@@ -2867,7 +2868,7 @@ mod tests {
         let commit = EncodedObject::new(
             ObjectType::Commit,
             Commit {
-                tree: tree_oid.clone(),
+                tree: tree_oid,
                 parents: Vec::new(),
                 author: identity.clone(),
                 committer: identity,
@@ -2881,7 +2882,7 @@ mod tests {
             .expect("test operation should succeed");
 
         let reachable =
-            collect_reachable_object_ids(&source, format, std::iter::once(commit_oid.clone()))
+            collect_reachable_object_ids(&source, format, std::iter::once(commit_oid))
                 .expect("test operation should succeed");
         assert!(reachable.contains(&commit_oid));
         assert!(reachable.contains(&tree_oid));
@@ -2891,7 +2892,7 @@ mod tests {
             &source,
             &destination,
             format,
-            std::iter::once(commit_oid.clone()),
+            std::iter::once(commit_oid),
         )
         .expect("test operation should succeed")
         .expect("reachable pack should be written");
@@ -2935,8 +2936,8 @@ mod tests {
             Tree {
                 entries: vec![TreeEntry {
                     mode: 0o100644,
-                    name: b"payload.txt".to_vec(),
-                    oid: blob_oid.clone(),
+                    name: BString::from(b"payload.txt"),
+                    oid: blob_oid,
                 }],
             }
             .write(),
@@ -2948,7 +2949,7 @@ mod tests {
         let commit = EncodedObject::new(
             ObjectType::Commit,
             Commit {
-                tree: tree_oid.clone(),
+                tree: tree_oid,
                 parents: Vec::new(),
                 author: identity.clone(),
                 committer: identity,
@@ -2960,12 +2961,12 @@ mod tests {
         let commit_oid = db
             .write_object(commit)
             .expect("test operation should succeed");
-        let excluded = HashSet::from([tree_oid.clone()]);
+        let excluded = HashSet::from([tree_oid]);
 
         let objects = collect_reachable_objects(
             &db,
             format,
-            [commit_oid.clone(), commit_oid.clone()],
+            [commit_oid, commit_oid],
             &excluded,
         )
         .expect("test operation should succeed");
@@ -2992,12 +2993,12 @@ mod tests {
         let oid = db
             .write_object(object.clone())
             .expect("test operation should succeed");
-        let pack = build_reachable_pack(&db, format, std::iter::once(oid.clone()), &HashSet::new())
+        let pack = build_reachable_pack(&db, format, std::iter::once(oid), &HashSet::new())
             .expect("test operation should succeed")
             .expect("reachable pack should be built");
         assert!(pack.pack.starts_with(b"PACK"));
         assert_eq!(pack.entries.len(), 1);
-        assert_eq!(pack.entries[0].oid, oid.clone());
+        assert_eq!(pack.entries[0].oid, oid);
 
         let excluded = HashSet::from([oid]);
         assert!(
@@ -3028,7 +3029,7 @@ mod tests {
         let tag = EncodedObject::new(
             ObjectType::Tag,
             Tag {
-                object: blob_oid.clone(),
+                object: blob_oid,
                 object_type: ObjectType::Blob,
                 name: b"v1".to_vec(),
                 tagger: Some(b"Example <example@example.invalid> 0 +0000".to_vec()),
@@ -3038,7 +3039,7 @@ mod tests {
         );
         let tag_oid = db.write_object(tag).expect("test operation should succeed");
 
-        let reachable = collect_reachable_object_ids(&db, format, std::iter::once(tag_oid.clone()))
+        let reachable = collect_reachable_object_ids(&db, format, std::iter::once(tag_oid))
             .expect("test operation should succeed");
         assert!(reachable.contains(&tag_oid));
         assert!(reachable.contains(&blob_oid));
@@ -3087,7 +3088,7 @@ mod tests {
         let oid = source
             .write_object(object)
             .expect("test operation should succeed");
-        let excluded = HashSet::from([oid.clone()]);
+        let excluded = HashSet::from([oid]);
 
         let result = install_reachable_pack_excluding(
             &source,
@@ -3122,7 +3123,7 @@ mod tests {
         let pack = build_reachable_pack(
             &source,
             format,
-            std::iter::once(oid.clone()),
+            std::iter::once(oid),
             &HashSet::new(),
         )
         .expect("test operation should succeed")
@@ -3131,11 +3132,11 @@ mod tests {
         assert_eq!(pack.entries[0].oid, oid);
 
         let result =
-            install_reachable_pack(&source, &destination, format, std::iter::once(oid.clone()))
+            install_reachable_pack(&source, &destination, format, std::iter::once(oid))
                 .expect("test operation should succeed")
                 .expect("sha256 reachable pack should be written");
 
-        assert_eq!(result.object_ids, vec![oid.clone()]);
+        assert_eq!(result.object_ids, vec![oid]);
         assert!(
             !destination
                 .loose()
@@ -3170,7 +3171,7 @@ mod tests {
             .write_object(object)
             .expect("test operation should succeed");
         let installer = RecordingInstaller::default();
-        installer.installed.borrow_mut().push(oid.clone());
+        installer.installed.borrow_mut().push(oid);
 
         let result = install_reachable_pack(&source, &installer, format, std::iter::once(oid))
             .expect("test operation should succeed")
@@ -3218,12 +3219,12 @@ mod tests {
             &[first_pack_name, second_pack_name],
             &[
                 sley_pack::MultiPackIndexEntry {
-                    oid: first_oid.clone(),
+                    oid: first_oid,
                     pack_int_id: 0,
                     offset: first_pack.entries[0].offset,
                 },
                 sley_pack::MultiPackIndexEntry {
-                    oid: second_oid.clone(),
+                    oid: second_oid,
                     pack_int_id: 1,
                     offset: second_pack.entries[0].offset,
                 },
@@ -3240,7 +3241,7 @@ mod tests {
         assert_eq!(
             db.resolve_prefix(&second_oid.to_hex()[..8])
                 .expect("test operation should succeed"),
-            ObjectPrefixResolution::Unique(second_oid.clone())
+            ObjectPrefixResolution::Unique(second_oid)
         );
         assert_eq!(read_object_for_assert(&db, &second_oid), second);
         assert_eq!(read_object_for_assert(&db, &first_oid), first);
@@ -3370,7 +3371,7 @@ mod tests {
 
         let result = unbundle_objects(&bundle, &prerequisite_reader, &mut writer)
             .expect("test operation should succeed");
-        assert_eq!(result.written_objects, vec![oid.clone()]);
+        assert_eq!(result.written_objects, vec![oid]);
         assert_eq!(result.references, bundle.references);
         assert_eq!(read_object_for_assert(&writer, &oid), object);
     }
@@ -3399,7 +3400,7 @@ mod tests {
         let result = install_bundle_pack(&bundle, &prerequisite_reader, &database)
             .expect("test operation should succeed");
 
-        assert_eq!(result.written_objects, vec![oid.clone()]);
+        assert_eq!(result.written_objects, vec![oid]);
         assert_eq!(result.references, bundle.references);
         assert!(
             database
@@ -3430,7 +3431,7 @@ mod tests {
         let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &mut writer)
             .expect("test operation should succeed");
 
-        assert_eq!(result.written_objects, vec![oid.clone()]);
+        assert_eq!(result.written_objects, vec![oid]);
         assert_eq!(read_object_for_assert(&writer, &oid), object);
     }
 
@@ -3474,8 +3475,8 @@ mod tests {
             Tree {
                 entries: vec![TreeEntry {
                     mode: 0o100644,
-                    name: b"payload.txt".to_vec(),
-                    oid: blob_oid.clone(),
+                    name: BString::from(b"payload.txt"),
+                    oid: blob_oid,
                 }],
             }
             .write(),
@@ -3487,7 +3488,7 @@ mod tests {
         let commit = EncodedObject::new(
             ObjectType::Commit,
             Commit {
-                tree: tree_oid.clone(),
+                tree: tree_oid,
                 parents: Vec::new(),
                 author: identity.clone(),
                 committer: identity,
@@ -3522,7 +3523,7 @@ mod tests {
         let graph = write_commit_graph(&mut db, b"repack payload\n");
 
         let mut expected: HashMap<ObjectId, EncodedObject> = graph.iter().cloned().collect();
-        expected.insert(packed_oid.clone(), packed_blob.clone());
+        expected.insert(packed_oid, packed_blob.clone());
 
         let result = repack_all_objects(&git_dir, format)
             .expect("test operation should succeed")
@@ -3553,7 +3554,7 @@ mod tests {
         // The pre-existing pack is reported obsolete (by its .pack path).
         assert_eq!(result.obsolete_packs, vec![existing.pack_path.clone()]);
         // Every loose object id is reported as now packed.
-        let mut want_loose: Vec<ObjectId> = graph.iter().map(|(oid, _)| oid.clone()).collect();
+        let mut want_loose: Vec<ObjectId> = graph.iter().map(|(oid, _)| *oid).collect();
         want_loose.sort_by_key(ObjectId::to_hex);
         assert_eq!(result.packed_loose, want_loose);
         assert!(!result.packed_loose.contains(&packed_oid));
@@ -3765,7 +3766,7 @@ mod tests {
             .write_object(stray.clone())
             .expect("test operation should succeed");
         assert!(!result.packed_loose.contains(&stray_oid));
-        result.packed_loose.push(stray_oid.clone());
+        result.packed_loose.push(stray_oid);
 
         install_repack_result(&git_dir, format, &result, true)
             .expect("test operation should succeed");
@@ -3808,9 +3809,9 @@ mod tests {
             .expect("test operation should succeed");
 
         // Report-only pass leaves everything on disk.
-        let reported = prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], false)
+        let reported = prune_unreachable_loose(&git_dir, format, [commit_oid], false)
             .expect("test operation should succeed");
-        assert_eq!(reported, vec![dangling_oid.clone()]);
+        assert_eq!(reported, vec![dangling_oid]);
         assert!(
             db.loose()
                 .object_path(&dangling_oid)
@@ -3819,9 +3820,9 @@ mod tests {
         );
 
         // Deleting pass removes only the unreachable object.
-        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid.clone()], true)
+        let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid], true)
             .expect("test operation should succeed");
-        assert_eq!(deleted, vec![dangling_oid.clone()]);
+        assert_eq!(deleted, vec![dangling_oid]);
         assert!(
             !db.loose()
                 .object_path(&dangling_oid)
@@ -3856,7 +3857,7 @@ mod tests {
             Tree {
                 entries: vec![TreeEntry {
                     mode: 0o160000,
-                    name: b"submodule".to_vec(),
+                    name: BString::from(b"submodule"),
                     oid: submodule_oid,
                 }],
             }
@@ -3889,7 +3890,7 @@ mod tests {
         let deleted = prune_unreachable_loose(&git_dir, format, [commit_oid], true)
             .expect("test operation should succeed");
 
-        assert_eq!(deleted, vec![dangling_oid.clone()]);
+        assert_eq!(deleted, vec![dangling_oid]);
         assert!(
             !db.loose()
                 .object_path(&dangling_oid)

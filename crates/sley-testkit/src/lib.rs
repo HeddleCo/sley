@@ -870,10 +870,10 @@ pub fn loose_ref_interop_parity_for_format(format: ObjectFormat) -> Result<RefIn
         tx.update(RefUpdate {
             name: name.into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: Some(ReflogEntry {
                 old_oid: zero_oid(format)?,
-                new_oid: oid.clone(),
+                new_oid: oid,
                 committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
                 message: b"interop".to_vec(),
             }),
@@ -924,7 +924,7 @@ pub fn packed_ref_interop_parity_for_format(format: ObjectFormat) -> Result<RefI
         store.write_packed_refs(&[PackedRef {
             reference: Ref {
                 name: name.into(),
-                target: RefTarget::Direct(oid.clone()),
+                target: RefTarget::Direct(oid),
             },
             peeled: None,
         }])?;
@@ -976,7 +976,7 @@ pub fn packed_ref_compaction_interop_parity_for_format(
         tx.update(RefUpdate {
             name: name.into(),
             expected: None,
-            new: RefTarget::Direct(oid.clone()),
+            new: RefTarget::Direct(oid),
             reflog: None,
         });
         tx.commit()?;
@@ -1052,7 +1052,7 @@ pub fn peeled_packed_ref_compaction_interop_parity_for_format(
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
-                object: commit.oid.clone(),
+                object: commit.oid,
                 object_type: ObjectType::Commit,
                 name: b"v-peel".to_vec(),
                 tagger: identity,
@@ -1061,7 +1061,7 @@ pub fn peeled_packed_ref_compaction_interop_parity_for_format(
         )?;
         let name = "refs/tags/v-peel";
         let store = FileRefStore::new(root.join(".git"), format);
-        store.create_tag("v-peel", tag_oid.clone())?;
+        store.create_tag("v-peel", tag_oid)?;
         let packed = sley_rev::pack_refs_with_auto_peel(root.join(".git"), format, true)?;
         let Some(packed_tag) = packed.iter().find(|packed| packed.reference.name == name) else {
             return Err(GitError::InvalidFormat(
@@ -1204,7 +1204,7 @@ pub fn show_ref_filter_parity_for_format(format: ObjectFormat) -> Result<ShowRef
         let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
-            commit.oid.clone(),
+            commit.oid,
             identity.clone(),
             b"branch: Created from main".to_vec(),
         )?;
@@ -1212,7 +1212,7 @@ pub fn show_ref_filter_parity_for_format(format: ObjectFormat) -> Result<ShowRef
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
-                object: commit.oid.clone(),
+                object: commit.oid,
                 object_type: ObjectType::Commit,
                 name: b"v2.0".to_vec(),
                 tagger: identity,
@@ -1346,15 +1346,15 @@ pub fn show_ref_verify_parity_for_format(format: ObjectFormat) -> Result<ShowRef
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
-                object: commit.oid.clone(),
+                object: commit.oid,
                 object_type: ObjectType::Commit,
                 name: b"v2.0".to_vec(),
                 tagger: identity,
                 message: b"release v2\n".to_vec(),
             },
         )?;
-        store.create_tag("v1.0", commit.oid.clone())?;
-        store.create_tag("v2.0", tag_oid.clone())?;
+        store.create_tag("v1.0", commit.oid)?;
+        store.create_tag("v2.0", tag_oid)?;
         let upstream = String::from_utf8_lossy(&run_git(
             &root,
             ["show-ref", "--verify", "refs/heads/main", "refs/tags/v1.0"],
@@ -1594,7 +1594,7 @@ fn rust_bundle_write_interop_parity_for_format(format: ObjectFormat) -> Result<B
             capabilities: Vec::new(),
             prerequisites: Vec::new(),
             references: vec![BundleReference {
-                oid: oid.clone(),
+                oid,
                 name: "refs/heads/main".into(),
             }],
             pack: written.pack,
@@ -2572,7 +2572,7 @@ fn format_log_record(
     format: ObjectFormat,
     oid: &ObjectId,
 ) -> Result<String> {
-    let records = sley_rev::walk_commits(reader, format, [oid.clone()])?;
+    let records = sley_rev::walk_commits(reader, format, [*oid])?;
     let record = records
         .first()
         .ok_or_else(|| GitError::not_found("commit record"))?;
@@ -3089,7 +3089,7 @@ fn format_ls_files_from_entries(
             let stage = (entry.flags >> 12) & 0x3;
             out.extend_from_slice(format!("{:06o} {} {stage}\t", entry.mode, entry.oid).as_bytes());
         }
-        out.extend_from_slice(&entry.path);
+        out.extend_from_slice(entry.path.as_bytes());
         out.push(terminator);
     }
     out
@@ -3184,11 +3184,11 @@ fn format_ls_files_selected_single(
     options: LsFilesFormatOptions,
     seen: &mut Vec<Vec<u8>>,
 ) -> Vec<u8> {
-    if options.deduplicate && seen.contains(&entry.path) {
+    if options.deduplicate && seen.iter().any(|p| p.as_slice() == entry.path.as_bytes()) {
         return Vec::new();
     }
     if options.deduplicate {
-        seen.push(entry.path.clone());
+        seen.push(entry.path.as_bytes().to_vec());
     }
     format_ls_files_from_entries(
         std::slice::from_ref(entry),
@@ -3254,10 +3254,10 @@ pub fn update_ref_delete_parity_for_format(format: ObjectFormat) -> Result<Updat
         tx.update(RefUpdate {
             name: "refs/heads/topic".into(),
             expected: None,
-            new: RefTarget::Direct(commit.oid.clone()),
+            new: RefTarget::Direct(commit.oid),
             reflog: Some(ReflogEntry {
                 old_oid: zero_oid(format)?,
-                new_oid: commit.oid.clone(),
+                new_oid: commit.oid,
                 committer: identity,
                 message: b"update by test".to_vec(),
             }),
@@ -3331,7 +3331,7 @@ pub fn update_ref_delete_packed_parity_for_format(
         store.write_packed_refs(&[PackedRef {
             reference: Ref {
                 name: "refs/heads/topic".into(),
-                target: RefTarget::Direct(commit.oid.clone()),
+                target: RefTarget::Direct(commit.oid),
             },
             peeled: None,
         }])?;
@@ -3786,11 +3786,11 @@ pub fn branch_create_parity_for_format(format: ObjectFormat) -> Result<BranchPar
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
-        let commit_oid = commit.oid.clone();
+        let commit_oid = commit.oid;
         let commit_hex = commit_oid.to_hex();
         store.create_branch(
             "feature",
-            commit_oid.clone(),
+            commit_oid,
             identity,
             b"branch: Created from main".to_vec(),
         )?;
@@ -3944,7 +3944,7 @@ pub fn branch_delete_parity_for_format(format: ObjectFormat) -> Result<BranchDel
         let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
-            commit.oid.clone(),
+            commit.oid,
             identity,
             b"branch: Created from main".to_vec(),
         )?;
@@ -4011,7 +4011,7 @@ pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<Checkou
         let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
-            feature_commit.oid.clone(),
+            feature_commit.oid,
             identity.clone(),
             b"branch: Created from main".to_vec(),
         )?;
@@ -4101,7 +4101,7 @@ pub fn tag_create_parity_for_format(format: ObjectFormat) -> Result<TagParity> {
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
-        store.create_tag("v1.0", commit.oid.clone())?;
+        store.create_tag("v1.0", commit.oid)?;
         let upstream =
             String::from_utf8_lossy(&run_git(&root, ["tag", "--list"], &[])?).to_string();
         let expected = "v1.0\n".to_string();
@@ -4165,7 +4165,7 @@ pub fn tag_delete_parity_for_format(format: ObjectFormat) -> Result<TagDeletePar
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
-        store.create_tag("v1.0", commit.oid.clone())?;
+        store.create_tag("v1.0", commit.oid)?;
         let before = String::from_utf8_lossy(&run_git(&root, ["tag", "--list"], &[])?).to_string();
         let deleted = store.delete_tag("v1.0")?;
         let after = String::from_utf8_lossy(&run_git(&root, ["tag", "--list"], &[])?).to_string();
@@ -4225,7 +4225,7 @@ pub fn annotated_tag_create_parity_for_format(format: ObjectFormat) -> Result<An
         let tag_oid = sley_sequencer::create_annotated_tag(
             &mut db,
             sley_sequencer::TagCreate {
-                object: commit.oid.clone(),
+                object: commit.oid,
                 object_type: ObjectType::Commit,
                 name: b"v2.0".to_vec(),
                 tagger: identity,
@@ -4233,7 +4233,7 @@ pub fn annotated_tag_create_parity_for_format(format: ObjectFormat) -> Result<An
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
-        store.create_tag("v2.0", tag_oid.clone())?;
+        store.create_tag("v2.0", tag_oid)?;
         let upstream_type =
             String::from_utf8_lossy(&run_git(&root, ["cat-file", "-t", "refs/tags/v2.0"], &[])?)
                 .trim()
@@ -4354,7 +4354,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
         let name_only_rust =
             sley_diff_merge::diff_name_status_head_worktree(&root, root.join(".git"), format)?
                 .into_iter()
-                .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
+                .map(|entry| format!("{}\n", String::from_utf8_lossy(entry.path.as_bytes())))
                 .collect::<String>();
         let cached_rust = sley_diff_merge::diff_name_status_head_index(root.join(".git"), format)?
             .into_iter()
@@ -4363,7 +4363,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
         let cached_name_only_rust =
             sley_diff_merge::diff_name_status_head_index(root.join(".git"), format)?
                 .into_iter()
-                .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
+                .map(|entry| format!("{}\n", String::from_utf8_lossy(entry.path.as_bytes())))
                 .collect::<String>();
         if rust != upstream
             || name_only_rust != name_only_upstream
@@ -4449,7 +4449,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
             .collect::<String>();
         let rename_copy_name_only_rust = rename_copy_entries
             .iter()
-            .map(|entry| format!("{}\n", String::from_utf8_lossy(&entry.path)))
+            .map(|entry| format!("{}\n", String::from_utf8_lossy(entry.path.as_bytes())))
             .collect::<String>();
         if rename_copy_rust != rename_copy_upstream
             || rename_copy_name_only_rust != rename_copy_name_only_upstream
@@ -4516,11 +4516,11 @@ pub fn rev_parse_parity_for_format(format: ObjectFormat) -> Result<RevParseParit
         let store = FileRefStore::new(root.join(".git"), format);
         store.create_branch(
             "feature",
-            commit.oid.clone(),
+            commit.oid,
             b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
             b"branch: Created from main".to_vec(),
         )?;
-        store.create_tag("v1.0", commit.oid.clone())?;
+        store.create_tag("v1.0", commit.oid)?;
         let commit_hex = commit.oid.to_hex();
         let revs = ["HEAD", "main", "feature", "v1.0", commit_hex.as_str()];
         let upstream = String::from_utf8_lossy(&run_git_owned(

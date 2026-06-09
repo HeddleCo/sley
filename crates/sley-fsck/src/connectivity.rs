@@ -339,7 +339,7 @@ where
         findings: Vec::new(),
     };
     for oid in roots {
-        walker.check_root(oid.clone());
+        walker.check_root(*oid);
     }
     let mut findings = FsckFindings {
         findings: walker.findings,
@@ -396,7 +396,7 @@ where
                     source_type,
                     source: source.clone(),
                     target_type: link.object_type,
-                    target: link.oid.clone(),
+                    target: link.oid,
                 });
                 self.findings.push(FsckFinding::MissingObject {
                     object_type: link.object_type,
@@ -407,7 +407,7 @@ where
         };
         if object.object_type != link.object_type {
             self.findings.push(FsckFinding::TypeMismatch {
-                oid: link.oid.clone(),
+                oid: link.oid,
                 actual: object.object_type,
                 expected: link.object_type,
             });
@@ -416,7 +416,7 @@ where
     }
 
     fn check_loaded(&mut self, oid: ObjectId, object: &EncodedObject) {
-        if !self.checked.insert(oid.clone()) {
+        if !self.checked.insert(oid) {
             return;
         }
         match object.object_id(self.format) {
@@ -618,7 +618,7 @@ where
     let mut pending = VecDeque::new();
     pending.extend(roots.iter().cloned());
     while let Some(oid) = pending.pop_front() {
-        if !reachable.insert(oid.clone()) {
+        if !reachable.insert(oid) {
             continue;
         }
         let Ok(object) = reader.read_object(&oid) else {
@@ -657,7 +657,7 @@ where
             continue;
         };
         unreachable.push((
-            oid.clone(),
+            *oid,
             object.object_type,
             object_links(format, &object),
         ));
@@ -665,12 +665,12 @@ where
 
     if only_tips {
         let unreachable_ids: HashSet<ObjectId> =
-            unreachable.iter().map(|(oid, _, _)| oid.clone()).collect();
+            unreachable.iter().map(|(oid, _, _)| *oid).collect();
         let referenced: HashSet<ObjectId> = unreachable
             .iter()
             .flat_map(|(_, _, links)| links.iter())
             .filter(|link| unreachable_ids.contains(&link.oid))
-            .map(|link| link.oid.clone())
+            .map(|link| link.oid)
             .collect();
         unreachable
             .into_iter()
@@ -739,6 +739,7 @@ fn tree_entry_object_type(mode: u32) -> ObjectType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sley_core::BString;
     use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeEntry};
     use sley_odb::{ObjectDatabase, ObjectWriter};
 
@@ -808,7 +809,7 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"payload.txt".to_vec(),
+                name: BString::from(b"payload.txt"),
                 oid: blob,
             }],
         );
@@ -826,7 +827,7 @@ mod tests {
     fn connectivity_reports_missing_tree_link() {
         let mut db = ObjectDatabase::new(fmt());
         let missing_tree = oid("1111111111111111111111111111111111111111");
-        let commit = write_commit(&mut db, missing_tree.clone(), Vec::new());
+        let commit = write_commit(&mut db, missing_tree, Vec::new());
 
         let findings = check_connectivity(
             &db,
@@ -845,7 +846,7 @@ mod tests {
                 source_type: ObjectType::Commit,
                 source: commit,
                 target_type: ObjectType::Tree,
-                target: missing_tree.clone(),
+                target: missing_tree,
             }
         );
         assert_eq!(
@@ -866,11 +867,11 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"gone.txt".to_vec(),
+                name: BString::from(b"gone.txt"),
                 oid: missing_blob.clone(),
             }],
         );
-        let commit = write_commit(&mut db, tree.clone(), Vec::new());
+        let commit = write_commit(&mut db, tree, Vec::new());
 
         let findings =
             check_connectivity(&db, fmt(), &[commit], &[], ConnectivityOptions::default());
@@ -1030,7 +1031,7 @@ mod tests {
     fn connectivity_follows_tag_to_missing_commit() {
         let mut db = ObjectDatabase::new(fmt());
         let missing_commit = oid("5555555555555555555555555555555555555555");
-        let tag = write_tag(&mut db, missing_commit.clone(), ObjectType::Commit, "v1");
+        let tag = write_tag(&mut db, missing_commit, ObjectType::Commit, "v1");
 
         let findings = check_connectivity(
             &db,
@@ -1044,7 +1045,7 @@ mod tests {
             source_type: ObjectType::Tag,
             source: tag,
             target_type: ObjectType::Commit,
-            target: missing_commit.clone(),
+            target: missing_commit,
         }));
         assert!(findings.findings.contains(&FsckFinding::MissingObject {
             object_type: ObjectType::Commit,
@@ -1061,17 +1062,17 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"lost.txt".to_vec(),
+                name: BString::from(b"lost.txt"),
                 oid: blob.clone(),
             }],
         );
-        let commit = write_commit(&mut db, tree.clone(), Vec::new());
+        let commit = write_commit(&mut db, tree, Vec::new());
 
         let findings = check_connectivity(
             &db,
             fmt(),
             &[],
-            &[blob.clone(), tree.clone(), commit.clone()],
+            &[blob.clone(), tree, commit],
             ConnectivityOptions {
                 report_dangling: true,
                 report_unreachable: false,
@@ -1129,17 +1130,17 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"lost.txt".to_vec(),
+                name: BString::from(b"lost.txt"),
                 oid: blob.clone(),
             }],
         );
-        let commit = write_commit(&mut db, tree.clone(), Vec::new());
+        let commit = write_commit(&mut db, tree, Vec::new());
 
         let findings = check_connectivity(
             &db,
             fmt(),
             &[],
-            &[blob.clone(), tree.clone(), commit.clone()],
+            &[blob.clone(), tree, commit],
             ConnectivityOptions {
                 report_dangling: false,
                 report_unreachable: true,
@@ -1175,13 +1176,13 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"kept.txt".to_vec(),
+                name: BString::from(b"kept.txt"),
                 oid: blob.clone(),
             }],
         );
-        let commit = write_commit(&mut db, tree.clone(), Vec::new());
+        let commit = write_commit(&mut db, tree, Vec::new());
 
-        let roots = [commit.clone()];
+        let roots = [commit];
         let findings = check_connectivity(
             &db,
             fmt(),
@@ -1205,7 +1206,7 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"x".to_vec(),
+                name: BString::from(b"x"),
                 oid: blob,
             }],
         );
@@ -1213,7 +1214,7 @@ mod tests {
         let missing = oid("6666666666666666666666666666666666666666");
 
         let refs = vec![
-            FsckRef::direct("refs/heads/main", commit.clone()),
+            FsckRef::direct("refs/heads/main", commit),
             FsckRef::direct("refs/heads/broken", missing.clone()),
         ];
         let findings = check_refs(&db, fmt(), &refs);
@@ -1260,7 +1261,7 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"x".to_vec(),
+                name: BString::from(b"x"),
                 oid: blob,
             }],
         );
@@ -1441,12 +1442,12 @@ mod tests {
             &mut db,
             vec![TreeEntry {
                 mode: 0o100644,
-                name: b"f".to_vec(),
+                name: BString::from(b"f"),
                 oid: blob,
             }],
         );
-        let base = write_commit(&mut db, tree.clone(), Vec::new());
-        let child_a = write_commit(&mut db, tree.clone(), vec![base.clone()]);
+        let base = write_commit(&mut db, tree, Vec::new());
+        let child_a = write_commit(&mut db, tree, vec![base]);
         let child_b = write_commit(&mut db, tree, vec![base]);
 
         // Two heads sharing history: no errors, no panics, terminates.

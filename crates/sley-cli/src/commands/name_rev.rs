@@ -234,7 +234,7 @@ fn collect_tips(
 
         // Peel tag objects through to the underlying commit, recording the tag
         // date for the age-based preference between competing tags.
-        let mut current = oid.clone();
+        let mut current = oid;
         let mut deref = false;
         let mut taggerdate = i64::MAX;
         let mut commit = None;
@@ -369,11 +369,11 @@ fn name_rev(
                 if let Some(name) = rev_names.get_mut(parent) {
                     name.tip_name = parent_tip_name;
                 }
-                to_queue.push(parent.clone());
+                to_queue.push(parent);
             }
         }
         while let Some(parent) = to_queue.pop() {
-            stack.push(parent);
+            stack.push(*parent);
         }
     }
     Ok(())
@@ -475,7 +475,7 @@ fn emit_all(
 ) -> Result<()> {
     let mut rows: Vec<(ObjectId, RevName)> = rev_names
         .iter()
-        .map(|(oid, name)| (oid.clone(), name.clone()))
+        .map(|(oid, name)| (*oid, name.clone()))
         .collect();
     rows.sort_by_key(|left| left.0.to_hex());
     let stdout = io::stdout();
@@ -638,7 +638,7 @@ fn emit_positional(
                 }
             }
         } else {
-            oid.clone()
+            oid
         };
         let name = name_for_object(&object_for_name, db, format, tips, rev_names, options)?;
         show_name(&mut out, db, Some(rev), &oid, name, options)?;

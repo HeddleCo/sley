@@ -319,7 +319,7 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
     let mut seen = HashSet::new();
     let mut haves = Vec::new();
     for advertisement in local_fetch_advertisements(git_dir, format)? {
-        if seen.insert(advertisement.oid.clone()) {
+        if seen.insert(advertisement.oid) {
             haves.push(advertisement.oid);
         }
     }

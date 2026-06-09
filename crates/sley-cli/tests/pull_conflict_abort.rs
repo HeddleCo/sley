@@ -159,8 +159,7 @@ fn pull_conflict_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_origin(&origin);
+            prepare_conflict_origin(&origin);
         prepare_conflict_clone(&origin, &upstream);
         prepare_conflict_clone(&origin, &rust);
 
@@ -190,9 +189,7 @@ fn pull_conflict_matches_upstream_git() {
             run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["ls-files", "--unmerged"]).stdout,
             "unmerged index entries differed after conflict pull"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }
 
 #[test]
@@ -204,8 +201,7 @@ fn pull_conflict_then_abort_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    let result = (|| {
-        prepare_conflict_origin(&origin);
+            prepare_conflict_origin(&origin);
         prepare_conflict_clone(&origin, &upstream);
         prepare_conflict_clone(&origin, &rust);
 
@@ -255,7 +251,5 @@ fn pull_conflict_then_abort_matches_upstream_git() {
             run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["ls-files", "--unmerged"]).stdout,
             "unmerged index entries differed after merge --abort"
         );
-    })();
     let _ = fs::remove_dir_all(&root);
-    result
 }

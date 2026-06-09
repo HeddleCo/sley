@@ -219,7 +219,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
             })?;
-            let wants = updates.iter().map(|update| update.oid.clone()).collect();
+            let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch: replay the current boundary as `shallow` lines and ask
             // the server to deepen to `depth`, then fold the server's shallow-info
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
@@ -286,7 +286,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
             })?;
-            let wants = updates.iter().map(|update| update.oid.clone()).collect();
+            let wants = updates.iter().map(|update| update.oid).collect();
             // Shallow fetch over SSH mirrors the HTTP path: replay the current
             // boundary, deepen to `depth`, then apply the server's shallow-info.
             let existing_shallow =
@@ -344,7 +344,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
             })?;
-            let starts = updates.iter().map(|update| update.oid.clone()).collect();
+            let starts = updates.iter().map(|update| update.oid).collect();
             crate::local::install_fetch_pack_via_local_upload_pack(
                 request.git_dir,
                 remote_git_dir,
@@ -487,7 +487,7 @@ fn finalize_fetch(
             && updates[0].src == "HEAD"
             && updates[0].dst.is_none()
         {
-            write_default_fetch_head(git_dir, remote_name, updates[0].oid.clone(), options.append)?;
+            write_default_fetch_head(git_dir, remote_name, updates[0].oid, options.append)?;
         } else {
             write_fetch_head(git_dir, fetch_head_source, updates, options.append)?;
         }
@@ -498,7 +498,7 @@ fn finalize_fetch(
         .filter_map(|update| {
             update.dst.as_ref().map(|dst| BundleRefUpdate {
                 name: dst.clone(),
-                oid: update.oid.clone(),
+                oid: update.oid,
             })
         })
         .collect::<Vec<_>>();
@@ -623,7 +623,7 @@ pub fn append_reachable_auto_follow_tags(
     let starts = updates
         .iter()
         .filter(|update| update.dst.is_some() && !update.src.starts_with("refs/tags/"))
-        .map(|update| update.oid.clone());
+        .map(|update| update.oid);
     let reachable = collect_reachable_object_ids(remote_db, format, starts)?;
     let mut fetched_srcs = updates
         .iter()
@@ -641,7 +641,7 @@ pub fn append_reachable_auto_follow_tags(
         updates.push(FetchRefUpdate {
             src: reference.name.clone(),
             dst: Some(reference.name.clone()),
-            oid: reference.oid.clone(),
+            oid: reference.oid,
             not_for_merge: true,
         });
     }
@@ -668,7 +668,7 @@ pub fn order_bundle_fetch_all_tags_updates(updates: &mut Vec<FetchRefUpdate>) {
     let followed_oids = updates
         .iter()
         .filter(|update| !update.src.starts_with("refs/tags/") && update.dst.is_some())
-        .map(|update| update.oid.clone())
+        .map(|update| update.oid)
         .collect::<HashSet<_>>();
     if followed_oids.is_empty() {
         return;

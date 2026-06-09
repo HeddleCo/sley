@@ -662,7 +662,7 @@ fn push_conflicted_stages(
         if let Some((mode, oid)) = entry {
             out.push(ConflictedStage {
                 mode: *mode,
-                oid: oid.clone(),
+                oid: *oid,
                 stage,
                 path: path.to_vec(),
             });
@@ -780,7 +780,7 @@ fn write_tree_from_leaf_map(
 ) -> Result<ObjectId> {
     let mut root = MergeTreeBuilder::default();
     for (path, (mode, oid)) in leaves {
-        root.insert(path, *mode, oid.clone());
+        root.insert(path, *mode, *oid);
     }
     root.write(db)
 }
@@ -818,15 +818,15 @@ impl MergeTreeBuilder {
         for (name, (mode, oid)) in &self.blobs {
             entries.push(TreeEntry {
                 mode: *mode,
-                name: name.clone(),
-                oid: oid.clone(),
+                name: BString::from(name.clone()),
+                oid: *oid,
             });
         }
         for (name, subtree) in &self.subtrees {
             let oid = subtree.write(db)?;
             entries.push(TreeEntry {
                 mode: 0o040000,
-                name: name.clone(),
+                name: BString::from(name.clone()),
                 oid,
             });
         }
@@ -840,7 +840,7 @@ impl MergeTreeBuilder {
 
 /// Tree-entry sort key: directory entries compare as if their name ended in `/`.
 fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
-    let mut key = entry.name.clone();
+    let mut key = entry.name.as_bytes().to_vec();
     if entry.mode == 0o040000 {
         key.push(b'/');
     }
@@ -947,7 +947,7 @@ fn trivial_resolution(
         entry.as_ref().map(|(mode, oid)| TrivialStageLine {
             label,
             mode: *mode,
-            oid: oid.clone(),
+            oid: *oid,
         })
     };
 
@@ -986,12 +986,12 @@ fn trivial_resolution(
                         TrivialStageLine {
                             label: "result",
                             mode: *our_mode,
-                            oid: their_oid.clone(),
+                            oid: *their_oid,
                         },
                         line("our", ours).unwrap_or(TrivialStageLine {
                             label: "our",
                             mode: *our_mode,
-                            oid: their_oid.clone(),
+                            oid: *their_oid,
                         }),
                     ];
                     Ok(("merged", lines, their_bytes))
