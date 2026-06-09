@@ -1,5 +1,5 @@
-//! Differential interop tests for `git apply`, `git gc`, and `git repack`
-//! against the system `git` binary.
+//! Differential interop tests for `git apply`, `git gc`, `git maintenance run`,
+//! and `git repack` against the system `git` binary.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -266,6 +266,112 @@ fn gc_consolidates_loose_objects_and_stays_valid() {
         .lines()
         .count();
     assert_eq!(log_lines, 3, "history not fully readable after gc");
+
+    fs::remove_dir_all(&root).ok();
+}
+
+fn pack_dir_has_pack(repo: &Path) -> bool {
+    fs::read_dir(repo.join(".git/objects/pack"))
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map(|x| x == "pack").unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+#[test]
+fn maintenance_run_matches_git_gc_behavior() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-run");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    for i in 0..3 {
+        write_file(&repo, "f.txt", &format!("v{i}\n"));
+        git_ok(&repo, &["add", "."]);
+        git_ok(&repo, &["commit", "-qm", &format!("c{i}")]);
+    }
+    let head_before = git(&repo, &["rev-parse", "HEAD"]).stdout;
+
+    let candidate = root.join("candidate");
+    let reference = root.join("reference");
+    copy_dir_all(&repo, &candidate);
+    copy_dir_all(&repo, &reference);
+
+    let rs = git_rs(&candidate, &["maintenance", "run"]);
+    assert!(
+        rs.status.success(),
+        "sley maintenance run failed: {}",
+        String::from_utf8_lossy(&rs.stderr)
+    );
+    git_ok(&reference, &["maintenance", "run"]);
+
+    assert!(
+        pack_dir_has_pack(&candidate),
+        "sley maintenance run did not produce a pack"
+    );
+    assert!(
+        pack_dir_has_pack(&reference),
+        "git maintenance run did not produce a pack"
+    );
+
+    for (label, path) in [("sley", &candidate), ("git", &reference)] {
+        let fsck = git(path, &["fsck", "--no-progress"]);
+        assert!(
+            fsck.status.success(),
+            "git fsck failed after {label} maintenance run: {}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+        assert_eq!(
+            git(path, &["rev-parse", "HEAD"]).stdout,
+            head_before,
+            "{label} maintenance run changed HEAD"
+        );
+        let log_lines = String::from_utf8_lossy(&git(path, &["log", "--oneline"]).stdout)
+            .lines()
+            .count();
+        assert_eq!(
+            log_lines, 3,
+            "history not fully readable after {label} maintenance run"
+        );
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn maintenance_run_quiet_accepted() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("maint-quiet");
+    let repo = root.join("repo");
+    git_ok(
+        &root,
+        &[
+            "init",
+            "-q",
+            repo.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(&repo, "f.txt", "hello\n");
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-qm", "base"]);
+
+    let out = git_rs(&repo, &["maintenance", "run", "--quiet"]);
+    assert!(
+        out.status.success(),
+        "sley maintenance run --quiet failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     fs::remove_dir_all(&root).ok();
 }
