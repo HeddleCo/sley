@@ -7,8 +7,12 @@ license.workspace = true
 
 [features]
 default = ["http", "ssh"]
-http = ["sley-transport/http-client"]
+http = ["sley-transport/http-client", "sley-transport/tls-rustls"]
 ssh = []
+# Forward ureq TLS backend selection to embedders (mutually exclusive in practice).
+tls-rustls = ["sley-transport/tls-rustls"]
+tls-native-tls = ["sley-transport/tls-native-tls"]
+tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 
 [dependencies]
 sley-config = { path = "../sley-config" }

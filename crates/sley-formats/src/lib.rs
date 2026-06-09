@@ -1710,13 +1710,15 @@ impl RepositoryLayout {
             fs::write(head_path, format!("ref: refs/heads/{initial_branch}\n"))?;
         }
         let mut config = GitConfig {
-            sections: vec![ConfigSection {
-                name: "core".into(),
-                subsection: None,
-                entries: vec![
-                    ConfigEntry {
-                        key: "repositoryformatversion".into(),
-                        value: Some(
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "core",
+                None,
+                vec![
+                    ConfigEntry::new(
+                        "repositoryformatversion",
+                        Some(
                             if object_format == ObjectFormat::Sha1 {
                                 "0"
                             } else {
@@ -1724,31 +1726,18 @@ impl RepositoryLayout {
                             }
                             .into(),
                         ),
-                        comment: None,
-                    },
-                    ConfigEntry {
-                        key: "filemode".into(),
-                        value: Some("true".into()),
-                        comment: None,
-                    },
-                    ConfigEntry {
-                        key: "bare".into(),
-                        value: Some(if bare { "true" } else { "false" }.into()),
-                        comment: None,
-                    },
+                    ),
+                    ConfigEntry::new("filemode", Some("true".into())),
+                    ConfigEntry::new("bare", Some(if bare { "true" } else { "false" }.into())),
                 ],
-            }],
+            )],
         };
         if object_format == ObjectFormat::Sha256 {
-            config.sections.push(ConfigSection {
-                name: "extensions".into(),
-                subsection: None,
-                entries: vec![ConfigEntry {
-                    key: "objectformat".into(),
-                    value: Some("sha256".into()),
-                    comment: None,
-                }],
-            });
+            config.sections.push(ConfigSection::new(
+                "extensions",
+                None,
+                vec![ConfigEntry::new("objectformat", Some("sha256".into()))],
+            ));
         }
         fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
         Ok(Self {

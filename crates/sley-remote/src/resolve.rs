@@ -213,25 +213,22 @@ mod tests {
     #[test]
     fn instead_of_rewrites_fetch_url() {
         let config = GitConfig {
+            preamble: Vec::new(),
+            suffix: Vec::new(),
             sections: vec![
-                ConfigSection {
-                    name: "remote".into(),
-                    subsection: Some("origin".into()),
-                    entries: vec![ConfigEntry {
-                        key: "url".into(),
-                        value: Some("git@github.com:org/repo.git".into()),
-                        comment: None,
-                    }],
-                },
-                ConfigSection {
-                    name: "url".into(),
-                    subsection: Some("https://github.com/".into()),
-                    entries: vec![ConfigEntry {
-                        key: "insteadOf".into(),
-                        value: Some("git@github.com:".into()),
-                        comment: None,
-                    }],
-                },
+                ConfigSection::new(
+                    "remote",
+                    Some("origin".into()),
+                    vec![ConfigEntry::new(
+                        "url",
+                        Some("git@github.com:org/repo.git".into()),
+                    )],
+                ),
+                ConfigSection::new(
+                    "url",
+                    Some("https://github.com/".into()),
+                    vec![ConfigEntry::new("insteadOf", Some("git@github.com:".into()))],
+                ),
             ],
         };
         assert_eq!(
@@ -243,22 +240,16 @@ mod tests {
     #[test]
     fn push_url_prefers_pushurl() {
         let config = GitConfig {
-            sections: vec![ConfigSection {
-                name: "remote".into(),
-                subsection: Some("origin".into()),
-                entries: vec![
-                    ConfigEntry {
-                        key: "url".into(),
-                        value: Some("https://fetch.example/x.git".into()),
-                        comment: None,
-                    },
-                    ConfigEntry {
-                        key: "pushurl".into(),
-                        value: Some("https://push.example/x.git".into()),
-                        comment: None,
-                    },
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin".into()),
+                vec![
+                    ConfigEntry::new("url", Some("https://fetch.example/x.git".into())),
+                    ConfigEntry::new("pushurl", Some("https://push.example/x.git".into())),
                 ],
-            }],
+            )],
         };
         assert_eq!(push_url(&config, "origin"), "https://push.example/x.git");
     }

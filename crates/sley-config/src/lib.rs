@@ -16,23 +16,67 @@ use std::path::{Path, PathBuf};
 /// half of `git remote add`/`remove`/`set-url`).
 pub mod remotes;
 
+/// A preserved comment or blank line from the source file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigPreambleLine {
+    /// Full-line `#` or `;` comment (sigil + text; whitespace after sigil is not stored).
+    Comment { sigil: char, text: String },
+    /// A blank line.
+    Blank,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GitConfig {
+    /// Comments and blank lines before the first section header.
+    pub preamble: Vec<ConfigPreambleLine>,
     pub sections: Vec<ConfigSection>,
+    /// Comments and blank lines after the last entry (uncommon but valid).
+    pub suffix: Vec<ConfigPreambleLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigSection {
     pub name: String,
     pub subsection: Option<String>,
+    /// Comments and blank lines after this section header and before its first entry.
+    pub preamble: Vec<ConfigPreambleLine>,
     pub entries: Vec<ConfigEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigEntry {
+    /// Comments and blank lines immediately preceding this entry within its section.
+    pub preamble: Vec<ConfigPreambleLine>,
+    /// Leading whitespace before the variable name (defaults to a tab).
+    pub indent: String,
     pub key: String,
     pub value: Option<String>,
     pub comment: Option<String>,
+}
+
+impl ConfigEntry {
+    /// Build a programmatic entry (no preserved preamble/comment).
+    pub fn new(key: impl Into<String>, value: Option<String>) -> Self {
+        Self {
+            preamble: Vec::new(),
+            indent: "\t".to_string(),
+            key: key.into(),
+            value,
+            comment: None,
+        }
+    }
+}
+
+impl ConfigSection {
+    /// Build a programmatic section (no preserved preamble).
+    pub fn new(name: impl Into<String>, subsection: Option<String>, entries: Vec<ConfigEntry>) -> Self {
+        Self {
+            name: name.into(),
+            subsection,
+            preamble: Vec::new(),
+            entries,
+        }
+    }
 }
 
 impl GitConfig {
@@ -136,31 +180,40 @@ impl GitConfig {
     /// result round-trips through [`GitConfig::parse`] and matches git's own output
     /// for the common cases. Bare boolean-true keys (value `None`) are written as
     /// just the key.
+    ///
+    /// Preserved comments and blank lines from [`GitConfig::parse`] are omitted;
+    /// use [`GitConfig::to_preserved_bytes`] when rewriting a user-edited file.
     pub fn to_canonical_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         for section in &self.sections {
-            out.extend_from_slice(b"[");
-            out.extend_from_slice(section.name.as_bytes());
-            if let Some(subsection) = &section.subsection {
-                out.extend_from_slice(b" \"");
-                out.extend_from_slice(escape_config_subsection(subsection).as_bytes());
-                out.extend_from_slice(b"\"");
-            }
-            out.extend_from_slice(b"]\n");
+            write_section_header(&mut out, section);
             for entry in &section.entries {
-                out.extend_from_slice(b"\t");
-                out.extend_from_slice(entry.key.as_bytes());
-                if let Some(value) = &entry.value {
-                    out.extend_from_slice(b" = ");
-                    out.extend_from_slice(quote_config_value(value).as_bytes());
-                }
-                if let Some(comment) = &entry.comment {
-                    out.extend_from_slice(b" # ");
-                    out.extend_from_slice(comment.as_bytes());
-                }
-                out.extend_from_slice(b"\n");
+                write_config_entry(&mut out, entry, b"\t");
             }
         }
+        out
+    }
+
+    /// Serialise while preserving comments, blank lines, and per-entry indentation
+    /// captured by [`GitConfig::parse`]. Semantic values are still canonicalised
+    /// (quoted/escaped) so parse → edit → write round-trips reliably.
+    pub fn to_preserved_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_preamble(&mut out, &self.preamble);
+        for section in &self.sections {
+            write_preamble(&mut out, &section.preamble);
+            write_section_header(&mut out, section);
+            for entry in &section.entries {
+                write_preamble(&mut out, &entry.preamble);
+                let indent = if entry.indent.is_empty() {
+                    "\t"
+                } else {
+                    &entry.indent
+                };
+                write_config_entry(&mut out, entry, indent.as_bytes());
+            }
+        }
+        write_preamble(&mut out, &self.suffix);
         out
     }
 
@@ -181,6 +234,45 @@ impl GitConfig {
         splice_includes(self, base_dir, context, 0, false, &mut resolved.sections)?;
         Ok(resolved)
     }
+}
+
+fn write_preamble(out: &mut Vec<u8>, lines: &[ConfigPreambleLine]) {
+    for line in lines {
+        match line {
+            ConfigPreambleLine::Comment { sigil, text } => {
+                out.push(*sigil as u8);
+                out.push(b' ');
+                out.extend_from_slice(text.as_bytes());
+                out.push(b'\n');
+            }
+            ConfigPreambleLine::Blank => out.push(b'\n'),
+        }
+    }
+}
+
+fn write_section_header(out: &mut Vec<u8>, section: &ConfigSection) {
+    out.extend_from_slice(b"[");
+    out.extend_from_slice(section.name.as_bytes());
+    if let Some(subsection) = &section.subsection {
+        out.extend_from_slice(b" \"");
+        out.extend_from_slice(escape_config_subsection(subsection).as_bytes());
+        out.extend_from_slice(b"\"");
+    }
+    out.extend_from_slice(b"]\n");
+}
+
+fn write_config_entry(out: &mut Vec<u8>, entry: &ConfigEntry, indent: &[u8]) {
+    out.extend_from_slice(indent);
+    out.extend_from_slice(entry.key.as_bytes());
+    if let Some(value) = &entry.value {
+        out.extend_from_slice(b" = ");
+        out.extend_from_slice(quote_config_value(value).as_bytes());
+    }
+    if let Some(comment) = &entry.comment {
+        out.extend_from_slice(b" # ");
+        out.extend_from_slice(comment.as_bytes());
+    }
+    out.push(b'\n');
 }
 
 /// Maximum depth of nested `include`/`includeIf` directives, matching git's
@@ -212,7 +304,11 @@ impl ConfigIncludeContext {
 pub fn load_config_with_includes(path: &Path, context: &ConfigIncludeContext) -> Result<GitConfig> {
     let mut sections = Vec::new();
     load_config_file(path, context, 0, false, &mut sections)?;
-    Ok(GitConfig { sections })
+    Ok(GitConfig {
+        preamble: Vec::new(),
+        suffix: Vec::new(),
+        sections,
+    })
 }
 
 /// Read and parse a single config file, then splice its includes into `out`.
@@ -392,7 +488,14 @@ fn include_condition_matches(
     if let Some(glob) = condition.strip_prefix("hasconfig:remote.*.url:") {
         let mut sections = loaded.to_vec();
         sections.extend(current_file.sections.iter().cloned());
-        return hasconfig_remote_url_matches(&GitConfig { sections }, glob);
+        return hasconfig_remote_url_matches(
+            &GitConfig {
+                preamble: Vec::new(),
+                suffix: Vec::new(),
+                sections,
+            },
+            glob,
+        );
     }
     // Unknown `hasconfig:` patterns (and any other unrecognised condition) do
     // not match, mirroring upstream git.
@@ -776,21 +879,45 @@ impl<'a> ConfigParser<'a> {
     fn parse(mut self) -> Result<GitConfig> {
         let mut config = GitConfig::default();
         let mut current: Option<usize> = None;
+        let mut pending_preamble = Vec::new();
+        let mut after_section_header = false;
         loop {
             self.skip_blanks();
             match self.peek() {
                 None => break,
                 Some('\n') => {
                     self.bump();
+                    if after_section_header {
+                        after_section_header = false;
+                    } else {
+                        pending_preamble.push(ConfigPreambleLine::Blank);
+                    }
                 }
-                Some('#') | Some(';') => self.skip_to_eol(),
+                Some('#') | Some(';') => {
+                    let sigil = self.bump().expect("peeked comment sigil");
+                    pending_preamble.push(ConfigPreambleLine::Comment {
+                        sigil,
+                        text: self.parse_comment_text(),
+                    });
+                }
                 Some('[') => {
-                    let section = self.parse_section_header()?;
+                    let mut section = self.parse_section_header()?;
+                    if config.sections.is_empty() {
+                        config.preamble = pending_preamble;
+                        section.preamble = Vec::new();
+                    } else {
+                        section.preamble = pending_preamble;
+                    }
+                    pending_preamble = Vec::new();
                     config.sections.push(section);
                     current = Some(config.sections.len() - 1);
+                    after_section_header = true;
                 }
                 Some(ch) if ch.is_ascii_alphabetic() => {
-                    let entry = self.parse_entry()?;
+                    let mut entry = self.parse_entry()?;
+                    entry.preamble = pending_preamble;
+                    pending_preamble = Vec::new();
+                    after_section_header = false;
                     let Some(idx) = current else {
                         return Err(self.err("variable definition appears before a section"));
                     };
@@ -801,18 +928,8 @@ impl<'a> ConfigParser<'a> {
                 }
             }
         }
+        config.suffix = pending_preamble;
         Ok(config)
-    }
-
-    /// Consume the rest of the current physical line, including its terminator.
-    fn skip_to_eol(&mut self) {
-        while let Some(ch) = self.peek() {
-            if ch == '\n' {
-                self.bump();
-                break;
-            }
-            self.bump();
-        }
     }
 
     /// Parse a `[section]`, `[section "subsection"]`, or deprecated
@@ -846,6 +963,7 @@ impl<'a> ConfigParser<'a> {
             return Ok(ConfigSection {
                 name: head.to_ascii_lowercase(),
                 subsection: Some(subsection.to_ascii_lowercase()),
+                preamble: Vec::new(),
                 entries: Vec::new(),
             });
         }
@@ -859,6 +977,7 @@ impl<'a> ConfigParser<'a> {
                 Ok(ConfigSection {
                     name,
                     subsection: None,
+                    preamble: Vec::new(),
                     entries: Vec::new(),
                 })
             }
@@ -877,6 +996,7 @@ impl<'a> ConfigParser<'a> {
                     name,
                     // Subsection names are case-sensitive in the quoted form.
                     subsection: Some(subsection),
+                    preamble: Vec::new(),
                     entries: Vec::new(),
                 })
             }
@@ -909,6 +1029,13 @@ impl<'a> ConfigParser<'a> {
     /// Parse a `name` or `name = value` entry. The first character of the name is
     /// the next character.
     fn parse_entry(&mut self) -> Result<ConfigEntry> {
+        let mut indent = String::new();
+        while matches!(self.peek(), Some(' ') | Some('\t')) {
+            indent.push(self.bump().expect("peeked whitespace"));
+        }
+        if indent.is_empty() {
+            indent.push('\t');
+        }
         let mut key = String::new();
         while let Some(ch) = self.peek() {
             if ch.is_ascii_alphanumeric() || ch == '-' {
@@ -925,6 +1052,8 @@ impl<'a> ConfigParser<'a> {
         match self.peek() {
             // Bare variable: boolean true. Nothing but a comment or EOL may follow.
             None => Ok(ConfigEntry {
+                preamble: Vec::new(),
+                indent,
                 key,
                 value: None,
                 comment: None,
@@ -932,6 +1061,8 @@ impl<'a> ConfigParser<'a> {
             Some('\n') => {
                 self.bump();
                 Ok(ConfigEntry {
+                    preamble: Vec::new(),
+                    indent,
                     key,
                     value: None,
                     comment: None,
@@ -941,6 +1072,8 @@ impl<'a> ConfigParser<'a> {
                 self.bump();
                 let (value, comment) = self.parse_value()?;
                 Ok(ConfigEntry {
+                    preamble: Vec::new(),
+                    indent,
                     key,
                     value: Some(value),
                     comment,
@@ -1270,7 +1403,11 @@ pub fn load_effective_config(
     for path in effective_config_paths(common_git_dir) {
         load_config_file(&path, context, 0, false, &mut sections)?;
     }
-    Ok(GitConfig { sections })
+    Ok(GitConfig {
+        preamble: Vec::new(),
+        suffix: Vec::new(),
+        sections,
+    })
 }
 
 /// Compute the ordered list of config files that make up the effective config,
@@ -1389,15 +1526,16 @@ mod tests {
     #[test]
     fn config_canonical_writer_round_trips() {
         let config = GitConfig {
-            sections: vec![ConfigSection {
-                name: "remote".into(),
-                subsection: Some("origin repo".into()),
-                entries: vec![ConfigEntry {
-                    key: "url".into(),
-                    value: Some("https://example.invalid/repo.git".into()),
-                    comment: None,
-                }],
-            }],
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("origin repo".into()),
+                vec![ConfigEntry::new(
+                    "url",
+                    Some("https://example.invalid/repo.git".into()),
+                )],
+            )],
         };
         let parsed =
             GitConfig::parse(&config.to_canonical_bytes()).expect("test operation should succeed");
@@ -1686,10 +1824,40 @@ mod tests {
     }
 
     #[test]
-    fn config_comments_and_blank_lines_are_skipped() {
-        let config = GitConfig::parse(b"# top\n; also\n\n[core]\n\n\tx = y\n# trailing\n")
-            .expect("test operation should succeed");
+    fn config_comments_and_blank_lines_are_preserved() {
+        let source = b"# top\n; also\n\n[core]\n\n\tx = y # inline\n# trailing\n";
+        let config = GitConfig::parse(source).expect("test operation should succeed");
         assert_eq!(config.get("core", None, "x"), Some("y"));
+        assert_eq!(
+            config.preamble,
+            vec![
+                ConfigPreambleLine::Comment {
+                    sigil: '#',
+                    text: "top".into(),
+                },
+                ConfigPreambleLine::Comment {
+                    sigil: ';',
+                    text: "also".into(),
+                },
+                ConfigPreambleLine::Blank,
+            ]
+        );
+        assert_eq!(
+            config.sections[0].entries[0].preamble,
+            vec![ConfigPreambleLine::Blank]
+        );
+        assert_eq!(config.sections[0].entries[0].comment.as_deref(), Some("inline"));
+        assert_eq!(
+            config.suffix,
+            vec![ConfigPreambleLine::Comment {
+                sigil: '#',
+                text: "trailing".into(),
+            }]
+        );
+        let preserved = config.to_preserved_bytes();
+        let reparsed = GitConfig::parse(&preserved).expect("test operation should succeed");
+        assert_eq!(reparsed, config);
+        assert_eq!(preserved, source);
     }
 
     // ----- bool / int / bool-or-int coercion -----
@@ -1784,15 +1952,13 @@ mod tests {
         ];
         for (value, expected) in cases {
             let config = GitConfig {
-                sections: vec![ConfigSection {
-                    name: "core".into(),
-                    subsection: None,
-                    entries: vec![ConfigEntry {
-                        key: "x".into(),
-                        value: Some(value.to_string()),
-                        comment: None,
-                    }],
-                }],
+                preamble: Vec::new(),
+                suffix: Vec::new(),
+                sections: vec![ConfigSection::new(
+                    "core",
+                    None,
+                    vec![ConfigEntry::new("x", Some(value.to_string()))],
+                )],
             };
             let bytes = config.to_canonical_bytes();
             let text = String::from_utf8(bytes).expect("test operation should succeed");
@@ -1807,15 +1973,13 @@ mod tests {
     #[test]
     fn config_subsection_header_only_escapes_quote_and_backslash() {
         let config = GitConfig {
-            sections: vec![ConfigSection {
-                name: "remote".into(),
-                subsection: Some("a\"b\\c".into()),
-                entries: vec![ConfigEntry {
-                    key: "url".into(),
-                    value: Some("x".into()),
-                    comment: None,
-                }],
-            }],
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "remote",
+                Some("a\"b\\c".into()),
+                vec![ConfigEntry::new("url", Some("x".into()))],
+            )],
         };
         let text =
             String::from_utf8(config.to_canonical_bytes()).expect("test operation should succeed");
@@ -1843,23 +2007,17 @@ mod tests {
         ];
         for value in values {
             let original = GitConfig {
-                sections: vec![ConfigSection {
-                    name: "core".into(),
-                    subsection: Some("a b\"c".into()),
-                    entries: vec![
-                        ConfigEntry {
-                            key: "x".into(),
-                            value: Some(value.to_string()),
-                            comment: None,
-                        },
+                preamble: Vec::new(),
+                suffix: Vec::new(),
+                sections: vec![ConfigSection::new(
+                    "core",
+                    Some("a b\"c".into()),
+                    vec![
+                        ConfigEntry::new("x", Some(value.to_string())),
                         // A bare boolean-true key should survive the round trip.
-                        ConfigEntry {
-                            key: "flag".into(),
-                            value: None,
-                            comment: None,
-                        },
+                        ConfigEntry::new("flag", None),
                     ],
-                }],
+                )],
             };
             let serialized = original.to_canonical_bytes();
             let reparsed = GitConfig::parse(&serialized).expect("test operation should succeed");
@@ -1876,27 +2034,17 @@ mod tests {
     #[test]
     fn config_round_trip_preserves_multi_value_order() {
         let original = GitConfig {
-            sections: vec![ConfigSection {
-                name: "core".into(),
-                subsection: None,
-                entries: vec![
-                    ConfigEntry {
-                        key: "x".into(),
-                        value: Some("first".into()),
-                        comment: None,
-                    },
-                    ConfigEntry {
-                        key: "x".into(),
-                        value: Some("second".into()),
-                        comment: None,
-                    },
-                    ConfigEntry {
-                        key: "x".into(),
-                        value: Some("first".into()),
-                        comment: None,
-                    },
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections: vec![ConfigSection::new(
+                "core",
+                None,
+                vec![
+                    ConfigEntry::new("x", Some("first".into())),
+                    ConfigEntry::new("x", Some("second".into())),
+                    ConfigEntry::new("x", Some("first".into())),
                 ],
-            }],
+            )],
         };
         let reparsed = GitConfig::parse(&original.to_canonical_bytes())
             .expect("test operation should succeed");
@@ -2331,7 +2479,11 @@ mod tests {
                     .sections,
             );
         }
-        GitConfig { sections }
+        GitConfig {
+            preamble: Vec::new(),
+            suffix: Vec::new(),
+            sections,
+        }
     }
 
     #[test]

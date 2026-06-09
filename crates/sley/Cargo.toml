@@ -34,6 +34,11 @@ fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1"]
 # Memory-map pack files (forwarded to sley-odb). Pulls in sley-mmap, the only crate
 # with unsafe; off by default. Benefits large-repo memory use / cold start.
 mmap = ["sley-odb/mmap"]
+# TLS backend for HTTPS remotes (forwarded to sley-remote / sley-transport).
+# Default remote/http uses rustls; enable one of these to override.
+tls-rustls = ["sley-remote/tls-rustls"]
+tls-native-tls = ["sley-remote/tls-native-tls"]
+tls-platform-verifier = ["sley-remote/tls-platform-verifier"]
 
 [lints]
 workspace = true

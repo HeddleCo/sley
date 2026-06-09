@@ -202,15 +202,16 @@ _(#57 status + #58 log/-n walk — the remaining parity refactors.)_
 1. ~~Config + facade polish~~ **DONE** — global/system config read + identity
    fallback (env → -c → repo → global → system), callable `[remote]`
    add/remove/set-url + `remote_names`, and `workdir()`/`is_shallow()`/
-   `remote_names()` on the facade. (Comment-preserving config round-trip still
-   pending — writes reformat via `to_canonical_bytes`.) Commits `42d5db9`,`7135dde`.
+   `remote_names()` on the facade. Comment-preserving round-trip via
+   `GitConfig::to_preserved_bytes` + `Repository::save_repo_config` heuristic.
+   Commits `42d5db9`,`7135dde`.
 2. ~~Signatures & dates typing (#46)~~ **DONE** — lossless `Signature` parse-view
    (raw bytes preserved, byte-exact round-trip; malformed → None) +
    `GitTime.negative_utc` for git's `-0000`. Commit `ff843b9`. Remaining
    (deferred): `FullName` ref-name newtype + path BString unification.
 3. **Dep-feature forwarding (#40)** — zlib-ng backend DONE; `fast-sha1`
-   (RustCrypto, hardware SHA-1) DONE; remaining: forward ureq's TLS backend
-   (rustls / native-tls / platform-verifier) as selectable.
+   (RustCrypto, hardware SHA-1) DONE; TLS backends forwarded (`tls-rustls` /
+   `tls-native-tls` / `tls-platform-verifier` on sley-transport → sley-remote → sley).
 8. ~~mmap pack reads (#55)~~ **DONE** (`c89b8c2`) — opt-in `mmap` feature; the only
    `unsafe` is isolated in the new `sley-mmap` crate (the lone crate not under the
    workspace forbid). Off by default; large-repo RSS / cold-start lever.
@@ -235,9 +236,9 @@ _(#57 status + #58 log/-n walk — the remaining parity refactors.)_
   ahead/behind revwalk; config include/includeIf.
 - **Built (export-core):** tree-editor, intent-to-add, index_from_tree, ref CAS,
   ObjectId types.
-- **Remaining gaps:** parallelism for large repos (#50), TLS-backend forwarding
-  (TLS half of #40), comment-preserving config round-trip, and deferred ref-name /
-  path newtypes. (mmap landed, opt-in, #55.) cat-file is now ~3×
+- **Remaining gaps:** parallelism for large repos (#50) and deferred ref-name /
+  path newtypes. (mmap landed, opt-in, #55; TLS backends + comment-preserving
+  config landed.) cat-file is now ~3×
   (`--batch-check`) / ~1.8× (`--batch`) of git, the residual being per-object CLI
   rev-parse (the library read path bypasses it). Bulk-read re-hash + header-only
   reads + streaming/fast SHA-1 + decoder reuse all landed; network,

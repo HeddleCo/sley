@@ -1430,11 +1430,11 @@ pub(crate) fn config_set_value_with_comment(
         .iter()
         .rposition(|section| config_section_matches(section, key))
         .unwrap_or_else(|| {
-            config.sections.push(ConfigSection {
-                name: key.section.clone(),
-                subsection: key.subsection.clone(),
-                entries: Vec::new(),
-            });
+            config.sections.push(ConfigSection::new(
+                key.section.clone(),
+                key.subsection.clone(),
+                Vec::new(),
+            ));
             config.sections.len() - 1
         });
     let section = &mut config.sections[section_idx];
@@ -1457,11 +1457,9 @@ pub(crate) fn config_set_value_with_comment(
             return;
         }
     }
-    section.entries.push(ConfigEntry {
-        key: key.key.clone(),
-        value: Some(value.to_string()),
-        comment: comment.map(str::to_string),
-    });
+    let mut entry = ConfigEntry::new(key.key.clone(), Some(value.to_string()));
+    entry.comment = comment.map(str::to_string);
+    section.entries.push(entry);
 }
 
 fn config_replace_all_value(

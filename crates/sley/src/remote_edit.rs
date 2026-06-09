@@ -19,9 +19,24 @@ impl Repository {
     /// Write `config` to `<common_dir>/config` using canonical serialization.
     ///
     /// Comments and original whitespace are not preserved (see
-    /// [`GitConfig::to_canonical_bytes`]).
+    /// [`GitConfig::to_preserved_bytes`] when the config was loaded from disk;
+    /// falls back to canonical form for programmatic configs).
     pub fn save_repo_config(&self, config: &GitConfig) -> Result<()> {
-        fs::write(self.common_dir().join("config"), config.to_canonical_bytes())?;
+        let bytes = if config.preamble.is_empty()
+            && config.suffix.is_empty()
+            && config.sections.iter().all(|section| {
+                section.preamble.is_empty()
+                    && section
+                        .entries
+                        .iter()
+                        .all(|entry| entry.preamble.is_empty() && entry.comment.is_none())
+            })
+        {
+            config.to_canonical_bytes()
+        } else {
+            config.to_preserved_bytes()
+        };
+        fs::write(self.common_dir().join("config"), bytes)?;
         Ok(())
     }
 
@@ -62,22 +77,14 @@ impl Repository {
     pub fn init_mirror(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let repo = Repository::init_bare(path)?;
         let mut config = repo.load_repo_config()?;
-        config.sections.push(ConfigSection {
-            name: "remote".into(),
-            subsection: Some("origin".into()),
-            entries: vec![
-                ConfigEntry {
-                    key: "fetch".into(),
-                    value: Some("+refs/*:refs/*".into()),
-                    comment: None,
-                },
-                ConfigEntry {
-                    key: "mirror".into(),
-                    value: Some("true".into()),
-                    comment: None,
-                },
+        config.sections.push(ConfigSection::new(
+            "remote",
+            Some("origin".into()),
+            vec![
+                ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())),
+                ConfigEntry::new("mirror", Some("true".into())),
             ],
-        });
+        ));
         repo.save_repo_config(&config)?;
         Ok(repo)
     }

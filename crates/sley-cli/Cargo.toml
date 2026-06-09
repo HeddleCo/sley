@@ -33,7 +33,7 @@ sley-remote = { path = "../sley-remote" }
 sley-rev = { path = "../sley-rev" }
 sley-sequencer = { path = "../sley-sequencer" }
 sley-testkit = { path = "../sley-testkit" }
-sley-transport = { path = "../sley-transport", features = ["http-client"] }
+sley-transport = { path = "../sley-transport", features = ["http-client", "tls-rustls"] }
 sley-worktree = { path = "../sley-worktree" }
 
 [features]
@@ -46,6 +46,10 @@ fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]
 # Build the sley binary with memory-mapped pack reads (forwarded to sley-odb).
 # Pulls in sley-mmap (the only unsafe); off by default.
 mmap = ["sley-odb/mmap"]
+# TLS backend for HTTPS remotes (forwarded to sley-transport via sley-remote).
+tls-rustls = ["sley-transport/tls-rustls"]
+tls-native-tls = ["sley-transport/tls-native-tls"]
+tls-platform-verifier = ["sley-transport/tls-platform-verifier"]
 
 [lints]
 workspace = true

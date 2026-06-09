@@ -1464,22 +1464,15 @@ fn apply_clone_sparse_checkout(
     write_repo_config(git_dir, &config)?;
 
     let worktree_config = GitConfig {
-        sections: vec![ConfigSection {
-            name: "core".into(),
-            subsection: None,
-            entries: vec![
-                ConfigEntry {
-                    key: "sparsecheckout".into(),
-                    value: Some("true".into()),
-                    comment: None,
-                },
-                ConfigEntry {
-                    key: "sparsecheckoutcone".into(),
-                    value: Some("true".into()),
-                    comment: None,
-                },
+        sections: vec![ConfigSection::new(
+            "core",
+            None,
+            vec![
+                ConfigEntry::new("sparsecheckout", Some("true".into())),
+                ConfigEntry::new("sparsecheckoutcone", Some("true".into())),
             ],
-        }],
+        )],
+        ..Default::default()
     };
     fs::write(
         git_dir.join("config.worktree"),
@@ -1641,70 +1634,41 @@ fn configure_clone_remote(
     partial_clone_filter: Option<&str>,
 ) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
-    let mut entries = vec![ConfigEntry {
-        key: "url".into(),
-        value: Some(url.to_string()),
-        comment: None,
-    }];
+    let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     if let Some(fetch_refspec) = fetch_refspec {
-        entries.push(ConfigEntry {
-            key: "fetch".into(),
-            value: Some(fetch_refspec),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("fetch", Some(fetch_refspec)));
     }
     if mirror {
-        entries.push(ConfigEntry {
-            key: "mirror".into(),
-            value: Some("true".into()),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("mirror", Some("true".into())));
     }
     if let Some(tag_opt) = tag_opt {
-        entries.push(ConfigEntry {
-            key: "tagopt".into(),
-            value: Some(tag_opt.to_string()),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("tagopt", Some(tag_opt.to_string())));
     }
     if let Some(filter) = partial_clone_filter {
-        entries.push(ConfigEntry {
-            key: "promisor".into(),
-            value: Some("true".into()),
-            comment: None,
-        });
-        entries.push(ConfigEntry {
-            key: "partialclonefilter".into(),
-            value: Some(filter.to_string()),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("promisor", Some("true".into())));
+        entries.push(ConfigEntry::new(
+            "partialclonefilter",
+            Some(filter.to_string()),
+        ));
     }
-    config.sections.push(ConfigSection {
-        name: "remote".into(),
-        subsection: Some(name.to_string()),
+    config.sections.push(ConfigSection::new(
+        "remote",
+        Some(name.to_string()),
         entries,
-    });
+    ));
     write_repo_config(git_dir, &config)
 }
 
 fn configure_clone_branch(git_dir: &Path, branch: &str, remote: &str) -> Result<()> {
     let mut config = read_repo_config(git_dir)?;
-    config.sections.push(ConfigSection {
-        name: "branch".into(),
-        subsection: Some(branch.to_string()),
-        entries: vec![
-            ConfigEntry {
-                key: "remote".into(),
-                value: Some(remote.to_string()),
-                comment: None,
-            },
-            ConfigEntry {
-                key: "merge".into(),
-                value: Some(format!("refs/heads/{branch}")),
-                comment: None,
-            },
+    config.sections.push(ConfigSection::new(
+        "branch",
+        Some(branch.to_string()),
+        vec![
+            ConfigEntry::new("remote", Some(remote.to_string())),
+            ConfigEntry::new("merge", Some(format!("refs/heads/{branch}"))),
         ],
-    });
+    ));
     write_repo_config(git_dir, &config)
 }
 pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
@@ -3051,57 +3015,35 @@ pub(crate) fn cmd_remote_add(args: &[String]) -> Result<()> {
     let mut config = read_repo_config(&git_dir)?;
     // Build the section body from the parsed options, then let the shared editor
     // append it (and reject a duplicate remote).
-    let mut entries = vec![ConfigEntry {
-        key: "url".into(),
-        value: Some(url.to_string()),
-        comment: None,
-    }];
+    let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     match mirror {
         RemoteAddMirror::Fetch | RemoteAddMirror::Both => {
-            entries.push(ConfigEntry {
-                key: "fetch".into(),
-                value: Some("+refs/*:refs/*".into()),
-                comment: None,
-            });
+            entries.push(ConfigEntry::new("fetch", Some("+refs/*:refs/*".into())));
         }
         RemoteAddMirror::Push => {
-            entries.push(ConfigEntry {
-                key: "mirror".into(),
-                value: Some("true".into()),
-                comment: None,
-            });
+            entries.push(ConfigEntry::new("mirror", Some("true".into())));
         }
         RemoteAddMirror::None => {
             if branches.is_empty() {
-                entries.push(ConfigEntry {
-                    key: "fetch".into(),
-                    value: Some(sley_config::remotes::default_fetch_refspec(name)),
-                    comment: None,
-                });
+                entries.push(ConfigEntry::new(
+                    "fetch",
+                    Some(sley_config::remotes::default_fetch_refspec(name)),
+                ));
             } else {
                 for branch in &branches {
-                    entries.push(ConfigEntry {
-                        key: "fetch".into(),
-                        value: Some(remote_branch_fetch_refspec(name, branch)),
-                        comment: None,
-                    });
+                    entries.push(ConfigEntry::new(
+                        "fetch",
+                        Some(remote_branch_fetch_refspec(name, branch)),
+                    ));
                 }
             }
         }
     }
     if let Some(tag_opt) = tag_opt {
-        entries.push(ConfigEntry {
-            key: "tagopt".into(),
-            value: Some(tag_opt),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("tagopt", Some(tag_opt)));
     }
     if mirror == RemoteAddMirror::Both {
-        entries.push(ConfigEntry {
-            key: "mirror".into(),
-            value: Some("true".into()),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("mirror", Some("true".into())));
     }
     match sley_config::remotes::add_remote(&mut config, name, entries) {
         Ok(()) => {}
@@ -3513,11 +3455,10 @@ pub(crate) fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
             .retain(|entry| !entry.key.eq_ignore_ascii_case("fetch"));
     }
     for branch in branches {
-        section.entries.push(ConfigEntry {
-            key: "fetch".into(),
-            value: Some(remote_branch_fetch_refspec(name, branch)),
-            comment: None,
-        });
+        section.entries.push(ConfigEntry::new(
+            "fetch",
+            Some(remote_branch_fetch_refspec(name, branch)),
+        ));
     }
     write_repo_config(&git_dir, &config)
 }

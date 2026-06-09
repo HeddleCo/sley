@@ -23344,11 +23344,11 @@ fn set_config_value(
         .iter()
         .rposition(|section| section.name == name && section.subsection.as_deref() == subsection)
         .unwrap_or_else(|| {
-            config.sections.push(ConfigSection {
-                name: name.into(),
-                subsection: subsection.map(str::to_string),
-                entries: Vec::new(),
-            });
+            config.sections.push(ConfigSection::new(
+                name,
+                subsection.map(str::to_string),
+                Vec::new(),
+            ));
             config.sections.len() - 1
         });
     let section = &mut config.sections[section_idx];
@@ -23360,11 +23360,7 @@ fn set_config_value(
         entry.value = Some(value.to_string());
         return;
     }
-    section.entries.push(ConfigEntry {
-        key: key.to_string(),
-        value: Some(value.to_string()),
-        comment: None,
-    });
+    section.entries.push(ConfigEntry::new(key, Some(value.to_string())));
 }
 
 fn set_submodule_config_value(config: &mut GitConfig, name: &str, key: &str, value: &str) {

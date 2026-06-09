@@ -7,13 +7,16 @@ license.workspace = true
 
 [features]
 http-client = ["dep:ureq"]
+# TLS backend selection for HTTPS (pick one; default rustls via sley-remote/http).
+tls-rustls = ["http-client", "ureq/rustls"]
+tls-native-tls = ["http-client", "ureq/native-tls"]
+tls-platform-verifier = ["http-client", "ureq/rustls", "ureq/platform-verifier"]
 
 [dependencies]
 sley-core = { path = "../sley-core" }
 sley-protocol = { path = "../sley-protocol" }
-# Default features bundle rustls + ring + Mozilla webpki roots, so HTTPS to
-# public hosts (GitHub/GitLab) works out of the box.
-ureq = { version = "3.3.0", optional = true, default-features = true }
+# gzip is required for smart-HTTP; TLS features are forwarded separately above.
+ureq = { version = "3.3.0", optional = true, default-features = false, features = ["gzip"] }
 
 [lints]
 workspace = true

@@ -1231,14 +1231,42 @@ impl UreqHttpClient {
         // `http_status_as_error(false)` makes ureq deliver 4xx/5xx as a normal
         // response (carrying status + body) rather than an error, which is what
         // smart-HTTP callers need (e.g. inspecting 401 to prompt for creds).
-        let config = ureq::Agent::config_builder()
+        let mut builder = ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .user_agent(HTTP_USER_AGENT)
-            .build();
+            .user_agent(HTTP_USER_AGENT);
+        if let Some(tls_config) = ureq_tls_config() {
+            builder = builder.tls_config(tls_config);
+        }
         Self {
-            agent: config.into(),
+            agent: builder.build().into(),
         }
     }
+}
+
+/// Build explicit TLS settings when a non-default backend is selected.
+#[cfg(feature = "http-client")]
+fn ureq_tls_config() -> Option<ureq::tls::TlsConfig> {
+    #[cfg(feature = "tls-platform-verifier")]
+    {
+        use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
+        return Some(
+            TlsConfig::builder()
+                .provider(TlsProvider::Rustls)
+                .root_certs(RootCerts::PlatformVerifier)
+                .build(),
+        );
+    }
+    #[cfg(all(feature = "tls-native-tls", not(feature = "tls-platform-verifier")))]
+    {
+        use ureq::tls::{TlsConfig, TlsProvider};
+        return Some(
+            TlsConfig::builder()
+                .provider(TlsProvider::NativeTls)
+                .build(),
+        );
+    }
+    // `tls-rustls` (and the default ureq rustls stack) need no explicit config.
+    None
 }
 
 #[cfg(feature = "http-client")]

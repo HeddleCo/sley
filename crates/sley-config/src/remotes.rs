@@ -10,10 +10,9 @@
 //! [`SetUrlError`] outcomes returned here into their own messages and exit
 //! codes.
 //!
-//! Serialization is unchanged: callers persist the mutated config with
-//! [`GitConfig::to_canonical_bytes`], which reformats the file (it does not
-//! preserve comments or original whitespace). This module only makes the
-//! editing logic callable; it does not add round-trip fidelity.
+//! Callers should persist edits with [`GitConfig::to_preserved_bytes`] when the
+//! config was loaded from a user file (comments and blank lines are kept).
+//! [`GitConfig::to_canonical_bytes`] remains for tests and green-field writes.
 
 use std::collections::BTreeSet;
 
@@ -157,11 +156,7 @@ pub fn add_remote(
     if remote_exists(config, name) {
         return Err(RemoteEditError::AlreadyExists);
     }
-    config.sections.push(ConfigSection {
-        name: "remote".into(),
-        subsection: Some(name.to_string()),
-        entries,
-    });
+    config.sections.push(ConfigSection::new("remote", Some(name.to_string()), entries));
     Ok(())
 }
 
@@ -178,24 +173,12 @@ pub fn add_remote_with_fetch(
     url: &str,
     fetch_refspecs: &[String],
 ) -> Result<(), RemoteEditError> {
-    let mut entries = vec![ConfigEntry {
-        key: "url".into(),
-        value: Some(url.to_string()),
-        comment: None,
-    }];
+    let mut entries = vec![ConfigEntry::new("url", Some(url.to_string()))];
     if fetch_refspecs.is_empty() {
-        entries.push(ConfigEntry {
-            key: "fetch".into(),
-            value: Some(default_fetch_refspec(name)),
-            comment: None,
-        });
+        entries.push(ConfigEntry::new("fetch", Some(default_fetch_refspec(name))));
     } else {
         for refspec in fetch_refspecs {
-            entries.push(ConfigEntry {
-                key: "fetch".into(),
-                value: Some(refspec.clone()),
-                comment: None,
-            });
+            entries.push(ConfigEntry::new("fetch", Some(refspec.clone())));
         }
     }
     add_remote(config, name, entries)
@@ -339,11 +322,7 @@ pub fn set_url(
     };
     match op {
         SetUrlOp::Add { url } => {
-            section.entries.push(ConfigEntry {
-                key: key.into(),
-                value: Some(url.to_string()),
-                comment: None,
-            });
+            section.entries.push(ConfigEntry::new(key, Some(url.to_string())));
             Ok(())
         }
         SetUrlOp::Delete { matches } => set_url_delete(section, kind, key, matches),
@@ -422,14 +401,7 @@ fn set_url_set(section: &mut ConfigSection, key: &str, url: &str) -> Result<(), 
     if let Some(idx) = indices.first().copied() {
         section.entries[idx].value = Some(url.to_string());
     } else {
-        section.entries.insert(
-            0,
-            ConfigEntry {
-                key: key.into(),
-                value: Some(url.to_string()),
-                comment: None,
-            },
-        );
+        section.entries.insert(0, ConfigEntry::new(key, Some(url.to_string())));
     }
     Ok(())
 }
