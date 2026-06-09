@@ -28,6 +28,7 @@ pub(crate) use sley_ref_filter::*;
 use sley_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefPrecondition, RefTarget, RefUpdate,
     ReflogEntry, branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
+    validate_symref_name, validate_symref_target,
 };
 use sley_transport::{RemoteTransport, parse_remote_url};
 use std::borrow::Cow;
@@ -83,13 +84,42 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_work_tree(global.work_tree);
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
-    let args = global.args;
+    dispatch_with_aliases(global.args, &global.config, 0)
+}
+
+fn dispatch_with_aliases(
+    args: &[String],
+    global_config: &[GlobalConfigOverride],
+    alias_depth: usize,
+) -> Result<()> {
+    if alias_depth >= commands::alias::MAX_ALIAS_DEPTH {
+        eprintln!("fatal: alias loop detected");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(command) = args.first().map(String::as_str) {
+        if !commands::alias::is_builtin_command(command) {
+            match commands::alias::expand_alias(command)? {
+                commands::alias::AliasExpansion::Shell(shell) => {
+                    return commands::alias::run_shell_alias(&shell, &args[1..]);
+                }
+                commands::alias::AliasExpansion::Args(mut expanded) => {
+                    expanded.extend(args[1..].iter().cloned());
+                    return dispatch_with_aliases(&expanded, global_config, alias_depth + 1);
+                }
+                commands::alias::AliasExpansion::None => {}
+            }
+        }
+    }
+    dispatch_command(args, global_config)
+}
+
+fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
     let Some(command) = args.first().map(String::as_str) else {
         print_usage();
         return Err(GitError::Command("missing command".into()));
     };
     match command {
-        "init" => cmd_init(&args[1..], &global.config),
+        "init" => cmd_init(&args[1..], global_config),
         "add" => cmd_add(&args[1..]),
         "archive" => cmd_archive(&args[1..]),
         "branch" => commands::branch::cmd_branch(&args[1..]),
@@ -6764,6 +6794,7 @@ fn cmd_checkout(args: &[String]) -> Result<()> {
                 branch_mode = CheckoutBranchMode::Create {
                     branch: branch.to_string(),
                     force: false,
+                    orphan: false,
                 };
             }
             "-B" => {
@@ -6773,6 +6804,17 @@ fn cmd_checkout(args: &[String]) -> Result<()> {
                 branch_mode = CheckoutBranchMode::Create {
                     branch: branch.to_string(),
                     force: true,
+                    orphan: false,
+                };
+            }
+            "--orphan" => {
+                let branch = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("checkout --orphan requires a branch".into()))?;
+                branch_mode = CheckoutBranchMode::Create {
+                    branch: branch.to_string(),
+                    force: false,
+                    orphan: true,
                 };
             }
             "--" => {
@@ -6798,15 +6840,26 @@ fn cmd_checkout(args: &[String]) -> Result<()> {
                 branch: branch.clone(),
             }
         }
-        CheckoutBranchMode::Create { branch, force } => {
+        CheckoutBranchMode::Create {
+            branch,
+            force,
+            orphan,
+        } => {
+            if orphan {
+                if !positional.is_empty() {
+                    return Err(GitError::Command(
+                        "checkout --orphan does not accept a start point".into(),
+                    ));
+                }
+                checkout_switch_to_unborn_branch(&git_dir, &branch)?;
+                if !quiet {
+                    eprintln!("Switched to a new branch '{branch}'");
+                }
+                return Ok(());
+            }
             if positional.len() > 1 {
                 return Err(GitError::Command(
                     "checkout -b/-B accepts at most one start point".into(),
-                ));
-            }
-            if !sley_worktree::short_status(&worktree_root, &git_dir, format)?.is_empty() {
-                return Err(GitError::Transaction(
-                    "checkout requires a clean working tree".into(),
                 ));
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
@@ -7086,7 +7139,24 @@ fn cmd_restore(args: &[String]) -> Result<()> {
 
 enum CheckoutBranchMode {
     Existing,
-    Create { branch: String, force: bool },
+    Create {
+        branch: String,
+        force: bool,
+        orphan: bool,
+    },
+}
+
+fn checkout_switch_to_unborn_branch(git_dir: &Path, branch: &str) -> Result<()> {
+    let store = FileRefStore::new(git_dir, repository_object_format(git_dir)?);
+    let name = branch_ref_name(branch)?;
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Symbolic(name),
+        reflog: None,
+    });
+    tx.commit()
 }
 
 enum CheckoutMessage {
@@ -7121,12 +7191,26 @@ fn checkout_create_or_reset_branch(
 ) -> Result<bool> {
     let store = FileRefStore::new(git_dir, format);
     let name = branch_ref_name(branch)?;
-    let start_oid = resolve_revision(git_dir, format, start)?;
     let existing = store.read_ref(&name)?;
     if existing.is_some() && !force {
         eprintln!("fatal: a branch named '{branch}' already exists");
         return Err(GitError::Exit(128));
     }
+    let start_oid = match resolve_checkout_start_oid(git_dir, format, start) {
+        Ok(Some(start_oid)) => start_oid,
+        Ok(None) => {
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".into(),
+                expected: None,
+                new: RefTarget::Symbolic(name),
+                reflog: None,
+            });
+            tx.commit()?;
+            return Ok(false);
+        }
+        Err(err) => return Err(err),
+    };
     if let Some(existing) = existing {
         let old_oid = match existing {
             RefTarget::Direct(oid) => oid,
@@ -7158,6 +7242,24 @@ fn checkout_create_or_reset_branch(
             format!("branch: Created from {start}").into_bytes(),
         )?;
         Ok(false)
+    }
+}
+
+fn resolve_checkout_start_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    start: &str,
+) -> Result<Option<ObjectId>> {
+    match resolve_revision(git_dir, format, start) {
+        Ok(oid) => Ok(Some(oid)),
+        Err(_) if start == "HEAD" || start == "@" => {
+            let store = FileRefStore::new(git_dir, format);
+            match store.read_ref("HEAD")? {
+                Some(RefTarget::Symbolic(name)) if store.read_ref(&name)?.is_none() => Ok(None),
+                _ => Err(GitError::not_found(format!("revision {start}"))),
+            }
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -24811,6 +24913,7 @@ fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut recurse = true;
     let mut delete = false;
+    let mut message = Vec::new();
     let mut positional = Vec::new();
     let mut positional_only = false;
     let mut idx = 0;
@@ -24833,10 +24936,14 @@ fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
             "--no-delete" => delete = false,
             "-m" => {
                 idx += 1;
-                args.get(idx)
+                let value = args
+                    .get(idx)
                     .ok_or_else(symbolic_ref_message_requires_value_error)?;
+                message = value.as_bytes().to_vec();
             }
-            value if value.starts_with("-m") && value.len() > 2 => {}
+            value if value.starts_with("-m") && value.len() > 2 => {
+                message = value[2..].as_bytes().to_vec();
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
                     "unsupported symbolic-ref option {value}"
@@ -24862,21 +24969,7 @@ fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
             }
             Ok(())
         }
-        [name, target] => {
-            validate_ref_name(name)?;
-            validate_ref_name(target)?;
-            if !target.starts_with("refs/") {
-                return symbolic_ref_refusing_outside_refs();
-            }
-            let mut tx = store.transaction();
-            tx.update(RefUpdate {
-                name: (*name).into(),
-                expected: None,
-                new: RefTarget::Symbolic((*target).into()),
-                reflog: None,
-            });
-            tx.commit()
-        }
+        [name, target] => update_symbolic_ref(&git_dir, &store, format, name, target, message),
         _ => Err(GitError::Command(
             "symbolic-ref currently supports: symbolic-ref [--short] [--quiet] <name> or symbolic-ref <name> <ref>"
                 .into(),
@@ -24884,9 +24977,83 @@ fn cmd_symbolic_ref(args: &[String]) -> Result<()> {
     }
 }
 
+fn update_symbolic_ref(
+    git_dir: &Path,
+    store: &FileRefStore,
+    format: ObjectFormat,
+    name: &str,
+    target: &str,
+    message: Vec<u8>,
+) -> Result<()> {
+    validate_symref_name(name)?;
+    if name == "HEAD" && !target.starts_with("refs/") {
+        return symbolic_ref_refusing_outside_refs();
+    }
+    if validate_symref_target(target).is_err() {
+        eprintln!("fatal: Refusing to set '{name}' to invalid ref '{target}'");
+        return Err(GitError::Exit(128));
+    }
+    let old_oid = resolve_symbolic_ref_oid(store, format, name)?;
+    let new_oid = resolve_symbolic_ref_oid(store, format, target)?;
+    let reflog = symbolic_ref_should_write_reflog(git_dir, name)?
+        .then(|| ReflogEntry {
+            old_oid,
+            new_oid,
+            committer: default_committer(),
+            message,
+        });
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: name.into(),
+        expected: None,
+        new: RefTarget::Symbolic(target.into()),
+        reflog,
+    });
+    commit_symbolic_ref_update(tx)
+}
+
+fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<()> {
+    match tx.commit() {
+        Ok(()) => Ok(()),
+        Err(GitError::Transaction(message))
+            if message.starts_with("cannot lock ref '") =>
+        {
+            eprintln!("error: {message}");
+            Err(GitError::Exit(1))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn symbolic_ref_should_write_reflog(git_dir: &Path, name: &str) -> Result<bool> {
+    if name == "HEAD" {
+        return Ok(true);
+    }
+    update_ref_should_write_reflog(git_dir, name, false)
+}
+
+fn resolve_symbolic_ref_oid(
+    store: &FileRefStore,
+    format: ObjectFormat,
+    name: &str,
+) -> Result<ObjectId> {
+    let mut current = name.to_string();
+    for _ in 0..16 {
+        match store.read_ref(&current)? {
+            Some(RefTarget::Symbolic(next)) => current = next,
+            Some(RefTarget::Direct(oid)) => return Ok(oid),
+            None => return zero_oid(format),
+        }
+    }
+    zero_oid(format)
+}
+
 fn delete_symbolic_ref(store: &FileRefStore, name: &str) -> Result<()> {
     if name == "HEAD" {
         return symbolic_ref_delete_head();
+    }
+    if validate_symref_name(name).is_err() {
+        return symbolic_ref_cannot_delete(name);
     }
     if store.delete_symbolic_ref(name)? {
         return Ok(());
@@ -24925,7 +25092,14 @@ fn symbolic_ref_not_symbolic(name: &str) -> Result<String> {
 }
 
 fn symbolic_ref_short_name(name: &str) -> &str {
+    if let Some(remote) = name.strip_prefix("refs/remotes/")
+        && let Some(remote_name) = remote.strip_suffix("/HEAD")
+    {
+        return remote_name;
+    }
     name.strip_prefix("refs/heads/")
+        .or_else(|| name.strip_prefix("refs/tags/"))
+        .or_else(|| name.strip_prefix("refs/remotes/"))
         .or_else(|| name.strip_prefix("refs/"))
         .unwrap_or(name)
 }
