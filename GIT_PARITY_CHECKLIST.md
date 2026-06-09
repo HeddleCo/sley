@@ -40,6 +40,41 @@ Non-goals:
 - [ ] `cargo fmt --all`, `cargo clippy --workspace --all-targets --no-deps --
   -D warnings`, and `cargo test --workspace` pass.
 
+## Verified Minimal Parity (main)
+
+This section records what is already covered by `PARITY.md`, upstream byte-compare
+integration tests, and the regression bundles on `main`. It does **not** mean full
+upstream `t/*.sh` parity or complete option matrices — see Phase 5+ for depth
+gaps.
+
+- [x] **Workflow sequencer:** `merge` (FF, 3-way, conflict, `--abort`,
+  `--continue`), `pull` (FF, merge, `pull.rebase`, conflict abort/continue,
+  rebase conflict continue), `rebase` (clean, conflict, `--abort`/`--continue`/
+  `--skip`), `cherry-pick`, `revert`, and `commit` during in-progress
+  merge/rebase — see `crates/sley-cli/tests/{merge,pull*,rebase*,sequencer,
+  commit_merge,commit_rebase}.rs`.
+- [x] **Transport:** local / SSH / HTTP(S) `clone`, `fetch`, `push`, `ls-remote`;
+  protocol v2 HTTP `ls-refs` ref advertisements; shallow `--depth` over HTTP —
+  see `crates/sley-cli/tests/{clone,http,push,ls_remote}.rs` and
+  `crates/sley-remote`.
+- [x] **Hygiene:** `gc`, `repack`, `fsck`, `apply`, `maintenance run` (gc
+  delegation) — see `crates/sley-cli/tests/{maintenance,fsck}.rs`.
+- [x] **Conflict replay:** `rerere status` / `clear` / `forget` — see
+  `crates/sley-cli/tests/rerere.rs`.
+- [x] **Plumbing (bcc2bea+):** `verify-pack`, `show-index`, `unpack-file`,
+  `prune`, `prune-packed`, `update-server-info`, `check-ref-format`,
+  `stripspace`, `var`, `check-mailmap`, `replace`, `get-tar-commit-id` — see
+  matching `crates/sley-cli/tests/*.rs` suites.
+- [x] **Config (partial):** modern + legacy local/file/stdin forms, typed reads,
+  `--default`, `--get-urlmatch` common cases — see `crates/sley-cli/tests/config.rs`.
+- [ ] **Still open at completion-definition level:** upstream `t/*.sh` harness
+  refresh, reftable, hooks/GPG, interactive rebase, full shallow
+  (`--shallow-since`/`--shallow-exclude`/unshallow), promisor/partial clone
+  filters, merge/pull diffstat output, and performance benchmark gates.
+
+Authoritative feature bullets live in `PARITY.md` (Implemented Initial Surface).
+This checklist tracks depth, harness, and release gates.
+
 ## Phase 0: Refresh the Truth Source
 
 - [ ] Re-run the upstream Git `t/*.sh` compatibility harness.
@@ -319,6 +354,30 @@ than git.
   - [ ] Word diff and color-moved parity.
   - [ ] Submodule diff formats.
   - [ ] Binary patch compatibility.
+- [x] `merge` (minimal)
+  - [x] Fast-forward and three-way merge with conflict markers.
+  - [x] `--abort` and `--continue` after conflict resolution.
+  - [ ] Post-merge diffstat output (upstream prints stat summary).
+  - [ ] Strategy selection, octopus, and broader option surface.
+- [x] `pull` (minimal)
+  - [x] Fetch + FF merge, three-way merge, and `pull.rebase` replay.
+  - [x] Conflicted pull abort/continue (merge path) and rebase-conflict continue.
+  - [ ] Broader flag surface (`--autostash`, `--verify-signatures`, etc.).
+- [x] `rebase` (minimal)
+  - [x] Onto upstream replay with `rebase-merge` state files.
+  - [x] `--abort`, `--continue`, and `--skip` on covered fixtures.
+  - [ ] Interactive rebase, autostash, merge/rebase-merges modes.
+- [x] `cherry-pick` / `revert` (minimal)
+  - [x] Clean and conflict paths with `--abort` / `--continue`.
+- [x] `commit` during sequencer (minimal)
+  - [x] Conclude in-progress merge/rebase without `--continue`.
+- [x] `gc` / `repack` / `fsck` / `apply` (minimal)
+  - [x] Covered small-repo workflows with upstream interop tests.
+- [x] `maintenance` (minimal)
+  - [x] `maintenance run` delegates to gc for covered cases.
+  - [ ] `maintenance start` / `stop` / register / scheduled tasks.
+- [x] `rerere` (minimal)
+  - [x] `status`, `clear`, `forget` on covered empty/disabled cases.
 
 ## Phase 6: Refs, Reflogs, and Repository Layout
 
@@ -371,14 +430,16 @@ than git.
 
 ## Phase 8: Transport and Server Parity
 
-- [ ] Complete protocol v2 over HTTP.
-- [ ] Keep protocol v0/v1 compatibility for upstream git servers.
+- [x] Protocol v2 HTTP ref advertisements via `ls-refs` RPC (fetch/clone/push
+  still use covered v0/v1 + v2 fetch paths where implemented).
+- [x] Protocol v0/v1 compatibility for upstream git servers (HTTP/SSH/local interop
+  tests).
 - [ ] Complete shallow clone/fetch:
-  - [ ] `--depth`.
+  - [x] `--depth` over HTTP (covered interop test).
   - [ ] `--shallow-since`.
   - [ ] `--shallow-exclude`.
   - [ ] Unshallow.
-  - [ ] Deepen.
+  - [x] Deepen (library + HTTP shallow fetch plumbing; broaden CLI coverage).
 - [ ] Complete partial clone filters:
   - [ ] `blob:none`.
   - [ ] `blob:limit`.
@@ -516,13 +577,13 @@ Every optimization must preserve compatibility tests.
 
 1. Refresh upstream harness results and delete stale gaps from the old gap map.
 2. Normalize usage exit code `129` across `cat-file`, `ls-tree`, `hash-object`,
-   and `config`.
-3. Preserve config writer case and comments for config edits.
+   and `config` (fix `--get-colorbool` regression in `config.rs`).
+3. Merge/pull post-merge diffstat output to match upstream stdout.
 4. Implement alias expansion before command dispatch.
 5. Finish `<rev>:<path>` and commit-message search revision grammar.
 6. Fill `cat-file` batch/legacy format gaps.
-7. Fix `ls-files --others` symlink and embedded-git handling.
-8. Route `log --format=%H` through graph-backed walks and add `-n` early-stop.
+7. Route `log --format=%H` through graph-backed walks and add `-n` early-stop.
+8. Reftable init/read/write and broader shallow (`--shallow-since` / unshallow).
 
 ## Progress Log
 
@@ -618,3 +679,11 @@ Every optimization must preserve compatibility tests.
   shared Rust stripspace helper for whitespace/comment stripping and adding
   `--comment-lines`, mutual-exclusion errors, usage output, and stdin/stdout
   behavior compared against upstream git.
+- 2026-06-08: Merged codex-branch plumbing (`bcc2bea`) onto `main`, then layered
+  protocol v2 HTTP `ls-refs`, `maintenance run`, and `rerere` parity slices.
+- 2026-06-08: Ported `git pull` and `git rebase` from the `cd16d98` `git-cli`
+  lineage onto `sley-cli`, including `merge --continue`, in-progress
+  merge/rebase `commit`, and 29 new upstream interop tests (`574fc26`).
+- 2026-06-08: Added **Verified Minimal Parity** section to this checklist and
+  reconciled stale gap wording in `PARITY.md` Major Gaps against implemented
+  transport/sequencer coverage.

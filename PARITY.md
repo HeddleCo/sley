@@ -888,8 +888,10 @@ Target: upstream Git 2.54.0.
   (upstream prints stat; sley prints shorter summary) is not implemented.
 - Rebase `Auto-merging` stdout during quiet/non-TTY replay paths may differ from
   upstream Git.
-- Full worktree status/add/checkout flows, broader diff, transport,
-  and porcelain commands are not implemented.
+- Broader porcelain option matrices (interactive commit, signing, pathspec
+  commits, full alias surface), advanced diff algorithms/options, and remaining
+  worktree edge cases beyond covered status/add/checkout/restore paths are not
+  implemented.
 - Upstream Git test script import is not implemented; the current harness covers
   SHA-1/SHA-256 object hashing, upstream repository config parsing,
   upstream index byte-for-byte round-trips, Rust-written `update-index`
