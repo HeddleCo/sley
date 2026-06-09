@@ -5,6 +5,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["http", "ssh"]
+http = ["sley-transport/http-client"]
+ssh = []
+
 [dependencies]
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
@@ -16,7 +21,7 @@ sley-pack = { path = "../sley-pack" }
 sley-protocol = { path = "../sley-protocol" }
 sley-refs = { path = "../sley-refs" }
 sley-rev = { path = "../sley-rev" }
-sley-transport = { path = "../sley-transport", features = ["http-client"] }
+sley-transport = { path = "../sley-transport", default-features = false }
 sley-worktree = { path = "../sley-worktree" }
 
 [lints]

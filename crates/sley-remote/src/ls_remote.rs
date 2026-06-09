@@ -16,8 +16,9 @@
 //!
 //! SSH ls-remote still lives in the CLI; only HTTP and local move here.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "http")]
+use std::collections::HashMap;
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
@@ -92,12 +93,17 @@ pub fn ls_remote(
     format: ObjectFormat,
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
-    credentials: &mut dyn CredentialProvider,
+    #[cfg_attr(not(feature = "http"), allow(unused_variables))] credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     match source {
+        #[cfg(feature = "http")]
         LsRemoteSource::Http(remote) => {
             ls_remote_http(remote, format, filter, matches, credentials)
         }
+        #[cfg(not(feature = "http"))]
+        LsRemoteSource::Http(_) => Err(GitError::Unsupported(
+            "HTTP transport is not enabled in this build".into(),
+        )),
         LsRemoteSource::Ssh(remote) => crate::ssh::ls_remote_ssh(remote, filter, matches),
         LsRemoteSource::Local { git_dir } => ls_remote_local(git_dir, format, filter, matches),
     }
@@ -106,6 +112,7 @@ pub fn ls_remote(
 /// List advertised refs over smart HTTP(S): fetch the upload-pack advertisement,
 /// then apply the class filters and `matches` predicate, attaching the advertised
 /// `HEAD` symref where present.
+#[cfg(feature = "http")]
 fn ls_remote_http(
     remote: &RemoteUrl,
     format: ObjectFormat,

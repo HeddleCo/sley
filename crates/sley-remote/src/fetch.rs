@@ -25,9 +25,11 @@ use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, collect_reachable_object_ids};
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, RefAdvertisement, RefSpec, encode_fetch_head,
+    FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
     fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refspec_map_source,
 };
+#[cfg(feature = "http")]
+use sley_protocol::ProtocolVersion;
 use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
 
@@ -183,6 +185,13 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     // The two transports differ only in how they advertise and how they pull the
     // pack; the ref-map planning and ref bookkeeping are identical.
     let advertisements = match request.source {
+        #[cfg(not(feature = "http"))]
+        FetchSource::Http(_) => {
+            return Err(GitError::Unsupported(
+                "HTTP transport is not enabled in this build".into(),
+            ));
+        }
+        #[cfg(feature = "http")]
         FetchSource::Http(remote) => {
             let client = crate::http::new_http_client();
             let discovered = crate::http::http_service_advertisements(

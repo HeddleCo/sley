@@ -31,7 +31,9 @@ pub use credentials::{
     http_credential_host, http_protocol_name, http_url_credential,
 };
 
+#[cfg(feature = "http")]
 mod http;
+#[cfg(feature = "http")]
 pub use http::{
     HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
     http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,

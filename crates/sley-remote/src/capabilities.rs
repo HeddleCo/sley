@@ -49,10 +49,10 @@ impl TransportCapabilities {
     /// Capabilities of the currently linked `sley-remote` build.
     pub const fn current() -> Self {
         Self {
-            http_fetch: true,
-            http_push: true,
-            http_protocol_v2_discovery: true,
-            http_protocol_v2_fetch: HTTP_PROTOCOL_V2_FETCH,
+            http_fetch: cfg!(feature = "http"),
+            http_push: cfg!(feature = "http"),
+            http_protocol_v2_discovery: cfg!(feature = "http"),
+            http_protocol_v2_fetch: cfg!(feature = "http") && HTTP_PROTOCOL_V2_FETCH,
             shallow_fetch: true,
             ssh_fetch: true,
             ssh_push: true,
@@ -62,7 +62,7 @@ impl TransportCapabilities {
             local_push: true,
             credential_helper: true,
             thin_pack_push: THIN_PACK_PUSH_SUPPORTED,
-            sha256_http: true,
+            sha256_http: cfg!(feature = "http"),
             sha256_ssh: true,
         }
     }
@@ -93,6 +93,22 @@ pub enum RemoteTransportKind {
     Ssh,
     Local,
     Bundle,
+}
+
+#[cfg(all(test, not(feature = "http")))]
+mod tests {
+    use super::TransportCapabilities;
+
+    #[test]
+    fn ssh_only_build_disables_http_fetch_capability() {
+        let caps = TransportCapabilities::current();
+        assert!(!caps.http_fetch);
+        assert!(!caps.http_push);
+        assert!(!caps.http_protocol_v2_discovery);
+        assert!(!caps.http_protocol_v2_fetch);
+        assert!(!caps.sha256_http);
+        assert!(caps.ssh_fetch);
+    }
 }
 
 impl RemoteTransportKind {

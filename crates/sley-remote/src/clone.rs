@@ -164,7 +164,14 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 
     let config = (services.configure)(&git_dir)?;
     let fetch_source = match request.source {
+        #[cfg(feature = "http")]
         CloneSource::Http(remote) => FetchSource::Http(remote.clone()),
+        #[cfg(not(feature = "http"))]
+        CloneSource::Http(_) => {
+            return Err(GitError::Unsupported(
+                "HTTP transport is not enabled in this build".into(),
+            ));
+        }
         CloneSource::Ssh(remote) => FetchSource::Ssh(remote.clone()),
         CloneSource::Local {
             git_dir: remote_git_dir,

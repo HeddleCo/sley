@@ -19,25 +19,32 @@
 //! functions) so there is a single implementation.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "http")]
+use std::io::Read;
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{FileObjectDatabase, ObjectReader, collect_reachable_object_ids};
 use sley_protocol::{
-    GitService, PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
-    ReceivePackPushRequest, ReceivePackPushRequestOptions, ReceivePackReportStatus,
-    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
-    parse_receive_pack_features, parse_refspec, plan_push_commands,
-    read_receive_pack_report_status, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type,
+    PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackPushRequest,
+    ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
+    parse_refspec, plan_push_commands,
+};
+#[cfg(feature = "http")]
+use sley_protocol::{
+    GitService, ReceivePackFeatures, ReceivePackPushRequestOptions,
+    parse_receive_pack_features, read_receive_pack_report_status,
+    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
 };
 
+#[cfg(feature = "http")]
 use crate::pack::{PushPackRequest, build_receive_pack_body};
 use sley_refs::{FileRefStore, Ref, RefTarget};
-use sley_transport::{HttpClient, RemoteUrl, http_smart_rpc_url};
+use sley_transport::RemoteUrl;
+#[cfg(feature = "http")]
+use sley_transport::{HttpClient, http_smart_rpc_url};
 
 use crate::{CredentialProvider, ProgressSink};
 
@@ -145,6 +152,7 @@ pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<Push
     // neither is consumed yet. Kept named for the public API and future use.
     let _ = (request.config, services.progress);
     match request.destination {
+        #[cfg(feature = "http")]
         PushDestination::Http(remote_url) => push_http(PushHttpRequest {
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
@@ -154,6 +162,10 @@ pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<Push
             options: request.options,
             credentials: services.credentials,
         }),
+        #[cfg(not(feature = "http"))]
+        PushDestination::Http(_) => Err(GitError::Unsupported(
+            "HTTP transport is not enabled in this build".into(),
+        )),
         PushDestination::Ssh(remote_url) => crate::ssh::push_ssh(crate::ssh::SshPushRequest {
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
@@ -181,6 +193,7 @@ pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<Push
 
 /// Push to a smart-HTTP(S) remote: advertise via receive-pack info/refs, plan,
 /// build the pack, POST the receive-pack RPC, and validate the report-status.
+#[cfg(feature = "http")]
 struct PushHttpRequest<'a> {
     git_dir: &'a Path,
     common_git_dir: &'a Path,
@@ -191,6 +204,7 @@ struct PushHttpRequest<'a> {
     credentials: &'a mut dyn CredentialProvider,
 }
 
+#[cfg(feature = "http")]
 fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
     let PushHttpRequest {
         git_dir,
@@ -354,6 +368,7 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
 
 /// Parse the receive-pack features from the leading ref advertisement (the empty
 /// default when the remote advertised no refs).
+#[cfg(feature = "http")]
 fn advertised_receive_pack_features(
     advertisements: &[RefAdvertisement],
 ) -> Result<ReceivePackFeatures> {
@@ -366,6 +381,7 @@ fn advertised_receive_pack_features(
 
 /// Reject a push whose object format disagrees with the remote's advertised
 /// `object-format`, and require the advertisement for any non-SHA-1 push.
+#[cfg(feature = "http")]
 fn verify_remote_object_format(features: &ReceivePackFeatures, format: ObjectFormat) -> Result<()> {
     if let Some(remote_format) = features.object_format {
         if remote_format != format {
@@ -388,6 +404,7 @@ fn verify_remote_object_format(features: &ReceivePackFeatures, format: ObjectFor
 /// git: report-status when advertised, ofs-delta when advertised, `quiet` only
 /// when both requested and advertised, and the advertised object-format only when
 /// the local repository's `format` is not SHA-1.
+#[cfg(feature = "http")]
 fn receive_pack_push_options(
     features: &ReceivePackFeatures,
     format: ObjectFormat,
