@@ -423,7 +423,11 @@ impl FileRefStore {
     }
 
     pub fn read_ref(&self, name: &str) -> Result<Option<RefTarget>> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
+        self.read_ref_unchecked(name)
+    }
+
+    fn read_ref_unchecked(&self, name: &str) -> Result<Option<RefTarget>> {
         if self.uses_reftable()? {
             return self.read_reftable_ref(name);
         }
@@ -798,7 +802,7 @@ impl FileRefStore {
     }
 
     pub fn delete_symbolic_ref(&self, name: &str) -> Result<bool> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
             let Some(target) = self.read_ref(name)? else {
                 return Ok(false);
@@ -882,6 +886,9 @@ impl FileRefStore {
     fn read_loose_ref(&self, name: &str) -> Result<Option<Ref>> {
         let path = self.ref_path(name);
         if !path.exists() {
+            return Ok(None);
+        }
+        if path.is_dir() {
             return Ok(None);
         }
         Ok(Some(parse_loose_ref(self.format, name, &fs::read(path)?)?))
@@ -1084,7 +1091,7 @@ impl FileRefStore {
     }
 
     pub fn append_reflog(&self, name: &str, entry: &ReflogEntry) -> Result<()> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
         let parent = path
             .parent()
@@ -1114,6 +1121,23 @@ impl FileRefStore {
             &self.common_dir
         }
     }
+
+    fn check_ref_directory_conflict(&self, name: &str) -> Result<()> {
+        let components = name.split('/').collect::<Vec<_>>();
+        for index in 1..components.len() {
+            let ancestor = components[..index].join("/");
+            if self.read_ref_unchecked(&ancestor)?.is_some() {
+                return Err(ref_directory_conflict_error(name, &ancestor));
+            }
+        }
+        let child_prefix = format!("{name}/");
+        for reference in self.list_refs()? {
+            if reference.name.starts_with(&child_prefix) {
+                return Err(ref_directory_conflict_error(name, &reference.name));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
@@ -1122,10 +1146,7 @@ fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
         ReftableRefValue::Direct(oid) | ReftableRefValue::Peeled { target: oid, .. } => {
             Ok(Some(RefTarget::Direct(oid)))
         }
-        ReftableRefValue::Symbolic(target) => {
-            validate_ref_name(&target)?;
-            Ok(Some(RefTarget::Symbolic(target)))
-        }
+        ReftableRefValue::Symbolic(target) => Ok(Some(RefTarget::Symbolic(target))),
     }
 }
 
@@ -1272,12 +1293,22 @@ impl FileRefStore {
         let mut pending = Vec::with_capacity(updates.len());
         // Acquire every lock first; bail (releasing what we hold) on any failure.
         for update in &updates {
+            if let Err(err) = self.check_ref_directory_conflict(&update.name) {
+                release_pending_locks(&pending);
+                return Err(err);
+            }
             let path = self.ref_path(&update.name);
             let parent = path
                 .parent()
                 .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
             if let Err(err) = fs::create_dir_all(parent) {
                 release_pending_locks(&pending);
+                if err.kind() == std::io::ErrorKind::NotADirectory {
+                    return Err(ref_directory_conflict_error(
+                        &update.name,
+                        &parent_to_ref_name(&self.ref_base_dir(&update.name), parent),
+                    ));
+                }
                 return Err(GitError::Io(err.to_string()));
             }
             let lock_path = match lock_path_for(&path) {
@@ -1381,7 +1412,7 @@ fn coalesce_ref_updates(updates: Vec<QueuedUpdate>) -> Result<Vec<CoalescedRefUp
     let mut order: Vec<String> = Vec::new();
     let mut by_name: HashMap<String, CoalescedRefUpdate> = HashMap::new();
     for update in updates {
-        validate_ref_name(&update.name)?;
+        validate_ref_name_for_update(&update.name)?;
         match by_name.get_mut(&update.name) {
             Some(existing) => {
                 existing.new = update.new;
@@ -2069,6 +2100,72 @@ fn lock_path_for(path: &Path) -> Result<PathBuf> {
     Ok(path.with_file_name(lock_name))
 }
 
+/// Validate a ref name using git's `check_refname_format` rules.
+pub fn check_refname_format(name: &str, allow_onelevel: bool) -> Result<()> {
+    if name.is_empty()
+        || name == "@"
+        || name.starts_with('/')
+        || name.ends_with('/')
+        || name.ends_with('.')
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || (!allow_onelevel && !name.contains('/'))
+    {
+        return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+    }
+    for component in name.split('/') {
+        if component.is_empty()
+            || component.starts_with('.')
+            || component.ends_with(".lock")
+        {
+            return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+        }
+        for (idx, byte) in component.bytes().enumerate() {
+            if byte <= b' '
+                || byte == 0x7f
+                || matches!(byte, b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\')
+            {
+                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+            }
+            if byte == b'.' && component.as_bytes().get(idx + 1) == Some(&b'.') {
+                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+            }
+            if byte == b'@' && component.as_bytes().get(idx + 1) == Some(&b'{') {
+                return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a symbolic ref name (HEAD, one-level pseudo-refs, or `refs/...`).
+pub fn validate_symref_name(name: &str) -> Result<()> {
+    if name == "HEAD" {
+        return Ok(());
+    }
+    check_refname_format(name, true)
+}
+
+/// Validate a symbolic ref target (one-level pseudo-refs or `refs/...`).
+pub fn validate_symref_target(name: &str) -> Result<()> {
+    check_refname_format(name, true)
+}
+
+fn validate_ref_name_for_read(name: &str) -> Result<()> {
+    if validate_ref_name(name).is_ok() {
+        return Ok(());
+    }
+    validate_symref_name(name)
+}
+
+fn validate_ref_name_for_update(name: &str) -> Result<()> {
+    if validate_ref_name(name).is_ok() {
+        return Ok(());
+    }
+    validate_symref_name(name)
+}
+
 pub fn validate_ref_name(name: &str) -> Result<()> {
     if name == "HEAD" {
         return Ok(());
@@ -2090,6 +2187,19 @@ pub fn validate_ref_name(name: &str) -> Result<()> {
         return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
     }
     Ok(())
+}
+
+fn ref_directory_conflict_error(new_ref: &str, existing_ref: &str) -> GitError {
+    GitError::Transaction(format!(
+        "cannot lock ref '{new_ref}': '{existing_ref}' exists; cannot create '{new_ref}'"
+    ))
+}
+
+fn parent_to_ref_name(base: &Path, parent: &Path) -> String {
+    match parent.strip_prefix(base) {
+        Ok(suffix) => suffix.to_string_lossy().replace('\\', "/"),
+        Err(_) => parent.to_string_lossy().into_owned(),
+    }
 }
 
 fn validate_namespaced_ref(name: &str, prefix: &str, kind: &str) -> Result<()> {
@@ -2201,6 +2311,49 @@ mod tests {
         let reference = parse_loose_ref(ObjectFormat::Sha1, "refs/heads/main", oid.as_bytes())
             .expect("test operation should succeed");
         assert_eq!(write_loose_ref(&reference), format!("{oid}\n").into_bytes());
+    }
+
+    #[test]
+    fn symref_names_allow_onelevel_pseudo_refs() {
+        for name in ["NOTHEAD", "FOO", "ORIG_HEAD", "TEST_SYMREF"] {
+            validate_symref_name(name).expect("symref name should be valid");
+        }
+        assert!(validate_ref_name("NOTHEAD").is_err());
+        assert!(validate_symref_target("refs/heads/foo").is_ok());
+        assert!(validate_symref_target("ORIG_HEAD").is_ok());
+        assert!(validate_symref_target("foo..bar").is_err());
+    }
+
+    #[test]
+    fn symref_directory_conflict_is_reported_gracefully() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/df".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("seed branch ref");
+
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/df/conflict".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/df".into()),
+            reflog: None,
+        });
+        let err = tx.commit().expect_err("child ref should conflict");
+        assert!(matches!(err, GitError::Transaction(message) if message.contains(
+            "cannot lock ref 'refs/heads/df/conflict'"
+        ) && message.contains("refs/heads/df")));
+        let _ = fs::remove_dir_all(git_dir);
     }
 
     #[test]

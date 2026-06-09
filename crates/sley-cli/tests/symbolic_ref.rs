@@ -225,6 +225,138 @@ fn symbolic_ref_delete_matches_upstream_git() {
 }
 
 #[test]
+fn symbolic_ref_onelevel_names_match_upstream_git() {
+    let root = unique_temp_dir("symbolic-ref-onelevel");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        run_success("git", &expected, &["init", "-q"]);
+        run_success("git", &actual, &["init", "-q"]);
+        run_success("git", &expected, &["commit", "--allow-empty", "-qm", "seed"]);
+        run_success("git", &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+
+        for args in [
+            vec!["symbolic-ref", "NOTHEAD", "refs/heads/foo"],
+            vec!["symbolic-ref", "-d", "NOTHEAD"],
+            vec!["symbolic-ref", "-d", "FOO"],
+            vec!["symbolic-ref", "refs/heads/top-level", "ORIG_HEAD"],
+            vec!["symbolic-ref", "refs/heads/invalid", "foo..bar"],
+        ] {
+            let expected_output = run("git", &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symbolic_ref_short_edge_cases_match_upstream_git() {
+    let root = unique_temp_dir("symbolic-ref-short-edge");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        run_success("git", &root, &["init", "-q"]);
+        run_success("git", &root, &["commit", "--allow-empty", "-qm", "seed"]);
+
+        for (set_args, read_args) in [
+            (
+                vec!["symbolic-ref", "TEST_SYMREF", "refs/remotes/origin/HEAD"],
+                vec!["symbolic-ref", "--short", "TEST_SYMREF"],
+            ),
+            (
+                vec!["symbolic-ref", "TEST_SYMREF", "refs/headsXfoo"],
+                vec!["symbolic-ref", "--short", "TEST_SYMREF"],
+            ),
+            (
+                vec!["symbolic-ref", "TEST_SYMREF", "refs/heads/%foo"],
+                vec!["symbolic-ref", "--short", "TEST_SYMREF"],
+            ),
+            (
+                vec![
+                    "symbolic-ref",
+                    "TEST_SYMREF",
+                    "refs/heads/测试-加-增加-加-增加",
+                ],
+                vec!["symbolic-ref", "--short", "TEST_SYMREF"],
+            ),
+        ] {
+            run_success("git", &root, &set_args);
+            let expected = run("git", &root, &read_args);
+            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &read_args);
+            assert_same_output(actual, expected, &read_args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn symbolic_ref_df_conflict_matches_upstream_git() {
+    let root = unique_temp_dir("symbolic-ref-df");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        run_success("git", &expected, &["init", "-q"]);
+        run_success("git", &actual, &["init", "-q"]);
+        for repo in [&expected, &actual] {
+            run_success("git", repo, &["commit", "--allow-empty", "-qm", "seed"]);
+            run_success("git", repo, &["checkout", "-b", "df"]);
+            run_success("git", repo, &["commit", "--allow-empty", "-qm", "df"]);
+        }
+
+        let args = ["symbolic-ref", "refs/heads/df/conflict", "refs/heads/df"];
+        let expected_output = run("git", &expected, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        assert_same_output(actual_output, expected_output, &args);
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn assert_symbolic_ref_matches_git(root: &Path, setup: impl Fn(&Path, &str)) {
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    run_success("git", &expected, &["init", "-q"]);
+    run_success("git", &actual, &["init", "-q"]);
+    run_success("git", &expected, &["commit", "--allow-empty", "-qm", "seed"]);
+    run_success("git", &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+    let head = run_success("git", &expected, &["rev-parse", "HEAD"]);
+    let oid = String::from_utf8_lossy(&head).trim().to_string();
+    setup(&expected, &oid);
+    setup(&actual, &oid);
+    let args = ["symbolic-ref", "HEAD"];
+    let expected_output = run("git", &expected, &args);
+    let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    assert_same_output(actual_output, expected_output, &args);
+}
+
+#[test]
+fn symbolic_ref_df_resolution_matches_upstream_git() {
+    let root = unique_temp_dir("symbolic-ref-df-resolve");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        assert_symbolic_ref_matches_git(&root.join("eisdir"), |repo, oid| {
+            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/outer"]);
+            fs::create_dir_all(repo.join(".git/refs/heads/outer")).expect("outer dir");
+            fs::write(
+                repo.join(".git/refs/heads/outer/inner"),
+                format!("{oid}\n"),
+            )
+            .expect("inner ref");
+        });
+        assert_symbolic_ref_matches_git(&root.join("enotdir"), |repo, oid| {
+            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/outer/inner"]);
+            run_success("git", repo, &["update-ref", "refs/heads/outer", oid]);
+        });
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-short-no-recurse");
     fs::create_dir_all(&root).expect("create temp repo");
