@@ -211,6 +211,11 @@ Target: upstream Git 2.54.0.
   from inside a moved linked worktree, linked admin `gitdir` correction, invalid
   path errors, unknown-option usage, and linked-worktree admin directory
   discovery through `commondir`.
+- Minimal `rerere` support for `rerere status` over `MERGE_RR` entries,
+  `rerere clear` removal of unresolved `rr-cache` entries and `MERGE_RR`,
+  `rerere forget <pathspec>...` removal of remembered resolutions,
+  no-argument no-op behavior when rerere is disabled, covered usage and
+  unknown-option errors, and deprecated `forget` without pathspec warnings.
 - Minimal `rev-list` support for commit-ish starts including annotated tags,
   linear-history traversal, `--max-count` / `-n` / `-<n>`, `--reverse`,
   `--skip`, default date-ready walk ordering, `--topo-order`, `--date-order`,
