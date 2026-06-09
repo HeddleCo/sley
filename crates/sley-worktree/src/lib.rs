@@ -1,6 +1,6 @@
 use sley_config::GitConfig;
 use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result};
-use sley_index::{Index, IndexEntry};
+use sley_index::{CacheTree, Index, IndexEntry, Stage};
 use sley_object::TreeEntries;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -1141,24 +1141,30 @@ pub fn short_status_with_options(
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let head = head_tree_entries(git_dir, format, &db)?;
     // Parse the index once: the tracked map drives status comparisons and the
     // stat cache lets the worktree walk skip re-hashing files whose stat proves
     // they are unchanged since staging (git's racy-git shortcut).
-    let (index, stat_cache) = read_index_entries_with_stat_cache(git_dir, format)?;
+    let (index, stat_cache, head_matches_index) =
+        read_index_entries_with_stat_cache(git_dir, format, &db)?;
+    let head = if head_matches_index {
+        index.clone()
+    } else {
+        head_tree_entries(git_dir, format, &db)?
+    };
     let tracked_paths = if options.untracked_mode == StatusUntrackedMode::None {
         Some(index.keys().cloned().collect::<BTreeSet<_>>())
     } else {
         None
     };
+    let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
     let worktree = worktree_entries_with_stat_cache(
         worktree_root,
         git_dir,
         format,
         Some(&stat_cache),
         tracked_paths.as_ref(),
+        Some(&mut ignores),
     )?;
-    let ignores = IgnoreMatcher::from_worktree_root(worktree_root)?;
     let mut paths = BTreeSet::new();
     paths.extend(head.keys().cloned());
     paths.extend(index.keys().cloned());
@@ -1233,25 +1239,7 @@ pub fn short_status_with_options(
             .cloned()
             .collect(),
         StatusUntrackedMode::Normal => {
-            let mut paths = BTreeSet::new();
-            collect_untracked_directory_paths(
-                worktree_root,
-                git_dir,
-                worktree_root,
-                &index,
-                &ignores,
-                &UntrackedPathOptions {
-                    directory: true,
-                    no_empty_directory: true,
-                    preserve_ignored_directories: false,
-                    exclude_standard: true,
-                    ignored_only: false,
-                    exclude_patterns: Vec::new(),
-                    exclude_per_directory: Vec::new(),
-                },
-                &mut paths,
-            )?;
-            paths.into_iter().collect()
+            normal_untracked_paths_from_worktree(&worktree, &index, &ignores)
         }
         StatusUntrackedMode::None => Vec::new(),
     };
@@ -1578,6 +1566,53 @@ fn index_has_path_under(index: &BTreeMap<Vec<u8>, TrackedEntry>, directory: &[u8
         .is_some_and(|(path, _)| path.starts_with(&prefix))
 }
 
+/// Derives normal-mode untracked paths (directory rollup) from the worktree map
+/// produced by the single status walk, avoiding a third filesystem traversal.
+fn normal_untracked_paths_from_worktree(
+    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
+    index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &IgnoreMatcher,
+) -> Vec<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    for (path, entry) in worktree {
+        if index.contains_key(path) || entry.mode == 0o040000 || ignores.is_ignored(path, false) {
+            continue;
+        }
+        paths.insert(untracked_normal_rollup_path(path, index, ignores));
+    }
+    paths.into_iter().collect()
+}
+
+fn untracked_normal_rollup_path(
+    file_path: &[u8],
+    index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &IgnoreMatcher,
+) -> Vec<u8> {
+    let segments = file_path
+        .split(|byte| *byte == b'/')
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.len() <= 1 {
+        return file_path.to_vec();
+    }
+    let mut prefix = Vec::new();
+    for segment in &segments[..segments.len() - 1] {
+        if !prefix.is_empty() {
+            prefix.push(b'/');
+        }
+        prefix.extend_from_slice(segment);
+        if index_has_path_under(index, &prefix) {
+            break;
+        }
+        if !ignores.is_ignored(&prefix, true) {
+            let mut directory = prefix;
+            directory.push(b'/');
+            return directory;
+        }
+    }
+    file_path.to_vec()
+}
+
 fn directory_has_file(
     dir: &Path,
     root: &Path,
@@ -1804,6 +1839,39 @@ impl IgnoreMatcher {
         matcher.extend_patterns(patterns);
         matcher.extend_per_directory_patterns(root, per_directory)?;
         Ok(matcher)
+    }
+
+    /// Builds only the repository-wide ignore sources — `core.excludesFile` (or the
+    /// default global) and `$GIT_DIR/info/exclude` — *without* walking the worktree
+    /// for `.gitignore`. The caller folds each directory's `.gitignore` into the
+    /// matcher as it descends (see [`read_dir_ignore_patterns`]), so status reads
+    /// the tree exactly once instead of doing a separate full-tree ignore pass.
+    fn from_worktree_base(root: &Path) -> Result<Self> {
+        let mut patterns = Vec::new();
+        read_ignore_patterns(
+            root.join(".git").join("info").join("exclude"),
+            &mut patterns,
+            &[],
+            b".git/info/exclude",
+        );
+        if !read_core_excludes_file(root, &mut patterns) {
+            read_default_global_excludes_file(&mut patterns);
+        }
+        Ok(Self { patterns })
+    }
+
+    fn fold_dir_ignore_patterns(&mut self, root: &Path, dir: &Path) -> Result<()> {
+        let relative = dir.strip_prefix(root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", dir.display()))
+        })?;
+        let base = git_path_bytes(relative)?;
+        let mut source = base.clone();
+        if !source.is_empty() {
+            source.push(b'/');
+        }
+        source.extend_from_slice(b".gitignore");
+        read_ignore_patterns(dir.join(".gitignore"), &mut self.patterns, &base, &source);
+        Ok(())
     }
 
     fn from_worktree_root(root: &Path) -> Result<Self> {
@@ -2626,6 +2694,17 @@ impl AttributeMatcher {
 /// Fold `dir`'s `.gitattributes` (if any) into `matcher`, scoped to `dir`'s path
 /// within `root`. Used both by the eager full-tree pass and by the status/diff
 /// worktree walk as it descends, so the tree is read for attributes exactly once.
+/// Fold `dir`'s `.gitignore` (if any) into `matcher`, scoped to `dir`'s path
+/// within `root`. Used by the status worktree walk as it descends so ignore
+/// patterns are collected in the same traversal as worktree entries.
+fn read_dir_ignore_patterns(
+    root: &Path,
+    dir: &Path,
+    matcher: &mut IgnoreMatcher,
+) -> Result<()> {
+    matcher.fold_dir_ignore_patterns(root, dir)
+}
+
 fn read_dir_attribute_patterns(
     root: &Path,
     dir: &Path,
@@ -3466,7 +3545,7 @@ pub fn modified_index_entries(
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let worktree =
-        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache), None)?;
+        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache), None, None)?;
     let mut modified = Vec::new();
     for entry in index.entries {
         let Some(worktree_entry) = worktree.get(entry.path.as_bytes()) else {
@@ -5410,7 +5489,74 @@ fn read_index_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    Ok(read_index_entries_with_stat_cache(git_dir, format)?.0)
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    Ok(read_index_entries_with_stat_cache(git_dir, format, &db)?.0)
+}
+
+fn resolve_head_tree_oid(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+) -> Result<Option<ObjectId>> {
+    let refs = FileRefStore::new(git_dir, format);
+    let Some(head) = refs.read_ref("HEAD")? else {
+        return Ok(None);
+    };
+    let commit_oid = match head {
+        RefTarget::Direct(oid) => Some(oid),
+        RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+    };
+    let Some(commit_oid) = commit_oid else {
+        return Ok(None);
+    };
+    let object = db.read_object(&commit_oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "HEAD {commit_oid} is not a commit"
+        )));
+    }
+    let commit = Commit::parse_ref(format, &object.body)?;
+    Ok(Some(commit.tree))
+}
+
+fn cache_tree_is_valid(tree: &CacheTree) -> bool {
+    if tree.entry_count < 0 || tree.oid.is_none() {
+        return false;
+    }
+    tree.subtrees
+        .iter()
+        .all(|child| cache_tree_is_valid(&child.tree))
+}
+
+fn index_stage0_entry_count(index: &Index) -> usize {
+    index
+        .entries
+        .iter()
+        .filter(|entry| entry.stage() == Stage::Normal)
+        .count()
+}
+
+fn head_matches_index_from_cache_tree(
+    index: &Index,
+    format: ObjectFormat,
+    head_tree_oid: &ObjectId,
+) -> Result<bool> {
+    let Some(cache_tree) = index.cache_tree(format)? else {
+        return Ok(false);
+    };
+    if !cache_tree_is_valid(&cache_tree) {
+        return Ok(false);
+    }
+    let Some(root_oid) = cache_tree.oid.as_ref() else {
+        return Ok(false);
+    };
+    if root_oid != head_tree_oid {
+        return Ok(false);
+    }
+    Ok(cache_tree.entry_count as usize == index_stage0_entry_count(index))
 }
 
 /// Parses the index a single time and returns both the path -> [`TrackedEntry`]
@@ -5419,12 +5565,17 @@ fn read_index_entries(
 fn read_index_entries_with_stat_cache(
     git_dir: &Path,
     format: ObjectFormat,
-) -> Result<(BTreeMap<Vec<u8>, TrackedEntry>, IndexStatCache)> {
+    db: &FileObjectDatabase,
+) -> Result<(BTreeMap<Vec<u8>, TrackedEntry>, IndexStatCache, bool)> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
-        return Ok((BTreeMap::new(), IndexStatCache::default()));
+        return Ok((BTreeMap::new(), IndexStatCache::default(), false));
     }
     let index = Index::parse(&fs::read(&index_path)?, format)?;
+    let head_matches_index = match resolve_head_tree_oid(git_dir, format, db)? {
+        Some(head_tree_oid) => head_matches_index_from_cache_tree(&index, format, &head_tree_oid)?,
+        None => false,
+    };
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let tracked = index
         .entries
@@ -5439,7 +5590,7 @@ fn read_index_entries_with_stat_cache(
             )
         })
         .collect();
-    Ok((tracked, stat_cache))
+    Ok((tracked, stat_cache, head_matches_index))
 }
 
 fn head_tree_entries(
@@ -5535,7 +5686,7 @@ fn worktree_entries(
     git_dir: &Path,
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None, None)
+    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None, None, None)
 }
 
 /// Like [`worktree_entries`], but accepts the index's [`IndexStatCache`] so the
@@ -5548,6 +5699,7 @@ fn worktree_entries_with_stat_cache(
     format: ObjectFormat,
     stat_cache: Option<&IndexStatCache>,
     tracked_paths: Option<&BTreeSet<Vec<u8>>>,
+    ignores: Option<&mut IgnoreMatcher>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
     // Worktree blobs are compared to the index by OID, so they must be passed
@@ -5570,6 +5722,7 @@ fn worktree_entries_with_stat_cache(
         requested: &attr_requested,
         stat_cache,
         tracked_paths,
+        ignores,
         entries: &mut entries,
     };
     collect_worktree_entries(&mut context, worktree_root)?;
@@ -5585,6 +5738,7 @@ struct WorktreeEntriesWalk<'a> {
     requested: &'a [Vec<u8>],
     stat_cache: Option<&'a IndexStatCache>,
     tracked_paths: Option<&'a BTreeSet<Vec<u8>>>,
+    ignores: Option<&'a mut IgnoreMatcher>,
     entries: &'a mut BTreeMap<Vec<u8>, TrackedEntry>,
 }
 
@@ -5596,6 +5750,9 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
     // files, so lookups for files here (and below) see it. This is what lets the
     // walk read the tree once instead of doing a separate full-tree attribute pass.
     read_dir_attribute_patterns(context.root, dir, context.matcher)?;
+    if let Some(ignores) = context.ignores.as_deref_mut() {
+        read_dir_ignore_patterns(context.root, dir, ignores)?;
+    }
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -5606,22 +5763,32 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
             continue;
         }
         let metadata = entry.metadata()?;
+        let relative = path.strip_prefix(context.root).map_err(|_| {
+            GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+        })?;
+        let git_path = git_path_bytes(relative)?;
+        if context
+            .ignores
+            .as_ref()
+            .is_some_and(|ignores| ignores.is_ignored(&git_path, metadata.is_dir()))
+        {
+            if metadata.is_dir()
+                && context
+                    .tracked_paths
+                    .is_some_and(|tracked_paths| tracked_paths_may_contain(tracked_paths, &git_path))
+            {
+                collect_worktree_entries(context, &path)?;
+            }
+            continue;
+        }
         if metadata.is_dir() {
-            if let Some(tracked_paths) = context.tracked_paths {
-                let relative = path.strip_prefix(context.root).map_err(|_| {
-                    GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-                })?;
-                let git_path = git_path_bytes(relative)?;
-                if !tracked_paths_may_contain(tracked_paths, &git_path) {
-                    continue;
-                }
+            if let Some(tracked_paths) = context.tracked_paths
+                && !tracked_paths_may_contain(tracked_paths, &git_path)
+            {
+                continue;
             }
             collect_worktree_entries(context, &path)?;
         } else if metadata.is_file() {
-            let relative = path.strip_prefix(context.root).map_err(|_| {
-                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
-            })?;
-            let git_path = git_path_bytes(relative)?;
             if let Some(tracked_paths) = context.tracked_paths
                 && !tracked_paths.contains(&git_path)
             {

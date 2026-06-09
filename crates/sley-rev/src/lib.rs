@@ -989,24 +989,94 @@ pub fn walk_commit_metadata<R: ObjectReader>(
         if !seen.insert(oid) {
             continue;
         }
-        let (parents, commit_time) = match graph.metadata(&oid) {
-            Some(metadata) => metadata,
-            None => commit_metadata_from_object(reader, format, &oid)?,
-        };
+        let metadata = commit_metadata_lookup(&mut graph, reader, format, &oid)?;
         // `--first-parent` follows only the first parent of each commit; otherwise
         // every parent is enqueued (matching `walk_commits`).
         if first_parent {
-            pending.extend(parents.first().cloned());
+            pending.extend(metadata.parents.first().cloned());
         } else {
-            pending.extend(parents.iter().cloned());
+            pending.extend(metadata.parents.iter().cloned());
         }
-        out.push(CommitMetadata {
-            oid,
-            parents,
-            commit_time,
-        });
+        out.push(metadata);
     }
     Ok(out)
+}
+
+/// Walk history in committer-date order, stopping after `limit` commits. This is
+/// the early-stop counterpart of walking every ancestor and then sorting for
+/// `rev-list`/`log -n`.
+pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
+    git_dir: &Path,
+    format: sley_core::ObjectFormat,
+    reader: &R,
+    starts: impl IntoIterator<Item = ObjectId>,
+    first_parent: bool,
+    limit: usize,
+) -> Result<Vec<CommitMetadata>> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut graph = CommitGraphContext::load(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut records = HashMap::<ObjectId, CommitMetadata>::new();
+    let mut heap = BinaryHeap::<(i64, Reverse<ObjectId>)>::new();
+    for start in starts {
+        if !seen.insert(start) {
+            continue;
+        }
+        let metadata = commit_metadata_lookup(&mut graph, reader, format, &start)?;
+        records.insert(metadata.oid, metadata.clone());
+        heap.push((metadata.commit_time, Reverse(metadata.oid)));
+    }
+
+    let mut out = Vec::with_capacity(limit.min(256));
+    while out.len() < limit {
+        let Some((_, Reverse(oid))) = heap.pop() else {
+            break;
+        };
+        let Some(metadata) = records.get(&oid).cloned() else {
+            continue;
+        };
+        out.push(metadata.clone());
+        let parents = if first_parent {
+            metadata.parents.first().into_iter().cloned().collect::<Vec<_>>()
+        } else {
+            metadata.parents.clone()
+        };
+        for parent in parents {
+            if !seen.insert(parent) {
+                continue;
+            }
+            let parent_metadata = commit_metadata_lookup(&mut graph, reader, format, &parent)?;
+            records.insert(parent_metadata.oid, parent_metadata.clone());
+            heap.push((
+                parent_metadata.commit_time,
+                Reverse(parent_metadata.oid),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn commit_metadata_lookup<R: ObjectReader>(
+    graph: &mut CommitGraphContext,
+    reader: &R,
+    format: sley_core::ObjectFormat,
+    oid: &ObjectId,
+) -> Result<CommitMetadata> {
+    let (parents, commit_time) = match graph.metadata(oid) {
+        Some(metadata) => metadata,
+        None => commit_metadata_from_object(reader, format, oid)?,
+    };
+    Ok(CommitMetadata {
+        oid: *oid,
+        parents,
+        commit_time,
+    })
 }
 
 /// Parents and committer time of `oid` read from its commit object (the fallback

@@ -16149,6 +16149,56 @@ fn cmd_log(args: &[String]) -> Result<()> {
             excluded.insert(record.oid);
         }
     }
+    if walk
+        && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && matches!(&output, LogOutput::Custom { format, .. } if log_format_is_oid_only(format))
+        && decoration == LogDecorationMode::Off
+        && !show_parents
+        && !show_children
+        && author_filters.is_empty()
+        && committer_filters.is_empty()
+        && grep_filters.is_empty()
+        && max_age.is_none()
+        && min_age.is_none()
+        && min_parents.is_none()
+        && max_parents.is_none()
+    {
+        let limit = max_count.map(|max| skip.saturating_add(max));
+        let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            sley_rev::walk_commit_metadata_date_ordered_limited(
+                &git_dir,
+                format,
+                &db,
+                starts.clone(),
+                first_parent,
+                limit,
+            )?
+        } else {
+            sley_rev::walk_commit_metadata(&git_dir, format, &db, starts.clone(), first_parent)?
+        };
+        let mut selected = metadata
+            .into_iter()
+            .filter(|record| !excluded.contains(&record.oid))
+            .collect::<Vec<_>>();
+        if limit.is_none() {
+            selected = rev_list_metadata_date_order(selected);
+        }
+        if skip > 0 {
+            selected = selected.into_iter().skip(skip).collect();
+        }
+        if let Some(max_count) = max_count {
+            selected.truncate(max_count);
+        }
+        if reverse {
+            selected.reverse();
+        }
+        let mut stdout = io::stdout();
+        for record in &selected {
+            writeln!(stdout, "{}", record.oid)?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
     let commits = if walk {
         rev_list_walk_commits(&db, format, starts, first_parent)?
     } else {
@@ -17402,13 +17452,25 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         && max_age.is_none()
         && min_age.is_none()
     {
-        let metadata = sley_rev::walk_commit_metadata(
-            &git_dir,
-            format,
-            &db,
-            include_commits.clone(),
-            first_parent,
-        )?;
+        let limit = max_count.map(|max| skip_count.saturating_add(max));
+        let metadata = if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            sley_rev::walk_commit_metadata_date_ordered_limited(
+                &git_dir,
+                format,
+                &db,
+                include_commits.clone(),
+                first_parent,
+                limit,
+            )?
+        } else {
+            sley_rev::walk_commit_metadata(
+                &git_dir,
+                format,
+                &db,
+                include_commits.clone(),
+                first_parent,
+            )?
+        };
         let mut selected = metadata
             .into_iter()
             .filter(|record| !excluded.contains(&record.oid))
@@ -17417,7 +17479,9 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                     || max_parents.is_some_and(|max| record.parents.len() > max))
             })
             .collect::<Vec<_>>();
-        selected = rev_list_metadata_date_order(selected);
+        if limit.is_none() {
+            selected = rev_list_metadata_date_order(selected);
+        }
         if skip_count > 0 {
             selected = selected.into_iter().skip(skip_count).collect();
         }
@@ -19655,6 +19719,10 @@ fn consume_log_format_literal(
     }
     *chars = lookahead;
     true
+}
+
+fn log_format_is_oid_only(format: &str) -> bool {
+    format.trim() == "%H"
 }
 
 fn log_format_uses_decorations(format: &str) -> bool {

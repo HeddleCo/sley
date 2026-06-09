@@ -134,12 +134,10 @@ walking commands are far behind, and the gaps are **algorithmic, not parallelism
   diff (wrong output + full-worktree rehash). Now routes to tree-vs-tree /
   tree-vs-worktree / tree-vs-index. flutter `diff HEAD~1 HEAD`: >15s → 174ms,
   byte-identical to git. New regression test.
-- **#57 status (135×)** — multi-part: status does *two* full worktree walks (one
-  for entries, one to build the attribute matcher across 3,871 dirs for 4
-  `.gitattributes`, no filters configured) + a full HEAD-tree read (no cache-tree)
-  + per-file hashing where the stat-cache misses. Fold attributes into the single
-  traversal; use the index cache-tree for index-vs-HEAD; confirm the stat-cache
-  shortcut engages on a git-written index.
+- **#57 status (135×) — DONE**: folded `.gitignore` into the single worktree walk
+  (`from_worktree_base` + per-directory fold, mirroring attributes); skip the HEAD
+  tree read when a valid cache-tree root matches `HEAD^{tree}`; derive normal-mode
+  untracked directory rollup from the worktree map (no third filesystem walk).
 - **#58 log/rev-list/merge-base (7–27×) — unifying root cause found by profiling.**
   The commit-graph loads fine (44,499 entries on flutter; `graph_to_map` works) —
   but the *CLI commands bypass it*: each has a naive object-reading walk
@@ -155,9 +153,10 @@ walking commands are far behind, and the gaps are **algorithmic, not parallelism
     Byte-identical to sley's slow path and to git (current graph). `rev-list
     --count` 6.5×→**1.4×** of git with a complete graph (flutter's stale graph
     bounds it to 3.7× — git would refresh it).
-  - **log + `-n` early-stop — remaining** (#60, #61): `log --format=%H` still uses
-    the object-reading walk (27×); and `-n N` still walks all then truncates
-    (`rev-list -n5000` 31.9×→18.6× — needs a date priority-queue early-stop).
+  - **log + `-n` early-stop — DONE** (#60, #61): `log --format=%H` uses
+    `walk_commit_metadata` (commit-graph, no object reads); `-n N` uses
+    `walk_commit_metadata_date_ordered_limited` (date-ordered heap early-stop) in
+    both `rev-list` and `log` fast paths.
   - Note: a pre-existing same-second-timestamp tie-break differs from git in
     `rev-list --all` ordering (sley's slow and fast paths agree; orthogonal).
 - **#59 abbrev length** — git auto-grows short-OID width on huge repos; sley
@@ -187,13 +186,13 @@ safety issues; all fixed, full suite green (1630):
 - **pack idx validation** (MED): v2 parse now checks oids are strictly ascending
   and within their fanout bucket (lookup binary-searches them).
 
-Still open from the review: rev-list exclude/first-parent walks not yet on the
-graph primitive (folds into #60/#61); header-only loose read still slurps the
-whole compressed object (LOW).
+Still open from the review: rev-list *exclude* walks still use `walk_commits`
+(object reads); header-only loose read still slurps the whole compressed object
+(LOW).
 
 ## 🔄 In progress
 
-_(#57 status + #58 log/-n walk — the remaining parity refactors.)_
+_(none — profile #50 parallelism next.)_
 
 ---
 
