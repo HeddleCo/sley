@@ -14,16 +14,23 @@
 
 use std::path::Path;
 
-use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{
+    Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
+};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2FetchShallowInfo, RefAdvertisement, RefAdvertisementSet,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest, parse_upload_pack_features, read_upload_pack_raw_packfile_response,
-    read_upload_pack_shallow_info_and_raw_packfile_response, smart_http_advertisement_content_type,
-    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchShallowInfo,
+    ProtocolV2LsRefsRequest,
+    RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
+    encode_protocol_v2_command_options, parse_upload_pack_features,
+    protocol_v2_object_format, read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
+    read_upload_pack_raw_packfile_response, read_upload_pack_shallow_info_and_raw_packfile_response,
+    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
+    smart_http_rpc_result_content_type, validate_protocol_v2_ls_refs_command_request,
+    write_protocol_v2_command_request, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_transport::{
     HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
@@ -132,8 +139,9 @@ pub fn http_validate_content_type(response: &HttpResponse, expected: &str) -> Re
     }
 }
 
-/// Parse a smart-HTTP info/refs body into a ref advertisement set, rejecting the
-/// (currently unsupported) protocol v2 advertisement form.
+/// Parse a smart-HTTP info/refs body into a ref advertisement set for protocol
+/// v0/v1. Protocol v2 discovery responses require a follow-up `ls-refs` RPC; use
+/// [`http_service_advertisements`] instead.
 pub fn http_advertised_refs(
     format: ObjectFormat,
     mut response: HttpResponse,
@@ -142,9 +150,81 @@ pub fn http_advertised_refs(
     match discovery.payload {
         ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
         ServiceDiscoveryPayload::ProtocolV2(_) => Err(GitError::Unsupported(
-            "protocol v2 advertisements over HTTP are not supported yet".into(),
+            "protocol v2 advertisements over HTTP require an ls-refs RPC; use http_service_advertisements".into(),
         )),
     }
+}
+
+fn protocol_v2_ls_refs_command_request(
+    format: ObjectFormat,
+    handshake: &TransportHandshake,
+) -> Result<ProtocolV2CommandRequest> {
+    let ls_refs = ProtocolV2LsRefsRequest {
+        peel: true,
+        symrefs: true,
+        unborn: false,
+        ref_prefixes: vec![
+            "HEAD".into(),
+            "refs/heads/".into(),
+            "refs/tags/".into(),
+        ],
+    };
+    let mut command = ls_refs.to_command_request()?;
+    let mut options = ProtocolV2CommandOptions::default();
+    if handshake
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "agent")
+    {
+        options.agent = Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}"));
+    }
+    if handshake
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "object-format")
+    {
+        let advertised_format = protocol_v2_object_format(&handshake.capabilities)?;
+        if advertised_format != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "remote repository uses {}, local repository uses {}",
+                advertised_format.name(),
+                format.name()
+            )));
+        }
+        options.object_format = Some(format);
+    }
+    command.capabilities = encode_protocol_v2_command_options(&options)?;
+    validate_protocol_v2_ls_refs_command_request(handshake, &command)?;
+    Ok(command)
+}
+
+fn http_protocol_v2_ls_refs_advertisements(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    service: GitService,
+    handshake: TransportHandshake,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<RefAdvertisementSet> {
+    let command = protocol_v2_ls_refs_command_request(format, &handshake)?;
+    let url = http_smart_rpc_url(remote, service)?;
+    let mut body = Vec::new();
+    write_protocol_v2_command_request(&mut body, &command)?;
+    let content_type = smart_http_rpc_request_content_type(service)?;
+    let mut response = http_send_with_auth(remote, credentials, |auth| {
+        client.post(
+            &url,
+            &content_type,
+            &http_authorization_headers(auth),
+            &body,
+        )
+    })?;
+    http_check_status(&response, &url)?;
+    http_validate_content_type(
+        &response,
+        &smart_http_rpc_result_content_type(service)?,
+    )?;
+    read_protocol_v2_ls_refs_response_as_ref_advertisement_set(format, &mut response.body)
 }
 
 /// Fetch and parse the ref advertisements for `service` from the smart-HTTP
@@ -157,12 +237,23 @@ pub fn http_service_advertisements(
     credentials: &mut dyn CredentialProvider,
 ) -> Result<RefAdvertisementSet> {
     let url = http_smart_info_refs_url(remote, service)?;
-    let response = http_send_with_auth(remote, credentials, |auth| {
+    let mut response = http_send_with_auth(remote, credentials, |auth| {
         client.get(&url, &http_authorization_headers(auth))
     })?;
     http_check_status(&response, &url)?;
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
-    http_advertised_refs(format, response)
+    let discovery = read_service_discovery_response(format, &mut response.body)?;
+    match discovery.payload {
+        ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
+        ServiceDiscoveryPayload::ProtocolV2(handshake) => http_protocol_v2_ls_refs_advertisements(
+            client,
+            remote,
+            format,
+            service,
+            handshake,
+            credentials,
+        ),
+    }
 }
 
 /// The upload-pack ref advertisements and parsed features for `remote`.
@@ -355,5 +446,188 @@ fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
         }]
     } else {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sley_protocol::{
+        ProtocolVersion, ProtocolV2LsRefsRecord, RefAdvertisement, write_protocol_v2_ls_refs_response,
+    };
+
+    fn sample_v2_handshake() -> TransportHandshake {
+        TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![
+                Capability {
+                    name: "ls-refs".into(),
+                    value: Some("peel symrefs".into()),
+                },
+                Capability {
+                    name: "agent".into(),
+                    value: Some("git/2.54.0".into()),
+                },
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha1".into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn protocol_v2_ls_refs_command_request_includes_agent_and_object_format() {
+        let handshake = sample_v2_handshake();
+        let command =
+            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+                .expect("test operation should succeed");
+        assert_eq!(command.command, "ls-refs");
+        assert_eq!(
+            command.capabilities,
+            vec![
+                Capability {
+                    name: "agent".into(),
+                    value: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
+                },
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha1".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            ProtocolV2LsRefsRequest::from_command_request(&command)
+                .expect("test operation should succeed"),
+            ProtocolV2LsRefsRequest {
+                peel: true,
+                symrefs: true,
+                unborn: false,
+                ref_prefixes: vec![
+                    "HEAD".into(),
+                    "refs/heads/".into(),
+                    "refs/tags/".into(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_v2_ls_refs_command_request_omits_object_format_when_unadvertised() {
+        let handshake = TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![
+                Capability {
+                    name: "ls-refs".into(),
+                    value: None,
+                },
+                Capability {
+                    name: "agent".into(),
+                    value: Some("git/2.54.0".into()),
+                },
+            ],
+        };
+        let command =
+            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+                .expect("test operation should succeed");
+        assert_eq!(
+            command.capabilities,
+            vec![Capability {
+                name: "agent".into(),
+                value: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
+            }]
+        );
+    }
+
+    #[test]
+    fn protocol_v2_ls_refs_round_trip_bridges_into_ref_advertisement_set() {
+        let handshake = sample_v2_handshake();
+        let command =
+            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+                .expect("test operation should succeed");
+        let head = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+        let tag = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("test operation should succeed");
+        let tag_peeled = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "3333333333333333333333333333333333333333",
+        )
+        .expect("test operation should succeed");
+        let records = vec![
+            ProtocolV2LsRefsRecord::Ref(sley_protocol::ProtocolV2LsRefsRef {
+                oid: head.clone(),
+                name: "HEAD".into(),
+                peeled: None,
+                symref_target: Some("refs/heads/main".into()),
+                attributes: Vec::new(),
+            }),
+            ProtocolV2LsRefsRecord::Ref(sley_protocol::ProtocolV2LsRefsRef {
+                oid: head.clone(),
+                name: "refs/heads/main".into(),
+                peeled: None,
+                symref_target: None,
+                attributes: Vec::new(),
+            }),
+            ProtocolV2LsRefsRecord::Ref(sley_protocol::ProtocolV2LsRefsRef {
+                oid: tag.clone(),
+                name: "refs/tags/v1".into(),
+                peeled: Some(tag_peeled.clone()),
+                symref_target: None,
+                attributes: Vec::new(),
+            }),
+        ];
+
+        let mut request_body = Vec::new();
+        write_protocol_v2_command_request(&mut request_body, &command)
+            .expect("test operation should succeed");
+        let mut response_body = Vec::new();
+        write_protocol_v2_ls_refs_response(&mut response_body, &records)
+            .expect("test operation should succeed");
+
+        let set = read_protocol_v2_ls_refs_response_as_ref_advertisement_set(
+            ObjectFormat::Sha1,
+            &mut response_body.as_slice(),
+        )
+        .expect("test operation should succeed");
+        assert_eq!(
+            set,
+            RefAdvertisementSet {
+                protocol: ProtocolVersion::V2,
+                refs: vec![
+                    RefAdvertisement {
+                        oid: head.clone(),
+                        name: "HEAD".into(),
+                        capabilities: vec![Capability {
+                            name: "symref".into(),
+                            value: Some("HEAD:refs/heads/main".into()),
+                        }],
+                    },
+                    RefAdvertisement {
+                        oid: head,
+                        name: "refs/heads/main".into(),
+                        capabilities: Vec::new(),
+                    },
+                    RefAdvertisement {
+                        oid: tag,
+                        name: "refs/tags/v1".into(),
+                        capabilities: Vec::new(),
+                    },
+                    RefAdvertisement {
+                        oid: tag_peeled,
+                        name: "refs/tags/v1^{}".into(),
+                        capabilities: Vec::new(),
+                    },
+                ],
+                shallow: Vec::new(),
+            }
+        );
+        assert!(!request_body.is_empty());
     }
 }
