@@ -1,0 +1,17 @@
+[package]
+name = "sley-notes"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sley-config = { path = "../sley-config" }
+sley-core = { path = "../sley-core" }
+sley-object = { path = "../sley-object" }
+sley-odb = { path = "../sley-odb" }
+sley-refs = { path = "../sley-refs" }
+sley-sequencer = { path = "../sley-sequencer" }
+
+[lints]
+workspace = true

@@ -3,6 +3,7 @@ members = [
     "crates/sley-core",
     "crates/sley-object",
     "crates/sley-config",
+    "crates/sley-notes",
     "crates/sley-index",
     "crates/sley-formats",
     "crates/sley-protocol",

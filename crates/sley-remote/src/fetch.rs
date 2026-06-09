@@ -12,20 +12,20 @@
 //! structured result (applied updates, pruned refs, the remote `HEAD` symref)
 //! comes back in [`FetchOutcome`] for the caller to format.
 //!
-//! SSH and bundle fetch still live in the CLI; only HTTP and local move here. The
-//! ref-map / `FETCH_HEAD` / prune helpers are shared (the CLI's SSH and bundle
-//! paths call the same `pub` functions) so there is a single implementation.
+//! Bundle fetch lives in [`crate::bundle`]; SSH uses the dispatch below. The ref-map
+//! / `FETCH_HEAD` / prune helpers are shared so there is a single implementation.
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, collect_reachable_object_ids};
 use sley_protocol::{
-    FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
+    FetchHeadRecord, FetchRefUpdate, ProtocolVersion, RefAdvertisement, RefSpec, encode_fetch_head,
     fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refspec_map_source,
 };
 use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
@@ -185,12 +185,21 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     let advertisements = match request.source {
         FetchSource::Http(remote) => {
             let client = crate::http::new_http_client();
-            let (advertisements, features) = crate::http::http_upload_pack_advertisements(
+            let discovered = crate::http::http_service_advertisements(
                 &client,
                 remote,
                 request.format,
+                sley_protocol::GitService::UploadPack,
                 services.credentials,
             )?;
+            let advertisements = discovered.set.refs;
+            let features = advertisements
+                .first()
+                .map(|advertisement| {
+                    sley_protocol::parse_upload_pack_features(&advertisement.capabilities)
+                })
+                .transpose()?
+                .unwrap_or_default();
             outcome.head_symref = head_symref_from_features(&features.symrefs);
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
@@ -207,19 +216,34 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // back into `$GIT_DIR/shallow`. A `None` depth keeps the full-fetch path.
             let existing_shallow =
                 shallow_boundary_for_request(request.git_dir, request.format, options.depth)?;
-            let shallow_info = crate::http::install_fetch_pack_via_http_upload_pack(
-                crate::http::HttpFetchPackRequest {
-                    client: &client,
-                    git_dir: request.git_dir,
-                    format: request.format,
-                    remote,
-                    wants,
-                    shallow: existing_shallow,
-                    deepen: options.depth,
-                    promisor: promisor_remote,
-                },
-                services.credentials,
-            )?;
+            let pack_request = crate::http::HttpFetchPackRequest {
+                client: &client,
+                git_dir: request.git_dir,
+                format: request.format,
+                remote,
+                wants,
+                shallow: existing_shallow,
+                deepen: options.depth,
+                promisor: promisor_remote,
+            };
+            let shallow_info = if discovered.set.protocol == ProtocolVersion::V2 {
+                let handshake = discovered.handshake.as_ref().ok_or_else(|| {
+                    GitError::InvalidFormat(
+                        "protocol v2 HTTP fetch requires a v2 handshake from service discovery"
+                            .into(),
+                    )
+                })?;
+                crate::http::install_fetch_pack_via_http_protocol_v2_fetch(
+                    pack_request,
+                    handshake,
+                    services.credentials,
+                )?
+            } else {
+                crate::http::install_fetch_pack_via_http_upload_pack(
+                    pack_request,
+                    services.credentials,
+                )?
+            };
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -793,70 +817,4 @@ fn remote_tracking_branch_names(refs: &[Ref], name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Whether `name` is a configured remote.
-fn remote_exists(config: &GitConfig, name: &str) -> bool {
-    config
-        .sections
-        .iter()
-        .any(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
-}
 
-/// All `remote.<name>.<key>` values, in config order.
-fn remote_config_values(config: &GitConfig, name: &str, key: &str) -> Vec<String> {
-    config
-        .sections
-        .iter()
-        .filter(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
-        .flat_map(|section| {
-            section
-                .entries
-                .iter()
-                .filter(move |entry| entry.key.eq_ignore_ascii_case(key))
-                .filter_map(|entry| entry.value.clone())
-        })
-        .collect()
-}
-
-/// Rewrite `url` per the longest matching `url.<base>.insteadOf` (or
-/// `pushInsteadOf` when `push`) prefix, mirroring git's `insteadOf` resolution.
-fn rewrite_url_with_config(config: &GitConfig, url: &str, push: bool) -> String {
-    let mut best: Option<(&str, &str, u8)> = None;
-    for section in &config.sections {
-        if section.name != "url" {
-            continue;
-        }
-        let Some(base) = section.subsection.as_deref() else {
-            continue;
-        };
-        for entry in &section.entries {
-            let priority = if push && entry.key.eq_ignore_ascii_case("pushInsteadOf") {
-                2
-            } else if entry.key.eq_ignore_ascii_case("insteadOf") {
-                1
-            } else {
-                continue;
-            };
-            let Some(prefix) = entry.value.as_deref() else {
-                continue;
-            };
-            if !url.starts_with(prefix) {
-                continue;
-            }
-            let replace = match best {
-                None => true,
-                Some((_, best_prefix, best_priority)) => {
-                    priority > best_priority
-                        || (priority == best_priority && prefix.len() > best_prefix.len())
-                }
-            };
-            if replace {
-                best = Some((base, prefix, priority));
-            }
-        }
-    }
-    if let Some((base, prefix, _)) = best {
-        format!("{base}{}", &url[prefix.len()..])
-    } else {
-        url.to_string()
-    }
-}

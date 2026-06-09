@@ -1,20 +1,11 @@
 //! `git notes` (add/append/show/list/remove/copy/get-ref) over a notes tree.
-//!
-//! Notes attach a free-form blob to an arbitrary object. The mapping
-//! object-oid -> note-blob is stored as a tree reachable from a notes ref
-//! (`refs/notes/commits` by default). Each entry's path is the hex of the
-//! annotated object; large note trees fan that path out into nested
-//! two-hex-digit subtrees. We read notes from any fanout depth and, like a
-//! fresh small repository, write a flat (un-fanned) tree which git reads back
-//! identically.
 
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
-use sley_object::TreeEntries;
-
-/// Default notes ref when none is selected via `--ref`, `GIT_NOTES_REF`, or
-/// `core.notesRef`.
-const DEFAULT_NOTES_REF: &str = "refs/notes/commits";
+use sley_notes::{
+    NotesCommitIdentity, NotesRef, list_notes, read_note, remove_note, resolve_notes_ref, upsert_note,
+    write_notes,
+};
 
 pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
     // Parse the global `--ref <ref>` / `--no-ref` option, which may appear
@@ -61,7 +52,7 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
 
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let notes_ref = resolve_notes_ref(&git_dir, ref_override.as_deref())?;
+    let notes_ref = resolve_notes_ref(&git_dir, ref_override.as_deref())?.as_str().to_string();
 
     match subcommand {
         "list" => notes_list(&git_dir, format, &notes_ref, sub_args),
@@ -75,233 +66,15 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
     }
 }
 
-/// Resolve the notes ref using git's precedence: `--ref` flag, then
-/// `GIT_NOTES_REF`, then `core.notesRef`, then the built-in default. A name
-/// without a `refs/notes/` prefix is qualified into the `refs/notes/`
-/// namespace (matching git's `expand_notes_ref`).
-fn resolve_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> Result<String> {
-    if let Some(value) = ref_override {
-        return Ok(expand_notes_ref(value));
-    }
-    if let Ok(value) = env::var("GIT_NOTES_REF")
-        && !value.is_empty()
-    {
-        return Ok(expand_notes_ref(&value));
-    }
-    if let Ok(config) = read_repo_config(git_dir)
-        && let Some(value) = config.get("core", None, "notesRef")
-        && !value.is_empty()
-    {
-        return Ok(expand_notes_ref(value));
-    }
-    Ok(DEFAULT_NOTES_REF.to_string())
+fn notes_ref_handle(notes_ref: &str) -> NotesRef {
+    NotesRef::expand(notes_ref)
 }
 
-/// Qualify a notes ref name. Only an already-`refs/notes/`-prefixed name is
-/// used verbatim; every other spelling is placed under `refs/notes/` (so
-/// `commits` -> `refs/notes/commits`, `refs/heads/x` -> `refs/notes/refs/heads/x`).
-fn expand_notes_ref(name: &str) -> String {
-    if name.starts_with("refs/notes/") {
-        name.to_string()
-    } else {
-        format!("refs/notes/{name}")
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Notes tree model
-// ---------------------------------------------------------------------------
-
-/// A single note: which object it annotates and the note blob's oid.
-struct NoteEntry {
-    annotated: ObjectId,
-    blob: ObjectId,
-}
-
-/// Read every note reachable from the notes ref, traversing any fanout layout.
-/// Returns entries sorted by annotated-object hex (git's on-tree order). An
-/// absent notes ref yields an empty set.
-fn read_all_notes(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-    notes_ref: &str,
-) -> Result<Vec<NoteEntry>> {
-    let Some(tree_oid) = notes_tree_oid(git_dir, format, store, notes_ref)? else {
-        return Ok(Vec::new());
-    };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let mut out = Vec::new();
-    collect_notes(&db, format, &tree_oid, "", &mut out)?;
-    out.sort_by_key(|entry| entry.annotated.to_hex());
-    Ok(out)
-}
-
-/// Recursively walk a notes (sub)tree. `prefix` is the hex accumulated from
-/// enclosing fanout directories. Leaf blob entries whose assembled path is a
-/// valid object id of the repository's hash become notes; anything else
-/// (non-hex names, stray files) is ignored, matching git's tolerant reader.
-fn collect_notes(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    prefix: &str,
-    out: &mut Vec<NoteEntry>,
-) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Ok(());
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let Ok(name) = std::str::from_utf8(entry.name) else {
-            continue;
-        };
-        if !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            continue;
-        }
-        if tree_entry_object_type(entry.mode) == ObjectType::Tree {
-            let mut nested = prefix.to_string();
-            nested.push_str(name);
-            collect_notes(db, format, &entry.oid, &nested, out)?;
-        } else {
-            let mut hex = prefix.to_string();
-            hex.push_str(name);
-            if hex.len() != format.hex_len() {
-                continue;
-            }
-            let Ok(annotated) = ObjectId::from_hex(format, &hex) else {
-                continue;
-            };
-            out.push(NoteEntry {
-                annotated,
-                blob: entry.oid,
-            });
-        }
-    }
-    Ok(())
-}
-
-/// The note blob oid attached to `target`, if any, across any fanout depth.
-fn read_note(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-    notes_ref: &str,
-    target: &ObjectId,
-) -> Result<Option<ObjectId>> {
-    let target_hex = target.to_hex();
-    Ok(read_all_notes(git_dir, format, store, notes_ref)?
-        .into_iter()
-        .find(|entry| entry.annotated.to_hex() == target_hex)
-        .map(|entry| entry.blob))
-}
-
-/// Peel the notes ref to its root tree oid. Returns None when the ref is
-/// absent (no notes have ever been written to it).
-fn notes_tree_oid(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-    notes_ref: &str,
-) -> Result<Option<ObjectId>> {
-    let Some(target) = store.read_ref(notes_ref)? else {
-        return Ok(None);
-    };
-    let commit_oid = match target {
-        RefTarget::Direct(oid) => oid,
-        RefTarget::Symbolic(name) => match store.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => oid,
-            _ => return Ok(None),
-        },
-    };
-    let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let object = db.read_object(&commit_oid)?;
-    match object.object_type {
-        ObjectType::Commit => Ok(Some(Commit::parse_ref(format, &object.body)?.tree)),
-        ObjectType::Tree => Ok(Some(commit_oid)),
-        _ => Ok(None),
-    }
-}
-
-/// Rewrite the notes tree to exactly `notes` (a flat tree keyed by full hex)
-/// and advance the notes ref to a new commit recording it. The new commit's
-/// parent is the prior notes commit (if any) and both its message and reflog
-/// entry use the supplied subject string. An empty `notes` set still records a
-/// commit pointing at the empty tree, matching git (which keeps the ref live
-/// rather than deleting it when the last note is removed).
-fn write_notes(
-    git_dir: &Path,
-    format: ObjectFormat,
-    store: &FileRefStore,
-    notes_ref: &str,
-    notes: &[NoteEntry],
-    message: &str,
-) -> Result<()> {
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-
-    let parent = match store.read_ref(notes_ref)? {
-        Some(RefTarget::Direct(oid)) => Some(oid),
-        _ => None,
-    };
-
-    let mut entries: Vec<TreeEntry> = notes
-        .iter()
-        .map(|note| TreeEntry {
-            mode: 0o100644,
-            name: note.annotated.to_hex().into_bytes(),
-            oid: note.blob.clone(),
-        })
-        .collect();
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    let tree = Tree { entries };
-    let tree_oid = db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))?;
-
-    let parents = parent.iter().cloned().collect();
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let commit_oid = sley_sequencer::create_commit(
-        &mut db,
-        sley_sequencer::CommitCreate {
-            tree: tree_oid,
-            parents,
-            author,
-            committer: committer.clone(),
-            message: format!("{message}\n").into_bytes(),
-        },
-    )?;
-
-    let old_oid = parent.clone().unwrap_or(zero_oid(format)?);
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: notes_ref.to_string(),
-        expected: parent.map(RefTarget::Direct),
-        new: RefTarget::Direct(commit_oid.clone()),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: commit_oid,
-            committer,
-            message: message.as_bytes().to_vec(),
-        }),
-    });
-    tx.commit()?;
-    Ok(())
-}
-
-/// Replace (or insert) the note for `target` with blob `blob` inside `notes`.
-fn upsert_note(notes: &mut Vec<NoteEntry>, target: &ObjectId, blob: ObjectId) {
-    let target_hex = target.to_hex();
-    if let Some(existing) = notes
-        .iter_mut()
-        .find(|entry| entry.annotated.to_hex() == target_hex)
-    {
-        existing.blob = blob;
-    } else {
-        notes.push(NoteEntry {
-            annotated: target.clone(),
-            blob,
-        });
-    }
+fn notes_commit_identity() -> Result<NotesCommitIdentity> {
+    Ok(NotesCommitIdentity {
+        author: commit_identity_from_env("AUTHOR")?,
+        committer: commit_identity_from_env("COMMITTER")?,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +288,7 @@ fn notes_list(
     if let Some(spec) = object {
         // `list <object>` prints just the note blob oid, or errors if absent.
         let target = resolve_note_object(git_dir, format, &spec)?;
-        match read_note(git_dir, format, &store, notes_ref, &target)? {
+        match read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)? {
             Some(blob) => {
                 println!("{}", blob.to_hex());
                 Ok(())
@@ -527,7 +300,7 @@ fn notes_list(
         }
     } else {
         // `list` (all) prints "<note-blob> <annotated-object>" per note.
-        for note in read_all_notes(git_dir, format, &store, notes_ref)? {
+        for note in list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))? {
             println!("{} {}", note.blob.to_hex(), note.annotated.to_hex());
         }
         Ok(())
@@ -544,7 +317,8 @@ fn notes_show(
         parse_optional_single_object(args, NotesUsage::Show)?.unwrap_or_else(|| "HEAD".to_string());
     let target = resolve_note_object(git_dir, format, &spec)?;
     let store = FileRefStore::new(git_dir, format);
-    let Some(blob) = read_note(git_dir, format, &store, notes_ref, &target)? else {
+    let Some(blob) = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?
+    else {
         eprintln!("error: no note found for object {}.", target.to_hex());
         return Err(GitError::Exit(1));
     };
@@ -561,7 +335,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
     let target = resolve_note_object(git_dir, format, &spec)?;
     let store = FileRefStore::new(git_dir, format);
 
-    let existing = read_note(git_dir, format, &store, notes_ref, &target)?;
+    let existing = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?;
     if existing.is_some() && !options.force {
         eprintln!(
             "error: Cannot add notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
@@ -588,30 +362,31 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
         // no-op when there was nothing to remove.
         if existing.is_some() {
             eprintln!("Removing note for object {}", target.to_hex());
-            let mut notes = read_all_notes(git_dir, format, &store, notes_ref)?;
-            let target_hex = target.to_hex();
-            notes.retain(|entry| entry.annotated.to_hex() != target_hex);
+            let mut notes = list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))?;
+            remove_note(&mut notes, &target);
             write_notes(
                 git_dir,
                 format,
                 &store,
-                notes_ref,
+                &notes_ref_handle(notes_ref),
                 &notes,
                 "Notes removed by 'git notes add'",
+                &notes_commit_identity()?,
             )?;
         }
         return Ok(());
     }
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
-    let mut notes = read_all_notes(git_dir, format, &store, notes_ref)?;
+    let mut notes = list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))?;
     upsert_note(&mut notes, &target, blob);
     write_notes(
         git_dir,
         format,
         &store,
-        notes_ref,
+        &notes_ref_handle(notes_ref),
         &notes,
         "Notes added by 'git notes add'",
+        &notes_commit_identity()?,
     )
 }
 
@@ -633,7 +408,7 @@ fn notes_append(
     };
 
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let existing = read_note(git_dir, format, &store, notes_ref, &target)?;
+    let existing = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?;
     let mut body = Vec::new();
     if let Some(blob) = &existing {
         let object = db.read_object(blob)?;
@@ -655,15 +430,16 @@ fn notes_append(
 
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body))?;
-    let mut notes = read_all_notes(git_dir, format, &store, notes_ref)?;
+    let mut notes = list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))?;
     upsert_note(&mut notes, &target, blob);
     write_notes(
         git_dir,
         format,
         &store,
-        notes_ref,
+        &notes_ref_handle(notes_ref),
         &notes,
         "Notes added by 'git notes append'",
+        &notes_commit_identity()?,
     )
 }
 
@@ -706,7 +482,7 @@ fn notes_remove(
     }
 
     let store = FileRefStore::new(git_dir, format);
-    let mut notes = read_all_notes(git_dir, format, &store, notes_ref)?;
+    let mut notes = list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))?;
     let mut any_missing = false;
     let mut removed_any = false;
     for spec in &specs {
@@ -718,7 +494,7 @@ fn notes_remove(
         if had_note {
             // git echoes the user's spelling of the object, not the full oid.
             eprintln!("Removing note for object {spec}");
-            notes.retain(|entry| entry.annotated.to_hex() != target_hex);
+            remove_note(&mut notes, &target);
             removed_any = true;
         } else {
             eprintln!("Object {spec} has no note");
@@ -732,9 +508,10 @@ fn notes_remove(
             git_dir,
             format,
             &store,
-            notes_ref,
+            &notes_ref_handle(notes_ref),
             &notes,
             "Notes removed by 'git notes remove'",
+            &notes_commit_identity()?,
         )?;
     }
     if any_missing {
@@ -787,7 +564,7 @@ fn notes_copy(
 
     // git checks the destination's existing-note guard before reading the
     // source note, so mirror that ordering for matching error precedence.
-    let existing = read_note(git_dir, format, &store, notes_ref, &to)?;
+    let existing = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &to)?;
     if existing.is_some() && !force {
         eprintln!(
             "error: Cannot copy notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
@@ -795,7 +572,9 @@ fn notes_copy(
         );
         return Err(GitError::Exit(1));
     }
-    let Some(source_blob) = read_note(git_dir, format, &store, notes_ref, &from)? else {
+    let Some(source_blob) =
+        read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &from)?
+    else {
         eprintln!(
             "error: missing notes on source object {}. Cannot copy.",
             from.to_hex()
@@ -806,15 +585,16 @@ fn notes_copy(
         eprintln!("Overwriting existing notes for object {}", to.to_hex());
     }
 
-    let mut notes = read_all_notes(git_dir, format, &store, notes_ref)?;
+    let mut notes = list_notes(git_dir, format, &store, &notes_ref_handle(notes_ref))?;
     upsert_note(&mut notes, &to, source_blob);
     write_notes(
         git_dir,
         format,
         &store,
-        notes_ref,
+        &notes_ref_handle(notes_ref),
         &notes,
         "Notes added by 'git notes copy'",
+        &notes_commit_identity()?,
     )
 }
 

@@ -17,20 +17,25 @@ use std::path::Path;
 use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
-use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
+use sley_fetch::{
+    install_protocol_v2_fetch_response_packfile, install_protocol_v2_fetch_response_promisor_packfile,
+    install_upload_pack_raw_promisor_response, install_upload_pack_raw_response,
+};
 use sley_odb::FileObjectDatabase;
 use sley_protocol::{
-    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchShallowInfo,
-    ProtocolV2LsRefsRequest,
+    GitService, ProtocolV2CommandOptions, ProtocolV2CommandRequest, ProtocolV2FetchRequest,
+    ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRequest,
     RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
-    encode_protocol_v2_command_options, parse_upload_pack_features,
-    protocol_v2_object_format, read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
+    encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
+    parse_upload_pack_features, protocol_v2_object_format,
+    read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
+    read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
     read_upload_pack_raw_packfile_response, read_upload_pack_shallow_info_and_raw_packfile_response,
     smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, validate_protocol_v2_ls_refs_command_request,
-    write_protocol_v2_command_request, write_upload_pack_negotiation_request,
-    write_upload_pack_request,
+    smart_http_rpc_result_content_type, validate_protocol_v2_fetch_command_request,
+    validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
+    write_upload_pack_negotiation_request, write_upload_pack_request,
 };
 use sley_transport::{
     HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
@@ -139,6 +144,14 @@ pub fn http_validate_content_type(response: &HttpResponse, expected: &str) -> Re
     }
 }
 
+/// Result of smart-HTTP service discovery: parsed ref advertisements plus the
+/// protocol v2 handshake when the server negotiated v2 on the info/refs exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpServiceAdvertisements {
+    pub set: RefAdvertisementSet,
+    pub handshake: Option<TransportHandshake>,
+}
+
 /// Parse a smart-HTTP info/refs body into a ref advertisement set for protocol
 /// v0/v1. Protocol v2 discovery responses require a follow-up `ls-refs` RPC; use
 /// [`http_service_advertisements`] instead.
@@ -198,6 +211,73 @@ fn protocol_v2_ls_refs_command_request(
     Ok(command)
 }
 
+fn protocol_v2_fetch_command_request(
+    format: ObjectFormat,
+    handshake: &TransportHandshake,
+    fetch: &ProtocolV2FetchRequest,
+) -> Result<ProtocolV2CommandRequest> {
+    let mut command = fetch.to_command_request()?;
+    let mut options = ProtocolV2CommandOptions::default();
+    if handshake
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "agent")
+    {
+        options.agent = Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}"));
+    }
+    if handshake
+        .capabilities
+        .iter()
+        .any(|capability| capability.name == "object-format")
+    {
+        let advertised_format = protocol_v2_object_format(&handshake.capabilities)?;
+        if advertised_format != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "remote repository uses {}, local repository uses {}",
+                advertised_format.name(),
+                format.name()
+            )));
+        }
+        options.object_format = Some(format);
+    }
+    command.capabilities = encode_protocol_v2_command_options(&options)?;
+    validate_protocol_v2_fetch_command_request(handshake, format, &command)?;
+    Ok(command)
+}
+
+fn protocol_v2_fetch_request_from_upload_pack_semantics(
+    wants: Vec<ObjectId>,
+    haves: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
+    handshake: &TransportHandshake,
+) -> Result<ProtocolV2FetchRequest> {
+    let sideband_all = parse_protocol_v2_fetch_features(&handshake.capabilities)?
+        .map(|features| features.sideband_all)
+        .unwrap_or(false);
+    Ok(ProtocolV2FetchRequest {
+        wants,
+        haves,
+        shallow,
+        deepen,
+        done: true,
+        sideband_all,
+        ..ProtocolV2FetchRequest::default()
+    })
+}
+
+fn shallow_info_from_protocol_v2_fetch_sections(
+    sections: &[ProtocolV2FetchResponseSection],
+) -> Vec<ProtocolV2FetchShallowInfo> {
+    let mut shallow_info = Vec::new();
+    for section in sections {
+        if let ProtocolV2FetchResponseSection::ShallowInfo(entries) = section {
+            shallow_info.extend(entries.clone());
+        }
+    }
+    shallow_info
+}
+
 fn http_protocol_v2_ls_refs_advertisements(
     client: &UreqHttpClient,
     remote: &RemoteUrl,
@@ -235,7 +315,7 @@ pub fn http_service_advertisements(
     format: ObjectFormat,
     service: GitService,
     credentials: &mut dyn CredentialProvider,
-) -> Result<RefAdvertisementSet> {
+) -> Result<HttpServiceAdvertisements> {
     let url = http_smart_info_refs_url(remote, service)?;
     let mut response = http_send_with_auth(remote, credentials, |auth| {
         client.get(&url, &http_authorization_headers(auth))
@@ -244,15 +324,24 @@ pub fn http_service_advertisements(
     http_validate_content_type(&response, &smart_http_advertisement_content_type(service)?)?;
     let discovery = read_service_discovery_response(format, &mut response.body)?;
     match discovery.payload {
-        ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(set),
-        ServiceDiscoveryPayload::ProtocolV2(handshake) => http_protocol_v2_ls_refs_advertisements(
-            client,
-            remote,
-            format,
-            service,
-            handshake,
-            credentials,
-        ),
+        ServiceDiscoveryPayload::AdvertisedRefs(set) => Ok(HttpServiceAdvertisements {
+            set,
+            handshake: None,
+        }),
+        ServiceDiscoveryPayload::ProtocolV2(handshake) => {
+            let set = http_protocol_v2_ls_refs_advertisements(
+                client,
+                remote,
+                format,
+                service,
+                handshake.clone(),
+                credentials,
+            )?;
+            Ok(HttpServiceAdvertisements {
+                set,
+                handshake: Some(handshake),
+            })
+        }
     }
 }
 
@@ -263,15 +352,20 @@ pub fn http_upload_pack_advertisements(
     format: ObjectFormat,
     credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<RefAdvertisement>, UploadPackFeatures)> {
-    let set =
+    let discovered =
         http_service_advertisements(client, remote, format, GitService::UploadPack, credentials)?;
-    let features = set
-        .refs
+    let features = upload_pack_features_from_advertisements(&discovered.set.refs)?;
+    Ok((discovered.set.refs, features))
+}
+
+fn upload_pack_features_from_advertisements(
+    advertisements: &[RefAdvertisement],
+) -> Result<UploadPackFeatures> {
+    Ok(advertisements
         .first()
         .map(|advertisement| parse_upload_pack_features(&advertisement.capabilities))
         .transpose()?
-        .unwrap_or_default();
-    Ok((set.refs, features))
+        .unwrap_or_default())
 }
 
 /// Post an upload-pack RPC `request` + `haves` and return the validated HTTP
@@ -344,6 +438,52 @@ pub fn http_upload_pack_shallow_fetch_response(
 )> {
     let mut response = http_upload_pack_post(client, remote, &request, haves, credentials)?;
     read_upload_pack_shallow_info_and_raw_packfile_response(format, &mut response.body)
+}
+
+/// Post a protocol v2 `fetch` RPC with `wants`/`haves`/`shallow`/`deepen` and
+/// read back the sectioned response. Authenticates and validates status + content
+/// type. When the server advertises `sideband-all`, the request and response use
+/// the sideband-all wire form.
+pub fn http_protocol_v2_fetch_response(
+    client: &UreqHttpClient,
+    remote: &RemoteUrl,
+    format: ObjectFormat,
+    handshake: &TransportHandshake,
+    wants: Vec<ObjectId>,
+    haves: Vec<ObjectId>,
+    shallow: Vec<ObjectId>,
+    deepen: Option<u32>,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<Vec<ProtocolV2FetchResponseSection>> {
+    let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+        wants, haves, shallow, deepen, handshake,
+    )?;
+    let command = protocol_v2_fetch_command_request(format, handshake, &fetch)?;
+    let url = http_smart_rpc_url(remote, GitService::UploadPack)?;
+    let mut body = Vec::new();
+    write_protocol_v2_command_request(&mut body, &command)?;
+    let content_type = smart_http_rpc_request_content_type(GitService::UploadPack)?;
+    let mut response = http_send_with_auth(remote, credentials, |auth| {
+        client.post(
+            &url,
+            &content_type,
+            &http_authorization_headers(auth),
+            &body,
+        )
+    })?;
+    http_check_status(&response, &url)?;
+    http_validate_content_type(
+        &response,
+        &smart_http_rpc_result_content_type(GitService::UploadPack)?,
+    )?;
+    if fetch.sideband_all {
+        Ok(
+            read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?
+                .sections,
+        )
+    } else {
+        read_protocol_v2_fetch_response(format, &mut response.body)
+    }
 }
 
 /// Fetch `wants` from an HTTP upload-pack remote into the repository at `git_dir`,
@@ -425,6 +565,39 @@ pub fn install_fetch_pack_via_http_upload_pack(
     Ok(shallow_info)
 }
 
+pub fn install_fetch_pack_via_http_protocol_v2_fetch(
+    request: HttpFetchPackRequest<'_>,
+    handshake: &TransportHandshake,
+    credentials: &mut dyn CredentialProvider,
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
+    if request.wants.is_empty() {
+        return Ok(Vec::new());
+    }
+    let local_db = FileObjectDatabase::from_git_dir(request.git_dir, request.format);
+    if request.deepen.is_none() && all_wants_present(&local_db, &request.wants)? {
+        return Ok(Vec::new());
+    }
+    let haves = crate::local::local_have_oids(request.git_dir, request.format)?;
+    let sections = http_protocol_v2_fetch_response(
+        request.client,
+        request.remote,
+        request.format,
+        handshake,
+        request.wants,
+        haves,
+        request.shallow,
+        request.deepen,
+        credentials,
+    )?;
+    let shallow_info = shallow_info_from_protocol_v2_fetch_sections(&sections);
+    if request.promisor {
+        install_protocol_v2_fetch_response_promisor_packfile(&sections, &local_db)?;
+    } else {
+        install_protocol_v2_fetch_response_packfile(&sections, &local_db)?;
+    }
+    Ok(shallow_info)
+}
+
 fn all_wants_present(db: &FileObjectDatabase, wants: &[ObjectId]) -> Result<bool> {
     for want in wants {
         if !db.contains(want)? {
@@ -453,7 +626,9 @@ fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
 mod tests {
     use super::*;
     use sley_protocol::{
-        ProtocolVersion, ProtocolV2LsRefsRecord, RefAdvertisement, write_protocol_v2_ls_refs_response,
+        ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolVersion,
+        ProtocolV2LsRefsRecord, RefAdvertisement, read_protocol_v2_fetch_response,
+        write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
     };
 
     fn sample_v2_handshake() -> TransportHandshake {
@@ -627,6 +802,137 @@ mod tests {
                 ],
                 shallow: Vec::new(),
             }
+        );
+        assert!(!request_body.is_empty());
+    }
+
+    fn sample_v2_fetch_handshake() -> TransportHandshake {
+        TransportHandshake {
+            protocol: ProtocolVersion::V2,
+            capabilities: vec![
+                Capability {
+                    name: "fetch".into(),
+                    value: Some("shallow sideband-all".into()),
+                },
+                Capability {
+                    name: "agent".into(),
+                    value: Some("git/2.54.0".into()),
+                },
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha1".into()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn protocol_v2_fetch_command_request_includes_agent_object_format_and_deepen() {
+        let handshake = sample_v2_fetch_handshake();
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+        let have = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "2222222222222222222222222222222222222222",
+        )
+        .expect("test operation should succeed");
+        let shallow = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "3333333333333333333333333333333333333333",
+        )
+        .expect("test operation should succeed");
+        let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+            vec![want.clone()],
+            vec![have.clone()],
+            vec![shallow.clone()],
+            Some(3),
+            &handshake,
+        )
+        .expect("test operation should succeed");
+        assert!(fetch.sideband_all);
+        assert!(fetch.done);
+        let command = protocol_v2_fetch_command_request(ObjectFormat::Sha1, &handshake, &fetch)
+            .expect("test operation should succeed");
+        assert_eq!(command.command, "fetch");
+        assert_eq!(
+            command.capabilities,
+            vec![
+                Capability {
+                    name: "agent".into(),
+                    value: Some(format!("git/{UPSTREAM_GIT_COMPAT_VERSION}")),
+                },
+                Capability {
+                    name: "object-format".into(),
+                    value: Some("sha1".into()),
+                },
+            ]
+        );
+        assert_eq!(
+            ProtocolV2FetchRequest::from_command_request(ObjectFormat::Sha1, &command)
+                .expect("test operation should succeed"),
+            ProtocolV2FetchRequest {
+                wants: vec![want],
+                haves: vec![have],
+                shallow: vec![shallow],
+                deepen: Some(3),
+                done: true,
+                sideband_all: true,
+                ..ProtocolV2FetchRequest::default()
+            }
+        );
+    }
+
+    #[test]
+    fn protocol_v2_fetch_round_trip_extracts_shallow_info_and_packfile_sections() {
+        let handshake = sample_v2_fetch_handshake();
+        let want = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        .expect("test operation should succeed");
+        let shallow = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        .expect("test operation should succeed");
+        let fetch = protocol_v2_fetch_request_from_upload_pack_semantics(
+            vec![want],
+            Vec::new(),
+            vec![shallow.clone()],
+            Some(1),
+            &handshake,
+        )
+        .expect("test operation should succeed");
+        let command = protocol_v2_fetch_command_request(ObjectFormat::Sha1, &handshake, &fetch)
+            .expect("test operation should succeed");
+        let mut request_body = Vec::new();
+        write_protocol_v2_command_request(&mut request_body, &command)
+            .expect("test operation should succeed");
+
+        let sections = vec![
+            ProtocolV2FetchResponseSection::ShallowInfo(vec![
+                ProtocolV2FetchShallowInfo::Shallow(shallow),
+            ]),
+            ProtocolV2FetchResponseSection::Packfile(vec![b"PACK-test".to_vec()]),
+        ];
+        let mut response_body = Vec::new();
+        write_protocol_v2_fetch_response(&mut response_body, &sections)
+            .expect("test operation should succeed");
+        let parsed = read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut response_body.as_slice())
+            .expect("test operation should succeed");
+        assert_eq!(parsed, sections);
+        assert_eq!(
+            shallow_info_from_protocol_v2_fetch_sections(&parsed),
+            vec![ProtocolV2FetchShallowInfo::Shallow(
+                ObjectId::from_hex(
+                    ObjectFormat::Sha1,
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                )
+                .expect("test operation should succeed")
+            )]
         );
         assert!(!request_body.is_empty());
     }

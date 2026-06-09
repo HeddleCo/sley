@@ -22,6 +22,7 @@ sley-fetch = { path = "../sley-fetch" }
 sley-formats = { path = "../sley-formats" }
 sley-fsck = { path = "../sley-fsck" }
 sley-index = { path = "../sley-index" }
+sley-notes = { path = "../sley-notes" }
 sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
 sley-pack = { path = "../sley-pack" }

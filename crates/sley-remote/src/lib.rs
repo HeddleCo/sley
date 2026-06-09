@@ -33,11 +33,12 @@ pub use credentials::{
 
 mod http;
 pub use http::{
-    HttpFetchPackRequest, http_advertised_refs, http_authorization_headers, http_check_status,
+    HttpFetchPackRequest, HttpServiceAdvertisements, http_advertised_refs,
+    http_authorization_headers, http_check_status, http_protocol_v2_fetch_response,
     http_send_with_auth, http_service_advertisements, http_upload_pack_advertisements,
     http_upload_pack_fetch_response, http_upload_pack_shallow_fetch_response,
-    http_validate_content_type, install_fetch_pack_via_http_upload_pack, new_http_client,
-    remote_url_is_http,
+    http_validate_content_type, install_fetch_pack_via_http_protocol_v2_fetch,
+    install_fetch_pack_via_http_upload_pack, new_http_client, remote_url_is_http,
 };
 
 mod ssh;
@@ -68,11 +69,17 @@ pub use fetch::{
     write_fetch_head_records,
 };
 
+mod pack;
+pub use pack::{
+    PushPackRequest, build_push_packfile, build_receive_pack_body,
+    remote_advertisement_tips_known_to_local,
+};
+
 mod push;
 pub use push::{
     PushDestination, PushOptions, PushOutcome, PushRequest, PushServices, local_push_source_refs,
     normalize_push_refname, normalize_push_refspec, push, reject_non_fast_forward_pushes,
-    remote_advertisement_tips_known_to_local, validate_receive_pack_report,
+    validate_receive_pack_report,
 };
 
 mod ls_remote;
@@ -81,8 +88,23 @@ pub use ls_remote::{LsRemoteFilter, LsRemoteRecord, LsRemoteSource, ls_remote};
 mod clone;
 pub use clone::{CloneOptions, CloneOutcome, CloneRequest, CloneServices, CloneSource, clone};
 
+mod bundle;
+pub use bundle::{FetchBundleRequest, fetch_bundle};
+
 mod shallow;
 pub use shallow::{apply_shallow_info, read_shallow, write_shallow};
+
+mod capabilities;
+pub use capabilities::{
+    BUNDLE_FETCH_SUPPORTED, HTTP_PROTOCOL_V2_FETCH, RemoteTransportKind, SSH_CLONE_SUPPORTED,
+    THIN_PACK_PUSH_SUPPORTED, TransportCapabilities,
+};
+
+mod resolve;
+pub use resolve::{
+    fetch_source_for_url, fetch_url, push_destination_for_url, push_url, resolve_fetch_source,
+    resolve_push_destination, transport_kind_for_url,
+};
 
 /// The object format of the repository whose common `$GIT_DIR` is `common_git_dir`.
 ///

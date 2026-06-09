@@ -159,7 +159,7 @@ pub(crate) fn push_ssh(request: SshPushRequest<'_>) -> Result<PushOutcome> {
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     let remote_excluded_tips =
-        crate::push::remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
+        crate::remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
     let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
     let starts = commands
         .iter()

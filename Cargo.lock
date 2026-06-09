@@ -283,12 +283,16 @@ version = "0.1.0"
 dependencies = [
  "sley-config",
  "sley-core",
+ "sley-diff-merge",
  "sley-formats",
  "sley-index",
+ "sley-notes",
  "sley-object",
  "sley-odb",
  "sley-refs",
+ "sley-remote",
  "sley-rev",
+ "sley-sequencer",
  "sley-worktree",
 ]
 
@@ -314,6 +318,7 @@ dependencies = [
  "sley-formats",
  "sley-fsck",
  "sley-index",
+ "sley-notes",
  "sley-object",
  "sley-odb",
  "sley-pack",
@@ -399,6 +404,18 @@ name = "sley-mmap"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+]
+
+[[package]]
+name = "sley-notes"
+version = "0.1.0"
+dependencies = [
+ "sley-config",
+ "sley-core",
+ "sley-object",
+ "sley-odb",
+ "sley-refs",
+ "sley-sequencer",
 ]
 
 [[package]]

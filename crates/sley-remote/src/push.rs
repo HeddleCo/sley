@@ -18,24 +18,24 @@
 //! push-planning helpers are shared (the CLI's SSH path calls the same `pub`
 //! functions) so there is a single implementation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
-use sley_odb::{
-    FileObjectDatabase, ObjectReader, build_reachable_pack, collect_reachable_object_ids,
-};
+use sley_odb::{FileObjectDatabase, ObjectReader, collect_reachable_object_ids};
 use sley_protocol::{
     GitService, PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackFeatures,
     ReceivePackPushRequest, ReceivePackPushRequestOptions, ReceivePackReportStatus,
-    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement, build_receive_pack_push_request,
+    ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
     parse_receive_pack_features, parse_refspec, plan_push_commands,
     read_receive_pack_report_status, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, write_receive_pack_push_request,
+    smart_http_rpc_result_content_type,
 };
+
+use crate::pack::{PushPackRequest, build_receive_pack_body};
 use sley_refs::{FileRefStore, Ref, RefTarget};
 use sley_transport::{HttpClient, RemoteUrl, http_smart_rpc_url};
 
@@ -202,13 +202,14 @@ fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
         credentials,
     } = request;
     let client = crate::http::new_http_client();
-    let advertisement_set = crate::http::http_service_advertisements(
+    let discovered = crate::http::http_service_advertisements(
         &client,
         remote_url,
         format,
         GitService::ReceivePack,
         credentials,
     )?;
+    let advertisement_set = discovered.set;
     let features = advertised_receive_pack_features(&advertisement_set.refs)?;
     verify_remote_object_format(&features, format)?;
 
@@ -228,21 +229,15 @@ fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
-    let packfile = build_push_packfile_against_advertisements(
-        &local_db,
+    let body = build_receive_pack_body(&PushPackRequest {
+        local_db: &local_db,
         format,
-        &commands,
-        &advertisement_set.refs,
-    )?;
-    let request = build_receive_pack_push_request(
-        &features,
-        commands.clone(),
-        packfile,
-        receive_pack_push_options(&features, format, options.quiet),
-    )?;
-
-    let mut body = Vec::new();
-    write_receive_pack_push_request(&mut body, &request)?;
+        commands: &commands,
+        remote_advertisements: &advertisement_set.refs,
+        features: &features,
+        options: receive_pack_push_options(&features, format, options.quiet),
+        thin: false,
+    })?;
     let url = http_smart_rpc_url(remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
     let mut response = crate::http::http_send_with_auth(remote_url, credentials, |auth| {
@@ -444,47 +439,6 @@ fn commands_from_forces(command_forces: &[(ReceivePackCommand, bool)]) -> Vec<Re
         .iter()
         .map(|(command, _)| command.clone())
         .collect()
-}
-
-/// Build the pack of objects the remote lacks, excluding everything reachable
-/// from the advertised tips the local repository already has. Used by the HTTP
-/// and SSH paths (the local path excludes via the remote's own object database).
-fn build_push_packfile_against_advertisements(
-    local_db: &FileObjectDatabase,
-    format: ObjectFormat,
-    commands: &[ReceivePackCommand],
-    advertisements: &[RefAdvertisement],
-) -> Result<Vec<u8>> {
-    let remote_excluded_tips = remote_advertisement_tips_known_to_local(local_db, advertisements)?;
-    let remote_excluded = collect_reachable_object_ids(local_db, format, remote_excluded_tips)?;
-    let starts = commands
-        .iter()
-        .filter(|command| !command.new_id.is_null())
-        .map(|command| command.new_id.clone());
-    Ok(
-        build_reachable_pack(local_db, format, starts, &remote_excluded)?
-            .map(|pack| pack.pack)
-            .unwrap_or_default(),
-    )
-}
-
-/// The advertised tips the local repository already has, deduplicated and
-/// excluding the all-zero sentinel — the safe negotiation base for the push pack.
-pub fn remote_advertisement_tips_known_to_local(
-    local_db: &FileObjectDatabase,
-    advertisements: &[RefAdvertisement],
-) -> Result<Vec<ObjectId>> {
-    let mut tips = Vec::new();
-    let mut seen = HashSet::new();
-    for advertisement in advertisements {
-        if advertisement.oid.is_null() || !seen.insert(advertisement.oid.clone()) {
-            continue;
-        }
-        if local_db.contains(&advertisement.oid)? {
-            tips.push(advertisement.oid.clone());
-        }
-    }
-    Ok(tips)
 }
 
 /// Validate a receive-pack report-status, surfacing a failed unpack or any

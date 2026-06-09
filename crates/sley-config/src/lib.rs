@@ -178,7 +178,7 @@ impl GitConfig {
         context: &ConfigIncludeContext,
     ) -> Result<GitConfig> {
         let mut resolved = GitConfig::default();
-        splice_includes(self, base_dir, context, 0, &mut resolved.sections)?;
+        splice_includes(self, base_dir, context, 0, false, &mut resolved.sections)?;
         Ok(resolved)
     }
 }
@@ -211,17 +211,20 @@ impl ConfigIncludeContext {
 /// matches git's behaviour of silently ignoring includes that do not exist.
 pub fn load_config_with_includes(path: &Path, context: &ConfigIncludeContext) -> Result<GitConfig> {
     let mut sections = Vec::new();
-    load_config_file(path, context, 0, &mut sections)?;
+    load_config_file(path, context, 0, false, &mut sections)?;
     Ok(GitConfig { sections })
 }
 
 /// Read and parse a single config file, then splice its includes into `out`.
 ///
 /// A non-existent file contributes nothing (git silently ignores it).
+/// When `forbid_remote_url` is set, the file (and any nested includes) must not
+/// define `remote.*.url`, matching git's guard for `includeIf.hasconfig` includes.
 fn load_config_file(
     path: &Path,
     context: &ConfigIncludeContext,
     depth: usize,
+    forbid_remote_url: bool,
     out: &mut Vec<ConfigSection>,
 ) -> Result<()> {
     let bytes = match fs::read(path) {
@@ -231,16 +234,28 @@ fn load_config_file(
     };
     let parsed = GitConfig::parse(&bytes)?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    splice_includes(&parsed, base_dir, context, depth, out)
+    splice_includes(
+        &parsed,
+        base_dir,
+        context,
+        depth,
+        forbid_remote_url,
+        out,
+    )
 }
 
 /// Walk the parsed sections in order, copying ordinary sections through and
 /// expanding `include`/`includeIf` directives in place.
+///
+/// `loaded` config for `hasconfig:` conditions is built incrementally: sections
+/// already spliced into `out` (from earlier files or parent includes) plus
+/// ordinary sections from this file that appear before each `includeIf`.
 fn splice_includes(
     parsed: &GitConfig,
     base_dir: &Path,
     context: &ConfigIncludeContext,
     depth: usize,
+    forbid_remote_url: bool,
     out: &mut Vec<ConfigSection>,
 ) -> Result<()> {
     if depth >= CONFIG_MAX_INCLUDE_DEPTH {
@@ -248,17 +263,30 @@ fn splice_includes(
             "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
         )));
     }
+    if forbid_remote_url {
+        reject_remote_urls_in_config(parsed)?;
+    }
+    let mut loaded = out.to_vec();
     for section in &parsed.sections {
         match include_section_kind(section) {
             Some(IncludeKind::Unconditional) => {
-                expand_include_paths(section, base_dir, context, depth, out)?;
+                let before = out.len();
+                expand_include_paths(section, base_dir, context, depth, forbid_remote_url, out)?;
+                loaded.extend_from_slice(&out[before..]);
             }
             Some(IncludeKind::Conditional(condition)) => {
-                if include_condition_matches(condition, base_dir, context) {
-                    expand_include_paths(section, base_dir, context, depth, out)?;
+                if include_condition_matches(condition, base_dir, context, &loaded, parsed) {
+                    let before = out.len();
+                    let forbid = forbid_remote_url
+                        || hasconfig_remote_url_condition(condition);
+                    expand_include_paths(section, base_dir, context, depth, forbid, out)?;
+                    loaded.extend_from_slice(&out[before..]);
                 }
             }
-            None => out.push(section.clone()),
+            None => {
+                loaded.push(section.clone());
+                out.push(section.clone());
+            }
         }
     }
     Ok(())
@@ -270,6 +298,7 @@ fn expand_include_paths(
     base_dir: &Path,
     context: &ConfigIncludeContext,
     depth: usize,
+    forbid_remote_url: bool,
     out: &mut Vec<ConfigSection>,
 ) -> Result<()> {
     for entry in &section.entries {
@@ -283,7 +312,7 @@ fn expand_include_paths(
             continue;
         }
         let resolved = resolve_include_path(raw, base_dir);
-        load_config_file(&resolved, context, depth + 1, out)?;
+        load_config_file(&resolved, context, depth + 1, forbid_remote_url, out)?;
     }
     Ok(())
 }
@@ -332,11 +361,21 @@ fn resolve_include_path(raw: &str, base_dir: &Path) -> PathBuf {
     }
 }
 
-/// Evaluate an `includeIf` condition against the context.
+/// Evaluate an `includeIf` condition against the context and the config
+/// visible at this point in the file.
+///
+/// `gitdir:` / `onbranch:` use `loaded` (sections already spliced from earlier
+/// files/includes plus ordinary sections from the current file that precede
+/// this directive). `hasconfig:remote.*.url:` mirrors git's
+/// `populate_remote_urls` and inspects every `remote.*.url` in `loaded` plus
+/// the entire `current_file` being processed, including sections that appear
+/// later in the same file.
 fn include_condition_matches(
     condition: &str,
     base_dir: &Path,
     context: &ConfigIncludeContext,
+    loaded: &[ConfigSection],
+    current_file: &GitConfig,
 ) -> bool {
     if let Some(pattern) = condition.strip_prefix("gitdir:") {
         return gitdir_condition_matches(pattern, base_dir, context, false);
@@ -350,9 +389,62 @@ fn include_condition_matches(
             None => false,
         };
     }
-    // `hasconfig:remote.*.url:` requires inspecting already-loaded config values
-    // and is not yet implemented; treat as non-matching for now.
+    if let Some(glob) = condition.strip_prefix("hasconfig:remote.*.url:") {
+        let mut sections = loaded.to_vec();
+        sections.extend(current_file.sections.iter().cloned());
+        return hasconfig_remote_url_matches(&GitConfig { sections }, glob);
+    }
+    // Unknown `hasconfig:` patterns (and any other unrecognised condition) do
+    // not match, mirroring upstream git.
     false
+}
+
+/// Whether an `includeIf` condition is the supported `hasconfig:remote.*.url:`
+/// form (included files must not define `remote.*.url`).
+fn hasconfig_remote_url_condition(condition: &str) -> bool {
+    condition.starts_with("hasconfig:remote.*.url:")
+}
+
+/// Return every `remote.*.url` value in `config`, in file order.
+fn collect_remote_urls(config: &GitConfig) -> Vec<&str> {
+    config
+        .sections
+        .iter()
+        .filter(|section| eq_ignore_ascii_case(&section.name, "remote"))
+        .flat_map(|section| {
+            section
+                .entries
+                .iter()
+                .filter(|entry| eq_ignore_ascii_case(&entry.key, "url"))
+                .filter_map(|entry| entry.value.as_deref())
+        })
+        .collect()
+}
+
+/// Match a `hasconfig:remote.*.url:<glob>` condition: true when at least one
+/// configured remote URL matches `<glob>` (pathname glob semantics).
+fn hasconfig_remote_url_matches(config: &GitConfig, glob: &str) -> bool {
+    collect_remote_urls(config)
+        .into_iter()
+        .any(|url| glob_match(glob, url, false))
+}
+
+/// Reject configs that set `remote.*.url`, used when expanding files included
+/// via `includeIf.hasconfig:remote.*.url`.
+fn reject_remote_urls_in_config(config: &GitConfig) -> Result<()> {
+    for section in &config.sections {
+        if !eq_ignore_ascii_case(&section.name, "remote") || section.subsection.is_none() {
+            continue;
+        }
+        for entry in &section.entries {
+            if eq_ignore_ascii_case(&entry.key, "url") {
+                return Err(GitError::InvalidFormat(
+                    "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Match a `gitdir:`/`gitdir/i:` pattern against the absolute git directory.
@@ -1176,7 +1268,7 @@ pub fn load_effective_config(
 ) -> Result<GitConfig> {
     let mut sections = Vec::new();
     for path in effective_config_paths(common_git_dir) {
-        load_config_file(&path, context, 0, &mut sections)?;
+        load_config_file(&path, context, 0, false, &mut sections)?;
     }
     Ok(GitConfig { sections })
 }
@@ -2046,6 +2138,173 @@ mod tests {
         let ctx = ConfigIncludeContext::default();
         let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("deep", None, "value"), Some("ok"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_hasconfig_remote_url_match_and_non_match() {
+        let dir = unique_include_dir("inc-hasconfig");
+        let include_this = dir.join("include-this");
+        let dont_include = dir.join("dont-include-that");
+        fs::write(
+            &include_this,
+            "[user]\n\tthis = this-is-included\n",
+        )
+        .expect("test operation should succeed");
+        fs::write(
+            &dont_include,
+            "[user]\n\tthat = that-is-not-included\n",
+        )
+        .expect("test operation should succeed");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            format!(
+                "[includeIf \"hasconfig:remote.*.url:foourl\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:barurl\"]\n\tpath = {}\n\
+                 [remote \"foo\"]\n\turl = foourl\n",
+                include_this.display(),
+                dont_include.display()
+            ),
+        )
+        .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::default();
+        let config =
+            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        assert_eq!(config.get("user", None, "this"), Some("this-is-included"));
+        assert_eq!(config.get("user", None, "that"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_hasconfig_respects_order_within_file() {
+        let dir = unique_include_dir("inc-hasconfig-order");
+        let include_file = dir.join("include-two-three");
+        fs::write(
+            &include_file,
+            "[user]\n\ttwo = included-config\n\tthree = included-config\n",
+        )
+        .expect("test operation should succeed");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            format!(
+                "[remote \"foo\"]\n\turl = foourl\n\
+                 [user]\n\tone = main-config\n\ttwo = main-config\n\
+                 [includeIf \"hasconfig:remote.*.url:foourl\"]\n\tpath = {}\n\
+                 [user]\n\tthree = main-config\n",
+                include_file.display()
+            ),
+        )
+        .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::default();
+        let config =
+            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        assert_eq!(config.get("user", None, "one"), Some("main-config"));
+        assert_eq!(config.get("user", None, "two"), Some("included-config"));
+        assert_eq!(config.get("user", None, "three"), Some("main-config"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_hasconfig_remote_url_globs() {
+        let dir = unique_include_dir("inc-hasconfig-globs");
+        let write_user = |name: &str, key: &str| {
+            fs::write(dir.join(name), format!("[user]\n\t{key} = yes\n"))
+                .expect("test operation should succeed");
+        };
+        write_user("double-star-start", "dss");
+        write_user("double-star-end", "dse");
+        write_user("double-star-middle", "dsm");
+        write_user("single-star-middle", "ssm");
+        write_user("no", "no");
+
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            format!(
+                "[remote \"foo\"]\n\turl = https://foo/bar/baz\n\
+                 [includeIf \"hasconfig:remote.*.url:**/baz\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:**/nomatch\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:https:/**\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:nomatch:/**\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:https:/**/baz\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:https:/**/nomatch\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:https://*/bar/baz\"]\n\tpath = {}\n\
+                 [includeIf \"hasconfig:remote.*.url:https://*/baz\"]\n\tpath = {}\n",
+                dir.join("double-star-start").display(),
+                dir.join("no").display(),
+                dir.join("double-star-end").display(),
+                dir.join("no").display(),
+                dir.join("double-star-middle").display(),
+                dir.join("no").display(),
+                dir.join("single-star-middle").display(),
+                dir.join("no").display(),
+            ),
+        )
+        .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::default();
+        let config =
+            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        assert_eq!(config.get("user", None, "dss"), Some("yes"));
+        assert_eq!(config.get("user", None, "dse"), Some("yes"));
+        assert_eq!(config.get("user", None, "dsm"), Some("yes"));
+        assert_eq!(config.get("user", None, "ssm"), Some("yes"));
+        assert_eq!(config.get("user", None, "no"), None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_hasconfig_forbids_remote_url_in_included_file() {
+        let dir = unique_include_dir("inc-hasconfig-forbid");
+        let include_file = dir.join("include-with-url");
+        fs::write(&include_file, "[remote \"bar\"]\n\turl = barurl\n")
+            .expect("test operation should succeed");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            format!(
+                "[remote \"foo\"]\n\turl = foourl\n\
+                 [includeIf \"hasconfig:remote.*.url:foourl\"]\n\tpath = {}\n",
+                include_file.display()
+            ),
+        )
+        .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::default();
+        let err = load_config_with_includes(&main, &ctx).expect_err("test operation should fail");
+        assert!(
+            matches!(err, GitError::InvalidFormat(ref message) if message.contains(
+                "remote URLs cannot be configured in file directly or indirectly included by includeIf.hasconfig:remote.*.url"
+            )),
+            "got {err:?}"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn config_include_if_unknown_hasconfig_does_not_match() {
+        let dir = unique_include_dir("inc-hasconfig-unknown");
+        let include_file = dir.join("extra.cfg");
+        fs::write(&include_file, "[user]\n\tname = included\n")
+            .expect("test operation should succeed");
+        let main = dir.join("config");
+        fs::write(
+            &main,
+            format!(
+                "[includeIf \"hasconfig:core.repositoryformatversion:0\"]\n\tpath = {}\n",
+                include_file.display()
+            ),
+        )
+        .expect("test operation should succeed");
+
+        let ctx = ConfigIncludeContext::default();
+        let config =
+            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        assert_eq!(config.get("user", None, "name"), None);
         fs::remove_dir_all(&dir).ok();
     }
 

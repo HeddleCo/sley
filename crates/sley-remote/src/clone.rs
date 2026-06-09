@@ -29,7 +29,8 @@
 //! upstream) at the right points in the flow while returning the [`GitConfig`]
 //! the next step needs, keeping that CLI-coupled config I/O out of the library.
 //!
-//! SSH clone still lives in the CLI; only HTTP and local move here.
+//! SSH clone uses the same [`crate::fetch`] SSH dispatch as fetch; only the
+//! caller-side URL resolution and post-clone presentation stay in the CLI.
 
 use std::path::{Path, PathBuf};
 
@@ -53,6 +54,9 @@ const CLONE_UNBORN_BRANCH: &str = "__git_rs_clone_unborn__";
 pub enum CloneSource {
     /// A smart-HTTP(S) remote at the given already-resolved URL.
     Http(RemoteUrl),
+    /// An SSH remote at the given already-resolved URL. Fetched by spawning `ssh`
+    /// (the credential seam is unused — the `ssh` program owns authentication).
+    Ssh(RemoteUrl),
     /// A local repository served in-process from `git_dir`.
     Local {
         /// The remote repository's `$GIT_DIR`.
@@ -161,6 +165,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     let config = (services.configure)(&git_dir)?;
     let fetch_source = match request.source {
         CloneSource::Http(remote) => FetchSource::Http(remote.clone()),
+        CloneSource::Ssh(remote) => FetchSource::Ssh(remote.clone()),
         CloneSource::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,

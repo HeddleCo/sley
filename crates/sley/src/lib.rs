@@ -8,6 +8,20 @@
 //! underlying plumbing objects ([`sley_odb::FileObjectDatabase`],
 //! [`sley_refs::FileRefStore`], [`sley_config::GitConfig`]) on demand.
 //!
+//! **Heddle / embedder surface** (feature `remote`, on by default):
+//!
+//! * [`Repository::config_snapshot`] — full git config with `include` /
+//!   `includeIf` / `hasconfig:` resolution.
+//! * [`Repository::init_mirror`] — bare mirror defaults (`+refs/*:refs/*`,
+//!   `mirror = true` on `origin`).
+//! * [`Repository::copy_reachable_from`] — pack-based object transfer.
+//! * [`Repository::remote`] / [`remote::RemoteContext`] — URL rewriting and
+//!   [`sley_remote`] fetch/push/clone/ls-remote orchestration (HTTP v2 fetch,
+//!   SSH, bundle fetch, thin-pack push).
+//! * [`notes`] — git notes read/write for round-trip fidelity.
+//! * [`Repository::capabilities`] / [`Repository::transport_capabilities`] —
+//!   capability probes before calling in.
+//!
 //! For power users the engine crates are re-exported under [`plumbing`] (and the
 //! most common types are re-exported at the crate root), so a single
 //! `git = { path = ... }` dependency is enough to reach the whole stack.
@@ -26,12 +40,28 @@
 //! # }
 //! ```
 
+mod capabilities;
+mod diff;
+mod notes_repo;
+mod refs;
+mod remote_edit;
+
+#[cfg(feature = "remote")]
+pub mod remote;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
-use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
+use sley_odb::{install_reachable_pack, FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
+use sley_rev::ResolvedTreePath;
+use sley_sequencer::create_annotated_tag;
+
+/// Git notes read/write ([`sley_notes`]).
+pub mod notes {
+    pub use sley_notes::*;
+}
 
 /// Re-exports of the underlying plumbing crates for callers that need direct
 /// access to the engine. Everything reachable through [`Repository`] is built
@@ -40,13 +70,18 @@ use sley_refs::{FileRefStore, RefTarget};
 pub mod plumbing {
     pub use sley_config;
     pub use sley_core;
+    pub use sley_diff_merge;
     pub use sley_formats;
     pub use sley_index;
+    pub use sley_notes;
     pub use sley_object;
     pub use sley_odb;
     pub use sley_refs;
     pub use sley_rev;
+    pub use sley_sequencer;
     pub use sley_worktree;
+    #[cfg(feature = "remote")]
+    pub use sley_remote;
 }
 
 // The most frequently used plumbing types are also re-exported at the crate root
@@ -58,8 +93,13 @@ pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
+pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
 pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
+pub use sley_sequencer::TagCreate;
+
+pub use capabilities::RepositoryCapabilities;
+pub use refs::{RefChange, RefChangeResult, RefConflict};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -366,6 +406,52 @@ impl Repository {
     /// `@{u}`, etc.) to a concrete [`ObjectId`].
     pub fn rev_parse(&self, spec: &str) -> Result<ObjectId> {
         sley_rev::resolve_revision(&self.git_dir, self.format, spec)
+    }
+
+    /// Resolve `<rev>:<path>` to the tree entry it names within `<rev>`'s tree.
+    ///
+    /// `rev` is peeled to a tree (commit, tag, or tree ids all work) and `path`
+    /// is walked component by component. An empty `path` resolves to the tree
+    /// itself.
+    pub fn resolve_path(&self, rev: &str, path: &str) -> Result<ResolvedTreePath> {
+        let objects = self.objects();
+        sley_rev::resolve_rev_path_entry(&self.git_dir, self.format, &objects, rev, path)
+    }
+
+    /// Write an annotated tag object, returning its id.
+    ///
+    /// This creates only the tag *object*; updating `refs/tags/<name>` is the
+    /// caller's responsibility (see [`Repository::apply_ref_changes`]).
+    pub fn write_annotated_tag(&self, tag: TagCreate) -> Result<ObjectId> {
+        let mut objects = self.objects();
+        create_annotated_tag(&mut objects, tag)
+    }
+
+    /// Copy objects reachable from `roots` out of `other` into this repository.
+    ///
+    /// Uses a pack-based transfer ([`sley_odb::build_reachable_pack`] on the
+    /// source, [`sley_odb::install_raw_pack`] on the destination) for
+    /// performance. Semantics:
+    ///
+    /// * Only *objects* are copied; refs in `other` are not updated here.
+    /// * The transitive closure of each root is included (commits bring in
+    ///   their trees, blobs, tags, and parent commits).
+    /// * Objects already present in this repository are skipped by the pack
+    ///   installer (ids are unchanged).
+    /// * Both repositories must use the same [`ObjectFormat`]; mismatches error.
+    /// * When nothing new is reachable, this is a no-op (`Ok(())`).
+    pub fn copy_reachable_from(&self, other: &Repository, roots: &[ObjectId]) -> Result<()> {
+        if self.format != other.format {
+            return Err(GitError::InvalidObjectId(format!(
+                "object format mismatch: destination uses {}, source uses {}",
+                self.format.name(),
+                other.format.name()
+            )));
+        }
+        let source = other.objects();
+        let destination = self.objects();
+        install_reachable_pack(&source, &destination, self.format, roots.iter().cloned())?;
+        Ok(())
     }
 
     /// Read a raw object (any type) from the object database.
@@ -983,5 +1069,138 @@ mod tests {
         let _format: plumbing::sley_core::ObjectFormat = ObjectFormat::Sha1;
         let _: fn(&[u8]) -> Result<plumbing::sley_config::GitConfig> =
             plumbing::sley_config::GitConfig::parse;
+        let _: plumbing::sley_diff_merge::DiffNameStatusOptions =
+            plumbing::sley_diff_merge::DiffNameStatusOptions::default();
+        let _: fn(&mut plumbing::sley_odb::FileObjectDatabase, TagCreate) -> Result<ObjectId> =
+            plumbing::sley_sequencer::create_annotated_tag;
+    }
+
+    #[test]
+    fn capabilities_reflect_repo_state() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let caps = repo.capabilities();
+        assert!(caps.annotated_tags);
+        assert!(caps.config_includes);
+        assert!(caps.hasconfig_include_if);
+        assert!(caps.notes);
+        assert!(caps.index);
+        assert!(!caps.shallow);
+        assert!(!caps.sha256);
+
+        fs::write(repo.git_dir().join("shallow"), b"").expect("shallow");
+        assert!(repo.capabilities().shallow);
+    }
+
+    #[test]
+    fn resolve_path_finds_blob_in_commit() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        seed_commit(&repo);
+
+        let entry = repo
+            .resolve_path("HEAD", "hello.txt")
+            .expect("resolve path");
+        assert_eq!(entry.name, b"hello.txt");
+        assert_eq!(entry.object_type, ObjectType::Blob);
+        assert!(entry.mode.is_some());
+    }
+
+    #[test]
+    fn remote_edit_round_trip() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+
+        repo.add_remote("origin", "https://example.invalid/o.git")
+            .expect("add");
+        assert_eq!(
+            repo.remote_names().expect("names"),
+            vec!["origin".to_string()]
+        );
+        assert_eq!(
+            repo.config_string_subsection("remote", Some("origin"), "url")
+                .expect("url"),
+            Some("https://example.invalid/o.git".to_string())
+        );
+
+        repo.set_remote_url("origin", "https://example.invalid/n.git")
+            .expect("set url");
+        assert_eq!(
+            repo.config_string_subsection("remote", Some("origin"), "url")
+                .expect("url"),
+            Some("https://example.invalid/n.git".to_string())
+        );
+
+        repo.remove_remote("origin").expect("remove");
+        assert!(repo.remote_names().expect("names").is_empty());
+    }
+
+    #[test]
+    fn init_mirror_writes_origin_fetch_and_mirror() {
+        let temp = TempDir::new();
+        let repo = Repository::init_mirror(temp.path()).expect("init mirror");
+        assert_eq!(repo.workdir(), None);
+        let config = repo.load_repo_config().expect("config");
+        assert_eq!(
+            config.get("remote", Some("origin"), "fetch"),
+            Some("+refs/*:refs/*")
+        );
+        assert_eq!(config.get("remote", Some("origin"), "mirror"), Some("true"));
+    }
+
+    #[test]
+    fn copy_reachable_from_transfers_missing_objects() {
+        let source_dir = TempDir::new();
+        let dest_dir = TempDir::new();
+        let source = Repository::init(source_dir.path()).expect("source");
+        let dest = Repository::init(dest_dir.path()).expect("dest");
+        let commit_oid = seed_commit(&source);
+
+        dest.copy_reachable_from(&source, std::slice::from_ref(&commit_oid))
+            .expect("copy");
+
+        let copied = dest.read_commit(&commit_oid).expect("read copied commit");
+        let original = source.read_commit(&commit_oid).expect("read source commit");
+        assert_eq!(copied.tree, original.tree);
+        assert_eq!(copied.message, original.message);
+    }
+
+    #[test]
+    fn write_annotated_tag_round_trips() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let commit_oid = seed_commit(&repo);
+
+        let tag_oid = repo
+            .write_annotated_tag(TagCreate {
+                object: commit_oid.clone(),
+                object_type: ObjectType::Commit,
+                name: b"v1".to_vec(),
+                tagger: b"Tagger <t@e.com> 1 +0000".to_vec(),
+                message: b"release\n".to_vec(),
+            })
+            .expect("tag");
+        let tag = repo.read_tag(&tag_oid).expect("read tag");
+        assert_eq!(tag.name, b"v1");
+        assert_eq!(tag.object, commit_oid);
+    }
+
+    #[test]
+    fn diff_name_status_reports_added_file() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let commit_oid = seed_commit(&repo);
+        let base_tree = repo.read_commit(&commit_oid).expect("commit").tree;
+
+        let mut editor = repo.edit_tree(&base_tree).expect("edit");
+        let blob_oid = repo.write_blob(b"new\n").expect("blob");
+        editor.upsert("added.txt", sley_object::EntryKind::Blob, blob_oid);
+        let new_tree = repo.write_tree(editor).expect("tree");
+
+        let changes = repo
+            .diff_name_status(&base_tree, &new_tree)
+            .expect("diff");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, b"added.txt");
     }
 }

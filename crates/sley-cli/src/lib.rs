@@ -13,13 +13,12 @@ use sley_odb::{
     FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
     collect_reachable_object_ids, install_bundle_pack, install_reachable_pack,
     prune_unreachable_loose, repository_object_ids, repository_objects_dir,
-    verify_bundle_prerequisites,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, ProtocolVersion, ReceivePackCommand, ReceivePackPushRequest,
     RefAdvertisement, RefAdvertisementSet, UploadPackFeatures, parse_refspec, read_fetch_head,
-    plan_fetch_ref_updates, read_receive_pack_push_options, read_receive_pack_request,
+    read_receive_pack_push_options, read_receive_pack_request,
     read_upload_pack_negotiation_request, read_upload_pack_request, refspec_map_source,
     write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
@@ -3718,6 +3717,31 @@ fn cmd_clone(args: &[String]) -> Result<()> {
             depth,
         });
     }
+    if fetch_source_is_ssh(&repository)? {
+        return clone_ssh_repository(CloneHttpOptions {
+            repository: &repository,
+            destination: &destination,
+            origin: &origin,
+            quiet,
+            bare,
+            checkout,
+            sparse,
+            single_branch,
+            branch: branch.clone(),
+            tag_opt: tag_opt.as_deref(),
+            partial_clone_filter: partial_clone_filter.as_deref(),
+            template: template.as_deref(),
+            template_config,
+            separate_git_dir: separate_git_dir.as_deref(),
+            config_overrides: &config_overrides,
+            submodule_active: &submodule_active,
+            revision: revision.as_deref(),
+            shared,
+            reference_alternates: &reference_alternates,
+            bundle_uri: bundle_uri.as_ref(),
+            depth,
+        });
+    }
 
     let remote_git_dir = ls_remote_git_dir(&repository)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
@@ -4041,6 +4065,123 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         depth: options.depth,
         committer: commit_identity_from_env("COMMITTER")?,
     };
+    let mut progress = StdoutProgress;
+    let outcome = sley_remote::clone(
+        sley_remote::CloneRequest {
+            destination: options.destination,
+            format,
+            source: &remote_source,
+            options: &clone_options,
+        },
+        sley_remote::CloneServices {
+            configure: &mut |git_dir| {
+                apply_clone_template(git_dir, template, template_config)?;
+                let fetch_refspec = if single_branch {
+                    Some(format!(
+                        "+refs/heads/{checkout_branch}:refs/remotes/{origin}/{checkout_branch}"
+                    ))
+                } else {
+                    Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
+                };
+                configure_clone_remote(
+                    git_dir,
+                    origin,
+                    repository,
+                    fetch_refspec,
+                    false,
+                    tag_opt,
+                    None,
+                )?;
+                apply_clone_config_overrides(git_dir, config_overrides)?;
+                apply_clone_submodule_active(git_dir, submodule_active)?;
+                read_repo_config(git_dir)
+            },
+            configure_branch: &mut |git_dir, branch| {
+                configure_clone_branch(git_dir, branch, origin)?;
+                read_repo_config(git_dir)
+            },
+            credentials: &mut credentials,
+            progress: &mut progress,
+        },
+    );
+    let outcome = map_clone_missing_branch(outcome, branch_explicit, &checkout_branch, origin)?;
+    let git_dir = outcome.git_dir;
+
+    if !options.checkout {
+        remove_clone_worktree_files(options.destination, &git_dir, format)?;
+    } else if options.sparse {
+        apply_clone_sparse_checkout(options.destination, &git_dir, format)?;
+    }
+    if let Some(separate_git_dir) = options.separate_git_dir {
+        apply_clone_separate_git_dir(options.destination, &git_dir, separate_git_dir)?;
+    }
+    if !options.quiet {
+        eprintln!("done.");
+    }
+    Ok(())
+}
+
+/// Clone a repository over SSH upload-pack. Covers the common non-bare case;
+/// bare/mirror, `--revision`, `--shared`/`--reference`, and `--bundle-uri` are
+/// not supported over SSH yet.
+fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
+    if options.bare {
+        return Err(GitError::Unsupported(
+            "cloning bare/mirror repositories over SSH is not supported yet".into(),
+        ));
+    }
+    if options.revision.is_some() {
+        return Err(GitError::Unsupported(
+            "clone --revision over SSH is not supported yet".into(),
+        ));
+    }
+    if options.shared || !options.reference_alternates.is_empty() {
+        return Err(GitError::Unsupported(
+            "clone --shared/--reference over SSH is not supported yet".into(),
+        ));
+    }
+    if options.bundle_uri.is_some() {
+        return Err(GitError::Unsupported(
+            "clone --bundle-uri over SSH is not supported yet".into(),
+        ));
+    }
+    if options.partial_clone_filter.is_some() {
+        eprintln!("warning: --filter is not supported over SSH yet, ignoring");
+    }
+
+    let remote = parse_remote_url(&ls_remote_resolved_url(options.repository)?)?;
+    let (advertisements, features) =
+        sley_remote::ssh_upload_pack_advertisements(&remote, ObjectFormat::Sha1)?;
+    let format = features.object_format.unwrap_or(ObjectFormat::Sha1);
+    let remote_head_branch = http_remote_head_branch(&features, &advertisements)?;
+    let branch_explicit = options.branch.is_some();
+    let checkout_branch = options
+        .branch
+        .clone()
+        .unwrap_or_else(|| remote_head_branch.clone());
+
+    if !options.quiet {
+        eprintln!("Cloning into '{}'...", options.destination.display());
+    }
+
+    let single_branch = options.single_branch;
+    let origin = options.origin;
+    let repository = options.repository;
+    let template = options.template;
+    let template_config = options.template_config;
+    let tag_opt = options.tag_opt;
+    let config_overrides = options.config_overrides;
+    let submodule_active = options.submodule_active;
+    let remote_source = sley_remote::CloneSource::Ssh(remote);
+    let clone_options = sley_remote::CloneOptions {
+        origin,
+        checkout_branch: &checkout_branch,
+        remote_head_branch: &remote_head_branch,
+        single_branch,
+        depth: options.depth,
+        committer: commit_identity_from_env("COMMITTER")?,
+    };
+    let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
         sley_remote::CloneRequest {
@@ -12452,52 +12593,14 @@ fn fetch_bundle(
     bundle: &Bundle,
     options: FetchOptions,
 ) -> Result<()> {
-    let prerequisite_reader = FileObjectDatabase::from_git_dir(git_dir, format);
-    let references = if options.dry_run {
-        verify_bundle_prerequisites(bundle, &prerequisite_reader)?;
-        bundle.references.clone()
-    } else {
-        let database = FileObjectDatabase::from_git_dir(git_dir, format);
-        install_bundle_pack(bundle, &prerequisite_reader, &database)?.references
-    };
-    if refspecs.is_empty() {
-        if options.dry_run {
-            return Ok(());
-        }
-        if options.write_fetch_head {
-            let reference = bundle_default_fetch_reference(&references)?;
-            write_bundle_default_fetch_head(git_dir, bundle_path, reference, options.append)?;
-        }
-        return Ok(());
-    }
-    let refspecs =
-        sley_remote::fetch_refspecs_for_source(Vec::new(), refspecs, options.fetch_all_tags);
-    let mut fetched = bundle_fetch_refs(&references, &refspecs, options.auto_follow_tags)?;
-    if options.fetch_all_tags {
-        sley_remote::mark_tag_refspec_updates_not_for_merge(&mut fetched);
-        sley_remote::order_bundle_fetch_all_tags_updates(&mut fetched);
-    }
-    let store = FileRefStore::new(git_dir, format);
-    if !options.fetch_all_tags {
-        sley_remote::retain_missing_auto_follow_tags(&store, &mut fetched)?;
-    }
-    if options.dry_run {
-        return Ok(());
-    }
-    if options.write_fetch_head {
-        sley_remote::write_fetch_head(git_dir, bundle_path, &fetched, options.append)?;
-    }
-    let updates = fetched
-        .iter()
-        .filter_map(|fetched| {
-            fetched.dst.as_ref().map(|dst| BundleRefUpdate {
-                name: dst.clone(),
-                oid: fetched.oid.clone(),
-            })
-        })
-        .collect::<Vec<_>>();
-    store.apply_bundle_ref_updates(&updates, None)?;
-    Ok(())
+    sley_remote::fetch_bundle(sley_remote::FetchBundleRequest {
+        git_dir,
+        format,
+        bundle_path,
+        bundle,
+        refspecs,
+        options: &options,
+    })
 }
 
 /// Resolve the repository context and delegate a local (`file://`/path) fetch to
@@ -12681,28 +12784,6 @@ fn ls_remote_filter(options: &LsRemoteOptions) -> sley_remote::LsRemoteFilter {
         tags: options.tags,
         refs_only: options.refs_only,
     }
-}
-
-fn bundle_default_fetch_reference(references: &[BundleReference]) -> Result<&BundleReference> {
-    references
-        .iter()
-        .find(|reference| reference.name == "HEAD")
-        .ok_or_else(|| GitError::NotFound("remote ref HEAD".into()))
-}
-
-fn write_bundle_default_fetch_head(
-    git_dir: &Path,
-    bundle_path: &str,
-    reference: &BundleReference,
-    append: bool,
-) -> Result<()> {
-    let records = [FetchHeadRecord {
-        oid: reference.oid.clone(),
-        not_for_merge: false,
-        description: bundle_path.to_string(),
-    }];
-    sley_remote::write_fetch_head_records(git_dir, &records, append)?;
-    Ok(())
 }
 
 #[derive(Debug, Default)]
@@ -13734,26 +13815,6 @@ fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
         MultiPackIndex::parse(&fs::read(midx_path)?, format)?;
     }
     Ok(())
-}
-
-fn bundle_fetch_refs(
-    references: &[BundleReference],
-    refspecs: &[String],
-    auto_follow_tags: bool,
-) -> Result<Vec<FetchRefUpdate>> {
-    let refs = references
-        .iter()
-        .map(|reference| RefAdvertisement {
-            oid: reference.oid.clone(),
-            name: reference.name.clone(),
-            capabilities: Vec::new(),
-        })
-        .collect::<Vec<_>>();
-    let refspecs = refspecs
-        .iter()
-        .map(|refspec| parse_refspec(refspec))
-        .collect::<Result<Vec<_>>>()?;
-    plan_fetch_ref_updates(&refs, &refspecs, auto_follow_tags)
 }
 
 fn cmd_remote(args: &[String]) -> Result<()> {
