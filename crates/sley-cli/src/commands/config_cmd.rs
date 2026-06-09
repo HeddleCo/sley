@@ -60,9 +60,82 @@ pub(crate) struct ConfigEntryWriteOptions {
     equals_separator: bool,
 }
 
+/// Mutually exclusive `git config` action modes. Git rejects combining these with
+/// the exact `error: options 'A' and 'B' cannot be used together` message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigMode {
+    Get,
+    GetAll,
+    GetRegexp,
+    List,
+    GetColor,
+    GetColorBool,
+    GetUrlMatch,
+    Set,
+    Add,
+    ReplaceAll,
+    Unset,
+    UnsetAll,
+    RenameSection,
+    RemoveSection,
+}
+
+impl ConfigMode {
+    fn from_action(action: ConfigAction) -> Self {
+        match action {
+            ConfigAction::Get => Self::Get,
+            ConfigAction::GetAll => Self::GetAll,
+            ConfigAction::GetRegexp => Self::GetRegexp,
+            ConfigAction::List => Self::List,
+            ConfigAction::GetColor => Self::GetColor,
+            ConfigAction::GetColorBool => Self::GetColorBool,
+            ConfigAction::GetUrlMatch => Self::GetUrlMatch,
+            ConfigAction::Set => Self::Set,
+            ConfigAction::Add => Self::Add,
+            ConfigAction::ReplaceAll => Self::ReplaceAll,
+            ConfigAction::Unset => Self::Unset,
+            ConfigAction::UnsetAll => Self::UnsetAll,
+            ConfigAction::RenameSection => Self::RenameSection,
+            ConfigAction::RemoveSection => Self::RemoveSection,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ConfigModeTracker {
+    chosen: Option<(ConfigMode, &'static str)>,
+}
+
+impl ConfigModeTracker {
+    fn set_action(&mut self, action: ConfigAction, flag: &'static str) -> Result<()> {
+        self.set_mode(ConfigMode::from_action(action), flag)
+    }
+
+    fn set_mode(&mut self, mode: ConfigMode, flag: &'static str) -> Result<()> {
+        if let Some((existing, existing_flag)) = self.chosen {
+            if existing != mode {
+                eprintln!(
+                    "error: options '{flag}' and '{existing_flag}' cannot be used together"
+                );
+                return Err(GitError::Exit(129));
+            }
+        } else {
+            self.chosen = Some((mode, flag));
+        }
+        Ok(())
+    }
+
+    fn set_action_value(&mut self, action: &mut Option<ConfigAction>, value: ConfigAction, flag: &'static str) -> Result<()> {
+        self.set_action(value, flag)?;
+        *action = Some(value);
+        Ok(())
+    }
+}
+
 pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut action = None;
     let mut subcommand = None;
+    let mut modes = ConfigModeTracker::default();
     let args = if let Some((first, rest)) = args.split_first() {
         match first.as_str() {
             "list" => {
@@ -119,16 +192,22 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             value if value.starts_with("--file=") => {
                 config_file = Some(value["--file=".len()..].to_string());
             }
-            "--get" => action = Some(ConfigAction::Get),
+            "--get" => modes.set_action_value(&mut action, ConfigAction::Get, "--get")?,
             "--get-color" => {
-                action = Some(ConfigAction::GetColor);
+                modes.set_action_value(&mut action, ConfigAction::GetColor, "--get-color")?;
                 value_type = ConfigValueType::Color;
             }
-            "--get-colorbool" => action = Some(ConfigAction::GetColorBool),
-            "--get-urlmatch" => action = Some(ConfigAction::GetUrlMatch),
-            "--get-all" => action = Some(ConfigAction::GetAll),
-            "--get-regexp" | "--get-regex" => action = Some(ConfigAction::GetRegexp),
-            "--list" | "-l" => action = Some(ConfigAction::List),
+            "--get-colorbool" => {
+                modes.set_action_value(&mut action, ConfigAction::GetColorBool, "--get-colorbool")?;
+            }
+            "--get-urlmatch" => {
+                modes.set_action_value(&mut action, ConfigAction::GetUrlMatch, "--get-urlmatch")?;
+            }
+            "--get-all" => modes.set_action_value(&mut action, ConfigAction::GetAll, "--get-all")?,
+            "--get-regexp" => modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regexp")?,
+            "--get-regex" => modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regex")?,
+            "--list" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
+            "-l" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
             "--all" if subcommand == Some(ConfigSubcommand::Get) => {
                 action = Some(ConfigAction::GetAll);
             }
@@ -184,12 +263,20 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             "--append" if subcommand == Some(ConfigSubcommand::Set) => {
                 action = Some(ConfigAction::Add);
             }
-            "--add" => action = Some(ConfigAction::Add),
-            "--replace-all" => action = Some(ConfigAction::ReplaceAll),
-            "--unset" => action = Some(ConfigAction::Unset),
-            "--unset-all" => action = Some(ConfigAction::UnsetAll),
-            "--rename-section" => action = Some(ConfigAction::RenameSection),
-            "--remove-section" => action = Some(ConfigAction::RemoveSection),
+            "--add" => modes.set_action_value(&mut action, ConfigAction::Add, "--add")?,
+            "--replace-all" => {
+                modes.set_action_value(&mut action, ConfigAction::ReplaceAll, "--replace-all")?;
+            }
+            "--unset" => modes.set_action_value(&mut action, ConfigAction::Unset, "--unset")?,
+            "--unset-all" => {
+                modes.set_action_value(&mut action, ConfigAction::UnsetAll, "--unset-all")?;
+            }
+            "--rename-section" => {
+                modes.set_action_value(&mut action, ConfigAction::RenameSection, "--rename-section")?;
+            }
+            "--remove-section" => {
+                modes.set_action_value(&mut action, ConfigAction::RemoveSection, "--remove-section")?;
+            }
             value => positional.push(value),
         }
     }
@@ -318,22 +405,52 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         Some(value) => ConfigSource::File(PathBuf::from(value)),
         None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
     };
-    let mut config = read_config_source(&source, action)?;
+    let loaded = read_config_source(&source, action)?;
+    let mut config = loaded.config;
     match action {
         ConfigAction::List => {
             config_list(&config, &source, display, name_only, null_terminate)?;
+            if let Some(err) = loaded.tail_error {
+                let path = match &source {
+                    ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
+                    ConfigSource::File(path) => Some(path.clone()),
+                    ConfigSource::Stdin => None,
+                };
+                return Err(report_config_parse_error(err, path.as_deref()));
+            }
         }
         ConfigAction::Get => {
             let key = key.expect("validated config key");
-            let value = config
-                .get(&key.section, key.subsection.as_deref(), &key.key)
-                .or(default_value.as_deref())
-                .ok_or(GitError::Exit(1))?;
+            let formatted = match value_type {
+                ConfigValueType::Bool => {
+                    let Some(value) = config
+                        .get_bool(&key.section, key.subsection.as_deref(), &key.key)
+                        .or_else(|| {
+                            default_value
+                                .as_deref()
+                                .and_then(sley_config::parse_config_bool)
+                        })
+                    else {
+                        return Err(GitError::Exit(1));
+                    };
+                    value.to_string()
+                }
+                _ => match config.get_entry(&key.section, key.subsection.as_deref(), &key.key) {
+                    Some(Some(value)) => format_config_value(value, value_type)?,
+                    Some(None) => String::new(),
+                    None => {
+                        let Some(default) = default_value.as_deref() else {
+                            return Err(GitError::Exit(1));
+                        };
+                        format_config_value(default, value_type)?
+                    }
+                },
+            };
             write_config_value(
                 &mut io::stdout(),
                 &source,
                 display,
-                &format_config_value(value, value_type)?,
+                &formatted,
                 null_terminate,
             )?;
         }
@@ -385,17 +502,23 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetAll => {
             let key = key.expect("validated config key");
-            let mut values = config_values(&config, &key).peekable();
-            if values.peek().is_none() {
+            let values = config
+                .get_all(&key.section, key.subsection.as_deref(), &key.key);
+            if values.is_empty() {
                 return Err(GitError::Exit(1));
             }
             let mut stdout = io::stdout();
             for value in values {
+                let formatted = match value {
+                    None if value_type == ConfigValueType::Bool => "true".to_string(),
+                    None => String::new(),
+                    Some(value) => format_config_value(value, value_type)?,
+                };
                 write_config_value(
                     &mut stdout,
                     &source,
                     display,
-                    &format_config_value(value, value_type)?,
+                    &formatted,
                     null_terminate,
                 )?;
             }
@@ -485,35 +608,80 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<GitConfig> {
+struct LoadedConfig {
+    config: GitConfig,
+    tail_error: Option<GitError>,
+}
+
+fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<LoadedConfig> {
     match source {
-        ConfigSource::Repository(git_dir) => read_repo_config(git_dir),
-        ConfigSource::File(path) => match GitConfig::read(path) {
-            Ok(config) => Ok(config),
-            Err(GitError::Io(_)) | Err(GitError::NotFound(_)) if action != ConfigAction::List => {
-                Ok(GitConfig::default())
+        ConfigSource::Repository(git_dir) => {
+            let path = git_dir.join("config");
+            match read_repo_config(git_dir) {
+                Ok(config) => Ok(LoadedConfig {
+                    config,
+                    tail_error: None,
+                }),
+                Err(err) => Err(report_config_parse_error(err, Some(&path))),
             }
-            Err(GitError::Io(err)) => {
+        }
+        ConfigSource::File(path) => match fs::read(path) {
+            Ok(bytes) => load_config_bytes(&bytes, action, Some(path.as_path())),
+            Err(err) if err.kind() == io::ErrorKind::NotFound && action != ConfigAction::List => {
+                Ok(LoadedConfig {
+                    config: GitConfig::default(),
+                    tail_error: None,
+                })
+            }
+            Err(err) => {
                 eprintln!(
                     "fatal: unable to read config file '{}': {err}",
                     path.display()
                 );
                 Err(GitError::Exit(128))
             }
-            Err(GitError::NotFound(kind)) => {
-                eprintln!(
-                    "fatal: unable to read config file '{}': {kind}",
-                    path.display()
-                );
-                Err(GitError::Exit(128))
-            }
-            Err(err) => Err(err),
         },
         ConfigSource::Stdin => {
             let mut bytes = Vec::new();
             io::stdin().read_to_end(&mut bytes)?;
-            GitConfig::parse(&bytes)
+            load_config_bytes(&bytes, action, None)
         }
+    }
+}
+
+fn load_config_bytes(bytes: &[u8], action: ConfigAction, path: Option<&Path>) -> Result<LoadedConfig> {
+    if action == ConfigAction::List {
+        let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
+        Ok(LoadedConfig { config, tail_error })
+    } else {
+        GitConfig::parse(bytes)
+            .map(|config| LoadedConfig {
+                config,
+                tail_error: None,
+            })
+            .map_err(|err| report_config_parse_error(err, path))
+    }
+}
+
+fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
+    match err {
+        GitError::InvalidFormat(message) => {
+            if let Some(line) = message.strip_prefix("config line ") {
+                if let Some((line, _)) = line.split_once(':') {
+                    if let Some(path) = path {
+                        eprintln!(
+                            "fatal: bad config line {line} in file {}",
+                            path.display()
+                        );
+                    } else {
+                        eprintln!("fatal: bad config line {line}");
+                    }
+                    return GitError::Exit(128);
+                }
+            }
+            GitError::InvalidFormat(message)
+        }
+        other => other,
     }
 }
 
@@ -784,12 +952,19 @@ pub(crate) struct ConfigUrlMatchTarget {
 pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
     let parts = value.split('.').collect::<Vec<_>>();
     if parts.len() < 2 {
-        return Err(GitError::InvalidFormat("config key is invalid".into()));
+        eprintln!("error: key does not contain a section: {value}");
+        return Err(GitError::Exit(1));
     }
     let section = parts[0].to_string();
     let key = parts[parts.len() - 1].to_string();
-    validate_config_name(&section)?;
-    validate_config_name(&key)?;
+    if key.is_empty() {
+        eprintln!("error: key does not contain variable name: {value}");
+        return Err(GitError::Exit(1));
+    }
+    if validate_config_name(&section).is_err() || validate_config_key_name(&key).is_err() {
+        eprintln!("error: invalid key: {value}");
+        return Err(GitError::Exit(1));
+    }
     let subsection = if parts.len() > 2 {
         let subsection = parts[1..parts.len() - 1].join(".");
         if subsection.is_empty()
@@ -797,9 +972,8 @@ pub(crate) fn parse_config_key(value: &str) -> Result<ConfigKey> {
                 .bytes()
                 .any(|byte| matches!(byte, b'\n' | b'\r' | 0))
         {
-            return Err(GitError::InvalidFormat(
-                "config subsection is invalid".into(),
-            ));
+            eprintln!("error: invalid key: {value}");
+            return Err(GitError::Exit(1));
         }
         Some(subsection)
     } else {
@@ -862,6 +1036,18 @@ fn validate_config_name(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_config_key_name(value: &str) -> Result<()> {
+    if validate_config_name(value).is_err()
+        || !value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic())
+    {
+        return Err(GitError::InvalidFormat("config key name is invalid".into()));
+    }
+    Ok(())
+}
+
 fn config_section_matches(section: &ConfigSection, key: &ConfigKey) -> bool {
     section.name.eq_ignore_ascii_case(&key.section)
         && section.subsection.as_deref() == key.subsection.as_deref()
@@ -870,20 +1056,6 @@ fn config_section_matches(section: &ConfigSection, key: &ConfigKey) -> bool {
 fn config_section_name_matches(section: &ConfigSection, name: &ConfigSectionName) -> bool {
     section.name.eq_ignore_ascii_case(&name.section)
         && section.subsection.as_deref() == name.subsection.as_deref()
-}
-
-fn config_values<'a>(config: &'a GitConfig, key: &'a ConfigKey) -> impl Iterator<Item = &'a str> {
-    config
-        .sections
-        .iter()
-        .filter(|section| config_section_matches(section, key))
-        .flat_map(|section| {
-            section
-                .entries
-                .iter()
-                .filter(|entry| entry.key.eq_ignore_ascii_case(&key.key))
-                .filter_map(|entry| entry.value.as_deref())
-        })
 }
 
 fn config_get_urlmatch(
@@ -1326,15 +1498,19 @@ fn write_config_entry(
         }
         return Ok(());
     }
-    let Some(value) = value else {
-        if options.null_terminate {
-            write!(stdout, "{name}\0")?;
-        } else {
-            writeln!(stdout, "{name}")?;
+    let formatted_value = match value {
+        None if options.value_type == ConfigValueType::Bool => "true".to_string(),
+        None => {
+            if options.null_terminate {
+                write!(stdout, "{name}\0")?;
+            } else {
+                writeln!(stdout, "{name}")?;
+            }
+            return Ok(());
         }
-        return Ok(());
+        Some(value) => format_config_value(value, options.value_type)?,
     };
-    let value = format_config_value(value, options.value_type)?;
+    let value = formatted_value;
     if options.null_terminate {
         write!(stdout, "{name}\n{value}\0")?;
     } else if options.equals_separator {

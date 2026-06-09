@@ -86,6 +86,15 @@ impl GitConfig {
         ConfigParser::new(text).parse()
     }
 
+    /// Parse a config file, returning any successfully parsed material even when a
+    /// later line is invalid. Used by `git config --list` to mirror git's behaviour
+    /// of printing valid entries before reporting a syntax error.
+    pub fn parse_collecting(bytes: &[u8]) -> Result<(Self, Option<GitError>)> {
+        let text =
+            std::str::from_utf8(bytes).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+        Ok(ConfigParser::new(text).parse_collecting())
+    }
+
     pub fn read(path: impl AsRef<Path>) -> Result<Self> {
         Self::parse(&fs::read(path)?)
     }
@@ -147,6 +156,30 @@ impl GitConfig {
     ///
     /// A value that is neither a recognised keyword nor an integer yields `None`
     /// (git reports this as a "bad boolean config value" error).
+    /// Return the last value of `section[.subsection].key`, distinguishing unset
+    /// keys from boolean-true bare keys.
+    ///
+    /// * `None` — no such key exists;
+    /// * `Some(None)` — key exists with no `=` value (boolean true);
+    /// * `Some(Some(value))` — key exists with an explicit value (which may be empty).
+    pub fn get_entry(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Option<Option<&str>> {
+        self.sections
+            .iter()
+            .rev()
+            .filter(|candidate| {
+                eq_ignore_ascii_case(&candidate.name, section)
+                    && candidate.subsection.as_deref() == subsection
+            })
+            .flat_map(|candidate| candidate.entries.iter().rev())
+            .find(|entry| eq_ignore_ascii_case(&entry.key, key))
+            .map(|entry| entry.value.as_deref())
+    }
+
     pub fn get_bool(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<bool> {
         let entry = self
             .sections
@@ -876,7 +909,14 @@ impl<'a> ConfigParser<'a> {
         }
     }
 
-    fn parse(mut self) -> Result<GitConfig> {
+    fn parse(self) -> Result<GitConfig> {
+        match self.parse_collecting() {
+            (config, None) => Ok(config),
+            (_, Some(err)) => Err(err),
+        }
+    }
+
+    fn parse_collecting(mut self) -> (GitConfig, Option<GitError>) {
         let mut config = GitConfig::default();
         let mut current: Option<usize> = None;
         let mut pending_preamble = Vec::new();
@@ -900,36 +940,43 @@ impl<'a> ConfigParser<'a> {
                         text: self.parse_comment_text(),
                     });
                 }
-                Some('[') => {
-                    let mut section = self.parse_section_header()?;
-                    if config.sections.is_empty() {
-                        config.preamble = pending_preamble;
-                        section.preamble = Vec::new();
-                    } else {
-                        section.preamble = pending_preamble;
+                Some('[') => match self.parse_section_header() {
+                    Ok(mut section) => {
+                        if config.sections.is_empty() {
+                            config.preamble = pending_preamble;
+                            section.preamble = Vec::new();
+                        } else {
+                            section.preamble = pending_preamble;
+                        }
+                        pending_preamble = Vec::new();
+                        config.sections.push(section);
+                        current = Some(config.sections.len() - 1);
+                        after_section_header = true;
                     }
-                    pending_preamble = Vec::new();
-                    config.sections.push(section);
-                    current = Some(config.sections.len() - 1);
-                    after_section_header = true;
-                }
-                Some(ch) if ch.is_ascii_alphabetic() => {
-                    let mut entry = self.parse_entry()?;
-                    entry.preamble = pending_preamble;
-                    pending_preamble = Vec::new();
-                    after_section_header = false;
-                    let Some(idx) = current else {
-                        return Err(self.err("variable definition appears before a section"));
-                    };
-                    config.sections[idx].entries.push(entry);
-                }
+                    Err(err) => return (config, Some(err)),
+                },
+                Some(ch) if ch.is_ascii_alphabetic() => match self.parse_entry() {
+                    Ok(mut entry) => {
+                        entry.preamble = pending_preamble;
+                        pending_preamble = Vec::new();
+                        after_section_header = false;
+                        let Some(idx) = current else {
+                            return (
+                                config,
+                                Some(self.err("variable definition appears before a section")),
+                            );
+                        };
+                        config.sections[idx].entries.push(entry);
+                    }
+                    Err(err) => return (config, Some(err)),
+                },
                 Some(ch) => {
-                    return Err(self.err(format!("unexpected character {ch:?}")));
+                    return (config, Some(self.err(format!("unexpected character {ch:?}"))));
                 }
             }
         }
         config.suffix = pending_preamble;
-        Ok(config)
+        (config, None)
     }
 
     /// Parse a `[section]`, `[section "subsection"]`, or deprecated
@@ -1157,13 +1204,27 @@ impl<'a> ConfigParser<'a> {
                     comment = Some(self.parse_comment_text());
                     break;
                 }
-                Some(ch @ (' ' | '\t' | '\r')) if !in_quotes => {
+                Some(ch @ (' ' | '\t')) if !in_quotes => {
                     self.bump();
                     if leading {
                         // Drop leading whitespace entirely.
                     } else {
                         out.push(ch);
                         trailing_ws += 1;
+                    }
+                }
+                Some('\r') if !in_quotes => {
+                    self.bump();
+                    match self.peek() {
+                        Some('\n') | None => {
+                            // Trailing CR before end-of-line is a line ending, not value data.
+                        }
+                        _ if !leading => {
+                            out.push('\r');
+                            trailing_ws = 0;
+                            leading = false;
+                        }
+                        _ => {}
                     }
                 }
                 Some(ch) => {
@@ -1210,6 +1271,7 @@ impl<'a> ConfigParser<'a> {
 fn quote_config_value(value: &str) -> String {
     let needs_quotes = value.starts_with(' ')
         || value.ends_with(' ')
+        || value.contains('\r')
         || value.bytes().any(|byte| matches!(byte, b'#' | b';'));
     let mut out = String::new();
     if needs_quotes {
@@ -1408,6 +1470,42 @@ pub fn load_effective_config(
         suffix: Vec::new(),
         sections,
     })
+}
+
+/// Load the config layers consulted before command dispatch (alias resolution):
+/// system, global, and repository when `common_git_dir` is known.
+///
+/// This mirrors git's pre-command config lookup: outside a repository only
+/// system and global files are read; inside a repository the local config is
+/// included as well. Command-line `-c` overrides are *not* included here — the
+/// caller layers those on top via [`GitConfig::get`] precedence or a separate
+/// override lookup.
+pub fn load_pre_dispatch_config(
+    common_git_dir: Option<&Path>,
+    context: &ConfigIncludeContext,
+) -> Result<GitConfig> {
+    let mut sections = Vec::new();
+    for path in pre_dispatch_config_paths(common_git_dir) {
+        load_config_file(&path, context, 0, false, &mut sections)?;
+    }
+    Ok(GitConfig {
+        preamble: Vec::new(),
+        suffix: Vec::new(),
+        sections,
+    })
+}
+
+/// Config file paths for pre-dispatch lookup (system, global, optional repo).
+fn pre_dispatch_config_paths(common_git_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(system) = system_config_path() {
+        paths.push(system);
+    }
+    paths.extend(global_config_paths());
+    if let Some(common_git_dir) = common_git_dir {
+        paths.push(common_git_dir.join("config"));
+    }
+    paths
 }
 
 /// Compute the ordered list of config files that make up the effective config,
@@ -1762,6 +1860,35 @@ mod tests {
     #[test]
     fn config_handles_crlf_line_endings() {
         assert_eq!(parse_core_x("[core]\r\n\tx = y\r\n").as_deref(), Some("y"));
+    }
+
+    #[test]
+    fn config_value_preserves_trailing_cr() {
+        assert_eq!(
+            parse_core_x("[core]\n\tx = \"bar\r\"\n").as_deref(),
+            Some("bar\r")
+        );
+        let config = GitConfig::parse(b"[core]\n\tx = \"bar\r\"\n")
+            .expect("test operation should succeed");
+        assert_eq!(
+            String::from_utf8(config.to_canonical_bytes()).expect("utf8"),
+            "[core]\n\tx = \"bar\r\"\n"
+        );
+        let config = GitConfig {
+            sections: vec![ConfigSection::new(
+                String::from("core"),
+                None,
+                vec![ConfigEntry::new(
+                    String::from("foo"),
+                    Some(format!("bar{}", '\r')),
+                )],
+            )],
+            ..GitConfig::default()
+        };
+        assert_eq!(
+            String::from_utf8(config.to_canonical_bytes()).expect("utf8"),
+            "[core]\n\tfoo = \"bar\r\"\n"
+        );
     }
 
     #[test]

@@ -583,6 +583,103 @@ fn config_comment_writes_match_upstream_git() {
 }
 
 #[test]
+fn config_rejects_incompatible_mode_combinations_like_upstream_git() {
+    let root = unique_temp_dir("config-mode-combo");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    assert_status_stdout_stderr_match(&upstream, &rust, &["config", "--get", "--get-all"]);
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_trailing_cr_round_trip_matches_upstream_git() {
+    let root = unique_temp_dir("config-trailing-cr");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        git(&upstream, &["init", "-q"]);
+        git(&rust, &["init", "-q"]);
+        let value = format!("bar{}", '\r');
+        let set_args = ["config", "set", "core.foo", value.as_str()];
+        assert_eq!(git(&upstream, &set_args), git_rs(&rust, &set_args));
+        assert_outputs_match(&upstream, &rust, &["config", "get", "core.foo"]);
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_invalid_keys_and_implicit_bool_get_match_upstream_git() {
+    let root = unique_temp_dir("config-edge-cases");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream dir");
+    fs::create_dir_all(&rust).expect("create rust dir");
+    {
+        let config_path = "bare.config";
+        let config_bytes = b"[core]\n\tflag\n\tempty =\n";
+        fs::write(upstream.join(config_path), config_bytes).expect("write upstream config");
+        fs::write(rust.join(config_path), config_bytes).expect("write rust config");
+
+        for args in [
+            ["config", "get", "invalid"],
+            ["config", "get", "core."],
+            ["config", "get", "core.0b"],
+        ] {
+            assert_status_stdout_stderr_match(&upstream, &rust, &args);
+        }
+
+        assert_status_stdout_stderr_match(
+            &upstream,
+            &rust,
+            &["config", "--file", config_path, "--get", "core.flag"],
+        );
+        assert_status_stdout_stderr_match(
+            &upstream,
+            &rust,
+            &[
+                "config",
+                "--file",
+                config_path,
+                "--bool",
+                "--get",
+                "core.flag",
+            ],
+        );
+        assert_status_stdout_stderr_match(
+            &upstream,
+            &rust,
+            &["config", "--file", config_path, "--get", "core.empty"],
+        );
+        assert_status_stdout_stderr_match(
+            &upstream,
+            &rust,
+            &[
+                "config",
+                "--file",
+                config_path,
+                "--get-regexp",
+                "--bool",
+                "^core",
+            ],
+        );
+
+        let bad_config = b"[core]\n\tx = bad\n[broken\n";
+        fs::write(upstream.join("bad.config"), bad_config).expect("write upstream bad config");
+        fs::write(rust.join("bad.config"), bad_config).expect("write rust bad config");
+        assert_status_stdout_stderr_match(
+            &upstream,
+            &rust,
+            &["config", "--file", "bad.config", "--list"],
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn config_get_set_add_and_unset_match_upstream_git() {
     let root = unique_temp_dir("config");
     let upstream = root.join("upstream");
