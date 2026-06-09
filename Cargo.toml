@@ -24,6 +24,7 @@ members = [
     "crates/sley",
     "crates/sley-cli",
     "crates/sley-testkit",
+    "crates/sley-bench",
 ]
 resolver = "3"
 

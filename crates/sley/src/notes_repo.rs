@@ -2,7 +2,7 @@
 
 use sley_notes::{
     Note, NotesCommitIdentity, NotesIter, NotesRef, iter_notes, list_notes,
-    read_note_bytes, read_note_for, resolve_notes_ref, write_notes,
+    notes_ref_expected, read_note_bytes, read_note_for, resolve_notes_ref, write_notes,
 };
 
 use crate::{ObjectId, Repository, Result};
@@ -84,6 +84,7 @@ impl Repository {
             notes,
             message,
             identity,
+            notes_ref_expected(&self.references(), notes_ref)?,
         )
     }
 }

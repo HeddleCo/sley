@@ -3,8 +3,8 @@
 // Glob the crate root for shared plumbing; see commands::stash for rationale.
 use crate::*;
 use sley_notes::{
-    NotesCommitIdentity, NotesRef, list_notes, read_note, remove_note, resolve_notes_ref, upsert_note,
-    write_notes,
+    NotesCommitIdentity, NotesRef, list_notes, notes_ref_expected, read_note, remove_note,
+    resolve_notes_ref, upsert_note, write_notes,
 };
 
 pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
@@ -372,6 +372,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
                 &notes,
                 "Notes removed by 'git notes add'",
                 &notes_commit_identity()?,
+                notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
             )?;
         }
         return Ok(());
@@ -387,6 +388,7 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
         &notes,
         "Notes added by 'git notes add'",
         &notes_commit_identity()?,
+        notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
     )
 }
 
@@ -440,6 +442,7 @@ fn notes_append(
         &notes,
         "Notes added by 'git notes append'",
         &notes_commit_identity()?,
+        notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
     )
 }
 
@@ -512,6 +515,7 @@ fn notes_remove(
             &notes,
             "Notes removed by 'git notes remove'",
             &notes_commit_identity()?,
+            notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
         )?;
     }
     if any_missing {
@@ -595,6 +599,7 @@ fn notes_copy(
         &notes,
         "Notes added by 'git notes copy'",
         &notes_commit_identity()?,
+        notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
     )
 }
 

@@ -13,6 +13,7 @@ use sley_object::{
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
 use sley_sequencer::{CommitCreate, create_commit};
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Default notes ref when none is selected via `GIT_NOTES_REF` or `core.notesRef`.
@@ -59,6 +60,24 @@ pub struct Note {
 pub struct NotesCommitIdentity {
     pub author: Vec<u8>,
     pub committer: Vec<u8>,
+}
+
+/// Result of an incremental note upsert at the repository level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertNoteOutcome {
+    /// A new or updated note was written and the notes ref advanced.
+    Updated { notes_commit: ObjectId },
+    /// The annotated object already referenced this blob; no objects or ref were written.
+    Unchanged,
+}
+
+/// Result of an incremental note removal at the repository level.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoveNoteOutcome {
+    /// One or more notes were removed and the notes ref advanced.
+    Removed { notes_commit: ObjectId },
+    /// The notes ref was absent or none of the requested annotated objects had notes.
+    Unchanged,
 }
 
 /// Resolve the notes ref using git's precedence: explicit override, then
@@ -221,8 +240,22 @@ pub fn read_note_bytes(
     Ok(Some(object.body.to_vec()))
 }
 
+/// Derive the compare-and-swap precondition used by legacy full-replace callers:
+/// [`Some`](RefTarget::Direct) when the notes ref exists as a direct oid, otherwise
+/// `None` (create-only).
+pub fn notes_ref_expected(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<RefTarget>> {
+    Ok(match store.read_ref(notes_ref.as_str())? {
+        Some(RefTarget::Direct(oid)) => Some(RefTarget::Direct(oid)),
+        _ => None,
+    })
+}
+
 /// Rewrite the notes tree to exactly `notes` and advance `notes_ref` to a new
 /// commit. An empty set still records a commit on the empty tree.
+///
+/// `ref_expected` is the compare-and-swap precondition on the notes ref:
+/// `None` means the ref must not exist; [`Some`](RefTarget::Direct) means it must
+/// point at that oid. Use [`notes_ref_expected`] for legacy auto-detection.
 pub fn write_notes(
     git_dir: &Path,
     format: ObjectFormat,
@@ -231,53 +264,139 @@ pub fn write_notes(
     notes: &[Note],
     message: &str,
     identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
 ) -> Result<()> {
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
-
-    let parent = match store.read_ref(notes_ref.as_str())? {
-        Some(RefTarget::Direct(oid)) => Some(oid),
-        _ => None,
-    };
-
-    let mut entries: Vec<TreeEntry> = notes
-        .iter()
-        .map(|note| TreeEntry {
-            mode: 0o100644,
-            name: BString::from(note.annotated.to_hex().as_bytes()),
-            oid: note.blob,
-        })
-        .collect();
-    entries.sort_by(|left, right| left.name.cmp(&right.name));
-    let tree = Tree { entries };
-    let tree_oid = db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))?;
-
-    let parents = parent.iter().cloned().collect();
-    let commit_oid = create_commit(
-        &mut db,
-        CommitCreate {
-            tree: tree_oid,
-            parents,
-            author: identity.author.clone(),
-            committer: identity.committer.clone(),
-            message: format!("{message}\n").into_bytes(),
-        },
+    commit_notes_update(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        notes,
+        message,
+        identity,
+        ref_expected,
     )?;
-
-    let old_oid = parent.unwrap_or(zero_oid(format)?);
-    let mut tx = store.transaction();
-    tx.update(RefUpdate {
-        name: notes_ref.as_str().to_string(),
-        expected: parent.map(RefTarget::Direct),
-        new: RefTarget::Direct(commit_oid),
-        reflog: Some(ReflogEntry {
-            old_oid,
-            new_oid: commit_oid,
-            committer: identity.committer.clone(),
-            message: message.as_bytes().to_vec(),
-        }),
-    });
-    tx.commit()?;
     Ok(())
+}
+
+/// Incrementally upsert a single note, reading any fanout layout and writing a
+/// flat sorted tree. Returns [`UpsertNoteOutcome::Unchanged`] when `annotated`
+/// already maps to `blob`.
+pub fn upsert_note_for(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    annotated: &ObjectId,
+    blob: ObjectId,
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+) -> Result<UpsertNoteOutcome> {
+    if let Some(existing) = read_note_for(git_dir, format, store, notes_ref, annotated)?
+        && existing == blob
+    {
+        return Ok(UpsertNoteOutcome::Unchanged);
+    }
+    let mut notes = list_notes(git_dir, format, store, notes_ref)?;
+    upsert_note(&mut notes, annotated, blob);
+    let notes_commit = commit_notes_update(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        &notes,
+        message,
+        identity,
+        ref_expected,
+    )?;
+    Ok(UpsertNoteOutcome::Updated { notes_commit })
+}
+
+/// Write `body` as a blob, then call [`upsert_note_for`].
+pub fn upsert_note_bytes_for(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    annotated: &ObjectId,
+    body: &[u8],
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+) -> Result<UpsertNoteOutcome> {
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body.to_vec()))?;
+    upsert_note_for(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        annotated,
+        blob,
+        message,
+        identity,
+        ref_expected,
+    )
+}
+
+/// Remove the note for a single annotated object, if present.
+pub fn remove_note_for(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    annotated: &ObjectId,
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+) -> Result<RemoveNoteOutcome> {
+    remove_notes_for(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        std::slice::from_ref(annotated),
+        message,
+        identity,
+        ref_expected,
+    )
+}
+
+/// Remove notes for `annotated` in a single fast-forward commit when any are
+/// present. Returns [`RemoveNoteOutcome::Unchanged`] when the ref is absent or
+/// none of the oids have notes.
+pub fn remove_notes_for(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    annotated: &[ObjectId],
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+) -> Result<RemoveNoteOutcome> {
+    if annotated.is_empty() || notes_head_oid(store, notes_ref)?.is_none() {
+        return Ok(RemoveNoteOutcome::Unchanged);
+    }
+    let targets: HashSet<_> = annotated.iter().collect();
+    let mut notes = list_notes(git_dir, format, store, notes_ref)?;
+    let before = notes.len();
+    notes.retain(|note| !targets.contains(&note.annotated));
+    if notes.len() == before {
+        return Ok(RemoveNoteOutcome::Unchanged);
+    }
+    let notes_commit = commit_notes_update(
+        git_dir,
+        format,
+        store,
+        notes_ref,
+        &notes,
+        message,
+        identity,
+        ref_expected,
+    )?;
+    Ok(RemoveNoteOutcome::Removed { notes_commit })
 }
 
 /// Replace (or insert) the note for `annotated` inside an in-memory note list.
@@ -389,6 +508,67 @@ fn expand_notes_ref(name: &str) -> String {
 
 fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
     GitConfig::read(git_dir.join("config"))
+}
+
+fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<ObjectId>> {
+    Ok(match store.read_ref(notes_ref.as_str())? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        _ => None,
+    })
+}
+
+fn commit_notes_update(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    notes_ref: &NotesRef,
+    notes: &[Note],
+    message: &str,
+    identity: &NotesCommitIdentity,
+    ref_expected: Option<RefTarget>,
+) -> Result<ObjectId> {
+    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let parent = notes_head_oid(store, notes_ref)?;
+
+    let mut entries: Vec<TreeEntry> = notes
+        .iter()
+        .map(|note| TreeEntry {
+            mode: 0o100644,
+            name: BString::from(note.annotated.to_hex().as_bytes()),
+            oid: note.blob,
+        })
+        .collect();
+    entries.sort_by(|left, right| left.name.cmp(&right.name));
+    let tree = Tree { entries };
+    let tree_oid = db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))?;
+
+    let parents = parent.iter().cloned().collect();
+    let commit_oid = create_commit(
+        &mut db,
+        CommitCreate {
+            tree: tree_oid,
+            parents,
+            author: identity.author.clone(),
+            committer: identity.committer.clone(),
+            message: format!("{message}\n").into_bytes(),
+        },
+    )?;
+
+    let old_oid = parent.unwrap_or(zero_oid(format)?);
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: notes_ref.as_str().to_string(),
+        expected: ref_expected,
+        new: RefTarget::Direct(commit_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: commit_oid,
+            committer: identity.committer.clone(),
+            message: message.as_bytes().to_vec(),
+        }),
+    });
+    tx.commit()?;
+    Ok(commit_oid)
 }
 
 fn zero_oid(format: ObjectFormat) -> Result<ObjectId> {
@@ -517,6 +697,7 @@ mod tests {
             &notes,
             "Notes added by test",
             &identity,
+            notes_ref_expected(&store, &notes_ref).expect("ref expected"),
         )
         .expect("test operation should succeed");
 
@@ -557,6 +738,7 @@ mod tests {
             }],
             "note",
             &test_identity(),
+            notes_ref_expected(&store, &notes_ref).expect("ref expected"),
         )
         .expect("write notes");
 
@@ -602,6 +784,7 @@ mod tests {
             ],
             "notes",
             &test_identity(),
+            notes_ref_expected(&store, &notes_ref).expect("ref expected"),
         )
         .expect("write notes");
 
@@ -782,5 +965,519 @@ mod tests {
         });
         let _ = fs::remove_dir_all(&dir);
         result.expect("note_bytes_match_system_git assertions");
+    }
+
+    fn heddle_notes_ref() -> NotesRef {
+        NotesRef::expand("refs/notes/heddle")
+    }
+
+    fn read_notes_head(store: &FileRefStore, notes_ref: &NotesRef) -> Option<ObjectId> {
+        match store.read_ref(notes_ref.as_str()).expect("read ref") {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        }
+    }
+
+    fn install_fanout_note(
+        git_dir: &Path,
+        store: &FileRefStore,
+        notes_ref: &NotesRef,
+        annotated: &ObjectId,
+        blob: ObjectId,
+        identity: &NotesCommitIdentity,
+    ) {
+        let format = ObjectFormat::Sha1;
+        let annotated_hex = annotated.to_hex();
+        let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+        let prefix = &annotated_hex[..2];
+        let suffix = &annotated_hex[2..];
+        let leaf = Tree {
+            entries: vec![TreeEntry {
+                mode: 0o100644,
+                name: BString::from(suffix.as_bytes()),
+                oid: blob,
+            }],
+        };
+        let leaf_oid = db
+            .write_object(EncodedObject::new(ObjectType::Tree, leaf.write()))
+            .expect("leaf");
+        let fanout = Tree {
+            entries: vec![TreeEntry {
+                mode: 0o040000,
+                name: BString::from(prefix.as_bytes()),
+                oid: leaf_oid,
+            }],
+        };
+        let fanout_oid = db
+            .write_object(EncodedObject::new(ObjectType::Tree, fanout.write()))
+            .expect("fanout");
+        let commit_oid = create_commit(
+            &mut db,
+            CommitCreate {
+                tree: fanout_oid,
+                parents: Vec::new(),
+                author: identity.author.clone(),
+                committer: identity.committer.clone(),
+                message: b"fanout notes\n".to_vec(),
+            },
+        )
+        .expect("commit");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: notes_ref.as_str().to_string(),
+            expected: notes_ref_expected(store, notes_ref).expect("ref expected"),
+            new: RefTarget::Direct(commit_oid),
+            reflog: None,
+        });
+        tx.commit().expect("update ref");
+    }
+
+    #[test]
+    fn upsert_note_for_unchanged_is_noop() {
+        let dir = unique_temp_dir("upsert-unchanged");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob = write_blob(&mut db, br#"{"status":"served"}"#).expect("blob");
+
+        let first = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob.clone(),
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("first upsert");
+        let first_head = read_notes_head(&store, &notes_ref).expect("head");
+        assert!(matches!(first, UpsertNoteOutcome::Updated { .. }));
+
+        let second = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob,
+            "heddle: export",
+            &identity,
+            Some(RefTarget::Direct(first_head)),
+        )
+        .expect("second upsert");
+        assert_eq!(second, UpsertNoteOutcome::Unchanged);
+        assert_eq!(read_notes_head(&store, &notes_ref), Some(first_head));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_note_for_updates_blob() {
+        let dir = unique_temp_dir("upsert-update");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob_a = write_blob(&mut db, br#"{"v":1}"#).expect("blob a");
+        let blob_b = write_blob(&mut db, br#"{"v":2}"#).expect("blob b");
+
+        let first = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob_a,
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("first upsert");
+        let UpsertNoteOutcome::Updated { notes_commit: first_commit } = first else {
+            panic!("expected first upsert to update");
+        };
+
+        let second = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob_b,
+            "heddle: export",
+            &identity,
+            Some(RefTarget::Direct(first_commit)),
+        )
+        .expect("second upsert");
+        let UpsertNoteOutcome::Updated { notes_commit: second_commit } = second else {
+            panic!("expected second upsert to update");
+        };
+        assert_ne!(first_commit, second_commit);
+        assert_eq!(
+            read_note(&git_dir, format, &store, &notes_ref, &target).expect("read"),
+            Some(blob_b)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_note_for_creates_ref() {
+        let dir = unique_temp_dir("upsert-create");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob = write_blob(&mut db, br#"{"status":"served"}"#).expect("blob");
+
+        assert_eq!(read_notes_head(&store, &notes_ref), None);
+        let outcome = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob,
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("upsert");
+        assert!(matches!(outcome, UpsertNoteOutcome::Updated { .. }));
+        assert!(read_notes_head(&store, &notes_ref).is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upsert_note_for_cas_mismatch_fails() {
+        let dir = unique_temp_dir("upsert-cas");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob_a = write_blob(&mut db, br#"{"v":1}"#).expect("blob a");
+        let blob_b = write_blob(&mut db, br#"{"v":2}"#).expect("blob b");
+
+        upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob_a,
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("seed note");
+        let head = read_notes_head(&store, &notes_ref).expect("head");
+        let wrong =
+            ObjectId::from_hex(format, "cccccccccccccccccccccccccccccccccccccccc").expect("oid");
+
+        let err = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob_b,
+            "heddle: export",
+            &identity,
+            Some(RefTarget::Direct(wrong)),
+        )
+        .expect_err("cas mismatch");
+        assert!(matches!(err, GitError::Transaction(_)));
+        assert_eq!(read_notes_head(&store, &notes_ref), Some(head));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_notes_for_partial_hit() {
+        let dir = unique_temp_dir("remove-partial");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let other =
+            ObjectId::from_hex(format, "dddddddddddddddddddddddddddddddddddddddd").expect("oid");
+        let blob_a = write_blob(&mut db, br#"{"a":1}"#).expect("blob a");
+        let blob_b = write_blob(&mut db, br#"{"b":2}"#).expect("blob b");
+
+        write_notes(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[
+                Note {
+                    annotated: target,
+                    blob: blob_a,
+                },
+                Note {
+                    annotated: other,
+                    blob: blob_b,
+                },
+            ],
+            "seed",
+            &identity,
+            None,
+        )
+        .expect("seed notes");
+        let head = read_notes_head(&store, &notes_ref).expect("head");
+
+        let outcome = remove_notes_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[target],
+            "heddle: retract",
+            &identity,
+            Some(RefTarget::Direct(head)),
+        )
+        .expect("remove");
+        assert!(matches!(outcome, RemoveNoteOutcome::Removed { .. }));
+        assert_eq!(
+            read_note(&git_dir, format, &store, &notes_ref, &target).expect("read"),
+            None
+        );
+        assert_eq!(
+            read_note(&git_dir, format, &store, &notes_ref, &other).expect("read"),
+            Some(blob_b)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_notes_for_noop_when_missing() {
+        let dir = unique_temp_dir("remove-noop");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let missing =
+            ObjectId::from_hex(format, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").expect("oid");
+
+        let absent = remove_notes_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[target],
+            "heddle: retract",
+            &identity,
+            None,
+        )
+        .expect("remove absent ref");
+        assert_eq!(absent, RemoveNoteOutcome::Unchanged);
+
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob = write_blob(&mut db, br#"{"x":1}"#).expect("blob");
+        upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob,
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("seed");
+        let head = read_notes_head(&store, &notes_ref).expect("head");
+
+        let noop = remove_notes_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[missing],
+            "heddle: retract",
+            &identity,
+            Some(RefTarget::Direct(head)),
+        )
+        .expect("remove missing oid");
+        assert_eq!(noop, RemoveNoteOutcome::Unchanged);
+        assert_eq!(read_notes_head(&store, &notes_ref), Some(head));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_notes_for_batch_single_commit() {
+        let dir = unique_temp_dir("remove-batch");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, _) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let first =
+            ObjectId::from_hex(format, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").expect("oid");
+        let second =
+            ObjectId::from_hex(format, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").expect("oid");
+        let third =
+            ObjectId::from_hex(format, "cccccccccccccccccccccccccccccccccccccccc").expect("oid");
+        let blob_a = write_blob(&mut db, b"a\n").expect("blob");
+        let blob_b = write_blob(&mut db, b"b\n").expect("blob");
+        let blob_c = write_blob(&mut db, b"c\n").expect("blob");
+
+        write_notes(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[
+                Note {
+                    annotated: first,
+                    blob: blob_a,
+                },
+                Note {
+                    annotated: second,
+                    blob: blob_b,
+                },
+                Note {
+                    annotated: third,
+                    blob: blob_c,
+                },
+            ],
+            "seed",
+            &identity,
+            None,
+        )
+        .expect("seed");
+        let head = read_notes_head(&store, &notes_ref).expect("head");
+
+        let RemoveNoteOutcome::Removed { notes_commit } = remove_notes_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &[first, second],
+            "heddle: retract",
+            &identity,
+            Some(RefTarget::Direct(head)),
+        )
+        .expect("batch remove") else {
+            panic!("expected removal");
+        };
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let commit = db.read_object(&notes_commit).expect("read commit");
+        let commit = Commit::parse_ref(format, &commit.body).expect("parse");
+        assert_eq!(commit.parents.len(), 1);
+        assert_eq!(commit.parents[0], head);
+        assert_eq!(
+            list_notes(&git_dir, format, &store, &notes_ref).expect("list").len(),
+            1
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_ops_read_fanout_legacy() {
+        let dir = unique_temp_dir("incremental-fanout");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let blob = write_blob(&mut db, br#"{"legacy":true}"#).expect("blob");
+
+        install_fanout_note(&git_dir, &store, &notes_ref, &target, blob, &identity);
+        let head = read_notes_head(&store, &notes_ref).expect("head");
+        let new_blob = write_blob(&mut db, br#"{"legacy":false}"#).expect("new blob");
+
+        upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            new_blob,
+            "heddle: export",
+            &identity,
+            Some(RefTarget::Direct(head)),
+        )
+        .expect("upsert fanout");
+
+        assert_eq!(
+            read_note_for(&git_dir, format, &store, &notes_ref, &target).expect("read"),
+            Some(new_blob)
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_ops_ff_chain() {
+        let dir = unique_temp_dir("incremental-ff");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (git_dir, target) = init_repo_with_commit(&dir);
+        let format = ObjectFormat::Sha1;
+        let store = FileRefStore::new(&git_dir, format);
+        let notes_ref = heddle_notes_ref();
+        let identity = test_identity();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let other =
+            ObjectId::from_hex(format, "ffffffffffffffffffffffffffffffffffffffff").expect("oid");
+        let blob_a = write_blob(&mut db, br#"{"first":true}"#).expect("blob a");
+        let blob_b = write_blob(&mut db, br#"{"second":true}"#).expect("blob b");
+
+        let UpsertNoteOutcome::Updated { notes_commit: first_commit } = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &target,
+            blob_a,
+            "heddle: export",
+            &identity,
+            None,
+        )
+        .expect("first upsert") else {
+            panic!("expected update");
+        };
+
+        let UpsertNoteOutcome::Updated { notes_commit: second_commit } = upsert_note_for(
+            &git_dir,
+            format,
+            &store,
+            &notes_ref,
+            &other,
+            blob_b,
+            "heddle: export",
+            &identity,
+            Some(RefTarget::Direct(first_commit)),
+        )
+        .expect("second upsert") else {
+            panic!("expected update");
+        };
+
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let object = db.read_object(&second_commit).expect("read commit");
+        let commit = Commit::parse_ref(format, &object.body).expect("parse");
+        assert_eq!(commit.parents, vec![first_commit]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
