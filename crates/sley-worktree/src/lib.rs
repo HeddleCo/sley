@@ -4258,6 +4258,61 @@ pub fn reset_index_and_worktree_to_commit(
     })
 }
 
+/// Materialize a tree object into the index and worktree.
+pub fn checkout_tree_to_index_and_worktree(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<RestoreResult> {
+    let worktree_root = worktree_root.as_ref();
+    let git_dir = git_dir.as_ref();
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let mut target_entries = BTreeMap::new();
+    collect_tree_entries(&db, format, tree_oid, &mut target_entries)?;
+
+    for path in read_index_entries(git_dir, format)?.keys() {
+        if !target_entries.contains_key(path) {
+            remove_worktree_file(worktree_root, path)?;
+        }
+    }
+
+    let mut index_entries = Vec::new();
+    for (path, entry) in &target_entries {
+        let object = db.read_object(&entry.oid)?;
+        if object.object_type != ObjectType::Blob {
+            return Err(GitError::InvalidObject(format!(
+                "expected blob {}, found {}",
+                entry.oid,
+                object.object_type.as_str()
+            )));
+        }
+        let file_path = worktree_path(worktree_root, path)?;
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&file_path, &object.body)?;
+        let metadata = fs::metadata(&file_path)?;
+        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid.clone(), &metadata);
+        index_entry.mode = entry.mode;
+        index_entries.push(index_entry);
+    }
+    index_entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        repository_index_path(git_dir),
+        Index {
+            version: 2,
+            entries: index_entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+    Ok(RestoreResult {
+        restored: target_entries.len(),
+    })
+}
+
 pub fn reset_index_to_commit(
     worktree_root: impl AsRef<Path>,
     git_dir: impl AsRef<Path>,

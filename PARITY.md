@@ -714,6 +714,29 @@ Target: upstream Git 2.54.0.
   objectsize, objectsize:disk, authordate, committerdate, taggerdate, and
   creatordate sorting with local-object requirements and missing-object
   failures, bad sort keys, `--exit-code`, and `--get-url`.
+- Minimal `merge` support for fast-forward and three-way merge from a commit-ish
+  or `FETCH_HEAD`, including `--no-ff`, `--ff-only`, `--quiet`, `-m` /
+  `--message`, conflict index/worktree materialization with `MERGE_HEAD` /
+  `MERGE_MSG` / `ORIG_HEAD` state, `--abort` to restore pre-merge state, and
+  covered usage errors.
+- Minimal `merge --continue` support for concluding in-progress merges after
+  conflict resolution, including unmerged-path rejection, default `MERGE_MSG`
+  reuse with whitespace cleanup, and two-parent merge commit creation.
+- Minimal `pull` support for configured/default remote fetches followed by
+  fast-forward merge, three-way merge, or rebase per `pull.rebase` / `pull.ff`
+  config and `--rebase` / `--no-rebase` / `--ff-only` / `--no-ff` / `--quiet`
+  flags, including `FETCH_HEAD` merge-src marking, divergent-history
+  `ensure_pull_can_merge` rejection when rebase is not configured, and
+  already-up-to-date handling.
+- Minimal `rebase` support for replaying local commits onto an upstream revision,
+  including `rebase-merge` state files (`onto`, `orig-head`, `done`,
+  `git-rebase-todo.backup`), conflict stop with `REBASE_HEAD`, `--abort`
+  restoration to `orig-head`, `--continue` after conflict resolution, `--skip`
+  for conflict steps, and already-up-to-date detection.
+- Minimal in-progress merge/rebase `commit` integration: `commit` during an
+  active merge concludes via `conclude_in_progress_merge`; `commit` during an
+  active rebase concludes the current step via `conclude_rebase_step_via_commit`,
+  including default message from `MERGE_MSG` / rebase step message files.
 - Typed pkt-line data/control-frame encoding and parsing for protocol plumbing,
   including flush, delimiter, and response-end packets plus incremental
   `Read`/`Write` helpers, bounded reads through flush/response-end, protocol
@@ -797,6 +820,7 @@ Target: upstream Git 2.54.0.
   and covered `objects/info/alternates` plus `GIT_ALTERNATE_OBJECT_DIRECTORIES`
   object lookup for `cat-file`,
   `add`, `branch`, `branch -d`, `checkout`, `checkout -b`, `checkout -B`, `clean`, `config`, `commit`, `commit-tree`,
+  `merge`, `merge --abort`, `merge --continue`, `pull`, `rebase`, `rebase --abort`, `rebase --continue`, `rebase --skip`,
   `diff --name-status`, `diff --name-only`, HEAD diff comparison, diff
   `--exit-code` / `--quiet`, diff `-z`, diff `--raw` with abbreviation controls,
   diff `--stat` including `--stat-count` truncation and non-narrowing width aliases, diff
@@ -856,7 +880,15 @@ Target: upstream Git 2.54.0.
   pack/index read/write is not implemented.
 - Broad packed-ref transactions, broad reflog expiration policy/gc, and reftable
   refs are not implemented.
-- Full worktree status/add/checkout flows, diff/merge, sequencer, transport,
+- Broader merge/rebase options (strategy selection, interactive rebase,
+  autostash, squash/fixup replay semantics), broader pull options, and advanced
+  sequencer workflows beyond covered merge/pull/rebase paths are not
+  implemented.
+- Merge/pull post-merge diffstat output after fast-forward and three-way merge
+  (upstream prints stat; sley prints shorter summary) is not implemented.
+- Rebase `Auto-merging` stdout during quiet/non-TTY replay paths may differ from
+  upstream Git.
+- Full worktree status/add/checkout flows, broader diff, transport,
   and porcelain commands are not implemented.
 - Upstream Git test script import is not implemented; the current harness covers
   SHA-1/SHA-256 object hashing, upstream repository config parsing,
@@ -1267,6 +1299,13 @@ Target: upstream Git 2.54.0.
   `--recurse` / `--no-recurse`, `--delete` / `--no-delete`, `--` ref
   separation, and update `-m` / `-m<reason>` option interop with upstream
   `git symbolic-ref`.
+  Rust `merge` interop for fast-forward, three-way, conflict, and `--abort`
+  cases, `merge --continue` after conflict resolution, `pull` fast-forward and
+  three-way merge plus `pull.rebase` / `--rebase` replay, pull conflict
+  abort/continue, pull-rebase conflict continue, `rebase` clean and
+  already-up-to-date cases, rebase conflict abort/continue/skip and multi-commit
+  skip, and `commit` during in-progress merge/rebase conclude paths observed
+  against upstream `git` for covered fixtures.
 - Reftable, broader commit-graph acceleration beyond parent suffixes and split
   graph writing, broader MIDX generation and maintenance integration, bitmaps, broader fetch/clone/push workflows, protocols, broader submodule workflows,
   hooks, filters, and broader maintenance (start/stop/register/scheduled

@@ -53,7 +53,7 @@ pub enum FetchSource {
 }
 
 /// Controls for a [`fetch`] run, mirroring the `git fetch` flags the CLI parses.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct FetchOptions {
     /// Suppress prune notices (deletions still happen; only the [`ProgressSink`]
     /// output is silenced — the caller wires that).
@@ -81,6 +81,9 @@ pub struct FetchOptions {
     /// depth on a local (`file://`/path) fetch is ignored (the in-process server
     /// has no shallow support), matching the CLI's local-clone behavior.
     pub depth: Option<u32>,
+    /// When fetching configured remote refspecs, mark the update whose `src`
+    /// matches this value as eligible for merge in `FETCH_HEAD` (used by `pull`).
+    pub merge_src: Option<String>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -148,7 +151,7 @@ pub struct FetchServices<'a> {
 /// Emits prune notices through `progress` and returns the structured
 /// [`FetchOutcome`]; never prints or returns `GitError::Exit`.
 pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<FetchOutcome> {
-    let mut options = *request.options;
+    let mut options = request.options.clone();
     apply_configured_remote_tag_option(request.config, request.remote_name, &mut options);
     apply_configured_fetch_prune_option(request.config, request.remote_name, &mut options);
     let promisor_remote = request
@@ -404,6 +407,13 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
     if configured_remote_fetch {
         for update in &mut updates {
             update.not_for_merge = true;
+        }
+        if let Some(merge_src) = &options.merge_src {
+            for update in &mut updates {
+                if update.src == *merge_src {
+                    update.not_for_merge = false;
+                }
+            }
         }
     }
     Ok(updates)

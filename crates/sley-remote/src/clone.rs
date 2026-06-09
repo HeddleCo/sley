@@ -267,5 +267,6 @@ fn clone_fetch_options(depth: Option<u32>) -> FetchOptions {
         tag_option_explicit: false,
         prune_option_explicit: false,
         depth,
+        merge_src: None,
     }
 }
