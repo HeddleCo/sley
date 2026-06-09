@@ -3121,6 +3121,16 @@ fn global_replace_objects() -> bool {
         && env::var_os("GIT_NO_REPLACE_OBJECTS").is_none()
 }
 
+pub(crate) fn replace_objects_active(refs: &FileRefStore) -> Result<bool> {
+    if !global_replace_objects() {
+        return Ok(false);
+    }
+    Ok(refs
+        .list_refs()?
+        .iter()
+        .any(|reference| reference.name.starts_with("refs/replace/")))
+}
+
 pub(crate) fn apply_replace_object(refs: &FileRefStore, oid: &ObjectId) -> Result<ObjectId> {
     if !global_replace_objects() {
         return Ok(oid.clone());
@@ -5986,6 +5996,34 @@ fn three_way_merge_trees(
     Ok((results, conflicts))
 }
 
+fn write_merge_result_diffstat(
+    stdout: &mut io::Stdout,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    old_tree: &ObjectId,
+    new_tree: &ObjectId,
+) -> Result<()> {
+    let entries = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        old_tree,
+        new_tree,
+        sley_diff_merge::DiffNameStatusOptions::default(),
+    )?;
+    write_diff_stat(
+        stdout,
+        &entries,
+        db,
+        None,
+        false,
+        DiffStatOptions {
+            compact_summary: false,
+            stat_count: None,
+            color: false,
+        },
+    )
+}
+
 /// Create a merge commit with two parents and advance the current branch (or
 /// detached HEAD) to it, writing a reflog entry.
 fn merge_commit_and_advance(
@@ -6205,12 +6243,18 @@ fn cmd_merge(args: &[String]) -> Result<()> {
             &other_oid,
         )?;
         if !options.quiet {
-            println!(
+            let mut stdout = io::stdout();
+            writeln!(
+                stdout,
                 "Updating {}..{}",
                 format_log_abbrev_oid(&head_oid),
                 format_log_abbrev_oid(&other_oid)
-            );
-            println!("Fast-forward");
+            )?;
+            writeln!(stdout, "Fast-forward")?;
+            let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+            let other_tree = commit_tree_oid(&db, format, &other_oid)?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &other_tree)?;
+            stdout.flush()?;
         }
         return Ok(());
     }
@@ -6307,6 +6351,18 @@ fn cmd_merge(args: &[String]) -> Result<()> {
             return Ok(());
         }
 
+        if !options.quiet {
+            let mut stdout = io::stdout();
+            writeln!(stdout, "Merge made by the 'ort' strategy.")?;
+            write_merge_result_diffstat(
+                &mut stdout,
+                &db,
+                format,
+                &head_tree,
+                &merged_tree,
+            )?;
+            stdout.flush()?;
+        }
         let merged_oid = merge_commit_and_advance(
             &git_dir,
             &refs,
@@ -6322,9 +6378,6 @@ fn cmd_merge(args: &[String]) -> Result<()> {
             format,
             &merged_oid,
         )?;
-        if !options.quiet {
-            println!("Merge made by the 'ort' strategy.");
-        }
         return Ok(());
     }
 
@@ -14082,28 +14135,30 @@ fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetColorBool => {
             let key = parse_config_key(positional[0])?;
-            if let Some(stdout_is_tty) = positional.get(1) {
-                if sley_config::parse_config_bool(stdout_is_tty).is_none() {
-                    eprintln!(
-                        "fatal: bad boolean config value '{stdout_is_tty}' for 'command line'"
-                    );
-                    return Err(GitError::Exit(128));
+            let stdout_tty_hint = match positional.get(1) {
+                Some(stdout_is_tty) => {
+                    let Some(parsed) = sley_config::parse_config_bool(stdout_is_tty) else {
+                        eprintln!(
+                            "fatal: bad boolean config value '{stdout_is_tty}' for 'command line'"
+                        );
+                        return Err(GitError::Exit(128));
+                    };
+                    Some(parsed)
                 }
-                let enabled = config
-                    .get(&key.section, key.subsection.as_deref(), &key.key)
-                    .map(|value| config_colorbool_enabled(&key, value))
-                    .transpose()?
-                    .unwrap_or(false);
+                None => None,
+            };
+            let value = config
+                .get(&key.section, key.subsection.as_deref(), &key.key)
+                .or_else(|| config.get("color", None, "ui"));
+            let setting = match value {
+                Some(value) => config_colorbool_setting(&key, value)?,
+                None => ConfigColorBoolSetting::Auto,
+            };
+            let enabled = config_colorbool_enabled(setting, stdout_tty_hint);
+            if stdout_tty_hint.is_some() {
                 writeln!(io::stdout(), "{enabled}")?;
-            } else {
-                let enabled = config
-                    .get(&key.section, key.subsection.as_deref(), &key.key)
-                    .map(|value| config_colorbool_enabled(&key, value))
-                    .transpose()?
-                    .unwrap_or(false);
-                if !enabled {
-                    return Err(GitError::Exit(1));
-                }
+            } else if !enabled {
+                return Err(GitError::Exit(1));
             }
         }
         ConfigAction::GetUrlMatch => {
@@ -14325,18 +14380,44 @@ fn format_config_default_color_value(value: &str) -> Result<String> {
     })
 }
 
-fn config_colorbool_enabled(key: &ConfigKey, value: &str) -> Result<bool> {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConfigColorBoolSetting {
+    Never,
+    Always,
+    Auto,
+}
+
+fn config_colorbool_setting(key: &ConfigKey, value: &str) -> Result<ConfigColorBoolSetting> {
+    if value.eq_ignore_ascii_case("never") {
+        return Ok(ConfigColorBoolSetting::Never);
+    }
     if value.eq_ignore_ascii_case("always") {
-        return Ok(true);
+        return Ok(ConfigColorBoolSetting::Always);
     }
-    if value.eq_ignore_ascii_case("auto") || sley_config::parse_config_bool(value).is_some() {
-        return Ok(false);
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok(ConfigColorBoolSetting::Auto);
     }
-    eprintln!(
-        "fatal: bad boolean config value '{value}' for '{}'",
-        config_key_name(key)
-    );
-    Err(GitError::Exit(128))
+    match sley_config::parse_config_bool(value) {
+        Some(false) => Ok(ConfigColorBoolSetting::Never),
+        Some(true) => Ok(ConfigColorBoolSetting::Auto),
+        None => {
+            eprintln!(
+                "fatal: bad boolean config value '{value}' for '{}'",
+                config_key_name(key)
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+fn config_colorbool_enabled(setting: ConfigColorBoolSetting, stdout_is_tty: Option<bool>) -> bool {
+    match setting {
+        ConfigColorBoolSetting::Never => false,
+        ConfigColorBoolSetting::Always => true,
+        ConfigColorBoolSetting::Auto => {
+            stdout_is_tty.unwrap_or_else(|| io::stdout().is_terminal())
+        }
+    }
 }
 
 fn format_config_color_value(value: &str) -> Result<String> {

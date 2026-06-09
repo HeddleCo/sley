@@ -324,6 +324,14 @@ impl RepositoryObjectView {
     fn all_object_ids(&self) -> Result<Vec<ObjectId>> {
         self.db().object_ids()
     }
+
+    fn resolve_object_name(&self, name: &str) -> Result<ObjectId> {
+        let format = self.format();
+        if name.len() == format.hex_len() && name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return ObjectId::from_hex(format, name);
+        }
+        self.resolve(name)
+    }
 }
 
 struct ObjectQuery<'a> {
@@ -415,6 +423,7 @@ impl CatFileBatchRequest {
 
     fn run_batch(&self, check_only: bool) -> Result<()> {
         let view = RepositoryObjectView::discover()?;
+        let apply_replace = replace_objects_active(view.repo.refs())?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
         let records = if self.batch_all_objects {
             view.all_object_ids()?
@@ -439,6 +448,7 @@ impl CatFileBatchRequest {
                     batch_format: batch_format.as_ref(),
                     check_only,
                     terminator,
+                    apply_replace,
                 },
             )?;
         }
@@ -448,6 +458,7 @@ impl CatFileBatchRequest {
 
     fn run_command(&self) -> Result<()> {
         let view = RepositoryObjectView::discover()?;
+        let apply_replace = replace_objects_active(view.repo.refs())?;
         let batch_format = self.format.as_deref().map(CatFileBatchFormat::parse);
         let mut input = Vec::new();
         io::stdin().read_to_end(&mut input)?;
@@ -473,6 +484,7 @@ impl CatFileBatchRequest {
                         batch_format: batch_format.as_ref(),
                         check_only: true,
                         terminator,
+                        apply_replace,
                     },
                 )?;
                 continue;
@@ -487,6 +499,7 @@ impl CatFileBatchRequest {
                         batch_format: batch_format.as_ref(),
                         check_only: false,
                         terminator,
+                        apply_replace,
                     },
                 )?;
                 continue;
@@ -523,6 +536,7 @@ struct CatFileBatchRecord<'a> {
     batch_format: Option<&'a CatFileBatchFormat<'a>>,
     check_only: bool,
     terminator: u8,
+    apply_replace: bool,
 }
 
 fn print_cat_file_batch_record(
@@ -533,12 +547,16 @@ fn print_cat_file_batch_record(
         view: record.view,
         name: record.object_name,
     };
-    let Ok(oid) = record.view.resolve(record.object_name) else {
+    let Ok(oid) = record.view.resolve_object_name(record.object_name) else {
         write!(stdout, "{} missing", record.object_name)?;
         stdout.write_all(&[record.terminator])?;
         return Ok(());
     };
-    let read_oid = record.view.replacement_oid(&oid)?;
+    let read_oid = if record.apply_replace {
+        record.view.replacement_oid(&oid)?
+    } else {
+        oid.clone()
+    };
     let object_mode = if record
         .batch_format
         .is_some_and(|format| format.needs_object_mode())
