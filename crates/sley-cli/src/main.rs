@@ -1,11 +1,17 @@
-use sley_core::GitError;
+use sley_core::{cli_exit_code, GitError};
 
 fn main() {
     if let Err(err) = sley_cli::run(std::env::args().skip(1).collect()) {
-        if let GitError::Exit(code) = err {
-            std::process::exit(code);
-        }
-        eprintln!("sley: {err}");
-        std::process::exit(1);
+        report_cli_error(&err);
+        std::process::exit(cli_exit_code(&err));
+    }
+}
+
+fn report_cli_error(err: &GitError) {
+    match err {
+        // Message was already printed by the command (e.g. `usage_error` in args.rs).
+        GitError::Exit(_) => {}
+        GitError::Cli(_, msg) => eprintln!("sley: {msg}"),
+        _ => eprintln!("sley: {err}"),
     }
 }

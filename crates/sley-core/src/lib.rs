@@ -697,6 +697,30 @@ impl fmt::Display for NotFoundKind {
     }
 }
 
+/// Git-compatible CLI exit status. See `git help exit-code` for the upstream taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliExit {
+    /// Success (exit 0).
+    Ok,
+    /// User-facing fatal error (exit 128).
+    UserError,
+    /// Invalid usage / bad arguments (exit 129).
+    Usage,
+    /// Command-specific exit code (e.g. grep returning 1 when no matches).
+    Custom(i32),
+}
+
+impl CliExit {
+    pub const fn code(self) -> i32 {
+        match self {
+            Self::Ok => 0,
+            Self::UserError => 128,
+            Self::Usage => 129,
+            Self::Custom(code) => code,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
     Io(String),
@@ -708,6 +732,9 @@ pub enum GitError {
     NotFound(NotFoundKind),
     Transaction(String),
     Command(String),
+    /// Typed CLI exit with a user-facing message printed by the binary entrypoint.
+    Cli(CliExit, String),
+    /// Legacy explicit exit code; the message (if any) was already printed by the command.
     Exit(i32),
 }
 
@@ -725,6 +752,7 @@ impl fmt::Display for GitError {
             Self::NotFound(kind) => write!(f, "not found: {kind}"),
             Self::Transaction(msg) => write!(f, "transaction failed: {msg}"),
             Self::Command(msg) => write!(f, "command failed: {msg}"),
+            Self::Cli(_, msg) => f.write_str(msg),
             Self::Exit(code) => write!(f, "exit {code}"),
         }
     }
@@ -733,6 +761,22 @@ impl fmt::Display for GitError {
 impl Error for GitError {}
 
 impl GitError {
+    pub fn usage(msg: impl Into<String>) -> Self {
+        Self::Cli(CliExit::Usage, msg.into())
+    }
+
+    pub fn user_error(msg: impl Into<String>) -> Self {
+        Self::Cli(CliExit::UserError, msg.into())
+    }
+
+    pub fn cli_exit(kind: CliExit, msg: impl Into<String>) -> Self {
+        Self::Cli(kind, msg.into())
+    }
+
+    pub fn cli_exit_code(&self) -> i32 {
+        cli_exit_code(self)
+    }
+
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(NotFoundKind::Message(msg.into()))
     }
@@ -764,6 +808,18 @@ impl GitError {
 impl From<std::io::Error> for GitError {
     fn from(value: std::io::Error) -> Self {
         Self::Io(value.to_string())
+    }
+}
+
+/// Map a [`GitError`] to the process exit code the CLI should use.
+pub fn cli_exit_code(err: &GitError) -> i32 {
+    match err {
+        GitError::Exit(code) => *code,
+        GitError::Cli(kind, _) => kind.code(),
+        // During migration, usage-style validation still returns `Command`; treat as
+        // general failure until those call sites adopt `GitError::usage`.
+        GitError::Command(_) => 1,
+        _ => 1,
     }
 }
 
@@ -1317,6 +1373,35 @@ mod tests {
         assert!(FullName::new("refs/heads/main ").is_err());
         assert!(FullName::new("refs//heads/main").is_err());
         assert!(FullName::new("refs/heads/\nmain").is_err());
+    }
+
+    #[test]
+    fn cli_exit_codes_match_git_taxonomy() {
+        assert_eq!(CliExit::Ok.code(), 0);
+        assert_eq!(CliExit::UserError.code(), 128);
+        assert_eq!(CliExit::Usage.code(), 129);
+        assert_eq!(CliExit::Custom(1).code(), 1);
+        assert_eq!(CliExit::Custom(5).code(), 5);
+    }
+
+    #[test]
+    fn git_error_cli_exit_code_mapping() {
+        assert_eq!(GitError::Exit(129).cli_exit_code(), 129);
+        assert_eq!(GitError::Exit(128).cli_exit_code(), 128);
+        assert_eq!(GitError::usage("unknown option").cli_exit_code(), 129);
+        assert_eq!(GitError::user_error("not a git repository").cli_exit_code(), 128);
+        assert_eq!(
+            GitError::cli_exit(CliExit::Custom(2), "diff found changes").cli_exit_code(),
+            2
+        );
+        assert_eq!(GitError::Command("bad value".into()).cli_exit_code(), 1);
+        assert_eq!(GitError::not_found("missing ref").cli_exit_code(), 1);
+    }
+
+    #[test]
+    fn git_error_cli_displays_message_only() {
+        let err = GitError::usage("unknown option `--foo'");
+        assert_eq!(err.to_string(), "unknown option `--foo'");
     }
 
     #[test]
