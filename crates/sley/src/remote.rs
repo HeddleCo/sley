@@ -184,7 +184,11 @@ impl Repository {
     /// or the parent of `.git` for a bare repository, or `git_dir` as fallback.
     pub(crate) fn remote_relative_base(&self) -> std::path::PathBuf {
         self.workdir().unwrap_or_else(|| {
-            if self.git_dir().file_name().is_some_and(|name| name == ".git") {
+            if self
+                .git_dir()
+                .file_name()
+                .is_some_and(|name| name == ".git")
+            {
                 self.git_dir()
                     .parent()
                     .map(Path::to_path_buf)

@@ -68,13 +68,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
         "status differed for {args:?}"
     );
     assert_eq!(
-        actual.stdout, expected.stdout,
+        actual.stdout,
+        expected.stdout,
         "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout)
     );
     assert_eq!(
-        actual.stderr, expected.stderr,
+        actual.stderr,
+        expected.stderr,
         "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&expected.stderr)
@@ -82,22 +84,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_conflict_origin(origin: &Path) {
@@ -120,7 +108,10 @@ fn prepare_conflict_clone(origin: &Path, clone: &Path) {
     let origin_arg = origin.to_str().expect("origin path is utf8");
     git(clone, &["remote", "add", "origin", origin_arg]);
     git(clone, &["fetch", "origin", "-q"]);
-    git(clone, &["branch", "--set-upstream-to=origin/master", "master"]);
+    git(
+        clone,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
     git(clone, &["config", "pull.rebase", "true"]);
     fs::write(clone.join("conflict.txt"), b"local\n").expect("write local file");
     git(clone, &["add", "conflict.txt"]);
@@ -176,67 +167,72 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_origin(&origin);
-        prepare_conflict_clone(&origin, &upstream);
-        prepare_conflict_clone(&origin, &rust);
+    prepare_conflict_origin(&origin);
+    prepare_conflict_clone(&origin, &upstream);
+    prepare_conflict_clone(&origin, &rust);
 
-        let upstream_pre_pull = start_conflict_pull_rebase("git", &upstream);
-        let rust_pre_pull = start_conflict_pull_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
-        assert_eq!(upstream_pre_pull, rust_pre_pull, "pre-pull HEAD differed");
+    let upstream_pre_pull = start_conflict_pull_rebase("git", &upstream);
+    let rust_pre_pull = start_conflict_pull_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    assert_eq!(upstream_pre_pull, rust_pre_pull, "pre-pull HEAD differed");
 
-        resolve_conflict(&upstream);
-        resolve_conflict(&rust);
+    resolve_conflict(&upstream);
+    resolve_conflict(&rust);
 
-        let args = ["rebase", "--continue"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["rebase", "--continue"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
 
-        assert!(
-            !upstream.join(".git/rebase-merge").exists(),
-            "upstream rebase-merge should be removed"
-        );
-        assert!(
-            !rust.join(".git/rebase-merge").exists(),
-            "git-rs rebase-merge should be removed"
-        );
-        assert_eq!(
-            upstream.join(".git/REBASE_HEAD").is_file(),
-            rust.join(".git/REBASE_HEAD").is_file(),
-            "REBASE_HEAD presence differed after rebase --continue"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after rebase --continue"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "--oneline"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
-            "log order differed after rebase --continue"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "master"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
-            "master branch differed after rebase --continue"
-        );
-        assert_eq!(
-            fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
-            fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
-            "worktree content differed after rebase --continue"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "-1", "--format=%s"]).stdout,
-            "latest commit subject differed after rebase --continue"
-        );
-        let upstream_pre_pull_parent =
-            String::from_utf8(run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout)
-                .expect("upstream parents utf8");
-        assert_eq!(
-            upstream_pre_pull_parent.split_whitespace().count(),
-            1,
-            "rebased commit should have a single parent"
-        );
+    assert!(
+        !upstream.join(".git/rebase-merge").exists(),
+        "upstream rebase-merge should be removed"
+    );
+    assert!(
+        !rust.join(".git/rebase-merge").exists(),
+        "git-rs rebase-merge should be removed"
+    );
+    assert_eq!(
+        upstream.join(".git/REBASE_HEAD").is_file(),
+        rust.join(".git/REBASE_HEAD").is_file(),
+        "REBASE_HEAD presence differed after rebase --continue"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after rebase --continue"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "--oneline"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
+        "log order differed after rebase --continue"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "master"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
+        "master branch differed after rebase --continue"
+    );
+    assert_eq!(
+        fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
+        fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
+        "worktree content differed after rebase --continue"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
+        "latest commit subject differed after rebase --continue"
+    );
+    let upstream_pre_pull_parent =
+        String::from_utf8(run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout)
+            .expect("upstream parents utf8");
+    assert_eq!(
+        upstream_pre_pull_parent.split_whitespace().count(),
+        1,
+        "rebased commit should have a single parent"
+    );
     let _ = fs::remove_dir_all(&root);
 }

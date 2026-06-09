@@ -832,40 +832,54 @@ mod tests {
     #[test]
     fn incompatible_cmd_and_batch_modes_exit_129() {
         let args = vec!["-e".to_string(), "--batch".to_string()];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 
     #[test]
     fn incompatible_cmd_modes_exit_129() {
         let args = vec!["-e".to_string(), "-p".to_string(), "HEAD".to_string()];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 
     #[test]
     fn missing_object_argument_exits_129() {
         let args = vec!["-e".to_string()];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 
     #[test]
     fn too_many_arguments_exit_129() {
-        let args = vec![
-            "-e".to_string(),
-            "HEAD".to_string(),
-            "extra".to_string(),
-        ];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        let args = vec!["-e".to_string(), "HEAD".to_string(), "extra".to_string()];
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 
     #[test]
     fn batch_mode_with_positional_argument_exits_129() {
         let args = vec!["--batch".to_string(), "HEAD".to_string()];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 
     #[test]
     fn option_with_unexpected_value_exits_129() {
         let args = vec!["--textconv=value".to_string(), "HEAD".to_string()];
-        assert!(matches!(CatFileInvocation::parse(&args), Err(GitError::Exit(129))));
+        assert!(matches!(
+            CatFileInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 }

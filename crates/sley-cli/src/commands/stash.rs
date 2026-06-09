@@ -1184,6 +1184,8 @@ fn create_stash_commit(
                 ignored_only: false,
                 exclude_patterns: Vec::new(),
                 exclude_per_directory: Vec::new(),
+                pathspecs: Vec::new(),
+                rollup_untracked_files_to_directories: false,
             },
         )?
     } else {

@@ -5,7 +5,7 @@
 //! eval "$(cargo run -p sley-bench --example setup_fixtures 2>/dev/null)"
 //! ```
 
-use sley_bench::{create_commit_fixture, create_fixture, BenchFixture, FIXTURE_OBJECT_COUNT};
+use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_commit_fixture, create_fixture};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -31,12 +31,18 @@ fn main() {
     let commit = create_commit_fixture().expect("commit fixture");
     let batch_file = write_batch_file(&pack).expect("batch oid file");
 
-    export("SLEY_BENCH_PACK_REPO", &pack.repo_root.display().to_string());
+    export(
+        "SLEY_BENCH_PACK_REPO",
+        &pack.repo_root.display().to_string(),
+    );
     export(
         "SLEY_BENCH_PACK_SAMPLE_OID",
         &pack.sample_oid.to_hex().to_string(),
     );
-    export("SLEY_BENCH_PACK_BATCH_FILE", &batch_file.display().to_string());
+    export(
+        "SLEY_BENCH_PACK_BATCH_FILE",
+        &batch_file.display().to_string(),
+    );
     export(
         "SLEY_BENCH_COMMIT_REPO",
         &commit.repo_root.display().to_string(),

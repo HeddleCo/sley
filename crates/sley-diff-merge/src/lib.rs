@@ -1752,7 +1752,9 @@ fn detect_exact_copies(
                 status: NameStatus::Copied(100),
                 path: entry.path,
                 old_path: Some(old_path.clone().into()),
-                old_mode: left_entries.get(old_path.as_slice()).map(|entry| entry.mode),
+                old_mode: left_entries
+                    .get(old_path.as_slice())
+                    .map(|entry| entry.mode),
                 new_mode: entry.new_mode,
                 old_oid: left_entries.get(old_path.as_slice()).map(|entry| entry.oid),
                 new_oid: entry.new_oid,
@@ -1914,7 +1916,14 @@ fn detect_inexact_renames(
             // The destination becomes a rename from the matched source. Pull the
             // old-side metadata from the snapshot; the new-side metadata stays as
             // the destination's.
-            let meta = source_meta.get(src_idx).cloned().unwrap_or(RenameSourceMeta { path: BString::default(), mode: None, oid: None });
+            let meta = source_meta
+                .get(src_idx)
+                .cloned()
+                .unwrap_or(RenameSourceMeta {
+                    path: BString::default(),
+                    mode: None,
+                    oid: None,
+                });
             result.push(NameStatusEntry {
                 status: NameStatus::Renamed(*score),
                 path: entry.path,
@@ -2175,7 +2184,11 @@ fn diff_entry_sort_path(entry: &NameStatusEntry) -> &[u8] {
     if matches!(entry.status, NameStatus::Copied(_)) {
         entry.path.as_bytes()
     } else {
-        entry.old_path.as_ref().map(|p| p.as_bytes()).unwrap_or_else(|| entry.path.as_bytes())
+        entry
+            .old_path
+            .as_ref()
+            .map(|p| p.as_bytes())
+            .unwrap_or_else(|| entry.path.as_bytes())
     }
 }
 

@@ -66,13 +66,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
         "status differed for {args:?}"
     );
     assert_eq!(
-        actual.stdout, expected.stdout,
+        actual.stdout,
+        expected.stdout,
         "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout)
     );
     assert_eq!(
-        actual.stderr, expected.stderr,
+        actual.stderr,
+        expected.stderr,
         "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&expected.stderr)
@@ -80,22 +82,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
@@ -161,61 +149,74 @@ fn commit_during_resolved_rebase_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_repos(&upstream, &rust);
-        let upstream_pre_rebase = topic_head("git", &upstream);
-        let rust_pre_rebase = topic_head(env!("CARGO_BIN_EXE_sley"), &rust);
-        assert_eq!(upstream_pre_rebase, rust_pre_rebase, "pre-rebase topic differed");
-        start_conflict_rebase("git", &upstream);
-        start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
-        resolve_conflict(&upstream);
-        resolve_conflict(&rust);
+    prepare_conflict_repos(&upstream, &rust);
+    let upstream_pre_rebase = topic_head("git", &upstream);
+    let rust_pre_rebase = topic_head(env!("CARGO_BIN_EXE_sley"), &rust);
+    assert_eq!(
+        upstream_pre_rebase, rust_pre_rebase,
+        "pre-rebase topic differed"
+    );
+    start_conflict_rebase("git", &upstream);
+    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    resolve_conflict(&upstream);
+    resolve_conflict(&rust);
 
-        let args = ["commit", "-m", "resolved topic"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["commit", "-m", "resolved topic"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
 
-        assert!(
-            upstream.join(".git/rebase-merge").is_dir(),
-            "upstream rebase-merge should remain"
-        );
-        assert!(
-            rust.join(".git/rebase-merge").is_dir(),
-            "git-rs rebase-merge should remain"
-        );
-        assert!(
-            upstream.join(".git/REBASE_HEAD").is_file(),
-            "upstream REBASE_HEAD should remain"
-        );
-        assert!(
-            rust.join(".git/REBASE_HEAD").is_file(),
-            "git-rs REBASE_HEAD should remain"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after commit during rebase"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "topic"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "topic"]).stdout,
-            "topic branch should remain at pre-rebase commit"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "-1", "--format=%s"]).stdout,
-            "commit subject differed"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "-1", "--format=%P"]).stdout,
-            "commit parents differed"
-        );
-        assert_eq!(
-            fs::read(upstream.join("c.txt")).expect("read upstream c file"),
-            fs::read(rust.join("c.txt")).expect("read rust c file"),
-            "worktree content differed after commit during rebase"
-        );
+    assert!(
+        upstream.join(".git/rebase-merge").is_dir(),
+        "upstream rebase-merge should remain"
+    );
+    assert!(
+        rust.join(".git/rebase-merge").is_dir(),
+        "git-rs rebase-merge should remain"
+    );
+    assert!(
+        upstream.join(".git/REBASE_HEAD").is_file(),
+        "upstream REBASE_HEAD should remain"
+    );
+    assert!(
+        rust.join(".git/REBASE_HEAD").is_file(),
+        "git-rs REBASE_HEAD should remain"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after commit during rebase"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "topic"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "topic"]).stdout,
+        "topic branch should remain at pre-rebase commit"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
+        "commit subject differed"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["log", "-1", "--format=%P"]
+        )
+        .stdout,
+        "commit parents differed"
+    );
+    assert_eq!(
+        fs::read(upstream.join("c.txt")).expect("read upstream c file"),
+        fs::read(rust.join("c.txt")).expect("read rust c file"),
+        "worktree content differed after commit during rebase"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -226,13 +227,13 @@ fn commit_during_rebase_with_unmerged_entries_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_repos(&upstream, &rust);
-        start_conflict_rebase("git", &upstream);
-        start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
+    prepare_conflict_repos(&upstream, &rust);
+    start_conflict_rebase("git", &upstream);
+    start_conflict_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
 
-        let args = ["commit", "-m", "resolved topic"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["commit", "-m", "resolved topic"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }

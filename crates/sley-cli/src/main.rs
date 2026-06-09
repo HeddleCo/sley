@@ -1,4 +1,4 @@
-use sley_core::{cli_exit_code, GitError};
+use sley_core::{GitError, cli_exit_code};
 
 fn main() {
     if let Err(err) = sley_cli::run(std::env::args().skip(1).collect()) {

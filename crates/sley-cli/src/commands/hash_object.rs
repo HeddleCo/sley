@@ -193,7 +193,9 @@ impl HashObjectInvocation {
                     "object-format" => {
                         let value = match option.value() {
                             Some(value) => value,
-                            None => args.next_required_value(|| switch_requires_value("object-format"))?,
+                            None => {
+                                args.next_required_value(|| switch_requires_value("object-format"))?
+                            }
                         };
                         invocation.set_explicit_format(value)?;
                     }

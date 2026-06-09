@@ -1389,7 +1389,10 @@ mod tests {
         assert_eq!(GitError::Exit(129).cli_exit_code(), 129);
         assert_eq!(GitError::Exit(128).cli_exit_code(), 128);
         assert_eq!(GitError::usage("unknown option").cli_exit_code(), 129);
-        assert_eq!(GitError::user_error("not a git repository").cli_exit_code(), 128);
+        assert_eq!(
+            GitError::user_error("not a git repository").cli_exit_code(),
+            128
+        );
         assert_eq!(
             GitError::cli_exit(CliExit::Custom(2), "diff found changes").cli_exit_code(),
             2

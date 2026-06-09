@@ -656,11 +656,7 @@ where
         let Ok(object) = reader.read_object(oid) else {
             continue;
         };
-        unreachable.push((
-            *oid,
-            object.object_type,
-            object_links(format, &object),
-        ));
+        unreachable.push((*oid, object.object_type, object_links(format, &object)));
     }
 
     if only_tips {

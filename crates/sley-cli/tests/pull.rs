@@ -60,22 +60,8 @@ fn git_with_identity(cwd: &Path, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_pull_clone(upstream: &Path, clone: &Path) {
@@ -87,7 +73,10 @@ fn prepare_pull_clone(upstream: &Path, clone: &Path) {
     let upstream_arg = upstream.to_str().expect("upstream path is utf8");
     git(clone, &["remote", "add", "origin", upstream_arg]);
     git(clone, &["fetch", "origin", "-q"]);
-    git(clone, &["branch", "--set-upstream-to=origin/master", "master"]);
+    git(
+        clone,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
     git(clone, &["config", "pull.rebase", "false"]);
 }
 
@@ -145,29 +134,32 @@ fn pull_fast_forward_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-            prepare_fast_forward_upstream(&upstream);
-        prepare_fast_forward_clone(&upstream, &expected);
-        prepare_fast_forward_clone(&upstream, &actual);
-        let args = ["pull"];
-        let expected_output = run_output_with_identity("git", &expected, &args);
-        let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-        assert_eq!(
-            actual_output.status.code(),
-            expected_output.status.code(),
-            "status differed for pull fast-forward"
-        );
-        assert!(
-            actual_output.status.success(),
-            "sley pull failed: {}",
-            String::from_utf8_lossy(&actual_output.stderr)
-        );
-        let actual_stdout = String::from_utf8_lossy(&actual_output.stdout);
-        assert!(actual_stdout.contains("Fast-forward"), "expected Fast-forward in output");
-        assert_eq!(
-            run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after fast-forward pull"
-        );
+    prepare_fast_forward_upstream(&upstream);
+    prepare_fast_forward_clone(&upstream, &expected);
+    prepare_fast_forward_clone(&upstream, &actual);
+    let args = ["pull"];
+    let expected_output = run_output_with_identity("git", &expected, &args);
+    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    assert_eq!(
+        actual_output.status.code(),
+        expected_output.status.code(),
+        "status differed for pull fast-forward"
+    );
+    assert!(
+        actual_output.status.success(),
+        "sley pull failed: {}",
+        String::from_utf8_lossy(&actual_output.stderr)
+    );
+    let actual_stdout = String::from_utf8_lossy(&actual_output.stdout);
+    assert!(
+        actual_stdout.contains("Fast-forward"),
+        "expected Fast-forward in output"
+    );
+    assert_eq!(
+        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after fast-forward pull"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -180,30 +172,30 @@ fn pull_three_way_clean_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-            prepare_three_way_upstream(&upstream);
-        prepare_three_way_clone(&upstream, &expected);
-        prepare_three_way_clone(&upstream, &actual);
-        let args = ["pull"];
-        let expected_output = run_output_with_identity("git", &expected, &args);
-        let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-        assert_eq!(
-            actual_output.status.code(),
-            expected_output.status.code(),
-            "status differed for pull three-way"
-        );
-        assert!(
-            actual_output.status.success(),
-            "sley pull failed: {}",
-            String::from_utf8_lossy(&actual_output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&actual_output.stdout).contains("ort"),
-            "expected ort merge summary in output"
-        );
-        assert_eq!(
-            run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after three-way pull"
-        );
+    prepare_three_way_upstream(&upstream);
+    prepare_three_way_clone(&upstream, &expected);
+    prepare_three_way_clone(&upstream, &actual);
+    let args = ["pull"];
+    let expected_output = run_output_with_identity("git", &expected, &args);
+    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    assert_eq!(
+        actual_output.status.code(),
+        expected_output.status.code(),
+        "status differed for pull three-way"
+    );
+    assert!(
+        actual_output.status.success(),
+        "sley pull failed: {}",
+        String::from_utf8_lossy(&actual_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&actual_output.stdout).contains("ort"),
+        "expected ort merge summary in output"
+    );
+    assert_eq!(
+        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after three-way pull"
+    );
     let _ = fs::remove_dir_all(&root);
 }

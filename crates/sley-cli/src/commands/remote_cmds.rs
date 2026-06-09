@@ -1,6 +1,8 @@
 //! Remote operations: clone, fetch, push, ls-remote, and `git remote` subcommands.
 
-use crate::commands::config_cmd::{config_set_value, parse_config_key, ConfigKey, SimpleConfigRegex};
+use crate::commands::config_cmd::{
+    ConfigKey, SimpleConfigRegex, config_set_value, parse_config_key,
+};
 use crate::remote::{
     remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
     rewrite_url_with_config,
@@ -1620,7 +1622,9 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
             .strip_prefix("refs/heads/")
             .map(str::to_string)
             .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
-        Some(RefTarget::Direct(_)) | None => Err(GitError::reference_not_found("remote HEAD branch")),
+        Some(RefTarget::Direct(_)) | None => {
+            Err(GitError::reference_not_found("remote HEAD branch"))
+        }
     }
 }
 
@@ -2088,7 +2092,6 @@ fn configure_push_upstreams(
     write_repo_config(git_dir, &config)
 }
 
-
 pub(crate) fn fetch_bundle(
     git_dir: &Path,
     format: ObjectFormat,
@@ -2326,7 +2329,6 @@ enum LsRemoteSort {
     CreatorDate,
     CreatorDateDescending,
 }
-
 
 pub(crate) fn cmd_ls_remote(args: &[String]) -> Result<()> {
     let options = parse_ls_remote_options(args)?;
@@ -3547,7 +3549,9 @@ pub(crate) fn cmd_remote_set_head(args: &[String]) -> Result<()> {
     validate_remote_branch_name(branch)?;
     let target = format!("refs/remotes/{name}/{branch}");
     if store.read_ref(&target)?.is_none() {
-        return Err(GitError::reference_not_found(format!("remote ref {target}")));
+        return Err(GitError::reference_not_found(format!(
+            "remote ref {target}"
+        )));
     }
     let mut tx = store.transaction();
     tx.update(RefUpdate {
@@ -3579,7 +3583,9 @@ fn discover_local_remote_head_branch(
             .strip_prefix("refs/heads/")
             .map(str::to_string)
             .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
-        Some(RefTarget::Direct(_)) | None => Err(GitError::reference_not_found("remote HEAD branch")),
+        Some(RefTarget::Direct(_)) | None => {
+            Err(GitError::reference_not_found("remote HEAD branch"))
+        }
     }
 }
 

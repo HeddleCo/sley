@@ -2807,11 +2807,7 @@ fn plan_pack_deltas(
     let mut external_indexes: Vec<(ObjectId, ObjectType, DeltaIndex<'_>)> =
         Vec::with_capacity(options.thin_bases.len());
     for (oid, object) in &options.thin_bases {
-        external_indexes.push((
-            *oid,
-            object.object_type,
-            DeltaIndex::new(&object.body),
-        ));
+        external_indexes.push((*oid, object.object_type, DeltaIndex::new(&object.body)));
     }
 
     // Chain depth ending at each object (0 = undeltified). Used to keep delta
@@ -4544,12 +4540,8 @@ mod tests {
         .expect("test operation should succeed");
         let pack_checksum = sley_core::digest_bytes(ObjectFormat::Sha1, b"pack")
             .expect("test operation should succeed");
-        let index = single_entry_index_v1(
-            ObjectFormat::Sha1,
-            oid,
-            0x1234_5678,
-            pack_checksum.clone(),
-        );
+        let index =
+            single_entry_index_v1(ObjectFormat::Sha1, oid, 0x1234_5678, pack_checksum.clone());
         let parsed =
             PackIndex::parse(&index, ObjectFormat::Sha1).expect("test operation should succeed");
         assert_eq!(parsed.version, 1);

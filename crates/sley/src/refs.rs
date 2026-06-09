@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use sley_refs::{RefUpdate, ReflogEntry, RefTarget};
+use sley_refs::{RefTarget, RefUpdate, ReflogEntry};
 
 use crate::{FullName, GitError, Repository, Result};
 
@@ -68,10 +68,7 @@ impl RefConflict {
             GitError::Transaction(message) => {
                 let ref_name = extract_ref_name_from_transaction(&message)
                     .unwrap_or_else(|| "unknown".to_string());
-                Self {
-                    ref_name,
-                    message,
-                }
+                Self { ref_name, message }
             }
             other => Self {
                 ref_name: "unknown".to_string(),
@@ -84,9 +81,10 @@ impl RefConflict {
 fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
     for prefix in ["expected ref ", "ref ", "could not lock ref "] {
         if let Some(rest) = message.strip_prefix(prefix)
-            && let Some(name) = rest.split_whitespace().next() {
-                return Some(name.to_string());
-            }
+            && let Some(name) = rest.split_whitespace().next()
+        {
+            return Some(name.to_string());
+        }
     }
     None
 }
@@ -143,7 +141,10 @@ mod tests {
         }
     }
 
-    fn write_commit(repo: &Repository, parent: Option<&sley_core::ObjectId>) -> sley_core::ObjectId {
+    fn write_commit(
+        repo: &Repository,
+        parent: Option<&sley_core::ObjectId>,
+    ) -> sley_core::ObjectId {
         let mut db = repo.objects_mut();
         let blob_oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"x\n".to_vec()))
@@ -180,9 +181,12 @@ mod tests {
             .expect("branch");
         let b = write_commit(&repo, Some(&a));
 
-        repo.apply_ref_changes(&[RefChange::new("refs/heads/feature", RefTarget::Direct(a.clone()))
-            .expect("valid ref name")])
-        .expect("create branch");
+        repo.apply_ref_changes(&[RefChange::new(
+            "refs/heads/feature",
+            RefTarget::Direct(a.clone()),
+        )
+        .expect("valid ref name")])
+            .expect("create branch");
 
         let feature = repo
             .find_reference("refs/heads/feature")

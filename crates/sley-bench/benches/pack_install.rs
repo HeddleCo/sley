@@ -4,8 +4,8 @@
 //! cargo bench -p sley-bench --bench pack_install -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use sley_bench::{build_blob_pack, create_pack_install_target, FIXTURE_OBJECT_COUNT};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use sley_bench::{FIXTURE_OBJECT_COUNT, build_blob_pack, create_pack_install_target};
 use sley_odb::FileObjectDatabase;
 use sley_pack::PackWrite;
 use std::sync::OnceLock;

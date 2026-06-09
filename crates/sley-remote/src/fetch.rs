@@ -20,16 +20,16 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
 use sley_config::GitConfig;
+use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_odb::{FileObjectDatabase, collect_reachable_object_ids};
+#[cfg(feature = "http")]
+use sley_protocol::ProtocolVersion;
 use sley_protocol::{
     FetchHeadRecord, FetchRefUpdate, RefAdvertisement, RefSpec, encode_fetch_head,
     fetch_ref_updates_to_fetch_head, parse_refspec, plan_fetch_ref_updates, refspec_map_source,
 };
-#[cfg(feature = "http")]
-use sley_protocol::ProtocolVersion;
 use sley_refs::{BundleRefUpdate, FileRefStore, Ref, RefTarget};
 use sley_transport::RemoteUrl;
 
@@ -825,5 +825,3 @@ fn remote_tracking_branch_names(refs: &[Ref], name: &str) -> Vec<String> {
         .into_iter()
         .collect()
 }
-
-

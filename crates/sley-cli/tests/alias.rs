@@ -75,7 +75,13 @@ fn alias_init_via_config_matches_upstream_git_outside_repo() {
                 .env_remove("GIT_CONFIG_SYSTEM")
                 .env_remove("XDG_CONFIG_HOME")
                 .env_remove("HOME")
-                .args(["config", "--file", config_path.to_str().expect("utf8 path"), "alias.aliasedinit", "init"])
+                .args([
+                    "config",
+                    "--file",
+                    config_path.to_str().expect("utf8 path"),
+                    "alias.aliasedinit",
+                    "init",
+                ])
                 .output()
                 .unwrap_or_else(|err| panic!("failed to run {program} config: {err}"));
             assert!(

@@ -30,8 +30,7 @@ impl Repository {
                         .entries
                         .iter()
                         .all(|entry| entry.preamble.is_empty() && entry.comment.is_none())
-            })
-        {
+            }) {
             config.to_canonical_bytes()
         } else {
             config.to_preserved_bytes()
@@ -43,8 +42,7 @@ impl Repository {
     /// Add `[remote "<name>"]` with `url` and the default fetch refspec.
     pub fn add_remote(&self, name: &str, url: &str) -> Result<()> {
         let mut config = self.load_repo_config()?;
-        remotes::add_remote_with_fetch(&mut config, name, url, &[])
-            .map_err(remote_edit_error)?;
+        remotes::add_remote_with_fetch(&mut config, name, url, &[]).map_err(remote_edit_error)?;
         self.save_repo_config(&config)
     }
 
@@ -58,13 +56,8 @@ impl Repository {
     /// Set the sole fetch URL for `[remote "<name>"]` (`git remote set-url`).
     pub fn set_remote_url(&self, name: &str, url: &str) -> Result<()> {
         let mut config = self.load_repo_config()?;
-        remotes::set_url(
-            &mut config,
-            name,
-            SetUrlKind::Fetch,
-            SetUrlOp::Set { url },
-        )
-        .map_err(set_url_error)?;
+        remotes::set_url(&mut config, name, SetUrlKind::Fetch, SetUrlOp::Set { url })
+            .map_err(set_url_error)?;
         self.save_repo_config(&config)
     }
 
@@ -92,9 +85,7 @@ impl Repository {
 
 fn remote_edit_error(err: RemoteEditError) -> GitError {
     match err {
-        RemoteEditError::AlreadyExists => {
-            GitError::Command("remote already exists".into())
-        }
+        RemoteEditError::AlreadyExists => GitError::Command("remote already exists".into()),
         RemoteEditError::NotFound => GitError::remote_not_found("remote not found"),
     }
 }
@@ -103,9 +94,7 @@ fn set_url_error(err: remotes::SetUrlError) -> GitError {
     match err {
         remotes::SetUrlError::RemoteNotFound => GitError::remote_not_found("remote not found"),
         remotes::SetUrlError::NoMatch => GitError::not_found("remote url did not match"),
-        remotes::SetUrlError::DeleteNoMatch => {
-            GitError::not_found("remote url did not match")
-        }
+        remotes::SetUrlError::DeleteNoMatch => GitError::not_found("remote url did not match"),
         remotes::SetUrlError::DeleteAllFetchUrls => {
             GitError::Command("cannot delete every fetch url".into())
         }

@@ -8,7 +8,8 @@
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{
-    BString, Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry, tree_entry_object_type,
+    BString, Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry,
+    tree_entry_object_type,
 };
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry};
@@ -186,8 +187,7 @@ pub fn list_notes(
     store: &FileRefStore,
     notes_ref: &NotesRef,
 ) -> Result<Vec<Note>> {
-    let mut notes = iter_notes(git_dir, format, store, notes_ref)?
-        .collect::<Result<Vec<_>>>()?;
+    let mut notes = iter_notes(git_dir, format, store, notes_ref)?.collect::<Result<Vec<_>>>()?;
     notes.sort_by_key(|entry| entry.annotated.to_hex());
     Ok(notes)
 }
@@ -608,7 +608,8 @@ mod tests {
 
     fn test_identity() -> NotesCommitIdentity {
         NotesCommitIdentity {
-            author: format_commit_identity(NAME, EMAIL, DATE).expect("test operation should succeed"),
+            author: format_commit_identity(NAME, EMAIL, DATE)
+                .expect("test operation should succeed"),
             committer: format_commit_identity(NAME, EMAIL, DATE)
                 .expect("test operation should succeed"),
         }
@@ -635,13 +636,9 @@ mod tests {
             .status()
             .expect("git add should succeed");
         let mut commit = Command::new("git");
-        git_env(
-            commit
-                .current_dir(root)
-                .args(["commit", "-q", "-m", "c1"]),
-        )
-        .status()
-        .expect("git commit should succeed");
+        git_env(commit.current_dir(root).args(["commit", "-q", "-m", "c1"]))
+            .status()
+            .expect("git commit should succeed");
         let git_dir = root.join(".git");
         let format = ObjectFormat::Sha1;
         let store = FileRefStore::new(&git_dir, format);
@@ -665,10 +662,7 @@ mod tests {
 
     #[test]
     fn notes_ref_expand_qualifies_names() {
-        assert_eq!(
-            NotesRef::expand("commits").as_str(),
-            "refs/notes/commits"
-        );
+        assert_eq!(NotesRef::expand("commits").as_str(), "refs/notes/commits");
         assert_eq!(
             NotesRef::expand("refs/notes/review").as_str(),
             "refs/notes/review"
@@ -931,11 +925,13 @@ mod tests {
             let notes_ref = NotesRef::expand(DEFAULT_NOTES_REF);
 
             let mut git_add_cmd = Command::new("git");
-            let git_add = git_env(
-                git_add_cmd
-                    .current_dir(&dir)
-                    .args(["notes", "add", "-m", "interop note", "HEAD"]),
-            )
+            let git_add = git_env(git_add_cmd.current_dir(&dir).args([
+                "notes",
+                "add",
+                "-m",
+                "interop note",
+                "HEAD",
+            ]))
             .output()
             .expect("git notes add should run");
             assert!(
@@ -1101,7 +1097,10 @@ mod tests {
             None,
         )
         .expect("first upsert");
-        let UpsertNoteOutcome::Updated { notes_commit: first_commit } = first else {
+        let UpsertNoteOutcome::Updated {
+            notes_commit: first_commit,
+        } = first
+        else {
             panic!("expected first upsert to update");
         };
 
@@ -1117,7 +1116,10 @@ mod tests {
             Some(RefTarget::Direct(first_commit)),
         )
         .expect("second upsert");
-        let UpsertNoteOutcome::Updated { notes_commit: second_commit } = second else {
+        let UpsertNoteOutcome::Updated {
+            notes_commit: second_commit,
+        } = second
+        else {
             panic!("expected second upsert to update");
         };
         assert_ne!(first_commit, second_commit);
@@ -1387,7 +1389,9 @@ mod tests {
         assert_eq!(commit.parents.len(), 1);
         assert_eq!(commit.parents[0], head);
         assert_eq!(
-            list_notes(&git_dir, format, &store, &notes_ref).expect("list").len(),
+            list_notes(&git_dir, format, &store, &notes_ref)
+                .expect("list")
+                .len(),
             1
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1444,7 +1448,9 @@ mod tests {
         let blob_a = write_blob(&mut db, br#"{"first":true}"#).expect("blob a");
         let blob_b = write_blob(&mut db, br#"{"second":true}"#).expect("blob b");
 
-        let UpsertNoteOutcome::Updated { notes_commit: first_commit } = upsert_note_for(
+        let UpsertNoteOutcome::Updated {
+            notes_commit: first_commit,
+        } = upsert_note_for(
             &git_dir,
             format,
             &store,
@@ -1455,11 +1461,14 @@ mod tests {
             &identity,
             None,
         )
-        .expect("first upsert") else {
+        .expect("first upsert")
+        else {
             panic!("expected update");
         };
 
-        let UpsertNoteOutcome::Updated { notes_commit: second_commit } = upsert_note_for(
+        let UpsertNoteOutcome::Updated {
+            notes_commit: second_commit,
+        } = upsert_note_for(
             &git_dir,
             format,
             &store,
@@ -1470,7 +1479,8 @@ mod tests {
             &identity,
             Some(RefTarget::Direct(first_commit)),
         )
-        .expect("second upsert") else {
+        .expect("second upsert")
+        else {
             panic!("expected update");
         };
 

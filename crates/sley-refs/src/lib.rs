@@ -441,7 +441,7 @@ impl FileRefStore {
     }
 
     pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
         if !path.exists() {
             return Ok(Vec::new());
@@ -450,7 +450,7 @@ impl FileRefStore {
     }
 
     pub fn write_reflog(&self, name: &str, entries: &[ReflogEntry]) -> Result<()> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
         let parent = path
             .parent()
@@ -464,7 +464,7 @@ impl FileRefStore {
     }
 
     pub fn expire_reflog_older_than(&self, name: &str, cutoff_seconds: i64) -> Result<usize> {
-        validate_ref_name(name)?;
+        validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
         if !path.exists() {
             return Ok(0);
@@ -698,7 +698,9 @@ impl FileRefStore {
             return Ok(());
         }
         let Some(target) = self.read_ref(&old_name)? else {
-            return Err(GitError::reference_not_found(format!("branch {old_branch}")));
+            return Err(GitError::reference_not_found(format!(
+                "branch {old_branch}"
+            )));
         };
         let RefTarget::Direct(oid) = target else {
             return Err(GitError::InvalidFormat(format!(
@@ -832,7 +834,9 @@ impl FileRefStore {
     fn delete_direct_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
         if self.uses_reftable()? {
             let Some(target) = self.read_ref(name)? else {
-                return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
+                return Err(GitError::reference_not_found(format!(
+                    "{kind} {short_name}"
+                )));
             };
             let RefTarget::Direct(oid) = target else {
                 return Err(GitError::InvalidFormat(format!(
@@ -864,14 +868,18 @@ impl FileRefStore {
     fn delete_packed_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
         let path = self.common_dir.join("packed-refs");
         if !path.exists() {
-            return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
+            return Err(GitError::reference_not_found(format!(
+                "{kind} {short_name}"
+            )));
         }
         let mut refs = parse_packed_refs(self.format, &fs::read(&path)?)?;
         let Some(index) = refs
             .iter()
             .position(|reference| reference.reference.name == name)
         else {
-            return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
+            return Err(GitError::reference_not_found(format!(
+                "{kind} {short_name}"
+            )));
         };
         let removed = refs.remove(index);
         let RefTarget::Direct(oid) = removed.reference.target else {
@@ -2115,10 +2123,7 @@ pub fn check_refname_format(name: &str, allow_onelevel: bool) -> Result<()> {
         return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
     }
     for component in name.split('/') {
-        if component.is_empty()
-            || component.starts_with('.')
-            || component.ends_with(".lock")
-        {
+        if component.is_empty() || component.starts_with('.') || component.ends_with(".lock") {
             return Err(GitError::InvalidPath(format!("invalid ref name {name}")));
         }
         for (idx, byte) in component.bytes().enumerate() {
@@ -2150,6 +2155,19 @@ pub fn validate_symref_name(name: &str) -> Result<()> {
 /// Validate a symbolic ref target (one-level pseudo-refs or `refs/...`).
 pub fn validate_symref_target(name: &str) -> Result<()> {
     check_refname_format(name, true)
+}
+
+/// Follow symbolic ref chains until a direct OID is reached.
+pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
+    let mut current = name.to_string();
+    for _ in 0..16 {
+        match store.read_ref(&current)? {
+            Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
+            Some(RefTarget::Symbolic(next)) => current = next,
+            None => return Ok(None),
+        }
+    }
+    Ok(None)
 }
 
 fn validate_ref_name_for_read(name: &str) -> Result<()> {
@@ -2325,6 +2343,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_ref_peeled_follows_symref_chains() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/target".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("seed target ref");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/alias".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/target".into()),
+            reflog: None,
+        });
+        tx.commit().expect("seed alias ref");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "ORIG_HEAD".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/alias".into()),
+            reflog: None,
+        });
+        tx.commit().expect("seed ORIG_HEAD symref");
+        assert_eq!(
+            resolve_ref_peeled(&store, "ORIG_HEAD").expect("resolve ORIG_HEAD"),
+            Some(oid)
+        );
+        let _ = fs::remove_dir_all(git_dir);
+    }
+
+    #[test]
     fn symref_directory_conflict_is_reported_gracefully() {
         let git_dir = temp_git_dir();
         let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
@@ -2350,9 +2408,11 @@ mod tests {
             reflog: None,
         });
         let err = tx.commit().expect_err("child ref should conflict");
-        assert!(matches!(err, GitError::Transaction(message) if message.contains(
+        assert!(
+            matches!(err, GitError::Transaction(message) if message.contains(
             "cannot lock ref 'refs/heads/df/conflict'"
-        ) && message.contains("refs/heads/df")));
+        ) && message.contains("refs/heads/df"))
+        );
         let _ = fs::remove_dir_all(git_dir);
     }
 

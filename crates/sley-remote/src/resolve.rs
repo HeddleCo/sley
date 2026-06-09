@@ -7,8 +7,8 @@
 
 use std::path::{Path, PathBuf};
 
-use sley_config::remotes::{resolve_remote_fetch_url, resolve_remote_push_url};
 use sley_config::GitConfig;
+use sley_config::remotes::{resolve_remote_fetch_url, resolve_remote_push_url};
 use sley_core::{GitError, Result};
 use sley_odb::repository_common_dir;
 use sley_transport::{RemoteTransport, RemoteUrl, parse_remote_url};
@@ -76,7 +76,10 @@ pub fn resolve_push_destination(
 
 enum ConcreteRemote {
     Network(RemoteUrl),
-    Local { git_dir: PathBuf, common_git_dir: PathBuf },
+    Local {
+        git_dir: PathBuf,
+        common_git_dir: PathBuf,
+    },
 }
 
 impl FetchSource {
@@ -85,9 +88,9 @@ impl FetchSource {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
                 RemoteTransport::Ssh | RemoteTransport::Git => Self::Ssh(remote),
-                RemoteTransport::Local | RemoteTransport::File => unreachable!(
-                    "local remotes use FetchSource::Local"
-                ),
+                RemoteTransport::Local | RemoteTransport::File => {
+                    unreachable!("local remotes use FetchSource::Local")
+                }
             },
             ConcreteRemote::Local {
                 git_dir,
@@ -106,9 +109,9 @@ impl PushDestination {
             ConcreteRemote::Network(remote) => match remote.transport {
                 RemoteTransport::Http | RemoteTransport::Https => Self::Http(remote),
                 RemoteTransport::Ssh | RemoteTransport::Git => Self::Ssh(remote),
-                RemoteTransport::Local | RemoteTransport::File => unreachable!(
-                    "local remotes use PushDestination::Local"
-                ),
+                RemoteTransport::Local | RemoteTransport::File => {
+                    unreachable!("local remotes use PushDestination::Local")
+                }
             },
             ConcreteRemote::Local {
                 git_dir,
@@ -123,7 +126,9 @@ impl PushDestination {
 
 fn source_from_parsed(parsed: &RemoteUrl, relative_base: &Path) -> Result<ConcreteRemote> {
     match parsed.transport {
-        RemoteTransport::Http | RemoteTransport::Https | RemoteTransport::Ssh
+        RemoteTransport::Http
+        | RemoteTransport::Https
+        | RemoteTransport::Ssh
         | RemoteTransport::Git => Ok(ConcreteRemote::Network(parsed.clone())),
         RemoteTransport::Local | RemoteTransport::File => {
             let repo_path = local_repository_path(parsed, relative_base)?;
@@ -148,9 +153,7 @@ fn local_repository_path(parsed: &RemoteUrl, relative_base: &Path) -> Result<Pat
         }
         RemoteTransport::File => PathBuf::from(&parsed.path),
         _ => {
-            return Err(GitError::Unsupported(
-                "expected a local remote URL".into(),
-            ));
+            return Err(GitError::Unsupported("expected a local remote URL".into()));
         }
     })
 }
@@ -160,9 +163,7 @@ fn discover_git_dir(start: &Path) -> Result<PathBuf> {
     let absolute = if start.is_absolute() {
         start.to_path_buf()
     } else {
-        std::env::current_dir()
-            .map_err(GitError::from)?
-            .join(start)
+        std::env::current_dir().map_err(GitError::from)?.join(start)
     };
     for candidate in absolute.ancestors() {
         let dot_git = candidate.join(".git");
@@ -199,9 +200,7 @@ fn read_gitdir_link(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(if target.is_absolute() {
         target
     } else {
-        path.parent()
-            .unwrap_or_else(|| Path::new(""))
-            .join(target)
+        path.parent().unwrap_or_else(|| Path::new("")).join(target)
     }))
 }
 
@@ -227,7 +226,10 @@ mod tests {
                 ConfigSection::new(
                     "url",
                     Some("https://github.com/".into()),
-                    vec![ConfigEntry::new("insteadOf", Some("git@github.com:".into()))],
+                    vec![ConfigEntry::new(
+                        "insteadOf",
+                        Some("git@github.com:".into()),
+                    )],
                 ),
             ],
         };

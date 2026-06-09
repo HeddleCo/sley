@@ -587,7 +587,8 @@ pub fn update_index_again(
         if index_entry_stage(entry) != 0 {
             continue;
         }
-        if !selected_paths.is_empty() && !git_path_selected(entry.path.as_bytes(), &selected_paths) {
+        if !selected_paths.is_empty() && !git_path_selected(entry.path.as_bytes(), &selected_paths)
+        {
             continue;
         }
         let differs_from_head = match head_entries.get(entry.path.as_bytes()) {
@@ -1284,6 +1285,15 @@ pub fn untracked_paths(
     )
 }
 
+/// Pathspec filter for untracked collection. Mirrors git `ls-files` pathspec
+/// semantics: literal paths, recursive directory prefixes, and fnmatch globs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedPathspecFilter {
+    pub path: Vec<u8>,
+    pub recursive: bool,
+    pub is_glob: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UntrackedPathOptions {
     pub directory: bool,
@@ -1293,6 +1303,235 @@ pub struct UntrackedPathOptions {
     pub ignored_only: bool,
     pub exclude_patterns: Vec<Vec<u8>>,
     pub exclude_per_directory: Vec<String>,
+    pub pathspecs: Vec<UntrackedPathspecFilter>,
+    /// When set (ls-files `--directory`), untracked files roll up to `parent/`.
+    pub rollup_untracked_files_to_directories: bool,
+}
+
+pub fn pathspec_is_glob(path: &[u8]) -> bool {
+    path.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+/// Whether `path` matches an `ls-files` pathspec (literal, directory prefix, or glob).
+pub fn untracked_pathspec_matches(spec: &UntrackedPathspecFilter, path: &[u8]) -> bool {
+    if spec.path.is_empty() {
+        return true;
+    }
+    let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
+    if path == spec.path.as_slice() || path_no_slash == spec.path.as_slice() {
+        return true;
+    }
+    if spec.recursive
+        && let Some(rest) = path
+            .strip_prefix(spec.path.as_slice())
+            .and_then(|rest| rest.strip_prefix(b"/"))
+        && !rest.is_empty()
+    {
+        return true;
+    }
+    if spec.is_glob {
+        return untracked_wildmatch(&spec.path, path)
+            || untracked_wildmatch(&spec.path, path_no_slash);
+    }
+    false
+}
+
+/// Whether a directory walk must descend into `parent` to satisfy active pathspecs.
+pub fn untracked_pathspec_needs_descent(parent: &[u8], specs: &[UntrackedPathspecFilter]) -> bool {
+    if specs.is_empty() {
+        return false;
+    }
+    let parent_prefix = if parent.is_empty() {
+        Vec::new()
+    } else {
+        let mut prefix = parent.to_vec();
+        prefix.push(b'/');
+        prefix
+    };
+    for spec in specs {
+        if !parent.is_empty()
+            && spec.path.starts_with(&parent_prefix)
+            && spec.path.as_slice() != parent
+        {
+            return true;
+        }
+        if spec.is_glob && glob_pathspec_may_match_under(&spec.path, parent) {
+            return true;
+        }
+        if spec.recursive
+            && !parent.is_empty()
+            && parent.starts_with(spec.path.as_slice())
+            && parent != spec.path.as_slice()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn glob_spec_matches_directory(spec: &UntrackedPathspecFilter, git_path: &[u8]) -> bool {
+    spec.is_glob
+        && (untracked_wildmatch(&spec.path, git_path)
+            || git_path
+                .strip_suffix(b"/")
+                .is_some_and(|stripped| untracked_wildmatch(&spec.path, stripped)))
+}
+
+fn glob_pathspec_may_match_under(pattern: &[u8], dir: &[u8]) -> bool {
+    let literal_prefix = literal_prefix_before_glob(pattern);
+    if literal_prefix.is_empty() {
+        return true;
+    }
+    if dir.is_empty() {
+        return true;
+    }
+    let mut dir_prefix = dir.to_vec();
+    dir_prefix.push(b'/');
+    if literal_prefix.starts_with(&dir_prefix) {
+        return true;
+    }
+    if dir_prefix.starts_with(&literal_prefix) {
+        return true;
+    }
+    literal_prefix
+        .strip_suffix(b"/")
+        .is_some_and(|prefix| prefix == dir)
+}
+
+fn literal_prefix_before_glob(pattern: &[u8]) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    for &byte in pattern {
+        if matches!(byte, b'*' | b'?' | b'[') {
+            break;
+        }
+        prefix.push(byte);
+    }
+    prefix
+}
+
+fn insert_untracked_directory(paths: &mut BTreeSet<Vec<u8>>, git_path: &[u8]) {
+    let mut directory = git_path.to_vec();
+    if directory.last() != Some(&b'/') {
+        directory.push(b'/');
+    }
+    paths.insert(directory);
+}
+
+fn parent_git_path(path: &[u8]) -> Option<&[u8]> {
+    let slash = path.iter().rposition(|byte| *byte == b'/')?;
+    if slash == 0 {
+        return None;
+    }
+    Some(&path[..slash])
+}
+
+/// fnmatch-style glob where `*` and `?` match any byte including `/`.
+fn untracked_wildmatch(pattern: &[u8], text: &[u8]) -> bool {
+    fn rec(pattern: &[u8], text: &[u8]) -> bool {
+        let mut pi = 0;
+        let mut ti = 0;
+        while pi < pattern.len() {
+            match pattern[pi] {
+                b'*' => {
+                    while pi < pattern.len() && pattern[pi] == b'*' {
+                        pi += 1;
+                    }
+                    if pi == pattern.len() {
+                        return true;
+                    }
+                    let mut k = ti;
+                    loop {
+                        if rec(&pattern[pi..], &text[k..]) {
+                            return true;
+                        }
+                        if k >= text.len() {
+                            return false;
+                        }
+                        k += 1;
+                    }
+                }
+                b'?' => {
+                    if ti >= text.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
+                }
+                b'[' => match untracked_match_bracket(&pattern[pi..], text[ti]) {
+                    UntrackedBracketOutcome::Match(consumed) => {
+                        pi += consumed;
+                        ti += 1;
+                    }
+                    UntrackedBracketOutcome::NoMatch => return false,
+                    UntrackedBracketOutcome::Malformed => {
+                        if ti >= text.len() || text[ti] != b'[' {
+                            return false;
+                        }
+                        pi += 1;
+                        ti += 1;
+                    }
+                },
+                b'\\' if pi + 1 < pattern.len() => {
+                    if ti >= text.len() || text[ti] != pattern[pi + 1] {
+                        return false;
+                    }
+                    pi += 2;
+                    ti += 1;
+                }
+                literal => {
+                    if ti >= text.len() || text[ti] != literal {
+                        return false;
+                    }
+                    pi += 1;
+                    ti += 1;
+                }
+            }
+        }
+        ti == text.len()
+    }
+    rec(pattern, text)
+}
+
+enum UntrackedBracketOutcome {
+    Match(usize),
+    NoMatch,
+    Malformed,
+}
+
+fn untracked_match_bracket(pattern: &[u8], ch: u8) -> UntrackedBracketOutcome {
+    let mut i = 1;
+    let negate = matches!(pattern.get(i), Some(b'!') | Some(b'^'));
+    if negate {
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while i < pattern.len() {
+        let c = pattern[i];
+        if c == b']' && !first {
+            let hit = matched != negate;
+            return if hit {
+                UntrackedBracketOutcome::Match(i + 1)
+            } else {
+                UntrackedBracketOutcome::NoMatch
+            };
+        }
+        first = false;
+        if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
+            let lo = c;
+            let hi = pattern[i + 2];
+            if lo <= ch && ch <= hi {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if c == ch {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    UntrackedBracketOutcome::Malformed
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1324,7 +1563,8 @@ pub fn untracked_paths_with_options(
 ) -> Result<Vec<Vec<u8>>> {
     let worktree_root = worktree_root.as_ref();
     let git_dir = git_dir.as_ref();
-    let index = read_index_entries(git_dir, format)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let (index, stat_cache, _) = read_index_entries_with_stat_cache(git_dir, format, &db)?;
     let ignores = IgnoreMatcher::from_sources(
         worktree_root,
         options.exclude_standard,
@@ -1353,8 +1593,17 @@ pub fn untracked_paths_with_options(
         )?;
         return Ok(paths.into_iter().collect());
     }
-    let worktree = worktree_entries(worktree_root, git_dir, format)?;
-    Ok(ls_files_untracked_paths_from_worktree(&worktree, &index, &ignores))
+    let worktree = worktree_entries_with_stat_cache(
+        worktree_root,
+        git_dir,
+        format,
+        Some(&stat_cache),
+        None,
+        None,
+    )?;
+    Ok(ls_files_untracked_paths_from_worktree(
+        &worktree, &index, &ignores,
+    ))
 }
 
 /// Untracked paths for `ls-files --others` (without `--directory`): every
@@ -1371,9 +1620,7 @@ fn ls_files_untracked_paths_from_worktree(
             continue;
         }
         if entry.mode == 0o040000 && entry.oid.is_null() {
-            let mut directory = path.clone();
-            directory.push(b'/');
-            paths.insert(directory);
+            insert_untracked_directory(&mut paths, path);
             continue;
         }
         paths.insert(path.clone());
@@ -1529,6 +1776,9 @@ fn collect_untracked_directory_paths(
         if is_worktree_dot_git(root, &path) {
             continue;
         }
+        if is_embedded_git_internals(root, &path) {
+            continue;
+        }
         if is_same_path(&path, git_dir) {
             continue;
         }
@@ -1542,36 +1792,55 @@ fn collect_untracked_directory_paths(
         }
         if metadata.is_dir() {
             if is_nested_repository_boundary(&path) {
-                if !index_has_path_under(index, &git_path) {
-                    let mut directory = git_path;
-                    directory.push(b'/');
-                    paths.insert(directory);
-                }
+                insert_untracked_directory(paths, &git_path);
                 continue;
             }
-            if !index_has_path_under(index, &git_path) {
-                if options.preserve_ignored_directories
-                    && directory_has_ignored(&path, root, git_dir, ignores)?
-                {
-                    collect_untracked_directory_paths(
-                        root, git_dir, &path, index, ignores, options, paths,
-                    )?;
-                } else if !options.no_empty_directory
-                    || directory_has_file(&path, root, git_dir, ignores)?
-                {
-                    let mut directory = git_path;
-                    directory.push(b'/');
-                    paths.insert(directory);
-                }
-            } else {
+            let has_tracked_below = index_has_path_under(index, &git_path);
+            let needs_descent = untracked_pathspec_needs_descent(&git_path, &options.pathspecs);
+            if has_tracked_below {
                 collect_untracked_directory_paths(
                     root, git_dir, &path, index, ignores, options, paths,
                 )?;
+            } else if needs_descent {
+                if options
+                    .pathspecs
+                    .iter()
+                    .any(|spec| glob_spec_matches_directory(spec, &git_path))
+                {
+                    insert_untracked_directory(paths, &git_path);
+                    continue;
+                }
+                collect_untracked_directory_paths(
+                    root, git_dir, &path, index, ignores, options, paths,
+                )?;
+            } else if options.preserve_ignored_directories
+                && directory_has_ignored(&path, root, git_dir, ignores)?
+            {
+                collect_untracked_directory_paths(
+                    root, git_dir, &path, index, ignores, options, paths,
+                )?;
+            } else if !options.no_empty_directory
+                || directory_has_file(&path, root, git_dir, ignores)?
+            {
+                insert_untracked_directory(paths, &git_path);
             }
         } else if !index.contains_key(&git_path)
             && (metadata.is_file() || metadata.file_type().is_symlink())
+            && (options.pathspecs.is_empty()
+                || options
+                    .pathspecs
+                    .iter()
+                    .any(|spec| untracked_pathspec_matches(spec, &git_path)))
         {
-            paths.insert(git_path);
+            if options.rollup_untracked_files_to_directories {
+                if let Some(parent) = parent_git_path(&git_path) {
+                    insert_untracked_directory(paths, parent);
+                } else {
+                    paths.insert(git_path);
+                }
+            } else {
+                paths.insert(git_path);
+            }
         }
     }
     Ok(())
@@ -1604,14 +1873,8 @@ fn normal_untracked_paths_from_worktree(
         if index.contains_key(path) || ignores.is_ignored(path, false) {
             continue;
         }
-        // Embedded-repository boundaries are listed as the directory itself (with
-        // a trailing slash), not by enumerating files inside the nested .git.
-        if entry.mode == 0o040000 {
-            if entry.oid.is_null() {
-                let mut directory = path.clone();
-                directory.push(b'/');
-                paths.insert(directory);
-            }
+        if entry.mode == 0o040000 && entry.oid.is_null() {
+            insert_untracked_directory(&mut paths, path);
             continue;
         }
         paths.insert(untracked_normal_rollup_path(path, index, ignores));
@@ -1662,6 +1925,9 @@ fn directory_has_file(
         let entry = entry?;
         let path = entry.path();
         if is_worktree_dot_git(root, &path) {
+            continue;
+        }
+        if is_embedded_git_internals(root, &path) {
             continue;
         }
         if is_same_path(&path, git_dir) {
@@ -1764,6 +2030,9 @@ fn collect_ignored_untracked_paths(
     for entry in entries {
         let path = entry.path();
         if is_worktree_dot_git(context.root, &path) {
+            continue;
+        }
+        if is_embedded_git_internals(context.root, &path) {
             continue;
         }
         if is_same_path(&path, context.git_dir) {
@@ -2741,11 +3010,7 @@ impl AttributeMatcher {
 /// Fold `dir`'s `.gitignore` (if any) into `matcher`, scoped to `dir`'s path
 /// within `root`. Used by the status worktree walk as it descends so ignore
 /// patterns are collected in the same traversal as worktree entries.
-fn read_dir_ignore_patterns(
-    root: &Path,
-    dir: &Path,
-    matcher: &mut IgnoreMatcher,
-) -> Result<()> {
+fn read_dir_ignore_patterns(root: &Path, dir: &Path, matcher: &mut IgnoreMatcher) -> Result<()> {
     matcher.fold_dir_ignore_patterns(root, dir)
 }
 
@@ -2863,8 +3128,7 @@ fn collect_attribute_patterns_from_index(
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     for entry in entries {
         let is_attributes_file =
-            entry.path == b".gitattributes"
-                || entry.path.as_bytes().ends_with(b"/.gitattributes");
+            entry.path == b".gitattributes" || entry.path.as_bytes().ends_with(b"/.gitattributes");
         if index_entry_stage(&entry) != 0
             || tree_entry_object_type(entry.mode) != ObjectType::Blob
             || !is_attributes_file
@@ -3588,8 +3852,14 @@ pub fn modified_index_entries(
     // unchanged files. A cached oid is only trusted on a non-racy stat match, so
     // genuinely modified files still fall through to a hash and are reported.
     let stat_cache = IndexStatCache::from_index(&index, &index_path);
-    let worktree =
-        worktree_entries_with_stat_cache(worktree_root, git_dir, format, Some(&stat_cache), None, None)?;
+    let worktree = worktree_entries_with_stat_cache(
+        worktree_root,
+        git_dir,
+        format,
+        Some(&stat_cache),
+        None,
+        None,
+    )?;
     let mut modified = Vec::new();
     for entry in index.entries {
         let Some(worktree_entry) = worktree.get(entry.path.as_bytes()) else {
@@ -3614,13 +3884,8 @@ pub fn checkout_branch(
     let git_dir = git_dir.as_ref();
     let branch_ref = branch_ref_name(branch)?;
     let refs = FileRefStore::new(git_dir, format);
-    let target = match refs.read_ref(&branch_ref)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) => {
-            return Err(GitError::Unsupported(
-                "checkout target branch must be direct".into(),
-            ));
-        }
+    let target = match sley_refs::resolve_ref_peeled(&refs, &branch_ref)? {
+        Some(oid) => oid,
         None => {
             checkout_switch_head_symbolic(&refs, branch_ref, committer, branch, None, None)?;
             return Ok(CheckoutResult {
@@ -3700,13 +3965,8 @@ pub fn checkout_branch_filtered(
     let git_dir = git_dir.as_ref();
     let branch_ref = branch_ref_name(branch)?;
     let refs = FileRefStore::new(git_dir, format);
-    let target = match refs.read_ref(&branch_ref)? {
-        Some(RefTarget::Direct(oid)) => oid,
-        Some(RefTarget::Symbolic(_)) => {
-            return Err(GitError::Unsupported(
-                "checkout target branch must be direct".into(),
-            ));
-        }
+    let target = match sley_refs::resolve_ref_peeled(&refs, &branch_ref)? {
+        Some(oid) => oid,
         None => {
             checkout_switch_head_symbolic(&refs, branch_ref, committer, branch, None, None)?;
             return Ok(CheckoutResult {
@@ -3962,8 +4222,7 @@ fn checkout_commit_to_index_and_worktree_sparse(
             }
             fs::write(&file_path, &object.body)?;
             let metadata = fs::metadata(&file_path)?;
-            let mut index_entry =
-                index_entry_from_metadata(path.clone(), entry.oid, &metadata);
+            let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
             index_entry.mode = entry.mode;
             // `index_entry_from_metadata` leaves flags_extended at 0, so the
             // skip-worktree bit is already clear for in-cone paths.
@@ -5156,7 +5415,10 @@ pub fn move_index_and_worktree_path(
             .map(|detail| detail.destination.clone())
             .collect();
         index.entries.retain(|entry| {
-            !entry.path.as_bytes().starts_with(&directory_prefix) && !moved_paths.iter().any(|m| m.as_slice() == entry.path.as_bytes())
+            !entry.path.as_bytes().starts_with(&directory_prefix)
+                && !moved_paths
+                    .iter()
+                    .any(|m| m.as_slice() == entry.path.as_bytes())
         });
         for (source_entry, detail) in directory_entries.into_iter().zip(details.iter()) {
             let relative_path = git_path_to_relative_path(&detail.destination)?;
@@ -5400,7 +5662,11 @@ fn index_entry_is_under_path(entry_path: &[u8], directory: &[u8]) -> bool {
         .is_some()
 }
 
-fn index_entry_from_metadata(path: impl Into<BString>, oid: ObjectId, metadata: &fs::Metadata) -> IndexEntry {
+fn index_entry_from_metadata(
+    path: impl Into<BString>,
+    oid: ObjectId,
+    metadata: &fs::Metadata,
+) -> IndexEntry {
     let modified = metadata.modified().ok();
     let duration = modified
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
@@ -5574,23 +5840,11 @@ fn resolve_head_tree_oid(
 
 fn resolve_head_commit_oid(git_dir: &Path, format: ObjectFormat) -> Result<Option<ObjectId>> {
     let refs = FileRefStore::new(git_dir, format);
-    let Some(head) = refs.read_ref("HEAD")? else {
-        return Ok(None);
-    };
-    Ok(match head {
-        RefTarget::Direct(oid) => Some(oid),
-        RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => Some(oid),
-            _ => None,
-        },
-    })
+    sley_refs::resolve_ref_peeled(&refs, "HEAD")
 }
 
 fn status_entry_is_untracked_or_ignored(entry: &ShortStatusEntry) -> bool {
-    matches!(
-        (entry.index, entry.worktree),
-        (b'?', b'?') | (b'!', b'!')
-    )
+    matches!((entry.index, entry.worktree), (b'?', b'?') | (b'!', b'!'))
 }
 
 fn checkout_switch_head_symbolic(
@@ -5779,18 +6033,10 @@ fn collect_tree_entries_into(
     Ok(())
 }
 
-fn worktree_entries(
-    worktree_root: &Path,
-    git_dir: &Path,
-    format: ObjectFormat,
-) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
-    worktree_entries_with_stat_cache(worktree_root, git_dir, format, None, None, None)
-}
-
-/// Like [`worktree_entries`], but accepts the index's [`IndexStatCache`] so the
+/// Like a full worktree walk, but accepts the index's [`IndexStatCache`] so the
 /// walk can reuse a cached oid for files that are provably unchanged since they
 /// were staged, skipping the read+filter+hash for those paths. Passing `None`
-/// hashes every file (the behaviour of plain [`worktree_entries`]).
+/// hashes every file when no stat cache is supplied.
 fn worktree_entries_with_stat_cache(
     worktree_root: &Path,
     git_dir: &Path,
@@ -5857,6 +6103,9 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
         if is_worktree_dot_git(context.root, &path) {
             continue;
         }
+        if is_embedded_git_internals(context.root, &path) {
+            continue;
+        }
         if is_same_path(&path, context.git_dir) {
             continue;
         }
@@ -5871,9 +6120,9 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
             .is_some_and(|ignores| ignores.is_ignored(&git_path, metadata.is_dir()))
         {
             if metadata.is_dir()
-                && context
-                    .tracked_paths
-                    .is_some_and(|tracked_paths| tracked_paths_may_contain(tracked_paths, &git_path))
+                && context.tracked_paths.is_some_and(|tracked_paths| {
+                    tracked_paths_may_contain(tracked_paths, &git_path)
+                })
             {
                 collect_worktree_entries(context, &path)?;
             }
@@ -5988,10 +6237,27 @@ fn is_worktree_dot_git(root: &Path, path: &Path) -> bool {
         .is_ok_and(|relative| relative == Path::new(".git"))
 }
 
-/// Whether `path` is a directory that contains its own `.git` file or directory,
-/// marking a nested-repository boundary that the worktree walk must not cross.
+/// Whether `path` is a directory that contains a `.git` gitfile or embedded git dir.
 fn is_nested_repository_boundary(path: &Path) -> bool {
     path.join(".git").exists()
+}
+
+/// Whether `path` is an embedded repository's `.git` directory or a path inside it.
+fn is_embedded_git_internals(root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        if matches!(component, std::path::Component::Normal(name) if name == ".git")
+            && current != root
+            && current.join(".git").is_dir()
+        {
+            return true;
+        }
+        current.push(component);
+    }
+    false
 }
 
 fn worktree_entry_mode(metadata: &fs::Metadata) -> u32 {
@@ -6061,7 +6327,11 @@ struct TreeFile {
 
 impl TreeNode {
     fn insert(&mut self, entry: &IndexEntry) -> Result<()> {
-        let components = entry.path.as_bytes().split(|byte| *byte == b'/').collect::<Vec<_>>();
+        let components = entry
+            .path
+            .as_bytes()
+            .split(|byte| *byte == b'/')
+            .collect::<Vec<_>>();
         if components.iter().any(|component| component.is_empty()) {
             return Err(GitError::InvalidPath(format!(
                 "invalid index path {}",
@@ -6108,8 +6378,14 @@ fn write_tree_node(node: &TreeNode, odb: &mut FileObjectDatabase) -> Result<Obje
             oid,
         });
     }
-    entries
-        .sort_by(|left, right| git_tree_entry_cmp(left.name.as_bytes(), left.mode, right.name.as_bytes(), right.mode));
+    entries.sort_by(|left, right| {
+        git_tree_entry_cmp(
+            left.name.as_bytes(),
+            left.mode,
+            right.name.as_bytes(),
+            right.mode,
+        )
+    });
     odb.write_object(EncodedObject::new(
         ObjectType::Tree,
         Tree { entries }.write(),
@@ -7326,11 +7602,13 @@ mod tests {
         let paths = untracked_paths(&root, &git_dir, ObjectFormat::Sha1)
             .expect("test operation should succeed");
         assert!(
-            paths.iter().any(|path| path.starts_with(b"not-a-submodule")),
+            paths.iter().any(|path| path == b"not-a-submodule/"),
             "embedded repository directory should be listed, got {paths:?}"
         );
         assert!(
-            !paths.iter().any(|path| path.starts_with(b"not-a-submodule/.git")),
+            !paths
+                .iter()
+                .any(|path| path.starts_with(b"not-a-submodule/.git")),
             "embedded .git internals must not be listed, got {paths:?}"
         );
         fs::remove_dir_all(root).expect("test operation should succeed");

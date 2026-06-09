@@ -71,13 +71,9 @@ pub fn fetch_bundle(request: FetchBundleRequest<'_>) -> Result<()> {
         }
         return Ok(());
     }
-    let refspecs = fetch_refspecs_for_source(
-        Vec::new(),
-        request.refspecs,
-        request.options.fetch_all_tags,
-    );
-    let mut fetched =
-        bundle_fetch_refs(&references, &refspecs, request.options.auto_follow_tags)?;
+    let refspecs =
+        fetch_refspecs_for_source(Vec::new(), request.refspecs, request.options.fetch_all_tags);
+    let mut fetched = bundle_fetch_refs(&references, &refspecs, request.options.auto_follow_tags)?;
     if request.options.fetch_all_tags {
         mark_tag_refspec_updates_not_for_merge(&mut fetched);
         order_bundle_fetch_all_tags_updates(&mut fetched);

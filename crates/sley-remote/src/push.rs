@@ -19,24 +19,24 @@
 //! functions) so there is a single implementation.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 #[cfg(feature = "http")]
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType};
 use sley_odb::{FileObjectDatabase, ObjectReader, collect_reachable_object_ids};
+#[cfg(feature = "http")]
+use sley_protocol::{
+    GitService, ReceivePackFeatures, ReceivePackPushRequestOptions, parse_receive_pack_features,
+    read_receive_pack_report_status, smart_http_rpc_request_content_type,
+    smart_http_rpc_result_content_type,
+};
 use sley_protocol::{
     PushSourceRef, ReceivePackCommand, ReceivePackCommandStatus, ReceivePackPushRequest,
     ReceivePackReportStatus, ReceivePackRequest, ReceivePackUnpackStatus, RefAdvertisement,
     parse_refspec, plan_push_commands,
-};
-#[cfg(feature = "http")]
-use sley_protocol::{
-    GitService, ReceivePackFeatures, ReceivePackPushRequestOptions,
-    parse_receive_pack_features, read_receive_pack_report_status,
-    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
 };
 
 #[cfg(feature = "http")]

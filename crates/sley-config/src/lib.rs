@@ -69,7 +69,11 @@ impl ConfigEntry {
 
 impl ConfigSection {
     /// Build a programmatic section (no preserved preamble).
-    pub fn new(name: impl Into<String>, subsection: Option<String>, entries: Vec<ConfigEntry>) -> Self {
+    pub fn new(
+        name: impl Into<String>,
+        subsection: Option<String>,
+        entries: Vec<ConfigEntry>,
+    ) -> Self {
         Self {
             name: name.into(),
             subsection,
@@ -363,14 +367,7 @@ fn load_config_file(
     };
     let parsed = GitConfig::parse(&bytes)?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    splice_includes(
-        &parsed,
-        base_dir,
-        context,
-        depth,
-        forbid_remote_url,
-        out,
-    )
+    splice_includes(&parsed, base_dir, context, depth, forbid_remote_url, out)
 }
 
 /// Walk the parsed sections in order, copying ordinary sections through and
@@ -406,8 +403,7 @@ fn splice_includes(
             Some(IncludeKind::Conditional(condition)) => {
                 if include_condition_matches(condition, base_dir, context, &loaded, parsed) {
                     let before = out.len();
-                    let forbid = forbid_remote_url
-                        || hasconfig_remote_url_condition(condition);
+                    let forbid = forbid_remote_url || hasconfig_remote_url_condition(condition);
                     expand_include_paths(section, base_dir, context, depth, forbid, out)?;
                     loaded.extend_from_slice(&out[before..]);
                 }
@@ -612,11 +608,30 @@ fn gitdir_condition_matches(
 }
 
 /// Look up `$HOME`, returning `None` when it is unset or empty.
-fn home_dir() -> Option<String> {
+pub fn home_dir() -> Option<String> {
     match std::env::var("HOME") {
         Ok(home) if !home.is_empty() => Some(home),
         _ => None,
     }
+}
+
+/// Expand a leading `~/` (or bare `~`) in a path using `$HOME`, matching git's
+/// treatment of `init.templatedir` and similar config values.
+pub fn expand_user_path(path: &str) -> PathBuf {
+    expand_user_path_with_home(path, home_dir().as_deref())
+}
+
+fn expand_user_path_with_home(path: &str, home: Option<&str>) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = home.filter(|home| !home.is_empty()) {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = home.filter(|home| !home.is_empty()) {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(path)
 }
 
 /// Expand the `~/`, `./`, and bare-`**` leading forms of a `gitdir` pattern.
@@ -971,7 +986,10 @@ impl<'a> ConfigParser<'a> {
                     Err(err) => return (config, Some(err)),
                 },
                 Some(ch) => {
-                    return (config, Some(self.err(format!("unexpected character {ch:?}"))));
+                    return (
+                        config,
+                        Some(self.err(format!("unexpected character {ch:?}"))),
+                    );
                 }
             }
         }
@@ -1622,6 +1640,18 @@ mod tests {
     }
 
     #[test]
+    fn expand_user_path_expands_tilde_prefix() {
+        assert_eq!(
+            expand_user_path_with_home("~/templates", Some("/tmp/sley-home")),
+            PathBuf::from("/tmp/sley-home/templates")
+        );
+        assert_eq!(
+            expand_user_path_with_home("~/templates", None),
+            PathBuf::from("~/templates")
+        );
+    }
+
+    #[test]
     fn config_canonical_writer_round_trips() {
         let config = GitConfig {
             preamble: Vec::new(),
@@ -1868,8 +1898,8 @@ mod tests {
             parse_core_x("[core]\n\tx = \"bar\r\"\n").as_deref(),
             Some("bar\r")
         );
-        let config = GitConfig::parse(b"[core]\n\tx = \"bar\r\"\n")
-            .expect("test operation should succeed");
+        let config =
+            GitConfig::parse(b"[core]\n\tx = \"bar\r\"\n").expect("test operation should succeed");
         assert_eq!(
             String::from_utf8(config.to_canonical_bytes()).expect("utf8"),
             "[core]\n\tx = \"bar\r\"\n"
@@ -1973,7 +2003,10 @@ mod tests {
             config.sections[0].entries[0].preamble,
             vec![ConfigPreambleLine::Blank]
         );
-        assert_eq!(config.sections[0].entries[0].comment.as_deref(), Some("inline"));
+        assert_eq!(
+            config.sections[0].entries[0].comment.as_deref(),
+            Some("inline")
+        );
         assert_eq!(
             config.suffix,
             vec![ConfigPreambleLine::Comment {
@@ -2421,16 +2454,10 @@ mod tests {
         let dir = unique_include_dir("inc-hasconfig");
         let include_this = dir.join("include-this");
         let dont_include = dir.join("dont-include-that");
-        fs::write(
-            &include_this,
-            "[user]\n\tthis = this-is-included\n",
-        )
-        .expect("test operation should succeed");
-        fs::write(
-            &dont_include,
-            "[user]\n\tthat = that-is-not-included\n",
-        )
-        .expect("test operation should succeed");
+        fs::write(&include_this, "[user]\n\tthis = this-is-included\n")
+            .expect("test operation should succeed");
+        fs::write(&dont_include, "[user]\n\tthat = that-is-not-included\n")
+            .expect("test operation should succeed");
         let main = dir.join("config");
         fs::write(
             &main,
@@ -2445,8 +2472,7 @@ mod tests {
         .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config =
-            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "this"), Some("this-is-included"));
         assert_eq!(config.get("user", None, "that"), None);
         fs::remove_dir_all(&dir).ok();
@@ -2475,8 +2501,7 @@ mod tests {
         .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config =
-            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "one"), Some("main-config"));
         assert_eq!(config.get("user", None, "two"), Some("included-config"));
         assert_eq!(config.get("user", None, "three"), Some("main-config"));
@@ -2522,8 +2547,7 @@ mod tests {
         .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config =
-            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "dss"), Some("yes"));
         assert_eq!(config.get("user", None, "dse"), Some("yes"));
         assert_eq!(config.get("user", None, "dsm"), Some("yes"));
@@ -2577,8 +2601,7 @@ mod tests {
         .expect("test operation should succeed");
 
         let ctx = ConfigIncludeContext::default();
-        let config =
-            load_config_with_includes(&main, &ctx).expect("test operation should succeed");
+        let config = load_config_with_includes(&main, &ctx).expect("test operation should succeed");
         assert_eq!(config.get("user", None, "name"), None);
         fs::remove_dir_all(&dir).ok();
     }

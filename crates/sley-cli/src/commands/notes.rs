@@ -52,7 +52,9 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
 
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let notes_ref = resolve_notes_ref(&git_dir, ref_override.as_deref())?.as_str().to_string();
+    let notes_ref = resolve_notes_ref(&git_dir, ref_override.as_deref())?
+        .as_str()
+        .to_string();
 
     match subcommand {
         "list" => notes_list(&git_dir, format, &notes_ref, sub_args),
@@ -288,7 +290,13 @@ fn notes_list(
     if let Some(spec) = object {
         // `list <object>` prints just the note blob oid, or errors if absent.
         let target = resolve_note_object(git_dir, format, &spec)?;
-        match read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)? {
+        match read_note(
+            git_dir,
+            format,
+            &store,
+            &notes_ref_handle(notes_ref),
+            &target,
+        )? {
             Some(blob) => {
                 println!("{}", blob.to_hex());
                 Ok(())
@@ -317,7 +325,13 @@ fn notes_show(
         parse_optional_single_object(args, NotesUsage::Show)?.unwrap_or_else(|| "HEAD".to_string());
     let target = resolve_note_object(git_dir, format, &spec)?;
     let store = FileRefStore::new(git_dir, format);
-    let Some(blob) = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?
+    let Some(blob) = read_note(
+        git_dir,
+        format,
+        &store,
+        &notes_ref_handle(notes_ref),
+        &target,
+    )?
     else {
         eprintln!("error: no note found for object {}.", target.to_hex());
         return Err(GitError::Exit(1));
@@ -335,7 +349,13 @@ fn notes_add(git_dir: &Path, format: ObjectFormat, notes_ref: &str, args: &[Stri
     let target = resolve_note_object(git_dir, format, &spec)?;
     let store = FileRefStore::new(git_dir, format);
 
-    let existing = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?;
+    let existing = read_note(
+        git_dir,
+        format,
+        &store,
+        &notes_ref_handle(notes_ref),
+        &target,
+    )?;
     if existing.is_some() && !options.force {
         eprintln!(
             "error: Cannot add notes. Found existing notes for object {}. Use '-f' to overwrite existing notes",
@@ -410,7 +430,13 @@ fn notes_append(
     };
 
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let existing = read_note(git_dir, format, &store, &notes_ref_handle(notes_ref), &target)?;
+    let existing = read_note(
+        git_dir,
+        format,
+        &store,
+        &notes_ref_handle(notes_ref),
+        &target,
+    )?;
     let mut body = Vec::new();
     if let Some(blob) = &existing {
         let object = db.read_object(blob)?;

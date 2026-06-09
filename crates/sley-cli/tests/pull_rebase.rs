@@ -60,22 +60,8 @@ fn git_with_identity(cwd: &Path, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_diverged_upstream(upstream: &Path) {
@@ -118,33 +104,32 @@ fn pull_rebase_clean_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-            prepare_diverged_upstream(&upstream);
-        prepare_pull_rebase_clone(&upstream, &expected, Some("true"));
-        prepare_pull_rebase_clone(&upstream, &actual, Some("true"));
-        let args = ["pull", "origin", "master"];
-        let expected_output = run_output_with_identity("git", &expected, &args);
-        let actual_output =
-            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-        assert_eq!(
-            actual_output.status.code(),
-            expected_output.status.code(),
-            "status differed for pull rebase"
-        );
-        assert!(
-            actual_output.status.success(),
-            "sley pull --rebase failed: {}",
-            String::from_utf8_lossy(&actual_output.stderr)
-        );
-        assert_eq!(
-            run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after pull rebase"
-        );
-        assert_eq!(
-            run_output("git", &expected, &["log", "--oneline"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
-            "log order differed after pull rebase"
-        );
+    prepare_diverged_upstream(&upstream);
+    prepare_pull_rebase_clone(&upstream, &expected, Some("true"));
+    prepare_pull_rebase_clone(&upstream, &actual, Some("true"));
+    let args = ["pull", "origin", "master"];
+    let expected_output = run_output_with_identity("git", &expected, &args);
+    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    assert_eq!(
+        actual_output.status.code(),
+        expected_output.status.code(),
+        "status differed for pull rebase"
+    );
+    assert!(
+        actual_output.status.success(),
+        "sley pull --rebase failed: {}",
+        String::from_utf8_lossy(&actual_output.stderr)
+    );
+    assert_eq!(
+        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after pull rebase"
+    );
+    assert_eq!(
+        run_output("git", &expected, &["log", "--oneline"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
+        "log order differed after pull rebase"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -157,32 +142,31 @@ fn pull_rebase_flag_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
-            prepare_diverged_upstream(&upstream);
-        prepare_pull_rebase_clone(&upstream, &expected, Some("false"));
-        prepare_pull_rebase_clone(&upstream, &actual, Some("false"));
-        let args = ["pull", "--rebase", "origin", "master"];
-        let expected_output = run_output_with_identity("git", &expected, &args);
-        let actual_output =
-            run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
-        assert_eq!(
-            actual_output.status.code(),
-            expected_output.status.code(),
-            "status differed for pull --rebase"
-        );
-        assert!(
-            actual_output.status.success(),
-            "sley pull --rebase failed: {}",
-            String::from_utf8_lossy(&actual_output.stderr)
-        );
-        assert_eq!(
-            run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after pull --rebase"
-        );
-        assert_eq!(
-            run_output("git", &expected, &["log", "--oneline"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
-            "log order differed after pull --rebase"
-        );
+    prepare_diverged_upstream(&upstream);
+    prepare_pull_rebase_clone(&upstream, &expected, Some("false"));
+    prepare_pull_rebase_clone(&upstream, &actual, Some("false"));
+    let args = ["pull", "--rebase", "origin", "master"];
+    let expected_output = run_output_with_identity("git", &expected, &args);
+    let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+    assert_eq!(
+        actual_output.status.code(),
+        expected_output.status.code(),
+        "status differed for pull --rebase"
+    );
+    assert!(
+        actual_output.status.success(),
+        "sley pull --rebase failed: {}",
+        String::from_utf8_lossy(&actual_output.stderr)
+    );
+    assert_eq!(
+        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after pull --rebase"
+    );
+    assert_eq!(
+        run_output("git", &expected, &["log", "--oneline"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["log", "--oneline"]).stdout,
+        "log order differed after pull --rebase"
+    );
     let _ = fs::remove_dir_all(&root);
 }

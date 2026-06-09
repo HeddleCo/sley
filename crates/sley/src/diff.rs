@@ -1,7 +1,9 @@
 //! Diff helpers on top of [`sley_diff_merge`].
 
 use sley_core::ObjectId;
-use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry, diff_name_status_trees_with_options};
+use sley_diff_merge::{
+    DiffNameStatusOptions, NameStatusEntry, diff_name_status_trees_with_options,
+};
 
 use crate::{Repository, Result};
 

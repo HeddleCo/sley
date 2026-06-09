@@ -4,8 +4,8 @@
 //! cargo bench -p sley-bench --bench batch_check_profile -- --quick
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
-use sley_bench::{create_fixture, BenchFixture, FIXTURE_OBJECT_COUNT};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
+use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::ObjectId;
 use sley_object::ObjectType;
 use sley_odb::ObjectReader;

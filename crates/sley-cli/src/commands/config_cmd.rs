@@ -114,9 +114,7 @@ impl ConfigModeTracker {
     fn set_mode(&mut self, mode: ConfigMode, flag: &'static str) -> Result<()> {
         if let Some((existing, existing_flag)) = self.chosen {
             if existing != mode {
-                eprintln!(
-                    "error: options '{flag}' and '{existing_flag}' cannot be used together"
-                );
+                eprintln!("error: options '{flag}' and '{existing_flag}' cannot be used together");
                 return Err(GitError::Exit(129));
             }
         } else {
@@ -125,7 +123,12 @@ impl ConfigModeTracker {
         Ok(())
     }
 
-    fn set_action_value(&mut self, action: &mut Option<ConfigAction>, value: ConfigAction, flag: &'static str) -> Result<()> {
+    fn set_action_value(
+        &mut self,
+        action: &mut Option<ConfigAction>,
+        value: ConfigAction,
+        flag: &'static str,
+    ) -> Result<()> {
         self.set_action(value, flag)?;
         *action = Some(value);
         Ok(())
@@ -198,14 +201,24 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 value_type = ConfigValueType::Color;
             }
             "--get-colorbool" => {
-                modes.set_action_value(&mut action, ConfigAction::GetColorBool, "--get-colorbool")?;
+                modes.set_action_value(
+                    &mut action,
+                    ConfigAction::GetColorBool,
+                    "--get-colorbool",
+                )?;
             }
             "--get-urlmatch" => {
                 modes.set_action_value(&mut action, ConfigAction::GetUrlMatch, "--get-urlmatch")?;
             }
-            "--get-all" => modes.set_action_value(&mut action, ConfigAction::GetAll, "--get-all")?,
-            "--get-regexp" => modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regexp")?,
-            "--get-regex" => modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regex")?,
+            "--get-all" => {
+                modes.set_action_value(&mut action, ConfigAction::GetAll, "--get-all")?
+            }
+            "--get-regexp" => {
+                modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regexp")?
+            }
+            "--get-regex" => {
+                modes.set_action_value(&mut action, ConfigAction::GetRegexp, "--get-regex")?
+            }
             "--list" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
             "-l" => modes.set_action_value(&mut action, ConfigAction::List, "--list")?,
             "--all" if subcommand == Some(ConfigSubcommand::Get) => {
@@ -272,10 +285,18 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 modes.set_action_value(&mut action, ConfigAction::UnsetAll, "--unset-all")?;
             }
             "--rename-section" => {
-                modes.set_action_value(&mut action, ConfigAction::RenameSection, "--rename-section")?;
+                modes.set_action_value(
+                    &mut action,
+                    ConfigAction::RenameSection,
+                    "--rename-section",
+                )?;
             }
             "--remove-section" => {
-                modes.set_action_value(&mut action, ConfigAction::RemoveSection, "--remove-section")?;
+                modes.set_action_value(
+                    &mut action,
+                    ConfigAction::RemoveSection,
+                    "--remove-section",
+                )?;
             }
             value => positional.push(value),
         }
@@ -502,8 +523,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetAll => {
             let key = key.expect("validated config key");
-            let values = config
-                .get_all(&key.section, key.subsection.as_deref(), &key.key);
+            let values = config.get_all(&key.section, key.subsection.as_deref(), &key.key);
             if values.is_empty() {
                 return Err(GitError::Exit(1));
             }
@@ -514,13 +534,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                     None => String::new(),
                     Some(value) => format_config_value(value, value_type)?,
                 };
-                write_config_value(
-                    &mut stdout,
-                    &source,
-                    display,
-                    &formatted,
-                    null_terminate,
-                )?;
+                write_config_value(&mut stdout, &source, display, &formatted, null_terminate)?;
             }
         }
         ConfigAction::GetRegexp => {
@@ -649,7 +663,11 @@ fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<Loa
     }
 }
 
-fn load_config_bytes(bytes: &[u8], action: ConfigAction, path: Option<&Path>) -> Result<LoadedConfig> {
+fn load_config_bytes(
+    bytes: &[u8],
+    action: ConfigAction,
+    path: Option<&Path>,
+) -> Result<LoadedConfig> {
     if action == ConfigAction::List {
         let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
         Ok(LoadedConfig { config, tail_error })
@@ -669,10 +687,7 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
             if let Some(line) = message.strip_prefix("config line ") {
                 if let Some((line, _)) = line.split_once(':') {
                     if let Some(path) = path {
-                        eprintln!(
-                            "fatal: bad config line {line} in file {}",
-                            path.display()
-                        );
+                        eprintln!("fatal: bad config line {line} in file {}", path.display());
                     } else {
                         eprintln!("fatal: bad config line {line}");
                     }
@@ -805,9 +820,7 @@ fn config_colorbool_enabled(setting: ConfigColorBoolSetting, stdout_is_tty: Opti
     match setting {
         ConfigColorBoolSetting::Never => false,
         ConfigColorBoolSetting::Always => true,
-        ConfigColorBoolSetting::Auto => {
-            stdout_is_tty.unwrap_or_else(|| io::stdout().is_terminal())
-        }
+        ConfigColorBoolSetting::Auto => stdout_is_tty.unwrap_or_else(|| io::stdout().is_terminal()),
     }
 }
 

@@ -66,13 +66,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
         "status differed for {args:?}"
     );
     assert_eq!(
-        actual.stdout, expected.stdout,
+        actual.stdout,
+        expected.stdout,
         "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout)
     );
     assert_eq!(
-        actual.stderr, expected.stderr,
+        actual.stderr,
+        expected.stderr,
         "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&expected.stderr)
@@ -80,22 +82,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_conflict_origin(origin: &Path) {
@@ -118,7 +106,10 @@ fn prepare_conflict_clone(origin: &Path, clone: &Path) {
     let origin_arg = origin.to_str().expect("origin path is utf8");
     git(clone, &["remote", "add", "origin", origin_arg]);
     git(clone, &["fetch", "origin", "-q"]);
-    git(clone, &["branch", "--set-upstream-to=origin/master", "master"]);
+    git(
+        clone,
+        &["branch", "--set-upstream-to=origin/master", "master"],
+    );
     git(clone, &["config", "pull.rebase", "false"]);
     fs::write(clone.join("conflict.txt"), b"local\n").expect("write local file");
     git(clone, &["add", "conflict.txt"]);
@@ -159,36 +150,41 @@ fn pull_conflict_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_origin(&origin);
-        prepare_conflict_clone(&origin, &upstream);
-        prepare_conflict_clone(&origin, &rust);
+    prepare_conflict_origin(&origin);
+    prepare_conflict_clone(&origin, &upstream);
+    prepare_conflict_clone(&origin, &rust);
 
-        let args = ["pull", "origin", "master"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_eq!(
-            actual.status.code(),
-            expected.status.code(),
-            "status differed for conflict pull"
-        );
-        assert!(
-            String::from_utf8_lossy(&actual.stdout).contains("CONFLICT"),
-            "expected CONFLICT in pull output"
-        );
+    let args = ["pull", "origin", "master"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "status differed for conflict pull"
+    );
+    assert!(
+        String::from_utf8_lossy(&actual.stdout).contains("CONFLICT"),
+        "expected CONFLICT in pull output"
+    );
 
-        assert!(
-            upstream.join(".git/MERGE_HEAD").is_file(),
-            "upstream MERGE_HEAD should exist after conflict pull"
-        );
-        assert!(
-            rust.join(".git/MERGE_HEAD").is_file(),
-            "git-rs MERGE_HEAD should exist after conflict pull"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["ls-files", "--unmerged"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["ls-files", "--unmerged"]).stdout,
-            "unmerged index entries differed after conflict pull"
-        );
+    assert!(
+        upstream.join(".git/MERGE_HEAD").is_file(),
+        "upstream MERGE_HEAD should exist after conflict pull"
+    );
+    assert!(
+        rust.join(".git/MERGE_HEAD").is_file(),
+        "git-rs MERGE_HEAD should exist after conflict pull"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["ls-files", "--unmerged"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["ls-files", "--unmerged"]
+        )
+        .stdout,
+        "unmerged index entries differed after conflict pull"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -201,55 +197,65 @@ fn pull_conflict_then_abort_matches_upstream_git() {
     fs::create_dir_all(&origin).expect("create origin repo");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_origin(&origin);
-        prepare_conflict_clone(&origin, &upstream);
-        prepare_conflict_clone(&origin, &rust);
+    prepare_conflict_origin(&origin);
+    prepare_conflict_clone(&origin, &upstream);
+    prepare_conflict_clone(&origin, &rust);
 
-        let upstream_pre_abort = start_conflict_pull("git", &upstream);
-        let rust_pre_abort = start_conflict_pull(env!("CARGO_BIN_EXE_sley"), &rust);
-        assert_eq!(upstream_pre_abort, rust_pre_abort, "pre-pull HEAD differed");
+    let upstream_pre_abort = start_conflict_pull("git", &upstream);
+    let rust_pre_abort = start_conflict_pull(env!("CARGO_BIN_EXE_sley"), &rust);
+    assert_eq!(upstream_pre_abort, rust_pre_abort, "pre-pull HEAD differed");
 
-        let args = ["merge", "--abort"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["merge", "--abort"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
 
-        assert!(
-            !upstream.join(".git/MERGE_HEAD").is_file(),
-            "upstream MERGE_HEAD should be removed"
-        );
-        assert!(
-            !rust.join(".git/MERGE_HEAD").is_file(),
-            "git-rs MERGE_HEAD should be removed"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after merge --abort"
-        );
-        let upstream_post_abort_head =
-            String::from_utf8(run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout)
-                .expect("upstream post-abort HEAD utf8")
-                .trim()
-                .to_string();
-        assert_eq!(
-            upstream_pre_abort, upstream_post_abort_head,
-            "upstream HEAD should return to pre-pull commit"
-        );
-        assert_eq!(
-            fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
-            fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
-            "worktree content differed after merge --abort"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["status", "--porcelain"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["status", "--porcelain"]).stdout,
-            "status differed after merge --abort"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["ls-files", "--unmerged"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["ls-files", "--unmerged"]).stdout,
-            "unmerged index entries differed after merge --abort"
-        );
+    assert!(
+        !upstream.join(".git/MERGE_HEAD").is_file(),
+        "upstream MERGE_HEAD should be removed"
+    );
+    assert!(
+        !rust.join(".git/MERGE_HEAD").is_file(),
+        "git-rs MERGE_HEAD should be removed"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after merge --abort"
+    );
+    let upstream_post_abort_head =
+        String::from_utf8(run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout)
+            .expect("upstream post-abort HEAD utf8")
+            .trim()
+            .to_string();
+    assert_eq!(
+        upstream_pre_abort, upstream_post_abort_head,
+        "upstream HEAD should return to pre-pull commit"
+    );
+    assert_eq!(
+        fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
+        fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
+        "worktree content differed after merge --abort"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["status", "--porcelain"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["status", "--porcelain"]
+        )
+        .stdout,
+        "status differed after merge --abort"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["ls-files", "--unmerged"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["ls-files", "--unmerged"]
+        )
+        .stdout,
+        "unmerged index entries differed after merge --abort"
+    );
     let _ = fs::remove_dir_all(&root);
 }

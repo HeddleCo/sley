@@ -54,7 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, Tree, TreeBuilder};
-use sley_odb::{install_reachable_pack, FileObjectDatabase, ObjectReader, ObjectWriter};
+use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter, install_reachable_pack};
 use sley_refs::{FileRefStore, RefTarget};
 use sley_rev::ResolvedTreePath;
 use sley_sequencer::create_annotated_tag;
@@ -78,11 +78,11 @@ pub mod plumbing {
     pub use sley_object;
     pub use sley_odb;
     pub use sley_refs;
+    #[cfg(feature = "remote")]
+    pub use sley_remote;
     pub use sley_rev;
     pub use sley_sequencer;
     pub use sley_worktree;
-    #[cfg(feature = "remote")]
-    pub use sley_remote;
 }
 
 // The most frequently used plumbing types are also re-exported at the crate root
@@ -91,12 +91,12 @@ pub use sley_config::GitConfig;
 pub use sley_core::{
     BString, FullName, GitError, GitTime, NotFoundKind, ObjectFormat, ObjectId, Result, Signature,
 };
+pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
-pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
 pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
 pub use sley_sequencer::TagCreate;
@@ -410,7 +410,9 @@ impl Repository {
     pub fn find_reference(&self, name: &str) -> Result<Option<Reference>> {
         let name = FullName::new(name)?;
         let refs = self.references();
-        Ok(refs.read_ref(name.as_str())?.map(|target| Reference { name, target }))
+        Ok(refs
+            .read_ref(name.as_str())?
+            .map(|target| Reference { name, target }))
     }
 
     /// Resolve a revision specification (anything `git rev-parse` accepts:
@@ -800,7 +802,10 @@ mod tests {
         let temp = TempDir::new();
         let repo = Repository::init(temp.path()).expect("init");
         let head = repo.head().expect("head");
-        assert_eq!(head.symbolic_target.as_ref().map(FullName::as_str), Some("refs/heads/main"));
+        assert_eq!(
+            head.symbolic_target.as_ref().map(FullName::as_str),
+            Some("refs/heads/main")
+        );
         assert_eq!(head.oid, None);
         assert!(head.is_unborn());
         assert!(!head.is_detached());
@@ -814,7 +819,10 @@ mod tests {
         let commit_oid = seed_commit(&repo);
 
         let head = repo.head().expect("head");
-        assert_eq!(head.symbolic_target.as_ref().map(FullName::as_str), Some("refs/heads/main"));
+        assert_eq!(
+            head.symbolic_target.as_ref().map(FullName::as_str),
+            Some("refs/heads/main")
+        );
         assert_eq!(head.oid.as_ref(), Some(&commit_oid));
         assert!(!head.is_unborn());
         assert_eq!(head.branch_name(), Some("main"));
@@ -891,10 +899,7 @@ mod tests {
             .expect("branch exists");
         assert_eq!(branch.name, "refs/heads/main");
         assert_eq!(branch.target, RefTarget::Direct(commit_oid));
-        assert_eq!(
-            branch.peeled_oid(&repo).expect("peel"),
-            Some(commit_oid)
-        );
+        assert_eq!(branch.peeled_oid(&repo).expect("peel"), Some(commit_oid));
 
         let head = repo
             .find_reference("HEAD")
@@ -1218,9 +1223,7 @@ mod tests {
         editor.upsert("added.txt", sley_object::EntryKind::Blob, blob_oid);
         let new_tree = repo.write_tree(editor).expect("tree");
 
-        let changes = repo
-            .diff_name_status(&base_tree, &new_tree)
-            .expect("diff");
+        let changes = repo.diff_name_status(&base_tree, &new_tree).expect("diff");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, b"added.txt");
     }

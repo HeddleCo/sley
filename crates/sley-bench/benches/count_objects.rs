@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use sley_bench::{create_fixture, BenchFixture};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use sley_bench::{BenchFixture, create_fixture};
 use sley_core::{GitError, Result};
 use std::io::Write;
 use std::path::Path;

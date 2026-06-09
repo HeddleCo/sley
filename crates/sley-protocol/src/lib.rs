@@ -626,10 +626,7 @@ pub fn plan_fetch_ref_updates(
         });
     }
     if auto_follow_tags && updates.iter().any(|update| update.dst.is_some()) {
-        let fetched_oids = updates
-            .iter()
-            .map(|update| update.oid)
-            .collect::<Vec<_>>();
+        let fetched_oids = updates.iter().map(|update| update.oid).collect::<Vec<_>>();
         let fetched_srcs = updates
             .iter()
             .map(|update| update.src.clone())
@@ -10677,10 +10674,7 @@ mod tests {
                 .expect("test operation should succeed");
             assert_eq!(
                 acknowledgment,
-                UploadPackAcknowledgment::Ack {
-                    oid,
-                    status,
-                }
+                UploadPackAcknowledgment::Ack { oid, status }
             );
             assert_eq!(
                 encode_upload_pack_acknowledgment(&acknowledgment)

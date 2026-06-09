@@ -465,11 +465,7 @@ pub fn install_repack_result(
     // Prune based on the objects the new pack's *index* can resolve (what reads use
     // once the old packs are gone), not just what the pack contains — so a stale
     // pack is never removed for an object the new index cannot serve.
-    let present: HashSet<ObjectId> = parsed_index
-        .entries
-        .iter()
-        .map(|entry| entry.oid)
-        .collect();
+    let present: HashSet<ObjectId> = parsed_index.entries.iter().map(|entry| entry.oid).collect();
 
     prune_packs_contained_in(&objects_dir, format, &present, &new_pack_path)?;
     prune_loose_objects(&objects_dir, format, result.packed_loose.iter(), &present)?;
@@ -950,9 +946,7 @@ impl ObjectReader for ObjectDatabase {
 impl ObjectWriter for ObjectDatabase {
     fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
-        self.objects
-            .entry(oid)
-            .or_insert_with(|| Arc::new(object));
+        self.objects.entry(oid).or_insert_with(|| Arc::new(object));
         Ok(oid)
     }
 }
@@ -1564,11 +1558,7 @@ impl FileObjectDatabase {
             pack_path,
             index_path,
             promisor_path,
-            object_ids: built
-                .entries
-                .iter()
-                .map(|entry| entry.oid)
-                .collect(),
+            object_ids: built.entries.iter().map(|entry| entry.oid).collect(),
         })
     }
 
@@ -2881,21 +2871,16 @@ mod tests {
             .write_object(commit.clone())
             .expect("test operation should succeed");
 
-        let reachable =
-            collect_reachable_object_ids(&source, format, std::iter::once(commit_oid))
-                .expect("test operation should succeed");
+        let reachable = collect_reachable_object_ids(&source, format, std::iter::once(commit_oid))
+            .expect("test operation should succeed");
         assert!(reachable.contains(&commit_oid));
         assert!(reachable.contains(&tree_oid));
         assert!(reachable.contains(&blob_oid));
 
-        let install = install_reachable_pack(
-            &source,
-            &destination,
-            format,
-            std::iter::once(commit_oid),
-        )
-        .expect("test operation should succeed")
-        .expect("reachable pack should be written");
+        let install =
+            install_reachable_pack(&source, &destination, format, std::iter::once(commit_oid))
+                .expect("test operation should succeed")
+                .expect("reachable pack should be written");
         assert_eq!(install.object_ids.len(), 3);
         for (oid, object) in [
             (&commit_oid, &commit),
@@ -2963,13 +2948,8 @@ mod tests {
             .expect("test operation should succeed");
         let excluded = HashSet::from([tree_oid]);
 
-        let objects = collect_reachable_objects(
-            &db,
-            format,
-            [commit_oid, commit_oid],
-            &excluded,
-        )
-        .expect("test operation should succeed");
+        let objects = collect_reachable_objects(&db, format, [commit_oid, commit_oid], &excluded)
+            .expect("test operation should succeed");
 
         assert_eq!(objects.len(), 1);
         assert_eq!(
@@ -3120,21 +3100,15 @@ mod tests {
             .write_object(object.clone())
             .expect("test operation should succeed");
 
-        let pack = build_reachable_pack(
-            &source,
-            format,
-            std::iter::once(oid),
-            &HashSet::new(),
-        )
-        .expect("test operation should succeed")
-        .expect("sha256 reachable pack should be built");
+        let pack = build_reachable_pack(&source, format, std::iter::once(oid), &HashSet::new())
+            .expect("test operation should succeed")
+            .expect("sha256 reachable pack should be built");
         assert!(pack.pack.starts_with(b"PACK"));
         assert_eq!(pack.entries[0].oid, oid);
 
-        let result =
-            install_reachable_pack(&source, &destination, format, std::iter::once(oid))
-                .expect("test operation should succeed")
-                .expect("sha256 reachable pack should be written");
+        let result = install_reachable_pack(&source, &destination, format, std::iter::once(oid))
+            .expect("test operation should succeed")
+            .expect("sha256 reachable pack should be written");
 
         assert_eq!(result.object_ids, vec![oid]);
         assert!(

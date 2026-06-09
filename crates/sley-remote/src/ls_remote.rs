@@ -16,9 +16,9 @@
 //!
 //! SSH ls-remote still lives in the CLI; only HTTP and local move here.
 
-use std::path::{Path, PathBuf};
 #[cfg(feature = "http")]
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_object::ObjectType;
@@ -93,7 +93,8 @@ pub fn ls_remote(
     format: ObjectFormat,
     filter: &LsRemoteFilter,
     matches: &dyn Fn(&str) -> bool,
-    #[cfg_attr(not(feature = "http"), allow(unused_variables))] credentials: &mut dyn CredentialProvider,
+    #[cfg_attr(not(feature = "http"), allow(unused_variables))]
+    credentials: &mut dyn CredentialProvider,
 ) -> Result<(Vec<LsRemoteRecord>, ObjectFormat)> {
     match source {
         #[cfg(feature = "http")]

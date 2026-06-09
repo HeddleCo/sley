@@ -1249,24 +1249,30 @@ fn ureq_tls_config() -> Option<ureq::tls::TlsConfig> {
     #[cfg(feature = "tls-platform-verifier")]
     {
         use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
-        return Some(
+        Some(
             TlsConfig::builder()
                 .provider(TlsProvider::Rustls)
                 .root_certs(RootCerts::PlatformVerifier)
                 .build(),
-        );
+        )
     }
     #[cfg(all(feature = "tls-native-tls", not(feature = "tls-platform-verifier")))]
     {
         use ureq::tls::{TlsConfig, TlsProvider};
-        return Some(
+        Some(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
                 .build(),
-        );
+        )
     }
-    // `tls-rustls` (and the default ureq rustls stack) need no explicit config.
-    None
+    #[cfg(not(any(
+        feature = "tls-platform-verifier",
+        all(feature = "tls-native-tls", not(feature = "tls-platform-verifier"))
+    )))]
+    {
+        // `tls-rustls` (and the default ureq rustls stack) need no explicit config.
+        None
+    }
 }
 
 #[cfg(feature = "http-client")]

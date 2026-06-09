@@ -383,10 +383,7 @@ fn describe_peel_commit(
         ObjectType::Commit => {
             let commit = Commit::parse(format, &object.body)?;
             let date = commit_identity_timestamp_i64(&commit.committer).unwrap_or(0);
-            Ok(DescribePeel::Lightweight {
-                commit: *oid,
-                date,
-            })
+            Ok(DescribePeel::Lightweight { commit: *oid, date })
         }
         ObjectType::Tag => {
             let tag = Tag::parse(format, &object.body)?;
@@ -709,10 +706,7 @@ fn finish_depth_computation(
             let flag_after = flags.get(&parent).copied().unwrap_or(0) & best_flag;
             if !was_seen {
                 let date = describe_commit_date(db, format, &parent)?;
-                queue.push(DescribeQueueItem {
-                    date,
-                    oid: parent,
-                });
+                queue.push(DescribeQueueItem { date, oid: parent });
                 if flag_after == 0 {
                     unflagged.insert(parent);
                 }

@@ -6,7 +6,7 @@ use sley_formats::CommitGraph;
 use sley_index::Index;
 use sley_object::{Commit, ObjectType, Tag, TreeEntries};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
-use sley_refs::{FileRefStore, PackedRef, RefTarget};
+use sley_refs::{FileRefStore, PackedRef, RefTarget, resolve_ref_peeled, validate_symref_name};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -176,22 +176,20 @@ fn resolve_revision_name(
 }
 
 fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectId>> {
-    let target = if rev == "HEAD" {
-        refs.read_ref("HEAD")?
+    let initial = if rev == "HEAD" {
+        "HEAD".to_string()
     } else if rev.starts_with("refs/") {
-        refs.read_ref(rev)?
+        rev.to_string()
+    } else if refs.read_ref(&format!("refs/heads/{rev}"))?.is_some() {
+        format!("refs/heads/{rev}")
+    } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
+        format!("refs/tags/{rev}")
+    } else if validate_symref_name(rev).is_ok() {
+        rev.to_string()
     } else {
-        refs.read_ref(&format!("refs/heads/{rev}"))?
-            .or(refs.read_ref(&format!("refs/tags/{rev}"))?)
+        return Ok(None);
     };
-    match target {
-        Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
-        Some(RefTarget::Symbolic(name)) => match refs.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
-            _ => Ok(None),
-        },
-        None => Ok(None),
-    }
+    resolve_ref_peeled(refs, &initial)
 }
 
 // ---------------------------------------------------------------------------
@@ -1043,7 +1041,12 @@ pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
         };
         out.push(metadata.clone());
         let parents = if first_parent {
-            metadata.parents.first().into_iter().cloned().collect::<Vec<_>>()
+            metadata
+                .parents
+                .first()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
         } else {
             metadata.parents.clone()
         };
@@ -1053,10 +1056,7 @@ pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
             }
             let parent_metadata = commit_metadata_lookup(&mut graph, reader, format, &parent)?;
             records.insert(parent_metadata.oid, parent_metadata.clone());
-            heap.push((
-                parent_metadata.commit_time,
-                Reverse(parent_metadata.oid),
-            ));
+            heap.push((parent_metadata.commit_time, Reverse(parent_metadata.oid)));
         }
     }
     Ok(out)
@@ -1984,12 +1984,7 @@ mod tests {
         let base = write_test_commit(&mut db, tree, Vec::new(), b"base\n");
         let first_parent = write_test_commit(&mut db, tree, vec![base], b"main\n");
         let second_parent = write_test_commit(&mut db, tree, vec![base], b"side\n");
-        let merge = write_test_commit(
-            &mut db,
-            tree,
-            vec![first_parent, second_parent],
-            b"merge\n",
-        );
+        let merge = write_test_commit(&mut db, tree, vec![first_parent, second_parent], b"merge\n");
         assert_eq!(
             resolve_revision_with_reader(&git_dir, ObjectFormat::Sha1, &db, &format!("{merge}^"))
                 .expect("test operation should succeed"),
@@ -2470,20 +2465,8 @@ mod tests {
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
         let first = write_dated_commit(&mut db, tree, Vec::new(), b"add feature\n", 1000);
-        let second = write_dated_commit(
-            &mut db,
-            tree,
-            vec![first],
-            b"fix the widget bug\n",
-            2000,
-        );
-        let third = write_dated_commit(
-            &mut db,
-            tree,
-            vec![second],
-            b"unrelated change\n",
-            3000,
-        );
+        let second = write_dated_commit(&mut db, tree, vec![first], b"fix the widget bug\n", 2000);
+        let third = write_dated_commit(&mut db, tree, vec![second], b"unrelated change\n", 3000);
         let refs = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
         let mut tx = refs.transaction();
         tx.update(RefUpdate {

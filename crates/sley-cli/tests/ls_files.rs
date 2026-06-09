@@ -744,11 +744,8 @@ fn ls_files_others_nested_git_matches_upstream_git() {
     for repo in [&upstream, &rust] {
         git(repo, &["init", "-q"]);
         fs::create_dir_all(repo.join("not-a-submodule")).expect("create nested dir");
-        fs::write(
-            repo.join("not-a-submodule").join("file.txt"),
-            b"inside\n",
-        )
-        .expect("write nested file");
+        fs::write(repo.join("not-a-submodule").join("file.txt"), b"inside\n")
+            .expect("write nested file");
         git(&repo.join("not-a-submodule"), &["init", "-q"]);
     }
 
@@ -761,6 +758,157 @@ fn ls_files_others_nested_git_matches_upstream_git() {
         let actual = git_rs(&rust, &args);
         assert_eq!(actual, expected, "sley output differed for {args:?}");
     }
+    let _ = fs::remove_dir_all(&root);
+}
+
+fn prepare_upstream_ls_files_others_fixture(repo: &Path) {
+    fs::write(repo.join("path0"), b"path0\n").expect("write path0");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink("xyzzy", repo.join("path1")).expect("create path1 symlink");
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(repo.join("path1"), b"path1\n").expect("write path1");
+    }
+    fs::create_dir_all(repo.join("path2")).expect("create path2");
+    fs::create_dir_all(repo.join("path3")).expect("create path3");
+    fs::create_dir_all(repo.join("path4")).expect("create path4");
+    fs::write(repo.join("path2").join("file2"), b"file2\n").expect("write file2");
+    fs::write(repo.join("path2-junk"), b"junk\n").expect("write path2-junk");
+    fs::write(repo.join("path3").join("file3"), b"file3\n").expect("write file3");
+    fs::write(repo.join("path3-junk"), b"junk\n").expect("write path3-junk");
+    git(
+        repo,
+        &["update-index", "--add", "path3-junk", "path3/file3"],
+    );
+}
+
+fn prepare_upstream_nested_pathspec_fixture(repo: &Path) {
+    git(repo, &["init", "-q"]);
+    fs::create_dir_all(repo.join("partially_tracked/untracked_dir")).expect("create tracked dir");
+    fs::write(repo.join("partially_tracked/content"), b"content\n").expect("write tracked content");
+    fs::write(repo.join("partially_tracked/untracked_dir/file"), b"file\n")
+        .expect("write untracked dir file");
+    fs::create_dir_all(repo.join("untracked/deep")).expect("create untracked deep dir");
+    fs::write(repo.join("untracked/deep/path"), b"path\n").expect("write deep path");
+    fs::write(repo.join("untracked/deep/foo.c"), b"foo\n").expect("write deep foo.c");
+    git(repo, &["add", "partially_tracked/content"]);
+}
+
+#[test]
+fn ls_files_others_basic_matches_upstream_git() {
+    let root = unique_temp_dir("ls-files-others-basic");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    git(&upstream, &["init", "-q"]);
+    git(&rust, &["init", "-q"]);
+    prepare_upstream_ls_files_others_fixture(&upstream);
+    prepare_upstream_ls_files_others_fixture(&rust);
+
+    for args in [
+        vec!["ls-files", "--others"],
+        vec!["ls-files", "--others", "--directory"],
+        vec![
+            "ls-files",
+            "--others",
+            "--directory",
+            "--no-empty-directory",
+        ],
+    ] {
+        let expected = git(&upstream, &args);
+        let actual = git_rs(&rust, &args);
+        assert_eq!(actual, expected, "sley output differed for {args:?}");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ls_files_others_non_submodule_git_file_matches_upstream_git() {
+    let root = unique_temp_dir("ls-files-others-git-file");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    git(&upstream, &["init", "-q"]);
+    git(&rust, &["init", "-q"]);
+    prepare_upstream_ls_files_others_fixture(&upstream);
+    prepare_upstream_ls_files_others_fixture(&rust);
+    fs::create_dir_all(upstream.join("not-a-submodule")).expect("create upstream nested dir");
+    fs::create_dir_all(rust.join("not-a-submodule")).expect("create rust nested dir");
+    fs::write(upstream.join("not-a-submodule/.git"), b"foo\n").expect("write upstream .git file");
+    fs::write(rust.join("not-a-submodule/.git"), b"foo\n").expect("write rust .git file");
+
+    let args = ["ls-files", "--others"];
+    let expected = git(&upstream, &args);
+    let actual = git_rs(&rust, &args);
+    assert_eq!(actual, expected, "sley output differed for {args:?}");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn ls_files_others_directory_pathspec_matches_upstream_git() {
+    let root = unique_temp_dir("ls-files-others-directory-pathspec");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    prepare_upstream_nested_pathspec_fixture(&upstream);
+    prepare_upstream_nested_pathspec_fixture(&rust);
+
+    for args in [
+        vec!["ls-files", "-o", "--directory", "untracked/deep/"],
+        vec![
+            "ls-files",
+            "-o",
+            "--directory",
+            "partially_tracked/",
+            "untracked/",
+        ],
+        vec![
+            "ls-files",
+            "-o",
+            "--directory",
+            "partially_tracked/",
+            "untracked/deep/path",
+        ],
+        vec![
+            "ls-files",
+            "--others",
+            "--directory",
+            "partially_tracked",
+            "untracked/*.c",
+        ],
+        vec![
+            "ls-files",
+            "--others",
+            "--directory",
+            "partially_tracked/",
+            "untracked/?*",
+        ],
+        vec!["ls-files", "--others", "--directory", "untracked/*.c"],
+        vec!["ls-files", "--others", "--directory", "untracked/?*"],
+        vec!["ls-files", "--others", "untracked/*.c"],
+    ] {
+        let expected = git(&upstream, &args);
+        let actual = git_rs(&rust, &args);
+        assert_eq!(actual, expected, "sley output differed for {args:?}");
+    }
+
+    let nested_empty_upstream = upstream.join("untracked/deep/empty");
+    let nested_empty_rust = rust.join("untracked/deep/empty");
+    git(&nested_empty_upstream, &["init", "-q"]);
+    git(&nested_empty_rust, &["init", "-q"]);
+    let args = ["ls-files", "--others", "untracked/*.c"];
+    let expected = git(&upstream, &args);
+    let actual = git_rs(&rust, &args);
+    assert_eq!(
+        actual, expected,
+        "sley output differed for nested gitdir case"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 

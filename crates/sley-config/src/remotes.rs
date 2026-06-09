@@ -118,7 +118,11 @@ pub fn resolve_remote_push_url(config: &GitConfig, remote: &str) -> String {
     let url = remote_config_values(config, remote, "pushurl")
         .into_iter()
         .next()
-        .or_else(|| remote_config_values(config, remote, "url").into_iter().next())
+        .or_else(|| {
+            remote_config_values(config, remote, "url")
+                .into_iter()
+                .next()
+        })
         .unwrap_or_else(|| remote.to_string());
     rewrite_url_with_config(config, &url, true)
 }
@@ -156,7 +160,11 @@ pub fn add_remote(
     if remote_exists(config, name) {
         return Err(RemoteEditError::AlreadyExists);
     }
-    config.sections.push(ConfigSection::new("remote", Some(name.to_string()), entries));
+    config.sections.push(ConfigSection::new(
+        "remote",
+        Some(name.to_string()),
+        entries,
+    ));
     Ok(())
 }
 
@@ -322,7 +330,9 @@ pub fn set_url(
     };
     match op {
         SetUrlOp::Add { url } => {
-            section.entries.push(ConfigEntry::new(key, Some(url.to_string())));
+            section
+                .entries
+                .push(ConfigEntry::new(key, Some(url.to_string())));
             Ok(())
         }
         SetUrlOp::Delete { matches } => set_url_delete(section, kind, key, matches),
@@ -401,7 +411,9 @@ fn set_url_set(section: &mut ConfigSection, key: &str, url: &str) -> Result<(), 
     if let Some(idx) = indices.first().copied() {
         section.entries[idx].value = Some(url.to_string());
     } else {
-        section.entries.insert(0, ConfigEntry::new(key, Some(url.to_string())));
+        section
+            .entries
+            .insert(0, ConfigEntry::new(key, Some(url.to_string())));
     }
     Ok(())
 }

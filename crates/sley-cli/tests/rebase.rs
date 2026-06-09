@@ -66,13 +66,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
         "status differed for {args:?}"
     );
     assert_eq!(
-        actual.stdout, expected.stdout,
+        actual.stdout,
+        expected.stdout,
         "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout)
     );
     assert_eq!(
-        actual.stderr, expected.stderr,
+        actual.stderr,
+        expected.stderr,
         "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&expected.stderr)
@@ -80,22 +82,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_diverged_repos(upstream: &Path, rust: &Path) {

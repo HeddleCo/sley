@@ -1,8 +1,8 @@
 use sley_config::{ConfigBoolOrInt, ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{BString, GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{
-    Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry,
-    RepositoryLayout,
+    Bundle, BundlePrerequisite, BundleReference, CommitGraph, CommitGraphWriteEntry, InitOptions,
+    RefStorageFormat, RepositoryBootstrap, RepositoryLayout,
 };
 use sley_index::{Index, IndexEntry};
 use sley_object::{
@@ -23,13 +23,13 @@ use sley_protocol::{
     write_receive_pack_report_status, write_ref_advertisement_set,
     write_upload_pack_packfile_response, write_upload_pack_raw_packfile_response,
 };
-use sley_remote::FetchOutcome;
 pub(crate) use sley_ref_filter::*;
 use sley_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefPrecondition, RefTarget, RefUpdate,
-    ReflogEntry, branch_ref_name, parse_packed_refs, tag_ref_name, validate_ref_name,
-    validate_symref_name, validate_symref_target,
+    ReflogEntry, branch_ref_name, parse_packed_refs, resolve_ref_peeled, tag_ref_name,
+    validate_ref_name, validate_symref_name, validate_symref_target,
 };
+use sley_remote::FetchOutcome;
 use sley_transport::{RemoteTransport, parse_remote_url};
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -55,10 +55,7 @@ mod remote;
 mod repo_path;
 mod repository;
 
-pub(crate) use log_format::{
-    CompiledLogFormat, FormatToken, LogFormatDialect, presets,
-};
-
+pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
 
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
@@ -66,9 +63,8 @@ pub(crate) use commands::config_cmd::{config_entry_name, has_unescaped_trailing_
 pub(crate) use commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, conclude_in_progress_merge,
     conclude_rebase_step_via_commit, head_commit_oid, merge_bases, merge_index_entry,
-    merge_is_regular_file, merge_read_blob, merge_remove_worktree_file,
-    merge_write_worktree_file, read_merge_message_from_file, rebase_in_progress,
-    three_way_merge_trees,
+    merge_is_regular_file, merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
+    read_merge_message_from_file, rebase_in_progress, three_way_merge_trees,
 };
 pub(crate) use commands::remote_cmds::{
     read_repo_config, remote_exists, remote_names, repo_current_branch_name, write_repo_config,
@@ -1448,7 +1444,6 @@ fn common_git_dir_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     fs::canonicalize(git_dir).map_err(|err| GitError::Io(err.to_string()))
 }
 
-
 struct GlobalOptions<'a> {
     args: &'a [String],
     config: Vec<GlobalConfigOverride>,
@@ -1756,8 +1751,9 @@ fn print_global_usage() {
 }
 
 fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
-    let mut bare = false;
-    let mut format = ObjectFormat::Sha1;
+    let mut bare = global_bare();
+    let mut object_format = None::<ObjectFormat>;
+    let mut ref_format = None::<Option<String>>;
     let mut initial_branch = global_config
         .iter()
         .rev()
@@ -1767,11 +1763,17 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     let mut initial_branch_explicit = false;
     let mut quiet = false;
     let mut path = PathBuf::from(".");
+    let mut template = None::<Option<String>>;
+    let mut template_config = true;
+    let mut separate_git_dir = None::<String>;
+    let mut shared_repository = None::<Option<String>>;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--bare" => bare = true,
             "-q" | "--quiet" => quiet = true,
+            "-s" | "--shared" => shared_repository = Some(Some("group".into())),
+            "--no-shared" => shared_repository = Some(None),
             "-b" | "--initial-branch" => {
                 initial_branch = iter
                     .next()
@@ -1779,14 +1781,43 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
                     .to_string();
                 initial_branch_explicit = true;
             }
-            "--object-format=sha1" => format = ObjectFormat::Sha1,
-            "--object-format=sha256" => format = ObjectFormat::Sha256,
+            "--object-format=sha1" => object_format = Some(ObjectFormat::Sha1),
+            "--object-format=sha256" => object_format = Some(ObjectFormat::Sha256),
             "--object-format" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
-                format = value.parse()?;
+                object_format = Some(value.parse()?);
             }
+            "--template" => {
+                template = Some(Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("--template requires a value".into()))?
+                        .to_string(),
+                ));
+                template_config = true;
+            }
+            "--no-template" => {
+                template = Some(None);
+                template_config = false;
+            }
+            "--separate-git-dir" => {
+                separate_git_dir = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("--separate-git-dir requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            "--no-separate-git-dir" => separate_git_dir = None,
+            "--ref-format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--ref-format requires a value".into()))?;
+                ref_format = Some(Some(value.to_string()));
+            }
+            "--no-ref-format" => ref_format = Some(None),
             value if value.starts_with("--initial-branch=") => {
                 initial_branch = value
                     .strip_prefix("--initial-branch=")
@@ -1794,24 +1825,94 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
                     .to_string();
                 initial_branch_explicit = true;
             }
+            value if value.starts_with("--object-format=") => {
+                let value = value
+                    .strip_prefix("--object-format=")
+                    .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
+                object_format = Some(value.parse()?);
+            }
+            value if value.starts_with("--template=") => {
+                template = Some(Some(
+                    value
+                        .strip_prefix("--template=")
+                        .ok_or_else(|| GitError::Command("--template requires a value".into()))?
+                        .to_string(),
+                ));
+                template_config = true;
+            }
+            value if value.starts_with("--separate-git-dir=") => {
+                separate_git_dir = Some(
+                    value
+                        .strip_prefix("--separate-git-dir=")
+                        .ok_or_else(|| {
+                            GitError::Command("--separate-git-dir requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--shared=") => {
+                shared_repository = Some(Some(
+                    value
+                        .strip_prefix("--shared=")
+                        .ok_or_else(|| GitError::Command("--shared requires a value".into()))?
+                        .to_string(),
+                ));
+            }
+            value if value.starts_with("--ref-format=") => {
+                ref_format = Some(Some(
+                    value
+                        .strip_prefix("--ref-format=")
+                        .ok_or_else(|| GitError::Command("--ref-format requires a value".into()))?
+                        .to_string(),
+                ));
+            }
             value => path = PathBuf::from(value),
         }
     }
+
+    if !bare
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".git"))
+    {
+        bare = true;
+    }
+
     validate_ref_name(&format!("refs/heads/{initial_branch}"))?;
-    let git_dir = if bare {
-        path.clone()
-    } else {
-        path.join(".git")
-    };
-    let existing = git_dir.join("HEAD").exists();
-    let layout =
-        RepositoryLayout::init_at_with_initial_branch(path, format, bare, &initial_branch)?;
-    if existing && initial_branch_explicit {
+
+    let cwd = env::current_dir()?;
+    let worktree = resolve_cli_path(&cwd, path.to_string_lossy().as_ref());
+    let separate_git_dir = separate_git_dir.map(|value| resolve_cli_path(&cwd, &value));
+
+    if bare && separate_git_dir.is_some() {
+        eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+
+    let object_format = resolve_init_object_format(object_format, global_config)?;
+    let ref_storage = resolve_init_ref_storage(ref_format, global_config)?;
+    let shared_repository = resolve_init_shared_repository(shared_repository, global_config, bare)?;
+    let template_dir = resolve_init_template_dir(template, template_config, global_config, &cwd)?;
+
+    let layout = RepositoryBootstrap::init(InitOptions {
+        worktree,
+        object_format,
+        bare,
+        initial_branch: initial_branch.clone(),
+        template_dir,
+        copy_template_config: template_config,
+        separate_git_dir,
+        shared_repository,
+        ref_storage,
+    })?;
+
+    if layout.reinitialized && initial_branch_explicit {
         eprintln!("warning: re-init: ignored --initial-branch={initial_branch}");
     }
     if !quiet {
         let git_dir = fs::canonicalize(&layout.git_dir)?;
-        let action = if existing {
+        let action = if layout.reinitialized {
             "Reinitialized existing"
         } else {
             "Initialized empty"
@@ -1821,6 +1922,162 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     Ok(())
 }
 
+fn resolve_init_object_format(
+    cli_format: Option<ObjectFormat>,
+    global_config: &[GlobalConfigOverride],
+) -> Result<ObjectFormat> {
+    if let Some(format) = cli_format {
+        return Ok(format);
+    }
+    if let Ok(hash) = env::var("GIT_DEFAULT_HASH") {
+        if !hash.is_empty() {
+            return hash.parse();
+        }
+    }
+    if let Some(value) = init_config_value("init.defaultObjectFormat", global_config)? {
+        match value.parse::<ObjectFormat>() {
+            Ok(format) => return Ok(format),
+            Err(_) => {
+                eprintln!("warning: unknown hash algorithm option: {value}");
+            }
+        }
+    }
+    Ok(ObjectFormat::Sha1)
+}
+
+fn resolve_init_ref_storage(
+    cli_ref_format: Option<Option<String>>,
+    global_config: &[GlobalConfigOverride],
+) -> Result<RefStorageFormat> {
+    if let Some(value) = cli_ref_format {
+        return parse_init_ref_storage(value.as_deref().unwrap_or(""));
+    }
+    if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {
+        return parse_init_ref_storage(&value);
+    }
+    if let Some(value) = init_config_value("init.defaultRefFormat", global_config)? {
+        if value.is_empty() {
+            return Ok(RefStorageFormat::Files);
+        }
+        match parse_init_ref_storage(&value) {
+            Ok(format) => return Ok(format),
+            Err(GitError::Exit(128)) => return Err(GitError::Exit(128)),
+            Err(_) => {
+                eprintln!("warning: unknown ref format option: {value}");
+            }
+        }
+    }
+    if init_config_bool("feature.experimental", global_config)?.unwrap_or(false) {
+        return Ok(RefStorageFormat::Reftable);
+    }
+    Ok(RefStorageFormat::Files)
+}
+
+fn parse_init_ref_storage(value: &str) -> Result<RefStorageFormat> {
+    RefStorageFormat::parse(value).map_err(|err| match err {
+        GitError::Command(message) => {
+            eprintln!("fatal: {message}");
+            GitError::Exit(128)
+        }
+        other => other,
+    })
+}
+
+fn resolve_init_shared_repository(
+    cli_shared: Option<Option<String>>,
+    global_config: &[GlobalConfigOverride],
+    bare: bool,
+) -> Result<Option<String>> {
+    if let Some(value) = cli_shared {
+        return Ok(value);
+    }
+    if bare {
+        return Ok(None);
+    }
+    init_config_value("core.sharedRepository", global_config)
+}
+
+fn resolve_init_template_dir(
+    cli_template: Option<Option<String>>,
+    template_config: bool,
+    global_config: &[GlobalConfigOverride],
+    cwd: &Path,
+) -> Result<Option<PathBuf>> {
+    let _ = template_config;
+    match cli_template {
+        Some(None) => Ok(None),
+        Some(Some(path)) => {
+            if path.is_empty() {
+                Ok(Some(PathBuf::new()))
+            } else {
+                Ok(Some(resolve_cli_path(cwd, &path)))
+            }
+        }
+        None => {
+            if let Some(path) = init_config_value("init.templatedir", global_config)? {
+                let expanded = sley_config::expand_user_path(&path);
+                Ok(Some(if expanded.is_absolute() {
+                    expanded
+                } else {
+                    cwd.join(expanded)
+                }))
+            } else if let Ok(path) = env::var("GIT_TEMPLATE_DIR") {
+                if path.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(resolve_cli_path(cwd, &path)))
+                }
+            } else {
+                Ok(default_init_template_dir())
+            }
+        }
+    }
+}
+
+fn default_init_template_dir() -> Option<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec_path = String::from_utf8_lossy(&output.stdout);
+    let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
+    candidate.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+fn init_config_value(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<String>> {
+    if let Some(value) = global_config
+        .iter()
+        .rev()
+        .find(|entry| entry.key.eq_ignore_ascii_case(key))
+        .map(|entry| entry.value.clone())
+    {
+        return Ok(Some(value));
+    }
+    if let Ok(Some(value)) = global_config_value(key) {
+        return Ok(Some(value));
+    }
+    let context = sley_config::ConfigIncludeContext::new(None, None);
+    let config = sley_config::load_pre_dispatch_config(None, &context)?;
+    let (section, entry_key) = key
+        .split_once('.')
+        .ok_or_else(|| GitError::Command(format!("invalid config key {key}")))?;
+    Ok(config.get(section, None, entry_key).map(str::to_owned))
+}
+
+fn init_config_bool(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<bool>> {
+    init_config_value(key, global_config).map(|value| value.as_deref().and_then(parse_config_bool))
+}
+
+fn parse_config_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
 
 fn cmd_add(args: &[String]) -> Result<()> {
     let mut paths = Vec::new();
@@ -2843,7 +3100,6 @@ fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>>
     }
     Ok(roots)
 }
-
 
 #[derive(Debug)]
 struct ReflogShowOptions {
@@ -4842,9 +5098,7 @@ fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
 }
 
 fn rerere_usage<T>() -> Result<T> {
-    eprintln!(
-        "usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]"
-    );
+    eprintln!("usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]");
     eprintln!();
     eprintln!("    --[no-]rerere-autoupdate");
     eprintln!("                          register clean resolutions in index");
@@ -4866,7 +5120,10 @@ fn read_merge_rr(git_dir: &Path) -> Result<Vec<MergeRrEntry>> {
         return Ok(Vec::new());
     };
     let mut entries = Vec::new();
-    for record in data.split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
+    for record in data
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
         let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
             return Err(GitError::Command("corrupt MERGE_RR".into()));
         };
@@ -4970,7 +5227,10 @@ fn rerere_forget(git_dir: &Path, paths: &[String]) -> Result<()> {
     let entries = read_merge_rr(git_dir)?;
     for pattern in paths {
         let mut matched = false;
-        for entry in entries.iter().filter(|entry| rerere_path_matches(&entry.path, pattern)) {
+        for entry in entries
+            .iter()
+            .filter(|entry| rerere_path_matches(&entry.path, pattern))
+        {
             matched = true;
             let cache_dir = rr_cache.join(&entry.hash);
             let postimage = rerere_cache_file_path(&cache_dir, entry.variant, "postimage");
@@ -4979,9 +5239,11 @@ fn rerere_forget(git_dir: &Path, paths: &[String]) -> Result<()> {
                 continue;
             }
             fs::remove_file(&postimage)?;
-            if let Ok(thisimage) =
-                fs::read(rerere_cache_file_path(&cache_dir, entry.variant, "thisimage"))
-            {
+            if let Ok(thisimage) = fs::read(rerere_cache_file_path(
+                &cache_dir,
+                entry.variant,
+                "thisimage",
+            )) {
                 fs::write(
                     rerere_cache_file_path(&cache_dir, entry.variant, "preimage"),
                     thisimage,
@@ -5934,47 +6196,36 @@ fn clean_targets(
     pathspec: &LsFilesPathspec,
     excludes: &[String],
 ) -> Result<Vec<CleanTarget>> {
-    let directory_paths = sley_worktree::untracked_paths_with_options(
-        worktree_root,
-        git_dir,
-        format,
-        sley_worktree::UntrackedPathOptions {
-            directory: true,
-            no_empty_directory: false,
-            preserve_ignored_directories: directories,
-            exclude_standard: !include_ignored,
-            ignored_only: false,
-            exclude_patterns: Vec::new(),
-            exclude_per_directory: Vec::new(),
-        },
-    )?;
-    let mut targets = Vec::new();
-    let mut selected_directories = Vec::new();
-    let mut selected_paths = BTreeSet::new();
-    for path in &directory_paths {
-        let is_dir = path.ends_with(b"/");
-        if is_dir && !directories && pathspec.filters.is_empty() {
-            continue;
-        }
-        let Some(display) = pathspec.display(path) else {
-            continue;
-        };
-        if clean_target_is_excluded(path, excludes) {
-            continue;
-        }
-        targets.push(CleanTarget {
-            path: path.clone(),
-            display,
-            is_dir,
-        });
-        selected_paths.insert(path.clone());
-        if is_dir {
-            selected_directories.push(path.clone());
-        }
-    }
+    let has_pathspec = !pathspec.filters.is_empty();
+    // Git treats any pathspec as `-d` for selection purposes.
+    let effective_directories = directories || has_pathspec;
+    let rollup_directory_pathspecs = has_pathspec
+        && pathspec
+            .filters
+            .iter()
+            .any(|filter| filter.recursive && !filter.is_glob);
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
+    let has_commits = repository_has_commits(git_dir, format)?;
 
-    if !pathspec.filters.is_empty() {
-        for path in sley_worktree::untracked_paths_with_options(
+    let mut paths = if effective_directories {
+        sley_worktree::untracked_paths_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            sley_worktree::UntrackedPathOptions {
+                directory: true,
+                no_empty_directory: false,
+                preserve_ignored_directories: directories,
+                exclude_standard: !include_ignored,
+                ignored_only: false,
+                exclude_patterns: Vec::new(),
+                exclude_per_directory: Vec::new(),
+                pathspecs: pathspec.untracked_pathspecs(),
+                rollup_untracked_files_to_directories: rollup_directory_pathspecs,
+            },
+        )?
+    } else {
+        sley_worktree::untracked_paths_with_options(
             worktree_root,
             git_dir,
             format,
@@ -5986,33 +6237,127 @@ fn clean_targets(
                 ignored_only: false,
                 exclude_patterns: Vec::new(),
                 exclude_per_directory: Vec::new(),
+                pathspecs: pathspec.untracked_pathspecs(),
+                rollup_untracked_files_to_directories: false,
             },
-        )? {
-            if selected_directories
-                .iter()
-                .any(|directory| clean_directory_contains_path(directory, &path))
-            {
-                continue;
-            }
-            if selected_paths.contains(&path) {
-                continue;
-            }
-            let Some(display) = pathspec.display(&path) else {
-                continue;
-            };
-            if clean_target_is_excluded(&path, excludes) {
-                continue;
-            }
-            targets.push(CleanTarget {
-                path,
-                display,
-                is_dir: false,
-            });
+        )?
+    };
+
+    if !has_pathspec {
+        paths.retain(|path| {
+            path.ends_with(b"/")
+                || clean_untracked_file_eligible(path, index.as_ref(), include_ignored, has_commits)
+        });
+    }
+
+    if has_pathspec {
+        paths = clean_collapse_untracked_paths(paths, pathspec);
+    }
+
+    let mut targets = Vec::new();
+    for path in paths {
+        let is_dir = path.ends_with(b"/");
+        let Some(display) = pathspec.display(&path) else {
+            continue;
+        };
+        if clean_target_is_excluded(&path, excludes) {
+            continue;
         }
+        targets.push(CleanTarget {
+            path,
+            display,
+            is_dir,
+        });
     }
 
     targets.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(targets)
+}
+
+/// Git clean file selection without `-d` or pathspecs:
+/// - unborn repo: only worktree-root files unless `-x` is set
+/// - after the first commit: also untracked files inside indexed directories
+/// - with `-x` on an unborn repo: same indexed-directory files as post-commit clean
+fn clean_untracked_file_eligible(
+    path: &[u8],
+    index: Option<&Index>,
+    include_ignored: bool,
+    has_commits: bool,
+) -> bool {
+    if !path.iter().any(|byte| *byte == b'/') {
+        return true;
+    }
+    if !has_commits && !include_ignored {
+        return false;
+    }
+    let Some(index) = index else {
+        return false;
+    };
+    clean_path_parent(path).is_some_and(|parent| clean_index_has_tracked_under(index, parent))
+}
+
+fn repository_has_commits(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    Ok(head_commit_oid(&store)?.is_some())
+}
+
+fn clean_index_has_tracked_under(index: &Index, directory: &[u8]) -> bool {
+    let mut prefix = directory.to_vec();
+    prefix.push(b'/');
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_bytes().starts_with(&prefix))
+}
+
+fn clean_path_parent(path: &[u8]) -> Option<&[u8]> {
+    let slash = path.iter().rposition(|byte| *byte == b'/')?;
+    if slash == 0 {
+        return None;
+    }
+    Some(&path[..slash])
+}
+
+/// Match git `correct_untracked_entries` for pathspec-driven clean.
+fn clean_collapse_untracked_paths(paths: Vec<Vec<u8>>, pathspec: &LsFilesPathspec) -> Vec<Vec<u8>> {
+    let mut sorted = paths;
+    sorted.sort();
+    let mut kept = BTreeSet::new();
+    for path in &sorted {
+        if sorted.iter().any(|other| {
+            other != path && other.ends_with(b"/") && clean_directory_contains_path(other, path)
+        }) {
+            continue;
+        }
+        if !path.ends_with(b"/") && clean_should_collapse_to_parent(path, pathspec) {
+            let parent = clean_path_parent(path).expect("parent directory");
+            let mut directory = parent.to_vec();
+            directory.push(b'/');
+            kept.insert(directory);
+        } else {
+            kept.insert(path.clone());
+        }
+    }
+    kept.into_iter().collect()
+}
+
+fn clean_should_collapse_to_parent(path: &[u8], pathspec: &LsFilesPathspec) -> bool {
+    let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
+    if pathspec
+        .filters
+        .iter()
+        .any(|filter| filter.path.as_slice() == path_no_slash)
+    {
+        return false;
+    }
+    let Some(parent) = clean_path_parent(path) else {
+        return false;
+    };
+    pathspec
+        .filters
+        .iter()
+        .any(|filter| filter.path.as_slice() == parent)
 }
 
 fn clean_target_is_excluded(path: &[u8], excludes: &[String]) -> bool {
@@ -6064,7 +6409,6 @@ fn cmd_bundle(args: &[String]) -> Result<()> {
         ))),
     }
 }
-
 
 fn cmd_commit_graph(args: &[String]) -> Result<()> {
     let Some(subcommand) = args.first().map(String::as_str) else {
@@ -6473,9 +6817,6 @@ fn cmd_multi_pack_index_expire(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-
-
-
 fn cmd_bundle_create(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut path = None;
@@ -6808,9 +7149,9 @@ fn cmd_checkout(args: &[String]) -> Result<()> {
                 };
             }
             "--orphan" => {
-                let branch = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command("checkout --orphan requires a branch".into()))?;
+                let branch = iter.next().ok_or_else(|| {
+                    GitError::Command("checkout --orphan requires a branch".into())
+                })?;
                 branch_mode = CheckoutBranchMode::Create {
                     branch: branch.to_string(),
                     force: false,
@@ -8555,12 +8896,7 @@ fn cmd_commit(args: &[String]) -> Result<()> {
     let message = tag_message_with_trailers(message, &trailers);
     if rebase_in_progress(&git_dir) {
         return conclude_rebase_step_via_commit(
-            &git_dir,
-            format,
-            author,
-            committer,
-            message,
-            quiet,
+            &git_dir, format, author, committer, message, quiet,
         );
     }
     if in_merge {
@@ -11623,6 +11959,7 @@ impl DiffPathspec {
         let mut filters = Vec::new();
         for arg in path_args {
             let filter_path = normalize_ls_files_pathspec(&prefix, arg)?;
+            let is_glob = sley_worktree::pathspec_is_glob(&filter_path);
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -11633,6 +11970,7 @@ impl DiffPathspec {
                 original: arg.clone(),
                 path: filter_path,
                 recursive: arg == "." || arg.ends_with('/') || absolute.is_dir(),
+                is_glob,
                 matched: Cell::new(false),
             });
         }
@@ -12053,41 +12391,40 @@ fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             Some(peeled_oid) => Some(db.read_object(&peeled_oid)?),
             None => None,
         };
-        let peeled_object =
-            if let (Some(peeled_oid), Some(peeled_encoded_object)) =
-                (peeled_oid, peeled_encoded_object.as_ref())
-            {
-                let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?;
-                let (tree, parents, message, author, committer, creator) =
-                    if peeled_encoded_object.object_type == ObjectType::Commit {
-                        let commit = Commit::parse_ref(format, &peeled_encoded_object.body)?;
-                        (
-                            Some(commit.tree),
-                            commit.parents,
-                            Some(Cow::Borrowed(commit.message)),
-                            Some(Cow::Borrowed(commit.author)),
-                            Some(Cow::Borrowed(commit.committer)),
-                            Some(Cow::Borrowed(commit.committer)),
-                        )
-                    } else {
-                        (None, Vec::new(), None, None, None, None)
-                    };
-                Some(ForEachRefPeeledObject {
-                    oid: peeled_oid,
-                    object_type: peeled_encoded_object.object_type,
-                    object_size: peeled_encoded_object.body.len(),
-                    object_disk_size,
-                    object_body: Cow::Borrowed(&peeled_encoded_object.body),
-                    tree,
-                    parents,
-                    message,
-                    author,
-                    committer,
-                    creator,
-                })
-            } else {
-                None
-            };
+        let peeled_object = if let (Some(peeled_oid), Some(peeled_encoded_object)) =
+            (peeled_oid, peeled_encoded_object.as_ref())
+        {
+            let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?;
+            let (tree, parents, message, author, committer, creator) =
+                if peeled_encoded_object.object_type == ObjectType::Commit {
+                    let commit = Commit::parse_ref(format, &peeled_encoded_object.body)?;
+                    (
+                        Some(commit.tree),
+                        commit.parents,
+                        Some(Cow::Borrowed(commit.message)),
+                        Some(Cow::Borrowed(commit.author)),
+                        Some(Cow::Borrowed(commit.committer)),
+                        Some(Cow::Borrowed(commit.committer)),
+                    )
+                } else {
+                    (None, Vec::new(), None, None, None, None)
+                };
+            Some(ForEachRefPeeledObject {
+                oid: peeled_oid,
+                object_type: peeled_encoded_object.object_type,
+                object_size: peeled_encoded_object.body.len(),
+                object_disk_size,
+                object_body: Cow::Borrowed(&peeled_encoded_object.body),
+                tree,
+                parents,
+                message,
+                author,
+                committer,
+                creator,
+            })
+        } else {
+            None
+        };
         let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &oid)?;
         let deltabase = zero_oid(format)?;
         let worktree_path =
@@ -14641,6 +14978,8 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                 ignored_only: ignored,
                 exclude_patterns: exclude_patterns.clone(),
                 exclude_per_directory: exclude_per_directory.clone(),
+                pathspecs: pathspec.untracked_pathspecs(),
+                rollup_untracked_files_to_directories: directory,
             },
         )?;
         for path in untracked {
@@ -14926,11 +15265,7 @@ fn index_entry_stage(entry: &sley_index::IndexEntry) -> u16 {
 }
 
 fn ls_files_oid_candidates(index: &Index) -> Vec<ObjectId> {
-    index
-        .entries
-        .iter()
-        .map(|entry| entry.oid)
-        .collect()
+    index.entries.iter().map(|entry| entry.oid).collect()
 }
 
 fn ls_files_oid(oid: &ObjectId, abbrev: Option<usize>, candidates: &[ObjectId]) -> String {
@@ -14971,6 +15306,7 @@ impl LsFilesPathspec {
         let mut filters = Vec::new();
         for arg in path_args {
             let filter_path = normalize_ls_files_pathspec(&prefix, arg)?;
+            let is_glob = sley_worktree::pathspec_is_glob(&filter_path);
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -14981,6 +15317,7 @@ impl LsFilesPathspec {
                 original: arg.clone(),
                 path: filter_path,
                 recursive: arg == "." || arg.ends_with('/') || absolute.is_dir(),
+                is_glob,
                 matched: Cell::new(false),
             });
         }
@@ -14990,6 +15327,17 @@ impl LsFilesPathspec {
             filters,
             cwd_depth,
         })
+    }
+
+    fn untracked_pathspecs(&self) -> Vec<sley_worktree::UntrackedPathspecFilter> {
+        self.filters
+            .iter()
+            .map(|filter| sley_worktree::UntrackedPathspecFilter {
+                path: filter.path.clone(),
+                recursive: filter.recursive,
+                is_glob: filter.is_glob,
+            })
+            .collect()
     }
 
     fn display(&self, path: &[u8]) -> Option<Vec<u8>> {
@@ -15059,28 +15407,20 @@ struct LsFilesPathFilter {
     original: String,
     path: Vec<u8>,
     recursive: bool,
+    is_glob: bool,
     matched: Cell<bool>,
 }
 
 impl LsFilesPathFilter {
     fn matches(&self, path: &[u8]) -> bool {
-        if self.path.is_empty() {
-            return true;
-        }
-        if path == self.path {
-            return true;
-        }
-        if path
-            .strip_suffix(b"/")
-            .is_some_and(|stripped| stripped == self.path)
-        {
-            return true;
-        }
-        self.recursive
-            && path
-                .strip_prefix(self.path.as_slice())
-                .and_then(|rest| rest.strip_prefix(b"/"))
-                .is_some_and(|rest| !rest.is_empty())
+        sley_worktree::untracked_pathspec_matches(
+            &sley_worktree::UntrackedPathspecFilter {
+                path: self.path.clone(),
+                recursive: self.recursive,
+                is_glob: self.is_glob,
+            },
+            path,
+        )
     }
 }
 
@@ -15299,6 +15639,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
     let mut reverse = false;
     let mut ordering = RevListOrdering::Default;
     let mut walk = true;
+    let mut walk_reflogs = false;
     let mut max_age = None;
     let mut min_age = None;
     let mut first_parent = false;
@@ -15536,6 +15877,8 @@ fn cmd_log(args: &[String]) -> Result<()> {
             }
             "--do-walk" => walk = true,
             "--no-walk" => walk = false,
+            "-g" | "--walk-reflogs" => walk_reflogs = true,
+            "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
                 let value = iter.next().ok_or_else(log_max_age_requires_value_error)?;
                 max_age = Some(log_parse_age(value)?);
@@ -16193,6 +16536,11 @@ fn cmd_log(args: &[String]) -> Result<()> {
     {
         includes.push("HEAD".to_string());
     }
+    if walk_reflogs {
+        return log_walk_reflogs(
+            &git_dir, format, &includes, max_count, skip, &output, reverse,
+        );
+    }
     let log_format_source = if !has_ref_selectors
         && includes.len() == 1
         && linear_ranges.is_empty()
@@ -16369,10 +16717,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
     if show_children {
         for record in &commits {
             for parent in &record.parents {
-                child_oids
-                    .entry(*parent)
-                    .or_default()
-                    .push(record.oid);
+                child_oids.entry(*parent).or_default().push(record.oid);
             }
         }
         for children in child_oids.values_mut() {
@@ -16509,6 +16854,79 @@ fn log_option_takes_no_value_error(option: &str) -> Result<()> {
 fn log_option_requires_value_error(option: &str) -> GitError {
     eprintln!("error: option `{option}' requires a value");
     GitError::Exit(129)
+}
+
+fn log_walk_reflogs(
+    git_dir: &Path,
+    format: ObjectFormat,
+    revisions: &[String],
+    max_count: Option<usize>,
+    skip: usize,
+    output: &LogOutput,
+    reverse: bool,
+) -> Result<()> {
+    let reference = reflog_reference_name(revisions.first().map(String::as_str))?;
+    let store = FileRefStore::new(git_dir, format);
+    let mut entries = store.read_reflog(&reference)?;
+    entries.reverse();
+    if skip > 0 {
+        entries = entries.into_iter().skip(skip).collect();
+    }
+    if let Some(max_count) = max_count {
+        entries.truncate(max_count);
+    }
+    if reverse {
+        entries.reverse();
+    }
+    let mut stdout = io::stdout();
+    for (index, entry) in entries.iter().enumerate() {
+        match output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => {
+                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                emit_compiled_reflog_walk_format(compiled, entry, index, &reference, &mut line)?;
+                stdout.write_all(&line)?;
+                if *final_newline && !line.ends_with(b"\n") {
+                    stdout.write_all(b"\n")?;
+                }
+            }
+            LogOutput::Default => {
+                stdout.write_all(&entry.message)?;
+                stdout.write_all(b"\n")?;
+            }
+        }
+    }
+    stdout.flush()?;
+    Ok(())
+}
+
+fn emit_compiled_reflog_walk_format(
+    compiled: &CompiledLogFormat,
+    entry: &ReflogEntry,
+    index: usize,
+    reference: &str,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
+    for token in &compiled.tokens {
+        match token {
+            FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
+            FormatToken::Percent => out.push(b'%'),
+            FormatToken::ReflogGs => out.extend_from_slice(&entry.message),
+            FormatToken::ReflogGd | FormatToken::ReflogGD => {
+                write!(out, "{reference}@{{{index}}}").map_err(io::Error::from)?;
+            }
+            FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
+            FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),
+            FormatToken::Newline => out.push(b'\n'),
+            FormatToken::HexByte(byte) => out.push(*byte),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn log_fatal_unrecognized_argument(value: &str) -> Result<()> {
@@ -17863,10 +18281,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         for record in &selected {
             for parent in &record.parents {
                 if selected_oids.contains(parent) {
-                    child_oids
-                        .entry(*parent)
-                        .or_default()
-                        .push(record.oid);
+                    child_oids.entry(*parent).or_default().push(record.oid);
                 }
             }
         }
@@ -19775,7 +20190,13 @@ fn print_log_format(
     context: LogFormatContext<'_>,
 ) -> Result<()> {
     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-    emit_compiled_log_format(record, compiled, &context, &mut line, 0..compiled.tokens.len())?;
+    emit_compiled_log_format(
+        record,
+        compiled,
+        &context,
+        &mut line,
+        0..compiled.tokens.len(),
+    )?;
     io::stdout().write_all(&line)?;
     io::stdout().flush()?;
     Ok(())
@@ -19788,12 +20209,10 @@ fn print_log_format_with_children(
     child_oids: &HashMap<ObjectId, Vec<ObjectId>>,
     abbrev_len: Option<usize>,
 ) -> Result<()> {
-    let subject_index = compiled.tokens.iter().position(|token| {
-        matches!(
-            token,
-            FormatToken::Subject | FormatToken::SanitizedSubject
-        )
-    });
+    let subject_index = compiled
+        .tokens
+        .iter()
+        .position(|token| matches!(token, FormatToken::Subject | FormatToken::SanitizedSubject));
     let child_abbrev_len = if compiled
         .tokens
         .iter()
@@ -19818,13 +20237,7 @@ fn print_log_format_with_children(
         pre_subject_end -= 1;
     }
     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-    emit_compiled_log_format(
-        record,
-        compiled,
-        &context,
-        &mut line,
-        0..pre_subject_end,
-    )?;
+    emit_compiled_log_format(record, compiled, &context, &mut line, 0..pre_subject_end)?;
     io::stdout().write_all(&line)?;
     print_log_selected_child_oids(record, child_oids, true, child_abbrev_len);
     if pre_subject_end < subject_index {
@@ -19872,7 +20285,9 @@ fn emit_compiled_log_format(
                 write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
                     .map_err(io::Error::from)?;
             }
-            FormatToken::TreeFull => write!(out, "{}", record.commit.tree).map_err(io::Error::from)?,
+            FormatToken::TreeFull => {
+                write!(out, "{}", record.commit.tree).map_err(io::Error::from)?
+            }
             FormatToken::TreeAbbrev => {
                 write!(out, "{}", format_log_oid(&record.commit.tree, abbrev_len))
                     .map_err(io::Error::from)?;
@@ -19886,7 +20301,8 @@ fn emit_compiled_log_format(
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::Subject => {
-                write!(out, "{}", commit_subject(&record.commit.message)).map_err(io::Error::from)?;
+                write!(out, "{}", commit_subject(&record.commit.message))
+                    .map_err(io::Error::from)?;
             }
             FormatToken::SanitizedSubject => {
                 write!(out, "{}", log_sanitized_subject(&record.commit.message))
@@ -19986,7 +20402,9 @@ fn emit_compiled_log_format(
                 write!(out, "{}", log_email_local_part(&committer_email))
                     .map_err(io::Error::from)?;
             }
-            FormatToken::CommitterTimestamp => out.extend_from_slice(committer_timestamp.as_bytes()),
+            FormatToken::CommitterTimestamp => {
+                out.extend_from_slice(committer_timestamp.as_bytes())
+            }
             FormatToken::CommitterDate => {
                 write!(
                     out,
@@ -20073,8 +20491,12 @@ fn emit_compiled_log_format_metadata(
                     .map_err(io::Error::from)?;
             }
             FormatToken::ParentsFull => {
-                write!(out, "{}", format_metadata_parent_oids(&record.parents, None))
-                    .map_err(io::Error::from)?;
+                write!(
+                    out,
+                    "{}",
+                    format_metadata_parent_oids(&record.parents, None)
+                )
+                .map_err(io::Error::from)?;
             }
             FormatToken::ParentsAbbrev => {
                 write!(
@@ -20190,8 +20612,12 @@ pub(crate) fn emit_compiled_stash_format(
                     .map_err(io::Error::from)?;
             }
             FormatToken::ParentsFull => {
-                write!(out, "{}", format_metadata_parent_oids(&commit.parents, None))
-                    .map_err(io::Error::from)?;
+                write!(
+                    out,
+                    "{}",
+                    format_metadata_parent_oids(&commit.parents, None)
+                )
+                .map_err(io::Error::from)?;
             }
             FormatToken::ParentsAbbrev => {
                 write!(
@@ -20244,12 +20670,8 @@ pub(crate) fn emit_compiled_stash_format(
             }
             FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
             FormatToken::AuthorDate => {
-                write!(
-                    out,
-                    "{}",
-                    commit_identity_date(&commit.author, date_mode)
-                )
-                .map_err(io::Error::from)?;
+                write!(out, "{}", commit_identity_date(&commit.author, date_mode))
+                    .map_err(io::Error::from)?;
             }
             FormatToken::AuthorDateIso => {
                 write!(
@@ -21190,7 +21612,7 @@ fn cmd_update_ref(args: &[String]) -> Result<()> {
     }
     let requested_name = positional[0].clone();
     let name = update_ref_effective_name(&store, &requested_name, deref)?;
-    let new_oid = ObjectId::from_hex(format, &positional[1])?;
+    let new_oid = parse_update_ref_new_oid(format, &store, &positional[1])?;
     let expected_oid = if let Some(old) = positional.get(2) {
         Some(parse_update_ref_expected(format, old)?)
     } else {
@@ -22424,6 +22846,25 @@ fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
         || name.starts_with("refs/notes/")
 }
 
+fn parse_update_ref_new_oid(
+    format: ObjectFormat,
+    store: &FileRefStore,
+    value: &str,
+) -> Result<ObjectId> {
+    if let Ok(oid) = ObjectId::from_hex(format, value) {
+        return Ok(oid);
+    }
+    resolve_ref_peeled(store, value)?.ok_or_else(|| {
+        eprintln!(
+            "fatal: invalid object id: expected {} hex digits for {}, got {}",
+            format.hex_len(),
+            format.name(),
+            value.len()
+        );
+        GitError::Exit(128)
+    })
+}
+
 fn parse_update_ref_expected(format: ObjectFormat, value: &str) -> Result<ObjectId> {
     ObjectId::from_hex(format, value)
 }
@@ -22582,7 +23023,7 @@ fn cmd_rev_parse(args: &[String]) -> Result<()> {
             | "--show-object-format=storage"
             | "--show-object-format=input"
             | "--show-object-format=output" => println!("{}", format.name()),
-            "--show-ref-format" => println!("files"),
+            "--show-ref-format" => println!("{}", repository_ref_storage_format(&git_dir)?),
             "--local-env-vars" => print_local_env_vars(),
             "--sq-quote" => {
                 print_rev_parse_sq_quote(&args[idx + 1..])?;
@@ -24094,7 +24535,9 @@ fn set_config_value(
         entry.value = Some(value.to_string());
         return;
     }
-    section.entries.push(ConfigEntry::new(key, Some(value.to_string())));
+    section
+        .entries
+        .push(ConfigEntry::new(key, Some(value.to_string())));
 }
 
 fn set_submodule_config_value(config: &mut GitConfig, name: &str, key: &str, value: &str) {
@@ -24756,15 +25199,7 @@ fn submodule_status_suffix(git_dir: Option<&Path>, oid: &ObjectId) -> Result<Str
 }
 
 fn resolve_ref_to_oid(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
-    let mut target = store.read_ref(name)?;
-    for _ in 0..5 {
-        match target {
-            Some(RefTarget::Direct(oid)) => return Ok(Some(oid)),
-            Some(RefTarget::Symbolic(next)) => target = store.read_ref(&next)?,
-            None => return Ok(None),
-        }
-    }
-    Ok(None)
+    resolve_ref_peeled(store, name)
 }
 
 fn display_submodule_ref(name: &str) -> String {
@@ -24995,13 +25430,12 @@ fn update_symbolic_ref(
     }
     let old_oid = resolve_symbolic_ref_oid(store, format, name)?;
     let new_oid = resolve_symbolic_ref_oid(store, format, target)?;
-    let reflog = symbolic_ref_should_write_reflog(git_dir, name)?
-        .then(|| ReflogEntry {
-            old_oid,
-            new_oid,
-            committer: default_committer(),
-            message,
-        });
+    let reflog = symbolic_ref_should_write_reflog(git_dir, name)?.then(|| ReflogEntry {
+        old_oid,
+        new_oid,
+        committer: default_committer(),
+        message,
+    });
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name: name.into(),
@@ -25015,9 +25449,7 @@ fn update_symbolic_ref(
 fn commit_symbolic_ref_update(tx: sley_refs::FileRefTransaction<'_>) -> Result<()> {
     match tx.commit() {
         Ok(()) => Ok(()),
-        Err(GitError::Transaction(message))
-            if message.starts_with("cannot lock ref '") =>
-        {
+        Err(GitError::Transaction(message)) if message.starts_with("cannot lock ref '") => {
             eprintln!("error: {message}");
             Err(GitError::Exit(1))
         }
@@ -25037,15 +25469,10 @@ fn resolve_symbolic_ref_oid(
     format: ObjectFormat,
     name: &str,
 ) -> Result<ObjectId> {
-    let mut current = name.to_string();
-    for _ in 0..16 {
-        match store.read_ref(&current)? {
-            Some(RefTarget::Symbolic(next)) => current = next,
-            Some(RefTarget::Direct(oid)) => return Ok(oid),
-            None => return zero_oid(format),
-        }
+    match resolve_ref_peeled(store, name)? {
+        Some(oid) => Ok(oid),
+        None => zero_oid(format),
     }
-    zero_oid(format)
 }
 
 fn delete_symbolic_ref(store: &FileRefStore, name: &str) -> Result<()> {
@@ -25454,6 +25881,7 @@ impl StatusPathspec {
         let mut filters = Vec::new();
         for arg in path_args {
             let filter_path = normalize_ls_files_pathspec(&prefix, arg)?;
+            let is_glob = sley_worktree::pathspec_is_glob(&filter_path);
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -25464,6 +25892,7 @@ impl StatusPathspec {
                 original: arg.clone(),
                 path: filter_path,
                 recursive: arg == "." || arg.ends_with('/') || absolute.is_dir(),
+                is_glob,
                 matched: Cell::new(false),
             });
         }
@@ -26706,6 +27135,18 @@ fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
         return Ok(ObjectFormat::Sha1);
     };
     config.repository_object_format()
+}
+
+fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let config = common_git_dir.join("config");
+    let Ok(config) = GitConfig::read(config) else {
+        return Ok(RefStorageFormat::Files.name());
+    };
+    Ok(match config.get("extensions", None, "refStorage") {
+        Some(value) if value.eq_ignore_ascii_case("reftable") => RefStorageFormat::Reftable.name(),
+        _ => RefStorageFormat::Files.name(),
+    })
 }
 
 fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usize>> {

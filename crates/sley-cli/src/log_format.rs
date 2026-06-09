@@ -15,6 +15,7 @@ pub(crate) enum LogFormatDialect {
 
 /// How much commit data a format needs to render.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)]
 pub(crate) enum FormatTier {
     /// `%H` (and literals / no-op color codes only).
     OidOnly,
@@ -29,6 +30,7 @@ pub(crate) enum FormatTier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct FormatFields(u16);
 
+#[allow(dead_code)]
 impl FormatFields {
     pub(crate) const OID: Self = Self(1 << 0);
     pub(crate) const TREE: Self = Self(1 << 1);
@@ -266,22 +268,16 @@ impl CompiledLogFormat {
                     tokens.push(FormatToken::DecorationsBare);
                 }
                 Some('G') => consume_g_placeholder(&mut chars, &mut tokens)?,
-                Some('g') if dialect == LogFormatDialect::Stash => {
-                    consume_stash_g_placeholder(&mut chars, &mut tokens)?;
+                Some('g') if matches!(dialect, LogFormatDialect::Stash | LogFormatDialect::Log) => {
+                    consume_reflog_g_placeholder(&mut chars, &mut tokens)?;
                 }
                 Some('g') => consume_g_date_placeholder(&mut chars, &mut tokens)?,
-                Some('a') => consume_identity_placeholder(
-                    &mut chars,
-                    &mut tokens,
-                    &mut fields,
-                    true,
-                )?,
-                Some('c') => consume_identity_placeholder(
-                    &mut chars,
-                    &mut tokens,
-                    &mut fields,
-                    false,
-                )?,
+                Some('a') => {
+                    consume_identity_placeholder(&mut chars, &mut tokens, &mut fields, true)?
+                }
+                Some('c') => {
+                    consume_identity_placeholder(&mut chars, &mut tokens, &mut fields, false)?
+                }
                 Some('n') => tokens.push(FormatToken::Newline),
                 Some('x') => {
                     let mut lookahead = chars.clone();
@@ -314,6 +310,7 @@ impl CompiledLogFormat {
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn tier(&self) -> FormatTier {
         self.fields.tier()
     }
@@ -331,8 +328,11 @@ impl CompiledLogFormat {
     }
 
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
+    #[allow(dead_code)]
     pub(crate) fn is_oid_only(&self) -> bool {
-        self.tokens.iter().any(|token| *token == FormatToken::OidFull)
+        self.tokens
+            .iter()
+            .any(|token| *token == FormatToken::OidFull)
             && self
                 .tokens
                 .iter()
@@ -348,13 +348,15 @@ impl CompiledLogFormat {
         for index in 0..self.tokens.len() {
             match self.tokens[index] {
                 FormatToken::OidFull => {
-                    self.tokens.insert(index + 1, FormatToken::Literal(" ".into()));
+                    self.tokens
+                        .insert(index + 1, FormatToken::Literal(" ".into()));
                     self.tokens.insert(index + 2, FormatToken::ParentsFull);
                     self.fields |= FormatFields::PARENTS;
                     return;
                 }
                 FormatToken::OidAbbrev => {
-                    self.tokens.insert(index + 1, FormatToken::Literal(" ".into()));
+                    self.tokens
+                        .insert(index + 1, FormatToken::Literal(" ".into()));
                     self.tokens.insert(index + 2, FormatToken::ParentsAbbrev);
                     self.fields |= FormatFields::PARENTS;
                     return;
@@ -416,13 +418,6 @@ fn consume_literal(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, literal
     true
 }
 
-/// Skip a `%C` color placeholder (stash list reuses this helper).
-pub(crate) fn consume_log_format_color(
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-) -> Result<()> {
-    consume_color(chars, &mut Vec::new())
-}
-
 fn consume_color(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     tokens: &mut Vec<FormatToken>,
@@ -480,7 +475,7 @@ fn consume_g_placeholder(
     Ok(())
 }
 
-fn consume_stash_g_placeholder(
+fn consume_reflog_g_placeholder(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     tokens: &mut Vec<FormatToken>,
 ) -> Result<()> {
@@ -600,11 +595,6 @@ pub(crate) mod presets {
         Ok(compiled)
     }
 
-    /// Plain `rev-list` / `log --format=%H` oid listing.
-    pub(crate) fn oid_line() -> Result<CompiledLogFormat> {
-        CompiledLogFormat::compile("%H", LogFormatDialect::RevList)
-    }
-
     /// `rev-list --oneline`.
     pub(crate) fn rev_list_oneline() -> Result<CompiledLogFormat> {
         CompiledLogFormat::compile("%h %s", LogFormatDialect::RevList)
@@ -624,8 +614,7 @@ mod tests {
 
     #[test]
     fn g_placeholders_are_not_oid_only() {
-        let compiled =
-            CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log).unwrap();
+        let compiled = CompiledLogFormat::compile("%G?|%GS", LogFormatDialect::Log).unwrap();
         assert!(!compiled.is_oid_only());
     }
 
@@ -652,14 +641,11 @@ mod tests {
     #[test]
     fn log_oneline_preset_inserts_parents() {
         let compiled = presets::log_oneline(false, false, true).unwrap();
-        assert!(compiled
-            .tokens
-            .windows(3)
-            .any(|w| {
-                matches!(w[0], FormatToken::OidAbbrev)
-                    && matches!(w[1], FormatToken::Literal(ref text) if text == " ")
-                    && matches!(w[2], FormatToken::ParentsAbbrev)
-            }));
+        assert!(compiled.tokens.windows(3).any(|w| {
+            matches!(w[0], FormatToken::OidAbbrev)
+                && matches!(w[1], FormatToken::Literal(ref text) if text == " ")
+                && matches!(w[2], FormatToken::ParentsAbbrev)
+        }));
     }
 
     #[test]
@@ -670,5 +656,11 @@ mod tests {
             vec![FormatToken::Percent, FormatToken::Literal("H".into())]
         );
         assert!(!compiled.is_oid_only());
+    }
+
+    #[test]
+    fn log_format_gs_is_reflog_subject() {
+        let compiled = CompiledLogFormat::compile("%gs", LogFormatDialect::Log).unwrap();
+        assert_eq!(compiled.tokens, vec![FormatToken::ReflogGs]);
     }
 }

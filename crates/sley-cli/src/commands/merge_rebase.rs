@@ -1,7 +1,7 @@
 //! Merge, rebase, pull, cherry-pick, revert, and merge-base commands.
 
 use crate::commands::remote_cmds::{
-    fetch_bundle, fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir, StdoutProgress,
+    StdoutProgress, fetch_bundle, fetch_source_is_ssh, fetch_ssh_repository, ls_remote_git_dir,
 };
 use crate::*;
 use sley_remote::FetchOptions;
@@ -339,11 +339,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         return cmd_merge_abort();
     }
     if continue_merge {
-        if !positional.is_empty()
-            || options.no_ff
-            || options.ff_only
-            || options.message.is_some()
-        {
+        if !positional.is_empty() || options.no_ff || options.ff_only || options.message.is_some() {
             eprintln!("fatal: --continue expects no arguments");
             return Err(GitError::Exit(129));
         }
@@ -559,13 +555,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         if !options.quiet {
             let mut stdout = io::stdout();
             writeln!(stdout, "Merge made by the 'ort' strategy.")?;
-            write_merge_result_diffstat(
-                &mut stdout,
-                &db,
-                format,
-                &head_tree,
-                &merged_tree,
-            )?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree)?;
             stdout.flush()?;
         }
         let merged_oid = merge_commit_and_advance(
@@ -679,10 +669,7 @@ pub(crate) fn cmd_merge_abort() -> Result<()> {
     let target_oid = if orig_head_path.is_file() {
         let contents = fs::read_to_string(&orig_head_path)?;
         ObjectId::from_hex(format, contents.trim()).map_err(|_| {
-            GitError::InvalidObject(format!(
-                "invalid ORIG_HEAD value {}",
-                contents.trim()
-            ))
+            GitError::InvalidObject(format!("invalid ORIG_HEAD value {}", contents.trim()))
         })?
     } else {
         resolve_revision(&git_dir, format, "HEAD")?
@@ -1011,14 +998,16 @@ pub(crate) fn cmd_rebase_continue() -> Result<()> {
         .to_string();
     let onto = ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "onto")?.trim())
         .map_err(|_| GitError::InvalidObject("invalid onto value during rebase".into()))?;
-    let orig_head =
-        ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "orig-head")?.trim())
-            .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
-    let stopped_sha =
-        ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "stopped-sha")?.trim())
-            .map_err(|_| {
-                GitError::InvalidObject("invalid stopped-sha value during rebase".into())
-            })?;
+    let orig_head = ObjectId::from_hex(
+        format,
+        read_rebase_merge_file(&git_dir, "orig-head")?.trim(),
+    )
+    .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
+    let stopped_sha = ObjectId::from_hex(
+        format,
+        read_rebase_merge_file(&git_dir, "stopped-sha")?.trim(),
+    )
+    .map_err(|_| GitError::InvalidObject("invalid stopped-sha value during rebase".into()))?;
     let message = read_rebase_message_from_file(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let stopped_record = read_rev_list_commit_record(&db, format, stopped_sha.clone())?;
@@ -1115,14 +1104,16 @@ pub(crate) fn cmd_rebase_skip() -> Result<()> {
         .to_string();
     let onto = ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "onto")?.trim())
         .map_err(|_| GitError::InvalidObject("invalid onto value during rebase".into()))?;
-    let orig_head =
-        ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "orig-head")?.trim())
-            .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
-    let stopped_sha =
-        ObjectId::from_hex(format, read_rebase_merge_file(&git_dir, "stopped-sha")?.trim())
-            .map_err(|_| {
-                GitError::InvalidObject("invalid stopped-sha value during rebase".into())
-            })?;
+    let orig_head = ObjectId::from_hex(
+        format,
+        read_rebase_merge_file(&git_dir, "orig-head")?.trim(),
+    )
+    .map_err(|_| GitError::InvalidObject("invalid orig-head value during rebase".into()))?;
+    let stopped_sha = ObjectId::from_hex(
+        format,
+        read_rebase_merge_file(&git_dir, "stopped-sha")?.trim(),
+    )
+    .map_err(|_| GitError::InvalidObject("invalid stopped-sha value during rebase".into()))?;
     let current_head = resolve_revision(&git_dir, format, "HEAD")?;
 
     sley_worktree::reset_index_and_worktree_to_commit(
@@ -1189,13 +1180,9 @@ pub(crate) fn rebase_in_progress(git_dir: &Path) -> bool {
 fn read_rebase_merge_file(git_dir: &Path, name: &str) -> Result<String> {
     let path = rebase_merge_dir(git_dir).join(name);
     if !path.is_file() {
-        return Err(GitError::not_found(format!(
-            "rebase-merge/{name} missing"
-        )));
+        return Err(GitError::not_found(format!("rebase-merge/{name} missing")));
     }
-    Ok(fs::read_to_string(path)?
-        .trim_end_matches('\n')
-        .to_string())
+    Ok(fs::read_to_string(path)?.trim_end_matches('\n').to_string())
 }
 
 fn clear_rebase_merge_state(git_dir: &Path) {
@@ -1342,14 +1329,7 @@ fn update_detached_head_at(
     reflog_message: Vec<u8>,
     committer: Vec<u8>,
 ) -> Result<()> {
-    detach_head_at(
-        git_dir,
-        format,
-        old_oid,
-        new_oid,
-        reflog_message,
-        committer,
-    )
+    detach_head_at(git_dir, format, old_oid, new_oid, reflog_message, committer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1417,7 +1397,9 @@ fn print_rebase_conflict_hints() {
     eprintln!("hint: Resolve all conflicts manually, mark them as resolved with");
     eprintln!("hint: \"git add/rm <conflicted_files>\", then run \"git rebase --continue\".");
     eprintln!("hint: You can instead skip this commit: run \"git rebase --skip\".");
-    eprintln!("hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\".");
+    eprintln!(
+        "hint: To abort and get back to the state before \"git rebase\", run \"git rebase --abort\"."
+    );
     eprintln!("hint: Disable this message with \"git config set advice.mergeConflict false\"");
 }
 
@@ -1476,13 +1458,19 @@ pub(crate) fn conclude_rebase_step_via_commit(
 }
 
 fn print_rebase_usage() {
-    eprintln!("usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base] [<upstream> [<branch>]]");
-    eprintln!("   or: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase>] --root [<branch>]");
+    eprintln!(
+        "usage: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase> | --keep-base] [<upstream> [<branch>]]"
+    );
+    eprintln!(
+        "   or: git rebase [-i] [options] [--exec <cmd>] [--onto <newbase>] --root [<branch>]"
+    );
     eprintln!("   or: git rebase --continue | --abort | --skip | --edit-todo");
     eprintln!();
     eprintln!("    --[no-]onto <revision>");
     eprintln!("                          rebase onto given branch instead of upstream");
-    eprintln!("    --[no-]keep-base      use the merge-base of upstream and branch as the current base");
+    eprintln!(
+        "    --[no-]keep-base      use the merge-base of upstream and branch as the current base"
+    );
     eprintln!("    --no-verify           allow pre-rebase hook to run");
     eprintln!("    --verify              opposite of --no-verify");
     eprintln!("    -q, --[no-]quiet      be quiet. implies --no-stat");
@@ -1515,11 +1503,15 @@ fn print_rebase_usage() {
     eprintln!("    -m, --merge           use merging strategies to rebase");
     eprintln!("    -i, --interactive     let the user edit the list of commits to rebase");
     eprintln!("    --[no-]rerere-autoupdate");
-    eprintln!("                          update the index with reused conflict resolution if possible");
+    eprintln!(
+        "                          update the index with reused conflict resolution if possible"
+    );
     eprintln!("    --empty (drop|keep|stop)");
     eprintln!("                          how to handle commits that become empty");
     eprintln!("    --[no-]autosquash     move commits that begin with squash!/fixup! under -i");
-    eprintln!("    --[no-]update-refs    update branches that point to commits that are being rebased");
+    eprintln!(
+        "    --[no-]update-refs    update branches that point to commits that are being rebased"
+    );
     eprintln!("    -S, --[no-]gpg-sign[=<key-id>]");
     eprintln!("                          GPG-sign commits");
     eprintln!("    --[no-]autostash      automatically stash/stash pop before and after");
@@ -1613,7 +1605,9 @@ fn rebase_replay_commits(
                         entries.push(merge_index_entry(path, *mode, *oid, 0));
                     }
                     MergePathResult::Resolved(None) => {}
-                    MergePathResult::Conflict { base, ours, theirs, .. } => {
+                    MergePathResult::Conflict {
+                        base, ours, theirs, ..
+                    } => {
                         if let Some((mode, oid)) = base {
                             entries.push(merge_index_entry(path, *mode, *oid, 1));
                         }
@@ -1627,9 +1621,9 @@ fn rebase_replay_commits(
                 }
             }
             entries.sort_by(|left, right| {
-                left.path.cmp(&right.path).then_with(|| {
-                    index_entry_stage(left).cmp(&index_entry_stage(right))
-                })
+                left.path
+                    .cmp(&right.path)
+                    .then_with(|| index_entry_stage(left).cmp(&index_entry_stage(right)))
             });
             fs::write(
                 sley_worktree::repository_index_path(git_dir),
@@ -1649,7 +1643,9 @@ fn rebase_replay_commits(
                             merge_write_worktree_file(worktree_root, path, &content, *mode)?;
                         }
                     }
-                    MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
+                    MergePathResult::Resolved(None) => {
+                        merge_remove_worktree_file(worktree_root, path)?
+                    }
                     MergePathResult::Conflict { worktree, .. } => match worktree {
                         Some((mode, content)) => {
                             merge_write_worktree_file(worktree_root, path, content, *mode)?
@@ -1732,11 +1728,7 @@ fn rebase_replay_commits(
             format,
             current_head,
             commit_oid,
-            format!(
-                "rebase (pick): {}",
-                commit_subject(&record.commit.message)
-            )
-            .into_bytes(),
+            format!("rebase (pick): {}", commit_subject(&record.commit.message)).into_bytes(),
             committer.clone(),
         )?;
         current_head = commit_oid;
@@ -1925,18 +1917,14 @@ fn resolve_pull_remote_and_refspecs(
     match (remote, branch) {
         (Some(remote), Some(branch)) => {
             let refspec = format!("refs/heads/{branch}");
-            Ok((
-                remote,
-                vec![refspec],
-                Some(format!("refs/heads/{branch}")),
-            ))
+            Ok((remote, vec![refspec], Some(format!("refs/heads/{branch}"))))
         }
         (Some(remote), None) => {
-            let merge_src = store
-                .current_branch()
-                .ok()
-                .flatten()
-                .and_then(|current| config.get("branch", Some(&current), "merge").map(str::to_string));
+            let merge_src = store.current_branch().ok().flatten().and_then(|current| {
+                config
+                    .get("branch", Some(&current), "merge")
+                    .map(str::to_string)
+            });
             Ok((remote, Vec::new(), merge_src))
         }
         (None, None) => {
@@ -1947,16 +1935,16 @@ fn resolve_pull_remote_and_refspecs(
                 eprintln!();
                 eprintln!("    git pull <remote> <branch>");
                 eprintln!();
-                eprintln!("If you wish to set tracking information for this branch you can do so with:");
+                eprintln!(
+                    "If you wish to set tracking information for this branch you can do so with:"
+                );
                 eprintln!();
                 eprintln!("    git branch --set-upstream-to=<remote>/<branch> HEAD");
                 eprintln!();
                 return Err(GitError::Exit(1));
             };
             let Some(remote) = config.get("branch", Some(&current), "remote") else {
-                eprintln!(
-                    "There is no tracking information for the current branch."
-                );
+                eprintln!("There is no tracking information for the current branch.");
                 eprintln!("Please specify which branch you want to merge with.");
                 eprintln!("See git-pull(1) for details.");
                 eprintln!();
@@ -1966,16 +1954,12 @@ fn resolve_pull_remote_and_refspecs(
                     "If you wish to set tracking information for this branch you can do so with:"
                 );
                 eprintln!();
-                eprintln!(
-                    "    git branch --set-upstream-to=<remote>/<branch> {current}"
-                );
+                eprintln!("    git branch --set-upstream-to=<remote>/<branch> {current}");
                 eprintln!();
                 return Err(GitError::Exit(1));
             };
             let Some(merge) = config.get("branch", Some(&current), "merge") else {
-                eprintln!(
-                    "There is no tracking information for the current branch."
-                );
+                eprintln!("There is no tracking information for the current branch.");
                 eprintln!("Please specify which branch you want to merge with.");
                 eprintln!("See git-pull(1) for details.");
                 eprintln!();
@@ -1985,9 +1969,7 @@ fn resolve_pull_remote_and_refspecs(
                     "If you wish to set tracking information for this branch you can do so with:"
                 );
                 eprintln!();
-                eprintln!(
-                    "    git branch --set-upstream-to=<remote>/<branch> {current}"
-                );
+                eprintln!("    git branch --set-upstream-to=<remote>/<branch> {current}");
                 eprintln!();
                 return Err(GitError::Exit(1));
             };
@@ -2001,7 +1983,8 @@ fn resolve_pull_remote_and_refspecs(
 
 fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<FetchHeadRecord> {
     let path = git_dir.join("FETCH_HEAD");
-    let mut input = fs::File::open(path).map_err(|_| GitError::reference_not_found("FETCH_HEAD"))?;
+    let mut input =
+        fs::File::open(path).map_err(|_| GitError::reference_not_found("FETCH_HEAD"))?;
     let records = read_fetch_head(format, &mut input)?;
     records
         .into_iter()
@@ -2026,7 +2009,9 @@ fn ensure_pull_can_merge(config: &GitConfig) -> Result<()> {
         eprintln!(
             "hint: You can replace \"git config\" with \"git config --global\" to set a default"
         );
-        eprintln!("hint: preference for all repositories. You can also pass --rebase, --no-rebase,");
+        eprintln!(
+            "hint: preference for all repositories. You can also pass --rebase, --no-rebase,"
+        );
         eprintln!("hint: or --ff-only on the command line to override the configured default per");
         eprintln!("hint: invocation.");
         eprintln!("fatal: Need to specify how to reconcile divergent branches.");
@@ -2244,9 +2229,15 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let fast_forward = theirs_depths.contains_key(&ours_commit);
     if fast_forward {
         let mut merge_args = Vec::new();
-        if no_ff { merge_args.push("--no-ff".to_string()); }
-        if effective_ff_only { merge_args.push("--ff-only".to_string()); }
-        if quiet { merge_args.push("--quiet".to_string()); }
+        if no_ff {
+            merge_args.push("--no-ff".to_string());
+        }
+        if effective_ff_only {
+            merge_args.push("--ff-only".to_string());
+        }
+        if quiet {
+            merge_args.push("--quiet".to_string());
+        }
         merge_args.push("FETCH_HEAD".to_string());
         return cmd_merge(&merge_args);
     }
@@ -2259,16 +2250,24 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         match rebase_onto_upstream(&git_dir, &worktree_root, format, "FETCH_HEAD", quiet)? {
             RebaseOntoOutcome::Rebasing => return Ok(()),
             RebaseOntoOutcome::UpToDate => {
-                if !quiet { println!("Already up to date."); }
+                if !quiet {
+                    println!("Already up to date.");
+                }
                 return Ok(());
             }
         }
     }
     ensure_pull_can_merge(&config)?;
     let mut merge_args = Vec::new();
-    if no_ff { merge_args.push("--no-ff".to_string()); }
-    if effective_ff_only { merge_args.push("--ff-only".to_string()); }
-    if quiet { merge_args.push("--quiet".to_string()); }
+    if no_ff {
+        merge_args.push("--no-ff".to_string());
+    }
+    if effective_ff_only {
+        merge_args.push("--ff-only".to_string());
+    }
+    if quiet {
+        merge_args.push("--quiet".to_string());
+    }
     merge_args.push("FETCH_HEAD".to_string());
     cmd_merge(&merge_args)
 }

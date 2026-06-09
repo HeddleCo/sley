@@ -66,13 +66,15 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
         "status differed for {args:?}"
     );
     assert_eq!(
-        actual.stdout, expected.stdout,
+        actual.stdout,
+        expected.stdout,
         "stdout differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stdout),
         String::from_utf8_lossy(&expected.stdout)
     );
     assert_eq!(
-        actual.stderr, expected.stderr,
+        actual.stderr,
+        expected.stderr,
         "stderr differed for {args:?}\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&actual.stderr),
         String::from_utf8_lossy(&expected.stderr)
@@ -80,22 +82,8 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_identity(root: &Path) {
-    git(
-        root,
-        &[
-            "config",
-            "user.name",
-            "Example User",
-        ],
-    );
-    git(
-        root,
-        &[
-            "config",
-            "user.email",
-            "example@example.invalid",
-        ],
-    );
+    git(root, &["config", "user.name", "Example User"]);
+    git(root, &["config", "user.email", "example@example.invalid"]);
 }
 
 fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
@@ -148,53 +136,63 @@ fn commit_during_resolved_merge_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_repos(&upstream, &rust);
-        start_conflict_merge("git", &upstream);
-        start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
-        resolve_conflict(&upstream);
-        resolve_conflict(&rust);
+    prepare_conflict_repos(&upstream, &rust);
+    start_conflict_merge("git", &upstream);
+    start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
+    resolve_conflict(&upstream);
+    resolve_conflict(&rust);
 
-        let args = ["commit", "-m", "custom merge message"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["commit", "-m", "custom merge message"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
 
-        assert!(
-            !upstream.join(".git/MERGE_HEAD").is_file(),
-            "upstream MERGE_HEAD should be removed"
-        );
-        assert!(
-            !rust.join(".git/MERGE_HEAD").is_file(),
-            "git-rs MERGE_HEAD should be removed"
-        );
-        assert!(
-            !upstream.join(".git/MERGE_MSG").is_file(),
-            "upstream MERGE_MSG should be removed"
-        );
-        assert!(
-            !rust.join(".git/MERGE_MSG").is_file(),
-            "git-rs MERGE_MSG should be removed"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
-            "HEAD differed after commit during merge"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "-1", "--format=%P"]).stdout,
-            "merge commit parents differed"
-        );
-        assert_eq!(
-            run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
-            run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "-1", "--format=%s"]).stdout,
-            "merge commit subject differed"
-        );
-        assert_eq!(
-            fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
-            fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
-            "worktree content differed after commit during merge"
-        );
+    assert!(
+        !upstream.join(".git/MERGE_HEAD").is_file(),
+        "upstream MERGE_HEAD should be removed"
+    );
+    assert!(
+        !rust.join(".git/MERGE_HEAD").is_file(),
+        "git-rs MERGE_HEAD should be removed"
+    );
+    assert!(
+        !upstream.join(".git/MERGE_MSG").is_file(),
+        "upstream MERGE_MSG should be removed"
+    );
+    assert!(
+        !rust.join(".git/MERGE_MSG").is_file(),
+        "git-rs MERGE_MSG should be removed"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
+        "HEAD differed after commit during merge"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["log", "-1", "--format=%P"]
+        )
+        .stdout,
+        "merge commit parents differed"
+    );
+    assert_eq!(
+        run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(
+            env!("CARGO_BIN_EXE_sley"),
+            &rust,
+            &["log", "-1", "--format=%s"]
+        )
+        .stdout,
+        "merge commit subject differed"
+    );
+    assert_eq!(
+        fs::read(upstream.join("conflict.txt")).expect("read upstream conflict file"),
+        fs::read(rust.join("conflict.txt")).expect("read rust conflict file"),
+        "worktree content differed after commit during merge"
+    );
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -205,13 +203,13 @@ fn commit_during_merge_with_unmerged_entries_fails() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-            prepare_conflict_repos(&upstream, &rust);
-        start_conflict_merge("git", &upstream);
-        start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
+    prepare_conflict_repos(&upstream, &rust);
+    start_conflict_merge("git", &upstream);
+    start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
 
-        let args = ["commit", "-m", "custom merge message"];
-        let expected = run_output_with_identity("git", &upstream, &args);
-        let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
-        assert_same_output(actual, expected, &args);
+    let args = ["commit", "-m", "custom merge message"];
+    let expected = run_output_with_identity("git", &upstream, &args);
+    let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+    assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);
 }

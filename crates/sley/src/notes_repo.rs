@@ -1,8 +1,8 @@
 //! Repository-level git notes helpers.
 
 use sley_notes::{
-    Note, NotesCommitIdentity, NotesIter, NotesRef, iter_notes, list_notes,
-    notes_ref_expected, read_note_bytes, read_note_for, resolve_notes_ref, write_notes,
+    Note, NotesCommitIdentity, NotesIter, NotesRef, iter_notes, list_notes, notes_ref_expected,
+    read_note_bytes, read_note_for, resolve_notes_ref, write_notes,
 };
 
 use crate::{ObjectId, Repository, Result};
@@ -49,7 +49,11 @@ impl Repository {
     }
 
     /// Return the note blob oid for `annotated`, if any.
-    pub fn read_note(&self, notes_ref: &NotesRef, annotated: &ObjectId) -> Result<Option<ObjectId>> {
+    pub fn read_note(
+        &self,
+        notes_ref: &NotesRef,
+        annotated: &ObjectId,
+    ) -> Result<Option<ObjectId>> {
         self.read_note_for(notes_ref, annotated)
     }
 

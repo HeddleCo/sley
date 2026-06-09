@@ -18,7 +18,8 @@ use sley_core::{
     Capability, GitError, ObjectFormat, ObjectId, Result, UPSTREAM_GIT_COMPAT_VERSION,
 };
 use sley_fetch::{
-    install_protocol_v2_fetch_response_packfile, install_protocol_v2_fetch_response_promisor_packfile,
+    install_protocol_v2_fetch_response_packfile,
+    install_protocol_v2_fetch_response_promisor_packfile,
     install_upload_pack_raw_promisor_response, install_upload_pack_raw_response,
 };
 use sley_odb::FileObjectDatabase;
@@ -28,14 +29,15 @@ use sley_protocol::{
     RefAdvertisement, RefAdvertisementSet, TransportHandshake, UploadPackFeatures,
     UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
     encode_protocol_v2_command_options, parse_protocol_v2_fetch_features,
-    parse_upload_pack_features, protocol_v2_object_format,
-    read_protocol_v2_fetch_response, read_protocol_v2_fetch_sideband_all_response,
+    parse_upload_pack_features, protocol_v2_object_format, read_protocol_v2_fetch_response,
+    read_protocol_v2_fetch_sideband_all_response,
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set,
-    read_upload_pack_raw_packfile_response, read_upload_pack_shallow_info_and_raw_packfile_response,
-    smart_http_advertisement_content_type, smart_http_rpc_request_content_type,
-    smart_http_rpc_result_content_type, validate_protocol_v2_fetch_command_request,
-    validate_protocol_v2_ls_refs_command_request, write_protocol_v2_command_request,
-    write_upload_pack_negotiation_request, write_upload_pack_request,
+    read_upload_pack_raw_packfile_response,
+    read_upload_pack_shallow_info_and_raw_packfile_response, smart_http_advertisement_content_type,
+    smart_http_rpc_request_content_type, smart_http_rpc_result_content_type,
+    validate_protocol_v2_fetch_command_request, validate_protocol_v2_ls_refs_command_request,
+    write_protocol_v2_command_request, write_upload_pack_negotiation_request,
+    write_upload_pack_request,
 };
 use sley_transport::{
     HttpClient, HttpResponse, RemoteTransport, RemoteUrl, ServiceDiscoveryPayload, UreqHttpClient,
@@ -176,11 +178,7 @@ fn protocol_v2_ls_refs_command_request(
         peel: true,
         symrefs: true,
         unborn: false,
-        ref_prefixes: vec![
-            "HEAD".into(),
-            "refs/heads/".into(),
-            "refs/tags/".into(),
-        ],
+        ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into()],
     };
     let mut command = ls_refs.to_command_request()?;
     let mut options = ProtocolV2CommandOptions::default();
@@ -300,10 +298,7 @@ fn http_protocol_v2_ls_refs_advertisements(
         )
     })?;
     http_check_status(&response, &url)?;
-    http_validate_content_type(
-        &response,
-        &smart_http_rpc_result_content_type(service)?,
-    )?;
+    http_validate_content_type(&response, &smart_http_rpc_result_content_type(service)?)?;
     read_protocol_v2_ls_refs_response_as_ref_advertisement_set(format, &mut response.body)
 }
 
@@ -471,10 +466,7 @@ pub fn http_protocol_v2_fetch_response(
         &smart_http_rpc_result_content_type(GitService::UploadPack)?,
     )?;
     if fetch.sideband_all {
-        Ok(
-            read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?
-                .sections,
-        )
+        Ok(read_protocol_v2_fetch_sideband_all_response(format, &mut response.body)?.sections)
     } else {
         read_protocol_v2_fetch_response(format, &mut response.body)
     }
@@ -624,8 +616,8 @@ fn shallow_request_capabilities(deepen: Option<u32>) -> Vec<Capability> {
 mod tests {
     use super::*;
     use sley_protocol::{
-        ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolVersion,
-        ProtocolV2LsRefsRecord, RefAdvertisement, read_protocol_v2_fetch_response,
+        ProtocolV2FetchResponseSection, ProtocolV2FetchShallowInfo, ProtocolV2LsRefsRecord,
+        ProtocolVersion, RefAdvertisement, read_protocol_v2_fetch_response,
         write_protocol_v2_fetch_response, write_protocol_v2_ls_refs_response,
     };
 
@@ -652,9 +644,8 @@ mod tests {
     #[test]
     fn protocol_v2_ls_refs_command_request_includes_agent_and_object_format() {
         let handshake = sample_v2_handshake();
-        let command =
-            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
-                .expect("test operation should succeed");
+        let command = protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+            .expect("test operation should succeed");
         assert_eq!(command.command, "ls-refs");
         assert_eq!(
             command.capabilities,
@@ -676,11 +667,7 @@ mod tests {
                 peel: true,
                 symrefs: true,
                 unborn: false,
-                ref_prefixes: vec![
-                    "HEAD".into(),
-                    "refs/heads/".into(),
-                    "refs/tags/".into(),
-                ],
+                ref_prefixes: vec!["HEAD".into(), "refs/heads/".into(), "refs/tags/".into(),],
             }
         );
     }
@@ -700,9 +687,8 @@ mod tests {
                 },
             ],
         };
-        let command =
-            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
-                .expect("test operation should succeed");
+        let command = protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+            .expect("test operation should succeed");
         assert_eq!(
             command.capabilities,
             vec![Capability {
@@ -715,9 +701,8 @@ mod tests {
     #[test]
     fn protocol_v2_ls_refs_round_trip_bridges_into_ref_advertisement_set() {
         let handshake = sample_v2_handshake();
-        let command =
-            protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
-                .expect("test operation should succeed");
+        let command = protocol_v2_ls_refs_command_request(ObjectFormat::Sha1, &handshake)
+            .expect("test operation should succeed");
         let head = ObjectId::from_hex(
             ObjectFormat::Sha1,
             "1111111111111111111111111111111111111111",
@@ -911,16 +896,17 @@ mod tests {
             .expect("test operation should succeed");
 
         let sections = vec![
-            ProtocolV2FetchResponseSection::ShallowInfo(vec![
-                ProtocolV2FetchShallowInfo::Shallow(shallow),
-            ]),
+            ProtocolV2FetchResponseSection::ShallowInfo(vec![ProtocolV2FetchShallowInfo::Shallow(
+                shallow,
+            )]),
             ProtocolV2FetchResponseSection::Packfile(vec![b"PACK-test".to_vec()]),
         ];
         let mut response_body = Vec::new();
         write_protocol_v2_fetch_response(&mut response_body, &sections)
             .expect("test operation should succeed");
-        let parsed = read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut response_body.as_slice())
-            .expect("test operation should succeed");
+        let parsed =
+            read_protocol_v2_fetch_response(ObjectFormat::Sha1, &mut response_body.as_slice())
+                .expect("test operation should succeed");
         assert_eq!(parsed, sections);
         assert_eq!(
             shallow_info_from_protocol_v2_fetch_sections(&parsed),

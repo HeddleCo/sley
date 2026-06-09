@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use sley_bench::{create_fixture, BenchFixture, FIXTURE_OBJECT_COUNT};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_fixture};
 use sley_core::{GitError, Result};
 use sley_odb::ObjectReader;
 use std::io::Write;
@@ -53,11 +53,7 @@ fn cat_file_p_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("cat_file_p_single_packed");
     group.bench_function("sley_cli", |b| {
         b.iter(|| {
-            let output = run_sley(
-                &fixture.repo_root,
-                &["cat-file", "-p", oid.as_str()],
-                &[],
-            );
+            let output = run_sley(&fixture.repo_root, &["cat-file", "-p", oid.as_str()], &[]);
             match output {
                 Ok(body) => black_box(body),
                 Err(err) => panic!("sley cat-file -p failed: {err}"),
@@ -127,19 +123,23 @@ fn odb_read_header_vs_read_object(c: &mut Criterion) {
         let oids = fixture.object_ids[..count].to_vec();
         group.throughput(Throughput::Elements(count as u64));
 
-        group.bench_with_input(BenchmarkId::new("read_object_header", count), &oids, |b, oids| {
-            b.iter(|| {
-                let mut total = 0u64;
-                for oid in oids {
-                    match db.read_object_header(black_box(oid)) {
-                        Ok(Some((_, size))) => total = total.wrapping_add(size),
-                        Ok(None) => panic!("missing object {oid}"),
-                        Err(err) => panic!("read_object_header failed: {err}"),
+        group.bench_with_input(
+            BenchmarkId::new("read_object_header", count),
+            &oids,
+            |b, oids| {
+                b.iter(|| {
+                    let mut total = 0u64;
+                    for oid in oids {
+                        match db.read_object_header(black_box(oid)) {
+                            Ok(Some((_, size))) => total = total.wrapping_add(size),
+                            Ok(None) => panic!("missing object {oid}"),
+                            Err(err) => panic!("read_object_header failed: {err}"),
+                        }
                     }
-                }
-                black_box(total)
-            });
-        });
+                    black_box(total)
+                });
+            },
+        );
 
         group.bench_with_input(BenchmarkId::new("read_object", count), &oids, |b, oids| {
             b.iter(|| {

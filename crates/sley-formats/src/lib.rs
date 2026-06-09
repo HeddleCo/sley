@@ -694,10 +694,7 @@ impl CommitGraph {
         let mut entries = entries.to_vec();
         entries.sort_by(|left, right| left.oid.as_bytes().cmp(right.oid.as_bytes()));
         validate_commit_graph_write_entries(format, &entries)?;
-        let object_ids = entries
-            .iter()
-            .map(|entry| entry.oid)
-            .collect::<Vec<_>>();
+        let object_ids = entries.iter().map(|entry| entry.oid).collect::<Vec<_>>();
         let (cdat, edge) = write_commit_graph_commit_data(&entries)?;
         let mut chunks = vec![
             (*b"OIDF", write_commit_graph_fanout(&object_ids)?),
@@ -1673,11 +1670,186 @@ fn parse_bundle_reference(line: &[u8], format: ObjectFormat) -> Result<BundleRef
     })
 }
 
+/// How refs are stored in a newly initialized repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefStorageFormat {
+    Files,
+    Reftable,
+}
+
+impl RefStorageFormat {
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "" | "files" => Ok(Self::Files),
+            "reftable" => Ok(Self::Reftable),
+            other => Err(GitError::Command(format!(
+                "unknown ref storage format '{other}'"
+            ))),
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Files => "files",
+            Self::Reftable => "reftable",
+        }
+    }
+}
+
+/// Fully-resolved options for [`RepositoryBootstrap::init`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitOptions {
+    pub worktree: PathBuf,
+    pub object_format: ObjectFormat,
+    pub bare: bool,
+    pub initial_branch: String,
+    pub template_dir: Option<PathBuf>,
+    pub copy_template_config: bool,
+    pub separate_git_dir: Option<PathBuf>,
+    pub shared_repository: Option<String>,
+    pub ref_storage: RefStorageFormat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepositoryLayout {
     pub git_dir: PathBuf,
+    pub worktree: PathBuf,
     pub object_format: ObjectFormat,
     pub bare: bool,
+    pub ref_storage: RefStorageFormat,
+    pub reinitialized: bool,
+}
+
+pub struct RepositoryBootstrap;
+
+impl RepositoryBootstrap {
+    pub fn init(options: InitOptions) -> Result<RepositoryLayout> {
+        if options.bare && options.separate_git_dir.is_some() {
+            return Err(GitError::Command(
+                "options '--bare' and '--separate-git-dir' cannot be used together".into(),
+            ));
+        }
+
+        let worktree = options.worktree;
+        if !options.bare {
+            fs::create_dir_all(&worktree)?;
+        }
+
+        let dot_git = worktree.join(".git");
+        let mut write_git_link = false;
+        let git_dir = if options.bare {
+            worktree.clone()
+        } else if dot_git.is_file() {
+            let existing = read_gitdir_file(&dot_git)?.ok_or_else(|| {
+                GitError::InvalidFormat(format!("invalid gitfile {}", dot_git.display()))
+            })?;
+            if let Some(new_separate) = options.separate_git_dir.clone() {
+                if existing != new_separate {
+                    if existing.exists() && !new_separate.exists() {
+                        if let Some(parent) = new_separate.parent() {
+                            create_shared_dir(parent, options.shared_repository.as_deref())?;
+                        }
+                        fs::rename(&existing, &new_separate)?;
+                    }
+                    write_git_link = true;
+                    new_separate
+                } else {
+                    existing
+                }
+            } else {
+                existing
+            }
+        } else if let Some(separate_git_dir) = options.separate_git_dir.clone() {
+            write_git_link = true;
+            if let Some(parent) = separate_git_dir.parent() {
+                create_shared_dir(parent, options.shared_repository.as_deref())?;
+            }
+            if dot_git.is_dir() && !separate_git_dir.exists() {
+                fs::rename(&dot_git, &separate_git_dir)?;
+            }
+            separate_git_dir
+        } else {
+            worktree.join(".git")
+        };
+
+        let reinitialized = git_dir.join("HEAD").exists();
+        create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
+        create_shared_dir(
+            git_dir.join("objects/info"),
+            options.shared_repository.as_deref(),
+        )?;
+        create_shared_dir(
+            git_dir.join("objects/pack"),
+            options.shared_repository.as_deref(),
+        )?;
+
+        if options.ref_storage == RefStorageFormat::Files {
+            create_shared_dir(
+                git_dir.join("refs/heads"),
+                options.shared_repository.as_deref(),
+            )?;
+            create_shared_dir(
+                git_dir.join("refs/tags"),
+                options.shared_repository.as_deref(),
+            )?;
+        } else {
+            create_shared_dir(
+                git_dir.join("reftable"),
+                options.shared_repository.as_deref(),
+            )?;
+        }
+
+        let head_path = git_dir.join("HEAD");
+        if options.ref_storage == RefStorageFormat::Files {
+            if !head_path.exists() {
+                fs::write(
+                    &head_path,
+                    format!("ref: refs/heads/{}\n", options.initial_branch),
+                )?;
+            }
+        } else if !head_path.exists() {
+            fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
+            write_initial_reftable(&git_dir, options.object_format, &options.initial_branch)?;
+        }
+
+        let config_path = git_dir.join("config");
+        if !config_path.exists() {
+            fs::write(
+                config_path,
+                build_init_config(
+                    options.object_format,
+                    options.bare,
+                    &options.shared_repository,
+                    options.ref_storage,
+                )
+                .to_canonical_bytes(),
+            )?;
+        }
+
+        if let Some(template_dir) = options.template_dir.as_deref() {
+            apply_init_template(
+                template_dir,
+                &git_dir,
+                options.copy_template_config,
+                options.shared_repository.as_deref(),
+            )?;
+        }
+
+        if write_git_link {
+            let link_target = gitdir_link_path(&worktree, &git_dir)?;
+            fs::write(&dot_git, format!("gitdir: {link_target}\n"))?;
+            apply_shared_file_mode(&dot_git, options.shared_repository.as_deref())?;
+        }
+
+        Ok(RepositoryLayout {
+            git_dir,
+            worktree,
+            object_format: options.object_format,
+            bare: options.bare,
+            ref_storage: options.ref_storage,
+            reinitialized,
+        })
+    }
 }
 
 impl RepositoryLayout {
@@ -1695,56 +1867,249 @@ impl RepositoryLayout {
         bare: bool,
         initial_branch: &str,
     ) -> Result<Self> {
-        let root = path.as_ref();
-        let git_dir = if bare {
-            root.to_path_buf()
-        } else {
-            root.join(".git")
-        };
-        fs::create_dir_all(git_dir.join("objects/info"))?;
-        fs::create_dir_all(git_dir.join("objects/pack"))?;
-        fs::create_dir_all(git_dir.join("refs/heads"))?;
-        fs::create_dir_all(git_dir.join("refs/tags"))?;
-        let head_path = git_dir.join("HEAD");
-        if !head_path.exists() {
-            fs::write(head_path, format!("ref: refs/heads/{initial_branch}\n"))?;
-        }
-        let mut config = GitConfig {
-            preamble: Vec::new(),
-            suffix: Vec::new(),
-            sections: vec![ConfigSection::new(
-                "core",
-                None,
-                vec![
-                    ConfigEntry::new(
-                        "repositoryformatversion",
-                        Some(
-                            if object_format == ObjectFormat::Sha1 {
-                                "0"
-                            } else {
-                                "1"
-                            }
-                            .into(),
-                        ),
-                    ),
-                    ConfigEntry::new("filemode", Some("true".into())),
-                    ConfigEntry::new("bare", Some(if bare { "true" } else { "false" }.into())),
-                ],
-            )],
-        };
-        if object_format == ObjectFormat::Sha256 {
-            config.sections.push(ConfigSection::new(
-                "extensions",
-                None,
-                vec![ConfigEntry::new("objectformat", Some("sha256".into()))],
-            ));
-        }
-        fs::write(git_dir.join("config"), config.to_canonical_bytes())?;
-        Ok(Self {
-            git_dir,
+        RepositoryBootstrap::init(InitOptions {
+            worktree: path.as_ref().to_path_buf(),
             object_format,
             bare,
+            initial_branch: initial_branch.into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Files,
         })
+    }
+}
+
+fn build_init_config(
+    object_format: ObjectFormat,
+    bare: bool,
+    shared_repository: &Option<String>,
+    ref_storage: RefStorageFormat,
+) -> GitConfig {
+    let uses_extensions =
+        object_format == ObjectFormat::Sha256 || ref_storage == RefStorageFormat::Reftable;
+    let mut core_entries = vec![
+        ConfigEntry::new(
+            "repositoryformatversion",
+            Some(if uses_extensions { "1" } else { "0" }.into()),
+        ),
+        ConfigEntry::new("filemode", Some("true".into())),
+        ConfigEntry::new("bare", Some(if bare { "true" } else { "false" }.into())),
+    ];
+    if let Some(shared) = shared_repository
+        && let Some(value) = shared_repository_config_value(shared)
+    {
+        core_entries.push(ConfigEntry::new("sharedRepository", Some(value)));
+    }
+    let mut sections = vec![ConfigSection::new("core", None, core_entries)];
+    let mut extension_entries = Vec::new();
+    if object_format == ObjectFormat::Sha256 {
+        extension_entries.push(ConfigEntry::new("objectformat", Some("sha256".into())));
+    }
+    if ref_storage == RefStorageFormat::Reftable {
+        extension_entries.push(ConfigEntry::new("refStorage", Some("reftable".into())));
+    }
+    if !extension_entries.is_empty() {
+        sections.push(ConfigSection::new("extensions", None, extension_entries));
+    }
+    GitConfig {
+        preamble: Vec::new(),
+        suffix: Vec::new(),
+        sections,
+    }
+}
+
+fn write_initial_reftable(
+    git_dir: &Path,
+    object_format: ObjectFormat,
+    initial_branch: &str,
+) -> Result<()> {
+    let update_index = 1;
+    let table_name = format!("{update_index:012}-{update_index:012}-init.ref");
+    let refs = vec![ReftableRefRecord {
+        name: "HEAD".into(),
+        update_index,
+        value: ReftableRefValue::Symbolic(format!("refs/heads/{initial_branch}")),
+    }];
+    let bytes = Reftable::write_ref_only(object_format, update_index, update_index, &refs)?;
+    let reftable_dir = git_dir.join("reftable");
+    fs::write(reftable_dir.join(&table_name), bytes)?;
+    fs::write(reftable_dir.join("tables.list"), format!("{table_name}\n"))?;
+    Ok(())
+}
+
+fn apply_init_template(
+    template_dir: &Path,
+    git_dir: &Path,
+    copy_config: bool,
+    shared_repository: Option<&str>,
+) -> Result<()> {
+    if !template_dir.is_dir() {
+        return Ok(());
+    }
+    copy_init_template_entries(template_dir, git_dir, shared_repository)?;
+    let template_config_path = template_dir.join("config");
+    if copy_config && template_config_path.is_file() {
+        let mut template_config = GitConfig::read(template_config_path)?;
+        let current_config = GitConfig::read(git_dir.join("config"))?;
+        template_config.sections.extend(current_config.sections);
+        fs::write(git_dir.join("config"), template_config.to_canonical_bytes())?;
+    }
+    Ok(())
+}
+
+fn copy_init_template_entries(
+    source: &Path,
+    destination: &Path,
+    shared_repository: Option<&str>,
+) -> Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let source_path = entry.path();
+        let destination_path = destination.join(&name);
+        if source_path.is_dir() {
+            if !destination_path.exists() {
+                create_shared_dir(&destination_path, shared_repository)?;
+            }
+            copy_init_template_entries(&source_path, &destination_path, shared_repository)?;
+        } else if name != "config" && !destination_path.exists() {
+            if let Some(parent) = destination_path.parent() {
+                create_shared_dir(parent, shared_repository)?;
+            }
+            fs::copy(source_path, &destination_path)?;
+            apply_shared_file_mode(&destination_path, shared_repository)?;
+        }
+    }
+    Ok(())
+}
+
+fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
+    let contents = fs::read_to_string(path)?;
+    let Some(target) = contents.trim().strip_prefix("gitdir:") else {
+        return Ok(None);
+    };
+    let target = PathBuf::from(target.trim());
+    if target.is_absolute() {
+        Ok(Some(target))
+    } else {
+        Ok(Some(
+            path.parent().unwrap_or_else(|| Path::new("")).join(target),
+        ))
+    }
+}
+
+fn gitdir_link_path(worktree: &Path, git_dir: &Path) -> Result<String> {
+    if let (Ok(worktree), Ok(git_dir)) = (fs::canonicalize(worktree), fs::canonicalize(git_dir)) {
+        if let Some(relative) = relative_path_from(&worktree, &git_dir) {
+            return Ok(relative);
+        }
+    }
+    Ok(git_dir.display().to_string())
+}
+
+fn relative_path_from(base: &Path, target: &Path) -> Option<String> {
+    let base = base.components().collect::<Vec<_>>();
+    let target = target.components().collect::<Vec<_>>();
+    let common = base
+        .iter()
+        .zip(target.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if common == 0 {
+        return None;
+    }
+    let mut out = PathBuf::new();
+    for _ in common..base.len() {
+        out.push("..");
+    }
+    for component in &target[common..] {
+        out.push(component);
+    }
+    out.to_str().map(str::to_string)
+}
+
+fn create_shared_dir(path: impl AsRef<Path>, shared_repository: Option<&str>) -> Result<()> {
+    let path = path.as_ref();
+    if path.exists() {
+        apply_shared_dir_mode(path, shared_repository)?;
+        return Ok(());
+    }
+    fs::create_dir_all(path)?;
+    apply_shared_dir_mode(path, shared_repository)?;
+    Ok(())
+}
+
+fn apply_shared_dir_mode(path: &Path, shared_repository: Option<&str>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(mode) = shared_dir_mode(shared_repository) else {
+            return Ok(());
+        };
+        let metadata = fs::metadata(path)?;
+        if metadata.is_dir() {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, shared_repository);
+    }
+    Ok(())
+}
+
+fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Some(mode) = shared_file_mode(shared_repository) else {
+            return Ok(());
+        };
+        let metadata = fs::metadata(path)?;
+        if metadata.is_file() {
+            let mut permissions = metadata.permissions();
+            permissions.set_mode(mode);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, shared_repository);
+    }
+    Ok(())
+}
+
+/// Canonical `core.sharedRepository` value written at init, matching git's
+/// numeric compatibility encoding (`group` → `1`, `all` → `2`, etc.).
+fn shared_repository_config_value(shared_repository: &str) -> Option<String> {
+    match shared_repository {
+        "false" | "0" | "umask" => None,
+        "group" | "1" | "true" => Some("1".into()),
+        "all" | "world" | "everybody" | "2" | "3" => Some("2".into()),
+        value if value.starts_with('0') && value.len() > 1 => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn shared_dir_mode(shared_repository: Option<&str>) -> Option<u32> {
+    match shared_repository? {
+        "false" | "0" | "umask" => None,
+        "group" | "2" => Some(0o2775),
+        "all" | "world" | "everybody" | "3" | "true" | "1" => Some(0o777),
+        _ => None,
+    }
+}
+
+fn shared_file_mode(shared_repository: Option<&str>) -> Option<u32> {
+    match shared_repository? {
+        "false" | "0" | "umask" => None,
+        "group" | "2" => Some(0o664),
+        "all" | "world" | "everybody" | "3" | "true" | "1" => Some(0o666),
+        _ => None,
     }
 }
 
@@ -2529,6 +2894,114 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn repository_bootstrap_copies_template_files() {
+        let root = unique_temp_dir("init-template");
+        let template = root.join("template");
+        let repo = root.join("repo");
+        fs::create_dir_all(template.join("hooks")).expect("create template hooks");
+        fs::write(template.join("description"), b"template repo\n").expect("write description");
+        fs::write(template.join("hooks/pre-commit"), b"#!/bin/sh\n").expect("write hook");
+        fs::write(template.join("config"), b"[user]\n\tname = Template User\n")
+            .expect("write template config");
+
+        let layout = RepositoryBootstrap::init(InitOptions {
+            worktree: repo.clone(),
+            object_format: ObjectFormat::Sha1,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: Some(template),
+            copy_template_config: true,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Files,
+        })
+        .expect("init should succeed");
+
+        assert_eq!(
+            fs::read_to_string(layout.git_dir.join("description")).expect("read description"),
+            "template repo\n"
+        );
+        assert!(layout.git_dir.join("hooks/pre-commit").is_file());
+        let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
+        assert_eq!(config.get("user", None, "name"), Some("Template User"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repository_bootstrap_separate_git_dir_writes_gitfile() {
+        let root = unique_temp_dir("init-separate-gitdir");
+        let worktree = root.join("worktree");
+        let gitdir = root.join("external.git");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            worktree: worktree.clone(),
+            object_format: ObjectFormat::Sha1,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: Some(gitdir.clone()),
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Files,
+        })
+        .expect("init should succeed");
+
+        assert_eq!(layout.git_dir, gitdir);
+        assert!(gitdir.join("HEAD").is_file());
+        let gitfile = fs::read_to_string(worktree.join(".git")).expect("read gitfile");
+        assert!(gitfile.starts_with("gitdir: "));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repository_bootstrap_reftable_writes_extension_and_table() {
+        let root = unique_temp_dir("init-reftable");
+        let repo = root.join("repo");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            worktree: repo,
+            object_format: ObjectFormat::Sha1,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: None,
+            ref_storage: RefStorageFormat::Reftable,
+        })
+        .expect("init should succeed");
+
+        let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
+        assert_eq!(
+            config.get("extensions", None, "refStorage"),
+            Some("reftable")
+        );
+        assert!(layout.git_dir.join("reftable/tables.list").is_file());
+        assert!(!layout.git_dir.join("refs/heads").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn repository_bootstrap_honors_shared_repository_config() {
+        let root = unique_temp_dir("init-shared");
+        let repo = root.join("repo");
+        let layout = RepositoryBootstrap::init(InitOptions {
+            worktree: repo,
+            object_format: ObjectFormat::Sha1,
+            bare: false,
+            initial_branch: "main".into(),
+            template_dir: None,
+            copy_template_config: false,
+            separate_git_dir: None,
+            shared_repository: Some("group".into()),
+            ref_storage: RefStorageFormat::Files,
+        })
+        .expect("init should succeed");
+
+        let config = GitConfig::read(layout.git_dir.join("config")).expect("read config");
+        assert_eq!(config.get("core", None, "sharedRepository"), Some("1"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn oid(hex: &str) -> ObjectId {

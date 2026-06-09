@@ -225,7 +225,13 @@ mod tests {
         let parsed = parse_receive_pack_push_request(format, &body, false).expect("parse body");
 
         assert_eq!(parsed.commands.commands, req.commands);
-        assert!(parsed.commands.capabilities.iter().any(|cap| cap.name == "report-status"));
+        assert!(
+            parsed
+                .commands
+                .capabilities
+                .iter()
+                .any(|cap| cap.name == "report-status")
+        );
         assert!(parsed.packfile.starts_with(b"PACK"));
         assert_eq!(parsed.push_options, None);
 
@@ -258,10 +264,7 @@ mod tests {
         let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let base_oid = write_blob(&mut db, b"0123456789abcdef repeated base\n");
-        let similar_oid = write_blob(
-            &mut db,
-            b"0123456789abcdef repeated base with extra tail\n",
-        );
+        let similar_oid = write_blob(&mut db, b"0123456789abcdef repeated base with extra tail\n");
         let commands = [push_command(&base_oid, &similar_oid)];
         let remote_advertisements = [advertisement(&base_oid, "refs/heads/main")];
         let features = default_features();
@@ -300,7 +303,8 @@ mod tests {
             true,
         ))
         .expect("thin receive-pack body");
-        let parsed = parse_receive_pack_push_request(format, &body, false).expect("parse thin body");
+        let parsed =
+            parse_receive_pack_push_request(format, &body, false).expect("parse thin body");
         assert_eq!(parsed.packfile, thin_pack);
         assert_eq!(parsed.commands.commands, commands);
 
