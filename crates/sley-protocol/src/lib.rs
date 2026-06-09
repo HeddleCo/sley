@@ -616,7 +616,7 @@ pub fn plan_fetch_ref_updates(
             continue;
         }
         let Some(reference) = refs.iter().find(|reference| reference.name == src) else {
-            return Err(GitError::NotFound(format!("remote ref {src}")));
+            return Err(GitError::reference_not_found(format!("remote ref {src}")));
         };
         updates.push(FetchRefUpdate {
             src: reference.name.clone(),
@@ -699,7 +699,7 @@ pub fn plan_push_commands(
             (None, Some(dst)) => {
                 validate_refspec_endpoint("push destination", dst)?;
                 let remote = remote_ref(remote_refs, dst)
-                    .ok_or_else(|| GitError::NotFound(format!("remote ref {dst}")))?;
+                    .ok_or_else(|| GitError::reference_not_found(format!("remote ref {dst}")))?;
                 commands.push(ReceivePackCommand {
                     old_id: remote.oid.clone(),
                     new_id: zero.clone(),
@@ -743,7 +743,7 @@ pub fn plan_push_commands(
             (Some(src), dst) => {
                 validate_refspec_endpoint("push source", src)?;
                 let local = local_ref(local_refs, src)
-                    .ok_or_else(|| GitError::NotFound(format!("local ref {src}")))?;
+                    .ok_or_else(|| GitError::reference_not_found(format!("local ref {src}")))?;
                 validate_push_source_ref(format, local)?;
                 let name = dst.unwrap_or(src);
                 validate_refspec_endpoint("push destination", name)?;

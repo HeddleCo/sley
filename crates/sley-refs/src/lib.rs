@@ -636,10 +636,10 @@ impl FileRefStore {
         tx.update(RefUpdate {
             name: name.clone(),
             expected: None,
-            new: RefTarget::Direct(start.clone()),
+            new: RefTarget::Direct(start),
             reflog: Some(ReflogEntry {
                 old_oid: zero,
-                new_oid: start.clone(),
+                new_oid: start,
                 committer,
                 message,
             }),
@@ -694,7 +694,7 @@ impl FileRefStore {
             return Ok(());
         }
         let Some(target) = self.read_ref(&old_name)? else {
-            return Err(GitError::NotFound(format!("branch {old_branch}")));
+            return Err(GitError::reference_not_found(format!("branch {old_branch}")));
         };
         let RefTarget::Direct(oid) = target else {
             return Err(GitError::InvalidFormat(format!(
@@ -713,11 +713,11 @@ impl FileRefStore {
 
         self.write_loose_ref(&Ref {
             name: new_name.clone(),
-            target: RefTarget::Direct(oid.clone()),
+            target: RefTarget::Direct(oid),
         })?;
         let mut reflog = self.read_reflog(&old_name)?;
         reflog.push(ReflogEntry {
-            old_oid: oid.clone(),
+            old_oid: oid,
             new_oid: oid,
             committer,
             message: if copy {
@@ -751,7 +751,7 @@ impl FileRefStore {
         tx.update(RefUpdate {
             name: name.clone(),
             expected: None,
-            new: RefTarget::Direct(target.clone()),
+            new: RefTarget::Direct(target),
             reflog: None,
         });
         tx.commit()?;
@@ -828,7 +828,7 @@ impl FileRefStore {
     fn delete_direct_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
         if self.uses_reftable()? {
             let Some(target) = self.read_ref(name)? else {
-                return Err(GitError::NotFound(format!("{kind} {short_name}")));
+                return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
             };
             let RefTarget::Direct(oid) = target else {
                 return Err(GitError::InvalidFormat(format!(
@@ -860,14 +860,14 @@ impl FileRefStore {
     fn delete_packed_ref(&self, name: &str, kind: &str, short_name: &str) -> Result<ObjectId> {
         let path = self.common_dir.join("packed-refs");
         if !path.exists() {
-            return Err(GitError::NotFound(format!("{kind} {short_name}")));
+            return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
         }
         let mut refs = parse_packed_refs(self.format, &fs::read(&path)?)?;
         let Some(index) = refs
             .iter()
             .position(|reference| reference.reference.name == name)
         else {
-            return Err(GitError::NotFound(format!("{kind} {short_name}")));
+            return Err(GitError::reference_not_found(format!("{kind} {short_name}")));
         };
         let removed = refs.remove(index);
         let RefTarget::Direct(oid) = removed.reference.target else {
@@ -1131,7 +1131,7 @@ fn reftable_ref_target(value: ReftableRefValue) -> Result<Option<RefTarget>> {
 
 fn reftable_value_from_ref_target(target: &RefTarget) -> ReftableRefValue {
     match target {
-        RefTarget::Direct(oid) => ReftableRefValue::Direct(oid.clone()),
+        RefTarget::Direct(oid) => ReftableRefValue::Direct(*oid),
         RefTarget::Symbolic(target) => ReftableRefValue::Symbolic(target.clone()),
     }
 }
@@ -2160,10 +2160,10 @@ where
         let reflog = match reflog {
             Some(reflog) => Some(ReflogEntry {
                 old_oid: match &old_oid {
-                    Some(oid) => oid.clone(),
+                    Some(oid) => *oid,
                     None => null_oid(bundle_ref.oid.format())?,
                 },
-                new_oid: bundle_ref.oid.clone(),
+                new_oid: bundle_ref.oid,
                 committer: reflog.committer.clone(),
                 message: reflog.message.clone(),
             }),
@@ -2171,14 +2171,14 @@ where
         };
         updates.push(RefUpdate {
             name: bundle_ref.name.clone(),
-            expected: old_oid.clone().map(RefTarget::Direct),
-            new: RefTarget::Direct(bundle_ref.oid.clone()),
+            expected: old_oid.map(RefTarget::Direct),
+            new: RefTarget::Direct(bundle_ref.oid),
             reflog,
         });
         applied.push(AppliedBundleRefUpdate {
             name: bundle_ref.name.clone(),
             old_oid,
-            new_oid: bundle_ref.oid.clone(),
+            new_oid: bundle_ref.oid,
         });
     }
     Ok((updates, applied))

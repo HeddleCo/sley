@@ -621,7 +621,7 @@ fn single_blob_pack_index_parity_for_format(format: ObjectFormat) -> Result<Pack
         }
         let oid = sley_core::ObjectId::from_hex(format, &oid)?;
         let Some(entry) = index.find(&oid) else {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::not_found(format!(
                 "object {oid} not found in generated pack index"
             )));
         };
@@ -1783,8 +1783,8 @@ fn packed_odb_read_interop_parity_for_format(
             .join("pack")
             .join(format!("pack-{pack_hash}.idx"));
         if !pack_path.exists() || !index_path.exists() {
-            return Err(GitError::NotFound(
-                "upstream git did not write expected pack/index".into(),
+            return Err(GitError::not_found(
+                "upstream git did not write expected pack/index",
             ));
         }
         let db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
@@ -2575,7 +2575,7 @@ fn format_log_record(
     let records = sley_rev::walk_commits(reader, format, [oid.clone()])?;
     let record = records
         .first()
-        .ok_or_else(|| GitError::NotFound("commit record".into()))?;
+        .ok_or_else(|| GitError::not_found("commit record"))?;
     let mut out = String::new();
     out.push_str(&format!("commit {}\n", record.oid));
     let author = String::from_utf8_lossy(&record.commit.author);
@@ -2745,7 +2745,7 @@ pub fn update_index_add_parity_for_format(format: ObjectFormat) -> Result<Update
         let oid = update
             .updated
             .first()
-            .ok_or_else(|| GitError::NotFound("updated index object id".into()))?;
+            .ok_or_else(|| GitError::not_found("updated index object id"))?;
         let upstream =
             String::from_utf8_lossy(&run_git(&root, ["ls-files", "--stage"], &[])?).to_string();
         let expected = format!("100644 {} 0\thello.txt\n", oid);
@@ -5521,7 +5521,7 @@ pub mod upstream {
 
         let runner = runner_script_path();
         if !runner.exists() {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::not_found(format!(
                 "runner script missing: {}",
                 runner.display()
             )));

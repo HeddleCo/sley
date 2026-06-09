@@ -4,13 +4,13 @@ use std::fmt;
 
 use sley_refs::{RefUpdate, ReflogEntry, RefTarget};
 
-use crate::{GitError, Repository};
+use crate::{FullName, GitError, Repository, Result};
 
 /// One ref update to apply atomically via [`Repository::apply_ref_changes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefChange {
     /// Full ref name (e.g. `refs/heads/main`).
-    pub name: String,
+    pub name: FullName,
     /// New target after the update.
     pub new: RefTarget,
     /// When set, the ref must currently match this target (compare-and-swap).
@@ -20,10 +20,23 @@ pub struct RefChange {
 }
 
 impl RefChange {
+    /// Build a ref update with no compare-and-swap precondition or reflog entry.
+    pub fn new(
+        name: impl TryInto<FullName, Error = GitError>,
+        new: RefTarget,
+    ) -> Result<RefChange> {
+        Ok(Self {
+            name: name.try_into()?,
+            new,
+            expected: None,
+            reflog: None,
+        })
+    }
+
     /// Convert into the plumbing [`RefUpdate`] used by [`FileRefStore::transaction`].
     pub fn into_update(self) -> RefUpdate {
         RefUpdate {
-            name: self.name,
+            name: self.name.into(),
             expected: self.expected,
             new: self.new,
             reflog: self.reflog,
@@ -70,11 +83,10 @@ impl RefConflict {
 
 fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
     for prefix in ["expected ref ", "ref ", "could not lock ref "] {
-        if let Some(rest) = message.strip_prefix(prefix) {
-            if let Some(name) = rest.split_whitespace().next() {
+        if let Some(rest) = message.strip_prefix(prefix)
+            && let Some(name) = rest.split_whitespace().next() {
                 return Some(name.to_string());
             }
-        }
     }
     None
 }
@@ -132,7 +144,7 @@ mod tests {
     }
 
     fn write_commit(repo: &Repository, parent: Option<&sley_core::ObjectId>) -> sley_core::ObjectId {
-        let mut db = repo.objects();
+        let mut db = repo.objects_mut();
         let blob_oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"x\n".to_vec()))
             .expect("blob");
@@ -168,12 +180,8 @@ mod tests {
             .expect("branch");
         let b = write_commit(&repo, Some(&a));
 
-        repo.apply_ref_changes(&[RefChange {
-            name: "refs/heads/feature".into(),
-            new: RefTarget::Direct(a.clone()),
-            expected: None,
-            reflog: None,
-        }])
+        repo.apply_ref_changes(&[RefChange::new("refs/heads/feature", RefTarget::Direct(a.clone()))
+            .expect("valid ref name")])
         .expect("create branch");
 
         let feature = repo
@@ -183,7 +191,7 @@ mod tests {
         assert_eq!(feature.target, RefTarget::Direct(a.clone()));
 
         repo.apply_ref_changes(&[RefChange {
-            name: "refs/heads/main".into(),
+            name: FullName::new("refs/heads/main").expect("valid ref name"),
             new: RefTarget::Direct(b.clone()),
             expected: Some(RefTarget::Direct(a.clone())),
             reflog: None,
@@ -193,7 +201,7 @@ mod tests {
         let stale = write_commit(&repo, Some(&b));
         let err = repo
             .apply_ref_changes(&[RefChange {
-                name: "refs/heads/main".into(),
+                name: FullName::new("refs/heads/main").expect("valid ref name"),
                 new: RefTarget::Direct(stale),
                 expected: Some(RefTarget::Direct(a)),
                 reflog: None,

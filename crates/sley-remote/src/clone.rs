@@ -204,7 +204,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             ));
         }
         None => {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::reference_not_found(format!(
                 "remote ref {remote_branch_ref}"
             )));
         }

@@ -329,7 +329,7 @@ impl TreeEntryRef<'_> {
         TreeEntry {
             mode: self.mode,
             name: self.name.to_vec(),
-            oid: self.oid.clone(),
+            oid: self.oid,
         }
     }
 }
@@ -558,7 +558,7 @@ impl<'a> CommitRef<'a> {
 
     pub fn to_owned(&self) -> Commit {
         Commit {
-            tree: self.tree.clone(),
+            tree: self.tree,
             parents: self.parents.clone(),
             author: self.author.to_vec(),
             committer: self.committer.to_vec(),
@@ -699,7 +699,7 @@ impl<'a> TagRef<'a> {
 
     pub fn to_owned(&self) -> Tag {
         Tag {
-            object: self.object.clone(),
+            object: self.object,
             object_type: self.object_type,
             name: self.name.to_vec(),
             tagger: self.tagger.map(<[u8]>::to_vec),

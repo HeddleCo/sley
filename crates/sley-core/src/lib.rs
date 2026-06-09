@@ -1,3 +1,4 @@
+use std::borrow::Borrow;
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -43,7 +44,7 @@ impl FromStr for ObjectFormat {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ObjectId {
     format: ObjectFormat,
     bytes: [u8; 32],
@@ -212,6 +213,140 @@ impl ByteString {
 impl From<&str> for ByteString {
     fn from(value: &str) -> Self {
         Self(value.as_bytes().to_vec())
+    }
+}
+
+/// A validated git ref name (e.g. `refs/heads/main`, `HEAD`).
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FullName(String);
+
+impl FullName {
+    /// Construct a ref name, rejecting empty names, ASCII control characters,
+    /// leading/trailing whitespace, and consecutive slashes.
+    pub fn new(name: impl AsRef<str>) -> Result<Self> {
+        let name = name.as_ref();
+        validate_full_name(name)?;
+        Ok(Self(name.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for FullName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("FullName").field(&self.0).finish()
+    }
+}
+
+impl fmt::Display for FullName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<FullName> for String {
+    fn from(value: FullName) -> Self {
+        value.0
+    }
+}
+
+impl Borrow<str> for FullName {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+impl AsRef<str> for FullName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<&str> for FullName {
+    type Error = GitError;
+
+    fn try_from(value: &str) -> Result<Self> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for FullName {
+    type Error = GitError;
+
+    fn try_from(value: String) -> Result<Self> {
+        validate_full_name(&value)?;
+        Ok(Self(value))
+    }
+}
+
+impl PartialEq<&str> for FullName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<FullName> for &str {
+    fn eq(&self, other: &FullName) -> bool {
+        *self == other.0
+    }
+}
+
+fn validate_full_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(GitError::InvalidFormat("ref name must not be empty".into()));
+    }
+    if name
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_whitespace())
+        || name.chars().last().is_some_and(|ch| ch.is_whitespace())
+    {
+        return Err(GitError::InvalidFormat(
+            "ref name must not have leading or trailing whitespace".into(),
+        ));
+    }
+    if name.contains("//") {
+        return Err(GitError::InvalidFormat(
+            "ref name must not contain consecutive slashes".into(),
+        ));
+    }
+    if name.bytes().any(|byte| byte.is_ascii_control()) {
+        return Err(GitError::InvalidFormat(
+            "ref name must not contain control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// A byte string for git paths and similar on-disk identifiers.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BString(Vec<u8>);
+
+impl BString {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(bytes.to_vec())
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl fmt::Display for BString {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", String::from_utf8_lossy(&self.0))
+    }
+}
+
+impl Borrow<[u8]> for BString {
+    fn borrow(&self) -> &[u8] {
+        &self.0
     }
 }
 
@@ -472,6 +607,27 @@ pub struct Capability {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotFoundKind {
+    Message(String),
+    Remote { name: String },
+    Object { oid: ObjectId },
+    Reference { name: String },
+    Repository { path: String },
+}
+
+impl fmt::Display for NotFoundKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Message(msg) => write!(f, "{msg}"),
+            Self::Remote { name } => write!(f, "remote {name}"),
+            Self::Object { oid } => write!(f, "object {oid}"),
+            Self::Reference { name } => write!(f, "{name}"),
+            Self::Repository { path } => write!(f, "{path}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitError {
     Io(String),
     InvalidObjectId(String),
@@ -479,7 +635,7 @@ pub enum GitError {
     InvalidFormat(String),
     InvalidPath(String),
     Unsupported(String),
-    NotFound(String),
+    NotFound(NotFoundKind),
     Transaction(String),
     Command(String),
     Exit(i32),
@@ -496,7 +652,7 @@ impl fmt::Display for GitError {
             Self::InvalidFormat(msg) => write!(f, "invalid format: {msg}"),
             Self::InvalidPath(msg) => write!(f, "invalid path: {msg}"),
             Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
-            Self::NotFound(msg) => write!(f, "not found: {msg}"),
+            Self::NotFound(kind) => write!(f, "not found: {kind}"),
             Self::Transaction(msg) => write!(f, "transaction failed: {msg}"),
             Self::Command(msg) => write!(f, "command failed: {msg}"),
             Self::Exit(code) => write!(f, "exit {code}"),
@@ -505,6 +661,41 @@ impl fmt::Display for GitError {
 }
 
 impl Error for GitError {}
+
+impl GitError {
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::NotFound(NotFoundKind::Message(msg.into()))
+    }
+
+    pub fn remote_not_found(name: impl Into<String>) -> Self {
+        Self::NotFound(NotFoundKind::Remote {
+            name: name.into(),
+        })
+    }
+
+    pub fn object_not_found(oid: ObjectId) -> Self {
+        Self::NotFound(NotFoundKind::Object { oid })
+    }
+
+    pub fn reference_not_found(name: impl Into<String>) -> Self {
+        Self::NotFound(NotFoundKind::Reference {
+            name: name.into(),
+        })
+    }
+
+    pub fn repository_not_found(path: impl Into<String>) -> Self {
+        Self::NotFound(NotFoundKind::Repository {
+            path: path.into(),
+        })
+    }
+
+    pub fn not_found_kind(&self) -> Option<&NotFoundKind> {
+        match self {
+            Self::NotFound(kind) => Some(kind),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for GitError {
     fn from(value: std::io::Error) -> Self {
@@ -1042,5 +1233,34 @@ mod tests {
         assert!(unknown.negative_utc);
         assert_eq!(unknown.seconds, 42);
         assert_eq!(unknown.offset_token(), "-0000");
+    }
+
+    #[test]
+    fn full_name_accepts_valid_ref_names() {
+        let name = FullName::new("refs/heads/main").expect("valid ref name");
+        assert_eq!(name.as_str(), "refs/heads/main");
+        assert_eq!(name, "refs/heads/main");
+        assert_eq!(format!("{name}"), "refs/heads/main");
+        assert_eq!(String::from(name.clone()), "refs/heads/main");
+        let borrowed: &str = name.borrow();
+        assert_eq!(borrowed, "refs/heads/main");
+    }
+
+    #[test]
+    fn full_name_rejects_invalid_ref_names() {
+        assert!(FullName::new("").is_err());
+        assert!(FullName::new(" refs/heads/main").is_err());
+        assert!(FullName::new("refs/heads/main ").is_err());
+        assert!(FullName::new("refs//heads/main").is_err());
+        assert!(FullName::new("refs/heads/\nmain").is_err());
+    }
+
+    #[test]
+    fn bstring_round_trips_bytes_and_displays_lossily() {
+        let path = BString::from_bytes(b"src/\xFF.txt");
+        assert_eq!(path.as_bytes(), b"src/\xFF.txt");
+        let borrowed: &[u8] = path.borrow();
+        assert_eq!(borrowed, b"src/\xFF.txt".as_slice());
+        assert_eq!(format!("{path}"), "src/\u{FFFD}.txt");
     }
 }

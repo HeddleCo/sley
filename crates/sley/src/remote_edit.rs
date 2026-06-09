@@ -88,16 +88,16 @@ fn remote_edit_error(err: RemoteEditError) -> GitError {
         RemoteEditError::AlreadyExists => {
             GitError::Command("remote already exists".into())
         }
-        RemoteEditError::NotFound => GitError::NotFound("remote not found".into()),
+        RemoteEditError::NotFound => GitError::remote_not_found("remote not found"),
     }
 }
 
 fn set_url_error(err: remotes::SetUrlError) -> GitError {
     match err {
-        remotes::SetUrlError::RemoteNotFound => GitError::NotFound("remote not found".into()),
-        remotes::SetUrlError::NoMatch => GitError::NotFound("remote url did not match".into()),
+        remotes::SetUrlError::RemoteNotFound => GitError::remote_not_found("remote not found"),
+        remotes::SetUrlError::NoMatch => GitError::not_found("remote url did not match"),
         remotes::SetUrlError::DeleteNoMatch => {
-            GitError::NotFound("remote url did not match".into())
+            GitError::not_found("remote url did not match")
         }
         remotes::SetUrlError::DeleteAllFetchUrls => {
             GitError::Command("cannot delete every fetch url".into())

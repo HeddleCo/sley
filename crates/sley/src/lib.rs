@@ -43,6 +43,7 @@
 mod capabilities;
 mod diff;
 mod notes_repo;
+mod objects;
 mod refs;
 mod remote_edit;
 
@@ -87,7 +88,9 @@ pub mod plumbing {
 // The most frequently used plumbing types are also re-exported at the crate root
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
-pub use sley_core::{GitError, GitTime, ObjectFormat, ObjectId, Result, Signature};
+pub use sley_core::{
+    BString, FullName, GitError, GitTime, NotFoundKind, ObjectFormat, ObjectId, Result, Signature,
+};
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
 pub use sley_object::{
     Commit as CommitObject, ObjectType as GitObjectType, Tag as TagObject, Tree as TreeObject,
@@ -99,6 +102,7 @@ pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as Refe
 pub use sley_sequencer::TagCreate;
 
 pub use capabilities::RepositoryCapabilities;
+pub use objects::LoadedObject;
 pub use refs::{RefChange, RefChangeResult, RefConflict};
 
 /// A resolved reference: its full name plus the target it points at.
@@ -109,7 +113,7 @@ pub use refs::{RefChange, RefChangeResult, RefConflict};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reference {
     /// The full reference name, e.g. `refs/heads/main` or `HEAD`.
-    pub name: String,
+    pub name: FullName,
     /// The reference's immediate target.
     pub target: RefTarget,
 }
@@ -119,7 +123,7 @@ impl Reference {
     /// direct reference.
     pub fn peeled_oid(&self, repo: &Repository) -> Result<Option<ObjectId>> {
         match &self.target {
-            RefTarget::Direct(oid) => Ok(Some(oid.clone())),
+            RefTarget::Direct(oid) => Ok(Some(*oid)),
             RefTarget::Symbolic(name) => repo.resolve_symbolic(name),
         }
     }
@@ -134,7 +138,7 @@ impl Reference {
 pub struct Head {
     /// The branch ref `HEAD` symbolically points at (e.g. `refs/heads/main`),
     /// or `None` when `HEAD` is detached (points directly at a commit).
-    pub symbolic_target: Option<String>,
+    pub symbolic_target: Option<FullName>,
     /// The commit `HEAD` resolves to, or `None` for an unborn branch.
     pub oid: Option<ObjectId>,
 }
@@ -154,7 +158,8 @@ impl Head {
     /// points at, if any.
     pub fn branch_name(&self) -> Option<&str> {
         self.symbolic_target
-            .as_deref()
+            .as_ref()
+            .map(FullName::as_str)
             .and_then(|name| name.strip_prefix("refs/heads/"))
     }
 }
@@ -164,15 +169,26 @@ impl Head {
 /// Construct one with [`Repository::open`] (when you already know the git
 /// directory), [`Repository::discover`] (to search upward from a working-tree
 /// path), or [`Repository::init`] / [`Repository::init_bare`] (to create a new
-/// repository). The handle is cheap to clone and holds no open file handles; it
-/// builds the plumbing objects ([`Repository::objects`],
-/// [`Repository::references`], [`Repository::config`]) on demand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// repository). The handle is cheap to clone and shares a session-scoped object
+/// database ([`Repository::objects`]) whose read caches survive across calls
+/// until [`Repository::refresh_objects`] (automatic after `fetch` / pack copy).
+#[derive(Debug, Clone)]
 pub struct Repository {
     git_dir: PathBuf,
     common_dir: PathBuf,
     format: ObjectFormat,
+    objects: Arc<FileObjectDatabase>,
 }
+
+impl PartialEq for Repository {
+    fn eq(&self, other: &Self) -> bool {
+        self.git_dir == other.git_dir
+            && self.common_dir == other.common_dir
+            && self.format == other.format
+    }
+}
+
+impl Eq for Repository {}
 
 impl Repository {
     /// Open the repository whose git directory is exactly `git_dir`.
@@ -186,7 +202,7 @@ impl Repository {
     pub fn open(git_dir: impl AsRef<Path>) -> Result<Self> {
         let git_dir = resolve_git_dir(git_dir.as_ref())?;
         if !is_git_dir(&git_dir) {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::repository_not_found(format!(
                 "not a git repository: {}",
                 git_dir.display()
             )));
@@ -229,10 +245,12 @@ impl Repository {
     fn from_git_dir(git_dir: PathBuf) -> Result<Self> {
         let common_dir = sley_odb::repository_common_dir(&git_dir);
         let format = read_object_format(&common_dir)?;
+        let objects = Arc::new(FileObjectDatabase::from_git_dir(&common_dir, format));
         Ok(Self {
             git_dir,
             common_dir,
             format,
+            objects,
         })
     }
 
@@ -285,12 +303,6 @@ impl Repository {
     /// `extensions.objectformat`.
     pub fn object_format(&self) -> ObjectFormat {
         self.format
-    }
-
-    /// The object database for this repository, reading loose and packed
-    /// objects (and any alternates).
-    pub fn objects(&self) -> FileObjectDatabase {
-        FileObjectDatabase::from_git_dir(&self.common_dir, self.format)
     }
 
     /// The reference store for this repository (loose refs, `packed-refs`, and
@@ -366,7 +378,8 @@ impl Repository {
     fn config_include_branch(&self) -> Option<String> {
         let head = self.head().ok()?;
         head.symbolic_target
-            .as_deref()
+            .as_ref()
+            .map(FullName::as_str)
             .and_then(|target| target.strip_prefix("refs/heads/"))
             .map(str::to_string)
     }
@@ -376,15 +389,16 @@ impl Repository {
     pub fn head(&self) -> Result<Head> {
         let refs = self.references();
         match refs.read_ref("HEAD")? {
-            None => Err(GitError::NotFound("HEAD is missing".into())),
+            None => Err(GitError::reference_not_found("HEAD is missing")),
             Some(RefTarget::Direct(oid)) => Ok(Head {
                 symbolic_target: None,
                 oid: Some(oid),
             }),
             Some(RefTarget::Symbolic(name)) => {
+                let symbolic_target = FullName::new(&name)?;
                 let oid = self.resolve_symbolic(&name)?;
                 Ok(Head {
-                    symbolic_target: Some(name),
+                    symbolic_target: Some(symbolic_target),
                     oid,
                 })
             }
@@ -394,11 +408,9 @@ impl Repository {
     /// Look up a reference by full name (e.g. `refs/heads/main`, `refs/tags/v1`,
     /// or `HEAD`), returning `None` if it does not exist.
     pub fn find_reference(&self, name: &str) -> Result<Option<Reference>> {
+        let name = FullName::new(name)?;
         let refs = self.references();
-        Ok(refs.read_ref(name)?.map(|target| Reference {
-            name: name.to_string(),
-            target,
-        }))
+        Ok(refs.read_ref(name.as_str())?.map(|target| Reference { name, target }))
     }
 
     /// Resolve a revision specification (anything `git rev-parse` accepts:
@@ -414,8 +426,13 @@ impl Repository {
     /// is walked component by component. An empty `path` resolves to the tree
     /// itself.
     pub fn resolve_path(&self, rev: &str, path: &str) -> Result<ResolvedTreePath> {
-        let objects = self.objects();
-        sley_rev::resolve_rev_path_entry(&self.git_dir, self.format, &objects, rev, path)
+        sley_rev::resolve_rev_path_entry(
+            &self.git_dir,
+            self.format,
+            self.objects.as_ref(),
+            rev,
+            path,
+        )
     }
 
     /// Write an annotated tag object, returning its id.
@@ -423,7 +440,7 @@ impl Repository {
     /// This creates only the tag *object*; updating `refs/tags/<name>` is the
     /// caller's responsibility (see [`Repository::apply_ref_changes`]).
     pub fn write_annotated_tag(&self, tag: TagCreate) -> Result<ObjectId> {
-        let mut objects = self.objects();
+        let mut objects = self.objects_mut();
         create_annotated_tag(&mut objects, tag)
     }
 
@@ -448,15 +465,19 @@ impl Repository {
                 other.format.name()
             )));
         }
-        let source = other.objects();
-        let destination = self.objects();
-        install_reachable_pack(&source, &destination, self.format, roots.iter().cloned())?;
+        install_reachable_pack(
+            other.objects().as_ref(),
+            self.objects().as_ref(),
+            self.format,
+            roots.iter().copied(),
+        )?;
+        self.refresh_objects();
         Ok(())
     }
 
     /// Read a raw object (any type) from the object database.
     pub fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
-        self.objects().read_object(oid)
+        ObjectReader::read_object(self.objects.as_ref(), oid)
     }
 
     /// Read a commit object, parsing it into a [`Commit`]. Returns an error if
@@ -527,7 +548,7 @@ impl Repository {
     /// returning its id. The bytes are stored verbatim, so writing an object
     /// that originated from another repository preserves its id exactly.
     pub fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
-        let mut odb = self.objects();
+        let mut odb = self.objects_mut();
         odb.write_object(object)
     }
 
@@ -562,7 +583,7 @@ impl Repository {
     /// Build a fresh index mirroring `tree_oid` (stage-0 entries with a zeroed
     /// stat), the way `git read-tree <tree>` would. Does not touch `.git/index`.
     pub fn index_from_tree(&self, tree_oid: &ObjectId) -> Result<Index> {
-        sley_worktree::index_from_tree(&self.objects(), self.format, tree_oid)
+        sley_worktree::index_from_tree(self.objects.as_ref(), self.format, tree_oid)
     }
 
     /// Follow a symbolic ref chain (e.g. `HEAD` -> `refs/heads/main`) to the
@@ -660,7 +681,7 @@ fn discover_git_dir(start: &Path) -> Result<PathBuf> {
             return Ok(candidate.to_path_buf());
         }
     }
-    Err(GitError::NotFound(format!(
+    Err(GitError::repository_not_found(format!(
         "not a git repository (or any parent up to {}): {}",
         absolute.display(),
         start.display()
@@ -706,7 +727,7 @@ mod tests {
     /// Write a blob, a tree referencing it, and a commit pointing at the tree,
     /// then point `refs/heads/main` at the commit. Returns the commit oid.
     fn seed_commit(repo: &Repository) -> ObjectId {
-        let mut db = repo.objects();
+        let mut db = repo.objects_mut();
 
         let blob_oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
@@ -779,7 +800,7 @@ mod tests {
         let temp = TempDir::new();
         let repo = Repository::init(temp.path()).expect("init");
         let head = repo.head().expect("head");
-        assert_eq!(head.symbolic_target.as_deref(), Some("refs/heads/main"));
+        assert_eq!(head.symbolic_target.as_ref().map(FullName::as_str), Some("refs/heads/main"));
         assert_eq!(head.oid, None);
         assert!(head.is_unborn());
         assert!(!head.is_detached());
@@ -793,7 +814,7 @@ mod tests {
         let commit_oid = seed_commit(&repo);
 
         let head = repo.head().expect("head");
-        assert_eq!(head.symbolic_target.as_deref(), Some("refs/heads/main"));
+        assert_eq!(head.symbolic_target.as_ref().map(FullName::as_str), Some("refs/heads/main"));
         assert_eq!(head.oid.as_ref(), Some(&commit_oid));
         assert!(!head.is_unborn());
         assert_eq!(head.branch_name(), Some("main"));

@@ -12,9 +12,8 @@ impl Repository {
         left: &ObjectId,
         right: &ObjectId,
     ) -> Result<Vec<NameStatusEntry>> {
-        let db = self.objects();
         diff_name_status_trees_with_options(
-            &db,
+            self.objects.as_ref(),
             self.object_format(),
             left,
             right,

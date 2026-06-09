@@ -798,7 +798,7 @@ pub(crate) fn cat_file_object_storage(
     FileObjectDatabase::from_git_dir(git_dir, format)
         .object_storage_info(oid)?
         .ok_or_else(|| {
-            GitError::NotFound(format!(
+            GitError::not_found(format!(
                 "object {oid} storage metadata in {}",
                 repository_objects_dir(git_dir).display()
             ))

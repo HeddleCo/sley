@@ -2063,7 +2063,7 @@ where
         }
         Some(DeltaBase::Ref(base_oid)) => {
             let base = resolve_ref_base(&base_oid)?
-                .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {base_oid}")))?;
+                .ok_or_else(|| GitError::not_found(format!("ref-delta base object {base_oid}")))?;
             let resolved = apply_pack_delta(&base.body, &body)?;
             Arc::new(EncodedObject::new(base.object_type, resolved))
         }
@@ -2141,7 +2141,7 @@ where
             cursor += hash_len;
             let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
             let base_type = resolve_ref_base_type(&oid)?
-                .ok_or_else(|| GitError::NotFound(format!("ref-delta base object {oid}")))?;
+                .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
             Ok((base_type, size))
         }
     }

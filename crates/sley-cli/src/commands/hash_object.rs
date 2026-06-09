@@ -274,7 +274,7 @@ impl HashObjectInvocation {
         if self.write {
             let git_dir = repo_git_dir
                 .as_ref()
-                .ok_or_else(|| GitError::NotFound("not a git repository".into()))?;
+                .ok_or_else(|| GitError::repository_not_found("not a git repository"))?;
             let repo_format = repository_object_format(git_dir)?;
             if !self.explicit_format {
                 self.format = repo_format;

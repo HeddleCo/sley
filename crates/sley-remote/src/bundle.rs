@@ -114,7 +114,7 @@ fn bundle_default_fetch_reference(references: &[BundleReference]) -> Result<&Bun
     references
         .iter()
         .find(|reference| reference.name == "HEAD")
-        .ok_or_else(|| GitError::NotFound("remote ref HEAD".into()))
+        .ok_or_else(|| GitError::reference_not_found("remote ref HEAD"))
 }
 
 fn write_bundle_default_fetch_head(

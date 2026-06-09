@@ -3497,7 +3497,7 @@ pub fn checkout_branch(
                 "checkout target branch must be direct".into(),
             ));
         }
-        None => return Err(GitError::NotFound(format!("branch {branch}"))),
+        None => return Err(GitError::reference_not_found(format!("branch {branch}"))),
     };
     let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?;
     let mut tx = refs.transaction();
@@ -3576,7 +3576,7 @@ pub fn checkout_branch_filtered(
                 "checkout target branch must be direct".into(),
             ));
         }
-        None => return Err(GitError::NotFound(format!("branch {branch}"))),
+        None => return Err(GitError::reference_not_found(format!("branch {branch}"))),
     };
     let files = checkout_commit_to_index_and_worktree_filtered(
         worktree_root,

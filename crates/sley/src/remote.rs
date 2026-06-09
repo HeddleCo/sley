@@ -96,6 +96,90 @@ impl Repository {
         RemoteContext::for_remote(self, remote)
     }
 
+    /// Fetch from `remote` (name or URL), installing objects and updating refs.
+    pub fn fetch(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: FetchOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+    ) -> Result<FetchOutcome> {
+        let ctx = self.remote(remote)?;
+        let source = ctx.fetch_source(self)?;
+        let outcome = fetch(
+            FetchRequest {
+                git_dir: self.git_dir(),
+                format: self.object_format(),
+                config: ctx.config(),
+                remote_name: ctx.name(),
+                source: &source,
+                refspecs,
+                options: &options,
+            },
+            FetchServices {
+                credentials,
+                progress,
+            },
+        )?;
+        self.refresh_objects();
+        Ok(outcome)
+    }
+
+    /// Push `refspecs` to `remote` (name or URL).
+    pub fn push(
+        &self,
+        remote: impl Into<String>,
+        refspecs: &[String],
+        options: PushOptions,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+    ) -> Result<PushOutcome> {
+        let ctx = self.remote(remote)?;
+        let destination = ctx.push_destination(self)?;
+        push(
+            PushRequest {
+                git_dir: self.git_dir(),
+                common_git_dir: self.common_dir(),
+                format: self.object_format(),
+                config: ctx.config(),
+                remote: ctx.name(),
+                destination: &destination,
+                refspecs,
+                options: &options,
+            },
+            PushServices {
+                credentials,
+                progress,
+            },
+        )
+    }
+
+    /// List refs advertised by `remote` (name or URL).
+    pub fn ls_remote(
+        &self,
+        remote: impl Into<String>,
+        filter: LsRemoteFilter,
+        matches: &dyn Fn(&str) -> bool,
+        credentials: &mut dyn CredentialProvider,
+    ) -> Result<Vec<LsRemoteRecord>> {
+        let ctx = self.remote(remote)?;
+        let source = ctx.fetch_source(self)?;
+        let ls_source = match source {
+            FetchSource::Http(url) => LsRemoteSource::Http(url),
+            FetchSource::Ssh(url) => LsRemoteSource::Ssh(url),
+            FetchSource::Local { git_dir, .. } => LsRemoteSource::Local { git_dir },
+        };
+        Ok(ls_remote(
+            &ls_source,
+            self.object_format(),
+            &filter,
+            matches,
+            credentials,
+        )?
+        .0)
+    }
+
     /// Directory relative local remote paths resolve against: working tree root,
     /// or the parent of `.git` for a bare repository, or `git_dir` as fallback.
     pub(crate) fn remote_relative_base(&self) -> std::path::PathBuf {

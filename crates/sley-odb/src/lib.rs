@@ -102,7 +102,7 @@ pub fn verify_bundle_prerequisites<R: ObjectReader>(bundle: &Bundle, reader: &R)
                     )));
                 }
             }
-            Err(GitError::NotFound(_)) => missing.push(prerequisite.oid.clone()),
+            Err(GitError::NotFound(_)) => missing.push(prerequisite.oid),
             Err(err) => return Err(err),
         }
     }
@@ -114,7 +114,7 @@ pub fn verify_bundle_prerequisites<R: ObjectReader>(bundle: &Bundle, reader: &R)
         .map(ObjectId::to_string)
         .collect::<Vec<_>>()
         .join(", ");
-    Err(GitError::NotFound(format!(
+    Err(GitError::not_found(format!(
         "bundle prerequisites missing: {missing}"
     )))
 }
@@ -943,7 +943,7 @@ impl ObjectReader for ObjectDatabase {
         self.objects
             .get(oid)
             .map(Arc::clone)
-            .ok_or_else(|| GitError::NotFound(format!("object {oid}")))
+            .ok_or_else(|| GitError::object_not_found(*oid))
     }
 }
 
@@ -1143,6 +1143,12 @@ impl<K: std::hash::Hash + Eq + Clone> LruCache<K> {
         if let Some(position) = self.order.iter().position(|existing| existing == key) {
             self.order.remove(position);
         }
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+        self.order.clear();
+        self.used = 0;
     }
 
     fn put(&mut self, key: K, object: Arc<EncodedObject>) {
@@ -1383,6 +1389,31 @@ impl FileObjectDatabase {
 
     pub fn from_git_dir(git_dir: impl AsRef<Path>, format: ObjectFormat) -> Self {
         Self::new(repository_objects_dir(git_dir), format)
+    }
+
+    /// Drop cached pack listings, indexes, and decoded objects so the next read
+    /// sees packs/objects installed after this handle was created (e.g. after
+    /// `fetch` or `install_pack`). Long-lived [`Repository`] sessions call this
+    /// via the owning repository's `refresh_objects` hook.
+    pub fn refresh_read_cache(&self) {
+        if let Ok(mut cache) = self.pack_listing.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.pack_indexes.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.multi_pack_indexes.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.pack_bytes.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.pack_deltas.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.decoded.lock() {
+            cache.clear();
+        }
     }
 
     pub fn loose(&self) -> &LooseObjectStore {
@@ -1899,7 +1930,7 @@ impl FileObjectDatabase {
             .unwrap_or_else(|| pack_name.clone());
         let pack = pack_dir.join(pack_file_name);
         if !pack.exists() {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::not_found(format!(
                 "pack file {} for multi-pack-index {}",
                 pack.display(),
                 midx_path.display()
@@ -2020,7 +2051,7 @@ impl ObjectReader for FileObjectDatabase {
                 Err(err) => return Err(err),
             }
         }
-        Err(GitError::NotFound(format!("object {oid}")))
+        Err(GitError::object_not_found(*oid))
     }
 }
 
@@ -2173,7 +2204,7 @@ impl ObjectReader for LooseObjectStore {
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(GitError::NotFound(format!("object {oid}")));
+                return Err(GitError::object_not_found(*oid));
             }
             Err(err) => return Err(GitError::Io(err.to_string())),
         };

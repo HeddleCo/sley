@@ -170,7 +170,7 @@ fn resolve_revision_name(
             ObjectPrefixResolution::Missing => {}
         }
     }
-    Err(GitError::NotFound(format!("revision {rev}")))
+    Err(GitError::not_found(format!("revision {rev}")))
 }
 
 fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectId>> {
@@ -220,7 +220,7 @@ fn resolve_at_selector(
         let refs = FileRefStore::new(git_dir.to_path_buf(), format);
         return match resolve_revision_ref(&refs, "HEAD")? {
             Some(oid) => Ok(Some(oid)),
-            None => Err(GitError::NotFound("revision @".into())),
+            None => Err(GitError::not_found("revision @")),
         };
     }
 
@@ -309,7 +309,7 @@ fn resolve_reflog_nth(
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let entries = refs.read_reflog(&ref_name)?;
     if entries.is_empty() {
-        return Err(GitError::NotFound(format!(
+        return Err(GitError::not_found(format!(
             "no reflog for '{}' to resolve {rev}",
             reflog_display_name(base)
         )));
@@ -317,7 +317,7 @@ fn resolve_reflog_nth(
     // `@{N}` counts back from the newest entry; index `len - 1 - n`.
     let len = entries.len();
     if n >= len {
-        return Err(GitError::NotFound(format!(
+        return Err(GitError::not_found(format!(
             "log for '{}' only has {len} entries",
             reflog_display_name(base)
         )));
@@ -362,13 +362,13 @@ fn resolve_previous_checkout(
         if seen == n {
             let from = from.to_string();
             return resolve_revision_name(git_dir, format, &from).map_err(|_| {
-                GitError::NotFound(format!(
+                GitError::not_found(format!(
                     "could not resolve previous branch '{from}' for {rev}"
                 ))
             });
         }
     }
-    Err(GitError::NotFound(format!(
+    Err(GitError::not_found(format!(
         "not enough previous checkouts to resolve {rev}"
     )))
 }
@@ -418,7 +418,7 @@ fn resolve_upstream(
     let merge = config
         .get("branch", Some(&branch), "merge")
         .ok_or_else(|| {
-            GitError::NotFound(format!("no upstream configured for branch '{branch}'"))
+            GitError::not_found(format!("no upstream configured for branch '{branch}'"))
         })?;
     let short = merge.strip_prefix("refs/heads/").unwrap_or(merge);
 
@@ -432,12 +432,12 @@ fn resolve_upstream(
     } else {
         config.get("branch", Some(&branch), "remote")
     }
-    .ok_or_else(|| GitError::NotFound(format!("no upstream remote for branch '{branch}'")))?;
+    .ok_or_else(|| GitError::not_found(format!("no upstream remote for branch '{branch}'")))?;
 
     let tracking = format!("refs/remotes/{remote}/{short}");
     match resolve_revision_ref(&refs, &tracking)? {
         Some(oid) => Ok(oid),
-        None => Err(GitError::NotFound(format!(
+        None => Err(GitError::not_found(format!(
             "upstream tracking ref '{tracking}' for {rev} is missing"
         ))),
     }
@@ -584,7 +584,7 @@ fn apply_revision_suffix<R: ObjectReader>(
                 .commit_parents(reader, base)?
                 .get(parent - 1)
                 .cloned()
-                .ok_or_else(|| GitError::NotFound(format!("parent {parent} of {base}")))
+                .ok_or_else(|| GitError::not_found(format!("parent {parent} of {base}")))
         }
         RevisionSuffix::FirstParent(count) => {
             let mut graph = CommitGraphContext::load(git_dir, format);
@@ -592,7 +592,7 @@ fn apply_revision_suffix<R: ObjectReader>(
             for _ in 0..count {
                 current = graph
                     .commit_first_parent(reader, &current)?
-                    .ok_or_else(|| GitError::NotFound(format!("first parent of {current}")))?;
+                    .ok_or_else(|| GitError::not_found(format!("first parent of {current}")))?;
             }
             Ok(current)
         }
@@ -1100,7 +1100,7 @@ pub fn resolve_rev_path_entry<R: ObjectReader>(
     let rev_oid = resolve_revision_with_reader(git_dir, format, reader, rev)?;
     let tree_oid = peel_to_tree(reader, format, &rev_oid)?;
     resolve_tree_path_entry(reader, format, &tree_oid, path)
-        .ok_or_else(|| GitError::NotFound(format!("path '{path}' does not exist in '{rev}'")))
+        .ok_or_else(|| GitError::not_found(format!("path '{path}' does not exist in '{rev}'")))
 }
 
 /// Walk `path` within the tree `tree_oid`, returning the id of the entry it
@@ -1205,7 +1205,7 @@ fn resolve_index_path(
     let bytes = match fs::read(&index_path) {
         Ok(bytes) => bytes,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(GitError::NotFound(format!(
+            return Err(GitError::not_found(format!(
                 "path '{path}' is not in the index"
             )));
         }
@@ -1223,11 +1223,11 @@ fn resolve_index_path(
         }
     }
     if path_exists {
-        Err(GitError::NotFound(format!(
+        Err(GitError::not_found(format!(
             "path '{path}' is in the index, but not at stage {stage}"
         )))
     } else {
-        Err(GitError::NotFound(format!(
+        Err(GitError::not_found(format!(
             "path '{path}' is not in the index"
         )))
     }
@@ -1301,7 +1301,7 @@ fn search_commit_message_all<R: ObjectReader>(
         }
     }
     best.map(|(_, oid)| oid)
-        .ok_or_else(|| GitError::NotFound(format!("no commit matching ':/{text}'")))
+        .ok_or_else(|| GitError::not_found(format!("no commit matching ':/{text}'")))
 }
 
 /// `<rev>^{/text}` — first commit reachable from `base` along the first-parent
@@ -1340,7 +1340,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
             None => commit.parents.into_iter().next(),
         };
     }
-    Err(GitError::NotFound(format!(
+    Err(GitError::not_found(format!(
         "no commit matching '^{{/{text}}}' in first-parent history"
     )))
 }
@@ -2011,7 +2011,7 @@ mod tests {
         struct MissingReader;
         impl ObjectReader for MissingReader {
             fn read_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<EncodedObject>> {
-                Err(GitError::NotFound(format!(
+                Err(GitError::not_found(format!(
                     "object reader should not be used for {oid}"
                 )))
             }
@@ -2291,7 +2291,7 @@ mod tests {
         )
         .expect_err("test operation should fail");
         assert!(
-            matches!(&missing, GitError::NotFound(msg) if msg.contains("does not exist")),
+            matches!(&missing, GitError::NotFound(kind) if kind.to_string().contains("does not exist")),
             "unexpected error: {missing:?}"
         );
 
@@ -2305,7 +2305,7 @@ mod tests {
         )
         .expect_err("test operation should fail");
         assert!(
-            matches!(&not_tree, GitError::NotFound(msg) if msg.contains("does not exist")),
+            matches!(&not_tree, GitError::NotFound(kind) if kind.to_string().contains("does not exist")),
             "unexpected error: {not_tree:?}"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
@@ -2372,7 +2372,7 @@ mod tests {
         )
         .expect_err("test operation should fail");
         assert!(
-            matches!(&wrong_stage, GitError::NotFound(msg) if msg.contains("not at stage 1")),
+            matches!(&wrong_stage, GitError::NotFound(kind) if kind.to_string().contains("not at stage 1")),
             "unexpected error: {wrong_stage:?}"
         );
         // Unknown path reports "not in the index".
@@ -2384,7 +2384,7 @@ mod tests {
         )
         .expect_err("test operation should fail");
         assert!(
-            matches!(&unknown, GitError::NotFound(msg) if msg.contains("not in the index")),
+            matches!(&unknown, GitError::NotFound(kind) if kind.to_string().contains("not in the index")),
             "unexpected error: {unknown:?}"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
@@ -2763,7 +2763,7 @@ mod tests {
         let err = resolve_revision(&git_dir, ObjectFormat::Sha1, "@{5}")
             .expect_err("test operation should fail");
         assert!(
-            matches!(&err, GitError::NotFound(msg) if msg.contains("only has 3 entries")),
+            matches!(&err, GitError::NotFound(kind) if kind.to_string().contains("only has 3 entries")),
             "unexpected error: {err:?}"
         );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
@@ -3119,7 +3119,7 @@ mod tests {
     struct PanicReader;
     impl ObjectReader for PanicReader {
         fn read_object(&self, oid: &ObjectId) -> Result<std::sync::Arc<EncodedObject>> {
-            Err(GitError::NotFound(format!(
+            Err(GitError::not_found(format!(
                 "object reader must not be used for {oid}; graph should cover it"
             )))
         }

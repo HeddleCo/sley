@@ -49,8 +49,14 @@ static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
 
 mod commands;
+mod remote;
 mod repo_path;
 mod repository;
+
+use crate::remote::{
+    remote_config_values, resolve_remote_fetch_url, resolve_remote_push_url,
+    rewrite_url_with_config,
+};
 pub(crate) use commands::args::{GitArgCursor, long_option_value};
 pub(crate) use commands::cat_file::{cat_file_all_object_ids, cat_file_object_storage};
 use commands::tag::{parse_tag_trailer, tag_message_with_trailers, tag_stripspace_message};
@@ -4250,9 +4256,10 @@ fn map_clone_missing_branch(
     origin: &str,
 ) -> Result<sley_remote::CloneOutcome> {
     match outcome {
-        Err(GitError::NotFound(message))
+        Err(GitError::NotFound(kind))
             if branch_explicit
-                && message == format!("remote ref refs/remotes/{origin}/{checkout_branch}") =>
+                && kind.to_string()
+                    == format!("remote ref refs/remotes/{origin}/{checkout_branch}") =>
         {
             eprintln!("fatal: Remote branch {checkout_branch} not found in upstream {origin}");
             Err(GitError::Exit(128))
@@ -4838,8 +4845,8 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
         Some(RefTarget::Symbolic(target)) => target
             .strip_prefix("refs/heads/")
             .map(str::to_string)
-            .ok_or_else(|| GitError::NotFound("remote HEAD branch".into())),
-        Some(RefTarget::Direct(_)) | None => Err(GitError::NotFound("remote HEAD branch".into())),
+            .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
+        Some(RefTarget::Direct(_)) | None => Err(GitError::reference_not_found("remote HEAD branch")),
     }
 }
 
@@ -7125,7 +7132,7 @@ fn rebase_in_progress(git_dir: &Path) -> bool {
 fn read_rebase_merge_file(git_dir: &Path, name: &str) -> Result<String> {
     let path = rebase_merge_dir(git_dir).join(name);
     if !path.is_file() {
-        return Err(GitError::NotFound(format!(
+        return Err(GitError::not_found(format!(
             "rebase-merge/{name} missing"
         )));
     }
@@ -7934,12 +7941,12 @@ fn resolve_pull_remote_and_refspecs(
 
 fn fetch_head_merge_record(git_dir: &Path, format: ObjectFormat) -> Result<FetchHeadRecord> {
     let path = git_dir.join("FETCH_HEAD");
-    let mut input = fs::File::open(path).map_err(|_| GitError::NotFound("FETCH_HEAD".into()))?;
+    let mut input = fs::File::open(path).map_err(|_| GitError::reference_not_found("FETCH_HEAD"))?;
     let records = read_fetch_head(format, &mut input)?;
     records
         .into_iter()
         .find(|record| !record.not_for_merge)
-        .ok_or_else(|| GitError::NotFound("FETCH_HEAD".into()))
+        .ok_or_else(|| GitError::reference_not_found("FETCH_HEAD"))
 }
 
 fn resolve_fetch_head_revision(git_dir: &Path, format: ObjectFormat) -> Result<ObjectId> {
@@ -9416,11 +9423,11 @@ fn replace_create(
     let object_type = db
         .read_object_header(&object_oid)?
         .map(|(object_type, _)| object_type)
-        .ok_or_else(|| GitError::NotFound(format!("object {object_oid}")))?;
+        .ok_or_else(|| GitError::object_not_found(object_oid))?;
     let replacement_type = db
         .read_object_header(&replacement_oid)?
         .map(|(object_type, _)| object_type)
-        .ok_or_else(|| GitError::NotFound(format!("object {replacement_oid}")))?;
+        .ok_or_else(|| GitError::object_not_found(replacement_oid))?;
     if object_type != replacement_type {
         eprintln!("error: Objects must be of the same type.");
         eprintln!(
@@ -12517,18 +12524,7 @@ fn push_remote_is_ssh(remote: &str) -> Result<bool> {
 fn push_resolved_url(remote: &str) -> Result<String> {
     if let Ok(git_dir) = discover_git_dir(&env::current_dir()?) {
         let config = read_repo_config(&git_dir)?;
-        let configured = remote_config_values(&config, remote, "pushurl")
-            .into_iter()
-            .next()
-            .or_else(|| {
-                remote_config_values(&config, remote, "url")
-                    .into_iter()
-                    .next()
-            });
-        if let Some(url) = configured {
-            return Ok(rewrite_url_with_config(&config, &url, true));
-        }
-        return Ok(rewrite_url_with_config(&config, remote, true));
+        return Ok(resolve_remote_push_url(&config, remote));
     }
     Ok(remote.to_string())
 }
@@ -13059,21 +13055,13 @@ fn ls_remote_ssh_records(
 
 fn ls_remote_resolved_url(repository: &str) -> Result<String> {
     let cwd = env::current_dir()?;
-    let config = discover_git_dir(&cwd)
+    if let Some(config) = discover_git_dir(&cwd)
         .ok()
-        .and_then(|git_dir| read_repo_config(&git_dir).ok());
-    let url = config
-        .as_ref()
-        .and_then(|config| {
-            remote_config_values(config, repository, "url")
-                .into_iter()
-                .next()
-        })
-        .unwrap_or_else(|| repository.to_string());
-    Ok(config
-        .as_ref()
-        .map(|config| rewrite_url_with_config(config, &url, false))
-        .unwrap_or(url))
+        .and_then(|git_dir| read_repo_config(&git_dir).ok())
+    {
+        return Ok(resolve_remote_fetch_url(&config, repository));
+    }
+    Ok(repository.to_string())
 }
 
 fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
@@ -13507,7 +13495,7 @@ fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
     if chain_path.exists() {
         return verify_split_commit_graph_chain(&chain_path, format);
     }
-    Err(GitError::NotFound("commit-graph".into()))
+    Err(GitError::not_found("commit-graph"))
 }
 
 fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> Result<()> {
@@ -14338,9 +14326,16 @@ fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<Git
             Err(GitError::Io(_)) | Err(GitError::NotFound(_)) if action != ConfigAction::List => {
                 Ok(GitConfig::default())
             }
-            Err(GitError::Io(err)) | Err(GitError::NotFound(err)) => {
+            Err(GitError::Io(err)) => {
                 eprintln!(
                     "fatal: unable to read config file '{}': {err}",
+                    path.display()
+                );
+                Err(GitError::Exit(128))
+            }
+            Err(GitError::NotFound(kind)) => {
+                eprintln!(
+                    "fatal: unable to read config file '{}': {kind}",
                     path.display()
                 );
                 Err(GitError::Exit(128))
@@ -15590,7 +15585,7 @@ fn cmd_remote_add(args: &[String]) -> Result<()> {
             return Err(GitError::Command(format!("remote {name} already exists")));
         }
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
-            return Err(GitError::NotFound(format!("remote {name}")));
+            return Err(GitError::remote_not_found(name));
         }
     }
     write_repo_config(&git_dir, &config)?;
@@ -15658,7 +15653,7 @@ fn cmd_remote_get_url(args: &[String]) -> Result<()> {
         urls = remote_config_values(&config, name, "url");
     }
     if urls.is_empty() {
-        return Err(GitError::NotFound(format!("remote {name}")));
+        return Err(GitError::remote_not_found(name));
     }
     let urls = urls
         .into_iter()
@@ -15686,7 +15681,7 @@ fn cmd_remote_remove(args: &[String]) -> Result<()> {
     match sley_config::remotes::remove_remote(&mut config, name) {
         Ok(()) => {}
         Err(sley_config::remotes::RemoteEditError::NotFound) => {
-            return Err(GitError::NotFound(format!("remote {name}")));
+            return Err(GitError::remote_not_found(name));
         }
         Err(sley_config::remotes::RemoteEditError::AlreadyExists) => {
             return Err(GitError::Command(format!("remote {name} already exists")));
@@ -15788,7 +15783,7 @@ fn cmd_remote_rename(args: &[String]) -> Result<()> {
         }
     }
     if !renamed {
-        return Err(GitError::NotFound(format!("remote {old}")));
+        return Err(GitError::remote_not_found(old));
     }
     write_repo_config(&git_dir, &config)?;
     let format = repository_object_format(&git_dir)?;
@@ -15986,7 +15981,7 @@ fn cmd_remote_set_branches(args: &[String]) -> Result<()> {
             section.name == "remote" && section.subsection.as_deref() == Some(name)
         })
     else {
-        return Err(GitError::NotFound(format!("remote {name}")));
+        return Err(GitError::remote_not_found(name));
     };
     if !add {
         section
@@ -16040,7 +16035,7 @@ fn cmd_remote_set_head(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let config = read_repo_config(&git_dir)?;
     if !remote_exists(&config, name) {
-        return Err(GitError::NotFound(format!("remote {name}")));
+        return Err(GitError::remote_not_found(name));
     }
     let format = repository_object_format(&git_dir)?;
     let store = FileRefStore::new(&git_dir, format);
@@ -16087,7 +16082,7 @@ fn cmd_remote_set_head(args: &[String]) -> Result<()> {
     validate_remote_branch_name(branch)?;
     let target = format!("refs/remotes/{name}/{branch}");
     if store.read_ref(&target)?.is_none() {
-        return Err(GitError::NotFound(format!("remote ref {target}")));
+        return Err(GitError::reference_not_found(format!("remote ref {target}")));
     }
     let mut tx = store.transaction();
     tx.update(RefUpdate {
@@ -16118,8 +16113,8 @@ fn discover_local_remote_head_branch(
         Some(RefTarget::Symbolic(target)) => target
             .strip_prefix("refs/heads/")
             .map(str::to_string)
-            .ok_or_else(|| GitError::NotFound("remote HEAD branch".into())),
-        Some(RefTarget::Direct(_)) | None => Err(GitError::NotFound("remote HEAD branch".into())),
+            .ok_or_else(|| GitError::reference_not_found("remote HEAD branch")),
+        Some(RefTarget::Direct(_)) | None => Err(GitError::reference_not_found("remote HEAD branch")),
     }
 }
 
@@ -16127,7 +16122,7 @@ fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Resul
     let url = remote_config_values(config, name, "url")
         .into_iter()
         .next()
-        .ok_or_else(|| GitError::NotFound(format!("remote {name} url")))?;
+        .ok_or_else(|| GitError::not_found(format!("remote {name} url")))?;
     let url = rewrite_url_with_config(config, &url, false);
     let parsed = parse_remote_url(&url)?;
     let remote_path = match parsed.transport {
@@ -16223,7 +16218,7 @@ fn cmd_remote_set_url(args: &[String]) -> Result<()> {
     match sley_config::remotes::set_url(&mut config, name, kind, op) {
         Ok(()) => write_repo_config(&git_dir, &config),
         Err(sley_config::remotes::SetUrlError::RemoteNotFound) => {
-            Err(GitError::NotFound(format!("remote {name}")))
+            Err(GitError::remote_not_found(name))
         }
         Err(sley_config::remotes::SetUrlError::NoMatch) => {
             // Only reachable for the `<oldurl>` (replace) form.
@@ -16605,63 +16600,6 @@ fn remote_names(config: &GitConfig) -> Vec<String> {
 
 fn remote_exists(config: &GitConfig, name: &str) -> bool {
     sley_config::remotes::remote_exists(config, name)
-}
-
-fn remote_config_values(config: &GitConfig, name: &str, key: &str) -> Vec<String> {
-    config
-        .sections
-        .iter()
-        .filter(|section| section.name == "remote" && section.subsection.as_deref() == Some(name))
-        .flat_map(|section| {
-            section
-                .entries
-                .iter()
-                .filter(move |entry| entry.key.eq_ignore_ascii_case(key))
-                .filter_map(|entry| entry.value.clone())
-        })
-        .collect()
-}
-
-fn rewrite_url_with_config(config: &GitConfig, url: &str, push: bool) -> String {
-    let mut best: Option<(&str, &str, u8)> = None;
-    for section in &config.sections {
-        if section.name != "url" {
-            continue;
-        }
-        let Some(base) = section.subsection.as_deref() else {
-            continue;
-        };
-        for entry in &section.entries {
-            let priority = if push && entry.key.eq_ignore_ascii_case("pushInsteadOf") {
-                2
-            } else if entry.key.eq_ignore_ascii_case("insteadOf") {
-                1
-            } else {
-                continue;
-            };
-            let Some(prefix) = entry.value.as_deref() else {
-                continue;
-            };
-            if !url.starts_with(prefix) {
-                continue;
-            }
-            let replace = match best {
-                None => true,
-                Some((_, best_prefix, best_priority)) => {
-                    priority > best_priority
-                        || (priority == best_priority && prefix.len() > best_prefix.len())
-                }
-            };
-            if replace {
-                best = Some((base, prefix, priority));
-            }
-        }
-    }
-    if let Some((base, prefix, _)) = best {
-        format!("{base}{}", &url[prefix.len()..])
-    } else {
-        url.to_string()
-    }
 }
 
 fn remote_branch_fetch_refspec(remote: &str, branch: &str) -> String {
@@ -32306,7 +32244,7 @@ fn rev_parse_abbrev_ref(git_dir: &Path, format: ObjectFormat, rev: &str) -> Resu
     if rev == "HEAD" {
         return store
             .current_branch()?
-            .ok_or_else(|| GitError::NotFound("symbolic HEAD".into()));
+            .ok_or_else(|| GitError::reference_not_found("symbolic HEAD"));
     }
     if let Some(name) = rev.strip_prefix("refs/heads/")
         && store.read_ref(rev)?.is_some()
@@ -32324,7 +32262,7 @@ fn rev_parse_abbrev_ref(git_dir: &Path, format: ObjectFormat, rev: &str) -> Resu
     if store.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
         return Ok(rev.into());
     }
-    Err(GitError::NotFound(format!("revision {rev}")))
+    Err(GitError::not_found(format!("revision {rev}")))
 }
 
 fn rev_parse_symbolic_full_name(
@@ -32350,7 +32288,7 @@ fn rev_parse_symbolic_full_name(
     if store.read_ref(&tag)?.is_some() {
         return Ok(Some(tag));
     }
-    Err(GitError::NotFound(format!("revision {rev}")))
+    Err(GitError::not_found(format!("revision {rev}")))
 }
 
 fn worktree_prefix(cwd: &Path, git_dir: &Path) -> Result<String> {
@@ -34232,11 +34170,11 @@ fn submodule_head(submodule_root: &Path) -> Result<(PathBuf, ObjectId)> {
         dot_git
     } else if dot_git.is_file() {
         let Some(git_dir) = read_gitdir_file(&dot_git)? else {
-            return Err(GitError::NotFound("submodule gitdir".into()));
+            return Err(GitError::not_found("submodule gitdir"));
         };
         git_dir
     } else {
-        return Err(GitError::NotFound("submodule gitdir".into()));
+        return Err(GitError::not_found("submodule gitdir"));
     };
     let format = repository_object_format(&git_dir)?;
     let oid = sley_rev::resolve_revision(&git_dir, format, "HEAD")?;
@@ -36119,7 +36057,7 @@ fn resolve_cli_path(cwd: &Path, value: &str) -> PathBuf {
 fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
     if let Some(git_dir) = explicit_git_dir() {
         if git_dir.as_os_str().is_empty() {
-            return Err(GitError::NotFound("not a git repository".into()));
+            return Err(GitError::repository_not_found("not a git repository"));
         }
         return Ok(resolve_cli_path(
             start.as_ref(),
@@ -36131,7 +36069,7 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         if is_git_dir_candidate(&cwd) {
             return fs::canonicalize(&cwd).map_err(|err| GitError::Io(err.to_string()));
         }
-        return Err(GitError::NotFound("not a git repository".into()));
+        return Err(GitError::repository_not_found("not a git repository"));
     }
     for candidate in start.as_ref().ancestors() {
         let dot_git = candidate.join(".git");
@@ -36148,7 +36086,7 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
             return Ok(candidate.to_path_buf());
         }
     }
-    Err(GitError::NotFound("not a git repository".into()))
+    Err(GitError::repository_not_found("not a git repository"))
 }
 
 fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {

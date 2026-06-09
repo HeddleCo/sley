@@ -179,7 +179,7 @@ fn discover_git_dir(start: &Path) -> Result<PathBuf> {
             return Ok(candidate.to_path_buf());
         }
     }
-    Err(GitError::NotFound(format!(
+    Err(GitError::repository_not_found(format!(
         "not a git repository: {}",
         start.display()
     )))

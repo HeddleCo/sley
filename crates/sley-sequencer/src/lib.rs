@@ -151,7 +151,7 @@ fn commit_tree_with_amend(
     let (updated_ref, parent) = head_update_target(&refs)?;
     let commit_parents = if amend {
         let Some(parent) = &parent else {
-            return Err(GitError::NotFound("commit to amend".into()));
+            return Err(GitError::not_found("commit to amend"));
         };
         let db = FileObjectDatabase::from_git_dir(git_dir, format);
         let object = db.read_object(parent)?;
