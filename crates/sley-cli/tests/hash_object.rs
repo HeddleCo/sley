@@ -101,6 +101,39 @@ fn git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn hash_object_usage_and_option_errors_exit_like_upstream_git() {
+    let root = unique_temp_dir("hash-object-usage");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        run("git", &root, &["init", "-q"]);
+        let stdin = b"stdin\n";
+        for args in [
+            vec!["hash-object"],
+            vec!["hash-object", "--stdin", "--stdin"],
+            vec!["hash-object", "--stdin", "--stdin-paths"],
+            vec!["hash-object", "--object-format"],
+            vec!["hash-object", "--object-format="],
+            vec!["hash-object", "--bogus"],
+            vec!["hash-object", "-x"],
+            vec!["hash-object", "-t"],
+            vec!["hash-object", "--stdin=value", "--stdin"],
+            vec!["hash-object", "--path"],
+        ] {
+            let expected = run_output_with_stdin("git", &root, &args, stdin);
+            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, stdin);
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "sley exit status differed for {args:?}\nexpected stderr:\n{}\nactual stderr:\n{}",
+                String::from_utf8_lossy(&expected.stderr),
+                String::from_utf8_lossy(&actual.stderr)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn hash_object_git_object_directory_matches_upstream_git() {
     let root = unique_temp_dir("hash-object-git-object-directory");
     let expected = root.join("expected");

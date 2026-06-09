@@ -87,6 +87,38 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 #[test]
+fn cat_file_usage_and_option_errors_exit_like_upstream_git() {
+    let root = unique_temp_dir("cat-file-usage");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        git(&root, &["init", "-q"]);
+        for args in [
+            vec!["cat-file", "-e", "--batch"],
+            vec!["cat-file", "-p", "--batch-check"],
+            vec!["cat-file", "-t", "-s", "HEAD"],
+            vec!["cat-file", "-e"],
+            vec!["cat-file", "--batch", "HEAD"],
+            vec!["cat-file", "--path=x", "--batch"],
+            vec!["cat-file", "-e", "HEAD", "extra"],
+            vec!["cat-file", "--batch-all-objects", "-e"],
+            vec!["cat-file", "-z"],
+            vec!["cat-file", "--textconv=value", "HEAD"],
+        ] {
+            let expected = run_output_with_stdin("git", &root, &args, b"");
+            let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
+            assert_eq!(
+                actual.status.code(),
+                expected.status.code(),
+                "sley exit status differed for {args:?}\nexpected stderr:\n{}\nactual stderr:\n{}",
+                String::from_utf8_lossy(&expected.stderr),
+                String::from_utf8_lossy(&actual.stderr)
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn cat_file_reads_alternate_object_directories_like_upstream_git() {
     let root = unique_temp_dir("cat-file-alternates");
     let expected = root.join("expected");

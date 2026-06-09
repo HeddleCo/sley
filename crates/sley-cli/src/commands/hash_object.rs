@@ -116,9 +116,9 @@ impl HashObjectInvocation {
                     continue;
                 }
                 if let Some(value) = args.resolve_value_for(option, "object-format", || {
-                    GitError::Command("--object-format requires a value".into())
+                    switch_requires_value("object-format")
                 })? {
-                    invocation.set_format(value.value().parse()?);
+                    invocation.set_explicit_format(value.value())?;
                     continue;
                 }
                 match option.name() {
@@ -193,13 +193,11 @@ impl HashObjectInvocation {
                     "object-format" => {
                         let value = match option.value() {
                             Some(value) => value,
-                            None => args.next_required_value(|| {
-                                GitError::Command("--object-format requires a value".into())
-                            })?,
+                            None => args.next_required_value(|| switch_requires_value("object-format"))?,
                         };
-                        invocation.set_format(value.parse()?);
+                        invocation.set_explicit_format(value)?;
                     }
-                    _ => invocation.paths.push(PathBuf::from(arg)),
+                    other => return hash_object_unknown_long_option(other),
                 }
                 continue;
             }
@@ -212,6 +210,9 @@ impl HashObjectInvocation {
                     invocation.object_type = value[2..].parse()?;
                 }
                 "-w" => invocation.write = true,
+                value if value.starts_with('-') => {
+                    return hash_object_unknown_short_switch(value);
+                }
                 value => invocation.paths.push(PathBuf::from(value)),
             }
         }
@@ -219,9 +220,10 @@ impl HashObjectInvocation {
         Ok(invocation)
     }
 
-    fn set_format(&mut self, format: ObjectFormat) {
-        self.format = format;
+    fn set_explicit_format(&mut self, value: &str) -> Result<()> {
+        self.format = parse_hash_object_format(value)?;
         self.explicit_format = true;
+        Ok(())
     }
 
     fn enable_stdin(&mut self) -> Result<()> {
@@ -252,14 +254,6 @@ impl HashObjectInvocation {
         }
         if self.filters.disabled_path().is_some() {
             return usage_error("cannot use --path with --no-filters");
-        }
-        if !self.read_stdin && !self.read_stdin_paths && self.paths.is_empty() {
-            if self.allow_no_input {
-                return Ok(());
-            }
-            return Err(GitError::Command(
-                "hash-object requires --stdin or a path".into(),
-            ));
         }
         Ok(())
     }
@@ -519,6 +513,86 @@ fn validate_hash_object_body(
         ObjectType::Tree => validate_tree_body(format, body),
         ObjectType::Commit => Commit::parse(format, body).map(|_| ()),
         ObjectType::Tag => Tag::parse(format, body).map(|_| ()),
+    }
+}
+
+fn parse_hash_object_format(value: &str) -> Result<ObjectFormat> {
+    if value.is_empty() {
+        return usage_error("option `object-format' requires a value");
+    }
+    match value {
+        "sha1" => Ok(ObjectFormat::Sha1),
+        "sha256" => Ok(ObjectFormat::Sha256),
+        other => {
+            let message = format!("unknown option `object-format={other}'");
+            usage_error(&message)
+        }
+    }
+}
+
+fn hash_object_unknown_long_option<T>(option: &str) -> Result<T> {
+    eprintln!("error: unknown option `{option}'");
+    Err(GitError::Exit(129))
+}
+
+fn hash_object_unknown_short_switch<T>(option: &str) -> Result<T> {
+    let tail = option.trim_start_matches('-');
+    eprintln!("error: unknown switch `{tail}'");
+    Err(GitError::Exit(129))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_invocation_is_allowed() {
+        assert!(HashObjectInvocation::parse(&[]).is_ok());
+    }
+
+    #[test]
+    fn duplicate_stdin_is_exit_129() {
+        let args = vec!["--stdin".to_string(), "--stdin".to_string()];
+        assert!(matches!(
+            HashObjectInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
+    }
+
+    #[test]
+    fn unknown_long_option_is_exit_129() {
+        let args = vec!["--bogus".to_string()];
+        assert!(matches!(
+            HashObjectInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
+    }
+
+    #[test]
+    fn unknown_short_switch_is_exit_129() {
+        let args = vec!["-x".to_string()];
+        assert!(matches!(
+            HashObjectInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
+    }
+
+    #[test]
+    fn object_format_missing_value_is_exit_129() {
+        let args = vec!["--object-format".to_string()];
+        assert!(matches!(
+            HashObjectInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
+    }
+
+    #[test]
+    fn object_format_empty_value_is_exit_129() {
+        let args = vec!["--object-format=".to_string()];
+        assert!(matches!(
+            HashObjectInvocation::parse(&args),
+            Err(GitError::Exit(129))
+        ));
     }
 }
 
