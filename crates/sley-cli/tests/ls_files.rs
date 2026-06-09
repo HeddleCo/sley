@@ -709,6 +709,87 @@ fn ls_files_quoted_paths_match_upstream_git() {
 }
 
 #[test]
+fn ls_files_others_symlink_matches_upstream_git() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let root = unique_temp_dir("ls-files-symlink");
+        let upstream = root.join("upstream");
+        let rust = root.join("rust");
+        fs::create_dir_all(&upstream).expect("create upstream repo");
+        fs::create_dir_all(&rust).expect("create rust repo");
+        for repo in [&upstream, &rust] {
+            git(repo, &["init", "-q"]);
+            fs::write(repo.join("target.txt"), b"target\n").expect("write target");
+            symlink(repo.join("target.txt"), repo.join("path1")).expect("create symlink");
+        }
+
+        for args in [vec!["ls-files", "--others"], vec!["ls-files", "-o", "-z"]] {
+            let expected = git(&upstream, &args);
+            let actual = git_rs(&rust, &args);
+            assert_eq!(actual, expected, "sley output differed for {args:?}");
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[test]
+fn ls_files_others_nested_git_matches_upstream_git() {
+    let root = unique_temp_dir("ls-files-nested-git");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    for repo in [&upstream, &rust] {
+        git(repo, &["init", "-q"]);
+        fs::create_dir_all(repo.join("not-a-submodule")).expect("create nested dir");
+        fs::write(
+            repo.join("not-a-submodule").join("file.txt"),
+            b"inside\n",
+        )
+        .expect("write nested file");
+        git(&repo.join("not-a-submodule"), &["init", "-q"]);
+    }
+
+    for args in [
+        vec!["ls-files", "--others"],
+        vec!["ls-files", "--others", "not-a-submodule"],
+        vec!["ls-files", "-o", "-z", "not-a-submodule"],
+    ] {
+        let expected = git(&upstream, &args);
+        let actual = git_rs(&rust, &args);
+        assert_eq!(actual, expected, "sley output differed for {args:?}");
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn checkout_b_on_fresh_init_matches_upstream_git() {
+    let root = unique_temp_dir("checkout-fresh-init");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    git(&upstream, &["init", "-q"]);
+    git_rs(&rust, &["init", "-q"]);
+
+    for args in [
+        vec!["checkout", "-B", "main"],
+        vec!["checkout", "-b", "feature"],
+        vec!["checkout", "-q", "--orphan", "orphan"],
+    ] {
+        let expected = run_status("git", &upstream, &args);
+        let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
+        assert_eq!(
+            actual, expected,
+            "sley status/stdout/stderr differed for {args:?}"
+        );
+    }
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn ls_files_error_unmatch_matches_upstream_git() {
     let root = unique_temp_dir("ls-files-error-unmatch");
     fs::create_dir_all(&root).expect("create temp repo");

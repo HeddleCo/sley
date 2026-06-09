@@ -1353,16 +1353,32 @@ pub fn untracked_paths_with_options(
         )?;
         return Ok(paths.into_iter().collect());
     }
-    let mut paths = Vec::new();
-    for path in worktree_entries(worktree_root, git_dir, format)?.into_keys() {
-        if !index.contains_key(&path) {
-            if ignores.is_ignored(&path, false) {
-                continue;
-            }
-            paths.push(path);
+    let worktree = worktree_entries(worktree_root, git_dir, format)?;
+    Ok(ls_files_untracked_paths_from_worktree(&worktree, &index, &ignores))
+}
+
+/// Untracked paths for `ls-files --others` (without `--directory`): every
+/// untracked file is listed individually, except embedded-repository boundaries
+/// which are emitted as `dir/` to match git's non-submodule `.git` handling.
+fn ls_files_untracked_paths_from_worktree(
+    worktree: &BTreeMap<Vec<u8>, TrackedEntry>,
+    index: &BTreeMap<Vec<u8>, TrackedEntry>,
+    ignores: &IgnoreMatcher,
+) -> Vec<Vec<u8>> {
+    let mut paths = BTreeSet::new();
+    for (path, entry) in worktree {
+        if index.contains_key(path) || ignores.is_ignored(path, false) {
+            continue;
         }
+        if entry.mode == 0o040000 && entry.oid.is_null() {
+            let mut directory = path.clone();
+            directory.push(b'/');
+            paths.insert(directory);
+            continue;
+        }
+        paths.insert(path.clone());
     }
-    Ok(paths)
+    paths.into_iter().collect()
 }
 
 pub fn path_matches_standard_ignore(
@@ -1525,6 +1541,14 @@ fn collect_untracked_directory_paths(
             continue;
         }
         if metadata.is_dir() {
+            if is_nested_repository_boundary(&path) {
+                if !index_has_path_under(index, &git_path) {
+                    let mut directory = git_path;
+                    directory.push(b'/');
+                    paths.insert(directory);
+                }
+                continue;
+            }
             if !index_has_path_under(index, &git_path) {
                 if options.preserve_ignored_directories
                     && directory_has_ignored(&path, root, git_dir, ignores)?
@@ -1544,7 +1568,9 @@ fn collect_untracked_directory_paths(
                     root, git_dir, &path, index, ignores, options, paths,
                 )?;
             }
-        } else if metadata.is_file() && !index.contains_key(&git_path) {
+        } else if !index.contains_key(&git_path)
+            && (metadata.is_file() || metadata.file_type().is_symlink())
+        {
             paths.insert(git_path);
         }
     }
@@ -1575,7 +1601,17 @@ fn normal_untracked_paths_from_worktree(
 ) -> Vec<Vec<u8>> {
     let mut paths = BTreeSet::new();
     for (path, entry) in worktree {
-        if index.contains_key(path) || entry.mode == 0o040000 || ignores.is_ignored(path, false) {
+        if index.contains_key(path) || ignores.is_ignored(path, false) {
+            continue;
+        }
+        // Embedded-repository boundaries are listed as the directory itself (with
+        // a trailing slash), not by enumerating files inside the nested .git.
+        if entry.mode == 0o040000 {
+            if entry.oid.is_null() {
+                let mut directory = path.clone();
+                directory.push(b'/');
+                paths.insert(directory);
+            }
             continue;
         }
         paths.insert(untracked_normal_rollup_path(path, index, ignores));
@@ -1639,11 +1675,16 @@ fn directory_has_file(
         if ignores.is_ignored(&git_path, metadata.is_dir()) {
             continue;
         }
-        if metadata.is_file() {
+        if metadata.is_file() || metadata.file_type().is_symlink() {
             return Ok(true);
         }
-        if metadata.is_dir() && directory_has_file(&path, root, git_dir, ignores)? {
-            return Ok(true);
+        if metadata.is_dir() {
+            if is_nested_repository_boundary(&path) {
+                continue;
+            }
+            if directory_has_file(&path, root, git_dir, ignores)? {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -1734,6 +1775,9 @@ fn collect_ignored_untracked_paths(
         })?;
         let git_path = git_path_bytes(relative)?;
         if metadata.is_dir() {
+            if is_nested_repository_boundary(&path) {
+                continue;
+            }
             let ignored = parent_ignored || context.ignores.is_ignored(&git_path, true);
             if ignored && !index_has_path_under(context.index, &git_path) {
                 if context.directory {
@@ -1746,8 +1790,8 @@ fn collect_ignored_untracked_paths(
             } else {
                 collect_ignored_untracked_paths(context, &path, ignored, paths)?;
             }
-        } else if metadata.is_file()
-            && !context.index.contains_key(&git_path)
+        } else if !context.index.contains_key(&git_path)
+            && (metadata.is_file() || metadata.file_type().is_symlink())
             && (parent_ignored || context.ignores.is_ignored(&git_path, false))
         {
             paths.insert(git_path);
@@ -3577,22 +3621,29 @@ pub fn checkout_branch(
                 "checkout target branch must be direct".into(),
             ));
         }
-        None => return Err(GitError::reference_not_found(format!("branch {branch}"))),
+        None => {
+            checkout_switch_head_symbolic(&refs, branch_ref, committer, branch, None, None)?;
+            return Ok(CheckoutResult {
+                branch: branch.into(),
+                oid: ObjectId::null(format),
+                files: 0,
+            });
+        }
     };
-    let files = checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?;
-    let mut tx = refs.transaction();
-    tx.update(RefUpdate {
-        name: "HEAD".into(),
-        expected: None,
-        new: RefTarget::Symbolic(branch_ref),
-        reflog: Some(ReflogEntry {
-            old_oid: target,
-            new_oid: target,
-            committer,
-            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
-        }),
-    });
-    tx.commit()?;
+    let current_head = resolve_head_commit_oid(git_dir, format)?;
+    let files = if current_head == Some(target) {
+        0
+    } else {
+        checkout_commit_to_index_and_worktree(worktree_root, git_dir, format, &target)?
+    };
+    checkout_switch_head_symbolic(
+        &refs,
+        branch_ref,
+        committer,
+        branch,
+        Some(target),
+        Some(target),
+    )?;
     Ok(CheckoutResult {
         branch: branch.into(),
         oid: target,
@@ -3656,28 +3707,35 @@ pub fn checkout_branch_filtered(
                 "checkout target branch must be direct".into(),
             ));
         }
-        None => return Err(GitError::reference_not_found(format!("branch {branch}"))),
+        None => {
+            checkout_switch_head_symbolic(&refs, branch_ref, committer, branch, None, None)?;
+            return Ok(CheckoutResult {
+                branch: branch.into(),
+                oid: ObjectId::null(format),
+                files: 0,
+            });
+        }
     };
-    let files = checkout_commit_to_index_and_worktree_filtered(
-        worktree_root,
-        git_dir,
-        format,
-        &target,
-        Some(config),
+    let current_head = resolve_head_commit_oid(git_dir, format)?;
+    let files = if current_head == Some(target) {
+        0
+    } else {
+        checkout_commit_to_index_and_worktree_filtered(
+            worktree_root,
+            git_dir,
+            format,
+            &target,
+            Some(config),
+        )?
+    };
+    checkout_switch_head_symbolic(
+        &refs,
+        branch_ref,
+        committer,
+        branch,
+        Some(target),
+        Some(target),
     )?;
-    let mut tx = refs.transaction();
-    tx.update(RefUpdate {
-        name: "HEAD".into(),
-        expected: None,
-        new: RefTarget::Symbolic(branch_ref),
-        reflog: Some(ReflogEntry {
-            old_oid: target,
-            new_oid: target,
-            committer,
-            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
-        }),
-    });
-    tx.commit()?;
     Ok(CheckoutResult {
         branch: branch.into(),
         oid: target,
@@ -3748,7 +3806,10 @@ fn checkout_commit_to_index_and_worktree_filtered(
     smudge_config: Option<&GitConfig>,
 ) -> Result<usize> {
     let status = short_status(worktree_root, git_dir, format)?;
-    if !status.is_empty() {
+    if status
+        .iter()
+        .any(|entry| !status_entry_is_untracked_or_ignored(entry))
+    {
         return Err(GitError::Transaction(
             "checkout requires a clean working tree".into(),
         ));
@@ -5469,7 +5530,7 @@ impl IndexStatCache {
         worktree_metadata: &fs::Metadata,
     ) -> Option<TrackedEntry> {
         let entry = self.entries.get(git_path)?;
-        if entry.mode != file_mode(worktree_metadata) {
+        if entry.mode != worktree_entry_mode(worktree_metadata) {
             return None;
         }
         if !worktree_entry_is_uptodate(entry, worktree_metadata) {
@@ -5498,18 +5559,7 @@ fn resolve_head_tree_oid(
     format: ObjectFormat,
     db: &FileObjectDatabase,
 ) -> Result<Option<ObjectId>> {
-    let refs = FileRefStore::new(git_dir, format);
-    let Some(head) = refs.read_ref("HEAD")? else {
-        return Ok(None);
-    };
-    let commit_oid = match head {
-        RefTarget::Direct(oid) => Some(oid),
-        RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
-            Some(RefTarget::Direct(oid)) => Some(oid),
-            _ => None,
-        },
-    };
-    let Some(commit_oid) = commit_oid else {
+    let Some(commit_oid) = resolve_head_commit_oid(git_dir, format)? else {
         return Ok(None);
     };
     let object = db.read_object(&commit_oid)?;
@@ -5520,6 +5570,54 @@ fn resolve_head_tree_oid(
     }
     let commit = Commit::parse_ref(format, &object.body)?;
     Ok(Some(commit.tree))
+}
+
+fn resolve_head_commit_oid(git_dir: &Path, format: ObjectFormat) -> Result<Option<ObjectId>> {
+    let refs = FileRefStore::new(git_dir, format);
+    let Some(head) = refs.read_ref("HEAD")? else {
+        return Ok(None);
+    };
+    Ok(match head {
+        RefTarget::Direct(oid) => Some(oid),
+        RefTarget::Symbolic(name) => match refs.read_ref(&name)? {
+            Some(RefTarget::Direct(oid)) => Some(oid),
+            _ => None,
+        },
+    })
+}
+
+fn status_entry_is_untracked_or_ignored(entry: &ShortStatusEntry) -> bool {
+    matches!(
+        (entry.index, entry.worktree),
+        (b'?', b'?') | (b'!', b'!')
+    )
+}
+
+fn checkout_switch_head_symbolic(
+    refs: &FileRefStore,
+    branch_ref: String,
+    committer: Vec<u8>,
+    branch: &str,
+    old_oid: Option<ObjectId>,
+    new_oid: Option<ObjectId>,
+) -> Result<()> {
+    let mut tx = refs.transaction();
+    let reflog = match (old_oid, new_oid) {
+        (Some(old_oid), Some(new_oid)) => Some(ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
+        }),
+        _ => None,
+    };
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Symbolic(branch_ref),
+        reflog,
+    });
+    tx.commit()
 }
 
 fn cache_tree_is_valid(tree: &CacheTree) -> bool {
@@ -5782,18 +5880,34 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
             continue;
         }
         if metadata.is_dir() {
+            if is_nested_repository_boundary(&path) {
+                if let Some(tracked_paths) = context.tracked_paths
+                    && !tracked_paths_may_contain(tracked_paths, &git_path)
+                {
+                    continue;
+                }
+                context.entries.insert(
+                    git_path,
+                    TrackedEntry {
+                        mode: 0o040000,
+                        oid: ObjectId::null(context.format),
+                    },
+                );
+                continue;
+            }
             if let Some(tracked_paths) = context.tracked_paths
                 && !tracked_paths_may_contain(tracked_paths, &git_path)
             {
                 continue;
             }
             collect_worktree_entries(context, &path)?;
-        } else if metadata.is_file() {
+        } else if metadata.is_file() || metadata.file_type().is_symlink() {
             if let Some(tracked_paths) = context.tracked_paths
                 && !tracked_paths.contains(&git_path)
             {
                 continue;
             }
+            let entry_mode = worktree_entry_mode(&metadata);
             // git's racy-git stat shortcut: when the index's cached stat proves
             // this file is unchanged since it was staged, reuse the staged oid
             // and skip the read+filter+hash entirely. `reuse_tracked_entry`
@@ -5820,7 +5934,7 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
                 context.entries.insert(
                     git_path,
                     TrackedEntry {
-                        mode: file_mode(&metadata),
+                        mode: entry_mode,
                         oid: ObjectId::null(context.format),
                     },
                 );
@@ -5840,12 +5954,10 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
             context.entries.insert(
                 git_path,
                 TrackedEntry {
-                    mode: file_mode(&metadata),
+                    mode: entry_mode,
                     oid,
                 },
             );
-        } else if context.format == ObjectFormat::Sha1 {
-            continue;
         }
     }
     Ok(())
@@ -5874,6 +5986,22 @@ fn is_same_path(left: &Path, right: &Path) -> bool {
 fn is_worktree_dot_git(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root)
         .is_ok_and(|relative| relative == Path::new(".git"))
+}
+
+/// Whether `path` is a directory that contains its own `.git` file or directory,
+/// marking a nested-repository boundary that the worktree walk must not cross.
+fn is_nested_repository_boundary(path: &Path) -> bool {
+    path.join(".git").exists()
+}
+
+fn worktree_entry_mode(metadata: &fs::Metadata) -> u32 {
+    if metadata.file_type().is_symlink() {
+        0o120000
+    } else if metadata.is_dir() {
+        0o040000
+    } else {
+        file_mode(metadata)
+    }
 }
 
 fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
@@ -7164,6 +7292,68 @@ mod tests {
             "the worktree entry must have reused the planted bogus index oid, not the real hash"
         );
 
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn short_status_empty_on_unborn_repository() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        let status = short_status(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        assert!(
+            status.is_empty(),
+            "an unborn repository with an empty worktree must be clean, got {status:?}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn untracked_paths_skips_embedded_git_internals() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        let nested = root.join("not-a-submodule");
+        fs::create_dir_all(nested.join(".git")).expect("test operation should succeed");
+        fs::write(nested.join(".git/HEAD"), "ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        fs::write(nested.join("file.txt"), b"inside\n").expect("test operation should succeed");
+        let paths = untracked_paths(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        assert!(
+            paths.iter().any(|path| path.starts_with(b"not-a-submodule")),
+            "embedded repository directory should be listed, got {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|path| path.starts_with(b"not-a-submodule/.git")),
+            "embedded .git internals must not be listed, got {paths:?}"
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untracked_paths_lists_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n")
+            .expect("test operation should succeed");
+        fs::write(root.join("target.txt"), b"target\n").expect("test operation should succeed");
+        symlink(root.join("target.txt"), root.join("path1")).expect("create symlink");
+        let paths = untracked_paths(&root, &git_dir, ObjectFormat::Sha1)
+            .expect("test operation should succeed");
+        assert!(
+            paths.contains(&b"path1".to_vec()),
+            "untracked symlink must be listed, got {paths:?}"
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 }
