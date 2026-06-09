@@ -88,6 +88,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         "config" => cmd_config(&args[1..]),
         "count-objects" => cmd_count_objects(&args[1..]),
         "gc" => cmd_gc(&args[1..]),
+        "maintenance" => cmd_maintenance(&args[1..]),
         "repack" => cmd_repack(&args[1..]),
         "apply" => cmd_apply(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
@@ -5415,6 +5416,101 @@ fn cmd_gc(args: &[String]) -> Result<()> {
         sley_odb::install_repack_result(&common_git_dir, format, &result, true)?;
     }
     let _ = quiet;
+    Ok(())
+}
+
+fn cmd_maintenance(args: &[String]) -> Result<()> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        eprintln!("error: need a subcommand");
+        return maintenance_usage();
+    };
+    match subcommand {
+        "run" => cmd_maintenance_run(&args[1..]),
+        _ => {
+            eprintln!("error: unknown subcommand: `{subcommand}`");
+            maintenance_usage()
+        }
+    }
+}
+
+fn maintenance_usage<T>() -> Result<T> {
+    eprintln!("usage: git maintenance <subcommand> [<options>]");
+    Err(GitError::Exit(129))
+}
+
+fn maintenance_run_usage<T>() -> Result<T> {
+    eprintln!("usage: git maintenance run [--auto] [--[no-]quiet] [--task=<task>] [--schedule]");
+    eprintln!();
+    eprintln!("    --[no-]auto           run tasks based on the state of the repository");
+    eprintln!("    --[no-]detach         perform maintenance in the background");
+    eprintln!("    --[no-]schedule <frequency>");
+    eprintln!("                          run tasks based on frequency");
+    eprintln!("    --[no-]quiet          do not report progress or other information over stderr");
+    eprintln!("    --task <task>         run a specific task");
+    Err(GitError::Exit(129))
+}
+
+fn cmd_maintenance_run(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut tasks = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        match arg.as_str() {
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => {}
+            "--auto" | "--no-auto" | "--detach" | "--no-detach" => {}
+            "--schedule" => {
+                index += 1;
+                if args.get(index).is_none() {
+                    eprintln!("error: option `schedule' requires a value");
+                    return Err(GitError::Exit(129));
+                }
+            }
+            value if value.starts_with("--schedule=") => {}
+            "--task" => {
+                index += 1;
+                let Some(task) = args.get(index) else {
+                    eprintln!("error: option `task' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                tasks.push(task.clone());
+            }
+            value if let Some(task) = value.strip_prefix("--task=") => {
+                tasks.push(task.to_string());
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown option `{}`", value.trim_start_matches('-'));
+                return maintenance_run_usage();
+            }
+            _ => return maintenance_run_usage(),
+        }
+        index += 1;
+    }
+
+    let run_gc = if tasks.is_empty() {
+        true
+    } else {
+        let mut saw_gc = false;
+        for task in &tasks {
+            match task.as_str() {
+                "gc" | "all" => saw_gc = true,
+                other => {
+                    eprintln!("error: '{other}' is not a valid task");
+                    return Err(GitError::Exit(129));
+                }
+            }
+        }
+        saw_gc
+    };
+
+    if run_gc {
+        let mut gc_args = Vec::new();
+        if quiet {
+            gc_args.push("--quiet".to_string());
+        }
+        cmd_gc(&gc_args)?;
+    }
     Ok(())
 }
 

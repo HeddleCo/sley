@@ -60,6 +60,11 @@ Target: upstream Git 2.54.0.
   `--is-ancestor`, `--independent`, `--octopus`, and covered reflog-backed
   `--fork-point`, including ancestor inputs,
   no-common-history exit status, and ancestor-query exit status.
+- Minimal `maintenance run` support for covered small repositories, delegating
+  to `gc` (repack + prune packs) with accepted no-op flags `--quiet`,
+  `--task=all`, `--task=gc`, `--auto`, `--schedule`, `--detach`, and
+  `--no-detach`, plus usage errors for unknown subcommands, extra arguments,
+  and invalid task names.
 - Minimal read-only `reflog` / `reflog show` support for covered `HEAD`
   reflogs, including default oneline display, `--oneline`, `--format=%gs`,
   `--pretty=format:%gs`, `-<n>`, and `--max-count=<n>` output over the
@@ -1259,4 +1264,5 @@ Target: upstream Git 2.54.0.
   `git symbolic-ref`.
 - Reftable, broader commit-graph acceleration beyond parent suffixes and split
   graph writing, broader MIDX generation and maintenance integration, bitmaps, broader fetch/clone/push workflows, protocols, broader submodule workflows,
-  hooks, filters, and maintenance/gc are not implemented.
+  hooks, filters, and broader maintenance (start/stop/register/scheduled
+  tasks beyond `maintenance run` gc delegation) are not implemented.
