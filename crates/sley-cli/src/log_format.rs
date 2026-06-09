@@ -10,6 +10,7 @@ use sley_core::{GitError, Result};
 pub(crate) enum LogFormatDialect {
     Log,
     RevList,
+    Stash,
 }
 
 /// How much commit data a format needs to render.
@@ -141,6 +142,41 @@ pub(crate) enum FormatToken {
     GDateIso,
     GDateIsoStrict,
     GDateRfc2822,
+    /// `stash list` — `%d` when `stash@{0}`.
+    StashDecoParen,
+    /// `stash list` — `%D` when `stash@{0}`.
+    StashDecoBare,
+    /// `stash list` — `%gd`.
+    ReflogGd,
+    /// `stash list` — `%gD`.
+    ReflogGD,
+    /// `stash list` — `%gn` / `%gN`.
+    ReflogGn,
+    /// `stash list` — `%ge` / `%gE`.
+    ReflogGe,
+    /// `stash list` — `%gs` (reflog subject).
+    ReflogGs,
+}
+
+impl FormatToken {
+    pub(crate) fn is_metadata_emitable(&self) -> bool {
+        matches!(
+            self,
+            FormatToken::Literal(_)
+                | FormatToken::Percent
+                | FormatToken::OidFull
+                | FormatToken::OidAbbrev
+                | FormatToken::ParentsFull
+                | FormatToken::ParentsAbbrev
+                | FormatToken::Marker
+                | FormatToken::NoteName
+                | FormatToken::RevisionSource
+                | FormatToken::ColorParen
+                | FormatToken::ColorName(_)
+                | FormatToken::Newline
+                | FormatToken::HexByte(_)
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,15 +251,24 @@ impl CompiledLogFormat {
                     fields |= FormatFields::BODY;
                     tokens.push(FormatToken::FullMessage);
                 }
+                Some('d') if dialect == LogFormatDialect::Stash => {
+                    tokens.push(FormatToken::StashDecoParen);
+                }
                 Some('d') => {
                     fields |= FormatFields::DECORATIONS;
                     tokens.push(FormatToken::DecorationsParen);
+                }
+                Some('D') if dialect == LogFormatDialect::Stash => {
+                    tokens.push(FormatToken::StashDecoBare);
                 }
                 Some('D') => {
                     fields |= FormatFields::DECORATIONS;
                     tokens.push(FormatToken::DecorationsBare);
                 }
                 Some('G') => consume_g_placeholder(&mut chars, &mut tokens)?,
+                Some('g') if dialect == LogFormatDialect::Stash => {
+                    consume_stash_g_placeholder(&mut chars, &mut tokens)?;
+                }
                 Some('g') => consume_g_date_placeholder(&mut chars, &mut tokens)?,
                 Some('a') => consume_identity_placeholder(
                     &mut chars,
@@ -277,6 +322,14 @@ impl CompiledLogFormat {
         self.fields.contains(FormatFields::DECORATIONS)
     }
 
+    pub(crate) fn uses_parents(&self) -> bool {
+        self.fields.contains(FormatFields::PARENTS)
+    }
+
+    pub(crate) fn uses_oid(&self) -> bool {
+        self.fields.contains(FormatFields::OID)
+    }
+
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
     pub(crate) fn is_oid_only(&self) -> bool {
         self.tokens.iter().any(|token| *token == FormatToken::OidFull)
@@ -284,6 +337,31 @@ impl CompiledLogFormat {
                 .tokens
                 .iter()
                 .all(|token| matches!(token, FormatToken::Literal(_) | FormatToken::OidFull))
+    }
+
+    /// True when every token can be rendered from [`sley_rev::CommitMetadata`] alone.
+    pub(crate) fn is_metadata_emitable(&self) -> bool {
+        !self.tokens.is_empty() && self.tokens.iter().all(|t| t.is_metadata_emitable())
+    }
+
+    pub(crate) fn insert_parents_after_oid(&mut self) {
+        for index in 0..self.tokens.len() {
+            match self.tokens[index] {
+                FormatToken::OidFull => {
+                    self.tokens.insert(index + 1, FormatToken::Literal(" ".into()));
+                    self.tokens.insert(index + 2, FormatToken::ParentsFull);
+                    self.fields |= FormatFields::PARENTS;
+                    return;
+                }
+                FormatToken::OidAbbrev => {
+                    self.tokens.insert(index + 1, FormatToken::Literal(" ".into()));
+                    self.tokens.insert(index + 2, FormatToken::ParentsAbbrev);
+                    self.fields |= FormatFields::PARENTS;
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Pre-size a line buffer for one emission pass.
@@ -402,6 +480,31 @@ fn consume_g_placeholder(
     Ok(())
 }
 
+fn consume_stash_g_placeholder(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    tokens: &mut Vec<FormatToken>,
+) -> Result<()> {
+    let token = match chars.next() {
+        Some('d') => FormatToken::ReflogGd,
+        Some('D') => FormatToken::ReflogGD,
+        Some('n') | Some('N') => FormatToken::ReflogGn,
+        Some('e') | Some('E') => FormatToken::ReflogGe,
+        Some('s') => FormatToken::ReflogGs,
+        Some(other) => {
+            return Err(GitError::Command(format!(
+                "unsupported stash list format placeholder %g{other}"
+            )));
+        }
+        None => {
+            return Err(GitError::Command(
+                "unterminated stash list format placeholder %g".into(),
+            ));
+        }
+    };
+    tokens.push(token);
+    Ok(())
+}
+
 fn consume_g_date_placeholder(
     chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
     tokens: &mut Vec<FormatToken>,
@@ -475,6 +578,39 @@ fn consume_identity_placeholder(
     Ok(())
 }
 
+pub(crate) mod presets {
+    use super::{CompiledLogFormat, LogFormatDialect, Result};
+
+    /// `git log --oneline` / `--pretty=oneline` (%h/%H + optional %d + subject).
+    pub(crate) fn log_oneline(
+        decorate: bool,
+        full_oid: bool,
+        parents: bool,
+    ) -> Result<CompiledLogFormat> {
+        let spec = match (full_oid, decorate) {
+            (true, true) => "%H%d %s",
+            (true, false) => "%H %s",
+            (false, true) => "%h%d %s",
+            (false, false) => "%h %s",
+        };
+        let mut compiled = CompiledLogFormat::compile(spec, LogFormatDialect::Log)?;
+        if parents {
+            compiled.insert_parents_after_oid();
+        }
+        Ok(compiled)
+    }
+
+    /// Plain `rev-list` / `log --format=%H` oid listing.
+    pub(crate) fn oid_line() -> Result<CompiledLogFormat> {
+        CompiledLogFormat::compile("%H", LogFormatDialect::RevList)
+    }
+
+    /// `rev-list --oneline`.
+    pub(crate) fn rev_list_oneline() -> Result<CompiledLogFormat> {
+        CompiledLogFormat::compile("%h %s", LogFormatDialect::RevList)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +640,26 @@ mod tests {
     fn metadata_tier() {
         let compiled = CompiledLogFormat::compile("%H %P", LogFormatDialect::RevList).unwrap();
         assert_eq!(compiled.tier(), FormatTier::Metadata);
+        assert!(compiled.is_metadata_emitable());
+    }
+
+    #[test]
+    fn metadata_not_emitable_with_subject() {
+        let compiled = CompiledLogFormat::compile("%H %s", LogFormatDialect::Log).unwrap();
+        assert!(!compiled.is_metadata_emitable());
+    }
+
+    #[test]
+    fn log_oneline_preset_inserts_parents() {
+        let compiled = presets::log_oneline(false, false, true).unwrap();
+        assert!(compiled
+            .tokens
+            .windows(3)
+            .any(|w| {
+                matches!(w[0], FormatToken::OidAbbrev)
+                    && matches!(w[1], FormatToken::Literal(ref text) if text == " ")
+                    && matches!(w[2], FormatToken::ParentsAbbrev)
+            }));
     }
 
     #[test]

@@ -55,7 +55,7 @@ mod repo_path;
 mod repository;
 
 pub(crate) use log_format::{
-    CompiledLogFormat, FormatToken, LogFormatDialect, consume_log_format_color,
+    CompiledLogFormat, FormatToken, LogFormatDialect, presets,
 };
 
 
@@ -15193,6 +15193,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
     let mut max_count = None;
     let mut skip = 0usize;
     let mut output = LogOutput::Default;
+    let mut preset_oneline: Option<bool> = None;
     let mut reverse = false;
     let mut ordering = RevListOrdering::Default;
     let mut walk = true;
@@ -15919,8 +15920,8 @@ fn cmd_log(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-show-signature=") => {
                 return log_fatal_unrecognized_argument(value);
             }
-            "--oneline" => output = LogOutput::AbbrevOneline,
-            "--pretty=oneline" | "--format=oneline" => output = LogOutput::FullOneline,
+            "--oneline" => preset_oneline = Some(false),
+            "--pretty=oneline" | "--format=oneline" => preset_oneline = Some(true),
             "--pretty=short" | "--format=short" => output = LogOutput::Default,
             "-n" | "--max-count" => {
                 let value = iter
@@ -15947,21 +15948,25 @@ fn cmd_log(args: &[String]) -> Result<()> {
                 skip = parse_log_count(value)?;
             }
             value if value.starts_with("--format=") => {
-                output = LogOutput::Custom {
+                output = LogOutput::Compiled {
                     compiled: CompiledLogFormat::compile(
                         &value["--format=".len()..],
                         LogFormatDialect::Log,
                     )?,
                     final_newline: true,
+                    show_children: false,
+                    inline_children: false,
                 };
             }
             value if value.starts_with("--pretty=format:") => {
-                output = LogOutput::Custom {
+                output = LogOutput::Compiled {
                     compiled: CompiledLogFormat::compile(
                         &value["--pretty=format:".len()..],
                         LogFormatDialect::Log,
                     )?,
                     final_newline: false,
+                    show_children: false,
+                    inline_children: false,
                 };
             }
             value if value.starts_with("-n") && value.len() > 2 => {
@@ -16021,6 +16026,30 @@ fn cmd_log(args: &[String]) -> Result<()> {
     if show_parents && show_children {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
         return Err(GitError::Exit(128));
+    }
+    if let Some(pretty_oneline) = preset_oneline {
+        if matches!(output, LogOutput::Default) {
+            let use_full_oid = match pretty_oneline {
+                true => !abbrev_commit,
+                false => abbrev_len.is_none(),
+            };
+            output = LogOutput::Compiled {
+                compiled: presets::log_oneline(
+                    decoration != LogDecorationMode::Off,
+                    use_full_oid,
+                    show_parents,
+                )?,
+                final_newline: true,
+                show_children,
+                inline_children: true,
+            };
+        }
+    } else if let LogOutput::Compiled {
+        show_children: compiled_children,
+        ..
+    } = &mut output
+    {
+        *compiled_children = show_children;
     }
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
@@ -16162,9 +16191,9 @@ fn cmd_log(args: &[String]) -> Result<()> {
     }
     if walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
-        && matches!(&output, LogOutput::Custom { compiled, .. } if compiled.is_oid_only())
+        && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
+            if compiled.is_metadata_emitable() && compiled.uses_oid() && !compiled.uses_decorations())
         && decoration == LogDecorationMode::Off
-        && !show_parents
         && !show_children
         && author_filters.is_empty()
         && committer_filters.is_empty()
@@ -16203,9 +16232,28 @@ fn cmd_log(args: &[String]) -> Result<()> {
         if reverse {
             selected.reverse();
         }
+        let compiled = match &output {
+            LogOutput::Compiled { compiled, .. } => compiled,
+            _ => unreachable!("metadata fast path requires compiled output"),
+        };
         let mut stdout = io::stdout();
         for record in &selected {
-            writeln!(stdout, "{}", record.oid)?;
+            let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+            emit_compiled_log_format_metadata(
+                record,
+                compiled,
+                &LogFormatContext {
+                    abbrev_len,
+                    decorations: &HashMap::new(),
+                    marker: '>',
+                    dialect: LogFormatDialect::Log,
+                    source: log_format_source.as_deref(),
+                    date_mode,
+                },
+                &mut line,
+            )?;
+            stdout.write_all(&line)?;
+            stdout.write_all(b"\n")?;
         }
         stdout.flush()?;
         return Ok(());
@@ -16265,7 +16313,7 @@ fn cmd_log(args: &[String]) -> Result<()> {
         selected.reverse();
     }
     let custom_decoration_mode = match &output {
-        LogOutput::Custom { compiled, .. } if compiled.uses_decorations() => {
+        LogOutput::Compiled { compiled, .. } if compiled.uses_decorations() => {
             Some(if decoration == LogDecorationMode::Full {
                 LogDecorationMode::Full
             } else {
@@ -16304,51 +16352,34 @@ fn cmd_log(args: &[String]) -> Result<()> {
                     println!("    {line}");
                 }
             }
-            LogOutput::AbbrevOneline => {
-                print!("{}", format_log_oid(&record.oid, abbrev_len));
-                print_log_decorations(&record.oid, &decorations);
-                print_log_selected_parent_oids(record, show_parents, abbrev_len);
-                print_log_selected_child_oids(record, &child_oids, show_children, abbrev_len);
-                println!(" {}", commit_subject(&record.commit.message));
-            }
-            LogOutput::FullOneline => {
-                print!(
-                    "{}",
-                    format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
-                );
-                print_log_decorations(&record.oid, &decorations);
-                print_log_selected_parent_oids(
-                    record,
-                    show_parents,
-                    abbrev_commit.then_some(abbrev_len).flatten(),
-                );
-                print_log_selected_child_oids(
-                    record,
-                    &child_oids,
-                    show_children,
-                    abbrev_commit.then_some(abbrev_len).flatten(),
-                );
-                println!(" {}", commit_subject(&record.commit.message));
-            }
-            LogOutput::Custom {
+            LogOutput::Compiled {
                 ref compiled,
                 final_newline,
+                show_children: compiled_children,
+                inline_children,
             } => {
                 if index > 0 && !final_newline {
                     println!();
                 }
-                print_log_format(
-                    record,
-                    compiled,
-                    LogFormatContext {
+                let format_context = LogFormatContext {
+                    abbrev_len,
+                    decorations: &decorations,
+                    marker: '>',
+                    dialect: LogFormatDialect::Log,
+                    source: log_format_source.as_deref(),
+                    date_mode,
+                };
+                if compiled_children && inline_children {
+                    print_log_format_with_children(
+                        record,
+                        compiled,
+                        format_context,
+                        &child_oids,
                         abbrev_len,
-                        decorations: &decorations,
-                        marker: '>',
-                        dialect: LogFormatDialect::Log,
-                        source: log_format_source.as_deref(),
-                        date_mode,
-                    },
-                )?;
+                    )?;
+                } else {
+                    print_log_format(record, compiled, format_context)?;
+                }
                 if final_newline {
                     println!();
                 }
@@ -16845,6 +16876,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut read_stdin = false;
     let mut header = false;
     let mut pretty = RevListPretty::Default;
+    let mut preset_oneline = false;
     let mut ignore_missing = false;
     let mut author_patterns = Vec::new();
     let mut committer_patterns = Vec::new();
@@ -17111,25 +17143,27 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--stdin" => read_stdin = true,
             "--header" => header = true,
             "--oneline" => {
-                pretty = RevListPretty::Oneline;
+                preset_oneline = true;
                 abbrev_commit = true;
             }
-            "--pretty=oneline" | "--format=oneline" => pretty = RevListPretty::Oneline,
+            "--pretty=oneline" | "--format=oneline" => preset_oneline = true,
             "--pretty=short" | "--format=short" => pretty = RevListPretty::Short,
             value if value.starts_with("--format=") => {
-                pretty = RevListPretty::Custom {
+                pretty = RevListPretty::Compiled {
                     compiled: CompiledLogFormat::compile(
                         &value["--format=".len()..],
                         LogFormatDialect::RevList,
                     )?,
+                    commit_header: true,
                 };
             }
             value if value.starts_with("--pretty=format:") => {
-                pretty = RevListPretty::Custom {
+                pretty = RevListPretty::Compiled {
                     compiled: CompiledLogFormat::compile(
                         &value["--pretty=format:".len()..],
                         LogFormatDialect::RevList,
                     )?,
+                    commit_header: true,
                 };
             }
             value if value.starts_with("--abbrev=") => {
@@ -17316,6 +17350,16 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             "options '--parents' and '--children' cannot be used together".into(),
         ));
     }
+    if preset_oneline {
+        let mut compiled = presets::rev_list_oneline()?;
+        if parents {
+            compiled.insert_parents_after_oid();
+        }
+        pretty = RevListPretty::Compiled {
+            compiled,
+            commit_header: false,
+        };
+    }
     if nul_terminated && (left_right || objects_edge || header || pretty != RevListPretty::Default)
     {
         return Err(GitError::Command(
@@ -17450,9 +17494,19 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     // commit object) walks via the commit-graph and reads zero commit objects. Any
     // commit-body-dependent mode falls through to the full walk below. The guard is
     // a strict allowlist — only flags whose handling needs solely oid+parents+time.
+    let metadata_format = match &pretty {
+        RevListPretty::Compiled { compiled, .. }
+            if compiled.is_metadata_emitable()
+                && compiled.uses_oid()
+                && !compiled.uses_decorations() =>
+        {
+            Some(compiled)
+        }
+        _ => None,
+    };
     if walk_mode == RevListWalkMode::Walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
-        && matches!(pretty, RevListPretty::Default)
+        && (matches!(pretty, RevListPretty::Default) || metadata_format.is_some())
         && matches!(object_filter, RevListObjectFilter::None)
         && !objects
         && !objects_edge
@@ -17516,15 +17570,39 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             return Ok(());
         }
         let mut stdout = io::stdout();
+        let effective_abbrev_len = abbrev_commit.then_some(abbrev_len).flatten();
         for record in &selected {
-            write!(
-                stdout,
-                "{}",
-                format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
-            )?;
-            if parents {
-                for parent in &record.parents {
-                    write!(stdout, " {parent}")?;
+            if let Some(compiled) = metadata_format {
+                let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                emit_compiled_log_format_metadata(
+                    record,
+                    compiled,
+                    &LogFormatContext {
+                        abbrev_len: effective_abbrev_len,
+                        decorations: &HashMap::new(),
+                        marker: '>',
+                        dialect: LogFormatDialect::RevList,
+                        source: None,
+                        date_mode,
+                    },
+                    &mut line,
+                )?;
+                stdout.write_all(&line)?;
+                if parents && !compiled.uses_parents() {
+                    for parent in &record.parents {
+                        write!(stdout, " {parent}")?;
+                    }
+                }
+            } else {
+                write!(
+                    stdout,
+                    "{}",
+                    format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                )?;
+                if parents {
+                    for parent in &record.parents {
+                        write!(stdout, " {parent}")?;
+                    }
                 }
             }
             stdout.write_all(if nul_terminated { b"\0" } else { b"\n" })?;
@@ -17588,7 +17666,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         selected.reverse();
     }
     let decorations = match &pretty {
-        RevListPretty::Custom { compiled } if compiled.uses_decorations() => {
+        RevListPretty::Compiled { compiled, .. } if compiled.uses_decorations() => {
             log_decoration_map(&git_dir, &db, format, LogDecorationMode::Short)?
         }
         _ => HashMap::new(),
@@ -17697,7 +17775,18 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
         }
         let left_right_prefix = left_right_sides.get(&record.oid).copied().unwrap_or('>');
         match &pretty {
-            RevListPretty::Default | RevListPretty::Oneline => {
+            RevListPretty::Default
+            | RevListPretty::Compiled {
+                commit_header: false,
+                ..
+            } => {
+                let oneline = matches!(
+                    pretty,
+                    RevListPretty::Compiled {
+                        commit_header: false,
+                        ..
+                    }
+                );
                 if timestamp {
                     print!(
                         "{} ",
@@ -17707,29 +17796,59 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                 if left_right {
                     print!("{left_right_prefix}");
                 }
-                print!(
-                    "{}",
-                    format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
-                );
-                if parents {
-                    for parent in &record.parents {
-                        print!(" {parent}");
+                if oneline {
+                    let RevListPretty::Compiled { compiled, .. } = &pretty else {
+                        unreachable!("oneline requires compiled preset");
+                    };
+                    let format_context = LogFormatContext {
+                        abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
+                        decorations: &decorations,
+                        marker: left_right_prefix,
+                        dialect: LogFormatDialect::RevList,
+                        source: None,
+                        date_mode,
+                    };
+                    if children {
+                        print!(
+                            "{}",
+                            format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                        );
+                        if parents {
+                            for parent in &record.parents {
+                                print!(" {parent}");
+                            }
+                        }
+                        if let Some(children) = child_oids.get(&record.oid) {
+                            for child in children {
+                                print!(" {child}");
+                            }
+                        }
+                        print!(" {}", commit_subject(&record.commit.message));
+                    } else {
+                        print_log_format(record, compiled, format_context)?;
                     }
-                }
-                if children && let Some(children) = child_oids.get(&record.oid) {
-                    for child in children {
-                        print!(" {child}");
+                } else {
+                    print!(
+                        "{}",
+                        format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                    );
+                    if parents {
+                        for parent in &record.parents {
+                            print!(" {parent}");
+                        }
                     }
-                }
-                if pretty == RevListPretty::Oneline {
-                    print!(" {}", commit_subject(&record.commit.message));
+                    if children && let Some(children) = child_oids.get(&record.oid) {
+                        for child in children {
+                            print!(" {child}");
+                        }
+                    }
                 }
                 if nul_terminated {
                     print!("\0");
                 } else {
                     println!();
                 }
-                if header && pretty == RevListPretty::Default {
+                if header && !oneline {
                     write_rev_list_header(record)?;
                 }
             }
@@ -17741,7 +17860,10 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                 abbrev_len,
                 timestamp,
             )?,
-            RevListPretty::Custom { compiled } => {
+            RevListPretty::Compiled {
+                compiled,
+                commit_header: true,
+            } => {
                 write_rev_list_commit_header_line(
                     record,
                     left_right.then_some(left_right_prefix),
@@ -17793,9 +17915,13 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RevListPretty {
     Default,
-    Oneline,
     Short,
-    Custom { compiled: CompiledLogFormat },
+    /// `commit_header` is true for `--format=` / `--pretty=format:` (git prints a
+    /// leading `commit <oid>` line); false for `--oneline` presets.
+    Compiled {
+        compiled: CompiledLogFormat,
+        commit_header: bool,
+    },
 }
 
 fn write_rev_list_header(record: &sley_rev::CommitRecord) -> Result<()> {
@@ -17933,24 +18059,51 @@ fn write_rev_list_boundary_record(
         date_mode,
     } = options;
     match pretty {
-        RevListPretty::Default | RevListPretty::Oneline => {
+        RevListPretty::Default
+        | RevListPretty::Compiled {
+            commit_header: false,
+            ..
+        } => {
+            let oneline = matches!(
+                pretty,
+                RevListPretty::Compiled {
+                    commit_header: false,
+                    ..
+                }
+            );
             if timestamp {
                 print!(
                     "{} ",
                     commit_identity_timestamp_i64(&record.commit.committer)?
                 );
             }
-            print!(
-                "-{}",
-                format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
-            );
-            if parents {
-                for parent in &record.parents {
-                    print!(" {parent}");
+            if oneline {
+                let RevListPretty::Compiled { compiled, .. } = pretty else {
+                    unreachable!("oneline requires compiled preset");
+                };
+                print!("-");
+                print_log_format(
+                    record,
+                    compiled,
+                    LogFormatContext {
+                        abbrev_len: abbrev_commit.then_some(abbrev_len).flatten(),
+                        decorations,
+                        marker: '-',
+                        dialect: LogFormatDialect::RevList,
+                        source: None,
+                        date_mode,
+                    },
+                )?;
+            } else {
+                print!(
+                    "-{}",
+                    format_rev_list_oid(&record.oid, abbrev_commit, abbrev_len)
+                );
+                if parents {
+                    for parent in &record.parents {
+                        print!(" {parent}");
+                    }
                 }
-            }
-            if *pretty == RevListPretty::Oneline {
-                print!(" {}", commit_subject(&record.commit.message));
             }
             println!();
             Ok(())
@@ -17963,7 +18116,10 @@ fn write_rev_list_boundary_record(
             abbrev_len,
             timestamp,
         ),
-        RevListPretty::Custom { compiled } => {
+        RevListPretty::Compiled {
+            compiled,
+            commit_header: true,
+        } => {
             write_rev_list_commit_header_line(
                 record,
                 Some('-'),
@@ -18907,12 +19063,16 @@ fn rev_list_hidden_ref_pattern_matches(pattern: &str, refname: &str) -> bool {
 
 #[derive(Debug, Clone)]
 enum LogOutput {
+    /// `short`/`medium` structured layout.
     Default,
-    AbbrevOneline,
-    FullOneline,
-    Custom {
+    /// `--oneline`, `--pretty=oneline`, or `--format=` resolved to a compiled stream.
+    Compiled {
         compiled: CompiledLogFormat,
         final_newline: bool,
+        show_children: bool,
+        /// When true, `--children` oids are printed between the commit oid and subject
+        /// (oneline presets only; custom `--format=` ignores `--children`).
+        inline_children: bool,
     },
 }
 
@@ -19513,7 +19673,69 @@ fn print_log_format(
     context: LogFormatContext<'_>,
 ) -> Result<()> {
     let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
-    emit_compiled_log_format(record, compiled, &context, &mut line)?;
+    emit_compiled_log_format(record, compiled, &context, &mut line, 0..compiled.tokens.len())?;
+    io::stdout().write_all(&line)?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn print_log_format_with_children(
+    record: &sley_rev::CommitRecord,
+    compiled: &CompiledLogFormat,
+    context: LogFormatContext<'_>,
+    child_oids: &HashMap<ObjectId, Vec<ObjectId>>,
+    abbrev_len: Option<usize>,
+) -> Result<()> {
+    let subject_index = compiled.tokens.iter().position(|token| {
+        matches!(
+            token,
+            FormatToken::Subject | FormatToken::SanitizedSubject
+        )
+    });
+    let child_abbrev_len = if compiled
+        .tokens
+        .iter()
+        .any(|token| *token == FormatToken::OidFull)
+    {
+        None
+    } else {
+        abbrev_len
+    };
+    let Some(subject_index) = subject_index else {
+        print_log_format(record, compiled, context)?;
+        print_log_selected_child_oids(record, child_oids, true, child_abbrev_len);
+        return Ok(());
+    };
+    let mut pre_subject_end = subject_index;
+    while pre_subject_end > 0
+        && matches!(
+            compiled.tokens[pre_subject_end - 1],
+            FormatToken::Literal(ref text) if text.chars().all(char::is_whitespace)
+        )
+    {
+        pre_subject_end -= 1;
+    }
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_log_format(
+        record,
+        compiled,
+        &context,
+        &mut line,
+        0..pre_subject_end,
+    )?;
+    io::stdout().write_all(&line)?;
+    print_log_selected_child_oids(record, child_oids, true, child_abbrev_len);
+    if pre_subject_end < subject_index {
+        io::stdout().write_all(b" ")?;
+    }
+    line.clear();
+    emit_compiled_log_format(
+        record,
+        compiled,
+        &context,
+        &mut line,
+        subject_index..compiled.tokens.len(),
+    )?;
     io::stdout().write_all(&line)?;
     io::stdout().flush()?;
     Ok(())
@@ -19524,6 +19746,7 @@ fn emit_compiled_log_format(
     compiled: &CompiledLogFormat,
     context: &LogFormatContext<'_>,
     out: &mut Vec<u8>,
+    token_range: std::ops::Range<usize>,
 ) -> Result<()> {
     let LogFormatContext {
         abbrev_len,
@@ -19538,7 +19761,7 @@ fn emit_compiled_log_format(
     let author_timestamp = commit_identity_timestamp(&record.commit.author);
     let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
 
-    for token in &compiled.tokens {
+    for token in &compiled.tokens[token_range] {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
@@ -19704,9 +19927,381 @@ fn emit_compiled_log_format(
             }
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
+            FormatToken::StashDecoParen
+            | FormatToken::StashDecoBare
+            | FormatToken::ReflogGd
+            | FormatToken::ReflogGD
+            | FormatToken::ReflogGn
+            | FormatToken::ReflogGe
+            | FormatToken::ReflogGs => {}
         }
     }
     Ok(())
+}
+
+fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
+    parents
+        .iter()
+        .map(|oid| format_log_oid(oid, abbrev_len))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn emit_compiled_log_format_metadata(
+    record: &sley_rev::CommitMetadata,
+    compiled: &CompiledLogFormat,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let LogFormatContext {
+        abbrev_len,
+        marker,
+        dialect,
+        source,
+        ..
+    } = *context;
+
+    for token in &compiled.tokens {
+        match token {
+            FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
+            FormatToken::Percent => out.push(b'%'),
+            FormatToken::OidFull => write!(out, "{}", record.oid).map_err(io::Error::from)?,
+            FormatToken::OidAbbrev => {
+                write!(out, "{}", format_log_oid(&record.oid, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsFull => {
+                write!(out, "{}", format_metadata_parent_oids(&record.parents, None))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsAbbrev => {
+                write!(
+                    out,
+                    "{}",
+                    format_metadata_parent_oids(&record.parents, abbrev_len)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::Marker => out.push(marker as u8),
+            FormatToken::NoteName if dialect == LogFormatDialect::Log => {}
+            FormatToken::NoteName => out.extend_from_slice(b"%N"),
+            FormatToken::RevisionSource if dialect == LogFormatDialect::Log => {
+                if let Some(source) = source {
+                    out.extend_from_slice(source.as_bytes());
+                }
+            }
+            FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
+            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::GRefname => out.push(b'N'),
+            FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
+            FormatToken::GPlaceholder
+            | FormatToken::GSignature
+            | FormatToken::GKey
+            | FormatToken::GFingerprint
+            | FormatToken::GPassthrough
+            | FormatToken::GDate
+            | FormatToken::GDateShort
+            | FormatToken::GDateIso
+            | FormatToken::GDateIsoStrict
+            | FormatToken::GDateRfc2822 => {}
+            FormatToken::Newline => out.push(b'\n'),
+            FormatToken::HexByte(byte) => out.push(*byte),
+            FormatToken::StashDecoParen
+            | FormatToken::StashDecoBare
+            | FormatToken::ReflogGd
+            | FormatToken::ReflogGD
+            | FormatToken::ReflogGn
+            | FormatToken::ReflogGe
+            | FormatToken::ReflogGs
+            | FormatToken::TreeFull
+            | FormatToken::TreeAbbrev
+            | FormatToken::Subject
+            | FormatToken::SanitizedSubject
+            | FormatToken::Encoding
+            | FormatToken::Body
+            | FormatToken::FullMessage
+            | FormatToken::DecorationsParen
+            | FormatToken::DecorationsBare
+            | FormatToken::AuthorName
+            | FormatToken::AuthorEmail
+            | FormatToken::AuthorEmailLocal
+            | FormatToken::AuthorTimestamp
+            | FormatToken::AuthorDate
+            | FormatToken::AuthorDateIso
+            | FormatToken::AuthorDateIsoStrict
+            | FormatToken::AuthorDateShort
+            | FormatToken::AuthorDateRfc2822
+            | FormatToken::CommitterName
+            | FormatToken::CommitterEmail
+            | FormatToken::CommitterEmailLocal
+            | FormatToken::CommitterTimestamp
+            | FormatToken::CommitterDate
+            | FormatToken::CommitterDateIso
+            | FormatToken::CommitterDateIsoStrict
+            | FormatToken::CommitterDateShort
+            | FormatToken::CommitterDateRfc2822 => {}
+        }
+    }
+    Ok(())
+}
+
+pub(crate) struct StashFormatContext<'a> {
+    pub entry: &'a ReflogEntry,
+    pub index: usize,
+    pub commit: &'a Commit,
+    pub abbrev_len: Option<usize>,
+    pub date_mode: ForEachRefDateMode,
+    pub date_explicit: bool,
+}
+
+pub(crate) fn emit_compiled_stash_format(
+    compiled: &CompiledLogFormat,
+    context: &StashFormatContext<'_>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let StashFormatContext {
+        entry,
+        index,
+        commit,
+        abbrev_len,
+        date_mode,
+        date_explicit,
+    } = *context;
+    let (author_name, author_email) = commit_identity_name_email(&commit.author);
+    let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
+    let author_timestamp = commit_identity_timestamp(&commit.author);
+    let committer_timestamp = commit_identity_timestamp(&commit.committer);
+    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
+
+    for token in &compiled.tokens {
+        match token {
+            FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
+            FormatToken::Percent => out.push(b'%'),
+            FormatToken::OidFull => write!(out, "{}", entry.new_oid).map_err(io::Error::from)?,
+            FormatToken::OidAbbrev => {
+                write!(out, "{}", format_log_oid(&entry.new_oid, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::TreeFull => write!(out, "{}", commit.tree).map_err(io::Error::from)?,
+            FormatToken::TreeAbbrev => {
+                write!(out, "{}", format_log_oid(&commit.tree, abbrev_len))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsFull => {
+                write!(out, "{}", format_metadata_parent_oids(&commit.parents, None))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::ParentsAbbrev => {
+                write!(
+                    out,
+                    "{}",
+                    format_metadata_parent_oids(&commit.parents, abbrev_len)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::Marker => out.push(b'>'),
+            FormatToken::Subject => {
+                write!(out, "{}", commit_subject(&commit.message)).map_err(io::Error::from)?;
+            }
+            FormatToken::SanitizedSubject => {
+                write!(out, "{}", log_sanitized_subject(&commit.message))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::Encoding => {
+                write!(out, "{}", commit_encoding(commit)).map_err(io::Error::from)?;
+            }
+            FormatToken::NoteName => {}
+            FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
+            FormatToken::ColorParen | FormatToken::ColorName(_) => {}
+            FormatToken::Body => out.extend_from_slice(commit_body(&commit.message)),
+            FormatToken::FullMessage => out.extend_from_slice(&commit.message),
+            FormatToken::StashDecoParen if index == 0 => {
+                out.extend_from_slice(b" (refs/stash)");
+            }
+            FormatToken::StashDecoParen => {}
+            FormatToken::StashDecoBare if index == 0 => {
+                out.extend_from_slice(b"refs/stash");
+            }
+            FormatToken::StashDecoBare => {}
+            FormatToken::GRefname => out.push(b'N'),
+            FormatToken::GTrailers => out.extend_from_slice(b"undefined"),
+            FormatToken::GPlaceholder
+            | FormatToken::GSignature
+            | FormatToken::GKey
+            | FormatToken::GFingerprint
+            | FormatToken::GPassthrough
+            | FormatToken::GDate
+            | FormatToken::GDateShort
+            | FormatToken::GDateIso
+            | FormatToken::GDateIsoStrict
+            | FormatToken::GDateRfc2822 => {}
+            FormatToken::AuthorName => out.extend_from_slice(author_name.as_bytes()),
+            FormatToken::AuthorEmail => out.extend_from_slice(author_email.as_bytes()),
+            FormatToken::AuthorEmailLocal => {
+                write!(out, "{}", log_email_local_part(&author_email)).map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorTimestamp => out.extend_from_slice(author_timestamp.as_bytes()),
+            FormatToken::AuthorDate => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, date_mode)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateIso => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Iso)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateIsoStrict => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::IsoStrict)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateShort => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Short)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::AuthorDateRfc2822 => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterName => out.extend_from_slice(committer_name.as_bytes()),
+            FormatToken::CommitterEmail => out.extend_from_slice(committer_email.as_bytes()),
+            FormatToken::CommitterEmailLocal => {
+                write!(out, "{}", log_email_local_part(&committer_email))
+                    .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterTimestamp => {
+                out.extend_from_slice(committer_timestamp.as_bytes());
+            }
+            FormatToken::CommitterDate => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, date_mode)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateIso => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Iso)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateIsoStrict => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::IsoStrict)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateShort => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Short)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::CommitterDateRfc2822 => {
+                write!(
+                    out,
+                    "{}",
+                    commit_identity_date(&commit.committer, ForEachRefDateMode::Rfc2822)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::ReflogGd => {
+                write!(
+                    out,
+                    "{}",
+                    stash_list_reflog_selector("stash", index, entry, date_mode, date_explicit)
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::ReflogGD => {
+                write!(
+                    out,
+                    "{}",
+                    stash_list_reflog_selector(
+                        "refs/stash",
+                        index,
+                        entry,
+                        date_mode,
+                        date_explicit
+                    )
+                )
+                .map_err(io::Error::from)?;
+            }
+            FormatToken::ReflogGn => out.extend_from_slice(reflog_name.as_bytes()),
+            FormatToken::ReflogGe => out.extend_from_slice(reflog_email.as_bytes()),
+            FormatToken::ReflogGs => out.extend_from_slice(&entry.message),
+            FormatToken::DecorationsParen | FormatToken::DecorationsBare => {}
+            FormatToken::Newline => out.push(b'\n'),
+            FormatToken::HexByte(byte) => out.push(*byte),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn print_stash_compiled_format(
+    entry: &ReflogEntry,
+    index: usize,
+    commit: &Commit,
+    compiled: &CompiledLogFormat,
+    abbrev_len: Option<usize>,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+) -> Result<()> {
+    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+    emit_compiled_stash_format(
+        compiled,
+        &StashFormatContext {
+            entry,
+            index,
+            commit,
+            abbrev_len,
+            date_mode,
+            date_explicit,
+        },
+        &mut line,
+    )?;
+    io::stdout().write_all(&line)?;
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn stash_list_reflog_selector(
+    reference: &str,
+    index: usize,
+    entry: &ReflogEntry,
+    date_mode: ForEachRefDateMode,
+    date_explicit: bool,
+) -> String {
+    if date_explicit {
+        let date = commit_identity_date(&entry.committer, date_mode);
+        return format!("{reference}@{{{date}}}");
+    }
+    format!("{reference}@{{{index}}}")
 }
 
 fn format_log_format_decorations(

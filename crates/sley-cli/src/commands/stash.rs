@@ -33,7 +33,10 @@ struct StashListOptions {
 enum StashListFormat {
     Default,
     Oneline,
-    Custom { format: String, final_newline: bool },
+    Custom {
+        compiled: CompiledLogFormat,
+        final_newline: bool,
+    },
 }
 
 pub(crate) fn cmd_stash(args: &[String]) -> Result<()> {
@@ -2327,16 +2330,16 @@ fn cmd_stash_list(args: &[String]) -> Result<()> {
                 );
             }
             StashListFormat::Custom {
-                format: list_format,
+                compiled,
                 final_newline,
             } => {
                 let object = db.read_object(&entry.new_oid)?;
                 let commit = Commit::parse(format, &object.body)?;
-                print_stash_list_format(
+                print_stash_compiled_format(
                     entry,
                     *stash_index,
                     &commit,
-                    list_format,
+                    compiled,
                     options.abbrev_len,
                     options.date_mode,
                     options.date_explicit,
@@ -3164,218 +3167,14 @@ fn parse_stash_list_format(value: &str) -> Result<StashListFormat> {
     match value {
         "oneline" => Ok(StashListFormat::Oneline),
         value if let Some(format) = value.strip_prefix("format:") => Ok(StashListFormat::Custom {
-            format: format.to_string(),
+            compiled: CompiledLogFormat::compile(format, LogFormatDialect::Stash)?,
             final_newline: false,
         }),
         value => Ok(StashListFormat::Custom {
-            format: value.to_string(),
+            compiled: CompiledLogFormat::compile(value, LogFormatDialect::Stash)?,
             final_newline: true,
         }),
     }
-}
-
-fn print_stash_list_format(
-    entry: &ReflogEntry,
-    index: usize,
-    commit: &Commit,
-    format: &str,
-    abbrev_len: Option<usize>,
-    date_mode: ForEachRefDateMode,
-    date_explicit: bool,
-) -> Result<()> {
-    let (author_name, author_email) = commit_identity_name_email(&commit.author);
-    let (committer_name, committer_email) = commit_identity_name_email(&commit.committer);
-    let author_timestamp = commit_identity_timestamp(&commit.author);
-    let committer_timestamp = commit_identity_timestamp(&commit.committer);
-    let (reflog_name, reflog_email) = commit_identity_name_email(&entry.committer);
-    let mut chars = format.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '%' {
-            print!("{ch}");
-            continue;
-        }
-        match chars.next() {
-            Some('%') => print!("%"),
-            Some('n') => println!(),
-            Some('H') => print!("{}", entry.new_oid),
-            Some('h') => print!("{}", format_log_oid(&entry.new_oid, abbrev_len)),
-            Some('T') => print!("{}", commit.tree),
-            Some('t') => print!("{}", format_log_oid(&commit.tree, abbrev_len)),
-            Some('P') => print!("{}", format_commit_parent_oids(&commit.parents, None)),
-            Some('p') => print!("{}", format_commit_parent_oids(&commit.parents, abbrev_len)),
-            Some('m') => print!(">"),
-            Some('s') => print!("{}", commit_subject(&commit.message)),
-            Some('f') => print!("{}", log_sanitized_subject(&commit.message)),
-            Some('e') => print!("{}", commit_encoding(commit)),
-            Some('b') => io::stdout().write_all(commit_body(&commit.message))?,
-            Some('B') => io::stdout().write_all(&commit.message)?,
-            Some('d') if index == 0 => print!(" (refs/stash)"),
-            Some('d') => {}
-            Some('D') if index == 0 => print!("refs/stash"),
-            Some('D') => {}
-            Some('N') => {}
-            Some('S') => print!("%S"),
-            Some('G') => match chars.next() {
-                Some('?') => print!("N"),
-                Some('T') => print!("undefined"),
-                Some('G' | 'S' | 'K' | 'F' | 'P') => {}
-                Some(other) => {
-                    return Err(GitError::Unsupported(format!(
-                        "unsupported stash list format placeholder %G{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Unsupported(
-                        "unterminated stash list format placeholder %G".into(),
-                    ));
-                }
-            },
-            Some('a') => match chars.next() {
-                Some('n' | 'N') => print!("{author_name}"),
-                Some('e' | 'E') => print!("{author_email}"),
-                Some('l' | 'L') => print!("{}", log_email_local_part(&author_email)),
-                Some('t') => print!("{author_timestamp}"),
-                Some('d') => print!("{}", commit_identity_date(&commit.author, date_mode)),
-                Some('i') => print!(
-                    "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Iso)
-                ),
-                Some('I') => print!(
-                    "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::IsoStrict)
-                ),
-                Some('s') => print!(
-                    "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Short)
-                ),
-                Some('D') => print!(
-                    "{}",
-                    commit_identity_date(&commit.author, ForEachRefDateMode::Rfc2822)
-                ),
-                Some(other) => {
-                    return Err(GitError::Unsupported(format!(
-                        "unsupported stash list format placeholder %a{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Unsupported(
-                        "unterminated stash list format placeholder %a".into(),
-                    ));
-                }
-            },
-            Some('c') => match chars.next() {
-                Some('n' | 'N') => print!("{committer_name}"),
-                Some('e' | 'E') => print!("{committer_email}"),
-                Some('l' | 'L') => print!("{}", log_email_local_part(&committer_email)),
-                Some('t') => print!("{committer_timestamp}"),
-                Some('d') => print!("{}", commit_identity_date(&commit.committer, date_mode)),
-                Some('i') => print!(
-                    "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Iso)
-                ),
-                Some('I') => print!(
-                    "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::IsoStrict)
-                ),
-                Some('s') => print!(
-                    "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Short)
-                ),
-                Some('D') => print!(
-                    "{}",
-                    commit_identity_date(&commit.committer, ForEachRefDateMode::Rfc2822)
-                ),
-                Some(other) => {
-                    return Err(GitError::Unsupported(format!(
-                        "unsupported stash list format placeholder %c{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Unsupported(
-                        "unterminated stash list format placeholder %c".into(),
-                    ));
-                }
-            },
-            Some('g') => match chars.next() {
-                Some('d') => print!(
-                    "{}",
-                    stash_list_reflog_selector("stash", index, entry, date_mode, date_explicit)
-                ),
-                Some('D') => print!(
-                    "{}",
-                    stash_list_reflog_selector(
-                        "refs/stash",
-                        index,
-                        entry,
-                        date_mode,
-                        date_explicit
-                    )
-                ),
-                Some('n' | 'N') => print!("{reflog_name}"),
-                Some('e' | 'E') => print!("{reflog_email}"),
-                Some('s') => print!("{}", String::from_utf8_lossy(&entry.message)),
-                Some(other) => {
-                    return Err(GitError::Unsupported(format!(
-                        "unsupported stash list format placeholder %g{other}"
-                    )));
-                }
-                None => {
-                    return Err(GitError::Unsupported(
-                        "unterminated stash list format placeholder %g".into(),
-                    ));
-                }
-            },
-            Some('C') => consume_log_format_color(&mut chars)?,
-            Some('x') => {
-                let mut lookahead = chars.clone();
-                if let (Some(high), Some(low)) = (lookahead.next(), lookahead.next())
-                    && let (Some(high), Some(low)) = (high.to_digit(16), low.to_digit(16))
-                {
-                    chars = lookahead;
-                    io::stdout().write_all(&[((high << 4) | low) as u8])?;
-                } else {
-                    print!("%x");
-                }
-            }
-            Some(other) => {
-                return Err(GitError::Unsupported(format!(
-                    "unsupported stash list format placeholder %{other}"
-                )));
-            }
-            None => {
-                return Err(GitError::Unsupported(
-                    "unterminated stash list format placeholder %".into(),
-                ));
-            }
-        }
-    }
-    io::stdout().flush()?;
-    Ok(())
-}
-
-fn format_commit_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
-    parents
-        .iter()
-        .map(|oid| match abbrev_len {
-            Some(_) => format_log_oid(oid, abbrev_len),
-            None => oid.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn stash_list_reflog_selector(
-    reference: &str,
-    index: usize,
-    entry: &ReflogEntry,
-    date_mode: ForEachRefDateMode,
-    date_explicit: bool,
-) -> String {
-    if date_explicit {
-        let date = commit_identity_date(&entry.committer, date_mode);
-        return format!("{reference}@{{{date}}}");
-    }
-    format!("{reference}@{{{index}}}")
 }
 
 fn stash_list_grep_filters_match(entry: &ReflogEntry, options: &StashListOptions) -> bool {
