@@ -17458,6 +17458,7 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut objects = false;
     let mut objects_edge = false;
     let mut object_filter = RevListObjectFilter::None;
+    let mut filter_provided_objects = false;
     let mut boundary = false;
     let mut disk_usage = None;
     let mut object_names = true;
@@ -17701,6 +17702,10 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
                 objects_edge = true;
             }
             "--no-filter" => object_filter = RevListObjectFilter::None,
+            // Apply the object filter to the directly-provided tip objects too, not just the
+            // objects reached by the walk. For an `object:type` filter this means a provided
+            // commit tip is itself dropped when it is not the requested type.
+            "--filter-provided-objects" => filter_provided_objects = true,
             "--filter=blob:none" => object_filter = RevListObjectFilter::BlobNone,
             value if value.starts_with("--filter=tree:") => {
                 object_filter = RevListObjectFilter::TreeDepth(parse_rev_list_tree_depth(
@@ -18055,10 +18060,14 @@ fn cmd_rev_list(args: &[String]) -> Result<()> {
             }
         }
     }
-    let object_filter_tip_oids = if matches!(
-        object_filter,
-        RevListObjectFilter::ObjectType(ObjectType::Blob | ObjectType::Tree | ObjectType::Tag)
-    ) {
+    let object_filter_tip_oids = if !filter_provided_objects
+        && matches!(
+            object_filter,
+            RevListObjectFilter::ObjectType(ObjectType::Blob | ObjectType::Tree | ObjectType::Tag)
+        ) {
+        // Without `--filter-provided-objects`, a directly-provided commit tip is emitted even
+        // when an `object:type` filter would otherwise exclude it; with the flag it is filtered
+        // like any other object (an empty exemption set).
         include_commits.iter().cloned().collect::<HashSet<_>>()
     } else {
         HashSet::new()
@@ -18785,10 +18794,36 @@ fn rev_list_selected_tag_objects(
 }
 
 fn parse_rev_list_blob_limit(value: &str) -> Result<usize> {
-    value.parse::<usize>().map_err(|_| {
-        eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
-        GitError::Exit(128)
-    })
+    // `blob:limit=<n>` accepts a `git_parse_ulong` value: base-0 with an optional
+    // case-insensitive k/m/g (1024-scaled) suffix, matching upstream's filter-spec parser.
+    git_parse_blob_limit(value)
+        .and_then(|limit| usize::try_from(limit).ok())
+        .ok_or_else(|| {
+            eprintln!("fatal: invalid filter-spec 'blob:limit={value}'");
+            GitError::Exit(128)
+        })
+}
+
+/// `git_parse_ulong` for `blob:limit`: a base-0 integer (decimal, `0x` hex, leading-`0` octal)
+/// with an optional case-insensitive `k`/`m`/`g` suffix scaling by 1024/1024²/1024³.
+fn git_parse_blob_limit(value: &str) -> Option<u64> {
+    if value.is_empty() || value.contains('-') {
+        return None;
+    }
+    let (digits, factor) = match value.as_bytes()[value.len() - 1] {
+        b'k' | b'K' => (&value[..value.len() - 1], 1024u64),
+        b'm' | b'M' => (&value[..value.len() - 1], 1024 * 1024),
+        b'g' | b'G' => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    let base = if let Some(hex) = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()?
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        u64::from_str_radix(&digits[1..], 8).ok()?
+    } else {
+        digits.parse::<u64>().ok()?
+    };
+    base.checked_mul(factor)
 }
 
 fn parse_rev_list_tree_depth(value: &str) -> Result<usize> {
