@@ -287,6 +287,7 @@ fn print_reset_unstaged_changes(
 
 pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
+    let mut force = false;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut positional = Vec::new();
     let mut iter = args.iter();
@@ -294,6 +295,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         match arg.as_str() {
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "--progress"
             | "--no-progress"
             | "--guess"
@@ -343,6 +346,32 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+
+    // `git checkout -f <commit-ish>` where the target is the commit HEAD already
+    // points at (the common `git checkout -f HEAD` form, e.g. the trailing step
+    // of upstream's test_commit_bulk): force-restore the index and working tree
+    // to that commit without changing which branch HEAD is on, and stay silent on
+    // success — exactly git's behavior when no branch switch happens.
+    if force
+        && matches!(branch_mode, CheckoutBranchMode::Existing)
+        && positional.len() == 1
+    {
+        let target = &positional[0];
+        let store = FileRefStore::new(&git_dir, format);
+        let head_commit = resolve_ref_peeled(&store, "HEAD")?;
+        if let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, target)
+            && head_commit == Some(target_oid)
+        {
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &target_oid,
+            )?;
+            return Ok(());
+        }
+    }
+
     let checkout_message = match branch_mode {
         CheckoutBranchMode::Existing => {
             let [branch] = positional.as_slice() else {

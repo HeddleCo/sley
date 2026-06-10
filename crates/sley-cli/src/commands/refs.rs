@@ -966,7 +966,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     }
     let requested_name = positional[0].clone();
     let name = update_ref_effective_name(&store, &requested_name, deref)?;
-    let new_oid = parse_update_ref_new_oid(format, &store, &positional[1])?;
+    let new_oid = parse_update_ref_new_oid(&git_dir, format, &store, &positional[1])?;
     let expected_oid = if let Some(old) = positional.get(2) {
         Some(parse_update_ref_expected(format, old)?)
     } else {
@@ -2201,6 +2201,7 @@ fn update_ref_log_all_ref_updates_matches(name: &str, value: &str) -> bool {
 }
 
 fn parse_update_ref_new_oid(
+    git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     value: &str,
@@ -2208,15 +2209,25 @@ fn parse_update_ref_new_oid(
     if let Ok(oid) = ObjectId::from_hex(format, value) {
         return Ok(oid);
     }
-    resolve_ref_peeled(store, value)?.ok_or_else(|| {
-        eprintln!(
-            "fatal: invalid object id: expected {} hex digits for {}, got {}",
-            format.hex_len(),
-            format.name(),
-            value.len()
-        );
-        GitError::Exit(128)
-    })
+    if let Ok(Some(oid)) = resolve_ref_peeled(store, value) {
+        return Ok(oid);
+    }
+    // git's update-ref resolves <newvalue> as a revision, so revision syntax like
+    // `HEAD~1` or `<branch>^0` works (e.g. t1500's bisect setup, driven by
+    // test_commit_bulk). Fall through to the full revision parser, storing
+    // whatever object it resolves to (git does not peel here). `resolve_revision`
+    // also covers the plain-ref case (a bare `refs/...` or `HEAD`), so a
+    // validation error from `resolve_ref_peeled` above is not fatal on its own.
+    if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, value) {
+        return Ok(oid);
+    }
+    eprintln!(
+        "fatal: invalid object id: expected {} hex digits for {}, got {}",
+        format.hex_len(),
+        format.name(),
+        value.len()
+    );
+    Err(GitError::Exit(128))
 }
 
 fn parse_update_ref_expected(format: ObjectFormat, value: &str) -> Result<ObjectId> {
