@@ -51,6 +51,32 @@ jobs:
       #    Everything downstream reuses these artifacts.
       # Cache the built git source tree, keyed on the version tag. A cache hit
 
+      # Pin the oracle git the cargo test suite compares against. The runner
+      # image's distro git happens to be 2.54.0 today, but the testkit version
+      # guard would hard-fail the day the image bumps — build the pinned
+      # version from source instead (shares the cache with upstream-parity).
+      - name: Cache upstream git source (built)
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/git-src
+          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}
+      - name: Fetch upstream git (cache miss)
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf /tmp/git-src
+          git clone --depth=1 --branch "$GIT_VERSION" https://github.com/git/git /tmp/git-src
+      - name: Install pinned oracle git
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
+          make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -3
+          echo "/tmp/git-prefix/bin" >> "$GITHUB_PATH"
+      - name: Assert pinned oracle on PATH
+        run: |
+          git version
+          test "$(git version)" = "git version ${GIT_VERSION#v}"
+
       - name: Build (default features)
         run: cargo build --locked --workspace --tests
 

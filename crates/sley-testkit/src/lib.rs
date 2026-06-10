@@ -4898,7 +4898,7 @@ pub fn rev_parse_object_format_parity() -> Result<RevParseObjectFormatParity> {
         let sha256_root = root.join("sha256");
         fs::create_dir_all(&sha1_root)?;
         fs::create_dir_all(&sha256_root)?;
-        run_git(&sha1_root, ["init", "-q"], &[])?;
+        run_git(&sha1_root, ["init", "-q", "-b", "main"], &[])?;
         run_git(&sha256_root, ["init", "-q", "--object-format=sha256"], &[])?;
 
         let args = [
@@ -5286,7 +5286,7 @@ fn upstream_git_hash_object_in_dir(cwd: &Path, object_type: &str, body: &[u8]) -
 
 fn init_repo_for_format(cwd: &Path, format: ObjectFormat) -> Result<()> {
     match format {
-        ObjectFormat::Sha1 => run_git(cwd, ["init", "-q"], &[]),
+        ObjectFormat::Sha1 => run_git(cwd, ["init", "-q", "-b", "main"], &[]),
         ObjectFormat::Sha256 => run_git(cwd, ["init", "-q", "--object-format=sha256"], &[]),
     }
     .map(|_| ())
@@ -5402,8 +5402,8 @@ fn run_git_owned(cwd: &Path, args: &[String], stdin: &[u8]) -> Result<Vec<u8>> {
 
 fn init_repo_with_format(root: &Path, format: ObjectFormat) -> Result<Vec<u8>> {
     match format {
-        ObjectFormat::Sha1 => run_git(root, ["init", "-q"], &[]),
-        ObjectFormat::Sha256 => run_git(root, ["init", "-q", "--object-format=sha256"], &[]),
+        ObjectFormat::Sha1 => run_git(root, ["init", "-q", "-b", "main"], &[]),
+        ObjectFormat::Sha256 => run_git(root, ["init", "-q", "-b", "main", "--object-format=sha256"], &[]),
     }
 }
 

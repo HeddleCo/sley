@@ -67,16 +67,20 @@ jobs:
           path: /tmp/git-src
           key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}
 
-      - name: Build upstream git from source
+      - name: Fetch upstream git (cache miss)
         if: steps.git-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf /tmp/git-src
           git clone --depth=1 --branch "$GIT_VERSION" \
             https://github.com/git/git /tmp/git-src
+      - name: Build + install upstream git
+        # Runs on cache hit too: only the source tree (with build artifacts)
+        # is cached; the install prefix must be re-made each run (fast on hit,
+        # no recompile). `make install` produces a full build (with
+        # GIT-BUILD-OPTIONS) that test-lib.sh and the t/ scripts can source.
+        run: |
           cd /tmp/git-src
-          # `make install` to a throwaway prefix produces a full build (with
-          # GIT-BUILD-OPTIONS) that test-lib.sh and the t/ scripts can source.
-          make -j"$(nproc)" prefix=/tmp/git-prefix install 2>&1 | tail -20
+          make -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -20
 
       - name: Build sley
         run: cargo build -p sley-cli --bin sley --release
