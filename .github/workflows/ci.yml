@@ -70,6 +70,7 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
+          echo "${GIT_VERSION#v}" > /tmp/git-src/version
           make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -3
           echo "/tmp/git-prefix/bin" >> "$GITHUB_PATH"
       - name: Assert pinned oracle on PATH

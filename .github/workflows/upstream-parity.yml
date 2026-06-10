@@ -80,6 +80,7 @@ jobs:
         # GIT-BUILD-OPTIONS) that test-lib.sh and the t/ scripts can source.
         run: |
           cd /tmp/git-src
+          echo "${GIT_VERSION#v}" > version
           make -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -20
 
       - name: Build sley
