@@ -3381,10 +3381,35 @@ struct FilterDriver {
     required: bool,
 }
 
+/// Decode one crlf-family attribute (`text` or its legacy alias `crlf`) into a
+/// text decision, plus whether the value form forced an EOL direction.
+///
+/// Mirrors git's `git_path_check_crlf` (convert.c): a *set* attribute is text,
+/// an *unset* one is binary, `=auto` is auto, `=input` forces LF while still
+/// counting as text, and any other value is "undefined" — i.e. no opinion, so
+/// the caller falls through to the next source (the `crlf` alias, then config).
+fn decode_crlf_family_attribute(state: Option<&AttributeState>) -> (TextDecision, EolConversion) {
+    match state {
+        Some(AttributeState::Set) => (TextDecision::Text, EolConversion::None),
+        Some(AttributeState::Unset) => (TextDecision::Binary, EolConversion::None),
+        Some(AttributeState::Value(value)) if value == b"auto" => {
+            (TextDecision::Auto, EolConversion::None)
+        }
+        // `crlf=input` / `text=input`: text content normalized to LF (no CR on
+        // smudge), exactly like `core.autocrlf=input`.
+        Some(AttributeState::Value(value)) if value == b"input" => {
+            (TextDecision::Text, EolConversion::Lf)
+        }
+        // `=<other>` is CRLF_UNDEFINED in git for the `crlf` alias: no opinion.
+        _ => (TextDecision::Unspecified, EolConversion::None),
+    }
+}
+
 impl ContentFilterPlan {
     /// Build the plan for `path` from the parsed attributes and repo config.
     fn resolve(config: &GitConfig, checks: &[AttributeCheck]) -> Self {
         let text_attr = checks.iter().find(|check| check.attribute == b"text");
+        let crlf_attr = checks.iter().find(|check| check.attribute == b"crlf");
         let eol_attr = checks.iter().find(|check| check.attribute == b"eol");
         let filter_attr = checks.iter().find(|check| check.attribute == b"filter");
 
@@ -3394,14 +3419,27 @@ impl ContentFilterPlan {
             _ => None,
         });
 
+        // The `text` attribute decides first; only when it is unspecified does
+        // git consult the legacy `crlf` alias (convert.c `convert_attrs`).
+        let mut forced_eol = EolConversion::None;
         let mut text = match text_attr.map(|check| &check.state) {
             Some(Some(AttributeState::Set)) => TextDecision::Text,
             Some(Some(AttributeState::Unset)) => TextDecision::Binary,
             Some(Some(AttributeState::Value(value))) if value == b"auto" => TextDecision::Auto,
+            Some(Some(AttributeState::Value(value))) if value == b"input" => {
+                forced_eol = EolConversion::Lf;
+                TextDecision::Text
+            }
             // `text=<other>` is treated by git as a set text attribute.
             Some(Some(AttributeState::Value(_))) => TextDecision::Text,
-            // `!text` (unspecified) or no text attribute: fall through.
-            _ => TextDecision::Unspecified,
+            // `!text` (unspecified) or no text attribute: fall through to `crlf`.
+            _ => {
+                let (decision, eol) = decode_crlf_family_attribute(
+                    crlf_attr.and_then(|check| check.state.as_ref()),
+                );
+                forced_eol = eol;
+                decision
+            }
         };
 
         // A concrete `eol` attribute implies the path is text even when `text`
@@ -3422,6 +3460,10 @@ impl ContentFilterPlan {
                 }
                 EolConversion::Lf
             }
+            // No explicit `eol` attribute, but `text=input`/`crlf=input` already
+            // forced the LF direction (git's CRLF_TEXT_INPUT). Honour it over the
+            // config-derived default.
+            _ if forced_eol == EolConversion::Lf => EolConversion::Lf,
             // No eol attribute: derive direction from config.
             _ => eol_from_config(config),
         };
@@ -3810,7 +3852,14 @@ fn smudge_attribute_checks_from_index(
 }
 
 fn filter_attribute_names() -> Vec<Vec<u8>> {
-    vec![b"text".to_vec(), b"eol".to_vec(), b"filter".to_vec()]
+    // `crlf` is git's legacy alias for `text` (convert.c registers both); it is
+    // consulted as a fallback when `text` is unspecified, so we must resolve it.
+    vec![
+        b"text".to_vec(),
+        b"crlf".to_vec(),
+        b"eol".to_vec(),
+        b"filter".to_vec(),
+    ]
 }
 
 pub fn deleted_index_entries(

@@ -434,7 +434,16 @@ fn hash_object_filter_git_path(
     policy: &HashObjectFilterPolicy,
 ) -> Result<Option<Vec<u8>>> {
     if let Some(path) = policy.path() {
-        return Ok(Some(hash_object_repo_path_bytes(path)?));
+        // git: `vpath = prefix_filename(prefix, vpath)` — the `--path` value is a
+        // *virtual* attribute-lookup path resolved relative to the cwd (which may
+        // sit in a subdirectory of the worktree). It need not name an existing
+        // file, so normalize it lexically rather than canonicalizing. A vpath that
+        // escapes the worktree matches no in-tree `.gitattributes`, so no filter
+        // applies (mirrors the source-path branch's out-of-tree handling).
+        return match hash_object_worktree_relative_lexical(cwd, worktree_root, path) {
+            Some(relative) => Ok(Some(hash_object_repo_path_bytes(&relative)?)),
+            None => Ok(None),
+        };
     }
     if let Some(path) = source_path {
         let absolute = if path.is_absolute() {
@@ -452,6 +461,28 @@ fn hash_object_filter_git_path(
         return Ok(Some(Vec::new()));
     }
     Ok(None)
+}
+
+/// Resolve `path` (possibly relative to `cwd`, possibly containing `..`) into a
+/// worktree-relative path by lexical normalization, returning `None` when it
+/// escapes `worktree_root`. Used for the `--path` virtual attribute path, which
+/// git resolves against the subdirectory prefix without requiring the file to
+/// exist.
+fn hash_object_worktree_relative_lexical(
+    cwd: &Path,
+    worktree_root: &Path,
+    path: &Path,
+) -> Option<PathBuf> {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let normalized = normalize_lexical_path(&joined);
+    normalized
+        .strip_prefix(worktree_root)
+        .ok()
+        .map(Path::to_path_buf)
 }
 
 fn hash_object_repo_path_bytes(path: &Path) -> Result<Vec<u8>> {

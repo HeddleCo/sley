@@ -190,7 +190,8 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "update-server-info" => cmd_update_server_info(&args[1..]),
         "var" => cmd_var(&args[1..]),
         "verify-pack" => cmd_verify_pack(&args[1..]),
-        "version" | "-v" | "--version" => cmd_version(),
+        "version" => cmd_version(&args[1..]),
+        "-v" | "--version" => cmd_version(&[]),
         "show" => commands::show::cmd_show(&args[1..]),
         "blame" => commands::blame::cmd_blame(&args[1..]),
         "describe" => commands::describe::cmd_describe(&args[1..]),
@@ -219,9 +220,34 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
     }
 }
 
-fn cmd_version() -> Result<()> {
+fn cmd_version(args: &[String]) -> Result<()> {
+    // `git version` ignores positional arguments and prints the version line; the
+    // only flag it acts on is `--build-options`, which appends a block of build
+    // facts. Upstream's test harness (t/test-lib.sh) parses that block for the
+    // active hash (`default-hash:`) and integer widths (`sizeof-*`), so the line
+    // shapes must match git's exactly.
+    let build_options = args.iter().any(|arg| arg == "--build-options");
     println!("git version {}", sley_core::UPSTREAM_GIT_COMPAT_VERSION);
+    if build_options {
+        print_version_build_options();
+    }
     Ok(())
+}
+
+/// Emit the `git version --build-options` block, mirroring git 2.54's line
+/// shapes. Only the fields with a parity-relevant meaning for sley are reported
+/// with truthful values; the rest match git's format so harness parsers (which
+/// read specific `key: value` lines) keep working.
+fn print_version_build_options() {
+    println!("cpu: {}", std::env::consts::ARCH);
+    println!("sizeof-long: {}", std::mem::size_of::<std::ffi::c_long>());
+    println!("sizeof-size_t: {}", std::mem::size_of::<usize>());
+    println!("shell-path: /bin/sh");
+    // sley creates `files`-backed ref storage and hashes with SHA-1 by default;
+    // these two lines are what upstream test-lib.sh consumes to prime its oid
+    // database and select the default ref format.
+    println!("default-ref-format: files");
+    println!("default-hash: {}", ObjectFormat::Sha1.name());
 }
 
 fn cmd_var(args: &[String]) -> Result<()> {
