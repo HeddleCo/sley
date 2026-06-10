@@ -49,12 +49,10 @@ fn run_output_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin pipe")
-        .write_all(stdin)
-        .expect("write stdin");
+    sley_testkit::write_stdin_tolerating_early_exit(
+        child.stdin.as_mut().expect("stdin pipe"),
+        stdin,
+    );
 
     child
         .wait_with_output()
