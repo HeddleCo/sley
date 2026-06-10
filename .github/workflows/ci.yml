@@ -14,7 +14,7 @@ concurrency:
 
 defaults:
   run:
-    shell: bash --noprofile --norc -eo pipefail
+    shell: bash --noprofile --norc -eo pipefail {0}
 
 env:
   CARGO_TERM_COLOR: always
