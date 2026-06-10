@@ -51,4 +51,5 @@ pub(crate) mod tag;
 pub(crate) mod trees;
 pub(crate) mod verify_commit;
 pub(crate) mod verify_tag;
+pub(crate) mod workspace;
 pub(crate) mod worktree;
