@@ -394,6 +394,20 @@ fn update_index_paths_impl(
         }
     };
     let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    // Build the `.gitattributes` matcher ONCE for the whole batch when clean
+    // filters are in play. `apply_clean_filter` rebuilds it from scratch on every
+    // call — and `AttributeMatcher::from_worktree_root` walks the entire worktree
+    // (a stat per file) to collect `.gitattributes`. Calling it per staged path
+    // made `add -u` of D dirty files in an N-file tree cost D*N stats (sley#27's
+    // dominant remaining term after the fsync fix: 10 dirty x 1000 files ~ 11k
+    // statx vs git's ~1k). Resolving attributes per path against the shared
+    // matcher is byte-identical to the per-call rebuild, just without the
+    // redundant tree walks.
+    let attribute_matcher = match clean_config {
+        Some(_) => Some(AttributeMatcher::from_worktree_root(worktree_root)?),
+        None => None,
+    };
+    let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
     for path in paths {
         let absolute = if path.is_absolute() {
@@ -459,9 +473,16 @@ fn update_index_paths_impl(
             symlink_target_bytes(&absolute)?
         } else {
             let body = fs::read(&absolute)?;
-            match clean_config {
-                Some(config) => apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?,
-                None => body,
+            match (clean_config, &attribute_matcher) {
+                (Some(config), Some(matcher)) => {
+                    // Identical to `apply_clean_filter`, but reuses the batch's
+                    // matcher instead of rebuilding it (and re-walking the tree)
+                    // for this path.
+                    let checks =
+                        matcher.attributes_for_path(&git_path, &requested_filter_attrs, false);
+                    apply_clean_filter_with_attributes(config, &checks, &git_path, &body)?
+                }
+                _ => body,
             }
         };
         let object = EncodedObject::new(ObjectType::Blob, body);
