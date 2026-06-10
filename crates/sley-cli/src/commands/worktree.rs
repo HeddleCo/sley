@@ -84,10 +84,21 @@ struct WorktreeAddOptions {
     checkout: bool,
     lock: bool,
     lock_reason: Option<String>,
+    /// The branch name to create/reset (`-b` or `-B`). When `--orphan` is set
+    /// without an explicit `-b`/`-B`, this is filled in later with the
+    /// worktree basename.
     branch: Option<String>,
+    /// `-B` was used (create-or-reset). Distinct from `-b` (create-only).
     force_branch: bool,
+    /// Explicit `--orphan` flag (NOT the DWIM-inferred orphan, which is tracked
+    /// separately on the resolved head).
+    orphan: bool,
     guess_remote: bool,
-    track: bool,
+    /// `--track`/`--no-track` as a tri-state mirror of git's `OPT_PASSTHRU`
+    /// `opt_track`: `None` when neither flag given, `Some(true)` for `--track`,
+    /// `Some(false)` for `--no-track`. Git only treats a *present* `opt_track`
+    /// (either form) as "tracking requested" for the orphan-conflict check.
+    track: Option<bool>,
     path: String,
     start: Option<String>,
 }
@@ -99,7 +110,7 @@ struct WorktreeTrackedEntry {
 }
 
 pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
-    let options = parse_worktree_add_options(args)?;
+    let mut options = parse_worktree_add_options(args)?;
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -108,10 +119,23 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
     validate_worktree_add_destination(&path, &options.path)?;
     let store = FileRefStore::new(&common_git_dir, format);
     let committer = commit_identity_from_env("COMMITTER")?;
-    if let Some(branch) = options.branch.as_ref() {
+
+    // `--orphan` with no explicit `-b`/`-B` names the new unborn branch after
+    // the worktree basename (git: `opts.orphan && !new_branch`).
+    if options.orphan && options.branch.is_none() {
+        options.branch = Some(default_worktree_add_branch_name(&path)?);
+    }
+
+    // `-B`: if the branch already exists and is checked out elsewhere, die
+    // before doing any work (git's `new_branch_force` arm calls
+    // `die_if_checked_out` up front).
+    if options.force_branch
+        && let Some(branch) = options.branch.as_ref()
+    {
         let refname = branch_ref_name(branch)?;
-        if let Some(existing_path) =
-            branch_checked_out_worktree(&common_git_dir, &refname, Some(&path))?
+        if store.read_ref(&refname)?.is_some()
+            && let Some(existing_path) =
+                branch_checked_out_worktree(&common_git_dir, &refname, Some(&path))?
             && options.force == 0
         {
             eprintln!(
@@ -621,17 +645,28 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
     let mut quiet = false;
     let mut detach = false;
     let mut checkout = true;
-    let mut lock = false;
-    let mut lock_reason = None;
-    let mut branch = None;
-    let mut force_branch = false;
+    let mut keep_locked = false;
+    let mut lock_reason: Option<String> = None;
+    // `-b` and `-B` are tracked separately so their simultaneous use (and use
+    // alongside `--detach`) is a "mutually exclusive options" error, matching
+    // git's `!!opts.detach + !!new_branch + !!new_branch_force > 1` check.
+    let mut new_branch: Option<String> = None;
+    let mut new_branch_force: Option<String> = None;
+    let mut orphan = false;
     let mut guess_remote = false;
-    let mut track = false;
+    let mut track: Option<bool> = None;
     let mut paths = Vec::new();
+    let mut saw_double_dash = false;
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
+        if saw_double_dash {
+            paths.push(arg.clone());
+            index += 1;
+            continue;
+        }
         match arg.as_str() {
+            "--" => saw_double_dash = true,
             "-f" | "--force" => force += 1,
             "--no-force" => force = 0,
             "-q" | "--quiet" => quiet = true,
@@ -640,48 +675,46 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
             "--no-detach" => detach = false,
             "--checkout" => checkout = true,
             "--no-checkout" => checkout = false,
-            "--lock" => lock = true,
-            "--no-lock" => lock = false,
+            "--orphan" => orphan = true,
+            "--no-orphan" => orphan = false,
+            "--lock" => keep_locked = true,
+            "--no-lock" => keep_locked = false,
             "--reason" => {
                 index += 1;
                 let Some(value) = args.get(index) else {
                     eprintln!("error: option `reason' requires a value");
                     return Err(GitError::Exit(129));
                 };
-                lock = true;
                 lock_reason = Some(value.clone());
             }
             value if let Some(value) = value.strip_prefix("--reason=") => {
-                lock = true;
                 lock_reason = Some(value.to_string());
             }
-            "--no-reason" => lock_reason = Some("(null)".to_string()),
+            "--no-reason" => lock_reason = None,
             "-b" | "-B" => {
-                force_branch = arg == "-B";
                 index += 1;
                 let Some(value) = args.get(index) else {
                     return worktree_add_usage();
                 };
-                branch = Some(value.clone());
+                if arg == "-B" {
+                    new_branch_force = Some(value.clone());
+                } else {
+                    new_branch = Some(value.clone());
+                }
             }
             value if value.starts_with("-b") && value.len() > 2 => {
-                branch = Some(value[2..].to_string());
-                force_branch = false;
+                new_branch = Some(value[2..].to_string());
             }
             value if value.starts_with("-B") && value.len() > 2 => {
-                branch = Some(value[2..].to_string());
-                force_branch = true;
+                new_branch_force = Some(value[2..].to_string());
             }
             "--guess-remote" => guess_remote = true,
             "--no-guess-remote" => guess_remote = false,
-            "--track" => track = true,
-            value if value.starts_with("--track=") => track = true,
-            "--no-track" => track = false,
-            "--orphan"
-            | "--no-orphan"
-            | "--relative-paths"
-            | "--no-relative-paths" => {}
-            value if value.starts_with('-') => {
+            "--track" => track = Some(true),
+            value if value.starts_with("--track=") => track = Some(true),
+            "--no-track" => track = Some(false),
+            "--relative-paths" | "--no-relative-paths" => {}
+            value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 return worktree_add_usage();
             }
@@ -689,21 +722,52 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
         }
         index += 1;
     }
+
+    // Mirror git's argument-validation order exactly (builtin/worktree.c add()).
+    if (detach as usize) + (new_branch.is_some() as usize) + (new_branch_force.is_some() as usize)
+        > 1
+    {
+        eprintln!("fatal: options '-b', '-B', and '--detach' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if detach && orphan {
+        eprintln!("fatal: options '--orphan' and '--detach' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if orphan && track.is_some() {
+        eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if orphan && !checkout {
+        eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    // `--orphan` with an explicit commit-ish (two positionals) is illegal.
+    if orphan && paths.len() == 2 {
+        eprintln!("fatal: option '--orphan' and commit-ish cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if lock_reason.is_some() && !keep_locked {
+        eprintln!("fatal: the option '--reason' requires '--lock'");
+        return Err(GitError::Exit(128));
+    }
+
     if paths.is_empty() || paths.len() > 2 {
         return worktree_add_usage();
     }
-    if detach && branch.is_some() {
-        return worktree_add_usage();
-    }
+
+    let force_branch = new_branch_force.is_some();
+    let branch = new_branch_force.or(new_branch);
     Ok(WorktreeAddOptions {
         force,
         quiet,
         detach,
         checkout,
-        lock,
+        lock: keep_locked,
         lock_reason,
         branch,
         force_branch,
+        orphan,
         guess_remote,
         track,
         path: paths.remove(0),
@@ -968,62 +1032,168 @@ struct WorktreeAddHead {
     branch_name: Option<String>,
     oid: ObjectId,
     prepare_message: String,
-    /// Set when `worktree add` inferred `--orphan` because the repository has
-    /// no usable local refs (unborn HEAD and no branches). In this mode the new
-    /// worktree checks out an unborn branch: there is no source commit, so
-    /// [`Self::oid`] is meaningless and the admin dir is laid out like git's
-    /// orphan worktree (symref HEAD, empty index, no `ORIG_HEAD`).
+    /// Set when the worktree checks out an unborn branch — either explicit
+    /// `--orphan` or the DWIM-inferred orphan (repository has no usable local
+    /// refs). In this mode there is no source commit, so [`Self::oid`] is
+    /// meaningless and the admin dir is laid out like git's orphan worktree
+    /// (symref HEAD, empty index, no `ORIG_HEAD`).
     orphan: bool,
 }
 
 /// Mirrors git's `can_use_local_refs` (builtin/worktree.c): the repository has a
 /// usable local ref when HEAD resolves to a real object, or any branch ref
-/// exists. When neither holds, `worktree add` infers `--orphan`.
-fn worktree_repo_has_local_refs(
+/// exists. When only branches exist but HEAD is invalid (a dangling/orphan
+/// HEAD), git additionally warns "HEAD points to an invalid (or orphaned)
+/// reference." unless `--quiet`. Returns whether a local ref is usable.
+fn can_use_local_refs(
     common_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
+    quiet: bool,
 ) -> Result<bool> {
     if resolve_revision(common_git_dir, format, "HEAD").is_ok() {
         return Ok(true);
     }
     for reference in store.list_refs()? {
         if reference.name.starts_with("refs/heads/") {
+            if !quiet {
+                eprintln!("warning: HEAD points to an invalid (or orphaned) reference.");
+            }
             return Ok(true);
         }
     }
     Ok(false)
 }
 
+/// Mirrors git's `can_use_remote_refs` (builtin/worktree.c). Returns whether a
+/// remote-tracking ref can supply the source. When `--guess-remote` is set but
+/// no remote ref exists yet a remote IS configured (and no `-f`), git dies
+/// asking the user to fetch first — sley cannot fetch, so this is the terminal
+/// outcome for those cells.
+fn can_use_remote_refs(
+    common_git_dir: &Path,
+    store: &FileRefStore,
+    options: &WorktreeAddOptions,
+) -> Result<bool> {
+    if !options.guess_remote {
+        return Ok(false);
+    }
+    for reference in store.list_refs()? {
+        if reference.name.starts_with("refs/remotes/") {
+            return Ok(true);
+        }
+    }
+    if options.force == 0 {
+        let config = GitConfig::read(common_git_dir.join("config")).unwrap_or_default();
+        if !sley_config::remotes::remote_names(&config).is_empty() {
+            eprintln!(
+                "fatal: No local or remote refs exist despite at least one remote\npresent, stopping; use 'add -f' to override or fetch a remote first"
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(false)
+}
+
 /// Mirrors git's `dwim_orphan` (builtin/worktree.c): decides whether
-/// `worktree add` should infer `--orphan`. Returns `true` only when the repo
-/// has no usable local refs and no remote path can supply a source.
-///
-/// `remote` distinguishes the two DWIM call sites: the bare `add <path>` DWIM
-/// passes `remote = true` (git also consults remote refs via
-/// `can_use_remote_refs`), while `add -b <branch> <path>` passes
-/// `remote = false`. sley cannot fetch, so when `remote && guess_remote` is set
-/// and a remote is configured we decline to infer — matching git, which either
-/// uses a remote-tracking ref or dies asking the user to fetch first; either
-/// way it does NOT create an orphan worktree. Declining here lets the caller
-/// fall through to its existing error path without leaving a partial worktree.
-fn worktree_should_infer_orphan(
+/// `worktree add` should infer `--orphan`. Returns `true` when neither a local
+/// nor (when `remote`) a remote ref can supply a source. When inferring, git
+/// prints the "No possible source branch, inferring '--orphan'" line (unless
+/// `--quiet`) and then dies if `--track`/`--no-checkout` make the inferred
+/// orphan an illegal combination.
+fn dwim_orphan(
     common_git_dir: &Path,
     format: ObjectFormat,
     store: &FileRefStore,
     options: &WorktreeAddOptions,
     remote: bool,
 ) -> Result<bool> {
-    if worktree_repo_has_local_refs(common_git_dir, format, store)? {
+    if can_use_local_refs(common_git_dir, format, store, options.quiet)? {
         return Ok(false);
     }
-    if remote && options.guess_remote {
-        let config = GitConfig::read(common_git_dir.join("config")).unwrap_or_default();
-        if !sley_config::remotes::remote_names(&config).is_empty() {
-            return Ok(false);
-        }
+    if remote && can_use_remote_refs(common_git_dir, store, options)? {
+        return Ok(false);
+    }
+    if !options.quiet {
+        eprintln!("No possible source branch, inferring '--orphan'");
+    }
+    // git checks --track before --no-checkout.
+    if options.track.is_some() {
+        eprintln!("fatal: options '--orphan' and '--track' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    if !options.checkout {
+        eprintln!("fatal: options '--orphan' and '--no-checkout' cannot be used together");
+        return Err(GitError::Exit(128));
     }
     Ok(true)
+}
+
+/// Resolve the commit-ish a `worktree add` should start from. Maps the `-`
+/// shorthand to `@{-1}` (git's "previous checkout"). Returns the resolved
+/// commit-ish string to feed the rest of the flow.
+fn worktree_add_start_commitish(options: &WorktreeAddOptions) -> String {
+    let start = options.start.as_deref().unwrap_or("HEAD");
+    if start == "-" {
+        "@{-1}".to_string()
+    } else {
+        start.to_string()
+    }
+}
+
+/// Returns the branch shortname `commitish` refers to when it names an existing
+/// local branch — directly (`refs/heads/<commitish>` exists) or via `@{-N}`
+/// (the N-th previously checked-out branch). Returns `None` for a non-branch
+/// commit-ish (so the caller checks out a detached HEAD).
+fn worktree_add_branch_for_commitish(
+    store: &FileRefStore,
+    commitish: &str,
+) -> Result<Option<String>> {
+    if let Some(rest) = commitish.strip_prefix("@{-") {
+        if let Some(num) = rest.strip_suffix('}')
+            && let Ok(n) = num.parse::<usize>()
+            && n > 0
+            && let Some(name) = previous_checkout_branch(store, n)?
+        {
+            let refname = branch_ref_name(&name)?;
+            if store.read_ref(&refname)?.is_some() {
+                return Ok(Some(name));
+            }
+        }
+        return Ok(None);
+    }
+    let Ok(refname) = branch_ref_name(commitish) else {
+        return Ok(None);
+    };
+    if store.read_ref(&refname)?.is_some() {
+        return Ok(Some(commitish.to_string()));
+    }
+    Ok(None)
+}
+
+/// Resolve `@{-N}` to the branch shortname it names by scanning HEAD's reflog
+/// newest-first for "checkout: moving from X to Y" entries (mirrors
+/// sley-rev's resolution but yields the branch *name*, which `worktree add`
+/// needs to point the new worktree's HEAD at the branch).
+fn previous_checkout_branch(store: &FileRefStore, n: usize) -> Result<Option<String>> {
+    let entries = store.read_reflog("HEAD")?;
+    let mut seen = 0usize;
+    for entry in entries.iter().rev() {
+        let Ok(message) = std::str::from_utf8(&entry.message) else {
+            continue;
+        };
+        let Some(rest) = message.strip_prefix("checkout: moving from ") else {
+            continue;
+        };
+        let Some((from, _to)) = rest.rsplit_once(" to ") else {
+            continue;
+        };
+        seen += 1;
+        if seen == n {
+            return Ok(Some(from.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 fn worktree_add_resolve_head(
@@ -1034,17 +1204,42 @@ fn worktree_add_resolve_head(
     options: &WorktreeAddOptions,
     committer: Vec<u8>,
 ) -> Result<WorktreeAddHead> {
+    // Explicit `--orphan` (the branch name was filled in by the caller): the new
+    // worktree checks out an unborn branch with no source commit.
+    if options.orphan {
+        let branch = options
+            .branch
+            .clone()
+            .unwrap_or(default_worktree_add_branch_name(path)?);
+        let refname = branch_ref_name(&branch)?;
+        if store.read_ref(&refname)?.is_some() {
+            eprintln!("fatal: a branch named '{branch}' already exists");
+            return Err(GitError::Exit(128));
+        }
+        return Ok(WorktreeAddHead {
+            branch_name: Some(branch.clone()),
+            oid: ObjectId::empty_tree(format),
+            prepare_message: format!("Preparing worktree (new branch '{branch}')"),
+            orphan: true,
+        });
+    }
+
     if let Some(branch) = options.branch.as_ref() {
         // DWIM: `worktree add -b <branch> <path>` with no explicit commit-ish in
         // a repo with no usable local refs infers `--orphan` (git
         // builtin/worktree.c `add`: the `ac < 2 && new_branch` arm).
         if options.start.is_none()
             && !options.force_branch
-            && worktree_should_infer_orphan(common_git_dir, format, store, options, false)?
+            && dwim_orphan(common_git_dir, format, store, options, false)?
         {
-            return worktree_add_orphan_head(branch.clone(), format, options);
+            return worktree_add_inferred_orphan_head(branch.clone(), format);
         }
         let start = options.start.as_deref().unwrap_or("HEAD");
+        // git: `if (!opts.orphan && !lookup_commit_reference_by_name(branch))`
+        // — when the start point is unresolvable (e.g. a dangling HEAD), emit
+        // the invalid-reference error (with the `-b`-aware orphan hint) instead
+        // of a lower-level failure from branch creation.
+        worktree_add_resolve_commitish(common_git_dir, format, options, start)?;
         let was_reset = checkout_create_or_reset_branch(
             common_git_dir,
             format,
@@ -1067,9 +1262,15 @@ fn worktree_add_resolve_head(
         });
     }
 
+    let commitish = worktree_add_start_commitish(options);
+
     if options.detach {
-        let start = options.start.as_deref().unwrap_or("HEAD");
-        let oid = resolve_revision(common_git_dir, format, start)?;
+        // Detaching at HEAD in a repo whose HEAD is dangling warns + dies via
+        // can_use_local_refs (git: the `detach && branch == "HEAD"` arm).
+        if commitish == "HEAD" {
+            can_use_local_refs(common_git_dir, format, store, options.quiet)?;
+        }
+        let oid = worktree_add_resolve_commitish(common_git_dir, format, options, &commitish)?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1081,18 +1282,19 @@ fn worktree_add_resolve_head(
         });
     }
 
-    if let Some(start) = options.start.as_ref() {
-        let branch_ref = branch_ref_name(start)?;
-        if store.read_ref(&branch_ref)?.is_some() {
-            let oid = resolve_revision(common_git_dir, format, start)?;
+    if options.start.is_some() {
+        // `ac == 2`: an explicit commit-ish. If it names a branch, check it out
+        // (HEAD becomes a symref); otherwise detach.
+        if let Some(branch) = worktree_add_branch_for_commitish(store, &commitish)? {
+            let oid = resolve_revision(common_git_dir, format, &commitish)?;
             return Ok(WorktreeAddHead {
-                branch_name: Some(start.clone()),
+                branch_name: Some(branch),
                 oid,
-                prepare_message: format!("Preparing worktree (checking out '{start}')"),
+                prepare_message: format!("Preparing worktree (checking out '{commitish}')"),
                 orphan: false,
             });
         }
-        let oid = resolve_revision(common_git_dir, format, start)?;
+        let oid = worktree_add_resolve_commitish(common_git_dir, format, options, &commitish)?;
         return Ok(WorktreeAddHead {
             branch_name: None,
             oid,
@@ -1104,14 +1306,28 @@ fn worktree_add_resolve_head(
         });
     }
 
+    // `ac < 2` plain DWIM: a worktree-named branch already present is checked
+    // out; otherwise a new branch is created from HEAD, or `--orphan` is
+    // inferred when the repo has no usable local/remote refs.
     let branch = default_worktree_add_branch_name(path)?;
-    // DWIM: `worktree add <path>` in a repo with no usable local refs infers
-    // `--orphan`, creating the worktree on a new unborn branch named after the
-    // worktree directory (git builtin/worktree.c `add`: the `ac < 2` arm where
-    // `dwim_branch` returns no source and `dwim_orphan` fires).
-    if worktree_should_infer_orphan(common_git_dir, format, store, options, true)? {
-        return worktree_add_orphan_head(branch, format, options);
+    let branch_ref = branch_ref_name(&branch)?;
+    if store.read_ref(&branch_ref)?.is_some() {
+        let oid = resolve_revision(common_git_dir, format, &branch)?;
+        let prepare_message = format!("Preparing worktree (checking out '{branch}')");
+        return Ok(WorktreeAddHead {
+            branch_name: Some(branch),
+            oid,
+            prepare_message,
+            orphan: false,
+        });
     }
+    if dwim_orphan(common_git_dir, format, store, options, true)? {
+        return worktree_add_inferred_orphan_head(branch, format);
+    }
+    // The new branch is created from HEAD. git's `!opts.orphan &&
+    // !lookup_commit_reference_by_name("HEAD")` arm emits the invalid-reference
+    // error (with the no-`-b` orphan hint) when HEAD is a dangling reference.
+    worktree_add_resolve_commitish(common_git_dir, format, options, "HEAD")?;
     commands::branch::create_branch_from_start(common_git_dir, format, store, &branch, None)?;
     let oid = resolve_revision(common_git_dir, format, &branch)?;
     Ok(WorktreeAddHead {
@@ -1122,43 +1338,61 @@ fn worktree_add_resolve_head(
     })
 }
 
-/// Builds the [`WorktreeAddHead`] for an inferred-`--orphan` `worktree add`: the
-/// new worktree checks out the unborn branch `branch`. `oid` is a placeholder
-/// (the empty tree) that is never written to disk in orphan mode. The
-/// `prepare_message` carries both stderr lines git emits, "No possible source
-/// branch, inferring '--orphan'" followed by "Preparing worktree (new branch
-/// '<branch>')".
-///
-/// Inferring `--orphan` can turn other flags into an illegal combination. Like
-/// git's `dwim_orphan`, once orphan is inferred we reject `--track` and
-/// `--no-checkout` (printing the "inferring" line first unless `--quiet`, then
-/// the fatal) and create nothing — so a rejected add never leaves a partial
-/// worktree directory behind.
-fn worktree_add_orphan_head(
-    branch: String,
+/// Resolve an explicit commit-ish to its object id, emitting git's
+/// invalid-reference error (and, when DWIM-eligible, the orphan hint) on
+/// failure. Mirrors the `!opts.orphan && !lookup_commit_reference_by_name`
+/// arm: the hint fires only when there was no explicit commit-ish (`ac < 2`)
+/// and `--quiet` is off, and uses the `-b`/`-B`-aware text when a new-branch
+/// option was supplied.
+fn worktree_add_resolve_commitish(
+    common_git_dir: &Path,
     format: ObjectFormat,
     options: &WorktreeAddOptions,
-) -> Result<WorktreeAddHead> {
-    if options.track || !options.checkout {
-        if !options.quiet {
-            eprintln!("No possible source branch, inferring '--orphan'");
+    commitish: &str,
+) -> Result<ObjectId> {
+    match resolve_revision(common_git_dir, format, commitish) {
+        Ok(oid) => Ok(oid),
+        Err(_) => {
+            let attempt_hint = !options.quiet && options.start.is_none();
+            if attempt_hint {
+                eprintln!(
+                    "hint: If you meant to create a worktree containing a new unborn branch"
+                );
+                eprintln!("hint: (branch with no commits) for this repository, you can do so");
+                eprintln!("hint: using the --orphan flag:");
+                eprintln!("hint:");
+                if let Some(branch) = options.branch.as_ref() {
+                    eprintln!(
+                        "hint:     git worktree add --orphan -b {} {}",
+                        branch,
+                        options.path
+                    );
+                } else {
+                    eprintln!("hint:     git worktree add --orphan {}", options.path);
+                }
+                eprintln!("hint:");
+                eprintln!(
+                    "hint: Disable this message with \"git config set advice.worktreeAddOrphan false\""
+                );
+            }
+            eprintln!("fatal: invalid reference: {commitish}");
+            Err(GitError::Exit(128))
         }
-        // git checks --track before --no-checkout.
-        let conflicting = if options.track {
-            "--track"
-        } else {
-            "--no-checkout"
-        };
-        eprintln!("fatal: options '--orphan' and '{conflicting}' cannot be used together");
-        return Err(GitError::Exit(128));
     }
-    let prepare_message = format!(
-        "No possible source branch, inferring '--orphan'\nPreparing worktree (new branch '{branch}')"
-    );
+}
+
+/// Builds the [`WorktreeAddHead`] for a DWIM-inferred `--orphan` `worktree add`.
+/// The "No possible source branch, inferring '--orphan'" line (and any illegal
+/// `--track`/`--no-checkout` combo) was already emitted by [`dwim_orphan`]; here
+/// we only carry the "Preparing worktree (new branch '<branch>')" line.
+fn worktree_add_inferred_orphan_head(
+    branch: String,
+    format: ObjectFormat,
+) -> Result<WorktreeAddHead> {
     Ok(WorktreeAddHead {
-        branch_name: Some(branch),
+        branch_name: Some(branch.clone()),
         oid: ObjectId::empty_tree(format),
-        prepare_message,
+        prepare_message: format!("Preparing worktree (new branch '{branch}')"),
         orphan: true,
     })
 }
