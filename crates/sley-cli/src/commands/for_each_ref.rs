@@ -222,6 +222,7 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         sorts.push(ForEachRefSort::Refname);
     }
     let format_spec = ForEachRefFormat::parse(&format_spec)?;
+    let needs = ForEachRefNeeds::analyze(&format_spec);
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let objectname_abbrev = repository_abbrev(&git_dir, format)?;
@@ -230,7 +231,13 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         .map(|rev| resolve_revision(&git_dir, format, rev))
         .collect::<Result<Vec<_>>>()?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let objectname_candidates = cat_file_all_object_ids(&git_dir, format)?;
+    // The abbreviation candidate set is only needed by `%(objectname:short...)`;
+    // enumerating every object id is otherwise pure overhead.
+    let objectname_candidates = if needs.candidates {
+        cat_file_all_object_ids(&git_dir, format)?
+    } else {
+        Vec::new()
+    };
     let contains_targets = contains_revs
         .iter()
         .map(|rev| {
@@ -258,6 +265,12 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         .transpose()?;
     let store = FileRefStore::new(&git_dir, format);
     let head_ref = store.current_branch_ref()?;
+    // Discover worktree paths once instead of re-scanning $GIT_DIR/worktrees per ref.
+    let worktree_paths = if needs.worktree {
+        for_each_ref_worktree_paths(&git_dir, head_ref.as_deref())?
+    } else {
+        HashMap::new()
+    };
     let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
     let mut stdout = io::stdout();
     let mut emitted = 0usize;
@@ -362,9 +375,25 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             .map(|push_ref| for_each_ref_upstream_track(&store, &db, format, &oid, push_ref))
             .transpose()?
             .flatten();
-        let object = db.read_object(&oid)?;
-        let contents = for_each_ref_contents(format, &object)?;
-        let peeled_oid = contents.as_ref().and_then(|contents| contents.tag_object);
+        // Only decode the ref object when the format references an atom that needs
+        // it (git's used_atom analysis). Formats like %(objectname)/%(refname) read
+        // nothing here.
+        let object = if needs.object {
+            Some(db.read_object(&oid)?)
+        } else {
+            None
+        };
+        let contents = object
+            .as_ref()
+            .map(|object| for_each_ref_contents(format, object))
+            .transpose()?
+            .flatten();
+        // The peeled tag target is only read when a %(*...) atom references it.
+        let peeled_oid = if needs.peeled {
+            contents.as_ref().and_then(|contents| contents.tag_object)
+        } else {
+            None
+        };
         let peeled_encoded_object = match peeled_oid {
             Some(peeled_oid) => Some(db.read_object(&peeled_oid)?),
             None => None,
@@ -372,7 +401,11 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         let peeled_object = if let (Some(peeled_oid), Some(peeled_encoded_object)) =
             (peeled_oid, peeled_encoded_object.as_ref())
         {
-            let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?;
+            let object_disk_size = if needs.peeled_disk {
+                for_each_ref_loose_object_disk_size(&git_dir, &peeled_oid)?
+            } else {
+                None
+            };
             let (tree, parents, message, author, committer, creator) =
                 if peeled_encoded_object.object_type == ObjectType::Commit {
                     let commit = Commit::parse_ref(format, &peeled_encoded_object.body)?;
@@ -403,10 +436,23 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         } else {
             None
         };
-        let object_disk_size = for_each_ref_loose_object_disk_size(&git_dir, &oid)?;
+        let object_disk_size = if needs.object_disk {
+            for_each_ref_loose_object_disk_size(&git_dir, &oid)?
+        } else {
+            None
+        };
         let deltabase = zero_oid(format)?;
-        let worktree_path =
-            for_each_ref_worktree_path(&git_dir, head_ref.as_deref(), &reference.name)?;
+        // `%(worktreepath)` reads from the hoisted map; the placeholder is the empty
+        // path for refs not checked out anywhere, matching git.
+        let worktree_path = worktree_paths.get(reference.name.as_str()).map(String::as_str);
+        // When the format needs no object, these fields are never observed (every
+        // atom that reads them is gated behind `needs.object`); the placeholders are
+        // therefore unobservable.
+        let object_type = object
+            .as_ref()
+            .map(|object| object.object_type)
+            .unwrap_or(ObjectType::Commit);
+        let object_body: &[u8] = object.as_ref().map(|object| object.body.as_ref()).unwrap_or(&[]);
         let format_context = ForEachRefFormatContext {
             git_dir: &git_dir,
             db: &db,
@@ -414,15 +460,15 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             refname: &reference.name,
             oid: &oid,
             deltabase: &deltabase,
-            object_type: object.object_type,
-            object_body: &object.body,
-            object_size: object.body.len(),
+            object_type,
+            object_body,
+            object_size: object_body.len(),
             object_disk_size,
             color,
             quote,
             objectname_abbrev,
             objectname_candidates: &objectname_candidates,
-            worktree_path: worktree_path.as_deref(),
+            worktree_path,
             is_head: head_ref.as_deref() == Some(reference.name.as_str()),
             symref: symref.as_deref(),
             upstream,
@@ -526,6 +572,130 @@ enum ForEachRefSort {
     PeeledCreatorDateDescending,
     VersionRefname,
     VersionRefnameDescending,
+}
+
+/// Which per-ref work the parsed `--format` actually requires (git's `used_atom`
+/// analysis). Computed once up front so the per-ref loop can skip object reads,
+/// the peeled-tag read, disk-size stats, the abbreviation candidate scan, and the
+/// worktree probe whenever the format never references the corresponding atom.
+#[derive(Default, Clone, Copy)]
+struct ForEachRefNeeds {
+    /// The ref's own object must be decoded (object body / type / size / contents).
+    object: bool,
+    /// The peeled tag target must be read (any `*`-prefixed object/contents atom).
+    /// Implies `object`, since the tag pointer comes from decoding the ref object.
+    peeled: bool,
+    /// `%(objectsize:disk)` — the loose-object on-disk size for the ref object.
+    object_disk: bool,
+    /// `%(*objectsize:disk)` — the loose-object on-disk size for the peeled object.
+    peeled_disk: bool,
+    /// `%(worktreepath)` — the per-ref worktree probe.
+    worktree: bool,
+    /// `%(objectname:short...)` / `%(*objectname:short...)` — needs the ambiguity
+    /// candidate set (the full object-id enumeration).
+    candidates: bool,
+}
+
+impl ForEachRefNeeds {
+    fn analyze(format_spec: &ForEachRefFormat) -> Self {
+        let mut needs = ForEachRefNeeds::default();
+        for segment in format_spec.segments() {
+            let ForEachRefFormatSegment::Atom(atom) = segment else {
+                continue;
+            };
+            match atom {
+                ForEachRefAtom::Raw(placeholder) => needs.note_raw(placeholder),
+                ForEachRefAtom::Color(_) => {}
+                ForEachRefAtom::RefName { .. } => {}
+                ForEachRefAtom::ObjectName { peeled, abbrev } => {
+                    if abbrev.is_some() {
+                        needs.candidates = true;
+                    }
+                    if *peeled {
+                        needs.peeled = true;
+                    }
+                    // The direct objectname comes straight from the ref target; it
+                    // never needs the object decoded.
+                }
+                ForEachRefAtom::Identity { peeled, .. }
+                | ForEachRefAtom::ContentsLines { peeled, .. } => {
+                    if *peeled {
+                        needs.peeled = true;
+                    } else {
+                        needs.object = true;
+                    }
+                }
+            }
+        }
+        // Reading the peeled tag target requires first decoding the ref object to
+        // discover the tag pointer; the disk-size stats follow their reads.
+        if needs.peeled {
+            needs.object = true;
+        }
+        if needs.peeled_disk {
+            needs.peeled = true;
+            needs.object = true;
+        }
+        needs
+    }
+
+    fn note_raw(&mut self, placeholder: &str) {
+        // Strip a leading `*` (peeled) marker, classifying the peeled need first.
+        let (base, peeled) = placeholder
+            .strip_prefix('*')
+            .map(|rest| (rest, true))
+            .unwrap_or((placeholder, false));
+        // Atoms that consult the ref object body (or, when peeled, the tag target).
+        let consumes_object = match base {
+            "objectsize" | "objecttype" | "raw" | "raw:size" | "subject" | "contents"
+            | "contents:subject" | "contents:body" | "contents:size" | "body" | "author"
+            | "authorname" | "authoremail" | "authordate" | "committer" | "committername"
+            | "committeremail" | "committerdate" | "tagger" | "taggername" | "taggeremail"
+            | "taggerdate" | "creator" | "creatordate" | "tree" | "parent" | "numparent"
+            | "tag" | "type" | "object" => true,
+            "objectsize:disk" => {
+                if peeled {
+                    self.peeled_disk = true;
+                } else {
+                    self.object_disk = true;
+                }
+                false
+            }
+            "objectname" | "deltabase" => peeled,
+            "worktreepath" => {
+                self.worktree = true;
+                false
+            }
+            other => {
+                if other == "objectname:short" || other.starts_with("objectname:short=") {
+                    self.candidates = true;
+                    // The direct objectname needs no read; peeled needs the tag target.
+                    peeled
+                } else if other.starts_with("authordate:")
+                    || other.starts_with("committerdate:")
+                    || other.starts_with("taggerdate:")
+                    || other.starts_with("creatordate:")
+                    || other.starts_with("authoremail:")
+                    || other.starts_with("committeremail:")
+                    || other.starts_with("taggeremail:")
+                    || other.starts_with("contents:lines=")
+                {
+                    true
+                } else {
+                    // refname*, symref*, upstream*, push*, color:, HEAD, ahead-behind:,
+                    // and any unsupported placeholder need no object read here.
+                    false
+                }
+            }
+        };
+        if consumes_object {
+            if peeled {
+                self.peeled = true;
+            } else {
+                self.object = true;
+            }
+        }
+    }
 }
 
 fn parse_for_each_ref_count(value: &str) -> Result<usize> {
