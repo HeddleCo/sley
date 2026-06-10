@@ -320,7 +320,11 @@ impl RawConfigEditor {
         ev: &Event,
         value_matches: Option<&dyn Fn(Option<&str>) -> bool>,
     ) -> bool {
-        if ev.key.as_deref() != Some(self.name.as_str()) {
+        // git's `matches()` compares the FULL key (`section.subsection.name`), so
+        // an entry only matches when it is BOTH in the target section and has the
+        // target variable name. (Without the section guard a same-named variable
+        // in a different section would be wrongly collected — t1300 #235.)
+        if !ev.is_keys_section || ev.key.as_deref() != Some(self.name.as_str()) {
             return false;
         }
         match value_matches {
@@ -997,6 +1001,16 @@ mod tests {
         let expect = "[beta] ; silly comment # another comment\nnoIndent= sillyValue ; 'nother silly comment\n\n# empty line\n\t\t; comment\n\thaha = gamma\n[nextSection] noNewline = ouch\n";
         assert_eq!(out, expect);
     }
+
+    #[test]
+    fn replace_all_does_not_touch_same_name_in_other_section() {
+        // `abc.key` must NOT match `xyz.key` — a same-named variable in another
+        // section (t1300 #235). The `[abc]key` header has an inline bare key.
+        let src = "[abc]key\n\tkeepSection\n[xyz]\n\tkey = 1\n[abc]\n\tkey = a\n";
+        let (out, _) = edit(src, "abc", None, "key", Some("b"), None, None, true);
+        let expect = "[abc]\n\tkeepSection\n[xyz]\n\tkey = 1\n[abc]\n\tkey = b\n";
+        assert_eq!(out, expect);
+    }
 }
 
 
@@ -1042,3 +1056,4 @@ mod section_tests {
         assert!(matches!(rr(src, "zzz", Some("q.r")), SectionEditOutcome::NotFound));
     }
 }
+
