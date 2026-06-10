@@ -30,8 +30,8 @@ declare -A FLOOR=(
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=361
     [t1401-symbolic-ref.sh]=25
-    [t1500-rev-parse.sh]=79
-    [t2400-worktree-add.sh]=110
+    [t1500-rev-parse.sh]=80
+    [t2400-worktree-add.sh]=158
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
 )
