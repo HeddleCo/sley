@@ -236,6 +236,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "diff-tree" => commands::diff_tree::cmd_diff_tree(&args[1..]),
         "diff-index" => commands::diff_index::cmd_diff_index(&args[1..]),
         "diff-files" => commands::diff_files::cmd_diff_files(&args[1..]),
+        "fast-import" => commands::fast_import::cmd_fast_import(&args[1..]),
         "merge-tree" => commands::merge_tree::cmd_merge_tree(&args[1..]),
         "merge-file" => commands::merge_file::cmd_merge_file(&args[1..]),
         "name-rev" => commands::name_rev::cmd_name_rev(&args[1..]),
