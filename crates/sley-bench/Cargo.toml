@@ -48,5 +48,9 @@ harness = false
 name = "tree_walk"
 harness = false
 
+[[bench]]
+name = "worktree_ops"
+harness = false
+
 [lints]
 workspace = true

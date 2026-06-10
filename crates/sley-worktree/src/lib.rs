@@ -524,6 +524,14 @@ pub fn refresh_index_paths(
         });
     }
     let mut index = Index::parse(&fs::read(&index_path)?, format)?;
+    // git's `update-index --refresh` trusts the cached stat: a stage-0 entry
+    // whose size+mtime still match the worktree file (and is not racily clean) is
+    // known unchanged, so its content is NOT re-read or re-hashed
+    // (read-cache.c `refresh_cache_ent` → `ie_match_stat`). Without this shortcut
+    // sley re-hashed every tracked file on every refresh — the 3.2x slowdown in
+    // sley#27. We build the cache from the same parsed index + the index file's
+    // own mtime (the racy-clean reference) so no extra parse is needed.
+    let stat_cache = IndexStatCache::from_index(&index, &index_path);
     let selected_paths = paths
         .iter()
         .map(|path| {
@@ -568,6 +576,16 @@ pub fn refresh_index_paths(
                 print_update_index_needs_update(entry.path.as_bytes());
             }
             needs_update = true;
+            continue;
+        }
+        // Stat shortcut: when the cached stat proves the file is unchanged since
+        // it was staged, its content hashes to the cached oid by construction
+        // (see `IndexStatCache`'s safety invariant). Skip the read+hash and just
+        // refresh the stat fields from current metadata — byte-identical to the
+        // clean arm below, since the oid stamped is the cached one and the
+        // metadata is the same one that re-stamp would read.
+        if let Some(tracked) = stat_cache.reuse_tracked_entry(entry.path.as_bytes(), &metadata) {
+            *entry = index_entry_from_metadata(entry.path.clone(), tracked.oid, &metadata);
             continue;
         }
         let body = fs::read(&absolute)?;

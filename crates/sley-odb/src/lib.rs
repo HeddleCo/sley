@@ -2469,7 +2469,15 @@ impl ObjectWriter for LooseObjectStore {
                     .create_new(true)
                     .open(&temp_path)?;
                 file.write_all(&compressed)?;
-                file.sync_all()?;
+                // No fsync: git's default `core.fsync=none` fsyncs nothing on the
+                // loose-object write path (object-file.c writes the temp file and
+                // renames it without syncing unless `core.fsync` names
+                // `loose-object`/`objects`/`all`, which it does not by default).
+                // A per-object sync_all() here made `git add` of N files cost N
+                // fsyncs — the dominant term in sley#27's 10x `add -u` slowdown —
+                // for durability git itself does not provide by default. The
+                // create_new temp + atomic rename below still guarantees the
+                // object never appears half-written under its final name.
             }
             match fs::rename(&temp_path, &path) {
                 Ok(()) => Ok(()),
