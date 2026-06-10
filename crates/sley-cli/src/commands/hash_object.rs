@@ -2,7 +2,6 @@
 //! apply the same worktree-to-blob conversions that Git uses for path-aware
 //! hashing.
 
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, Read};
@@ -10,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, Result};
-use sley_object::{Commit, ObjectType, Tag};
+use sley_object::ObjectType;
 use sley_odb::LooseObjectStore;
 
 use super::args::{
@@ -493,7 +492,7 @@ fn print_hash_object(
     store: Option<&mut LooseObjectStore>,
 ) -> Result<()> {
     if !literally {
-        validate_hash_object_body(object_type, format, &body)?;
+        super::hash_object_fsck::check_object(object_type, format, &body)?;
     }
     let object = sley_object::EncodedObject::new(object_type, body);
     let oid = if let Some(store) = store {
@@ -503,19 +502,6 @@ fn print_hash_object(
     };
     println!("{oid}");
     Ok(())
-}
-
-fn validate_hash_object_body(
-    object_type: ObjectType,
-    format: ObjectFormat,
-    body: &[u8],
-) -> Result<()> {
-    match object_type {
-        ObjectType::Blob => Ok(()),
-        ObjectType::Tree => validate_tree_body(format, body),
-        ObjectType::Commit => Commit::parse(format, body).map(|_| ()),
-        ObjectType::Tag => Tag::parse(format, body).map(|_| ()),
-    }
 }
 
 fn parse_hash_object_format(value: &str) -> Result<ObjectFormat> {
@@ -596,50 +582,4 @@ mod tests {
             Err(GitError::Exit(129))
         ));
     }
-}
-
-fn validate_tree_body(format: ObjectFormat, body: &[u8]) -> Result<()> {
-    let mut offset = 0usize;
-    let mut names = HashSet::new();
-    while offset < body.len() {
-        let mode_start = offset;
-        while body.get(offset).copied() != Some(b' ') {
-            offset += 1;
-            if offset >= body.len() {
-                return Err(GitError::InvalidFormat("unterminated tree mode".into()));
-            }
-        }
-        let mode_text = std::str::from_utf8(&body[mode_start..offset])
-            .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
-        let mode = u32::from_str_radix(mode_text, 8)
-            .map_err(|_| GitError::InvalidFormat("invalid tree mode".into()))?;
-        if !matches!(mode, 0o040000 | 0o100644 | 0o100755 | 0o120000 | 0o160000) {
-            return Err(GitError::InvalidObject("invalid tree mode".into()));
-        }
-        offset += 1;
-        let name_start = offset;
-        while body.get(offset).copied() != Some(0) {
-            offset += 1;
-            if offset >= body.len() {
-                return Err(GitError::InvalidFormat("unterminated tree path".into()));
-            }
-        }
-        if offset == name_start {
-            return Err(GitError::InvalidObject("empty tree path".into()));
-        }
-        let name = body[name_start..offset].to_vec();
-        if !names.insert(name) {
-            return Err(GitError::InvalidObject("duplicateEntries".into()));
-        }
-        offset += 1;
-        let oid_end = offset
-            .checked_add(format.raw_len())
-            .ok_or_else(|| GitError::InvalidFormat("tree oid overflow".into()))?;
-        if oid_end > body.len() {
-            return Err(GitError::InvalidFormat("truncated tree object id".into()));
-        }
-        let _ = sley_core::ObjectId::from_raw(format, &body[offset..oid_end])?;
-        offset = oid_end;
-    }
-    Ok(())
 }
