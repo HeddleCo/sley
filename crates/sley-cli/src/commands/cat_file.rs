@@ -34,22 +34,34 @@ impl CatFileInvocation {
 
 struct CatFileOptions {
     batch: Option<(CatFileBatchMode, Option<String>)>,
-    batch_all_objects: bool,
-    buffer: bool,
+    buffer: Option<bool>,
     follow_symlinks: bool,
     input_nul: bool,
     output_nul: bool,
-    cmd_mode: Option<CatFileCmdMode>,
+    /// The selected command-mode (`-e/-p/-t/-s/--textconv/--filters/--batch-all-objects`).
+    ///
+    /// Upstream `cat-file` declares all of these as `OPT_CMDMODE` writing to a single
+    /// `opt` variable, so any two distinct ones conflict and the conflict diagnostic is
+    /// emitted by `parse_options` in command-line order (the later option named first).
+    /// We mirror that here by recording the first selection and reporting a conflict the
+    /// moment a different one is seen.
+    cmd_mode: Option<CatFileCmdSelection>,
     path: Option<String>,
     positional: Vec<String>,
+}
+
+/// A recorded `OPT_CMDMODE` selection plus the spelling the user typed for it, so a later
+/// conflict can be reported with git's exact option text (e.g. `-s` vs `--batch-all-objects`).
+struct CatFileCmdSelection {
+    mode: CatFileCmdMode,
+    name: &'static str,
 }
 
 impl CatFileOptions {
     fn parse(args: &[String]) -> Result<Self> {
         let mut options = Self {
             batch: None,
-            batch_all_objects: false,
-            buffer: false,
+            buffer: None,
             follow_symlinks: false,
             input_nul: false,
             output_nul: false,
@@ -82,31 +94,34 @@ impl CatFileOptions {
                         if option.has_value() {
                             return option_takes_no_value("textconv");
                         }
-                        options.set_cmd_mode(CatFileCmdMode::Textconv)?;
+                        options.set_cmd_mode(CatFileCmdMode::Textconv, "--textconv")?;
                     }
                     "filters" => {
                         if option.has_value() {
                             return option_takes_no_value("filters");
                         }
-                        options.set_cmd_mode(CatFileCmdMode::Filters)?;
+                        options.set_cmd_mode(CatFileCmdMode::Filters, "--filters")?;
                     }
                     "batch-all-objects" => {
                         if option.has_value() {
                             return option_takes_no_value("batch-all-objects");
                         }
-                        options.batch_all_objects = true;
+                        options.set_cmd_mode(
+                            CatFileCmdMode::BatchAllObjects,
+                            "--batch-all-objects",
+                        )?;
                     }
                     "buffer" => {
                         if option.has_value() {
                             return option_takes_no_value("buffer");
                         }
-                        options.buffer = true;
+                        options.buffer = Some(true);
                     }
                     "no-buffer" => {
                         if option.has_value() {
                             return option_takes_no_value("no-buffer");
                         }
-                        options.buffer = false;
+                        options.buffer = Some(false);
                     }
                     "unordered" | "no-unordered" => {
                         if option.has_value() {
@@ -137,10 +152,10 @@ impl CatFileOptions {
                 continue;
             }
             match arg {
-                "-e" => options.set_cmd_mode(CatFileCmdMode::Exists)?,
-                "-t" => options.set_cmd_mode(CatFileCmdMode::Type)?,
-                "-s" => options.set_cmd_mode(CatFileCmdMode::Size)?,
-                "-p" => options.set_cmd_mode(CatFileCmdMode::Pretty)?,
+                "-e" => options.set_cmd_mode(CatFileCmdMode::Exists, "-e")?,
+                "-t" => options.set_cmd_mode(CatFileCmdMode::Type, "-t")?,
+                "-s" => options.set_cmd_mode(CatFileCmdMode::Size, "-s")?,
+                "-p" => options.set_cmd_mode(CatFileCmdMode::Pretty, "-p")?,
                 "-z" => options.input_nul = true,
                 "-Z" => {
                     options.input_nul = true;
@@ -154,89 +169,122 @@ impl CatFileOptions {
 
     fn set_batch_mode(&mut self, mode: CatFileBatchMode, format: Option<String>) -> Result<()> {
         if self.batch.replace((mode, format)).is_some() {
-            return cat_file_cannot_use_together("batch modes", mode.as_str());
+            return cat_file_only_one_batch_option();
         }
         Ok(())
     }
 
-    fn set_cmd_mode(&mut self, new: CatFileCmdMode) -> Result<()> {
-        if let Some(old) = self.cmd_mode.replace(new) {
-            return cat_file_cannot_use_together(old.as_str(), new.as_str());
+    fn set_cmd_mode(&mut self, new: CatFileCmdMode, name: &'static str) -> Result<()> {
+        match &self.cmd_mode {
+            Some(existing) if existing.mode != new => {
+                // `parse_options` names the option currently being parsed first and the
+                // previously-recorded one second.
+                cat_file_cannot_use_together(name, existing.name)
+            }
+            Some(_) => Ok(()),
+            None => {
+                self.cmd_mode = Some(CatFileCmdSelection { mode: new, name });
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn into_invocation(self) -> Result<CatFileInvocation> {
-        if let Some((mode, format)) = self.batch {
-            if let Some(cmd_mode) = self.cmd_mode {
-                return cat_file_cannot_use_together(mode.as_str(), cmd_mode.as_str());
+        let cmd_mode = self.cmd_mode.as_ref().map(|selection| selection.mode);
+        let opt_cw = matches!(
+            cmd_mode,
+            Some(CatFileCmdMode::Textconv | CatFileCmdMode::Filters)
+        );
+        let batch_all_objects = cmd_mode == Some(CatFileCmdMode::BatchAllObjects);
+
+        // `--path` requires `--textconv`/`--filters`; checked before the batch-mode and
+        // argument-count diagnostics by upstream.
+        if self.path.is_some() && !opt_cw {
+            return cat_file_path_needs_filters_or_textconv();
+        }
+
+        // Option compatibility with batch mode: each of these is only valid alongside a
+        // batch mode, and upstream checks them in exactly this order.
+        if self.batch.is_none() {
+            if self.follow_symlinks {
+                return cat_file_requires_batch_mode("--follow-symlinks");
             }
-            if self.path.is_some() {
-                return cat_file_incompatible_usage("--path requires --textconv or --filters");
+            if self.buffer.is_some() {
+                return cat_file_requires_batch_mode("--buffer");
+            }
+            if batch_all_objects {
+                return cat_file_requires_batch_mode("--batch-all-objects");
+            }
+            if self.input_nul && !self.output_nul {
+                return cat_file_requires_batch_mode("-z");
+            }
+            if self.output_nul {
+                return cat_file_requires_batch_mode("-Z");
+            }
+        }
+
+        if let Some((mode, format)) = self.batch {
+            // In batch mode a non-textconv/filters command mode is rejected; `-b`
+            // (`--batch-all-objects`) is permitted and folded into the batch request.
+            if let Some(selection) = self.cmd_mode.as_ref()
+                && !opt_cw
+                && !batch_all_objects
+            {
+                return cat_file_incompatible_with_batch_mode(selection.name);
             }
             if !self.positional.is_empty() {
-                return cat_file_too_many_arguments();
+                return cat_file_batch_modes_take_no_arguments();
             }
             return Ok(CatFileInvocation::Batch(CatFileBatchRequest {
                 mode,
                 format,
                 input_nul: self.input_nul,
                 output_nul: self.output_nul,
-                batch_all_objects: self.batch_all_objects,
-                buffer: self.buffer,
+                batch_all_objects,
+                buffer: self.buffer.unwrap_or(false),
             }));
         }
-        if self.batch_all_objects {
-            return cat_file_incompatible_usage("'--batch-all-objects' requires a batch mode");
-        }
-        if self.input_nul || self.output_nul {
-            return cat_file_incompatible_usage("'-z' requires a batch mode");
-        }
-        if self.buffer {
-            return cat_file_incompatible_usage("'--buffer' requires a batch mode");
-        }
-        if self.follow_symlinks {
-            return cat_file_incompatible_usage("'--follow-symlinks' requires a batch mode");
-        }
-        if let Some(mode) = self.cmd_mode {
-            if self.path.is_some()
-                && !matches!(mode, CatFileCmdMode::Textconv | CatFileCmdMode::Filters)
-            {
-                return cat_file_incompatible_usage("--path is incompatible with this mode");
+
+        if let Some(selection) = self.cmd_mode {
+            let mode = selection.mode;
+            if matches!(mode, CatFileCmdMode::BatchAllObjects) {
+                // Reachable only without a batch mode; already diagnosed above.
+                return cat_file_requires_batch_mode("--batch-all-objects");
             }
-            let object_name = single_object_argument(&self.positional)?;
+            match self.positional.len() {
+                0 => {
+                    return match mode {
+                        CatFileCmdMode::Textconv => {
+                            cat_file_rev_required_with("--textconv")
+                        }
+                        CatFileCmdMode::Filters => cat_file_rev_required_with("--filters"),
+                        _ => cat_file_object_required_with(selection.name),
+                    };
+                }
+                1 => {}
+                _ => return cat_file_too_many_arguments(),
+            }
             return Ok(CatFileInvocation::Object(CatFileObjectRequest {
                 mode: CatFileObjectMode::Command(mode),
-                object_name,
+                object_name: self.positional[0].clone(),
             }));
         }
-        if self.path.is_some() {
-            return cat_file_incompatible_usage("--path requires --textconv or --filters");
+
+        // `<type> <object>` mode: exactly two positional arguments are required.
+        match self.positional.len() {
+            0 => return cat_file_bare_usage(),
+            2 => {}
+            other => return cat_file_two_arguments_required(other),
         }
-        if self.positional.len() > 2 {
-            return cat_file_too_many_arguments();
-        }
-        if self.positional.len() != 2 {
-            return cat_file_missing_required_argument();
-        }
-        let Ok(object_type) = self.positional[0].parse::<ObjectType>() else {
-            return cat_file_incompatible_usage("type argument must name an object type");
+        let object_type = match self.positional[0].parse::<ObjectType>() {
+            Ok(object_type) => object_type,
+            Err(_) => return cat_file_unknown_type(&self.positional[0], &self.positional[1]),
         };
         Ok(CatFileInvocation::Object(CatFileObjectRequest {
             mode: CatFileObjectMode::Typed(object_type),
             object_name: self.positional[1].clone(),
         }))
     }
-}
-
-fn single_object_argument(positional: &[String]) -> Result<String> {
-    if positional.is_empty() {
-        return cat_file_missing_required_argument();
-    }
-    if positional.len() > 1 {
-        return cat_file_too_many_arguments();
-    }
-    Ok(positional[0].clone())
 }
 
 struct CatFileObjectRequest {
@@ -271,6 +319,12 @@ enum CatFileCmdMode {
     Pretty,
     Textconv,
     Filters,
+    /// `--batch-all-objects`. Upstream declares this as an `OPT_CMDMODE` (value `'b'`)
+    /// sharing the same slot as `-e/-p/-t/-s/--textconv/--filters`, so it participates in
+    /// the "cannot be used together" conflict detection. It never reaches the object
+    /// execution path: `into_invocation` either folds it into a batch request or rejects it
+    /// with "requires a batch mode".
+    BatchAllObjects,
 }
 
 impl CatFileCmdMode {
@@ -282,6 +336,7 @@ impl CatFileCmdMode {
             Self::Pretty => "-p",
             Self::Textconv => "--textconv",
             Self::Filters => "--filters",
+            Self::BatchAllObjects => "--batch-all-objects",
         }
     }
 }
@@ -376,6 +431,11 @@ impl ObjectQuery<'_> {
                     mode.as_str()
                 )));
             }
+            // Never reaches execution: `--batch-all-objects` is folded into a batch
+            // request or rejected during option validation.
+            CatFileCmdMode::BatchAllObjects => unreachable!(
+                "--batch-all-objects is handled during option validation, not execution"
+            ),
         }
         Ok(())
     }
@@ -517,16 +577,6 @@ enum CatFileBatchMode {
     Batch,
     BatchCheck,
     Command,
-}
-
-impl CatFileBatchMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Batch => "--batch",
-            Self::BatchCheck => "--batch-check",
-            Self::Command => "--batch-command",
-        }
-    }
 }
 
 struct CatFileBatchRecord<'a> {
@@ -805,24 +855,117 @@ pub(crate) fn cat_file_object_storage(
         })
 }
 
-fn cat_file_cannot_use_together<T>(left: &str, right: &str) -> Result<T> {
-    eprintln!("error: options '{left}' and '{right}' cannot be used together");
+/// The `cat-file` usage block, byte-for-byte as upstream git 2.54 emits it (the rendered
+/// `builtin_catfile_usage` + the option table). Appended after the `fatal:` line by every
+/// diagnostic that upstream routes through `usage_msg_opt*`/`usage_with_options`.
+const CAT_FILE_USAGE: &str = "\
+usage: git cat-file <type> <object>
+   or: git cat-file (-e | -p | -t | -s) <object>
+   or: git cat-file (--textconv | --filters)
+                    [<rev>:<path|tree-ish> | --path=<path|tree-ish> <rev>]
+   or: git cat-file (--batch | --batch-check | --batch-command) [--batch-all-objects]
+                    [--buffer] [--follow-symlinks] [--unordered]
+                    [--textconv | --filters] [-Z]
+
+Check object existence or emit object contents
+    -e                    check if <object> exists
+    -p                    pretty-print <object> content
+
+Emit [broken] object attributes
+    -t                    show object type (one of 'blob', 'tree', 'commit', 'tag', ...)
+    -s                    show object size
+    --[no-]use-mailmap    use mail map file
+    --[no-]mailmap ...    alias of --use-mailmap
+
+Batch objects requested on stdin (or --batch-all-objects)
+    --batch[=<format>]    show full <object> or <rev> contents
+    --batch-check[=<format>]
+                          like --batch, but don't emit <contents>
+    -Z                    stdin and stdout is NUL-terminated
+    --batch-command[=<format>]
+                          read commands from stdin
+    --batch-all-objects   with --batch[-check]: ignores stdin, batches all known objects
+
+Change or optimize batch output
+    --[no-]buffer         buffer --batch output
+    --[no-]follow-symlinks
+                          follow in-tree symlinks
+    --[no-]unordered      do not order objects before emitting them
+
+Emit object (blob or tree) with conversion or filter (stand-alone, or with batch)
+    --textconv            run textconv on object's content
+    --filters             run filters on object's content
+    --[no-]path blob|tree use a <path> for (--textconv | --filters); Not with 'batch'
+    --[no-]filter <args>  object filtering
+
+";
+
+/// Print `fatal: <message>`, a blank line, then the usage block; exit 129. Mirrors git's
+/// `usage_msg_opt`/`usage_msg_optf`.
+fn cat_file_usage_msg<T>(message: &str) -> Result<T> {
+    eprintln!("fatal: {message}\n");
+    eprint!("{CAT_FILE_USAGE}");
     Err(GitError::Exit(129))
 }
 
-fn cat_file_incompatible_usage<T>(message: &str) -> Result<T> {
-    eprintln!("fatal: {message}");
+/// `parse_options`-style cmdmode conflict: no usage block, just the `error:` line. The
+/// option being parsed is named first, the previously-recorded one second.
+fn cat_file_cannot_use_together<T>(current: &str, previous: &str) -> Result<T> {
+    eprintln!("error: options '{current}' and '{previous}' cannot be used together");
     Err(GitError::Exit(129))
 }
 
-fn cat_file_missing_required_argument<T>() -> Result<T> {
-    eprintln!("fatal: <object> required");
+fn cat_file_only_one_batch_option<T>() -> Result<T> {
+    eprintln!("error: only one batch option may be specified");
     Err(GitError::Exit(129))
+}
+
+fn cat_file_path_needs_filters_or_textconv<T>() -> Result<T> {
+    cat_file_usage_msg("'--path=<path|tree-ish>' needs '--filters' or '--textconv'")
+}
+
+fn cat_file_requires_batch_mode<T>(option: &str) -> Result<T> {
+    cat_file_usage_msg(&format!("'{option}' requires a batch mode"))
+}
+
+fn cat_file_incompatible_with_batch_mode<T>(option: &str) -> Result<T> {
+    cat_file_usage_msg(&format!("'{option}' is incompatible with batch mode"))
+}
+
+fn cat_file_batch_modes_take_no_arguments<T>() -> Result<T> {
+    cat_file_usage_msg("batch modes take no arguments")
+}
+
+fn cat_file_rev_required_with<T>(option: &str) -> Result<T> {
+    cat_file_usage_msg(&format!("<rev> required with '{option}'"))
+}
+
+fn cat_file_object_required_with<T>(option: &str) -> Result<T> {
+    cat_file_usage_msg(&format!("<object> required with '{option}'"))
 }
 
 fn cat_file_too_many_arguments<T>() -> Result<T> {
-    eprintln!("fatal: too many arguments");
+    cat_file_usage_msg("too many arguments")
+}
+
+fn cat_file_two_arguments_required<T>(argc: usize) -> Result<T> {
+    cat_file_usage_msg(&format!(
+        "only two arguments allowed in <type> <object> mode, not {argc}"
+    ))
+}
+
+/// The bare `git cat-file` (no command mode, no arguments) case: just the usage block,
+/// with no `fatal:` line. Mirrors git's `usage_with_options`.
+fn cat_file_bare_usage<T>() -> Result<T> {
+    eprint!("{CAT_FILE_USAGE}");
     Err(GitError::Exit(129))
+}
+
+/// `<type> <object>` mode with an unrecognized type string. Upstream resolves the type via
+/// `type_from_string`, which dies (exit 128) rather than emitting a usage error.
+fn cat_file_unknown_type<T>(exp_type: &str, _obj_name: &str) -> Result<T> {
+    eprintln!("fatal: invalid object type \"{exp_type}\"");
+    Err(GitError::Exit(128))
 }
 
 #[cfg(test)]
