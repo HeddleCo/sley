@@ -20,6 +20,7 @@ pub(crate) mod diff;
 pub(crate) mod diff_files;
 pub(crate) mod diff_index;
 pub(crate) mod diff_tree;
+pub(crate) mod for_each_ref;
 pub(crate) mod format_patch;
 pub(crate) mod grep;
 pub(crate) mod hash_object;
