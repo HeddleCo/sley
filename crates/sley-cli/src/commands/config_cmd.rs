@@ -804,21 +804,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
             }
             ConfigAction::RenameSection => {
-                let mut config = load_write_document(&source)?;
-                let old = parse_config_section_name(positional[0])?;
-                let new = parse_config_section_name(positional[1])?;
-                if !config_rename_section(&mut config, &old, &new) {
-                    return Err(GitError::Exit(128));
-                }
-                write_config_source(&source, &config)?;
+                config_rename_or_remove_section(
+                    &source,
+                    positional[0],
+                    Some(positional[1]),
+                )?;
             }
             ConfigAction::RemoveSection => {
-                let mut config = load_write_document(&source)?;
-                let section = parse_config_section_name(positional[0])?;
-                if !config_remove_section(&mut config, &section) {
-                    return Err(GitError::Exit(128));
-                }
-                write_config_source(&source, &config)?;
+                config_rename_or_remove_section(&source, positional[0], None)?;
             }
             _ => unreachable!("write actions handled above"),
         }
@@ -1268,35 +1261,6 @@ fn parse_config_bytes(
 
 /// The document writes operate on: the target file parsed alone, includes left
 /// in place. Missing files start empty.
-fn load_write_document(source: &ConfigSource) -> Result<GitConfig> {
-    let path = match source {
-        ConfigSource::Repository(git_dir) => git_dir.join("config"),
-        ConfigSource::ScopedFile { path, .. } => path.clone(),
-        ConfigSource::File(path) => path.clone(),
-        ConfigSource::Blob(_) => {
-            eprintln!("fatal: writing config blobs is not supported");
-            return Err(GitError::Exit(128));
-        }
-        ConfigSource::Stdin => {
-            eprintln!("fatal: writing to stdin is not supported");
-            return Err(GitError::Exit(128));
-        }
-    };
-    match fs::read(&path) {
-        Ok(bytes) => GitConfig::parse(&bytes).map_err(|err| {
-            report_config_parse_error(err, Some(&path))
-        }),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(GitConfig::default()),
-        Err(err) => {
-            eprintln!(
-                "fatal: unable to read config file '{}': {err}",
-                path.display()
-            );
-            Err(GitError::Exit(128))
-        }
-    }
-}
-
 /// Resolve the on-disk path a write action targets, or `None` for the
 /// unsupported Blob/Stdin sources (the caller already rejects those).
 fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
@@ -1359,6 +1323,108 @@ fn config_raw_edit(
             fs::write(&path, editor.into_bytes())?;
             Ok(true)
         }
+    }
+}
+
+/// git's `section_name_is_ok`: a new section name must be non-empty, and the
+/// part before the first `.` must be alphanumeric or `-`.
+fn section_name_is_ok(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    for ch in std::iter::once(first).chain(chars) {
+        if ch == '.' {
+            return true;
+        }
+        if ch != '-' && !ch.is_ascii_alphanumeric() {
+            return false;
+        }
+    }
+    true
+}
+
+/// The display form git uses for the section-name passed to rename/remove:
+/// `section[.subsection]`, section unchanged (rename is case-sensitive).
+fn section_name_string(name: &ConfigSectionName) -> String {
+    match &name.subsection {
+        Some(subsection) => format!("{}.{}", name.section, subsection),
+        None => name.section.clone(),
+    }
+}
+
+/// `git config --rename-section`/`--remove-section` via git's byte-faithful
+/// line-based section copier (`repo_config_copy_or_rename_section_in_file`),
+/// preserving every untouched byte.
+fn config_rename_or_remove_section(
+    source: &ConfigSource,
+    old: &str,
+    new: Option<&str>,
+) -> Result<()> {
+    // Validate the names the same way git does (subsection/section syntax).
+    let old_name = parse_config_section_name(old)?;
+    let new_name = match new {
+        Some(new) => {
+            let parsed = parse_config_section_name(new)?;
+            let rendered = section_name_string(&parsed);
+            if !section_name_is_ok(&rendered) {
+                eprintln!("error: invalid section name: {rendered}");
+                return Err(GitError::Exit(128));
+            }
+            Some(rendered)
+        }
+        None => None,
+    };
+    let old_rendered = section_name_string(&old_name);
+
+    let Some(path) = config_write_path(source) else {
+        match source {
+            ConfigSource::Stdin => eprintln!("fatal: writing to stdin is not supported"),
+            _ => eprintln!("fatal: writing config blobs is not supported"),
+        }
+        return Err(GitError::Exit(128));
+    };
+    let display_path = config_source_display_name(source, &path);
+    let contents = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        // git: a missing config file means nothing to rename — no error.
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            eprintln!(
+                "fatal: unable to read config file '{}': {err}",
+                path.display()
+            );
+            return Err(GitError::Exit(128));
+        }
+    };
+    match sley_config::raw_edit::rename_or_remove_section(
+        &contents,
+        &old_rendered,
+        new_name.as_deref(),
+    ) {
+        sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
+            fs::write(&path, out)?;
+            Ok(())
+        }
+        sley_config::raw_edit::SectionEditOutcome::NotFound => {
+            eprintln!("fatal: no such section: {old_rendered}");
+            Err(GitError::Exit(128))
+        }
+        sley_config::raw_edit::SectionEditOutcome::LineTooLong(line) => {
+            eprintln!(
+                "error: refusing to work with overly long line in '{display_path}' on line {line}"
+            );
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// The filename git prints in diagnostics for the given source: the explicit
+/// `--file` path verbatim, otherwise the display path.
+fn config_source_display_name(source: &ConfigSource, path: &Path) -> String {
+    match source {
+        ConfigSource::File(p) => p.display().to_string(),
+        _ => path.display().to_string(),
     }
 }
 
@@ -1494,24 +1560,6 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
             GitError::InvalidFormat(message)
         }
         other => other,
-    }
-}
-
-fn write_config_source(source: &ConfigSource, config: &GitConfig) -> Result<()> {
-    match source {
-        ConfigSource::Repository(git_dir) => write_repo_config(git_dir, config),
-        ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => {
-            fs::write(path, config.to_canonical_bytes())?;
-            Ok(())
-        }
-        ConfigSource::Blob(_) => {
-            eprintln!("fatal: writing config blobs is not supported");
-            Err(GitError::Exit(128))
-        }
-        ConfigSource::Stdin => {
-            eprintln!("fatal: writing to stdin is not supported");
-            Err(GitError::Exit(128))
-        }
     }
 }
 
@@ -1920,11 +1968,6 @@ fn config_section_matches(section: &ConfigSection, key: &ConfigKey) -> bool {
         && section.subsection.as_deref() == key.subsection.as_deref()
 }
 
-fn config_section_name_matches(section: &ConfigSection, name: &ConfigSectionName) -> bool {
-    section.name.eq_ignore_ascii_case(&name.section)
-        && section.subsection.as_deref() == name.subsection.as_deref()
-}
-
 fn config_get_urlmatch(
     entries: &[sley_config::ConfigStackEntry],
     target: &ConfigUrlMatchTarget,
@@ -2136,21 +2179,6 @@ fn config_url_hex_value(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
-}
-
-fn config_value_count(config: &GitConfig, key: &ConfigKey) -> usize {
-    config
-        .sections
-        .iter()
-        .filter(|section| config_section_matches(section, key))
-        .map(|section| {
-            section
-                .entries
-                .iter()
-                .filter(|entry| entry.key.eq_ignore_ascii_case(&key.key))
-                .count()
-        })
-        .sum()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2885,146 +2913,3 @@ pub(crate) fn config_set_value_with_comment(
     section.entries.push(entry);
 }
 
-fn config_replace_all_value(
-    config: &mut GitConfig,
-    key: &ConfigKey,
-    value: &str,
-    value_pattern: Option<&ConfigValueMatcher>,
-    comment: Option<&str>,
-) {
-    let Some(value_pattern) = value_pattern else {
-        config_set_value_with_comment(config, key, value, false, comment);
-        return;
-    };
-
-    let mut replaced = false;
-    let mut matched = false;
-    for section in &mut config.sections {
-        if !config_section_matches(section, key) {
-            continue;
-        }
-        section.entries.retain_mut(|entry| {
-            if !entry.key.eq_ignore_ascii_case(&key.key)
-                || !entry
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| value_pattern.is_match(value))
-            {
-                return true;
-            }
-            matched = true;
-            if replaced {
-                return false;
-            }
-            entry.key = key.key.clone();
-            entry.value = Some(value.to_string());
-            entry.comment = comment.map(str::to_string);
-            replaced = true;
-            true
-        });
-    }
-    if !matched {
-        config_set_value_with_comment(config, key, value, true, comment);
-    }
-}
-
-fn config_unset_value(
-    config: &mut GitConfig,
-    key: &ConfigKey,
-    all: bool,
-    value_pattern: Option<&ConfigValueMatcher>,
-) -> bool {
-    if let Some(value_pattern) = value_pattern {
-        return config_unset_value_matching(config, key, all, value_pattern);
-    }
-    let mut removed = false;
-    for section in &mut config.sections {
-        if !config_section_matches(section, key) {
-            continue;
-        }
-        if all {
-            let before = section.entries.len();
-            section
-                .entries
-                .retain(|entry| !entry.key.eq_ignore_ascii_case(&key.key));
-            removed |= section.entries.len() != before;
-        } else if let Some(position) = section
-            .entries
-            .iter()
-            .rposition(|entry| entry.key.eq_ignore_ascii_case(&key.key))
-        {
-            section.entries.remove(position);
-            return true;
-        }
-    }
-    if all {
-        config
-            .sections
-            .retain(|section| !config_section_matches(section, key) || !section.entries.is_empty());
-    }
-    removed
-}
-
-fn config_unset_value_matching(
-    config: &mut GitConfig,
-    key: &ConfigKey,
-    all: bool,
-    value_pattern: &ConfigValueMatcher,
-) -> bool {
-    let matches = config
-        .sections
-        .iter()
-        .filter(|section| config_section_matches(section, key))
-        .flat_map(|section| section.entries.iter())
-        .filter(|entry| entry.key.eq_ignore_ascii_case(&key.key))
-        .filter(|entry| {
-            entry
-                .value
-                .as_deref()
-                .is_some_and(|value| value_pattern.is_match(value))
-        })
-        .count();
-    if matches == 0 || (!all && matches != 1) {
-        return false;
-    }
-    for section in &mut config.sections {
-        if !config_section_matches(section, key) {
-            continue;
-        }
-        section.entries.retain(|entry| {
-            !entry.key.eq_ignore_ascii_case(&key.key)
-                || !entry
-                    .value
-                    .as_deref()
-                    .is_some_and(|value| value_pattern.is_match(value))
-        });
-    }
-    config
-        .sections
-        .retain(|section| !config_section_matches(section, key) || !section.entries.is_empty());
-    true
-}
-
-fn config_rename_section(
-    config: &mut GitConfig,
-    old: &ConfigSectionName,
-    new: &ConfigSectionName,
-) -> bool {
-    let mut renamed = false;
-    for section in &mut config.sections {
-        if config_section_name_matches(section, old) {
-            section.name = new.section.clone();
-            section.subsection = new.subsection.clone();
-            renamed = true;
-        }
-    }
-    renamed
-}
-
-fn config_remove_section(config: &mut GitConfig, name: &ConfigSectionName) -> bool {
-    let before = config.sections.len();
-    config
-        .sections
-        .retain(|section| !config_section_name_matches(section, name));
-    config.sections.len() != before
-}

@@ -508,6 +508,195 @@ impl RawConfigEditor {
     }
 }
 
+/// git's `GIT_CONFIG_MAX_LINE_LEN`.
+const GIT_CONFIG_MAX_LINE_LEN: usize = 512 * 1024;
+
+/// Outcome of [`rename_or_remove_section`].
+pub enum SectionEditOutcome {
+    /// One or more sections matched; the new file bytes are returned.
+    Changed(Vec<u8>),
+    /// No section matched `old_name` (git's `ret == 0` → exit 128).
+    NotFound,
+    /// A line exceeded `GIT_CONFIG_MAX_LINE_LEN`; carries the 1-based line
+    /// number for git's "refusing to work with overly long line" diagnostic.
+    LineTooLong(usize),
+}
+
+/// git's `repo_config_copy_or_rename_section_in_file` (copy = false): rename
+/// every `[old_name]` header to `[new_name]` (when `new_name` is `Some`) or
+/// remove the matching sections (`new_name == None`), preserving every other
+/// byte. `old_name`/`new_name` are git's normalised `section[.subsection]`
+/// form (section lower-cased).
+pub fn rename_or_remove_section(
+    contents: &[u8],
+    old_name: &str,
+    new_name: Option<&str>,
+) -> SectionEditOutcome {
+    let mut out: Vec<u8> = Vec::with_capacity(contents.len() + 16);
+    let mut matched = 0usize;
+    let mut removing = false;
+    let mut line_nr = 0usize;
+    let mut pos = 0usize;
+    let len = contents.len();
+
+    while pos < len {
+        // Read one whole physical line including its trailing '\n'.
+        let line_start = pos;
+        while pos < len && contents[pos] != b'\n' {
+            pos += 1;
+        }
+        if pos < len {
+            pos += 1; // include the '\n'
+        }
+        let line = &contents[line_start..pos];
+        line_nr += 1;
+
+        if line.len() >= GIT_CONFIG_MAX_LINE_LEN {
+            return SectionEditOutcome::LineTooLong(line_nr);
+        }
+
+        // Find the first non-space char (git skips leading whitespace).
+        let mut i = 0usize;
+        while i < line.len() && (line[i] as char).is_whitespace() {
+            i += 1;
+        }
+        if i < line.len() && line[i] == b'[' {
+            let offset = section_name_match(&line[i..], old_name);
+            if offset > 0 {
+                matched += 1;
+                if let Some(new_name) = new_name {
+                    write_section_normalised(&mut out, new_name);
+                    // Skip the old section header; emit the remainder of the line
+                    // (an inline declaration) indented with a tab. git gobbles the
+                    // trailing newline into `offset` for a bare header, so a header
+                    // with nothing after it leaves `consumed == line.len()`.
+                    let consumed = i + offset;
+                    if consumed < line.len() {
+                        // There is more content on this line beyond the header.
+                        out.push(b'\t');
+                        out.extend_from_slice(&line[consumed..]);
+                    }
+                    removing = false;
+                    continue;
+                } else {
+                    // Remove mode: drop this header and following lines until the
+                    // next section.
+                    removing = true;
+                    continue;
+                }
+            }
+            removing = false;
+        }
+        if removing {
+            continue;
+        }
+        out.extend_from_slice(line);
+    }
+
+    if matched == 0 {
+        SectionEditOutcome::NotFound
+    } else {
+        SectionEditOutcome::Changed(out)
+    }
+}
+
+/// git's `section_name_match`: returns the byte length consumed (including
+/// trailing whitespace after `]`) when `buf` (starting at `[`) is a header for
+/// `name` (`section[.subsection]`), else 0.
+fn section_name_match(buf: &[u8], name: &str) -> usize {
+    // Treat `buf` as a NUL-terminated C string: `gb(k)` returns 0 past the end,
+    // mirroring git's reliance on the trailing NUL to stop the scan.
+    let nb = name.as_bytes();
+    let gb = |k: usize| -> u8 { *buf.get(k).unwrap_or(&0) };
+    let gn = |k: usize| -> u8 { *nb.get(k).unwrap_or(&0) };
+
+    if gb(0) != b'[' {
+        return 0;
+    }
+    // Faithful port of git's `for (i = 1; buf[i] && buf[i] != ']'; i++)`: the
+    // loop's `i++` fires at the end of EVERY iteration, including after the
+    // `continue` in the dot-transition branch (this is the subtle part — the
+    // opening `"` of a quoted subsection is skipped by that trailing `i++`).
+    let mut i = 1usize;
+    let mut j = 0usize;
+    let mut dot = false;
+    // git's `isspace`: space, tab, newline, CR, form-feed, vertical-tab. The
+    // trailing-whitespace gobble after `]` deliberately swallows the line's `\n`,
+    // so a bare header consumes its whole line (leaving no inline remainder).
+    let is_space =
+        |c: u8| c == b' ' || c == b'\t' || c == b'\n' || c == b'\r' || c == 0x0c || c == 0x0b;
+    'outer: while gb(i) != 0 && gb(i) != b']' {
+        // `continue` in C re-runs the for-increment; emulate with a flag.
+        let mut did_continue = false;
+        if !dot && is_space(gb(i)) {
+            dot = true;
+            let nj = gn(j);
+            j += 1;
+            if nj != b'.' {
+                break;
+            }
+            // for (i++; isspace(buf[i]); i++);
+            i += 1;
+            while is_space(gb(i)) {
+                i += 1;
+            }
+            if gb(i) != b'"' {
+                break;
+            }
+            did_continue = true;
+        }
+        if !did_continue {
+            if gb(i) == b'\\' && dot {
+                i += 1;
+            } else if gb(i) == b'"' && dot {
+                i += 1;
+                while is_space(gb(i)) {
+                    i += 1;
+                }
+                break 'outer;
+            }
+            // buf[i] != name[j++]
+            let bc = gb(i);
+            let nc = gn(j);
+            j += 1;
+            if bc != nc {
+                break 'outer;
+            }
+        }
+        i += 1; // the for-loop increment, run for every iteration
+    }
+    if gb(i) == b']' && gn(j) == 0 {
+        i += 1;
+        while gb(i) != 0 && is_space(gb(i)) {
+            i += 1;
+        }
+        return i;
+    }
+    0
+}
+
+/// git's `store_create_section`/`write_section` for the rename path: render the
+/// normalised `section[.subsection]` name as `[section "subsection"]` (or
+/// `[section]`) followed by a newline.
+fn write_section_normalised(out: &mut Vec<u8>, name: &str) {
+    out.push(b'[');
+    if let Some((section, subsection)) = name.split_once('.') {
+        out.extend_from_slice(section.as_bytes());
+        out.extend_from_slice(b" \"");
+        for ch in subsection.chars() {
+            if ch == '"' || ch == '\\' {
+                out.push(b'\\');
+            }
+            let mut b = [0u8; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut b).as_bytes());
+        }
+        out.push(b'"');
+    } else {
+        out.extend_from_slice(name.as_bytes());
+    }
+    out.extend_from_slice(b"]\n");
+}
+
 /// git's `write_pair`: always `\t<name> = <quoted-value>[<comment>]\n`.
 fn write_pair(out: &mut Vec<u8>, name: &str, value: &str, comment: Option<&str>) {
     out.push(b'\t');
@@ -810,3 +999,46 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod section_tests {
+    use super::*;
+
+    fn rr(src: &str, old: &str, new: Option<&str>) -> SectionEditOutcome {
+        rename_or_remove_section(src.as_bytes(), old, new)
+    }
+
+    #[test]
+    fn rename_quoted_and_dotted_forms() {
+        let src = "# Hallo\n\t#Bello\n[branch \"eins\"]\n\tx = 1\n[branch.eins]\n\ty = 1\n\t[branch \"1 234 blabl/a\"]\nweird\n";
+        let SectionEditOutcome::Changed(out) = rr(src, "branch.eins", Some("branch.zwei")) else {
+            panic!("expected Changed");
+        };
+        let expect = "# Hallo\n\t#Bello\n[branch \"zwei\"]\n\tx = 1\n[branch \"zwei\"]\n\ty = 1\n\t[branch \"1 234 blabl/a\"]\nweird\n";
+        assert_eq!(String::from_utf8(out).unwrap(), expect);
+    }
+
+    #[test]
+    fn rename_inline_var_indents_remainder() {
+        let src = "[branch \"vier\"] z = 1\n";
+        let SectionEditOutcome::Changed(out) = rr(src, "branch.vier", Some("branch.zwei")) else {
+            panic!("expected Changed");
+        };
+        assert_eq!(String::from_utf8(out).unwrap(), "[branch \"zwei\"]\n\tz = 1\n");
+    }
+
+    #[test]
+    fn remove_section_drops_lines() {
+        let src = "[a]\n\tx = 1\n[b]\n\ty = 2\n";
+        let SectionEditOutcome::Changed(out) = rr(src, "a", None) else {
+            panic!("expected Changed");
+        };
+        assert_eq!(String::from_utf8(out).unwrap(), "[b]\n\ty = 2\n");
+    }
+
+    #[test]
+    fn rename_nonexistent_is_not_found() {
+        let src = "[a]\n\tx = 1\n";
+        assert!(matches!(rr(src, "zzz", Some("q.r")), SectionEditOutcome::NotFound));
+    }
+}
