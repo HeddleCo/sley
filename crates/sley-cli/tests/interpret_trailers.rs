@@ -13,7 +13,6 @@
 //! `git --version` is unavailable.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -74,18 +73,10 @@ fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Out
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("failed to spawn {program} {args:?}: {err}"));
-    // Some invocations (invalid enum, missing option value, `--only-input
-    // --trailer`) are usage errors that exit 129 *before* draining stdin. The
-    // child can close its read end before this `write_all` completes, so the
-    // write legitimately races to a `BrokenPipe`/`EPIPE`. Both `git` and `sley`
-    // behave this way identically (verified by strace: neither reads fd 0 before
-    // exiting), so a broken pipe here is the child's expected early exit, not a
-    // failure — swallow it and let `wait_with_output` capture the real result.
-    match child.stdin.as_mut().expect("stdin is piped").write_all(stdin) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
-        Err(err) => panic!("write stdin: {err}"),
-    }
+    sley_testkit::write_stdin_tolerating_early_exit(
+        child.stdin.as_mut().expect("stdin is piped"),
+        stdin,
+    );
     child
         .wait_with_output()
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
