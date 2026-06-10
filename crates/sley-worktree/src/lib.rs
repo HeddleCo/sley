@@ -3745,6 +3745,41 @@ pub fn apply_clean_filter(
     apply_clean_filter_with_attributes(config, &checks, path, content)
 }
 
+/// A reusable handle that captures the worktree's `.gitattributes` chain once so
+/// repeated clean-filter calls (e.g. `hash-object --stdin-paths` hashing many
+/// paths in one process) don't re-walk the worktree and re-read every
+/// `.gitattributes`/global config per path.
+///
+/// Build it once with [`WorktreeAttributes::from_worktree_root`], then call
+/// [`WorktreeAttributes::apply_clean_filter`] per path. This mirrors
+/// [`apply_clean_filter`] exactly except the expensive attribute-source scan is
+/// amortized across calls.
+pub struct WorktreeAttributes {
+    matcher: AttributeMatcher,
+}
+
+impl WorktreeAttributes {
+    /// Read the worktree's attribute sources once (global/`core.attributesFile`,
+    /// every in-tree `.gitattributes`, and `$GIT_DIR/info/attributes`).
+    pub fn from_worktree_root(worktree_root: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            matcher: AttributeMatcher::from_worktree_root(worktree_root.as_ref())?,
+        })
+    }
+
+    /// Apply the clean conversion to `content` for `path`, reusing the cached
+    /// attribute chain. Behaviourally identical to [`apply_clean_filter`].
+    pub fn apply_clean_filter(
+        &self,
+        config: &GitConfig,
+        path: &[u8],
+        content: &[u8],
+    ) -> Result<Vec<u8>> {
+        let checks = self.matcher.attributes_for_path(path, &filter_attribute_names(), false);
+        apply_clean_filter_with_attributes(config, &checks, path, content)
+    }
+}
+
 /// Like [`apply_clean_filter`] but takes already-resolved attribute checks,
 /// letting callers that have computed attributes once reuse them.
 pub fn apply_clean_filter_with_attributes(

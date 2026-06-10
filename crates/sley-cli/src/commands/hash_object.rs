@@ -388,20 +388,20 @@ impl HashObjectFilterPolicy {
         else {
             return Ok(body);
         };
-        sley_worktree::apply_clean_filter(
-            &context.worktree_root,
-            &context.git_dir,
-            &context.config,
-            &git_path,
-            &body,
-        )
+        context
+            .attributes
+            .apply_clean_filter(&context.config, &git_path, &body)
     }
 }
 
 struct HashObjectFilterContext {
     worktree_root: PathBuf,
-    git_dir: PathBuf,
     config: GitConfig,
+    // The worktree's `.gitattributes` chain, scanned once. `hash-object
+    // --stdin-paths` hashes many paths in one process; without this the clean
+    // filter re-walked the entire worktree and re-read every `.gitattributes`
+    // per path (sley#25: ~163x slower than git for 200 paths).
+    attributes: sley_worktree::WorktreeAttributes,
 }
 
 impl HashObjectFilterContext {
@@ -419,10 +419,11 @@ impl HashObjectFilterContext {
         let Ok(worktree_root) = worktree_root_for_git_dir(git_dir) else {
             return Ok(None);
         };
+        let attributes = sley_worktree::WorktreeAttributes::from_worktree_root(&worktree_root)?;
         Ok(Some(Self {
             worktree_root,
-            git_dir: git_dir.to_path_buf(),
             config: read_repo_config(git_dir)?,
+            attributes,
         }))
     }
 }
