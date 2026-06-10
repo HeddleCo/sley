@@ -11,6 +11,21 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}", std::process::id()))
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = dst.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
 fn run(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new(program)
         .current_dir(cwd)
@@ -170,6 +185,100 @@ fn rev_parse_inside_repository_flags_match_upstream_git() {
                 );
             }
         }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+// Mirrors upstream t1500-rev-parse.sh's `test_rev_parse` matrix (lines 92-108):
+// explicit `core.bare = true/false/unset` config, optionally combined with a
+// GIT_DIR pointing at the worktree's `.git` or a detached `repo.git` copy.
+// git's rules:
+//   * a bare repository is never inside a work tree (`--is-inside-work-tree`=false),
+//   * with `core.bare` unset, bareness is only inferred from directory layout
+//     during discovery; an explicit GIT_DIR defaults to non-bare.
+#[test]
+fn rev_parse_core_bare_config_matches_upstream_git() {
+    let root = unique_temp_dir("rev-parse-core-bare");
+    fs::create_dir_all(&root).expect("create temp root");
+    {
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "abc",
+            ],
+        );
+        // A detached copy of `.git`, mirroring upstream's `cp -R .git repo.git`.
+        let repo_git = root.join("repo.git");
+        copy_dir_recursive(&root.join(".git"), &repo_git).expect("copy .git to repo.git");
+        let work = root.join("work");
+        fs::create_dir_all(&work).expect("create work dir");
+
+        let flags = [
+            ["rev-parse", "--is-bare-repository"],
+            ["rev-parse", "--is-inside-git-dir"],
+            ["rev-parse", "--is-inside-work-tree"],
+        ];
+
+        // Set `core.bare` to the requested state on the repo whose config the
+        // active GIT_DIR resolves to, then compare sley to the oracle for each
+        // flag under the same cwd + env.
+        let check = |bare: Option<bool>, config_dir: &Path, cwd: &Path, env_git_dir: Option<&str>| {
+            match bare {
+                Some(true) => {
+                    git(config_dir, &["config", "core.bare", "true"]);
+                }
+                Some(false) => {
+                    git(config_dir, &["config", "core.bare", "false"]);
+                }
+                None => {
+                    // Tolerate an already-unset key (exit 5), like `test_unconfig`.
+                    let _ = run_status(sley_testkit::oracle_git(), config_dir, &["config", "--unset", "core.bare"]);
+                }
+            }
+            for args in &flags {
+                let (expected, actual) = match env_git_dir {
+                    Some(git_dir) => {
+                        let envs = [("GIT_DIR", git_dir)];
+                        (
+                            run_status_with_env(sley_testkit::oracle_git(), cwd, args, &envs),
+                            run_status_with_env(env!("CARGO_BIN_EXE_sley"), cwd, args, &envs),
+                        )
+                    }
+                    None => (
+                        run_status(sley_testkit::oracle_git(), cwd, args),
+                        run_status(env!("CARGO_BIN_EXE_sley"), cwd, args),
+                    ),
+                };
+                assert_eq!(
+                    actual,
+                    expected,
+                    "sley result differed for {args:?} (core.bare={bare:?}, GIT_DIR={env_git_dir:?}) in {}",
+                    cwd.display()
+                );
+            }
+        };
+
+        // toplevel: core.bare true / unset (upstream L92, L94)
+        check(Some(true), &root, &root, None);
+        check(None, &root, &root, None);
+
+        // GIT_DIR=../.git from work: core.bare false / true / unset (upstream L97-101)
+        check(Some(false), &root, &work, Some("../.git"));
+        check(Some(true), &root, &work, Some("../.git"));
+        check(None, &root, &work, Some("../.git"));
+
+        // GIT_DIR=../repo.git from work: core.bare false / true / unset (upstream L104-108)
+        check(Some(false), &repo_git, &work, Some("../repo.git"));
+        check(Some(true), &repo_git, &work, Some("../repo.git"));
+        check(None, &repo_git, &work, Some("../repo.git"));
     };
     let _ = fs::remove_dir_all(&root);
 }

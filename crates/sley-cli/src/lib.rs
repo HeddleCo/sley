@@ -23532,6 +23532,12 @@ fn is_inside_work_tree(cwd: &Path, git_dir: &Path) -> Result<bool> {
         let cwd = fs::canonicalize(cwd)?;
         return Ok(cwd.starts_with(root));
     }
+    // A bare repository has no work tree, so we are never inside one. This
+    // covers `core.bare = true` set on a `.git`-named directory, which the
+    // directory-layout probe below would otherwise treat as having a worktree.
+    if is_bare_repository(git_dir)? {
+        return Ok(false);
+    }
     if worktree_root_for_git_dir(git_dir).is_err() {
         return Ok(false);
     }
@@ -23547,6 +23553,13 @@ fn is_bare_repository(git_dir: &Path) -> Result<bool> {
         && let Some(bare) = config.get_bool("core", None, "bare")
     {
         return Ok(bare);
+    }
+    // With `core.bare` unset, git only infers bareness from the directory layout
+    // during *discovery* (walking up to find a repo). When the git dir was named
+    // explicitly via `--git-dir`/`GIT_DIR`, git applies no name heuristic and
+    // defaults to non-bare.
+    if explicit_git_dir().is_some() {
+        return Ok(false);
     }
     Ok(git_dir.file_name().and_then(|name| name.to_str()) != Some(".git"))
 }
