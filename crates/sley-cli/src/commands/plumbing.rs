@@ -1,0 +1,3246 @@
+//! Extracted from the crate root (sley#8 phase 1) — code motion only.
+
+// A glob of the crate root brings every shared helper/type into scope via
+// descendant-privacy; see commands::stash for the rationale.
+use crate::*;
+
+pub(crate) fn cmd_archive(args: &[String]) -> Result<()> {
+    let mut format_name = "tar";
+    let mut prefix = Vec::new();
+    let mut output = None;
+    let mut treeish = None;
+    let mut pathspecs = Vec::new();
+    let mut positional_only = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if positional_only {
+            if treeish.is_none() {
+                treeish = Some(arg.as_str());
+            } else {
+                pathspecs.push(arg.as_bytes().to_vec());
+            }
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--format" => {
+                format_name = iter
+                    .next()
+                    .map(String::as_str)
+                    .ok_or_else(|| GitError::Command("archive --format requires a value".into()))?;
+            }
+            "--prefix" => {
+                prefix = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("archive --prefix requires a value".into()))?
+                    .as_bytes()
+                    .to_vec();
+            }
+            "-o" | "--output" => {
+                output = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("archive --output requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--format=") => {
+                format_name = &value["--format=".len()..];
+            }
+            value if value.starts_with("--prefix=") => {
+                prefix = value.as_bytes()["--prefix=".len()..].to_vec();
+            }
+            value if value.starts_with("--output=") => {
+                output = Some(value["--output=".len()..].to_string());
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "unsupported archive option {value}"
+                )));
+            }
+            value => {
+                if treeish.is_none() {
+                    treeish = Some(value);
+                } else {
+                    pathspecs.push(value.as_bytes().to_vec());
+                }
+            }
+        }
+    }
+    if format_name != "tar" {
+        return Err(GitError::Command(format!(
+            "archive currently supports --format=tar, not {format_name}"
+        )));
+    }
+    let treeish = treeish.ok_or_else(|| GitError::Command("archive requires a tree-ish".into()))?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let current_prefix = worktree_prefix(&cwd, &git_dir)?.into_bytes();
+    let pathspecs = archive_pathspecs_for_current_prefix(&current_prefix, pathspecs);
+    let oid = resolve_revision(&git_dir, format, treeish)?;
+    let object = db.read_object(&oid)?;
+    let (tree_oid, mtime, commit_id) = match object.object_type {
+        ObjectType::Commit => {
+            let commit = Commit::parse_ref(format, &object.body)?;
+            let mtime = commit_graph_commit_time_from_committer(commit.committer)?;
+            (commit.tree, mtime, Some(oid))
+        }
+        ObjectType::Tree => (oid, current_unix_seconds().max(0) as u64, None),
+        ObjectType::Tag => {
+            let tree_oid = sley_rev::peel_to_tree(&db, format, &oid)?;
+            (tree_oid, current_unix_seconds().max(0) as u64, None)
+        }
+        other => {
+            return Err(GitError::InvalidObject(format!(
+                "expected tree-ish {oid}, found {}",
+                other.as_str()
+            )));
+        }
+    };
+    let options = sley_archive::TarArchiveOptions {
+        prefix,
+        strip_prefix: current_prefix,
+        mtime,
+        commit_id,
+        pathspecs,
+    };
+    if let Some(path) = output {
+        let mut file = fs::File::create(path)?;
+        handle_archive_result(sley_archive::write_tar_archive(
+            &mut file, &db, format, &tree_oid, options,
+        ))
+    } else {
+        let stdout = io::stdout();
+        let mut lock = stdout.lock();
+        handle_archive_result(sley_archive::write_tar_archive(
+            &mut lock, &db, format, &tree_oid, options,
+        ))?;
+        lock.flush()?;
+        Ok(())
+    }
+}
+
+fn handle_archive_result(result: Result<()>) -> Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(GitError::InvalidPath(message)) if message.starts_with("pathspec ") => {
+            eprintln!("fatal: {message}");
+            Err(GitError::Exit(128))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn archive_pathspecs_for_current_prefix(
+    current_prefix: &[u8],
+    pathspecs: Vec<Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    if current_prefix.is_empty() {
+        return pathspecs;
+    }
+    if pathspecs.is_empty() {
+        return vec![
+            current_prefix
+                .strip_suffix(b"/")
+                .unwrap_or(current_prefix)
+                .to_vec(),
+        ];
+    }
+    pathspecs
+        .into_iter()
+        .map(|pathspec| {
+            let pathspec = pathspec.strip_prefix(b"./").unwrap_or(&pathspec);
+            let mut full = Vec::with_capacity(current_prefix.len() + pathspec.len());
+            full.extend_from_slice(current_prefix);
+            full.extend_from_slice(pathspec);
+            full
+        })
+        .collect()
+}
+
+fn init_repo_is_implicitly_bare(cwd: &Path) -> Result<bool> {
+    // Determine the effective git directory git would inspect.
+    if let Some(git_dir) = environment_git_dir() {
+        return Ok(guess_repository_type(&git_dir, cwd));
+    }
+    // No GIT_DIR: git_dir defaults to ".git". Only a linked-worktree gitfile (whose
+    // target has a `commondir`) redirects the inspection to the common repository;
+    // a plain separate-git-dir gitfile does not.
+    let dot_git = cwd.join(".git");
+    if dot_git.is_file()
+        && let Some(target) = read_gitdir_file(&dot_git)?
+        && target.join("commondir").is_file()
+    {
+        let common = common_git_dir_for_git_dir(&target)?;
+        return Ok(guess_repository_type(&common, cwd));
+    }
+    // Otherwise git_dir is ".git", which guess_repository_type treats as non-bare.
+    Ok(false)
+}
+
+fn guess_repository_type(git_dir: &Path, cwd: &Path) -> bool {
+    // "GIT_DIR=. git init" — and "GIT_DIR=$(pwd) git init" — are always bare.
+    if git_dir == Path::new(".") {
+        return true;
+    }
+    if git_dir == cwd {
+        return true;
+    }
+    // "GIT_DIR=.git" or "GIT_DIR=something/.git" is usually NOT bare.
+    if git_dir == Path::new(".git") {
+        return false;
+    }
+    if git_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".git")
+    {
+        return false;
+    }
+    // Otherwise it is often bare. At this point git is just guessing.
+    true
+}
+
+pub(crate) fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
+    let mut bare = global_bare();
+    // git distinguishes an *explicitly requested* bare repo (`--bare`/global
+    // `--bare`) from one merely *guessed* from the environment. The former pairs
+    // with `--separate-git-dir` as "cannot be used together"; the latter as
+    // "incompatible with bare repository". Track the explicit signal separately
+    // from the `.git`-suffix path heuristic applied further down.
+    let mut bare_explicit = global_bare();
+    let mut object_format = None::<String>;
+    let mut ref_format = None::<Option<String>>;
+    let mut initial_branch = None::<String>;
+    let mut initial_branch_explicit = false;
+    let mut quiet = false;
+    let mut path = PathBuf::from(".");
+    let mut path_given = false;
+    let mut template = None::<Option<String>>;
+    let mut template_config = true;
+    let mut separate_git_dir = None::<String>;
+    let mut shared_repository = None::<Option<String>>;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--bare" => {
+                bare = true;
+                bare_explicit = true;
+            }
+            "-q" | "--quiet" => quiet = true,
+            "-s" | "--shared" => shared_repository = Some(Some("group".into())),
+            "--no-shared" => shared_repository = Some(None),
+            "-b" | "--initial-branch" => {
+                initial_branch = Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?
+                        .to_string(),
+                );
+                initial_branch_explicit = true;
+            }
+            "--object-format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
+                object_format = Some(value.to_string());
+            }
+            "--template" => {
+                template = Some(Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command("--template requires a value".into()))?
+                        .to_string(),
+                ));
+                template_config = true;
+            }
+            "--no-template" => {
+                template = Some(None);
+                template_config = false;
+            }
+            "--separate-git-dir" => {
+                separate_git_dir = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("--separate-git-dir requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            "--no-separate-git-dir" => separate_git_dir = None,
+            "--ref-format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--ref-format requires a value".into()))?;
+                ref_format = Some(Some(value.to_string()));
+            }
+            "--no-ref-format" => ref_format = Some(None),
+            value if value.starts_with("--initial-branch=") => {
+                initial_branch = Some(
+                    value
+                        .strip_prefix("--initial-branch=")
+                        .ok_or_else(|| {
+                            GitError::Command("--initial-branch requires a value".into())
+                        })?
+                        .to_string(),
+                );
+                initial_branch_explicit = true;
+            }
+            value if value.starts_with("--object-format=") => {
+                let value = value
+                    .strip_prefix("--object-format=")
+                    .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
+                object_format = Some(value.to_string());
+            }
+            value if value.starts_with("--template=") => {
+                template = Some(Some(
+                    value
+                        .strip_prefix("--template=")
+                        .ok_or_else(|| GitError::Command("--template requires a value".into()))?
+                        .to_string(),
+                ));
+                template_config = true;
+            }
+            value if value.starts_with("--separate-git-dir=") => {
+                separate_git_dir = Some(
+                    value
+                        .strip_prefix("--separate-git-dir=")
+                        .ok_or_else(|| {
+                            GitError::Command("--separate-git-dir requires a value".into())
+                        })?
+                        .to_string(),
+                );
+            }
+            value if value.starts_with("--shared=") => {
+                shared_repository = Some(Some(
+                    value
+                        .strip_prefix("--shared=")
+                        .ok_or_else(|| GitError::Command("--shared requires a value".into()))?
+                        .to_string(),
+                ));
+            }
+            value if value.starts_with("--ref-format=") => {
+                ref_format = Some(Some(
+                    value
+                        .strip_prefix("--ref-format=")
+                        .ok_or_else(|| GitError::Command("--ref-format requires a value".into()))?
+                        .to_string(),
+                ));
+            }
+            value => {
+                path = PathBuf::from(value);
+                path_given = true;
+            }
+        }
+    }
+
+    if !bare
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".git"))
+    {
+        bare = true;
+    }
+
+    // Mirror refs.c `repo_default_branch_name`: an explicit `--initial-branch`
+    // wins; otherwise `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` (when non-empty),
+    // then `init.defaultBranch`, then "master" (which triggers the
+    // `advice.defaultBranchName` hint, emitted after a successful fresh init).
+    // A name sourced from the env/config default dies with git's
+    // `invalid branch name: init.defaultBranch = <name>`; an explicit
+    // `--initial-branch` dies with `invalid initial branch name: '<name>'`
+    // (init-db.c).
+    let mut branch_defaulted = false;
+    let initial_branch = match initial_branch {
+        Some(branch) => {
+            if check_refname_format(&format!("refs/heads/{branch}"), false).is_err() {
+                eprintln!("fatal: invalid initial branch name: '{branch}'");
+                return Err(GitError::Exit(128));
+            }
+            branch
+        }
+        None => {
+            let default_name = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map_or_else(
+                    || init_config_value("init.defaultBranch", global_config),
+                    |name| Ok(Some(name)),
+                )?
+                .filter(|value| !value.is_empty());
+            match default_name {
+                Some(name) => {
+                    if check_refname_format(&format!("refs/heads/{name}"), false).is_err() {
+                        eprintln!("fatal: invalid branch name: init.defaultBranch = {name}");
+                        return Err(GitError::Exit(128));
+                    }
+                    name
+                }
+                None => {
+                    branch_defaulted = true;
+                    "master".to_string()
+                }
+            }
+        }
+    };
+
+    let cwd = env::current_dir()?;
+    let worktree = resolve_cli_path(&cwd, path.to_string_lossy().as_ref());
+    let separate_git_dir = separate_git_dir.map(|value| resolve_cli_path(&cwd, &value));
+
+    if separate_git_dir.is_some() {
+        if bare_explicit {
+            // init-db.c: `real_git_dir && is_bare_repository_cfg == 1` where the
+            // `1` came from the `--bare` option.
+            eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+        // init-db.c later sets `is_bare_repository_cfg = guess_repository_type(git_dir)`
+        // when bare was not explicit, then rejects `--separate-git-dir` against an
+        // implicitly-bare repository (e.g. `GIT_DIR=.`, or inside a linked worktree
+        // whose common repository is bare).
+        if init_repo_is_implicitly_bare(&cwd)? {
+            eprintln!("fatal: --separate-git-dir incompatible with bare repository");
+            return Err(GitError::Exit(128));
+        }
+    }
+
+    // init-db.c: GIT_WORK_TREE (or --work-tree) only makes sense together with
+    // GIT_DIR and without an explicit `--bare`. After chdir'ing into the target
+    // directory, `--bare` pins GIT_DIR to that directory (overwriting the
+    // environment when a directory argument was given); the effective git dir
+    // then comes from GIT_DIR and its *string* form drives the bare guess.
+    let env_git_dir = explicit_git_dir();
+    let env_work_tree = explicit_work_tree();
+    if env_work_tree.is_some() && (bare_explicit || env_git_dir.is_none()) {
+        eprintln!(
+            "fatal: GIT_WORK_TREE (or --work-tree=<directory>) not allowed without specifying GIT_DIR (or --git-dir=<directory>)"
+        );
+        return Err(GitError::Exit(128));
+    }
+
+    let mut worktree = worktree;
+    let mut git_dir_override = None::<PathBuf>;
+    let mut core_worktree = None::<String>;
+    // Re-initializing from *inside* a linked worktree operates on the shared
+    // repository: git's setup discovers the common git dir and the *main*
+    // worktree, so `init --separate-git-dir` there relocates the common dir and
+    // repoints the main worktree's `.git` (init-db.c works on the discovered
+    // repository, not the linked-worktree admin dir). Redirect `worktree` to the
+    // main worktree root before bootstrap so `.git` resolves to the common dir.
+    if !bare && env_git_dir.is_none() && env_work_tree.is_none() {
+        let dot_git = worktree.join(".git");
+        if dot_git.is_file()
+            && let Some(admin_dir) = read_gitdir_file(&dot_git)?
+            && admin_dir.join("commondir").is_file()
+        {
+            let common = common_git_dir_for_git_dir(&admin_dir)?;
+            if let Some(main_root) = common.parent() {
+                worktree = main_root.to_path_buf();
+            }
+        }
+    }
+    if bare_explicit {
+        // `--bare` without a directory argument leaves an existing GIT_DIR in
+        // charge of where the (bare) repository lives.
+        if !path_given && let Some(raw) = env_git_dir.clone() {
+            git_dir_override = Some(resolve_cli_path(&worktree, raw.to_string_lossy().as_ref()));
+        }
+    } else if let Some(raw) = env_git_dir.clone()
+        && separate_git_dir.is_none()
+        && !bare
+    {
+        let git_dir_abs = resolve_cli_path(&worktree, raw.to_string_lossy().as_ref());
+        if guess_repository_type(&raw, &worktree) {
+            match env_work_tree.clone() {
+                // Guessed-bare git dir + GIT_WORK_TREE: the repository is
+                // *non*-bare after all; record `core.worktree` (init-db.c sets
+                // the work tree, so `create_default_files` writes it).
+                Some(raw_work_tree) => {
+                    let work_tree_abs =
+                        resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
+                    let work_tree_abs =
+                        fs::canonicalize(&work_tree_abs).unwrap_or(work_tree_abs);
+                    if git_dir_abs != work_tree_abs.join(".git") {
+                        core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
+                    }
+                    git_dir_override = Some(git_dir_abs);
+                    worktree = work_tree_abs;
+                }
+                // Plain guessed-bare GIT_DIR (e.g. `GIT_DIR=dir.git git init`):
+                // a bare repository at that directory.
+                None => {
+                    git_dir_override = Some(git_dir_abs);
+                    bare = true;
+                }
+            }
+        } else {
+            // Non-bare guess (".git" or "…/.git"): the work tree is the git
+            // dir's parent (or the target directory), unless GIT_WORK_TREE
+            // overrides it.
+            let work_tree_abs = match env_work_tree.clone() {
+                Some(raw_work_tree) => {
+                    let resolved =
+                        resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
+                    fs::canonicalize(&resolved).unwrap_or(resolved)
+                }
+                None => git_dir_abs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| worktree.clone()),
+            };
+            if git_dir_abs != work_tree_abs.join(".git") {
+                core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
+            }
+            git_dir_override = Some(git_dir_abs);
+            worktree = work_tree_abs;
+        }
+    }
+
+    let (object_format, object_format_explicit) =
+        resolve_init_object_format(object_format, global_config)?;
+    let (ref_storage, ref_storage_explicit) =
+        resolve_init_ref_storage(ref_format, global_config)?;
+    let shared_repository = resolve_init_shared_repository(shared_repository, global_config, bare)?;
+    let template_dir = resolve_init_template_dir(template, template_config, global_config, &cwd)?;
+
+    let layout = RepositoryBootstrap::init(InitOptions {
+        worktree,
+        git_dir_override,
+        core_worktree,
+        object_format,
+        object_format_explicit,
+        bare,
+        initial_branch: initial_branch.clone(),
+        template_dir,
+        copy_template_config: template_config,
+        separate_git_dir,
+        shared_repository,
+        ref_storage,
+        ref_storage_explicit,
+    })
+    .map_err(|err| match err {
+        // Bootstrap reports fatal init failures (e.g. reinitializing with a different
+        // object/ref format) as `GitError::Command`; git prints these as `fatal: <msg>`
+        // and exits 128.
+        GitError::Command(message) => {
+            eprintln!("fatal: {message}");
+            GitError::Exit(128)
+        }
+        other => other,
+    })?;
+
+    if branch_defaulted && !quiet && !layout.reinitialized {
+        emit_default_branch_advice(&initial_branch, global_config)?;
+    }
+    if layout.reinitialized && initial_branch_explicit {
+        eprintln!("warning: re-init: ignored --initial-branch={initial_branch}");
+    }
+    if !quiet {
+        let git_dir = fs::canonicalize(&layout.git_dir)?;
+        let action = if layout.reinitialized {
+            "Reinitialized existing"
+        } else {
+            "Initialized empty"
+        };
+        println!("{action} Git repository in {}/", git_dir.to_string_lossy());
+    }
+    Ok(())
+}
+
+fn emit_default_branch_advice(
+    branch: &str,
+    global_config: &[GlobalConfigOverride],
+) -> Result<()> {
+    if let Ok(value) = env::var("GIT_ADVICE") {
+        if !parse_config_bool(&value).unwrap_or(!value.is_empty()) {
+            return Ok(());
+        }
+    }
+    if init_config_bool("advice.defaultBranchName", global_config)? == Some(false) {
+        return Ok(());
+    }
+    // `color.advice`: "always" colours unconditionally; "never"/false disables;
+    // "auto"/true/unset colour only when stderr is a terminal (color.c
+    // `git_config_colorbool` + `want_color_stderr`).
+    let colored = match init_config_value("color.advice", global_config)?.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("always") => true,
+        Some(value) if value.eq_ignore_ascii_case("never") => false,
+        Some(value) if value.eq_ignore_ascii_case("auto") => stderr_is_terminal(),
+        Some(value) => match parse_config_bool(value) {
+            Some(false) => false,
+            _ => stderr_is_terminal(),
+        },
+        None => stderr_is_terminal(),
+    };
+    let (color, reset) = if colored { ("\x1b[33m", "\x1b[m") } else { ("", "") };
+    // The advice body already ends without a trailing newline; the
+    // `Disable this message ...` instruction line was appended above with the
+    // leading blank line git's `turn_off_instructions` carries.
+    let body = DEFAULT_BRANCH_NAME_ADVICE.replacen("{}", branch, 1);
+    for line in body.split('\n') {
+        let sep = if line.is_empty() { "" } else { " " };
+        eprintln!("{color}hint:{sep}{line}{reset}");
+    }
+    Ok(())
+}
+
+fn stderr_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    io::stderr().is_terminal()
+}
+
+/// [`RepositoryBootstrap::init`], once the existing repository format is known.
+fn resolve_init_object_format(
+    cli_format: Option<String>,
+    global_config: &[GlobalConfigOverride],
+) -> Result<(ObjectFormat, bool)> {
+    // git reads the config defaults FIRST (setup.c `read_default_format_config`),
+    // so an invalid `init.defaultObjectFormat` warns even when the command line
+    // or `GIT_DEFAULT_HASH` ends up choosing the format.
+    let config_format = match init_config_value("init.defaultObjectFormat", global_config)? {
+        Some(value) => match value.parse::<ObjectFormat>() {
+            Ok(format) => Some(format),
+            Err(_) => {
+                eprintln!("warning: unknown hash algorithm '{value}'");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(value) = cli_format {
+        return Ok((parse_init_object_format(&value)?, true));
+    }
+    if let Ok(hash) = env::var("GIT_DEFAULT_HASH") {
+        if !hash.is_empty() {
+            return Ok((parse_init_object_format(&hash)?, false));
+        }
+    }
+    if let Some(format) = config_format {
+        return Ok((format, false));
+    }
+    Ok((ObjectFormat::Sha1, false))
+}
+
+fn parse_init_object_format(value: &str) -> Result<ObjectFormat> {
+    value.parse::<ObjectFormat>().map_err(|_| {
+        eprintln!("fatal: unknown hash algorithm '{value}'");
+        GitError::Exit(128)
+    })
+}
+
+fn resolve_init_ref_storage(
+    cli_ref_format: Option<Option<String>>,
+    global_config: &[GlobalConfigOverride],
+) -> Result<(RefStorageFormat, bool)> {
+    // git reads the config defaults FIRST (setup.c `read_default_format_config`),
+    // so an invalid `init.defaultRefFormat` warns even when the command line or
+    // `GIT_DEFAULT_REF_FORMAT` ends up choosing the format.
+    let config_format = match init_config_value("init.defaultRefFormat", global_config)? {
+        Some(value) if value.is_empty() => Some(RefStorageFormat::Files),
+        Some(value) => match RefStorageFormat::parse(&value) {
+            Ok(format) => Some(format),
+            Err(_) => {
+                eprintln!("warning: unknown ref storage format '{value}'");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(value) = cli_ref_format {
+        return Ok((parse_init_ref_storage(value.as_deref().unwrap_or(""))?, true));
+    }
+    if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {
+        return Ok((parse_init_ref_storage(&value)?, false));
+    }
+    if let Some(format) = config_format {
+        return Ok((format, false));
+    }
+    if init_config_bool("feature.experimental", global_config)?.unwrap_or(false) {
+        return Ok((RefStorageFormat::Reftable, false));
+    }
+    Ok((RefStorageFormat::Files, false))
+}
+
+fn parse_init_ref_storage(value: &str) -> Result<RefStorageFormat> {
+    RefStorageFormat::parse(value).map_err(|err| match err {
+        GitError::Command(message) => {
+            eprintln!("fatal: {message}");
+            GitError::Exit(128)
+        }
+        other => other,
+    })
+}
+
+fn resolve_init_shared_repository(
+    cli_shared: Option<Option<String>>,
+    global_config: &[GlobalConfigOverride],
+    bare: bool,
+) -> Result<Option<String>> {
+    if let Some(value) = cli_shared {
+        return Ok(value);
+    }
+    if bare {
+        return Ok(None);
+    }
+    init_config_value("core.sharedRepository", global_config)
+}
+
+fn resolve_init_template_dir(
+    cli_template: Option<Option<String>>,
+    template_config: bool,
+    global_config: &[GlobalConfigOverride],
+    cwd: &Path,
+) -> Result<Option<PathBuf>> {
+    let _ = template_config;
+    match cli_template {
+        Some(None) => Ok(None),
+        Some(Some(path)) => {
+            if path.is_empty() {
+                Ok(Some(PathBuf::new()))
+            } else {
+                Ok(Some(resolve_cli_path(cwd, &path)))
+            }
+        }
+        None => {
+            if let Some(path) = init_config_value("init.templatedir", global_config)? {
+                let expanded = sley_config::expand_user_path(&path);
+                Ok(Some(if expanded.is_absolute() {
+                    expanded
+                } else {
+                    cwd.join(expanded)
+                }))
+            } else if let Ok(path) = env::var("GIT_TEMPLATE_DIR") {
+                if path.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(resolve_cli_path(cwd, &path)))
+                }
+            } else {
+                Ok(default_init_template_dir())
+            }
+        }
+    }
+}
+
+fn default_init_template_dir() -> Option<PathBuf> {
+    let output = ProcessCommand::new("git")
+        .arg("--exec-path")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let exec_path = String::from_utf8_lossy(&output.stdout);
+    let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
+    candidate.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+fn init_config_bool(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<bool>> {
+    init_config_value(key, global_config).map(|value| value.as_deref().and_then(parse_config_bool))
+}
+
+pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
+    let mut paths = Vec::new();
+    let mut dry_run = false;
+    let mut verbose = false;
+    let mut update = false;
+    let mut all = false;
+    let mut ignore_removal = false;
+    let mut ignore_missing = false;
+    let mut chmod = None;
+    let mut pathspec_from_file: Option<PathBuf> = None;
+    let mut pathspec_file_nul = false;
+    let mut parsing_options = true;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !parsing_options {
+            if pathspec_from_file.is_some() {
+                eprintln!(
+                    "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                );
+                return Err(GitError::Exit(128));
+            }
+            paths.push(PathBuf::from(arg));
+            continue;
+        }
+        match arg.as_str() {
+            "--" => parsing_options = false,
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            "-u" | "--update" => update = true,
+            "--no-update" => update = false,
+            "-A" | "--all" | "--no-ignore-removal" => {
+                all = true;
+                ignore_removal = false;
+            }
+            "--ignore-removal" | "--no-all" => {
+                all = false;
+                ignore_removal = true;
+            }
+            "--ignore-missing" => ignore_missing = true,
+            "--no-ignore-missing" => ignore_missing = false,
+            "--chmod" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--chmod requires a value".into()))?;
+                chmod = Some(parse_add_chmod(value)?);
+            }
+            "--no-chmod" => chmod = None,
+            value if value.starts_with("--chmod=") => {
+                let value = value
+                    .strip_prefix("--chmod=")
+                    .expect("prefix checked by match guard");
+                chmod = Some(parse_add_chmod(value)?);
+            }
+            "--ignore-errors" | "--no-ignore-errors" | "--sparse" | "--no-sparse" => {}
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--pathspec-from-file" => {
+                if !paths.is_empty() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => {}
+            value if value.starts_with("--pathspec-from-file=") => {
+                if !paths.is_empty() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
+                    GitError::Command("--pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            value
+                if value.starts_with('-')
+                    && value.len() > 2
+                    && value[1..]
+                        .bytes()
+                        .all(|option| matches!(option, b'A' | b'n' | b'u' | b'v')) =>
+            {
+                for option in value[1..].bytes() {
+                    match option {
+                        b'A' => all = true,
+                        b'n' => dry_run = true,
+                        b'u' => update = true,
+                        b'v' => verbose = true,
+                        _ => unreachable!("add short-option group was filtered"),
+                    }
+                }
+            }
+            value => {
+                if pathspec_from_file.is_some() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                paths.push(PathBuf::from(value));
+            }
+        }
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(pathspec_file) = pathspec_from_file {
+        paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
+    }
+    if ignore_missing && !dry_run {
+        eprintln!("fatal: the option '--ignore-missing' requires '--dry-run'");
+        return Err(GitError::Exit(128));
+    }
+    if paths.is_empty() && !update && !all {
+        eprintln!("Nothing specified, nothing added.");
+        eprintln!("hint: Maybe you wanted to say 'git add .'?");
+        eprintln!(
+            "hint: Disable this message with \"git config set advice.addEmptyPathspec false\""
+        );
+        return Ok(());
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    if update || all {
+        let actions = resolve_add_update_actions(
+            &cwd,
+            &worktree_root,
+            &git_dir,
+            format,
+            paths,
+            all,
+            ignore_missing,
+        )?;
+        if dry_run {
+            print_add_actions(&worktree_root, &actions)?;
+            return Ok(());
+        }
+        let action_paths = actions
+            .iter()
+            .map(AddAction::path)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !action_paths.is_empty() {
+            let config = read_repo_config(&git_dir)?;
+            sley_worktree::update_index_paths_filtered(
+                &worktree_root,
+                git_dir,
+                format,
+                &action_paths,
+                sley_worktree::UpdateIndexOptions {
+                    add: true,
+                    remove: true,
+                    force_remove: false,
+                    chmod,
+                    info_only: false,
+                    ignore_skip_worktree_entries: false,
+                },
+                &config,
+            )?;
+        }
+        if verbose {
+            print_add_actions(&worktree_root, &actions)?;
+        }
+        return Ok(());
+    }
+    let actions = resolve_add_regular_actions(
+        &cwd,
+        &worktree_root,
+        &git_dir,
+        format,
+        paths,
+        AddRegularOptions {
+            chmod,
+            ignore_removal,
+            ignore_missing,
+        },
+    )?;
+    if dry_run {
+        print_add_actions(&worktree_root, &actions)?;
+        return Ok(());
+    }
+    let action_paths = actions
+        .iter()
+        .map(AddAction::path)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !action_paths.is_empty() {
+        let config = read_repo_config(&git_dir)?;
+        sley_worktree::update_index_paths_filtered(
+            &worktree_root,
+            git_dir,
+            format,
+            &action_paths,
+            sley_worktree::UpdateIndexOptions {
+                add: true,
+                remove: true,
+                force_remove: false,
+                chmod,
+                info_only: false,
+                ignore_skip_worktree_entries: false,
+            },
+            &config,
+        )?;
+    }
+    if verbose {
+        print_add_actions(&worktree_root, &actions)?;
+    }
+    Ok(())
+}
+
+fn parse_add_chmod(value: &str) -> Result<bool> {
+    match value {
+        "+x" => Ok(true),
+        "-x" => Ok(false),
+        _ => {
+            eprintln!("fatal: --chmod param '{value}' must be either -x or +x");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AddRegularOptions {
+    chmod: Option<bool>,
+    ignore_removal: bool,
+    ignore_missing: bool,
+}
+
+fn resolve_add_regular_actions(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: Vec<PathBuf>,
+    options: AddRegularOptions,
+) -> Result<Vec<AddAction>> {
+    let pathspecs = paths
+        .into_iter()
+        .map(|path| {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                cwd.join(&path)
+            };
+            let matched = absolute.exists();
+            (path, absolute, matched)
+        })
+        .collect::<Vec<_>>();
+    let mut matched = pathspecs
+        .iter()
+        .map(|(_, _, matched)| *matched)
+        .collect::<Vec<_>>();
+    let mut actions = Vec::new();
+    let mut seen = BTreeSet::new();
+    for entry in sley_worktree::short_status(worktree_root, git_dir, format)? {
+        let actionable = (entry.index == b'?' && entry.worktree == b'?')
+            || entry.worktree == b'M'
+            || entry.worktree == b'D';
+        if !actionable {
+            continue;
+        }
+        let path = worktree_root.join(
+            std::str::from_utf8(&entry.path)
+                .map_err(|err| GitError::InvalidPath(err.to_string()))?,
+        );
+        let mut path_matches = false;
+        for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
+            if add_path_matches(&path, pathspec) {
+                matched[idx] = true;
+                path_matches = true;
+            }
+        }
+        if !path_matches {
+            continue;
+        }
+        if entry.worktree == b'D' && options.ignore_removal {
+            continue;
+        }
+        if seen.insert(path.clone()) {
+            let action = if entry.worktree == b'D' {
+                AddAction::Remove(path)
+            } else {
+                AddAction::Add(path)
+            };
+            actions.push(action);
+        }
+    }
+    if options.chmod.is_some() {
+        for (_, pathspec, _) in &pathspecs {
+            for path in resolve_add_paths(cwd, worktree_root, vec![pathspec.clone()])? {
+                if seen.insert(path.clone()) {
+                    actions.push(AddAction::Add(path));
+                }
+            }
+        }
+    }
+    for ((display, _, _), matched) in pathspecs.iter().zip(matched) {
+        if !matched && !options.ignore_missing {
+            eprintln!(
+                "fatal: pathspec '{}' did not match any files",
+                display.to_string_lossy()
+            );
+            return Err(GitError::Exit(128));
+        }
+    }
+    Ok(actions)
+}
+
+fn resolve_add_paths(
+    cwd: &Path,
+    worktree_root: &Path,
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let mut resolved = BTreeSet::new();
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            cwd.join(path)
+        };
+        if absolute.is_dir() {
+            collect_add_files(worktree_root, &absolute, &mut resolved)?;
+        } else {
+            resolved.insert(absolute);
+        }
+    }
+    Ok(resolved.into_iter().collect())
+}
+
+fn collect_add_files(
+    worktree_root: &Path,
+    directory: &Path,
+    out: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path == worktree_root.join(".git") {
+            continue;
+        }
+        if path.is_dir() {
+            collect_add_files(worktree_root, &path, out)?;
+        } else {
+            out.insert(path);
+        }
+    }
+    Ok(())
+}
+
+fn print_add_actions(worktree_root: &Path, actions: &[AddAction]) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    for action in actions {
+        let path = action.path();
+        let display = path.strip_prefix(worktree_root).unwrap_or(path);
+        let verb = match action {
+            AddAction::Add(_) => "add",
+            AddAction::Remove(_) => "remove",
+        };
+        writeln!(
+            stdout,
+            "{verb} '{}'",
+            display.to_string_lossy().replace('\\', "/")
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_clean(args: &[String]) -> Result<()> {
+    let mut dry_run = false;
+    let mut force = false;
+    let mut force_was_mentioned = false;
+    let mut directories = false;
+    let mut include_ignored = false;
+    let mut quiet = false;
+    let mut excludes = Vec::new();
+    let mut path_args = Vec::new();
+    let mut parsing_options = true;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !parsing_options {
+            path_args.push(arg.to_string());
+            continue;
+        }
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-f" | "--force" | "-ff" => {
+                force = true;
+                force_was_mentioned = true;
+            }
+            "--no-force" => {
+                force = false;
+                force_was_mentioned = true;
+            }
+            "-d" => directories = true,
+            "-x" => include_ignored = true,
+            "-e" | "--exclude" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("clean --exclude requires a value".into()))?;
+                excludes.push(value.to_string());
+            }
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "--no-interactive" => {}
+            value
+                if value.starts_with('-')
+                    && !value.starts_with("--")
+                    && value.len() > 2
+                    && value[1..]
+                        .bytes()
+                        .all(|byte| matches!(byte, b'f' | b'd' | b'n' | b'q' | b'x')) =>
+            {
+                dry_run |= value.contains('n');
+                if value.contains('f') {
+                    force = true;
+                    force_was_mentioned = true;
+                }
+                directories |= value.contains('d');
+                include_ignored |= value.contains('x');
+                quiet |= value.contains('q');
+            }
+            "--" => parsing_options = false,
+            value if value.starts_with("--exclude=") => {
+                let value = value
+                    .strip_prefix("--exclude=")
+                    .ok_or_else(|| GitError::Command("clean --exclude requires a value".into()))?;
+                excludes.push(value.to_string());
+            }
+            value => path_args.push(value.to_string()),
+        }
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let config = read_repo_config(&git_dir)?;
+    let require_force = config
+        .get_bool("clean", None, "requireForce")
+        .unwrap_or(true);
+    if !dry_run && !force && require_force {
+        if force_was_mentioned {
+            eprintln!("fatal: clean.requireForce is true and -f not given: refusing to clean");
+        } else {
+            eprintln!(
+                "fatal: clean.requireForce defaults to true and neither -i, -n, nor -f given; refusing to clean"
+            );
+        }
+        return Err(GitError::Exit(128));
+    }
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&git_dir)?;
+    let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, false, &path_args)?;
+    let paths = clean_targets(
+        &worktree_root,
+        &git_dir,
+        format,
+        directories,
+        include_ignored,
+        &pathspec,
+        &excludes,
+    )?;
+    let mut stdout = io::stdout();
+    for target in paths {
+        let display = String::from_utf8_lossy(&target.display);
+        if dry_run {
+            writeln!(stdout, "Would remove {display}")?;
+            continue;
+        }
+        if !quiet {
+            writeln!(stdout, "Removing {display}")?;
+        }
+        let mut filesystem_path = target.path;
+        if filesystem_path.ends_with(b"/") {
+            filesystem_path.pop();
+        }
+        let relative = std::str::from_utf8(&filesystem_path)
+            .map_err(|err| GitError::InvalidPath(err.to_string()))?;
+        let absolute = worktree_root.join(relative);
+        if target.is_dir {
+            fs::remove_dir_all(absolute)?;
+        } else {
+            fs::remove_file(absolute)?;
+        }
+    }
+    Ok(())
+}
+
+enum ApplyAction {
+    Write {
+        path: Vec<u8>,
+        mode: u32,
+        content: Vec<u8>,
+    },
+    Remove {
+        path: Vec<u8>,
+    },
+}
+
+pub(crate) fn cmd_apply(args: &[String]) -> Result<()> {
+    let mut check = false;
+    let mut files = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--apply" | "--stat" | "--numstat" | "--summary" | "-q" | "--quiet" | "--recount"
+            | "--allow-empty" | "--unsafe-paths" => {}
+            "-R" | "--reverse" => {
+                return Err(GitError::Unsupported(
+                    "apply --reverse is not supported yet".into(),
+                ));
+            }
+            "-3" | "--3way" | "--index" | "--cached" => {
+                return Err(GitError::Unsupported(format!(
+                    "apply {arg} is not supported yet"
+                )));
+            }
+            "-p" | "-C" | "--whitespace" | "--directory" | "--exclude" | "--include" => {
+                iter.next();
+            }
+            "--" => {
+                files.extend(iter.by_ref().map(|value| value.to_string()));
+                break;
+            }
+            value
+                if value.starts_with("-p")
+                    || value.starts_with("--whitespace=")
+                    || value.starts_with("--directory=")
+                    || value.starts_with("--exclude=")
+                    || value.starts_with("--include=") => {}
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!(
+                    "unsupported apply option {value}"
+                )));
+            }
+            value => files.push(value.to_string()),
+        }
+    }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let mut input = Vec::new();
+    if files.is_empty() {
+        io::stdin().read_to_end(&mut input)?;
+    } else {
+        for file in &files {
+            input.extend_from_slice(&fs::read(file)?);
+        }
+    }
+    let patches = sley_diff_merge::parse_unified_patch(&input)?;
+
+    // Phase 1: compute every result first (git applies a patch atomically).
+    let mut actions = Vec::new();
+    for patch in &patches {
+        let base = if patch.is_new {
+            Vec::new()
+        } else if let Some(old) = patch.old_path.as_deref().or(patch.new_path.as_deref()) {
+            let rel = std::str::from_utf8(old)
+                .map_err(|_| GitError::InvalidFormat("non-utf8 patch path".into()))?;
+            fs::read(worktree_root.join(rel)).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let content = match sley_diff_merge::apply_file_patch(&base, patch) {
+            sley_diff_merge::ApplyOutcome::Applied(content) => content,
+            sley_diff_merge::ApplyOutcome::Rejected => {
+                let name = patch
+                    .new_path
+                    .as_deref()
+                    .or(patch.old_path.as_deref())
+                    .unwrap_or(b"");
+                eprintln!("error: patch failed: {}", String::from_utf8_lossy(name));
+                return Err(GitError::Exit(1));
+            }
+        };
+        if patch.is_delete {
+            if let Some(old) = &patch.old_path {
+                actions.push(ApplyAction::Remove { path: old.clone() });
+            }
+        } else {
+            let mode = patch.new_mode.or(patch.old_mode).unwrap_or(0o100644);
+            let Some(target) = patch.new_path.clone().or_else(|| patch.old_path.clone()) else {
+                return Err(GitError::InvalidFormat("patch missing target path".into()));
+            };
+            actions.push(ApplyAction::Write {
+                path: target,
+                mode,
+                content,
+            });
+            if patch.is_rename
+                && let Some(old) = &patch.old_path
+            {
+                actions.push(ApplyAction::Remove { path: old.clone() });
+            }
+        }
+    }
+
+    if check {
+        return Ok(());
+    }
+    // Phase 2: materialize.
+    for action in actions {
+        match action {
+            ApplyAction::Write {
+                path,
+                mode,
+                content,
+            } => merge_write_worktree_file(&worktree_root, &path, &content, mode)?,
+            ApplyAction::Remove { path } => merge_remove_worktree_file(&worktree_root, &path)?,
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_fsck(args: &[String]) -> Result<()> {
+    let mut progress = true;
+    let mut report_dangling = true;
+    let mut report_unreachable = false;
+    for arg in args {
+        match arg.as_str() {
+            "--no-progress" => progress = false,
+            "--progress" => progress = true,
+            "--dangling" => report_dangling = true,
+            "--no-dangling" => report_dangling = false,
+            "--unreachable" => report_unreachable = true,
+            "--no-unreachable" => report_unreachable = false,
+            "--full" | "--strict" | "--connectivity-only" | "--name-objects" => {}
+            value => {
+                return Err(GitError::Command(format!(
+                    "fsck currently supports --no-progress and basic object connectivity; unsupported option {value}"
+                )));
+            }
+        }
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let roots = fsck_root_oids(&git_dir, format)?;
+    let mut object_ids = repository_object_ids(&git_dir, format)?;
+    // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
+    // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
+    // stderr (with git's path-form spelling) and excluding them from the object set
+    // so they neither parse nor surface as dangling.
+    let objects_dir_display = fsck_objects_dir_display(&git_dir, &cwd);
+    let mut bad_loose = HashSet::new();
+    for oid in db.loose().object_ids()? {
+        let hex = oid.to_hex();
+        let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
+        match db.loose().verify_object(&oid, &display_path)? {
+            None | Some(LooseObjectIntegrity::Ok) => {}
+            Some(LooseObjectIntegrity::HashMismatch { actual }) => {
+                eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                bad_loose.insert(oid);
+            }
+            Some(LooseObjectIntegrity::Corrupt) => {
+                eprintln!("error: {oid}: object corrupt or missing: {display_path}");
+                bad_loose.insert(oid);
+            }
+        }
+    }
+    let loose_errors = !bad_loose.is_empty();
+    object_ids.retain(|oid| !bad_loose.contains(oid));
+    if roots.is_empty() && progress {
+        eprintln!("notice: No default references");
+    }
+    let report = sley_fsck::fsck_objects_with_options(
+        &db,
+        format,
+        roots,
+        object_ids,
+        sley_fsck::FsckOptions {
+            report_dangling,
+            report_unreachable,
+        },
+    );
+    for notice in &report.notices {
+        println!("{}", notice.message);
+    }
+    for issue in &report.issues {
+        println!("{}", issue.message);
+    }
+    if !report.is_ok() {
+        Err(GitError::Exit(10))
+    } else if loose_errors {
+        // builtin/fsck.c exits with its `errors_found` bitmask; a corrupt or
+        // misplaced loose object sets ERROR_OBJECT (= 1).
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+/// spelling for those shapes and fall back to the absolute path.
+fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
+    if git_dir == cwd {
+        return "./objects".to_string();
+    }
+    if let Ok(relative) = git_dir.strip_prefix(cwd) {
+        return format!("{}/objects", relative.display());
+    }
+    format!("{}/objects", git_dir.display())
+}
+
+fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut seen = HashSet::new();
+    let mut roots = Vec::new();
+    if let Some(target) = store.read_ref("HEAD")? {
+        let reference = Ref {
+            name: "HEAD".to_string(),
+            target,
+        };
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid)
+        {
+            roots.push(oid);
+        }
+    }
+    for reference in store.list_refs()? {
+        if let Some((oid, _)) = resolve_for_each_ref_target(&store, &reference)?
+            && seen.insert(oid)
+        {
+            roots.push(oid);
+        }
+    }
+    Ok(roots)
+}
+
+#[derive(Debug)]
+enum ReplaceMode {
+    Create { object: String, replacement: String },
+    List { pattern: Option<String> },
+    Delete { objects: Vec<String> },
+}
+
+#[derive(Debug)]
+struct ReplaceOptions {
+    force: bool,
+    format: ReplaceListFormat,
+    mode: ReplaceMode,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReplaceListFormat {
+    Short,
+    Medium,
+    Long,
+}
+
+pub(crate) fn cmd_replace(args: &[String]) -> Result<()> {
+    let options = parse_replace_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    match options.mode {
+        ReplaceMode::List { pattern } => {
+            replace_list(&store, &db, format, pattern.as_deref(), options.format)
+        }
+        ReplaceMode::Delete { objects } => {
+            replace_delete(&store, &common_git_dir, format, &objects)
+        }
+        ReplaceMode::Create {
+            object,
+            replacement,
+        } => replace_create(
+            &store,
+            &db,
+            &common_git_dir,
+            format,
+            &object,
+            &replacement,
+            options.force,
+        ),
+    }
+}
+
+fn parse_replace_options(args: &[String]) -> Result<ReplaceOptions> {
+    let mut force = false;
+    let mut format = ReplaceListFormat::Short;
+    let mut list = false;
+    let mut delete = false;
+    let mut unsupported_mode = None::<&str>;
+    let mut positional = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--" => {
+                positional.extend(iter.cloned());
+                break;
+            }
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            "-l" | "--list" => list = true,
+            "-d" | "--delete" => delete = true,
+            "-e" | "--edit" => unsupported_mode = Some("--edit"),
+            "-g" | "--graft" => unsupported_mode = Some("--graft"),
+            "--convert-graft-file" => unsupported_mode = Some("--convert-graft-file"),
+            "--raw" | "--no-raw" => {}
+            "--format" => {
+                let Some(value) = iter.next() else {
+                    eprintln!("error: option `format' requires a value");
+                    return Err(GitError::Exit(129));
+                };
+                format = parse_replace_list_format(value)?;
+            }
+            "--no-format" => format = ReplaceListFormat::Short,
+            value if let Some(value) = long_option_value(value, "format") => {
+                format = parse_replace_list_format(value)?;
+            }
+            value if value.starts_with("--no-force=") => {
+                eprintln!("error: option `no-force' takes no value");
+                return Err(GitError::Exit(129));
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return replace_usage();
+            }
+            value if value.starts_with('-') && value.len() > 1 => {
+                for option in value[1..].chars() {
+                    match option {
+                        'f' => force = true,
+                        'l' => list = true,
+                        'd' => delete = true,
+                        'e' => unsupported_mode = Some("--edit"),
+                        'g' => unsupported_mode = Some("--graft"),
+                        other => {
+                            eprintln!("error: unknown switch `{other}'");
+                            return replace_usage();
+                        }
+                    }
+                }
+            }
+            value => positional.push(value.to_string()),
+        }
+    }
+    if let Some(mode) = unsupported_mode {
+        return Err(GitError::Unsupported(format!("replace {mode}")));
+    }
+    if delete {
+        if positional.is_empty() {
+            return replace_usage();
+        }
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::Delete {
+                objects: positional,
+            },
+        });
+    }
+    if list || positional.len() <= 1 {
+        if positional.len() > 1 {
+            return replace_usage();
+        }
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::List {
+                pattern: positional.pop(),
+            },
+        });
+    }
+    if positional.len() == 2 {
+        return Ok(ReplaceOptions {
+            force,
+            format,
+            mode: ReplaceMode::Create {
+                object: positional.remove(0),
+                replacement: positional.remove(0),
+            },
+        });
+    }
+    replace_usage()
+}
+
+fn parse_replace_list_format(value: &str) -> Result<ReplaceListFormat> {
+    match value {
+        "short" => Ok(ReplaceListFormat::Short),
+        "medium" => Ok(ReplaceListFormat::Medium),
+        "long" => Ok(ReplaceListFormat::Long),
+        other => {
+            eprintln!("error: invalid replace format '{other}'");
+            eprintln!("valid formats are 'short', 'medium' and 'long'");
+            Err(GitError::Exit(255))
+        }
+    }
+}
+
+fn replace_list(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    object_format: ObjectFormat,
+    pattern: Option<&str>,
+    format: ReplaceListFormat,
+) -> Result<()> {
+    for reference in store.list_refs()? {
+        let Some(object) = reference.name.strip_prefix("refs/replace/") else {
+            continue;
+        };
+        if pattern.is_some_and(|pattern| !refname_pattern_matches(pattern, object)) {
+            continue;
+        }
+        let RefTarget::Direct(replacement) = reference.target else {
+            continue;
+        };
+        match format {
+            ReplaceListFormat::Short => println!("{object}"),
+            ReplaceListFormat::Medium => println!("{object} -> {replacement}"),
+            ReplaceListFormat::Long => {
+                let object_type = replace_object_type(db, object_format, object)?;
+                let replacement_type = db
+                    .read_object_header(&replacement)?
+                    .map(|(object_type, _)| object_type.as_str())
+                    .unwrap_or("unknown");
+                println!("{object} ({object_type}) -> {replacement} ({replacement_type})");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn replace_delete(
+    store: &FileRefStore,
+    git_dir: &Path,
+    format: ObjectFormat,
+    objects: &[String],
+) -> Result<()> {
+    let mut failed = false;
+    for object in objects {
+        let oid = match ObjectId::from_hex(format, object) {
+            Ok(oid) => oid,
+            Err(_) => match resolve_revision(git_dir, format, object) {
+                Ok(oid) => oid,
+                Err(_) => {
+                    eprintln!("error: failed to resolve '{object}' as a valid ref");
+                    failed = true;
+                    continue;
+                }
+            },
+        };
+        let name = format!("refs/replace/{oid}");
+        match store.delete_ref(&name) {
+            Ok(_) => println!("Deleted replace ref '{oid}'"),
+            Err(_) => {
+                eprintln!("error: replace ref '{oid}' not found");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
+    }
+}
+
+fn replace_create(
+    store: &FileRefStore,
+    db: &FileObjectDatabase,
+    git_dir: &Path,
+    format: ObjectFormat,
+    object: &str,
+    replacement: &str,
+    force: bool,
+) -> Result<()> {
+    let object_oid = resolve_revision(git_dir, format, object)?;
+    let replacement_oid = resolve_revision(git_dir, format, replacement)?;
+    let object_type = db
+        .read_object_header(&object_oid)?
+        .map(|(object_type, _)| object_type)
+        .ok_or_else(|| GitError::object_not_found(object_oid))?;
+    let replacement_type = db
+        .read_object_header(&replacement_oid)?
+        .map(|(object_type, _)| object_type)
+        .ok_or_else(|| GitError::object_not_found(replacement_oid))?;
+    if object_type != replacement_type {
+        eprintln!("error: Objects must be of the same type.");
+        eprintln!(
+            "'{object}' points to a replaced object of type '{}'",
+            object_type.as_str()
+        );
+        eprintln!(
+            "while '{replacement}' points to a replacement object of type '{}'.",
+            replacement_type.as_str()
+        );
+        return Err(GitError::Exit(255));
+    }
+    let name = format!("refs/replace/{object_oid}");
+    let precondition = if force {
+        RefPrecondition::Any
+    } else {
+        RefPrecondition::MustNotExist
+    };
+    let mut tx = store.transaction();
+    tx.update_to(
+        name.clone(),
+        RefTarget::Direct(replacement_oid),
+        precondition,
+        None,
+    );
+    match tx.commit() {
+        Ok(()) => Ok(()),
+        Err(_) if !force => {
+            eprintln!("error: replace ref '{name}' already exists");
+            Err(GitError::Exit(255))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn replace_object_type(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    object: &str,
+) -> Result<&'static str> {
+    let oid = ObjectId::from_hex(format, object)?;
+    Ok(db
+        .read_object_header(&oid)?
+        .map(|(object_type, _)| object_type.as_str())
+        .unwrap_or("unknown"))
+}
+
+fn replace_usage<T>() -> Result<T> {
+    eprintln!("usage: git replace [-f] <object> <replacement>");
+    eprintln!("   or: git replace [-f] --edit <object>");
+    eprintln!("   or: git replace [-f] --graft <commit> [<parent>...]");
+    eprintln!("   or: git replace [-f] --convert-graft-file");
+    eprintln!("   or: git replace -d <object>...");
+    eprintln!("   or: git replace [--format=<format>] [-l [<pattern>]]");
+    eprintln!();
+    eprintln!("    -l, --list            list replace refs");
+    eprintln!("    -d, --delete          delete replace refs");
+    eprintln!("    -e, --edit            edit existing object");
+    eprintln!("    -g, --graft           change a commit's parents");
+    eprintln!("    --convert-graft-file  convert existing graft file");
+    eprintln!("    -f, --[no-]force      replace the ref if it exists");
+    eprintln!("    --[no-]raw            do not pretty-print contents for --edit");
+    eprintln!("    --[no-]format <format>");
+    eprintln!("                          use this format");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+pub(crate) fn cmd_prune_packed(args: &[String]) -> Result<()> {
+    let mut dry_run = false;
+    let mut positional = 0usize;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-q" | "--quiet" | "--no-quiet" => {}
+            "--" => {
+                positional += iter.count();
+                break;
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return prune_packed_usage();
+            }
+            value if value.starts_with('-') => {
+                eprintln!("error: unknown switch `{}'", value.trim_start_matches('-'));
+                return prune_packed_usage();
+            }
+            _ => positional += 1,
+        }
+    }
+    if positional > 0 {
+        eprintln!("fatal: too many arguments");
+        eprintln!();
+        return prune_packed_usage();
+    }
+
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let objects_dir = repository_objects_dir(&git_dir);
+    let packed = prune_packed_object_ids(&objects_dir.join("pack"), format)?;
+    if packed.is_empty() {
+        return Ok(());
+    }
+    for (oid, path) in prune_packed_loose_object_paths(&objects_dir, format)? {
+        if !packed.contains(&oid) {
+            continue;
+        }
+        if dry_run {
+            println!("rm -f {}", prune_packed_display_path(&path)?);
+        } else {
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+fn prune_packed_usage<T>() -> Result<T> {
+    eprintln!("usage: git prune-packed [-n | --dry-run] [-q | --quiet]");
+    eprintln!();
+    eprintln!("    -n, --[no-]dry-run    dry run");
+    eprintln!("    -q, --[no-]quiet      be quiet");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MergeRrEntry {
+    hash: String,
+    variant: u32,
+    path: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RerereSubcommand {
+    Clear,
+    Forget,
+    Status,
+}
+
+#[derive(Debug)]
+struct RerereOptions {
+    subcommand: Option<RerereSubcommand>,
+    paths: Vec<String>,
+}
+
+pub(crate) fn cmd_rerere(args: &[String]) -> Result<()> {
+    let options = parse_rerere_options(args)?;
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    match options.subcommand {
+        None => Ok(()),
+        Some(RerereSubcommand::Status) => rerere_status(&git_dir),
+        Some(RerereSubcommand::Clear) => rerere_clear(&git_dir),
+        Some(RerereSubcommand::Forget) => rerere_forget(&git_dir, &options.paths),
+    }
+}
+
+fn parse_rerere_options(args: &[String]) -> Result<RerereOptions> {
+    let mut autoupdate = None;
+    let mut subcommand = None;
+    let mut paths = Vec::new();
+    let mut positional_only = false;
+    for arg in args {
+        if positional_only {
+            paths.push(arg.clone());
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--rerere-autoupdate" => autoupdate = Some(true),
+            "--no-rerere-autoupdate" => autoupdate = Some(false),
+            value if value.starts_with("--no-rerere-autoupdate=") => {
+                eprintln!("error: option `no-rerere-autoupdate' takes no value");
+                return rerere_usage();
+            }
+            value if value.starts_with("--rerere-autoupdate=") => {
+                eprintln!("error: option `rerere-autoupdate' takes no value");
+                return rerere_usage();
+            }
+            value if value.starts_with("--") => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return rerere_usage();
+            }
+            "clear" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Clear),
+            "forget" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Forget),
+            "status" if subcommand.is_none() => subcommand = Some(RerereSubcommand::Status),
+            _ if subcommand.is_none() => return rerere_usage(),
+            value => paths.push(value.to_string()),
+        }
+    }
+    if matches!(subcommand, Some(RerereSubcommand::Forget)) && paths.is_empty() {
+        eprintln!("warning: 'git rerere forget' without paths is deprecated");
+    }
+    let _ = autoupdate;
+    Ok(RerereOptions { subcommand, paths })
+}
+
+fn rerere_usage<T>() -> Result<T> {
+    eprintln!("usage: git rerere [clear | forget <pathspec>... | diff | status | remaining | gc]");
+    eprintln!();
+    eprintln!("    --[no-]rerere-autoupdate");
+    eprintln!("                          register clean resolutions in index");
+    eprintln!();
+    Err(GitError::Exit(129))
+}
+
+fn is_rerere_enabled(git_dir: &Path) -> Result<bool> {
+    let config = read_repo_config(git_dir)?;
+    if let Some(value) = config.get("rerere", None, "enabled") {
+        return Ok(matches!(value, "true" | "1" | "yes" | "on"));
+    }
+    Ok(git_dir.join("rr-cache").is_dir())
+}
+
+fn read_merge_rr(git_dir: &Path) -> Result<Vec<MergeRrEntry>> {
+    let path = git_dir.join("MERGE_RR");
+    let Ok(data) = fs::read(&path) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for record in data
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        let Some(tab) = record.iter().position(|byte| *byte == b'\t') else {
+            return Err(GitError::Command("corrupt MERGE_RR".into()));
+        };
+        let id = std::str::from_utf8(&record[..tab])
+            .map_err(|_| GitError::Command("corrupt MERGE_RR".into()))?;
+        let path = std::str::from_utf8(&record[tab + 1..])
+            .map_err(|_| GitError::Command("corrupt MERGE_RR".into()))?;
+        let (hash, variant) = parse_merge_rr_id(id)?;
+        entries.push(MergeRrEntry {
+            hash,
+            variant,
+            path: path.to_string(),
+        });
+    }
+    Ok(entries)
+}
+
+fn parse_merge_rr_id(id: &str) -> Result<(String, u32)> {
+    let Some(dot) = id.find('.') else {
+        return Ok((id.to_string(), 0));
+    };
+    let hash = &id[..dot];
+    let variant = id[dot + 1..]
+        .parse::<u32>()
+        .map_err(|_| GitError::Command("corrupt MERGE_RR".into()))?;
+    Ok((hash.to_string(), variant))
+}
+
+fn rerere_cache_file_path(cache_dir: &Path, variant: u32, name: &str) -> PathBuf {
+    if variant == 0 {
+        cache_dir.join(name)
+    } else {
+        cache_dir.join(format!("{name}.{variant}"))
+    }
+}
+
+fn rerere_has_resolution(rr_cache: &Path, entry: &MergeRrEntry) -> bool {
+    let cache_dir = rr_cache.join(&entry.hash);
+    rerere_cache_file_path(&cache_dir, entry.variant, "preimage").is_file()
+        && rerere_cache_file_path(&cache_dir, entry.variant, "postimage").is_file()
+}
+
+fn remove_rr_cache_entry(rr_cache: &Path, entry: &MergeRrEntry) -> Result<()> {
+    let cache_dir = rr_cache.join(&entry.hash);
+    if !cache_dir.is_dir() {
+        return Ok(());
+    }
+    for file in fs::read_dir(&cache_dir)? {
+        let path = file?.path();
+        if path.is_file() {
+            fs::remove_file(path)?;
+        }
+    }
+    match fs::remove_dir(&cache_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => return Err(GitError::Io(err.to_string())),
+    }
+    Ok(())
+}
+
+fn rerere_status(git_dir: &Path) -> Result<()> {
+    if !is_rerere_enabled(git_dir)? {
+        return Ok(());
+    }
+    for entry in read_merge_rr(git_dir)? {
+        println!("{}", entry.path);
+    }
+    Ok(())
+}
+
+fn rerere_clear(git_dir: &Path) -> Result<()> {
+    if !is_rerere_enabled(git_dir)? {
+        return Ok(());
+    }
+    let rr_cache = git_dir.join("rr-cache");
+    for entry in read_merge_rr(git_dir)? {
+        if !rerere_has_resolution(&rr_cache, &entry) {
+            remove_rr_cache_entry(&rr_cache, &entry)?;
+        }
+    }
+    let merge_rr = git_dir.join("MERGE_RR");
+    if merge_rr.is_file() {
+        fs::remove_file(merge_rr)?;
+    }
+    Ok(())
+}
+
+fn rerere_path_matches(path: &str, pattern: &str) -> bool {
+    path == pattern || path.ends_with(&format!("/{pattern}"))
+}
+
+fn rerere_forget(git_dir: &Path, paths: &[String]) -> Result<()> {
+    if !is_rerere_enabled(git_dir)? {
+        return Ok(());
+    }
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let rr_cache = git_dir.join("rr-cache");
+    let entries = read_merge_rr(git_dir)?;
+    for pattern in paths {
+        let mut matched = false;
+        for entry in entries
+            .iter()
+            .filter(|entry| rerere_path_matches(&entry.path, pattern))
+        {
+            matched = true;
+            let cache_dir = rr_cache.join(&entry.hash);
+            let postimage = rerere_cache_file_path(&cache_dir, entry.variant, "postimage");
+            if !postimage.is_file() {
+                eprintln!("error: no remembered resolution for '{pattern}'");
+                continue;
+            }
+            fs::remove_file(&postimage)?;
+            if let Ok(thisimage) = fs::read(rerere_cache_file_path(
+                &cache_dir,
+                entry.variant,
+                "thisimage",
+            )) {
+                fs::write(
+                    rerere_cache_file_path(&cache_dir, entry.variant, "preimage"),
+                    thisimage,
+                )?;
+                eprintln!("Updated preimage for '{pattern}'");
+            }
+            eprintln!("Forgot resolution for '{pattern}'");
+        }
+        if !matched {
+            eprintln!("error: no remembered resolution for '{pattern}'");
+        }
+    }
+    Ok(())
+}
+
+fn prune_packed_object_ids(pack_dir: &Path, format: ObjectFormat) -> Result<HashSet<ObjectId>> {
+    let mut packed = HashSet::new();
+    if !pack_dir.exists() {
+        return Ok(packed);
+    }
+    for entry in fs::read_dir(pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("idx") {
+            continue;
+        }
+        let index = PackIndex::parse(&fs::read(path)?, format)?;
+        packed.extend(index.entries.into_iter().map(|entry| entry.oid));
+    }
+    Ok(packed)
+}
+
+fn prune_packed_loose_object_paths(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<(ObjectId, PathBuf)>> {
+    let mut objects = Vec::new();
+    if !objects_dir.exists() {
+        return Ok(objects);
+    }
+    let hex_len = format.hex_len();
+    for entry in fs::read_dir(objects_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let fanout = entry.file_name();
+        let Some(fanout) = fanout.to_str() else {
+            continue;
+        };
+        if fanout.len() != 2 || !fanout.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        for object_entry in fs::read_dir(entry.path())? {
+            let object_entry = object_entry?;
+            if !object_entry.file_type()?.is_file() {
+                continue;
+            }
+            let suffix = object_entry.file_name();
+            let Some(suffix) = suffix.to_str() else {
+                continue;
+            };
+            if suffix.len() != hex_len - 2 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                continue;
+            }
+            let oid = ObjectId::from_hex(format, &format!("{fanout}{suffix}"))?;
+            objects.push((oid, object_entry.path()));
+        }
+    }
+    objects.sort_by(|left, right| left.0.as_bytes().cmp(right.0.as_bytes()));
+    Ok(objects)
+}
+
+fn prune_packed_display_path(path: &Path) -> Result<String> {
+    let cwd = env::current_dir()?;
+    let display = path.strip_prefix(&cwd).unwrap_or(path);
+    Ok(display.to_string_lossy().replace('\\', "/"))
+}
+
+pub(crate) fn cmd_rm(args: &[String]) -> Result<()> {
+    let mut paths = Vec::new();
+    let mut recursive = false;
+    let mut quiet = false;
+    let mut cached = false;
+    let mut force = false;
+    let mut dry_run = false;
+    let mut ignore_unmatch = false;
+    let mut parsing_options = true;
+    let mut pathspec_from_file: Option<PathBuf> = None;
+    let mut pathspec_file_nul = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if !parsing_options {
+            if pathspec_from_file.is_some() {
+                eprintln!(
+                    "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                );
+                return Err(GitError::Exit(128));
+            }
+            paths.push(PathBuf::from(arg));
+            continue;
+        }
+        match arg.as_str() {
+            "--" => parsing_options = false,
+            "-r" | "-R" | "--recursive" => recursive = true,
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-q" | "--quiet" => quiet = true,
+            "--no-quiet" => quiet = false,
+            "--cached" => cached = true,
+            "--no-cached" => cached = false,
+            "--ignore-unmatch" => ignore_unmatch = true,
+            "--no-ignore-unmatch" => ignore_unmatch = false,
+            "--sparse" | "--no-sparse" => {}
+            "--pathspec-file-nul" => pathspec_file_nul = true,
+            "--no-pathspec-file-nul" => pathspec_file_nul = false,
+            "--pathspec-from-file" => {
+                if !paths.is_empty() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            "--no-pathspec-from-file" => {}
+            value if value.starts_with("--pathspec-from-file=") => {
+                if !paths.is_empty() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                let value = value.strip_prefix("--pathspec-from-file=").ok_or_else(|| {
+                    GitError::Command("--pathspec-from-file requires a value".into())
+                })?;
+                pathspec_from_file = Some(PathBuf::from(value));
+            }
+            value
+                if value.starts_with('-')
+                    && value.len() > 2
+                    && value[1..]
+                        .bytes()
+                        .all(|option| matches!(option, b'r' | b'R' | b'f' | b'n' | b'q')) =>
+            {
+                for option in value[1..].bytes() {
+                    match option {
+                        b'r' | b'R' => recursive = true,
+                        b'f' => force = true,
+                        b'n' => dry_run = true,
+                        b'q' => quiet = true,
+                        _ => unreachable!("rm short-option group was filtered"),
+                    }
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!("unsupported rm option {value}")));
+            }
+            value => {
+                if pathspec_from_file.is_some() {
+                    eprintln!(
+                        "fatal: '--pathspec-from-file' and pathspec arguments cannot be used together"
+                    );
+                    return Err(GitError::Exit(128));
+                }
+                paths.push(PathBuf::from(value));
+            }
+        }
+    }
+    if pathspec_file_nul && pathspec_from_file.is_none() {
+        eprintln!("fatal: the option '--pathspec-file-nul' requires '--pathspec-from-file'");
+        return Err(GitError::Exit(128));
+    }
+    if let Some(pathspec_file) = pathspec_from_file {
+        paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
+    }
+    if paths.is_empty() {
+        eprintln!("fatal: No pathspec was given. Which files should I remove?");
+        return Err(GitError::Exit(128));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let resolved_paths = paths
+        .into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        })
+        .collect::<Vec<_>>();
+    let result = sley_worktree::remove_index_and_worktree_paths(
+        worktree_root,
+        git_dir,
+        format,
+        &resolved_paths,
+        sley_worktree::RemoveOptions {
+            recursive,
+            cached,
+            force,
+            dry_run,
+            ignore_unmatch,
+        },
+    )?;
+    if !quiet {
+        let mut stdout = io::stdout().lock();
+        for path in result.removed {
+            writeln!(stdout, "rm '{}'", String::from_utf8_lossy(&path))?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_mv(args: &[String]) -> Result<()> {
+    let mut paths = Vec::new();
+    let mut force = false;
+    let mut dry_run = false;
+    let mut verbose = false;
+    let mut skip_errors = false;
+    let mut parsing_options = true;
+    for arg in args {
+        if !parsing_options {
+            paths.push(PathBuf::from(arg));
+            continue;
+        }
+        match arg.as_str() {
+            "--" => parsing_options = false,
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
+            "-n" | "--dry-run" => dry_run = true,
+            "--no-dry-run" => dry_run = false,
+            "-v" | "--verbose" => verbose = true,
+            "--no-verbose" => verbose = false,
+            "-k" => skip_errors = true,
+            "--sparse" | "--no-sparse" => {}
+            value if value.starts_with('-') && !value.starts_with("--") && value.len() > 2 => {
+                for flag in value[1..].bytes() {
+                    match flag {
+                        b'f' => force = true,
+                        b'n' => dry_run = true,
+                        b'v' => verbose = true,
+                        b'k' => skip_errors = true,
+                        other => {
+                            return Err(GitError::Command(format!(
+                                "unsupported mv option -{}",
+                                other as char
+                            )));
+                        }
+                    }
+                }
+            }
+            value if value.starts_with('-') => {
+                return Err(GitError::Command(format!("unsupported mv option {value}")));
+            }
+            value => paths.push(PathBuf::from(value)),
+        }
+    }
+    if paths.len() < 2 {
+        return Err(GitError::Command(
+            "mv currently supports <source>... <destination>".into(),
+        ));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&git_dir)?;
+    let destination = if paths[paths.len() - 1].is_absolute() {
+        paths[paths.len() - 1].clone()
+    } else {
+        cwd.join(&paths[paths.len() - 1])
+    };
+    if paths.len() > 2 && !destination.is_dir() {
+        eprintln!(
+            "fatal: destination '{}' is not a directory",
+            destination.display()
+        );
+        return Err(GitError::Exit(128));
+    }
+
+    let mut results = Vec::new();
+    for source in &paths[..paths.len() - 1] {
+        let source = if source.is_absolute() {
+            source.clone()
+        } else {
+            cwd.join(source)
+        };
+        let result = sley_worktree::move_index_and_worktree_path(
+            &worktree_root,
+            &git_dir,
+            format,
+            &source,
+            &destination,
+            sley_worktree::MoveOptions {
+                force,
+                dry_run,
+                skip_errors,
+            },
+        )?;
+        let fatal = result.fatal.is_some();
+        results.push(result);
+        if dry_run && fatal {
+            break;
+        }
+    }
+    if dry_run {
+        for result in &results {
+            let source = String::from_utf8_lossy(&result.source);
+            let destination = String::from_utf8_lossy(&result.destination);
+            println!("Checking rename of '{source}' to '{destination}'");
+            for detail in &result.details {
+                let source = String::from_utf8_lossy(&detail.source);
+                let destination = String::from_utf8_lossy(&detail.destination);
+                println!("Checking rename of '{source}' to '{destination}'");
+            }
+        }
+        if let Some(fatal) = results.iter().find_map(|result| result.fatal.as_deref()) {
+            eprintln!("{fatal}");
+            return Err(GitError::Exit(128));
+        }
+    }
+    if dry_run || verbose {
+        for result in &results {
+            if result.skipped {
+                continue;
+            }
+            let source = String::from_utf8_lossy(&result.source);
+            let destination = String::from_utf8_lossy(&result.destination);
+            println!("Renaming {source} to {destination}");
+            for detail in &result.details {
+                if detail.skipped {
+                    continue;
+                }
+                let source = String::from_utf8_lossy(&detail.source);
+                let destination = String::from_utf8_lossy(&detail.destination);
+                println!("Renaming {source} to {destination}");
+            }
+        }
+    }
+    Ok(())
+}
+
+struct CleanTarget {
+    path: Vec<u8>,
+    display: Vec<u8>,
+    is_dir: bool,
+}
+
+fn clean_targets(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    directories: bool,
+    include_ignored: bool,
+    pathspec: &LsFilesPathspec,
+    excludes: &[String],
+) -> Result<Vec<CleanTarget>> {
+    let has_pathspec = !pathspec.filters.is_empty();
+    // Git treats any pathspec as `-d` for selection purposes.
+    let effective_directories = directories || has_pathspec;
+    let index = sley_worktree::read_repository_index(git_dir, format)?;
+
+    let mut paths = if effective_directories {
+        sley_worktree::untracked_paths_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            sley_worktree::UntrackedPathOptions {
+                directory: true,
+                no_empty_directory: false,
+                preserve_ignored_directories: directories,
+                exclude_standard: !include_ignored,
+                ignored_only: false,
+                exclude_patterns: Vec::new(),
+                exclude_per_directory: Vec::new(),
+                pathspecs: pathspec.untracked_pathspecs(),
+            },
+        )?
+    } else {
+        sley_worktree::untracked_paths_with_options(
+            worktree_root,
+            git_dir,
+            format,
+            sley_worktree::UntrackedPathOptions {
+                directory: false,
+                no_empty_directory: false,
+                preserve_ignored_directories: false,
+                exclude_standard: !include_ignored,
+                ignored_only: false,
+                exclude_patterns: Vec::new(),
+                exclude_per_directory: Vec::new(),
+                pathspecs: pathspec.untracked_pathspecs(),
+            },
+        )?
+    };
+
+    // Without `-d` (and without a pathspec, which Git treats as `-d`), the
+    // non-directory walk lists every untracked file. Git only removes a file in
+    // a subdirectory when that directory contains tracked content; an untracked
+    // file inside a wholly-untracked directory needs `-d`. The directory walk
+    // already encodes this selection (it rolls wholly-untracked directories up
+    // to `dir/` and only descends into directories with tracked/ignored content),
+    // so the retain must run only on the non-directory walk's flat output.
+    if !effective_directories {
+        paths.retain(|path| {
+            path.ends_with(b"/") || clean_untracked_file_eligible(path, index.as_ref())
+        });
+    }
+
+    if has_pathspec {
+        paths = clean_collapse_untracked_paths(paths);
+    }
+
+    let mut targets = Vec::new();
+    for path in paths {
+        let is_dir = path.ends_with(b"/");
+        let Some(display) = pathspec.display(&path) else {
+            continue;
+        };
+        if clean_target_is_excluded(&path, excludes) {
+            continue;
+        }
+        targets.push(CleanTarget {
+            path,
+            display,
+            is_dir,
+        });
+    }
+
+    targets.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(targets)
+}
+
+/// regardless of `-x` or whether the repository has any commits yet.
+fn clean_untracked_file_eligible(path: &[u8], index: Option<&Index>) -> bool {
+    if !path.iter().any(|byte| *byte == b'/') {
+        return true;
+    }
+    let Some(index) = index else {
+        return false;
+    };
+    clean_path_parent(path).is_some_and(|parent| clean_index_has_tracked_under(index, parent))
+}
+
+fn clean_index_has_tracked_under(index: &Index, directory: &[u8]) -> bool {
+    let mut prefix = directory.to_vec();
+    prefix.push(b'/');
+    index
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_bytes().starts_with(&prefix))
+}
+
+fn clean_path_parent(path: &[u8]) -> Option<&[u8]> {
+    let slash = path.iter().rposition(|byte| *byte == b'/')?;
+    if slash == 0 {
+        return None;
+    }
+    Some(&path[..slash])
+}
+
+/// Match git `correct_untracked_entries` for pathspec-driven clean.
+fn clean_collapse_untracked_paths(paths: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    // The directory walk already encodes Git's `--directory` rollup: a
+    // wholly-untracked directory named by a pathspec is emitted as `dir/`, while
+    // untracked files inside a partially-tracked directory are listed
+    // individually. The only post-processing left is dropping a file entry that
+    // is already subsumed by a rolled-up parent directory entry.
+    let mut sorted = paths;
+    sorted.sort();
+    let mut kept = BTreeSet::new();
+    for path in &sorted {
+        if sorted.iter().any(|other| {
+            other != path && other.ends_with(b"/") && clean_directory_contains_path(other, path)
+        }) {
+            continue;
+        }
+        kept.insert(path.clone());
+    }
+    kept.into_iter().collect()
+}
+
+fn clean_target_is_excluded(path: &[u8], excludes: &[String]) -> bool {
+    excludes
+        .iter()
+        .any(|pattern| clean_exclude_pattern_matches(pattern, path))
+}
+
+fn clean_exclude_pattern_matches(pattern: &str, path: &[u8]) -> bool {
+    let pattern = pattern.trim_end_matches('/');
+    let path = String::from_utf8_lossy(path);
+    let normalized = path.trim_end_matches('/');
+    let candidate = if pattern.contains('/') {
+        normalized
+    } else {
+        normalized.rsplit('/').next().unwrap_or(normalized)
+    };
+    if pattern
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'['))
+    {
+        refname_pattern_matches(pattern, candidate)
+    } else {
+        candidate == pattern
+    }
+}
+
+fn clean_directory_contains_path(directory: &[u8], path: &[u8]) -> bool {
+    directory.strip_suffix(b"/").is_some_and(|directory| {
+        path.strip_prefix(directory)
+            .and_then(|rest| rest.strip_prefix(b"/"))
+            .is_some()
+    })
+}
+
+pub(crate) fn cmd_bundle(args: &[String]) -> Result<()> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err(GitError::Command(
+            "bundle requires <create|verify|list-heads|unbundle>".into(),
+        ));
+    };
+    match subcommand {
+        "create" => cmd_bundle_create(&args[1..]),
+        "verify" => cmd_bundle_verify(&args[1..]),
+        "list-heads" => cmd_bundle_list_heads(&args[1..]),
+        "unbundle" => cmd_bundle_unbundle(&args[1..]),
+        other => Err(GitError::Command(format!(
+            "unsupported bundle subcommand {other}"
+        ))),
+    }
+}
+
+pub(crate) fn cmd_commit_graph(args: &[String]) -> Result<()> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        return Err(GitError::Command(
+            "commit-graph requires <write|verify>".into(),
+        ));
+    };
+    match subcommand {
+        "write" => cmd_commit_graph_write(&args[1..]),
+        "verify" => cmd_commit_graph_verify(&args[1..]),
+        other => Err(GitError::Command(format!(
+            "unsupported commit-graph subcommand {other}"
+        ))),
+    }
+}
+
+fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let mut object_dir: Option<PathBuf> = None;
+    let mut reachable = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--reachable" => reachable = true,
+            "--object-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            "--progress" | "--no-progress" => {}
+            value if value.starts_with("--object-dir=") => {
+                let value = value
+                    .strip_prefix("--object-dir=")
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            other => {
+                return Err(GitError::Unsupported(format!(
+                    "commit-graph write option {other}"
+                )));
+            }
+        }
+    }
+    if !reachable {
+        return Ok(());
+    }
+    let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
+    let graph = commit_graph_for_reachable_refs(&git_dir, &object_dir, format)?;
+    let graph_dir = object_dir.join("info");
+    fs::create_dir_all(&graph_dir)?;
+    fs::write(graph_dir.join("commit-graph"), graph)?;
+    Ok(())
+}
+
+fn cmd_commit_graph_verify(args: &[String]) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let mut object_dir: Option<PathBuf> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--object-dir" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            "--progress" | "--no-progress" => {}
+            value if value.starts_with("--object-dir=") => {
+                let value = value
+                    .strip_prefix("--object-dir=")
+                    .ok_or_else(|| GitError::Command("--object-dir requires a value".into()))?;
+                object_dir = Some(resolve_cli_path(&cwd, value));
+            }
+            other => {
+                return Err(GitError::Unsupported(format!(
+                    "commit-graph verify option {other}"
+                )));
+            }
+        }
+    }
+    let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
+    let graph_path = object_dir.join("info").join("commit-graph");
+    if graph_path.exists() {
+        CommitGraph::parse(&fs::read(graph_path)?, format)?;
+        return Ok(());
+    }
+    let chain_path = object_dir
+        .join("info")
+        .join("commit-graphs")
+        .join("commit-graph-chain");
+    if chain_path.exists() {
+        return verify_split_commit_graph_chain(&chain_path, format);
+    }
+    Err(GitError::not_found("commit-graph"))
+}
+
+fn verify_split_commit_graph_chain(chain_path: &Path, format: ObjectFormat) -> Result<()> {
+    let chain_dir = chain_path
+        .parent()
+        .ok_or_else(|| GitError::InvalidPath("commit-graph chain path has no parent".into()))?;
+    let chain_bytes = fs::read(chain_path)?;
+    let text = std::str::from_utf8(&chain_bytes)
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let mut graph_hashes = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        graph_hashes.push(ObjectId::from_hex(format, line)?);
+    }
+    if graph_hashes.is_empty() {
+        return Err(GitError::InvalidFormat(
+            "commit-graph chain is empty".into(),
+        ));
+    }
+    for (idx, expected_hash) in graph_hashes.iter().enumerate() {
+        let graph_path = chain_dir.join(format!("graph-{expected_hash}.graph"));
+        let graph = CommitGraph::parse(&fs::read(&graph_path)?, format)?;
+        if &graph.checksum != expected_hash {
+            return Err(GitError::InvalidFormat(format!(
+                "commit-graph {} checksum is {}, expected {expected_hash}",
+                graph_path.display(),
+                graph.checksum
+            )));
+        }
+        if graph.base_graph_count as usize != graph.base_graphs.len() {
+            return Err(GitError::InvalidFormat(
+                "commit-graph BASE count does not match parsed base list".into(),
+            ));
+        }
+        if graph.base_graph_count as usize > idx {
+            return Err(GitError::InvalidFormat(
+                "commit-graph has more base graphs than previous chain entries".into(),
+            ));
+        }
+        if !graph.base_graphs.is_empty() {
+            let expected_bases = &graph_hashes[idx - graph.base_graphs.len()..idx];
+            if graph.base_graphs != expected_bases {
+                return Err(GitError::InvalidFormat(
+                    "commit-graph BASE hashes do not match chain order".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn commit_graph_for_reachable_refs(
+    git_dir: &Path,
+    object_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<u8>> {
+    let db = FileObjectDatabase::new(object_dir, format);
+    let store = FileRefStore::new(git_dir, format);
+    let mut starts = Vec::new();
+    let mut seen_starts = HashSet::new();
+    for reference in store.list_refs()? {
+        let RefTarget::Direct(oid) = reference.target else {
+            continue;
+        };
+        if let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+            && seen_starts.insert(commit)
+        {
+            starts.push(commit);
+        }
+    }
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD")
+        && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &head)
+        && seen_starts.insert(commit)
+    {
+        starts.push(commit);
+    }
+    let records = sley_rev::walk_commits(&db, format, starts)?;
+    let record_map = records
+        .iter()
+        .map(|record| (record.oid, record))
+        .collect::<HashMap<_, _>>();
+    let mut generation_cache = HashMap::new();
+    let mut entries = Vec::with_capacity(records.len());
+    for record in &records {
+        entries.push(CommitGraphWriteEntry {
+            oid: record.oid,
+            tree: record.commit.tree,
+            parents: record.parents.clone(),
+            generation: commit_graph_generation(&record.oid, &record_map, &mut generation_cache)?,
+            commit_time: commit_graph_commit_time(&record.commit)?,
+        });
+    }
+    CommitGraph::write(format, &entries)
+}
+
+fn commit_graph_generation(
+    oid: &ObjectId,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+    cache: &mut HashMap<ObjectId, u32>,
+) -> Result<u32> {
+    if let Some(generation) = cache.get(oid) {
+        return Ok(*generation);
+    }
+    let record = records
+        .get(oid)
+        .ok_or_else(|| GitError::InvalidObject(format!("commit {oid} missing from walk")))?;
+    let generation = if record.parents.is_empty() {
+        1
+    } else {
+        record
+            .parents
+            .iter()
+            .map(|parent| commit_graph_generation(parent, records, cache))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| GitError::InvalidFormat("commit generation overflow".into()))?
+    };
+    cache.insert(*oid, generation);
+    Ok(generation)
+}
+
+fn commit_graph_commit_time(commit: &Commit) -> Result<u64> {
+    commit_graph_commit_time_from_committer(&commit.committer)
+}
+
+fn commit_graph_commit_time_from_committer(committer: &[u8]) -> Result<u64> {
+    let committer =
+        std::str::from_utf8(committer).map_err(|err| GitError::InvalidFormat(err.to_string()))?;
+    let Some((before_tz, _tz)) = committer.rsplit_once(' ') else {
+        return Err(GitError::InvalidFormat(
+            "commit committer is missing timezone".into(),
+        ));
+    };
+    let Some((_identity, timestamp)) = before_tz.rsplit_once(' ') else {
+        return Err(GitError::InvalidFormat(
+            "commit committer is missing timestamp".into(),
+        ));
+    };
+    timestamp
+        .parse::<u64>()
+        .map_err(|err| GitError::InvalidFormat(err.to_string()))
+}
+
+fn cmd_bundle_create(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut path = None;
+    let mut all = false;
+    let mut revs = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" if path.is_none() => quiet = true,
+            "--all" if path.is_some() => all = true,
+            _ if path.is_none() => path = Some(arg),
+            _ => revs.push(arg.clone()),
+        }
+    }
+    let _ = quiet;
+    let Some(path) = path else {
+        return Err(GitError::Command("bundle create requires <file>".into()));
+    };
+    if !all && revs.is_empty() {
+        return Err(GitError::Unsupported(
+            "bundle create currently supports --all or explicit <rev> [^<rev>...]".into(),
+        ));
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let selection = if all {
+        bundle_all_revision_selection(&git_dir, format, &revs)?
+    } else {
+        bundle_revision_selection(&git_dir, format, &revs)?
+    };
+    if selection.references.is_empty() {
+        return Err(GitError::Command("Refusing to create empty bundle.".into()));
+    }
+    let excluded = collect_reachable_object_ids(&db, format, selection.excludes)?;
+    let Some(pack) = build_reachable_pack(&db, format, selection.starts, &excluded)? else {
+        eprintln!("fatal: Refusing to create empty bundle.");
+        return Err(GitError::Exit(128));
+    };
+    let bundle = Bundle {
+        version: if format == ObjectFormat::Sha1 { 2 } else { 3 },
+        format,
+        capabilities: Vec::new(),
+        prerequisites: selection.prerequisites,
+        references: selection.references,
+        pack: pack.pack,
+    };
+    fs::write(path, bundle.write()?)?;
+    Ok(())
+}
+
+fn cmd_bundle_verify(args: &[String]) -> Result<()> {
+    let mut quiet = false;
+    let mut path = None;
+    for arg in args {
+        match arg.as_str() {
+            "-q" | "--quiet" if path.is_none() => quiet = true,
+            _ if path.is_none() => path = Some(arg),
+            _ => {
+                return Err(GitError::Command(
+                    "bundle verify requires [-q|--quiet] <file>".into(),
+                ));
+            }
+        }
+    }
+    let Some(path) = path else {
+        return Err(GitError::Command("bundle verify requires <file>".into()));
+    };
+    let cwd = env::current_dir()?;
+    let git_dir = match discover_git_dir(&cwd) {
+        Ok(git_dir) => git_dir,
+        Err(_) => {
+            eprintln!("error: need a repository to verify a bundle");
+            return Err(GitError::Exit(1));
+        }
+    };
+    let format = repository_object_format(&git_dir)?;
+    let bundle = Bundle::parse(&fs::read(path)?, format)?;
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    verify_bundle_prerequisites_for_cli(&bundle, &db)?;
+    if !quiet {
+        print_bundle_verify_details(&bundle)?;
+    }
+    eprintln!("{path} is okay");
+    Ok(())
+}
+
+fn cmd_bundle_list_heads(args: &[String]) -> Result<()> {
+    let Some(path) = args.first() else {
+        return Err(GitError::Command(
+            "bundle list-heads requires <file>".into(),
+        ));
+    };
+    let refs = &args[1..];
+    let bundle = Bundle::parse_standalone(&fs::read(path)?)?;
+    print_bundle_refs(&bundle.references, refs)
+}
+
+fn cmd_bundle_unbundle(args: &[String]) -> Result<()> {
+    let mut progress = false;
+    let mut path = None;
+    let mut refs = Vec::new();
+    for arg in args {
+        if arg == "--progress" && path.is_none() {
+            progress = true;
+        } else if path.is_none() {
+            path = Some(arg);
+        } else {
+            refs.push(arg.clone());
+        }
+    }
+    let _ = progress;
+    let Some(path) = path else {
+        return Err(GitError::Command("bundle unbundle requires <file>".into()));
+    };
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let bundle = Bundle::parse(&fs::read(path)?, format)?;
+    let prerequisite_reader = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let database = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let result = install_bundle_pack(&bundle, &prerequisite_reader, &database)?;
+    print_bundle_refs(&result.references, &refs)
+}
+
+fn print_bundle_refs(refs: &[BundleReference], filters: &[String]) -> Result<()> {
+    for reference in refs {
+        if filters.is_empty() || filters.iter().any(|filter| filter == &reference.name) {
+            println!("{} {}", reference.oid, reference.name);
+        }
+    }
+    Ok(())
+}
+
+fn print_bundle_verify_details(bundle: &Bundle) -> Result<()> {
+    match bundle.references.len() {
+        1 => println!("The bundle contains this ref:"),
+        count => println!("The bundle contains these {count} refs:"),
+    }
+    print_bundle_refs(&bundle.references, &[])?;
+    match bundle.prerequisites.len() {
+        0 => println!("The bundle records a complete history."),
+        1 => {
+            println!("The bundle requires this ref:");
+            print_bundle_prerequisites(bundle)?;
+        }
+        count => {
+            println!("The bundle requires these {count} refs:");
+            print_bundle_prerequisites(bundle)?;
+        }
+    }
+    println!(
+        "The bundle uses this hash algorithm: {}",
+        bundle.format.name()
+    );
+    Ok(())
+}
+
+fn verify_bundle_prerequisites_for_cli(bundle: &Bundle, db: &FileObjectDatabase) -> Result<()> {
+    let mut missing = Vec::new();
+    for prerequisite in &bundle.prerequisites {
+        match db.read_object(&prerequisite.oid) {
+            Ok(object) => {
+                let actual = object.object_id(bundle.format)?;
+                if actual != prerequisite.oid {
+                    return Err(GitError::InvalidObject(format!(
+                        "bundle prerequisite {} hashes to {actual}",
+                        prerequisite.oid
+                    )));
+                }
+            }
+            Err(GitError::NotFound(_)) => missing.push(prerequisite),
+            Err(err) => return Err(err),
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    eprintln!("error: Repository lacks these prerequisite commits:");
+    for prerequisite in missing {
+        eprintln!("error: {} ", prerequisite.oid);
+    }
+    Err(GitError::Exit(1))
+}
+
+fn print_bundle_prerequisites(bundle: &Bundle) -> Result<()> {
+    for prerequisite in &bundle.prerequisites {
+        println!("{} ", prerequisite.oid);
+    }
+    Ok(())
+}
+
+fn bundle_all_references(git_dir: &Path, format: ObjectFormat) -> Result<Vec<BundleReference>> {
+    let store = FileRefStore::new(git_dir, format);
+    let mut references = Vec::new();
+    for reference in store.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target {
+            references.push(BundleReference {
+                oid,
+                name: reference.name,
+            });
+        }
+    }
+    if let Ok(oid) = resolve_revision(git_dir, format, "HEAD") {
+        references.push(BundleReference {
+            oid,
+            name: "HEAD".into(),
+        });
+    }
+    Ok(references)
+}
+
+struct BundleCreateSelection {
+    references: Vec<BundleReference>,
+    prerequisites: Vec<BundlePrerequisite>,
+    starts: Vec<ObjectId>,
+    excludes: Vec<ObjectId>,
+}
+
+fn bundle_all_revision_selection(
+    git_dir: &Path,
+    format: ObjectFormat,
+    revs: &[String],
+) -> Result<BundleCreateSelection> {
+    let references = bundle_all_references(git_dir, format)?;
+    let mut starts = references
+        .iter()
+        .map(|reference| reference.oid)
+        .collect::<Vec<_>>();
+    let mut prerequisites = Vec::new();
+    let mut excludes = Vec::new();
+    for rev in revs {
+        if let Some(excluded) = rev.strip_prefix('^') {
+            if excluded.is_empty() {
+                return Err(GitError::Command(
+                    "bundle create excludes require a revision".into(),
+                ));
+            }
+            let oid = resolve_revision(git_dir, format, excluded)?;
+            prerequisites.push(BundlePrerequisite {
+                oid,
+                comment: Vec::new(),
+            });
+            excludes.push(oid);
+        } else {
+            starts.push(resolve_revision(git_dir, format, rev)?);
+        }
+    }
+    Ok(BundleCreateSelection {
+        references,
+        prerequisites,
+        starts,
+        excludes,
+    })
+}
+
+fn bundle_revision_selection(
+    git_dir: &Path,
+    format: ObjectFormat,
+    revs: &[String],
+) -> Result<BundleCreateSelection> {
+    let mut references = Vec::new();
+    let mut prerequisites = Vec::new();
+    let mut starts = Vec::new();
+    let mut excludes = Vec::new();
+    for rev in revs {
+        if let Some(excluded) = rev.strip_prefix('^') {
+            if excluded.is_empty() {
+                return Err(GitError::Command(
+                    "bundle create excludes require a revision".into(),
+                ));
+            }
+            let oid = resolve_revision(git_dir, format, excluded)?;
+            prerequisites.push(BundlePrerequisite {
+                oid,
+                comment: Vec::new(),
+            });
+            excludes.push(oid);
+        } else {
+            let oid = resolve_revision(git_dir, format, rev)?;
+            references.push(BundleReference {
+                oid,
+                name: rev.clone(),
+            });
+            starts.push(oid);
+        }
+    }
+    Ok(BundleCreateSelection {
+        references,
+        prerequisites,
+        starts,
+        excludes,
+    })
+}
+
+pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
+    let mut tree = None;
+    let mut parents = Vec::new();
+    let mut message_chunks = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-p" => {
+                let Some(parent) = iter.next() else {
+                    return commit_tree_parent_requires_value_error();
+                };
+                parents.push(parent.to_string());
+            }
+            value if value.starts_with("-p") && value.len() > 2 => {
+                parents.push(value[2..].to_string());
+            }
+            "-m" => {
+                let Some(message) = iter.next() else {
+                    return commit_message_requires_value_error();
+                };
+                let mut chunk = message.as_bytes().to_vec();
+                chunk.push(b'\n');
+                message_chunks.push(chunk);
+            }
+            value if value.starts_with("-m") && value.len() > 2 => {
+                let mut chunk = value.as_bytes()[2..].to_vec();
+                chunk.push(b'\n');
+                message_chunks.push(chunk);
+            }
+            "-F" => {
+                let Some(path) = iter.next() else {
+                    return commit_tree_file_requires_value_error();
+                };
+                message_chunks.push(read_commit_message_file(path)?);
+            }
+            value if value.starts_with("-F") && value.len() > 2 => {
+                message_chunks.push(read_commit_message_file(&value[2..])?);
+            }
+            "--no-gpg-sign" => {}
+            value if tree.is_none() => tree = Some(value.to_string()),
+            value if !value.starts_with('-') => return commit_tree_requires_one_tree_error(),
+            value => {
+                return Err(GitError::Command(format!(
+                    "unexpected commit-tree argument {value}"
+                )));
+            }
+        }
+    }
+    let Some(tree) = tree else {
+        return commit_tree_requires_one_tree_error();
+    };
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let tree = ObjectId::from_hex(format, &tree)?;
+    let parents = parents
+        .iter()
+        .map(|parent| ObjectId::from_hex(format, parent))
+        .collect::<Result<Vec<_>>>()?;
+    let message = if message_chunks.is_empty() {
+        let mut message = Vec::new();
+        io::stdin().read_to_end(&mut message)?;
+        message
+    } else {
+        commit_message_from_prepared_chunks(&message_chunks)
+    };
+    let author = commit_identity_from_env("AUTHOR")?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let oid = sley_sequencer::create_commit(
+        &mut db,
+        sley_sequencer::CommitCreate {
+            tree,
+            parents,
+            author,
+            committer,
+            message,
+        },
+    )?;
+    println!("{oid}");
+    Ok(())
+}
+
+fn commit_tree_parent_requires_value_error() -> Result<()> {
+    eprintln!("error: switch `p' requires a value");
+    Err(GitError::Exit(129))
+}
+
+fn commit_tree_requires_one_tree_error() -> Result<()> {
+    eprintln!("fatal: must give exactly one tree");
+    Err(GitError::Exit(128))
+}
