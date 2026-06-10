@@ -3804,106 +3804,11 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.creator.as_deref()),
             )?,
-            "authordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "committerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "taggerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggerdate" => write_for_each_ref_identity_date(stdout, None)?,
-            "creatordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.creator.as_deref()),
-            )?,
-            "*creatordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.creator.as_deref()),
-            )?,
-            "authordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "committerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "taggerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggerdate:raw" => write_for_each_ref_identity_date_raw(stdout, None)?,
-            "creatordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.creator.as_deref()),
-            )?,
-            "*creatordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.creator.as_deref()),
-            )?,
+            "authordate" | "*authordate" | "committerdate" | "*committerdate" | "taggerdate"
+            | "*taggerdate" | "creatordate" | "*creatordate" => {
+                for_each_ref_try_date_atom(stdout, placeholder, context)
+                    .expect("date atom recognized")?
+            }
             "tree" => {
                 if let Some(tree) = context
                     .contents
@@ -4122,8 +4027,8 @@ fn print_for_each_ref_format(
                     result?;
                 } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
                     result?;
-                } else if let Some((identity, mode)) = for_each_ref_date_modifier(other, context) {
-                    write_for_each_ref_identity_date_mode(stdout, identity, mode)?;
+                } else if let Some(result) = for_each_ref_try_date_atom(stdout, other, context) {
+                    result?;
                 } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                     let target = resolve_revision(context.git_dir, context.format, rev)?;
                     if let Some(track) =
@@ -4326,43 +4231,6 @@ fn write_for_each_ref_contents_lines(
     Ok(())
 }
 
-fn for_each_ref_date_modifier<'a>(
-    placeholder: &str,
-    context: &'a ForEachRefFormatContext<'_>,
-) -> Option<(Option<&'a [u8]>, ForEachRefDateMode)> {
-    let (atom, modifier) = placeholder.split_once(':')?;
-    let mode = match modifier {
-        "raw" => ForEachRefDateMode::Raw,
-        "unix" => ForEachRefDateMode::Unix,
-        "short" => ForEachRefDateMode::Short,
-        "iso" | "iso8601" => ForEachRefDateMode::Iso,
-        "iso8601-strict" => ForEachRefDateMode::IsoStrict,
-        "rfc2822" => ForEachRefDateMode::Rfc2822,
-        _ => return None,
-    };
-    let contents = context.contents.as_ref();
-    let identity = match atom {
-        "authordate" => contents.and_then(|contents| contents.author.as_deref()),
-        "committerdate" => contents.and_then(|contents| contents.committer.as_deref()),
-        "taggerdate" => contents.and_then(|contents| contents.tagger.as_deref()),
-        "creatordate" => contents.and_then(|contents| contents.creator.as_deref()),
-        "*authordate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.author.as_deref()),
-        "*committerdate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.committer.as_deref()),
-        "*taggerdate" => None,
-        "*creatordate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.creator.as_deref()),
-        _ => return None,
-    };
-    Some((identity, mode))
-}
 
 /// The set of `%(...email)` options, mirroring git's `email_option` bitset
 /// (ref-filter.c `EO_TRIM`/`EO_LOCALPART`/`EO_MAILMAP`).
@@ -4443,6 +4311,47 @@ fn for_each_ref_try_email_atom(
         None => ForEachRefEmailOptions::default(),
     };
     Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// If `placeholder` is a date atom (`(\*?)(author|committer|tagger|creator)date`
+/// with an optional `:spec`), render it through the full date grammar. Returns
+/// `Some(Err(_))` (after reporting to stderr) on an invalid specifier.
+fn for_each_ref_try_date_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authordate" => (false, ForEachRefAtomIdentityRole::Author),
+        "committerdate" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggerdate" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "creatordate" => (false, ForEachRefAtomIdentityRole::Creator),
+        "*authordate" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committerdate" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggerdate" => (true, ForEachRefAtomIdentityRole::Tagger),
+        "*creatordate" => (true, ForEachRefAtomIdentityRole::Creator),
+        _ => return None,
+    };
+    let Some(spec) = ForEachRefDateSpec::parse(arg) else {
+        let name = atom.strip_prefix('*').unwrap_or(atom);
+        eprintln!(
+            "fatal: unrecognized %({name}) argument: {}",
+            arg.unwrap_or("")
+        );
+        return Some(Err(GitError::Exit(128)));
+    };
+    Some((|| -> Result<()> {
+        if let Some(identity) = for_each_ref_typed_identity(context, peeled, role)
+            && let Some(value) = for_each_ref_identity_date_spec(identity, &spec)
+        {
+            stdout.write_all(value.as_bytes())?;
+        }
+        Ok(())
+    })())
 }
 
 /// For an oid atom like `tree:short` / `parent:short=7`, return the option
