@@ -6199,13 +6199,7 @@ fn clean_targets(
     let has_pathspec = !pathspec.filters.is_empty();
     // Git treats any pathspec as `-d` for selection purposes.
     let effective_directories = directories || has_pathspec;
-    let rollup_directory_pathspecs = has_pathspec
-        && pathspec
-            .filters
-            .iter()
-            .any(|filter| filter.recursive && !filter.is_glob);
     let index = sley_worktree::read_repository_index(git_dir, format)?;
-    let has_commits = repository_has_commits(git_dir, format)?;
 
     let mut paths = if effective_directories {
         sley_worktree::untracked_paths_with_options(
@@ -6221,7 +6215,6 @@ fn clean_targets(
                 exclude_patterns: Vec::new(),
                 exclude_per_directory: Vec::new(),
                 pathspecs: pathspec.untracked_pathspecs(),
-                rollup_untracked_files_to_directories: rollup_directory_pathspecs,
             },
         )?
     } else {
@@ -6238,20 +6231,25 @@ fn clean_targets(
                 exclude_patterns: Vec::new(),
                 exclude_per_directory: Vec::new(),
                 pathspecs: pathspec.untracked_pathspecs(),
-                rollup_untracked_files_to_directories: false,
             },
         )?
     };
 
-    if !has_pathspec {
+    // Without `-d` (and without a pathspec, which Git treats as `-d`), the
+    // non-directory walk lists every untracked file. Git only removes a file in
+    // a subdirectory when that directory contains tracked content; an untracked
+    // file inside a wholly-untracked directory needs `-d`. The directory walk
+    // already encodes this selection (it rolls wholly-untracked directories up
+    // to `dir/` and only descends into directories with tracked/ignored content),
+    // so the retain must run only on the non-directory walk's flat output.
+    if !effective_directories {
         paths.retain(|path| {
-            path.ends_with(b"/")
-                || clean_untracked_file_eligible(path, index.as_ref(), include_ignored, has_commits)
+            path.ends_with(b"/") || clean_untracked_file_eligible(path, index.as_ref())
         });
     }
 
     if has_pathspec {
-        paths = clean_collapse_untracked_paths(paths, pathspec);
+        paths = clean_collapse_untracked_paths(paths);
     }
 
     let mut targets = Vec::new();
@@ -6274,32 +6272,19 @@ fn clean_targets(
     Ok(targets)
 }
 
-/// Git clean file selection without `-d` or pathspecs:
-/// - unborn repo: only worktree-root files unless `-x` is set
-/// - after the first commit: also untracked files inside indexed directories
-/// - with `-x` on an unborn repo: same indexed-directory files as post-commit clean
-fn clean_untracked_file_eligible(
-    path: &[u8],
-    index: Option<&Index>,
-    include_ignored: bool,
-    has_commits: bool,
-) -> bool {
+/// Git clean file selection without `-d` or pathspecs: a worktree-root file is
+/// always eligible; a file in a subdirectory is eligible only when its immediate
+/// parent directory contains tracked content (otherwise the file lives in a
+/// wholly-untracked directory that Git would only remove under `-d`). This holds
+/// regardless of `-x` or whether the repository has any commits yet.
+fn clean_untracked_file_eligible(path: &[u8], index: Option<&Index>) -> bool {
     if !path.iter().any(|byte| *byte == b'/') {
         return true;
-    }
-    if !has_commits && !include_ignored {
-        return false;
     }
     let Some(index) = index else {
         return false;
     };
     clean_path_parent(path).is_some_and(|parent| clean_index_has_tracked_under(index, parent))
-}
-
-fn repository_has_commits(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
-    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let store = FileRefStore::new(&common_git_dir, format);
-    Ok(head_commit_oid(&store)?.is_some())
 }
 
 fn clean_index_has_tracked_under(index: &Index, directory: &[u8]) -> bool {
@@ -6320,7 +6305,12 @@ fn clean_path_parent(path: &[u8]) -> Option<&[u8]> {
 }
 
 /// Match git `correct_untracked_entries` for pathspec-driven clean.
-fn clean_collapse_untracked_paths(paths: Vec<Vec<u8>>, pathspec: &LsFilesPathspec) -> Vec<Vec<u8>> {
+fn clean_collapse_untracked_paths(paths: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    // The directory walk already encodes Git's `--directory` rollup: a
+    // wholly-untracked directory named by a pathspec is emitted as `dir/`, while
+    // untracked files inside a partially-tracked directory are listed
+    // individually. The only post-processing left is dropping a file entry that
+    // is already subsumed by a rolled-up parent directory entry.
     let mut sorted = paths;
     sorted.sort();
     let mut kept = BTreeSet::new();
@@ -6330,34 +6320,9 @@ fn clean_collapse_untracked_paths(paths: Vec<Vec<u8>>, pathspec: &LsFilesPathspe
         }) {
             continue;
         }
-        if !path.ends_with(b"/") && clean_should_collapse_to_parent(path, pathspec) {
-            let parent = clean_path_parent(path).expect("parent directory");
-            let mut directory = parent.to_vec();
-            directory.push(b'/');
-            kept.insert(directory);
-        } else {
-            kept.insert(path.clone());
-        }
+        kept.insert(path.clone());
     }
     kept.into_iter().collect()
-}
-
-fn clean_should_collapse_to_parent(path: &[u8], pathspec: &LsFilesPathspec) -> bool {
-    let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
-    if pathspec
-        .filters
-        .iter()
-        .any(|filter| filter.path.as_slice() == path_no_slash)
-    {
-        return false;
-    }
-    let Some(parent) = clean_path_parent(path) else {
-        return false;
-    };
-    pathspec
-        .filters
-        .iter()
-        .any(|filter| filter.path.as_slice() == parent)
 }
 
 fn clean_target_is_excluded(path: &[u8], excludes: &[String]) -> bool {
@@ -14979,7 +14944,6 @@ fn cmd_ls_files(args: &[String]) -> Result<()> {
                 exclude_patterns: exclude_patterns.clone(),
                 exclude_per_directory: exclude_per_directory.clone(),
                 pathspecs: pathspec.untracked_pathspecs(),
-                rollup_untracked_files_to_directories: directory,
             },
         )?;
         for path in untracked {

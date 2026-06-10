@@ -900,6 +900,8 @@ fn ls_files_others_directory_pathspec_matches_upstream_git() {
 
     let nested_empty_upstream = upstream.join("untracked/deep/empty");
     let nested_empty_rust = rust.join("untracked/deep/empty");
+    fs::create_dir_all(&nested_empty_upstream).expect("create nested empty gitdir");
+    fs::create_dir_all(&nested_empty_rust).expect("create nested empty gitdir");
     git(&nested_empty_upstream, &["init", "-q"]);
     git(&nested_empty_rust, &["init", "-q"]);
     let args = ["ls-files", "--others", "untracked/*.c"];
