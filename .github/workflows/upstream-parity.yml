@@ -1,0 +1,136 @@
+name: Upstream Git Parity Tests
+
+# Run sley against the upstream git t/*.sh test suite — the authoritative
+# parity oracle. This workflow:
+#   1. Builds git 2.54.0 from source (cached) so test-lib.sh has a real built
+#      checkout (GIT-BUILD-OPTIONS + t/).
+#   2. Builds the sley binary and runs the foundational t-file subset through
+#      crates/sley-testkit/scripts/run-upstream-tests.sh.
+#   3. Gates on a per-file PASS FLOOR: each tracked t-file must not drop below
+#      its recorded ok-assertion count. A net gain never fails the gate; only a
+#      regression below floor does.
+#
+# Triggered manually or weekly. Pinned to git 2.54.0 so the floors below stay
+# meaningful across runs (a newer git could add/rename assertions and shift the
+# baseline out from under the floors).
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_version:
+        description: 'Upstream git version tag to build from source (default v2.54.0)'
+        required: false
+        default: 'v2.54.0'
+  schedule:
+    # Weekly: Thursdays 08:00 UTC.
+    - cron: '0 8 * * 4'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-parity-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GIT_VERSION: ${{ github.event.inputs.git_version || 'v2.54.0' }}
+
+jobs:
+  upstream-parity:
+    name: Upstream parity (floor-gated subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ runner.os }}
+
+      # Build deps for git from source (matches the local build:
+      # libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext).
+      - name: Install git build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
+
+      # Cache the built git source tree, keyed on the version tag. A cache hit
+      # skips the ~minutes-long clone+make.
+      - name: Cache upstream git build
+        id: git-cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/git-src
+          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}
+
+      - name: Build upstream git from source
+        if: steps.git-cache.outputs.cache-hit != 'true'
+        run: |
+          rm -rf /tmp/git-src
+          git clone --depth=1 --branch "$GIT_VERSION" \
+            https://github.com/git/git /tmp/git-src
+          cd /tmp/git-src
+          # `make install` to a throwaway prefix produces a full build (with
+          # GIT-BUILD-OPTIONS) that test-lib.sh and the t/ scripts can source.
+          make -j"$(nproc)" prefix=/tmp/git-prefix install 2>&1 | tail -20
+
+      - name: Build sley
+        run: cargo build -p sley-cli --bin sley --release
+
+      - name: Run upstream parity subset
+        env:
+          GIT_SRC_DIR: /tmp/git-src
+          GIT_TEST_DEFAULT_HASH: sha1
+          # The floor-gated subset: the 9 foundational t-files sley tracks.
+          # t2400 has no command-name alias in the runner, so we pass exact
+          # filenames via SLEY_TESTS (overrides the runner's default subset).
+          SLEY_TESTS: >-
+            t0001-init.sh
+            t1006-cat-file.sh
+            t1007-hash-object.sh
+            t1300-config.sh
+            t1401-symbolic-ref.sh
+            t1500-rev-parse.sh
+            t2400-worktree-add.sh
+            t3000-ls-files-others.sh
+            t3103-ls-tree-misc.sh
+          SLEY_RUN_LABEL: ${{ github.sha }}
+        run: |
+          export SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley"
+          # The runner exits non-zero unless EVERY script is a full PASS. We do
+          # NOT gate on its exit code — these t-files are partially-passing by
+          # design. The floor-check below is the real gate. `|| true` keeps the
+          # step from short-circuiting before the floor-check runs.
+          crates/sley-testkit/scripts/run-upstream-tests.sh || true
+
+      # Floor gate: each tracked t-file must keep at least its recorded ok
+      # count. Reads the per-script summary CSV the runner writes
+      # (script,command,result,ok,notok,total,plan_total). A net GAIN passes;
+      # only a DROP below floor fails. Floors recorded 2026-06-10 against
+      # base b069dbe + git 2.54.0.
+      - name: Check parity floors
+        run: |
+          bash .github/workflows/scripts/check-parity-floors.sh \
+            crates/sley-testkit/upstream-report-summary.csv
+
+      - name: Archive upstream test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-test-results
+          path: |
+            crates/sley-testkit/upstream-report.txt
+            crates/sley-testkit/upstream-report-summary.csv
+            crates/sley-testkit/upstream-history.csv
+
+      - name: Report upstream parity
+        if: always()
+        run: |
+          if [ -f crates/sley-testkit/upstream-report.txt ]; then
+            echo "=== Upstream Git Parity Report ==="
+            tail -50 crates/sley-testkit/upstream-report.txt
+          fi
