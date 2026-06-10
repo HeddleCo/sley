@@ -1260,3 +1260,66 @@ fn for_each_ref_direct_remote_refspecs_match_upstream_git() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Name-only formats must not read the ref's object (git's used_atom analysis).
+///
+/// We point a ref at an object id that does not exist in the object store. Both
+/// git and sley print `%(objectname) %(refname)` from the loose-ref value alone,
+/// so the output is byte-identical and neither errors. Before the used_atom
+/// optimization, sley called `db.read_object` per ref unconditionally and would
+/// have failed on the missing object — this test pins the skip as an invariant.
+#[test]
+fn for_each_ref_name_only_format_skips_missing_object() {
+    let root = unique_temp_dir("for-each-ref-name-only-skip");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q", "-b", "main"]);
+        fs::write(root.join("file"), b"file\n").expect("write fixture");
+        git(&root, &["add", "file"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=Example User",
+                "-c",
+                "user.email=example@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+                "-q",
+            ],
+        );
+        // A ref whose target object is absent from the store. `update-ref` refuses
+        // to point at a nonexistent object, so write the loose ref file directly —
+        // a plain filesystem write, no host state, fully hermetic.
+        let dangling = "0123456789012345678901234567890123456789";
+        fs::write(
+            root.join(".git").join("refs").join("heads").join("dangling"),
+            format!("{dangling}\n"),
+        )
+        .expect("write dangling loose ref");
+
+        // Sanity: the object really is missing (so any read would fail).
+        let missing = git_rs_raw(&root, &["cat-file", "-e", dangling]);
+        assert!(
+            !missing.status.success(),
+            "fixture invalid: object {dangling} unexpectedly present"
+        );
+
+        let args = ["for-each-ref", "--format=%(objectname) %(refname)"];
+        let expected = git(&root, &args);
+        let actual = git_rs(&root, &args);
+        assert_eq!(
+            actual, expected,
+            "name-only for-each-ref must match git without reading the object"
+        );
+        // The dangling ref must appear in the output (proving it was not silently
+        // dropped by an object read failure).
+        assert!(
+            String::from_utf8_lossy(&actual).contains("refs/heads/dangling"),
+            "dangling ref missing from name-only output: {}",
+            String::from_utf8_lossy(&actual)
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
