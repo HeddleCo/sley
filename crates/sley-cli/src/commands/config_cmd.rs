@@ -12,6 +12,11 @@ pub(crate) enum ConfigAction {
     GetRegexp,
     List,
     Set,
+    /// git's `ACTION_SET_ALL` — the legacy default `git config <key> <value>
+    /// <value-pattern>` (3 positionals, no explicit mode). Like `--replace-all`
+    /// but WITHOUT the multi-replace flag, so it refuses when several entries
+    /// match the pattern.
+    SetAll,
     ReplaceAll,
     Add,
     Unset,
@@ -136,7 +141,7 @@ impl ConfigMode {
             ConfigAction::GetColor => Self::GetColor,
             ConfigAction::GetColorBool => Self::GetColorBool,
             ConfigAction::GetUrlMatch => Self::GetUrlMatch,
-            ConfigAction::Set => Self::Set,
+            ConfigAction::Set | ConfigAction::SetAll => Self::Set,
             ConfigAction::Add => Self::Add,
             ConfigAction::ReplaceAll => Self::ReplaceAll,
             ConfigAction::Unset => Self::Unset,
@@ -420,6 +425,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         match positional.len() {
             1 => ConfigAction::Get,
             2 => ConfigAction::Set,
+            // Legacy `git config <key> <value> <value-pattern>` (git's
+            // ACTION_SET_ALL).
+            3 => ConfigAction::SetAll,
             _ => {
                 return Err(GitError::Command(
                     "config requires <key> [<value>] or an explicit action".into(),
@@ -488,7 +496,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 "config write action requires <key> <value>".into(),
             ));
         }
-        ConfigAction::ReplaceAll if !(2..=3).contains(&positional.len()) => {
+        ConfigAction::ReplaceAll | ConfigAction::SetAll if !(2..=3).contains(&positional.len()) => {
             return Err(GitError::Command(
                 "config --replace-all requires <key> <value> [<value-pattern>]".into(),
             ));
@@ -545,7 +553,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     if comment.is_some()
         && !matches!(
             action,
-            ConfigAction::Set | ConfigAction::ReplaceAll | ConfigAction::Add
+            ConfigAction::Set
+                | ConfigAction::SetAll
+                | ConfigAction::ReplaceAll
+                | ConfigAction::Add
         )
     {
         eprintln!("error: --comment is only applicable to add/set/replace operations");
@@ -562,7 +573,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             | ConfigAction::GetRegexp
             | ConfigAction::Unset
             | ConfigAction::UnsetAll => positional.len() > 1,
-            ConfigAction::Set | ConfigAction::ReplaceAll => positional.len() > 2,
+            ConfigAction::Set | ConfigAction::SetAll | ConfigAction::ReplaceAll => {
+                positional.len() > 2
+            }
             _ => false,
         };
         if !allowed {
@@ -570,16 +583,18 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(129));
         }
     }
-    let value_matcher = match action {
-        ConfigAction::ReplaceAll if positional.len() == 3 => {
-            Some(ConfigValueMatcher::parse(positional[2], fixed_value))
+    // The value-pattern positional, parsed as git's value-pattern (a leading `!`
+    // negates the match, unless `--fixed-value` requests literal comparison).
+    let value_pattern_filter = match action {
+        ConfigAction::SetAll | ConfigAction::ReplaceAll if positional.len() == 3 => {
+            Some(ConfigValuePatternFilter::parse(positional[2], fixed_value))
         }
         ConfigAction::Unset | ConfigAction::UnsetAll if positional.len() == 2 => {
-            Some(ConfigValueMatcher::parse(positional[1], fixed_value))
+            Some(ConfigValuePatternFilter::parse(positional[1], fixed_value))
         }
         _ => None,
     };
-    let value_matcher = value_matcher.as_ref();
+    let value_pattern_filter = value_pattern_filter.as_ref();
 
     let key = if matches!(
         action,
@@ -686,6 +701,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let is_write_action = matches!(
         action,
         ConfigAction::Set
+            | ConfigAction::SetAll
             | ConfigAction::Add
             | ConfigAction::ReplaceAll
             | ConfigAction::Unset
@@ -702,62 +718,93 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         // Writes operate on the target file's document alone — never on the
         // merged stack, and never with includes spliced in (git edits the file
         // in place and leaves include directives untouched).
-        let mut config = load_write_document(&source)?;
+        //
+        // Variable set/add/replace/unset go through the git-faithful surgical
+        // editor (`config_raw_edit`), which preserves the target file
+        // byte-for-byte apart from the lines it genuinely touches — exactly like
+        // git's `git_config_set_multivar_in_file`. Section rename/remove still use
+        // the structured document path.
         match action {
             ConfigAction::Set => {
                 let key = key.expect("validated config key");
-                if config_value_count(&config, &key) > 1 {
+                // git's ACTION_SET: with no value-pattern, refuse if the key is
+                // already multi-valued (CONFIG_NOTHING_SET → "cannot overwrite
+                // multiple values with a single value").
+                let value = normalize_set_value(&key, positional[1], value_type)?;
+                if !config_raw_edit(&source, &key, Some(&value), comment.as_deref(), None, false)? {
+                    eprintln!(
+                        "warning: {} has multiple values",
+                        config_key_display(&key)
+                    );
+                    eprintln!(
+                        "error: cannot overwrite multiple values with a single value\n       Use a regexp, --add or --replace-all to change {}.",
+                        config_key_display(&key)
+                    );
                     return Err(GitError::Exit(5));
                 }
-                config_set_value_with_comment(
-                    &mut config,
+            }
+            ConfigAction::SetAll => {
+                // git's ACTION_SET_ALL: legacy `<key> <value> <value-pattern>` —
+                // single replace with a value-pattern (no multi-replace flag).
+                let key = key.expect("validated config key");
+                let value = normalize_set_value(&key, positional[1], value_type)?;
+                let pred = value_pattern_filter.map(filter_predicate);
+                if !config_raw_edit(
+                    &source,
                     &key,
-                    positional[1],
-                    false,
+                    Some(&value),
                     comment.as_deref(),
-                );
-                write_config_source(&source, &config)?;
+                    pred.as_deref(),
+                    false,
+                )? {
+                    return Err(GitError::Exit(5));
+                }
             }
             ConfigAction::ReplaceAll => {
                 let key = key.expect("validated config key");
-                config_replace_all_value(
-                    &mut config,
+                let value = normalize_set_value(&key, positional[1], value_type)?;
+                let pred = value_pattern_filter.map(filter_predicate);
+                // --replace-all: multi-replace; never errors on multiple matches.
+                config_raw_edit(
+                    &source,
                     &key,
-                    positional[1],
-                    value_matcher,
+                    Some(&value),
                     comment.as_deref(),
-                );
-                write_config_source(&source, &config)?;
+                    pred.as_deref(),
+                    true,
+                )?;
             }
             ConfigAction::Add => {
                 let key = key.expect("validated config key");
-                config_set_value_with_comment(
-                    &mut config,
+                let value = normalize_set_value(&key, positional[1], value_type)?;
+                // git's ACTION_ADD: set_multivar with CONFIG_REGEX_NONE — a
+                // pattern that matches nothing, so it always appends a new line.
+                let never = |_: Option<&str>| false;
+                config_raw_edit(
+                    &source,
                     &key,
-                    positional[1],
-                    true,
+                    Some(&value),
                     comment.as_deref(),
-                );
-                write_config_source(&source, &config)?;
+                    Some(&never),
+                    true,
+                )?;
             }
             ConfigAction::Unset => {
                 let key = key.expect("validated config key");
-                if value_matcher.is_none() && config_value_count(&config, &key) > 1 {
+                let pred = value_pattern_filter.map(filter_predicate);
+                if !config_raw_edit(&source, &key, None, None, pred.as_deref(), false)? {
                     return Err(GitError::Exit(5));
                 }
-                if !config_unset_value(&mut config, &key, false, value_matcher) {
-                    return Err(GitError::Exit(5));
-                }
-                write_config_source(&source, &config)?;
             }
             ConfigAction::UnsetAll => {
                 let key = key.expect("validated config key");
-                if !config_unset_value(&mut config, &key, true, value_matcher) {
+                let pred = value_pattern_filter.map(filter_predicate);
+                if !config_raw_edit(&source, &key, None, None, pred.as_deref(), true)? {
                     return Err(GitError::Exit(5));
                 }
-                write_config_source(&source, &config)?;
             }
             ConfigAction::RenameSection => {
+                let mut config = load_write_document(&source)?;
                 let old = parse_config_section_name(positional[0])?;
                 let new = parse_config_section_name(positional[1])?;
                 if !config_rename_section(&mut config, &old, &new) {
@@ -766,6 +813,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 write_config_source(&source, &config)?;
             }
             ConfigAction::RemoveSection => {
+                let mut config = load_write_document(&source)?;
                 let section = parse_config_section_name(positional[0])?;
                 if !config_remove_section(&mut config, &section) {
                     return Err(GitError::Exit(128));
@@ -1245,6 +1293,68 @@ fn load_write_document(source: &ConfigSource) -> Result<GitConfig> {
                 path.display()
             );
             Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Resolve the on-disk path a write action targets, or `None` for the
+/// unsupported Blob/Stdin sources (the caller already rejects those).
+fn config_write_path(source: &ConfigSource) -> Option<PathBuf> {
+    match source {
+        ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
+        ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => Some(path.clone()),
+        ConfigSource::Blob(_) | ConfigSource::Stdin => None,
+    }
+}
+
+/// Apply a git-faithful surgical edit (`git config set/add/--replace-all/--unset`)
+/// to the target file's raw bytes, preserving every untouched byte. Mirrors
+/// git's `git_config_set_multivar_in_file_gently`.
+///
+/// `value == None` is an unset; `multi_replace` is `--replace-all`'s
+/// `CONFIG_FLAGS_MULTI_REPLACE`; `value_matches` is the optional value-pattern
+/// filter (already folding in `!` negation and `--fixed-value`). Returns `false`
+/// when the edit matched nothing to unset, or matched several entries under a
+/// single-value set (git's exit code 5).
+fn config_raw_edit(
+    source: &ConfigSource,
+    key: &ConfigKey,
+    value: Option<&str>,
+    comment: Option<&str>,
+    value_matches: Option<&dyn Fn(Option<&str>) -> bool>,
+    multi_replace: bool,
+) -> Result<bool> {
+    let Some(path) = config_write_path(source) else {
+        eprintln!("fatal: writing config blobs is not supported");
+        return Err(GitError::Exit(128));
+    };
+    let contents = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => {
+            eprintln!(
+                "fatal: unable to read config file '{}': {err}",
+                path.display()
+            );
+            return Err(GitError::Exit(128));
+        }
+    };
+    let mut editor = sley_config::raw_edit::RawConfigEditor::new(
+        contents,
+        &key.section,
+        key.subsection.as_deref(),
+        &key.key,
+    );
+    match editor.set_multivar(value, comment, value_matches, multi_replace) {
+        sley_config::raw_edit::RawEditOutcome::NothingSet => Ok(false),
+        sley_config::raw_edit::RawEditOutcome::Changed => {
+            if let Some(parent) = path.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).ok();
+            }
+            fs::write(&path, editor.into_bytes())?;
+            Ok(true)
         }
     }
 }
@@ -2652,16 +2762,76 @@ fn config_key_name(key: &ConfigKey) -> String {
     }
 }
 
+/// git's key spelling in `set`-related diagnostics: the section/variable are
+/// lower-cased (subsection keeps its case), matching `git_config_parse_key`.
+fn config_key_display(key: &ConfigKey) -> String {
+    match &key.subsection {
+        Some(subsection) => format!(
+            "{}.{}.{}",
+            key.section.to_ascii_lowercase(),
+            subsection,
+            key.key.to_ascii_lowercase()
+        ),
+        None => format!(
+            "{}.{}",
+            key.section.to_ascii_lowercase(),
+            key.key.to_ascii_lowercase()
+        ),
+    }
+}
+
+/// git's `normalize_value` for the set path: `string`/`path`/`expiry-date` are
+/// stored verbatim; `int`/`bool`/`bool-or-int` are canonicalised; `color` is
+/// validated but stored as written.
+fn normalize_set_value(
+    key: &ConfigKey,
+    value: &str,
+    value_type: ConfigValueType,
+) -> Result<String> {
+    match value_type {
+        ConfigValueType::Raw | ConfigValueType::Path | ConfigValueType::ExpiryDate => {
+            Ok(value.to_string())
+        }
+        ConfigValueType::Color => {
+            // Validate (git dies on a bad color) but store the original spelling.
+            format_config_color_value(value).map(|_| value.to_string())
+        }
+        ConfigValueType::Int | ConfigValueType::Bool | ConfigValueType::BoolOrInt => {
+            format_config_value_with(value, value_type, Some(&config_key_display(key)), None)
+        }
+    }
+}
+
+/// Adapt a [`ConfigValuePatternFilter`] into the value-matching predicate the raw
+/// editor expects.
+fn filter_predicate(
+    filter: &ConfigValuePatternFilter,
+) -> Box<dyn Fn(Option<&str>) -> bool + '_> {
+    Box::new(move |value: Option<&str>| filter.matches(value))
+}
+
+/// git's `git_config_prepare_comment_string`: turn the user's `--comment=<text>`
+/// into the exact suffix `write_pair` appends after the value.
+///
+/// * leading blanks followed by `#` → used verbatim (e.g. `\t# c` → `\t# c`);
+/// * begins with `#` → a single space is prefixed (`#abc` → ` #abc`);
+/// * otherwise → ` # <text>` (`find fish` → ` # find fish`).
+///
+/// Multi-line comments are rejected (git's `die`).
 fn parse_config_comment(value: &str) -> Result<String> {
-    if value.bytes().any(|byte| matches!(byte, b'\n' | b'\r')) {
+    if value.contains('\n') {
         eprintln!("fatal: no multi-line comment allowed: '{value}'");
         return Err(GitError::Exit(128));
     }
-    let value = value
-        .strip_prefix('#')
-        .map(|rest| rest.trim_start_matches([' ', '\t']))
-        .unwrap_or(value);
-    Ok(value.to_string())
+    let leading_blanks = value.len() - value.trim_start_matches([' ', '\t']).len();
+    let prepared = if leading_blanks > 0 && value[leading_blanks..].starts_with('#') {
+        value.to_string()
+    } else if value.starts_with('#') {
+        format!(" {value}")
+    } else {
+        format!(" # {value}")
+    };
+    Ok(prepared)
 }
 
 pub(crate) fn config_set_value(config: &mut GitConfig, key: &ConfigKey, value: &str, add: bool) {

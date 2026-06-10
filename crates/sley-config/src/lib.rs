@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 /// half of `git remote add`/`remove`/`set-url`).
 pub mod remotes;
 
+/// Byte-faithful in-place config editing mirroring git's surgical splice writer.
+pub mod raw_edit;
+
 /// A preserved comment or blank line from the source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigPreambleLine {
@@ -1755,7 +1758,7 @@ impl<'a> ConfigParser<'a> {
 /// becomes `\n`; other characters (including backspace) are emitted verbatim, just
 /// as git does. The result always round-trips back through the parser to the
 /// original value.
-fn quote_config_value(value: &str) -> String {
+pub(crate) fn quote_config_value(value: &str) -> String {
     let needs_quotes = value.starts_with(' ')
         || value.ends_with(' ')
         || value.contains('\r')
