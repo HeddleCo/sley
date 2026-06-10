@@ -559,15 +559,24 @@ impl ObjectQuery<'_> {
     fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
         let oid = self.view.resolve(self.name)?;
         let oid = self.view.replacement_oid(&oid)?;
-        let oid = match object_type {
-            ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid)?,
-            ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid)?,
+        let peeled = match object_type {
+            ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid),
+            ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid),
             ObjectType::Commit => {
-                sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)?
+                sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)
             }
-            ObjectType::Tag => oid,
+            ObjectType::Tag => Ok(oid),
         };
-        let object = self.view.db().read_object(&oid)?;
+        // The peel itself reads the object, so a corrupt loose object surfaces here
+        // for a direct `<type> <oid>` spelling just as it would from the body read.
+        let oid = match peeled {
+            Ok(oid) => oid,
+            Err(err) => return self.typed_body_read_error(err, &oid),
+        };
+        let object = match self.view.db().read_object(&oid) {
+            Ok(object) => object,
+            Err(err) => return self.typed_body_read_error(err, &oid),
+        };
         if object.object_type != object_type {
             eprintln!("fatal: git cat-file {}: bad file", self.name);
             return Err(GitError::Exit(128));
@@ -575,6 +584,24 @@ impl ObjectQuery<'_> {
         io::stdout().write_all(&object.body)?;
         io::stdout().flush()?;
         Ok(())
+    }
+
+    /// A failed read in `<type> <object>` mode. Upstream reads with
+    /// `OBJECT_INFO_DIE_IF_CORRUPT`, so a corrupt loose object surfaces the odb's
+    /// `error:`-level diagnostic and then dies with `loose object <oid> (stored in
+    /// <path>) is corrupt` (exit 128); every other error propagates unchanged.
+    fn typed_body_read_error<T>(&self, err: GitError, oid: &ObjectId) -> Result<T> {
+        if let GitError::InvalidObject(message) = &err
+            && is_loose_corruption_message(message)
+        {
+            eprintln!("error: {message}");
+            eprintln!(
+                "fatal: loose object {oid} (stored in {}) is corrupt",
+                loose_object_display_path(self.view.db(), oid)
+            );
+            return Err(GitError::Exit(128));
+        }
+        Err(err)
     }
 }
 
@@ -1053,9 +1080,10 @@ fn print_cat_file_batch_record(
             eprintln!("fatal: invalid object type");
             return Err(GitError::Exit(128));
         }
-        // An over-long loose header is non-fatal in batch mode: git emits the `error:` line and
-        // reports the oid as `missing`, then continues.
-        Err(GitError::InvalidObject(message)) if is_loose_header_too_long(&message) => {
+        // A corrupt loose object (over-long header, unpackable stream, broken body) is
+        // non-fatal in batch mode: git emits the `error:` line and reports the oid as
+        // `missing`, then continues.
+        Err(GitError::InvalidObject(message)) if is_loose_corruption_message(&message) => {
             eprintln!("error: {message}");
             return report_object_missing(stdout, &record, &query);
         }
@@ -1095,11 +1123,11 @@ fn batch_object_header(
             Err(GitError::Exit(128))
         }
         Err(err) => {
-            // An over-long loose header is not fatal in batch mode: git prints the
+            // A corrupt loose object is not fatal in batch mode: git prints the
             // `error:`-level diagnostic to stderr, reports the oid as `missing`, and keeps
             // going (exit 0). Any other read error is likewise reported as missing.
             if let GitError::InvalidObject(message) = &err
-                && is_loose_header_too_long(message)
+                && is_loose_corruption_message(message)
             {
                 eprintln!("error: {message}");
             }
@@ -1447,11 +1475,11 @@ fn cat_file_object_info_error<T>(
             eprintln!("fatal: invalid object type");
             return Err(GitError::Exit(128));
         }
-        if is_loose_header_too_long(message) {
-            // The odb already formatted git's exact `error:`-level text
-            // (`header for <oid> too long, exceeds 32 bytes`); print it, then fall through to
-            // the per-cmd trailing `fatal:` below (object-file.c emits the `error()`, then the
-            // caller's `die()`).
+        if is_loose_corruption_message(message) {
+            // The odb already formatted git's exact `error:`-level text (too-long header,
+            // unpackable header, corrupt body); print it, then fall through to the per-cmd
+            // trailing `fatal:` below (object-file.c emits the `error()`, then the caller's
+            // `die()`).
             eprintln!("error: {message}");
             return cat_file_object_info_failed(user);
         }
@@ -1469,6 +1497,32 @@ fn cat_file_object_info_error<T>(
 /// <n> bytes`), matched on the stable suffix so it stays independent of the embedded oid.
 fn is_loose_header_too_long(message: &str) -> bool {
     message.starts_with("header for ") && message.contains(" too long, exceeds ")
+}
+
+/// Any `error:`-level loose-object corruption diagnostic the odb pre-formats with git's
+/// exact object-file.c text: the over-long header (ULHR_TOO_LONG), the unpackable header
+/// (`unable to unpack <oid> header`, ULHR_BAD), or the corrupt body (`corrupt loose object
+/// '<oid>'`, `unpack_loose_rest`). Callers print the message as `error: <message>` and then
+/// add their own per-command `fatal:`.
+fn is_loose_corruption_message(message: &str) -> bool {
+    is_loose_header_too_long(message)
+        || (message.starts_with("unable to unpack ") && message.ends_with(" header"))
+        || message.starts_with("corrupt loose object '")
+}
+
+/// The `stored in <path>` spelling of upstream's corrupt-loose die. git prints the loose
+/// path under `$GIT_DIR/objects` using GIT_DIR's textual (often relative) value; sley's
+/// discovery yields an absolute path, so relativize against the cwd when possible.
+fn loose_object_display_path(db: &FileObjectDatabase, oid: &ObjectId) -> String {
+    let Ok(path) = db.loose().object_path(oid) else {
+        return format!("objects/{oid}");
+    };
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = path.strip_prefix(&cwd)
+    {
+        return relative.display().to_string();
+    }
+    path.display().to_string()
 }
 
 /// The trailing `fatal:` git prints after a failed object-info lookup, chosen per `cmd_object`
