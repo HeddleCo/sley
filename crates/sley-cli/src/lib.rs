@@ -3316,15 +3316,22 @@ fn for_each_ref_upstream_track(
     oid: &ObjectId,
     upstream: &str,
 ) -> Result<Option<ForEachRefTrack>> {
+    // git: a configured-but-unresolvable upstream reports `[gone]`, distinct
+    // from "no upstream configured" (which the caller already filtered out).
+    let gone_track = ForEachRefTrack {
+        ahead: 0,
+        behind: 0,
+        gone: true,
+    };
     let Some(upstream_target) = store.read_ref(upstream)? else {
-        return Ok(None);
+        return Ok(Some(gone_track));
     };
     let upstream_ref = sley_refs::Ref {
         name: upstream.to_string(),
         target: upstream_target,
     };
     let Some((upstream_oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)? else {
-        return Ok(None);
+        return Ok(Some(gone_track));
     };
     for_each_ref_ahead_behind(db, format, oid, &upstream_oid)
 }
@@ -3351,7 +3358,11 @@ fn for_each_ref_ahead_behind(
         .collect::<HashSet<_>>();
     let ahead = local_reachable.difference(&target_reachable).count();
     let behind = target_reachable.difference(&local_reachable).count();
-    Ok(Some(ForEachRefTrack { ahead, behind }))
+    Ok(Some(ForEachRefTrack {
+        ahead,
+        behind,
+        gone: false,
+    }))
 }
 
 struct ForEachRefContents<'a> {
@@ -3602,7 +3613,7 @@ fn print_for_each_ref_format(
                     write_for_each_ref_track(stdout, track, true)?;
                 }
             }
-            "upstream:track,nobracket" => {
+            "upstream:track,nobracket" | "upstream:nobracket,track" => {
                 if let Some(track) = context.upstream_track {
                     write_for_each_ref_track(stdout, track, false)?;
                 }
@@ -3650,7 +3661,7 @@ fn print_for_each_ref_format(
                     write_for_each_ref_track(stdout, track, true)?;
                 }
             }
-            "push:track,nobracket" => {
+            "push:track,nobracket" | "push:nobracket,track" => {
                 if let Some(track) = context.push_track {
                     write_for_each_ref_track(stdout, track, false)?;
                 }

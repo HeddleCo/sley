@@ -394,6 +394,9 @@ pub fn write_for_each_ref_quoted_atom(
 pub struct ForEachRefTrack {
     pub ahead: usize,
     pub behind: usize,
+    /// The upstream is configured but its ref no longer resolves; git renders
+    /// `%(upstream:track)` as `[gone]` and `%(upstream:trackshort)` as empty.
+    pub gone: bool,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -729,6 +732,16 @@ pub fn write_for_each_ref_track(
     track: ForEachRefTrack,
     bracketed: bool,
 ) -> Result<()> {
+    if track.gone {
+        // git emits a literal "[gone]" (or bare "gone" with nobracket) when the
+        // configured upstream no longer resolves.
+        if bracketed {
+            stdout.write_all(b"[gone]")?;
+        } else {
+            stdout.write_all(b"gone")?;
+        }
+        return Ok(());
+    }
     if bracketed && (track.ahead > 0 || track.behind > 0) {
         stdout.write_all(b"[")?;
     }
@@ -747,6 +760,10 @@ pub fn write_for_each_ref_track(
 }
 
 pub fn for_each_ref_track_short(track: ForEachRefTrack) -> &'static str {
+    if track.gone {
+        // git's trackshort is empty for a gone upstream.
+        return "";
+    }
     match (track.ahead, track.behind) {
         (0, 0) => "=",
         (_, 0) => ">",
@@ -1386,28 +1403,32 @@ mod tests {
         assert_eq!(
             for_each_ref_track_short(ForEachRefTrack {
                 ahead: 0,
-                behind: 0
+                behind: 0,
+                gone: false,
             }),
             "="
         );
         assert_eq!(
             for_each_ref_track_short(ForEachRefTrack {
                 ahead: 1,
-                behind: 0
+                behind: 0,
+                gone: false,
             }),
             ">"
         );
         assert_eq!(
             for_each_ref_track_short(ForEachRefTrack {
                 ahead: 0,
-                behind: 1
+                behind: 1,
+                gone: false,
             }),
             "<"
         );
         assert_eq!(
             for_each_ref_track_short(ForEachRefTrack {
                 ahead: 1,
-                behind: 1
+                behind: 1,
+                gone: false,
             }),
             "<>"
         );
@@ -1418,6 +1439,7 @@ mod tests {
             ForEachRefTrack {
                 ahead: 2,
                 behind: 3,
+                gone: false,
             },
             true,
         )
