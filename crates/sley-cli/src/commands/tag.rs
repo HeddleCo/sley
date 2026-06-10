@@ -463,6 +463,10 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 "tag listing currently supports: tag [-l|--list] [--format <format>|--no-format] [--sort <key>|--no-sort] [-i|--ignore-case|--no-ignore-case] [--omit-empty|--no-omit-empty] [--points-at <object-ish>|--no-points-at|--contains <commit-ish>|--no-contains <commit-ish>|--merged [<commit-ish>]|--no-merged [<commit-ish>]] [<pattern>...]".into(),
             ));
         }
+        if column != TagListColumn::None && annotation_lines.is_some() {
+            eprintln!("fatal: options '--column' and '-n' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
         let points_at = points_at
             .as_deref()
             .map(|rev| resolve_tag_points_at_filter(&git_dir, format, rev))
