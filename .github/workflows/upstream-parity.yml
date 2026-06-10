@@ -33,7 +33,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GIT_VERSION: ${{ github.event.inputs.git_version || 'v2.54.0' }}
+  ORACLE_GIT_TAG: ${{ github.event.inputs.git_version || 'v2.54.0' }}
 
 jobs:
   upstream-parity:
@@ -65,13 +65,13 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/git-src
-          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}-v2
+          key: git-src-${{ env.ORACLE_GIT_TAG }}-${{ runner.os }}-v2
 
       - name: Fetch upstream git (cache miss)
         if: steps.git-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf /tmp/git-src
-          git clone --depth=1 --branch "$GIT_VERSION" \
+          git clone --depth=1 --branch "$ORACLE_GIT_TAG" \
             https://github.com/git/git /tmp/git-src
       - name: Build + install upstream git
         # Runs on cache hit too: only the source tree (with build artifacts)
@@ -80,7 +80,7 @@ jobs:
         # GIT-BUILD-OPTIONS) that test-lib.sh and the t/ scripts can source.
         run: |
           cd /tmp/git-src
-          echo "${GIT_VERSION#v}" > version
+          echo "${ORACLE_GIT_TAG#v}" > version
           make -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -20
 
       - name: Build sley

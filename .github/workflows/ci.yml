@@ -17,7 +17,7 @@ defaults:
     shell: bash --noprofile --norc -eo pipefail {0}
 
 env:
-  GIT_VERSION: v2.54.0
+  ORACLE_GIT_TAG: v2.54.0
   CARGO_TERM_COLOR: always
   RUSTC_WRAPPER: sccache
   # sccache caches to LOCAL DISK; avoids GHA cache churn.
@@ -60,23 +60,23 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/git-src
-          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}-v2
+          key: git-src-${{ env.ORACLE_GIT_TAG }}-${{ runner.os }}-v2
       - name: Fetch upstream git (cache miss)
         if: steps.git-cache.outputs.cache-hit != 'true'
         run: |
           rm -rf /tmp/git-src
-          git clone --depth=1 --branch "$GIT_VERSION" https://github.com/git/git /tmp/git-src
+          git clone --depth=1 --branch "$ORACLE_GIT_TAG" https://github.com/git/git /tmp/git-src
       - name: Install pinned oracle git
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q libcurl4-openssl-dev libexpat1-dev libpcre2-dev gettext
-          echo "${GIT_VERSION#v}" > /tmp/git-src/version
+          echo "${ORACLE_GIT_TAG#v}" > /tmp/git-src/version
           make -C /tmp/git-src -j"$(nproc)" prefix=/tmp/git-prefix USE_LIBPCRE2=1 install 2>&1 | tail -3
           echo "/tmp/git-prefix/bin" >> "$GITHUB_PATH"
       - name: Assert pinned oracle on PATH
         run: |
           git version
-          test "$(git version)" = "git version ${GIT_VERSION#v}"
+          test "$(git version)" = "git version ${ORACLE_GIT_TAG#v}"
 
       - name: Build (default features)
         run: cargo build --locked --workspace --tests
