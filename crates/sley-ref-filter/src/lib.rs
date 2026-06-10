@@ -726,6 +726,16 @@ fn format_for_each_ref_date(parts: ForEachRefDateParts<'_>, mode: ForEachRefDate
 }
 
 fn for_each_ref_strict_timezone(timezone: &str) -> String {
+    // git's ISO 8601 strict output (date.c, DATE_ISO8601_STRICT) emits 'Z' when the
+    // numeric timezone offset is zero (covers both `+0000` and `-0000`), and
+    // `±HH:MM` otherwise. The incoming `timezone` is the `±HHMM` form.
+    let digits = timezone
+        .strip_prefix(['+', '-'])
+        .unwrap_or(timezone)
+        .trim_start_matches('0');
+    if digits.is_empty() {
+        return "Z".to_string();
+    }
     format!("{}:{}", &timezone[..3], &timezone[3..])
 }
 
