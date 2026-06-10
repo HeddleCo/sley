@@ -8240,7 +8240,113 @@ fn print_tree_recursive_to_writer(
     Ok(())
 }
 
-fn cmd_commit(args: &[String]) -> Result<()> {
+/// Classification of a `git commit` short option, mirroring its
+/// `builtin_commit_options` table in upstream `builtin/commit.c`.
+enum CommitShortFlag {
+    /// A boolean flag that takes no value (e.g. `-q`, `-s`, `-a`).
+    Boolean,
+    /// A flag whose value is required (e.g. `-m`, `-F`, `-C`, `-c`, `-t`,
+    /// `-U`). In a cluster it consumes the rest of the cluster; standalone it
+    /// consumes the next argument.
+    RequiresValue,
+    /// A flag whose value is optional (`-S`, `-u`; `PARSE_OPT_OPTARG`). It
+    /// consumes the rest of the cluster if any, but never the next argument.
+    OptionalValue,
+}
+
+/// Classify a `git commit` short flag character, or `None` if it is not a
+/// recognized short option for `git commit`.
+fn commit_short_flag_kind(ch: char) -> Option<CommitShortFlag> {
+    match ch {
+        // OPT__QUIET / OPT__VERBOSE and the plain OPT_BOOL entries.
+        'q' | 'v' | 's' | 'e' | 'a' | 'i' | 'p' | 'o' | 'n' | 'z' => {
+            Some(CommitShortFlag::Boolean)
+        }
+        // OPT_CALLBACK('m'), OPT_FILENAME('F'/'t'), OPT_STRING('c'/'C'),
+        // OPT_DIFF_UNIFIED ('U').
+        'm' | 'F' | 'c' | 'C' | 't' | 'U' => Some(CommitShortFlag::RequiresValue),
+        // PARSE_OPT_OPTARG entries: gpg-sign ('S') and untracked-files ('u').
+        'S' | 'u' => Some(CommitShortFlag::OptionalValue),
+        _ => None,
+    }
+}
+
+/// Expand clustered short options for `git commit` (e.g. `-qm <msg>`,
+/// `-sqm <msg>`) into the per-flag tokens the main parser already understands,
+/// following git's getopt semantics: leading boolean flags are split off one at
+/// a time, and the first value-taking flag in a cluster consumes the remainder
+/// of the cluster as its (glued) value.
+///
+/// Only clusters that *begin with a boolean* short flag are expanded; arguments
+/// whose first short flag already takes a value (`-m<msg>`, `-F<path>`,
+/// `-C<rev>`, `-u<mode>`, `-S<key>`, ...) are passed through untouched so the
+/// existing glued-value arms handle them verbatim. Anything that is not a short
+/// option (long options, `--`, positionals, `-`) is passed through unchanged,
+/// and everything after a literal `--` is left verbatim.
+fn expand_commit_short_clusters(args: &[String]) -> Result<Vec<String>> {
+    let mut expanded = Vec::with_capacity(args.len());
+    let mut saw_dashdash = false;
+    for arg in args {
+        if saw_dashdash {
+            expanded.push(arg.clone());
+            continue;
+        }
+        if arg == "--" {
+            saw_dashdash = true;
+            expanded.push(arg.clone());
+            continue;
+        }
+        let bytes = arg.as_bytes();
+        // Not a short-option cluster: keep `-`, `--long`, and positionals as-is.
+        if bytes.len() < 2 || bytes[0] != b'-' || bytes[1] == b'-' {
+            expanded.push(arg.clone());
+            continue;
+        }
+        let cluster = &arg[1..];
+        let mut chars = cluster.char_indices();
+        let Some((_, first)) = chars.next() else {
+            expanded.push(arg.clone());
+            continue;
+        };
+        // Only expand clusters that *start* with a boolean flag. If the first
+        // flag is unknown or already takes a value, defer entirely to the main
+        // parser (its glued-value / error arms own that input).
+        if !matches!(commit_short_flag_kind(first), Some(CommitShortFlag::Boolean)) {
+            expanded.push(arg.clone());
+            continue;
+        }
+        expanded.push(format!("-{first}"));
+        // Walk the remaining flags in this cluster. A value-taking flag
+        // swallows the rest of the cluster and ends the scan; the main parser
+        // owns next-argument consumption when the glued value is empty.
+        for (idx, ch) in chars {
+            match commit_short_flag_kind(ch) {
+                Some(CommitShortFlag::Boolean) => expanded.push(format!("-{ch}")),
+                Some(CommitShortFlag::RequiresValue)
+                | Some(CommitShortFlag::OptionalValue) => {
+                    // `-q` `m` `rest` -> `-mrest`; when `rest` is empty we emit
+                    // just `-m`, and the main parser consumes the next argument
+                    // (required) or treats the value as absent (optional).
+                    expanded.push(format!("-{}", &cluster[idx..]));
+                    break;
+                }
+                None => {
+                    // Unknown flag inside the cluster: preserve the existing
+                    // error for the whole original cluster (exit 1) rather than
+                    // emitting partial side effects from the leading flags.
+                    return Err(GitError::Command(format!(
+                        "unsupported commit argument {arg}; currently supports -m and -F"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(expanded)
+}
+
+fn cmd_commit(raw_args: &[String]) -> Result<()> {
+    let args = expand_commit_short_clusters(raw_args)?;
+    let args = args.as_slice();
     let mut message_chunks = Vec::new();
     let mut file_message = None;
     let mut signoff = false;
