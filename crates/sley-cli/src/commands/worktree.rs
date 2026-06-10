@@ -86,6 +86,8 @@ struct WorktreeAddOptions {
     lock_reason: Option<String>,
     branch: Option<String>,
     force_branch: bool,
+    guess_remote: bool,
+    track: bool,
     path: String,
     start: Option<String>,
 }
@@ -156,7 +158,11 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         format!("{}\n", path.join(".git").display()),
     )?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
-    fs::write(admin_dir.join("ORIG_HEAD"), format!("{}\n", add_head.oid))?;
+    // An inferred-orphan worktree has no source commit, so — matching git — it
+    // writes no ORIG_HEAD and points HEAD at the unborn branch.
+    if !add_head.orphan {
+        fs::write(admin_dir.join("ORIG_HEAD"), format!("{}\n", add_head.oid))?;
+    }
     match add_head.branch_name.as_ref() {
         Some(branch) => fs::write(
             admin_dir.join("HEAD"),
@@ -173,6 +179,16 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
                 .map(|reason| format!("{reason}\n"))
                 .unwrap_or_default(),
         )?;
+    }
+    if add_head.orphan {
+        // Orphan worktrees check out the empty tree: write an empty index (with
+        // the empty-tree cache-tree, byte-for-byte like git) and no files. No
+        // "HEAD is now at" reset line is printed since there is no commit.
+        write_empty_worktree_index(&admin_dir, format)?;
+        if !options.quiet {
+            eprintln!("{}", add_head.prepare_message);
+        }
+        return Ok(());
     }
     write_linked_worktree_checkout(
         &common_git_dir,
@@ -609,6 +625,8 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
     let mut lock_reason = None;
     let mut branch = None;
     let mut force_branch = false;
+    let mut guess_remote = false;
+    let mut track = false;
     let mut paths = Vec::new();
     let mut index = 0;
     while index < args.len() {
@@ -654,12 +672,13 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
                 branch = Some(value[2..].to_string());
                 force_branch = true;
             }
+            "--guess-remote" => guess_remote = true,
+            "--no-guess-remote" => guess_remote = false,
+            "--track" => track = true,
+            value if value.starts_with("--track=") => track = true,
+            "--no-track" => track = false,
             "--orphan"
             | "--no-orphan"
-            | "--track"
-            | "--no-track"
-            | "--guess-remote"
-            | "--no-guess-remote"
             | "--relative-paths"
             | "--no-relative-paths" => {}
             value if value.starts_with('-') => {
@@ -685,6 +704,8 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
         lock_reason,
         branch,
         force_branch,
+        guess_remote,
+        track,
         path: paths.remove(0),
         start: paths.pop(),
     })
@@ -947,6 +968,62 @@ struct WorktreeAddHead {
     branch_name: Option<String>,
     oid: ObjectId,
     prepare_message: String,
+    /// Set when `worktree add` inferred `--orphan` because the repository has
+    /// no usable local refs (unborn HEAD and no branches). In this mode the new
+    /// worktree checks out an unborn branch: there is no source commit, so
+    /// [`Self::oid`] is meaningless and the admin dir is laid out like git's
+    /// orphan worktree (symref HEAD, empty index, no `ORIG_HEAD`).
+    orphan: bool,
+}
+
+/// Mirrors git's `can_use_local_refs` (builtin/worktree.c): the repository has a
+/// usable local ref when HEAD resolves to a real object, or any branch ref
+/// exists. When neither holds, `worktree add` infers `--orphan`.
+fn worktree_repo_has_local_refs(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+) -> Result<bool> {
+    if resolve_revision(common_git_dir, format, "HEAD").is_ok() {
+        return Ok(true);
+    }
+    for reference in store.list_refs()? {
+        if reference.name.starts_with("refs/heads/") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Mirrors git's `dwim_orphan` (builtin/worktree.c): decides whether
+/// `worktree add` should infer `--orphan`. Returns `true` only when the repo
+/// has no usable local refs and no remote path can supply a source.
+///
+/// `remote` distinguishes the two DWIM call sites: the bare `add <path>` DWIM
+/// passes `remote = true` (git also consults remote refs via
+/// `can_use_remote_refs`), while `add -b <branch> <path>` passes
+/// `remote = false`. sley cannot fetch, so when `remote && guess_remote` is set
+/// and a remote is configured we decline to infer — matching git, which either
+/// uses a remote-tracking ref or dies asking the user to fetch first; either
+/// way it does NOT create an orphan worktree. Declining here lets the caller
+/// fall through to its existing error path without leaving a partial worktree.
+fn worktree_should_infer_orphan(
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    options: &WorktreeAddOptions,
+    remote: bool,
+) -> Result<bool> {
+    if worktree_repo_has_local_refs(common_git_dir, format, store)? {
+        return Ok(false);
+    }
+    if remote && options.guess_remote {
+        let config = GitConfig::read(common_git_dir.join("config")).unwrap_or_default();
+        if !sley_config::remotes::remote_names(&config).is_empty() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn worktree_add_resolve_head(
@@ -958,6 +1035,15 @@ fn worktree_add_resolve_head(
     committer: Vec<u8>,
 ) -> Result<WorktreeAddHead> {
     if let Some(branch) = options.branch.as_ref() {
+        // DWIM: `worktree add -b <branch> <path>` with no explicit commit-ish in
+        // a repo with no usable local refs infers `--orphan` (git
+        // builtin/worktree.c `add`: the `ac < 2 && new_branch` arm).
+        if options.start.is_none()
+            && !options.force_branch
+            && worktree_should_infer_orphan(common_git_dir, format, store, options, false)?
+        {
+            return worktree_add_orphan_head(branch.clone(), format, options);
+        }
         let start = options.start.as_deref().unwrap_or("HEAD");
         let was_reset = checkout_create_or_reset_branch(
             common_git_dir,
@@ -977,6 +1063,7 @@ fn worktree_add_resolve_head(
             branch_name: Some(branch.clone()),
             oid,
             prepare_message,
+            orphan: false,
         });
     }
 
@@ -990,6 +1077,7 @@ fn worktree_add_resolve_head(
                 "Preparing worktree (detached HEAD {})",
                 format_log_abbrev_oid(&oid)
             ),
+            orphan: false,
         });
     }
 
@@ -1001,6 +1089,7 @@ fn worktree_add_resolve_head(
                 branch_name: Some(start.clone()),
                 oid,
                 prepare_message: format!("Preparing worktree (checking out '{start}')"),
+                orphan: false,
             });
         }
         let oid = resolve_revision(common_git_dir, format, start)?;
@@ -1011,16 +1100,66 @@ fn worktree_add_resolve_head(
                 "Preparing worktree (detached HEAD {})",
                 format_log_abbrev_oid(&oid)
             ),
+            orphan: false,
         });
     }
 
     let branch = default_worktree_add_branch_name(path)?;
+    // DWIM: `worktree add <path>` in a repo with no usable local refs infers
+    // `--orphan`, creating the worktree on a new unborn branch named after the
+    // worktree directory (git builtin/worktree.c `add`: the `ac < 2` arm where
+    // `dwim_branch` returns no source and `dwim_orphan` fires).
+    if worktree_should_infer_orphan(common_git_dir, format, store, options, true)? {
+        return worktree_add_orphan_head(branch, format, options);
+    }
     commands::branch::create_branch_from_start(common_git_dir, format, store, &branch, None)?;
     let oid = resolve_revision(common_git_dir, format, &branch)?;
     Ok(WorktreeAddHead {
         branch_name: Some(branch.clone()),
         oid,
         prepare_message: format!("Preparing worktree (new branch '{branch}')"),
+        orphan: false,
+    })
+}
+
+/// Builds the [`WorktreeAddHead`] for an inferred-`--orphan` `worktree add`: the
+/// new worktree checks out the unborn branch `branch`. `oid` is a placeholder
+/// (the empty tree) that is never written to disk in orphan mode. The
+/// `prepare_message` carries both stderr lines git emits, "No possible source
+/// branch, inferring '--orphan'" followed by "Preparing worktree (new branch
+/// '<branch>')".
+///
+/// Inferring `--orphan` can turn other flags into an illegal combination. Like
+/// git's `dwim_orphan`, once orphan is inferred we reject `--track` and
+/// `--no-checkout` (printing the "inferring" line first unless `--quiet`, then
+/// the fatal) and create nothing — so a rejected add never leaves a partial
+/// worktree directory behind.
+fn worktree_add_orphan_head(
+    branch: String,
+    format: ObjectFormat,
+    options: &WorktreeAddOptions,
+) -> Result<WorktreeAddHead> {
+    if options.track || !options.checkout {
+        if !options.quiet {
+            eprintln!("No possible source branch, inferring '--orphan'");
+        }
+        // git checks --track before --no-checkout.
+        let conflicting = if options.track {
+            "--track"
+        } else {
+            "--no-checkout"
+        };
+        eprintln!("fatal: options '--orphan' and '{conflicting}' cannot be used together");
+        return Err(GitError::Exit(128));
+    }
+    let prepare_message = format!(
+        "No possible source branch, inferring '--orphan'\nPreparing worktree (new branch '{branch}')"
+    );
+    Ok(WorktreeAddHead {
+        branch_name: Some(branch),
+        oid: ObjectId::empty_tree(format),
+        prepare_message,
+        orphan: true,
     })
 }
 
@@ -1167,6 +1306,28 @@ fn write_linked_worktree_checkout(
             checksum: None,
         }
         .write(format)?,
+    )?;
+    Ok(())
+}
+
+/// Writes the empty index of an inferred-orphan worktree, byte-for-byte like
+/// git: a zero-entry v2 index whose `TREE` cache-tree caches the empty tree
+/// (`entry_count = 0`, oid = the empty tree).
+fn write_empty_worktree_index(admin_dir: &Path, format: ObjectFormat) -> Result<()> {
+    let mut index = Index {
+        version: 2,
+        entries: Vec::new(),
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    index.set_cache_tree(Some(&sley_index::CacheTree {
+        entry_count: 0,
+        oid: Some(ObjectId::empty_tree(format)),
+        subtrees: Vec::new(),
+    }))?;
+    fs::write(
+        sley_worktree::repository_index_path(admin_dir),
+        index.write(format)?,
     )?;
     Ok(())
 }
