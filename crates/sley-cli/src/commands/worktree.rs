@@ -99,6 +99,9 @@ struct WorktreeAddOptions {
     /// `Some(false)` for `--no-track`. Git only treats a *present* `opt_track`
     /// (either form) as "tracking requested" for the orphan-conflict check.
     track: Option<bool>,
+    /// Tri-state `--relative-paths`/`--no-relative-paths`. `None` falls back to
+    /// the `worktree.useRelativePaths` config default at use time.
+    relative_paths: Option<bool>,
     path: String,
     start: Option<String>,
 }
@@ -180,16 +183,17 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         eprintln!("{}", add_head.prepare_message);
     }
     check_worktree_candidate_path(&common_git_dir, &path, &options.path, options.force)?;
+    // `--relative-paths`/`--no-relative-paths` override the `worktree.useRelativePaths`
+    // config default (git: `opts.relative_paths = use_relative_paths`).
+    let relative_paths = options.relative_paths.unwrap_or_else(|| {
+        GitConfig::read(common_git_dir.join("config"))
+            .ok()
+            .and_then(|config| config.get_bool("worktree", None, "useRelativePaths"))
+            .unwrap_or(false)
+    });
     let admin_dir = create_linked_worktree_admin_dir(&common_git_dir, &path)?;
     fs::create_dir_all(&path)?;
-    fs::write(
-        path.join(".git"),
-        format!("gitdir: {}\n", admin_dir.display()),
-    )?;
-    fs::write(
-        admin_dir.join("gitdir"),
-        format!("{}\n", path.join(".git").display()),
-    )?;
+    write_worktree_linking_files(&common_git_dir, &admin_dir, &path, relative_paths)?;
     fs::write(admin_dir.join("commondir"), "../..\n")?;
     // An inferred-orphan worktree has no source commit, so — matching git — it
     // writes no ORIG_HEAD and points HEAD at the unborn branch.
@@ -663,6 +667,7 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
     let mut orphan = false;
     let mut guess_remote = false;
     let mut track: Option<bool> = None;
+    let mut relative_paths: Option<bool> = None;
     let mut paths = Vec::new();
     let mut saw_double_dash = false;
     let mut index = 0;
@@ -721,7 +726,8 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
             "--track" => track = Some(true),
             value if value.starts_with("--track=") => track = Some(true),
             "--no-track" => track = Some(false),
-            "--relative-paths" | "--no-relative-paths" => {}
+            "--relative-paths" => relative_paths = Some(true),
+            "--no-relative-paths" => relative_paths = Some(false),
             value if value.starts_with('-') && value != "-" => {
                 eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
                 return worktree_add_usage();
@@ -778,6 +784,7 @@ fn parse_worktree_add_options(args: &[String]) -> Result<WorktreeAddOptions> {
         orphan,
         guess_remote,
         track,
+        relative_paths,
         path: paths.remove(0),
         start: paths.pop(),
     })
@@ -1451,6 +1458,95 @@ fn check_worktree_candidate_path(
         return Err(GitError::Exit(128));
     }
     Ok(())
+}
+
+/// Port of git's `write_worktree_linking_files` (worktree.c): write the
+/// worktree's `.git` link file and the admin dir's `gitdir` file. With
+/// `relative_paths`, both are expressed relative to each other's real path and
+/// the repository is upgraded to format 1 with `extensions.relativeWorktrees`;
+/// otherwise both hold absolute, symlink-resolved paths (the historical default).
+fn write_worktree_linking_files(
+    common_git_dir: &Path,
+    admin_dir: &Path,
+    worktree_path: &Path,
+    relative_paths: bool,
+) -> Result<()> {
+    let dotgit = worktree_path.join(".git");
+    if relative_paths {
+        upgrade_repo_for_relative_worktrees(common_git_dir)?;
+        // git canonicalizes both real paths before computing the relatives.
+        let real_wt = fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+        let real_admin = fs::canonicalize(admin_dir).unwrap_or_else(|_| admin_dir.to_path_buf());
+        let admin_to_wt = relative_path_from_absolute_components(&real_admin, &real_wt)?;
+        let wt_to_admin = relative_path_from_absolute_components(&real_wt, &real_admin)?;
+        let admin_to_wt = admin_to_wt.trim_end_matches('/');
+        let wt_to_admin = wt_to_admin.trim_end_matches('/');
+        fs::write(admin_dir.join("gitdir"), format!("{admin_to_wt}/.git\n"))?;
+        fs::write(&dotgit, format!("gitdir: {wt_to_admin}\n"))?;
+    } else {
+        // git writes the symlink-resolved real paths (`strbuf_realpath`), so a
+        // `./` segment in the user-supplied path never leaks into the link files.
+        let real_admin = fs::canonicalize(admin_dir).unwrap_or_else(|_| admin_dir.to_path_buf());
+        let real_wt =
+            fs::canonicalize(worktree_path).unwrap_or_else(|_| worktree_path.to_path_buf());
+        fs::write(&dotgit, format!("gitdir: {}\n", real_admin.display()))?;
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}/.git\n", real_wt.display()),
+        )?;
+    }
+    Ok(())
+}
+
+/// Upgrade the repository to format version 1 with the `relativeWorktrees`
+/// extension, mirroring git's `upgrade_repository_format(1)` +
+/// `extensions.relativeWorktrees=true`. Idempotent: when the extension is
+/// already present nothing changes.
+fn upgrade_repo_for_relative_worktrees(common_git_dir: &Path) -> Result<()> {
+    let config_path = common_git_dir.join("config");
+    let mut config = GitConfig::read(&config_path).unwrap_or_default();
+    if config
+        .get_bool("extensions", None, "relativeWorktrees")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    // core.repositoryformatversion = 1
+    set_config_simple(&mut config, "core", "repositoryformatversion", "1");
+    set_config_simple(&mut config, "extensions", "relativeWorktrees", "true");
+    fs::write(&config_path, config.to_canonical_bytes())?;
+    Ok(())
+}
+
+/// Set a single non-subsectioned `<section>.<key> = <value>`, replacing the
+/// last existing value for that key or appending to the (last) section, creating
+/// the section if absent.
+fn set_config_simple(config: &mut GitConfig, section: &str, key: &str, value: &str) {
+    if let Some(existing) = config
+        .sections
+        .iter_mut()
+        .rev()
+        .find(|s| s.name.eq_ignore_ascii_case(section) && s.subsection.is_none())
+    {
+        if let Some(entry) = existing
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|e| e.key.eq_ignore_ascii_case(key))
+        {
+            entry.value = Some(value.to_string());
+        } else {
+            existing
+                .entries
+                .push(sley_config::ConfigEntry::new(key, Some(value.to_string())));
+        }
+        return;
+    }
+    config.sections.push(sley_config::ConfigSection::new(
+        section,
+        None,
+        vec![sley_config::ConfigEntry::new(key, Some(value.to_string()))],
+    ));
 }
 
 fn validate_worktree_add_destination(path: &Path, original: &str) -> Result<()> {
