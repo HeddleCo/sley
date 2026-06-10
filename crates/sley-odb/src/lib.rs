@@ -1042,6 +1042,17 @@ type DecodedObjectCache = Arc<Mutex<LruObjectCache>>;
 /// decoded bases instead of re-inflating the whole chain on every read.
 type PackDeltaCaches = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<LruOffsetCache>>>>>;
 
+/// Per-pack memo of `in-pack offset -> end-of-chain object type` for the
+/// `cat-file --batch-check` header fast path. Resolving a packed delta's *type*
+/// walks the delta chain to its base; without this memo every header read
+/// re-walks (and re-inflates) the whole chain, so reading every object in a
+/// deeply-deltified pack is super-linear (sley#26). The type only depends on the
+/// chain base, so memoizing `offset -> type` lets each chain be walked at most
+/// once across a batch. Keyed by pack path so an offset key is never applied to
+/// the wrong pack's bytes; shared across cloned handles.
+type PackHeaderTypeCaches =
+    Arc<Mutex<HashMap<PathBuf, Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>>>>;
+
 /// Default approximate byte budget for the decoded-object LRU. Sized to comfortably
 /// hold the working set of a history walk (commits/trees/blobs and their delta
 /// bases) without growing without bound on large repositories. Overridable via the
@@ -1228,6 +1239,23 @@ impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
     }
 }
 
+/// Bridges a per-pack `offset -> ObjectType` memo into the header fast path so
+/// the ofs-delta chain walk is performed at most once per chain across a batch
+/// of `read_object_header` calls (sley#26).
+struct PackHeaderTypeCacheAdapter<'a>(&'a Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>);
+
+impl sley_pack::HeaderTypeCache for PackHeaderTypeCacheAdapter<'_> {
+    fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
+        self.0.lock().ok()?.get(&pack_offset).copied()
+    }
+
+    fn put(&mut self, pack_offset: u64, header: (ObjectType, u64)) {
+        if let Ok(mut cache) = self.0.lock() {
+            cache.insert(pack_offset, header);
+        }
+    }
+}
+
 /// Parsed pack indexes keyed by `.idx` path, shared across cloned handles. Caches
 /// the index parse so locating a packed object doesn't re-parse every `.idx` on
 /// each read.
@@ -1265,6 +1293,7 @@ pub struct FileObjectDatabase {
     pack_listing: PackListingCache,
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
+    pack_header_types: PackHeaderTypeCaches,
 }
 
 pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
@@ -1388,6 +1417,7 @@ impl FileObjectDatabase {
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
+            pack_header_types: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1404,6 +1434,7 @@ impl FileObjectDatabase {
             pack_listing: Arc::new(Mutex::new(HashMap::new())),
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
+            pack_header_types: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1429,6 +1460,9 @@ impl FileObjectDatabase {
             cache.clear();
         }
         if let Ok(mut cache) = self.pack_deltas.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.pack_header_types.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.decoded.lock() {
@@ -1670,11 +1704,33 @@ impl FileObjectDatabase {
         }
         if let Some(pack_paths) = self.find_pack_containing(oid)? {
             let bytes = self.cached_pack_bytes(&pack_paths.pack)?;
-            let header =
-                sley_pack::read_object_header_at(&bytes, pack_paths.offset, self.format, |base| {
-                    self.read_object_header(base)
-                        .map(|header| header.map(|(t, _)| t))
-                })?;
+            // Per-pack offset->type memo so the ofs-delta chain walk that resolves
+            // a packed object's type runs at most once per chain across the batch,
+            // instead of re-walking (and re-inflating each link's leading varints)
+            // on every header read — the sley#26 super-linear cat-file --batch-check.
+            let type_cache = self.pack_header_type_cache(&pack_paths.pack);
+            let resolve_ref_base = |base: &ObjectId| {
+                self.read_object_header(base)
+                    .map(|header| header.map(|(t, _)| t))
+            };
+            let header = match &type_cache {
+                Some(cache) => {
+                    let mut adapter = PackHeaderTypeCacheAdapter(cache);
+                    sley_pack::read_object_header_at_with_cache(
+                        &bytes,
+                        pack_paths.offset,
+                        self.format,
+                        resolve_ref_base,
+                        &mut adapter,
+                    )?
+                }
+                None => sley_pack::read_object_header_at(
+                    &bytes,
+                    pack_paths.offset,
+                    self.format,
+                    resolve_ref_base,
+                )?,
+            };
             return Ok(Some(header));
         }
         for alternate in &self.alternates {
@@ -1751,6 +1807,20 @@ impl FileObjectDatabase {
         let cache = caches.entry(pack_path.to_path_buf()).or_insert_with(|| {
             Arc::new(Mutex::new(LruOffsetCache::new(delta_base_cache_budget())))
         });
+        Some(Arc::clone(cache))
+    }
+
+    /// The per-pack header-type memo for `pack_path`, creating it on first use.
+    /// Returns `None` only if the shared map's lock is poisoned, in which case the
+    /// caller falls back to an unmemoized header walk (correctness preserved).
+    fn pack_header_type_cache(
+        &self,
+        pack_path: &Path,
+    ) -> Option<Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>> {
+        let mut caches = self.pack_header_types.lock().ok()?;
+        let cache = caches
+            .entry(pack_path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(HashMap::new())));
         Some(Arc::clone(cache))
     }
 
@@ -1867,6 +1937,23 @@ impl FileObjectDatabase {
             )));
         }
         let pack_dir = self.objects_dir.join("pack");
+        // Hot path: a previously cached pack listing or multi-pack-index already
+        // names every pack, and locating `oid` in them is pure in-memory index
+        // work (no directory I/O). Try that first so a warm handle doesn't stat
+        // the pack dir / multi-pack-index on every single lookup — that redundant
+        // per-object FS probing is what made `cat-file --batch-check` scale poorly
+        // versus git, which resolves through its in-memory index (sley#26).
+        if let Some(midx) = self.cached_loaded_multi_pack_index()
+            && let Some(pack_paths) = self.midx_pack_paths(&pack_dir, &midx, oid)?
+        {
+            return Ok(Some(pack_paths));
+        }
+        if let Some(listing) = self.cached_loaded_pack_listing(&pack_dir)
+            && let Some(pack_paths) = self.find_in_pack_listing(&listing, oid)?
+        {
+            return Ok(Some(pack_paths));
+        }
+
         if !pack_dir.exists() {
             return Ok(None);
         }
@@ -1932,6 +2019,18 @@ impl FileObjectDatabase {
         let Some(midx) = self.cached_multi_pack_index(&midx_path)? else {
             return Ok(None);
         };
+        self.midx_pack_paths(pack_dir, &midx, oid)
+    }
+
+    /// Resolve `oid` against an already-loaded multi-pack-index, returning the pack
+    /// path and in-pack offset. Pure in-memory index work plus a single existence
+    /// check on the resolved pack; performs no scan of the pack directory itself.
+    fn midx_pack_paths(
+        &self,
+        pack_dir: &Path,
+        midx: &MultiPackIndex,
+        oid: &ObjectId,
+    ) -> Result<Option<PackPaths>> {
         let Some(entry) = midx.find(oid) else {
             return Ok(None);
         };
@@ -1949,13 +2048,32 @@ impl FileObjectDatabase {
             return Err(GitError::not_found(format!(
                 "pack file {} for multi-pack-index {}",
                 pack.display(),
-                midx_path.display()
+                pack_dir.join("multi-pack-index").display()
             )));
         }
         Ok(Some(PackPaths {
             pack,
             offset: entry.offset,
         }))
+    }
+
+    /// The multi-pack-index for this object store *only if already parsed and
+    /// cached* — never touches the filesystem. Used by the lookup hot path to skip
+    /// the per-call `multi-pack-index` existence stat when a handle is warm.
+    fn cached_loaded_multi_pack_index(&self) -> Option<Arc<MultiPackIndex>> {
+        let midx_path = self.objects_dir.join("pack").join("multi-pack-index");
+        let cache = self.multi_pack_indexes.lock().ok()?;
+        cache.get(&midx_path).map(Arc::clone)
+    }
+
+    /// The discovered pack listing for `pack_dir` *only if already scanned and
+    /// cached* — never touches the filesystem. Used by the lookup hot path to skip
+    /// the per-call pack-dir existence stat when a handle is warm. A cold cache (or
+    /// a poisoned lock) returns `None`, so the caller falls back to the scanning
+    /// path that establishes the cache and preserves the new-pack rescan semantics.
+    fn cached_loaded_pack_listing(&self, pack_dir: &Path) -> Option<Arc<Vec<DiscoveredPack>>> {
+        let cache = self.pack_listing.lock().ok()?;
+        cache.get(pack_dir).map(Arc::clone)
     }
 }
 
