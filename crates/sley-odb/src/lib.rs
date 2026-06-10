@@ -1470,6 +1470,7 @@ impl FileObjectDatabase {
         if let Ok(mut cache) = self.decoded.lock() {
             cache.clear();
         }
+        self.loose.invalidate_cache();
     }
 
     pub fn loose(&self) -> &LooseObjectStore {
@@ -2022,8 +2023,11 @@ impl FileObjectDatabase {
     }
 
     /// Resolve `oid` against an already-loaded multi-pack-index, returning the pack
-    /// path and in-pack offset. Pure in-memory index work plus a single existence
-    /// check on the resolved pack; performs no scan of the pack directory itself.
+    /// path and in-pack offset. Pure in-memory index work; performs no filesystem
+    /// access. The named pack's existence was established when the midx was parsed
+    /// and cached, so the hot lookup path no longer re-`stat()`s it on every call —
+    /// a missing pack surfaces as an `open()` failure when the bytes are actually
+    /// read (`cached_pack_bytes`), not as a redundant per-lookup existence probe.
     fn midx_pack_paths(
         &self,
         pack_dir: &Path,
@@ -2043,13 +2047,6 @@ impl FileObjectDatabase {
             .map(|stem| format!("{stem}.pack"))
             .unwrap_or_else(|| pack_name.clone());
         let pack = pack_dir.join(pack_file_name);
-        if !pack.exists() {
-            return Err(GitError::not_found(format!(
-                "pack file {} for multi-pack-index {}",
-                pack.display(),
-                pack_dir.join("multi-pack-index").display()
-            )));
-        }
         Ok(Some(PackPaths {
             pack,
             offset: entry.offset,
@@ -2328,6 +2325,15 @@ pub enum LooseObjectIntegrity {
 pub struct LooseObjectStore {
     objects_dir: PathBuf,
     format: ObjectFormat,
+    /// Lazily-populated set of loose object ids present on disk, mirroring git's
+    /// `loose_objects_cache` (object-file.c). `None` until the first access scans
+    /// the `objects/XX/` fanout; thereafter reads consult the set and skip the
+    /// per-oid `open()`/`stat()` for ids known to be packed-only. Shared across
+    /// `FileObjectDatabase` clones via `Arc` so a write through one handle is
+    /// visible to reads through another; cleared by `refresh_read_cache` so
+    /// objects installed out-of-band (fetch, repack) become visible. Writes
+    /// extend the set in place rather than invalidating it.
+    loose_cache: Arc<Mutex<Option<HashSet<ObjectId>>>>,
 }
 
 impl LooseObjectStore {
@@ -2335,6 +2341,54 @@ impl LooseObjectStore {
         Self {
             objects_dir: objects_dir.into(),
             format,
+            loose_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Whether `oid` is *known* to be present in loose storage according to the
+    /// in-memory cache. Returns `Ok(false)` only when the cache is populated and
+    /// the id is absent — i.e. a definitive "not loose" verdict that lets the
+    /// caller skip the filesystem probe. A poisoned lock falls back to `true`
+    /// (forcing the real filesystem read) so a lock failure never hides an
+    /// on-disk object. The first call populates the cache by scanning the fanout
+    /// once (git's `odb_loose_cache` lazy fill).
+    fn loose_oid_present(&self, oid: &ObjectId) -> bool {
+        let mut guard = match self.loose_cache.lock() {
+            Ok(guard) => guard,
+            // Poisoned lock: don't trust the cache, force the filesystem read.
+            Err(_) => return true,
+        };
+        if guard.is_none() {
+            // Scan the fanout once. A scan error (e.g. a transient readdir
+            // failure) leaves the cache unpopulated and forces filesystem reads
+            // for this call; a later call retries the scan.
+            match loose_object_ids(&self.objects_dir, self.format) {
+                Ok(ids) => *guard = Some(ids.into_iter().collect()),
+                Err(_) => return true,
+            }
+        }
+        guard
+            .as_ref()
+            .map(|set| set.contains(oid))
+            .unwrap_or(true)
+    }
+
+    /// Record `oid` as present in loose storage so subsequent reads find it
+    /// without a rescan. A no-op when the cache has not been populated yet (the
+    /// eventual lazy scan will pick the object up) or the lock is poisoned.
+    fn note_loose_write(&self, oid: ObjectId) {
+        if let Ok(mut guard) = self.loose_cache.lock()
+            && let Some(set) = guard.as_mut()
+        {
+            set.insert(oid);
+        }
+    }
+
+    /// Drop the in-memory loose set so the next access rescans the fanout. Called
+    /// by `FileObjectDatabase::refresh_read_cache` after out-of-band installs.
+    pub(crate) fn invalidate_cache(&self) {
+        if let Ok(mut guard) = self.loose_cache.lock() {
+            *guard = None;
         }
     }
 
@@ -2355,11 +2409,19 @@ impl LooseObjectStore {
     }
 
     pub fn exists(&self, oid: &ObjectId) -> Result<bool> {
-        Ok(self.object_path(oid)?.exists())
+        let path = self.object_path(oid)?;
+        if !self.loose_oid_present(oid) {
+            return Ok(false);
+        }
+        Ok(path.exists())
     }
 
     pub fn disk_size(&self, oid: &ObjectId) -> Result<Option<u64>> {
-        match fs::metadata(self.object_path(oid)?) {
+        let path = self.object_path(oid)?;
+        if !self.loose_oid_present(oid) {
+            return Ok(None);
+        }
+        match fs::metadata(path) {
             Ok(metadata) => Ok(Some(metadata.len())),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(GitError::Io(err.to_string())),
@@ -2372,6 +2434,9 @@ impl LooseObjectStore {
     /// Returns `Ok(None)` when the loose object is absent.
     pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         let path = self.object_path(oid)?;
+        if !self.loose_oid_present(oid) {
+            return Ok(None);
+        }
         let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2514,6 +2579,11 @@ fn read_full_prefix(file: &mut fs::File, prefix: &mut [u8]) -> Result<usize> {
 impl ObjectReader for LooseObjectStore {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         let path = self.object_path(oid)?;
+        // Skip the `open()` (and its ENOENT) for ids the loose cache knows are
+        // not on disk — the dominant wasted syscall when reading packed objects.
+        if !self.loose_oid_present(oid) {
+            return Err(GitError::object_not_found(*oid));
+        }
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -2569,6 +2639,7 @@ impl ObjectWriter for LooseObjectStore {
         let oid = object.object_id(self.format)?;
         let path = self.object_path(&oid)?;
         if path.exists() {
+            self.note_loose_write(oid);
             return Ok(oid);
         }
         let parent = path
@@ -2609,6 +2680,7 @@ impl ObjectWriter for LooseObjectStore {
             let _ = fs::remove_file(&temp_path);
         }
         write_result?;
+        self.note_loose_write(oid);
         Ok(oid)
     }
 }
