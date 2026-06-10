@@ -1,6 +1,13 @@
 use std::path::PathBuf;
-use std::process::Command;
 
+// A build script must NOT invoke `cargo` recursively: under `cargo test
+// --workspace` (and any build that compiles this crate's bench targets), the
+// outer cargo holds the build lock, so a nested `cargo build` blocks on that
+// same lock forever — a hard deadlock that hangs the whole workspace test run
+// and CI. The binary is not needed to *compile* the benches, only to *run*
+// them, so we just compute and emit the expected path here. Benchmarks that
+// exec it are responsible for ensuring `cargo build -p sley-cli` has run first
+// (the bench harness checks SLEY_BENCH_BIN at runtime).
 fn main() {
     let manifest_dir =
         PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -14,26 +21,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../sley-cli/src/main.rs");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-env-changed=CARGO_TARGET_DIR");
-
-    if !bin.exists() {
-        eprintln!("sley-bench: building sley-cli for benchmarks");
-        let cargo = std::env::var("CARGO").expect("CARGO");
-        let status = Command::new(&cargo)
-            .args(["build", "-p", "sley-cli", "--bin", "sley"])
-            .current_dir(&workspace_root)
-            .status()
-            .expect("failed to spawn cargo build for sley-cli");
-        if !status.success() {
-            panic!("failed to build sley-cli binary for benchmarks");
-        }
-    }
-
-    if !bin.exists() {
-        panic!(
-            "sley binary not found at {} after building sley-cli",
-            bin.display()
-        );
-    }
 
     println!("cargo:rustc-env=SLEY_BENCH_BIN={}", bin.display());
 }
