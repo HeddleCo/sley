@@ -2845,7 +2845,7 @@ impl Ord for LsRemoteSortKey {
             (LsRemoteSortKey::Number(left), LsRemoteSortKey::Number(right)) => left.cmp(right),
             (LsRemoteSortKey::Text(left), LsRemoteSortKey::Text(right)) => left.cmp(right),
             (LsRemoteSortKey::Version(left), LsRemoteSortKey::Version(right)) => {
-                version_sort_cmp(left, right)
+                version_sort_cmp(left, right, &[])
             }
             (left, right) => ls_remote_sort_key_rank(left).cmp(&ls_remote_sort_key_rank(right)),
         }

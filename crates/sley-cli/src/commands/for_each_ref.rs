@@ -1262,7 +1262,7 @@ impl Ord for ForEachRefSortKey {
             (ForEachRefSortKey::Number(left), ForEachRefSortKey::Number(right)) => left.cmp(right),
             (ForEachRefSortKey::Text(left), ForEachRefSortKey::Text(right)) => left.cmp(right),
             (ForEachRefSortKey::Version(left), ForEachRefSortKey::Version(right)) => {
-                version_sort_cmp(left, right)
+                version_sort_cmp(left, right, &[])
             }
             (left, right) => {
                 for_each_ref_sort_key_rank(left).cmp(&for_each_ref_sort_key_rank(right))

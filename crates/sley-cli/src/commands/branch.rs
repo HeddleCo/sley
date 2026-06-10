@@ -8219,7 +8219,7 @@ fn print_branch_list_filtered_version_sorted_with_color(
 ) -> Result<()> {
     let current = store.current_branch_ref()?;
     let mut refs = store.list_refs()?;
-    refs.sort_by(|left, right| version_sort_cmp(&left.name, &right.name));
+    refs.sort_by(|left, right| version_sort_cmp(&left.name, &right.name, &[]));
     if descending {
         refs.reverse();
     }
