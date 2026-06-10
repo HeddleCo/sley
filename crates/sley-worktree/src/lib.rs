@@ -1304,8 +1304,6 @@ pub struct UntrackedPathOptions {
     pub exclude_patterns: Vec<Vec<u8>>,
     pub exclude_per_directory: Vec<String>,
     pub pathspecs: Vec<UntrackedPathspecFilter>,
-    /// When set (ls-files `--directory`), untracked files roll up to `parent/`.
-    pub rollup_untracked_files_to_directories: bool,
 }
 
 pub fn pathspec_is_glob(path: &[u8]) -> bool {
@@ -1369,12 +1367,19 @@ pub fn untracked_pathspec_needs_descent(parent: &[u8], specs: &[UntrackedPathspe
     false
 }
 
-fn glob_spec_matches_directory(spec: &UntrackedPathspecFilter, git_path: &[u8]) -> bool {
-    spec.is_glob
-        && (untracked_wildmatch(&spec.path, git_path)
-            || git_path
-                .strip_suffix(b"/")
-                .is_some_and(|stripped| untracked_wildmatch(&spec.path, stripped)))
+/// Whether some pathspec selects the directory `git_path` *as a whole* (so an
+/// untracked directory can roll up to `dir/` under `--directory`), as opposed to
+/// only matching something strictly below it (which forces descent). A
+/// directory-prefix pathspec covering the directory, an exact directory match, or
+/// a glob matching the directory's own name all count; a deeper glob such as
+/// `dir/*.c` or an exact file path inside the directory does not.
+fn untracked_pathspec_selects_directory(
+    specs: &[UntrackedPathspecFilter],
+    git_path: &[u8],
+) -> bool {
+    specs
+        .iter()
+        .any(|spec| untracked_pathspec_matches(spec, git_path))
 }
 
 fn glob_pathspec_may_match_under(pattern: &[u8], dir: &[u8]) -> bool {
@@ -1415,14 +1420,6 @@ fn insert_untracked_directory(paths: &mut BTreeSet<Vec<u8>>, git_path: &[u8]) {
         directory.push(b'/');
     }
     paths.insert(directory);
-}
-
-fn parent_git_path(path: &[u8]) -> Option<&[u8]> {
-    let slash = path.iter().rposition(|byte| *byte == b'/')?;
-    if slash == 0 {
-        return None;
-    }
-    Some(&path[..slash])
 }
 
 /// fnmatch-style glob where `*` and `?` match any byte including `/`.
@@ -1773,7 +1770,7 @@ fn collect_untracked_directory_paths(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
-        if is_worktree_dot_git(root, &path) {
+        if is_dot_git_entry(&path) {
             continue;
         }
         if is_embedded_git_internals(root, &path) {
@@ -1802,11 +1799,14 @@ fn collect_untracked_directory_paths(
                     root, git_dir, &path, index, ignores, options, paths,
                 )?;
             } else if needs_descent {
-                if options
-                    .pathspecs
-                    .iter()
-                    .any(|spec| glob_spec_matches_directory(spec, &git_path))
-                {
+                // A pathspec reaches into this wholly-untracked directory. Git's
+                // `--directory` still rolls it up to `dir/` when a pathspec selects
+                // the directory *as a whole* (a directory-prefix that covers it, or
+                // a glob matching its name). It descends only when a pathspec
+                // targets something strictly below it that does not select the
+                // directory itself (e.g. a deeper glob like `dir/*.c` or an exact
+                // file path).
+                if untracked_pathspec_selects_directory(&options.pathspecs, &git_path) {
                     insert_untracked_directory(paths, &git_path);
                     continue;
                 }
@@ -1832,15 +1832,14 @@ fn collect_untracked_directory_paths(
                     .iter()
                     .any(|spec| untracked_pathspec_matches(spec, &git_path)))
         {
-            if options.rollup_untracked_files_to_directories {
-                if let Some(parent) = parent_git_path(&git_path) {
-                    insert_untracked_directory(paths, parent);
-                } else {
-                    paths.insert(git_path);
-                }
-            } else {
-                paths.insert(git_path);
-            }
+            // A file reached here was found by descending into its parent
+            // directory, which happens only when that directory is not eligible
+            // for rollup (it contains tracked content, has ignored entries `-d`
+            // must preserve, or a pathspec selects something strictly below it).
+            // Git's `--directory` rollup is a directory-level decision made when
+            // the whole directory matches; an individually-reached file is always
+            // listed individually.
+            paths.insert(git_path);
         }
     }
     Ok(())
@@ -1924,7 +1923,7 @@ fn directory_has_file(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if is_worktree_dot_git(root, &path) {
+        if is_dot_git_entry(&path) {
             continue;
         }
         if is_embedded_git_internals(root, &path) {
@@ -1968,7 +1967,7 @@ fn directory_has_ignored(
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if is_worktree_dot_git(root, &path) {
+        if is_dot_git_entry(&path) {
             continue;
         }
         if is_same_path(&path, git_dir) {
@@ -2029,7 +2028,7 @@ fn collect_ignored_untracked_paths(
     entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let path = entry.path();
-        if is_worktree_dot_git(context.root, &path) {
+        if is_dot_git_entry(&path) {
             continue;
         }
         if is_embedded_git_internals(context.root, &path) {
@@ -6100,7 +6099,7 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        if is_worktree_dot_git(context.root, &path) {
+        if is_dot_git_entry(&path) {
             continue;
         }
         if is_embedded_git_internals(context.root, &path) {
@@ -6232,14 +6231,20 @@ fn is_same_path(left: &Path, right: &Path) -> bool {
     left == right
 }
 
-fn is_worktree_dot_git(root: &Path, path: &Path) -> bool {
-    path.strip_prefix(root)
-        .is_ok_and(|relative| relative == Path::new(".git"))
+/// Whether `path`'s final component is `.git`. Git never lists a `.git` entry at
+/// any depth (a repository's own `.git`, a submodule gitlink file, or an embedded
+/// repository's `.git` directory) as untracked content.
+fn is_dot_git_entry(path: &Path) -> bool {
+    path.file_name() == Some(std::ffi::OsStr::new(".git"))
 }
 
-/// Whether `path` is a directory that contains a `.git` gitfile or embedded git dir.
+/// Whether `path` is a directory containing an embedded repository's `.git`
+/// *directory*. Git only treats a nested `.git` directory as a repository
+/// boundary (listing the directory as `dir/`); a plain `.git` *file* (an invalid
+/// or non-submodule gitlink) is not a boundary — Git descends into the directory
+/// and lists its other untracked contents normally.
 fn is_nested_repository_boundary(path: &Path) -> bool {
-    path.join(".git").exists()
+    path.join(".git").is_dir()
 }
 
 /// Whether `path` is an embedded repository's `.git` directory or a path inside it.
