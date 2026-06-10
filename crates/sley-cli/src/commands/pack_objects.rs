@@ -12,15 +12,14 @@
 
 use std::io::BufRead;
 
-use sley_pack::{PackInput, PackIndexEntry, PackReverseIndex};
+use sley_pack::{pack_order_index_positions, PackInput, PackReverseIndex};
 
 use crate::*;
 
 pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let mut base_name = None::<String>;
-    let mut iter = args.iter();
     let mut saw_dashdash = false;
-    while let Some(arg) = iter.next() {
+    for arg in args {
         match arg.as_str() {
             "--" if !saw_dashdash => saw_dashdash = true,
             // Progress-meter toggles: sley never draws a progress meter, so
@@ -72,7 +71,7 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         })
         .collect();
     let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
-    let positions = pack_order_positions(&written.entries);
+    let positions = pack_order_index_positions(&written.entries);
     let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
 
     // Write the pack before its lookup companions so no reader ever sees an
@@ -140,24 +139,6 @@ fn pack_objects_garbage<T>(what: &str, line: &[u8]) -> Result<T> {
         String::from_utf8_lossy(line)
     );
     Err(GitError::Exit(128))
-}
-
-/// Build the `.rev` table for a freshly written pack: index positions (the
-/// rank of each object in the oid-sorted `.idx`) listed in pack order
-/// (ascending pack offset), as upstream `write_rev_file` lays them out.
-fn pack_order_positions(entries: &[PackIndexEntry]) -> Vec<u32> {
-    let mut oid_sorted: Vec<usize> = (0..entries.len()).collect();
-    oid_sorted.sort_by(|&a, &b| entries[a].oid.as_bytes().cmp(entries[b].oid.as_bytes()));
-    let mut index_position = vec![0u32; entries.len()];
-    for (position, &entry) in oid_sorted.iter().enumerate() {
-        index_position[entry] = position as u32;
-    }
-    let mut by_offset: Vec<usize> = (0..entries.len()).collect();
-    by_offset.sort_by_key(|&entry| entries[entry].offset);
-    by_offset
-        .into_iter()
-        .map(|entry| index_position[entry])
-        .collect()
 }
 
 fn pack_objects_usage<T>() -> Result<T> {

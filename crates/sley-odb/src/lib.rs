@@ -454,8 +454,18 @@ pub fn install_repack_result(
     }
     let pack_name = format!("pack-{}", result.pack_checksum.to_hex());
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
+    let new_rev_path = pack_dir.join(format!("{pack_name}.rev"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
+    // git writes a `.rev` alongside every repacked pack (`pack.writeReverseIndex`
+    // defaults to true). Write it before the `.idx` so the index never becomes
+    // visible ahead of its companions, mirroring upstream's finalize order.
+    let reverse_index = sley_pack::PackReverseIndex::write(
+        format,
+        &sley_pack::pack_order_index_positions(&parsed_index.entries),
+        &result.pack_checksum,
+    )?;
     write_pack_component(&new_pack_path, &result.pack)?;
+    write_pack_component(&new_rev_path, &reverse_index)?;
     write_pack_component(&new_index_path, &result.idx)?;
 
     if !prune {
