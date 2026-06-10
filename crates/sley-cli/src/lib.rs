@@ -4060,6 +4060,64 @@ fn print_for_each_ref_format(
                             .as_bytes(),
                         )?;
                     }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(tree) = context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tree.as_ref())
+                    {
+                        stdout.write_all(
+                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                .as_bytes(),
+                        )?;
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(tree) = context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.tree.as_ref())
+                    {
+                        stdout.write_all(
+                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                .as_bytes(),
+                        )?;
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(contents) = &context.contents {
+                        for (idx, parent) in contents.parents.iter().enumerate() {
+                            if idx > 0 {
+                                stdout.write_all(b" ")?;
+                            }
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(
+                                    parent,
+                                    width,
+                                    context.objectname_candidates,
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(peeled) = &context.peeled_object {
+                        for (idx, parent) in peeled.parents.iter().enumerate() {
+                            if idx > 0 {
+                                stdout.write_all(b" ")?;
+                            }
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(
+                                    parent,
+                                    width,
+                                    context.objectname_candidates,
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                    }
                 } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context) {
                     result?;
                 } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
@@ -4385,6 +4443,31 @@ fn for_each_ref_try_email_atom(
         None => ForEachRefEmailOptions::default(),
     };
     Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// For an oid atom like `tree:short` / `parent:short=7`, return the option
+/// argument (`short` or `short=7`) when `placeholder` is exactly `atom:<arg>`.
+fn for_each_ref_oid_atom_arg<'a>(placeholder: &'a str, atom: &str) -> Option<&'a str> {
+    let rest = placeholder.strip_prefix(atom)?;
+    rest.strip_prefix(':')
+}
+
+/// Parse the `short`/`short=N` argument of an oid atom into an abbreviation
+/// width, mirroring git's `oid_atom_parser` validation.
+fn for_each_ref_oid_atom_width(arg: &str, atom: &str) -> Result<Option<usize>> {
+    if arg == "short" {
+        Ok(None)
+    } else if let Some(value) = arg.strip_prefix("short=") {
+        Ok(Some(parse_for_each_ref_abbrev_width(value).map_err(
+            |_| {
+                eprintln!("fatal: positive value expected '{value}' in %({atom})");
+                GitError::Exit(128)
+            },
+        )?))
+    } else {
+        eprintln!("fatal: unrecognized %({atom}) argument: {arg}");
+        Err(GitError::Exit(128))
+    }
 }
 
 /// If `placeholder` is a name atom (`(\*?)(author|committer|tagger)name` with an

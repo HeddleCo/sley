@@ -675,6 +675,15 @@ impl ForEachRefNeeds {
                     self.candidates = true;
                     // The direct objectname needs no read; peeled needs the tag target.
                     peeled
+                } else if other == "tree:short"
+                    || other.starts_with("tree:short=")
+                    || other == "parent:short"
+                    || other.starts_with("parent:short=")
+                {
+                    // Abbreviating the tree/parent oid needs both the decoded
+                    // object (to read the oids) and the ambiguity candidate set.
+                    self.candidates = true;
+                    true
                 } else if other.starts_with("authordate:")
                     || other.starts_with("committerdate:")
                     || other.starts_with("taggerdate:")
