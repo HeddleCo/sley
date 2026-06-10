@@ -11,6 +11,9 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
     let git_dir = repo.git_dir();
     let format = repo.format();
     let store = repo.refs();
+    // git validates branch.autosetuprebase up front, so even a plain listing
+    // fails on a malformed value (t3200 #145/#146).
+    validate_autosetuprebase(&read_repo_config(git_dir)?)?;
     if let Some(show_current) = parse_branch_show_current_options(args)? {
         if show_current {
             if let Some(branch) = store.current_branch()? {
@@ -5929,8 +5932,14 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         [flag, branch, start] if flag == "-f" || flag == "--force" => {
             force_update_branch(git_dir, format, store, branch, Some(start))
         }
-        [branch] => create_branch_from_start(git_dir, format, store, branch, None),
-        [branch, start] => create_branch_from_start(git_dir, format, store, branch, Some(start)),
+        [branch] => {
+            create_branch_from_start(git_dir, format, store, branch, None)?;
+            branch_create_set_tracking(git_dir, store, branch, None, None, false)
+        }
+        [branch, start] => {
+            create_branch_from_start(git_dir, format, store, branch, Some(start))?;
+            branch_create_set_tracking(git_dir, store, branch, Some(start), None, false)
+        }
         _ => Err(GitError::Command(
             "branch currently supports: branch [--list [<pattern>...]] [<name> [<start>]] or branch -d|-D <name>... or branch --force <name> [<start>]"
                 .into(),
@@ -5948,10 +5957,11 @@ struct BranchCreateOptions {
     positionals: Vec<String>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum BranchTrackMode {
     Direct,
     Inherit,
+    Never,
 }
 
 struct BranchVerboseListOptions {
@@ -6192,7 +6202,10 @@ fn run_branch_move_options(
         }
         return Err(GitError::Exit(128));
     }
-    if !options.force && store.read_ref(&new_ref)?.is_some() {
+    // A dangling symref destination does not "exist" for the purposes of the
+    // rename collision check (git's validate_branchname uses RESOLVE_REF_READING),
+    // so `branch -m m broken_symref` overwrites it without --force (t3200 #16).
+    if !options.force && sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
         eprintln!("fatal: a branch named '{new_branch}' already exists");
         return Err(GitError::Exit(128));
     }
@@ -6652,7 +6665,7 @@ fn parse_branch_create_options(args: &[String]) -> Result<Option<BranchCreateOpt
             }
             "--no-track" => {
                 saw_create_option = true;
-                track = None;
+                track = Some(BranchTrackMode::Never);
             }
             "--recurse-submodules" => {
                 saw_create_option = true;
@@ -6814,6 +6827,49 @@ fn branch_edit_description(store: &FileRefStore, positionals: &[String]) -> Resu
     }
 }
 
+/// The effective tracking mode, mirroring git's `enum branch_track`. When the
+/// command line does not request a mode, `branch.autosetupmerge` (parsed in
+/// [`config_default_track`]) selects the default — which is `Remote`, not
+/// "off", so creating a branch from a remote-tracking start-point sets up
+/// tracking automatically.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EffectiveTrack {
+    Never,
+    Remote,
+    Always,
+    Explicit,
+    Inherit,
+    Simple,
+}
+
+/// Resolve `branch.autosetupmerge` into the default tracking mode used when the
+/// command line gives no `--track`/`--no-track`. Matches git's
+/// `git_default_branch_config` (environment.c).
+fn config_default_track(config: &GitConfig) -> EffectiveTrack {
+    match config.get("branch", None, "autosetupmerge") {
+        None => EffectiveTrack::Remote,
+        Some("always") => EffectiveTrack::Always,
+        Some("inherit") => EffectiveTrack::Inherit,
+        Some("simple") => EffectiveTrack::Simple,
+        Some(other) => {
+            if config_bool_value(other) {
+                EffectiveTrack::Remote
+            } else {
+                EffectiveTrack::Never
+            }
+        }
+    }
+}
+
+/// git's `git_config_bool` truthiness for non-special strings.
+fn config_bool_value(value: &str) -> bool {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "true" | "yes" | "on" => true,
+        "false" | "no" | "off" | "0" => false,
+        other => other.parse::<i64>().map(|n| n != 0).unwrap_or(true),
+    }
+}
+
 fn branch_create_set_tracking(
     git_dir: &Path,
     store: &FileRefStore,
@@ -6822,16 +6878,151 @@ fn branch_create_set_tracking(
     track: Option<BranchTrackMode>,
     quiet: bool,
 ) -> Result<()> {
-    match track {
-        None => Ok(()),
-        Some(BranchTrackMode::Direct) => {
+    let config = read_repo_config(git_dir)?;
+    let effective = match track {
+        Some(BranchTrackMode::Never) => EffectiveTrack::Never,
+        Some(BranchTrackMode::Direct) => EffectiveTrack::Explicit,
+        Some(BranchTrackMode::Inherit) => EffectiveTrack::Inherit,
+        None => config_default_track(&config),
+    };
+    match effective {
+        EffectiveTrack::Never => Ok(()),
+        EffectiveTrack::Inherit => {
+            branch_create_inherit_upstream(git_dir, store, branch, start, quiet)
+        }
+        EffectiveTrack::Explicit | EffectiveTrack::Always => {
+            // --track / autosetupmerge=always: track even a local start-point.
             let upstream = branch_create_direct_upstream(store, start)?;
             set_branch_upstream_quiet(git_dir, store, branch, &upstream, quiet)
         }
-        Some(BranchTrackMode::Inherit) => {
-            branch_create_inherit_upstream(git_dir, store, branch, start, quiet)
+        EffectiveTrack::Remote | EffectiveTrack::Simple => {
+            // Default / autosetupmerge=simple: only track when the start-point
+            // is a remote-tracking branch matched by some remote's fetch
+            // refspec. `simple` additionally requires the remote branch name
+            // to equal the new branch name.
+            let Some(start) = start else { return Ok(()) };
+            let resolved =
+                match resolve_remote_tracking_upstream(store, &config, start.as_str())? {
+                    Some(resolved) => resolved,
+                    None => return Ok(()),
+                };
+            if effective == EffectiveTrack::Simple {
+                let tracked = resolved.merge.strip_prefix("refs/heads/");
+                if tracked != Some(branch) {
+                    return Ok(());
+                }
+            }
+            install_tracking_config(git_dir, store, branch, &resolved, quiet)
         }
     }
+}
+
+/// Resolve a start-point to a remote-tracking upstream, mirroring git's
+/// `setup_tracking` for `BRANCH_TRACK_REMOTE`: only matches when the
+/// start-point names a remote-tracking branch covered by some remote's fetch
+/// refspec. Returns `None` for local branches (which the default mode must not
+/// track).
+fn resolve_remote_tracking_upstream(
+    store: &FileRefStore,
+    config: &GitConfig,
+    start: &str,
+) -> Result<Option<ResolvedBranchUpstream>> {
+    for remote in remote_names(config) {
+        let Some((remote_ref, merge)) = branch_upstream_remote_ref(config, &remote, start) else {
+            continue;
+        };
+        if store.read_ref(&remote_ref)?.is_some() {
+            let display = remote_ref
+                .strip_prefix("refs/remotes/")
+                .unwrap_or(remote_ref.as_str())
+                .to_string();
+            return Ok(Some(ResolvedBranchUpstream {
+                remote,
+                merge,
+                display,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve `branch.autosetuprebase` (environment.c), returning whether the
+/// newly-created branch should get `branch.<name>.rebase = true` given whether
+/// its upstream is on a remote (`is_remote`). Errors on a malformed value, like
+/// git's `git branch` does.
+fn should_setup_rebase(config: &GitConfig, is_remote: bool) -> Result<bool> {
+    match validate_autosetuprebase(config)? {
+        AutoRebase::Never => Ok(false),
+        AutoRebase::Local => Ok(!is_remote),
+        AutoRebase::Remote => Ok(is_remote),
+        AutoRebase::Always => Ok(true),
+    }
+}
+
+enum AutoRebase {
+    Never,
+    Local,
+    Remote,
+    Always,
+}
+
+/// Parse and validate `branch.autosetuprebase`, mirroring git's
+/// `git_default_branch_config`. A missing key defaults to `never`; a bare key
+/// with no value (`config_error_nonbool`) or an unrecognised value is an error,
+/// which makes plain `git branch` fail (t3200 #145/#146).
+fn validate_autosetuprebase(config: &GitConfig) -> Result<AutoRebase> {
+    match config.get_entry("branch", None, "autosetuprebase") {
+        None => Ok(AutoRebase::Never),
+        Some(None) => {
+            eprintln!("error: missing value for 'branch.autosetuprebase'");
+            Err(GitError::Exit(128))
+        }
+        Some(Some("never")) => Ok(AutoRebase::Never),
+        Some(Some("local")) => Ok(AutoRebase::Local),
+        Some(Some("remote")) => Ok(AutoRebase::Remote),
+        Some(Some("always")) => Ok(AutoRebase::Always),
+        Some(Some(other)) => {
+            eprintln!("error: malformed value for 'branch.autosetuprebase': {other}");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
+/// Install `branch.<name>.{remote,merge}` (and `.rebase` per autosetuprebase)
+/// for a resolved remote-tracking upstream, printing the tracking message
+/// unless quiet. Mirrors git's `install_branch_config_multiple_remotes`.
+fn install_tracking_config(
+    git_dir: &Path,
+    _store: &FileRefStore,
+    branch: &str,
+    resolved: &ResolvedBranchUpstream,
+    quiet: bool,
+) -> Result<()> {
+    let mut config = read_repo_config(git_dir)?;
+    let rebasing = should_setup_rebase(&config, resolved.remote != ".")?;
+    set_config_value(
+        &mut config,
+        "branch",
+        Some(branch),
+        "remote",
+        &resolved.remote,
+    );
+    set_config_value(&mut config, "branch", Some(branch), "merge", &resolved.merge);
+    if rebasing {
+        set_config_value(&mut config, "branch", Some(branch), "rebase", "true");
+    }
+    write_repo_config(git_dir, &config)?;
+    if !quiet {
+        if rebasing {
+            println!(
+                "branch '{branch}' set up to track '{}' by rebasing.",
+                resolved.display
+            );
+        } else {
+            println!("branch '{branch}' set up to track '{}'.", resolved.display);
+        }
+    }
+    Ok(())
 }
 
 fn branch_create_direct_upstream(store: &FileRefStore, start: Option<&String>) -> Result<String> {
@@ -6848,7 +7039,7 @@ fn set_branch_upstream_quiet(
     upstream: &str,
     quiet: bool,
 ) -> Result<()> {
-    let mut config = read_repo_config(git_dir)?;
+    let config = read_repo_config(git_dir)?;
     let Some(upstream) = resolve_branch_upstream(store, &config, upstream)? else {
         eprintln!("fatal: the requested upstream branch '{upstream}' does not exist");
         return Err(GitError::Exit(128));
@@ -6857,25 +7048,7 @@ fn set_branch_upstream_quiet(
         eprintln!("warning: not setting branch '{branch}' as its own upstream");
         return Ok(());
     }
-    set_config_value(
-        &mut config,
-        "branch",
-        Some(branch),
-        "remote",
-        &upstream.remote,
-    );
-    set_config_value(
-        &mut config,
-        "branch",
-        Some(branch),
-        "merge",
-        &upstream.merge,
-    );
-    write_repo_config(git_dir, &config)?;
-    if !quiet {
-        println!("branch '{branch}' set up to track '{}'.", upstream.display);
-    }
-    Ok(())
+    install_tracking_config(git_dir, store, branch, &upstream, quiet)
 }
 
 fn branch_create_inherit_upstream(
@@ -6999,6 +7172,18 @@ fn resolve_branch_start(
     match resolve_revision(git_dir, format, start) {
         Ok(oid) => Ok(oid),
         Err(err) => {
+            // A trailing range operator with an empty other side (`main..`,
+            // `main...`) resolves to the named committish, exactly as git's
+            // `get_oid_committish` does (t3200 #9).
+            if let Some(base) = start
+                .strip_suffix("...")
+                .or_else(|| start.strip_suffix(".."))
+                && !base.is_empty()
+                && !base.contains("..")
+                && let Ok(oid) = resolve_revision(git_dir, format, base)
+            {
+                return Ok(oid);
+            }
             let remote_ref = format!("refs/remotes/{start}");
             match store.read_ref(&remote_ref)? {
                 Some(RefTarget::Direct(oid)) => Ok(oid),
@@ -7036,6 +7221,13 @@ pub(crate) fn create_branch_from_start(
 }
 
 fn validate_branch_creation_name(branch: &str) -> Result<String> {
+    // git's strbuf_check_branch_ref rejects "HEAD" (and "@") as a branch name
+    // even though refs/heads/HEAD passes check_refname_format (t3200 #10).
+    if branch == "HEAD" || branch == "@" {
+        eprintln!("fatal: '{branch}' is not a valid branch name");
+        print_branch_ref_syntax_hint();
+        return Err(GitError::Exit(128));
+    }
     match branch_ref_name(branch) {
         Ok(refname) => Ok(refname),
         Err(GitError::InvalidPath(_)) => {
@@ -7185,6 +7377,27 @@ fn branch_option_takes_no_value<T>(option: &str) -> Result<T> {
     Err(GitError::Exit(129))
 }
 
+/// If `name` is a symbolic ref, delete the symref itself (not its target),
+/// printing git's `Deleted branch <branch> (was <raw-target>).` message and
+/// returning `Ok(Some(()))`. Mirrors builtin/branch.c, which resolves the
+/// branch with `RESOLVE_REF_NO_RECURSE`, so the merge check is bypassed and the
+/// reported value is the symref's immediate target verbatim (t3200 #81-#83).
+fn try_delete_symref_branch(
+    store: &FileRefStore,
+    name: &str,
+    branch: &str,
+    quiet: bool,
+) -> Result<Option<()>> {
+    let Some(RefTarget::Symbolic(target)) = store.read_ref(name)? else {
+        return Ok(None);
+    };
+    store.delete_symbolic_ref(name)?;
+    if !quiet {
+        println!("Deleted branch {branch} (was {target}).");
+    }
+    Ok(Some(()))
+}
+
 fn force_delete_branches(
     git_dir: &Path,
     store: &FileRefStore,
@@ -7211,6 +7424,9 @@ fn force_delete_branches(
                 worktree_root.display()
             );
             failed = true;
+            continue;
+        }
+        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
             continue;
         }
         let deleted = store.delete_branch(branch)?;
@@ -7331,6 +7547,11 @@ fn delete_merged_branches(
                 worktree_root.display()
             );
             failed = true;
+            continue;
+        }
+        // A symbolic-ref branch is deleted without a merge check (git resolves
+        // it with RESOLVE_REF_NO_RECURSE); the symref itself is removed.
+        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
             continue;
         }
         let RefTarget::Direct(oid) = target else {
