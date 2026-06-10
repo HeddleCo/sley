@@ -10,9 +10,99 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The major.minor of git that sley's parity tests are written against.
+///
+/// Oracle output (the upstream `git` we diff sley against) is version-sensitive:
+/// flags, default formatting, and error wording change across releases, so a
+/// mismatched oracle produces large numbers of spurious parity "failures". The
+/// guard in [`oracle_git`] pins the oracle to this series.
+const REQUIRED_ORACLE_GIT_SERIES: &str = "2.54";
+
+static ORACLE_GIT: OnceLock<&'static str> = OnceLock::new();
+
+/// Returns the program name/path to use as the **oracle git** in parity tests.
+///
+/// Resolution order:
+/// * `$SLEY_TEST_GIT`, if set — the explicit, pinnable override (point it at a
+///   `git-2.54/bin/git`).
+/// * otherwise `"git"` (the PATH git).
+///
+/// On first call this also runs a one-time version guard (see
+/// [`assert_oracle_git_version`]): if the resolved oracle is not on the
+/// [`REQUIRED_ORACLE_GIT_SERIES`] series it panics with an actionable message,
+/// converting the silent-skew failure mode (comparing against the wrong git and
+/// getting dozens of bogus diffs) into a single, self-explaining error.
+///
+/// The returned value is `&'static str` so it is a drop-in for the `program`
+/// argument of the per-test `run`/`run_output`/… helpers and for
+/// `Command::new(...)`.
+pub fn oracle_git() -> &'static str {
+    ORACLE_GIT.get_or_init(|| {
+        // Leak once: the oracle program is fixed for the lifetime of the test
+        // process, and callers want a `&'static str`.
+        let program: &'static str = match std::env::var("SLEY_TEST_GIT") {
+            Ok(path) if !path.is_empty() => Box::leak(path.into_boxed_str()),
+            _ => "git",
+        };
+        assert_oracle_git_version(program);
+        program
+    })
+}
+
+/// Runs `<program> --version`, parses the reported version, and panics unless it
+/// is on the [`REQUIRED_ORACLE_GIT_SERIES`] series.
+fn assert_oracle_git_version(program: &str) {
+    let output = Command::new(program)
+        .arg("--version")
+        .output()
+        .unwrap_or_else(|err| {
+            panic!(
+                "sley parity tests could not run the oracle git `{program} --version`: {err}. \
+                 Install git {REQUIRED_ORACLE_GIT_SERIES} and put it on PATH, or set \
+                 SLEY_TEST_GIT=/path/to/git-{REQUIRED_ORACLE_GIT_SERIES}/bin/git."
+            )
+        });
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let reported = stdout.trim();
+    let version = parse_git_version(reported).unwrap_or_else(|| {
+        panic!(
+            "sley parity tests could not parse the oracle git version from `{program} --version` \
+             (got {reported:?}). Expected git {REQUIRED_ORACLE_GIT_SERIES}.x."
+        )
+    });
+    if !version_on_series(&version, REQUIRED_ORACLE_GIT_SERIES) {
+        panic!(
+            "sley parity tests require git {REQUIRED_ORACLE_GIT_SERIES}.x as the oracle; \
+             found {version} (via `{program}`). Install git {REQUIRED_ORACLE_GIT_SERIES} and put \
+             it on PATH, or set SLEY_TEST_GIT=/path/to/git-{REQUIRED_ORACLE_GIT_SERIES}/bin/git."
+        );
+    }
+}
+
+/// Extracts the dotted version (e.g. `2.54.0`) from a `git --version` line such
+/// as `git version 2.54.0`. Returns `None` if no version token is found.
+fn parse_git_version(version_line: &str) -> Option<String> {
+    version_line
+        .split_whitespace()
+        .find(|token| token.chars().next().is_some_and(|c| c.is_ascii_digit()))
+        .map(|token| token.to_string())
+}
+
+/// True if `version` (e.g. `2.54.0` or `2.54.1.windows.1`) is on the
+/// `series` series (e.g. `2.54`), i.e. its `major.minor` prefix matches.
+fn version_on_series(version: &str, series: &str) -> bool {
+    let mut v = version.split('.');
+    let mut s = series.split('.');
+    matches!(
+        (v.next(), s.next(), v.next(), s.next()),
+        (Some(vmaj), Some(smaj), Some(vmin), Some(smin)) if vmaj == smaj && vmin == smin
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HashObjectCase {
@@ -5170,7 +5260,7 @@ fn upstream_git_hash_object(
 }
 
 fn upstream_git_hash_object_in_dir(cwd: &Path, object_type: &str, body: &[u8]) -> Result<String> {
-    let mut child = Command::new("git")
+    let mut child = Command::new(oracle_git())
         .args(["hash-object", "-t", object_type, "--stdin"])
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -5203,7 +5293,7 @@ fn init_repo_for_format(cwd: &Path, format: ObjectFormat) -> Result<()> {
 }
 
 fn run_git<const N: usize>(cwd: &Path, args: [&str; N], stdin: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
+    let mut child = Command::new(oracle_git())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
@@ -5233,7 +5323,7 @@ fn run_git_with_env<const N: usize, const M: usize>(
     stdin: &[u8],
     env: [(&str, &str); M],
 ) -> Result<Vec<u8>> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(oracle_git());
     command.args(args).current_dir(cwd);
     for (name, value) in env {
         command.env(name, value);
@@ -5261,7 +5351,7 @@ fn run_git_with_env<const N: usize, const M: usize>(
 }
 
 fn run_git_owned(cwd: &Path, args: &[String], stdin: &[u8]) -> Result<Vec<u8>> {
-    let mut child = Command::new("git")
+    let mut child = Command::new(oracle_git())
         .args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
