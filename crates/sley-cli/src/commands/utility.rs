@@ -459,7 +459,7 @@ enum MailmapSourceSpec {
 }
 
 #[derive(Debug, Default)]
-struct Mailmap {
+pub(crate) struct Mailmap {
     entries: Vec<MailmapEntry>,
 }
 
@@ -478,6 +478,48 @@ struct MailmapContact {
 }
 
 impl Mailmap {
+    /// Load only the repository `.mailmap` plus any `mailmap.file`/`mailmap.blob`
+    /// config sources — the set git consults when resolving `%(...:mailmap)`
+    /// atoms in for-each-ref / log / etc.
+    pub(crate) fn load_default(git_dir: &Path, format: ObjectFormat) -> Result<Self> {
+        Self::load(git_dir, format, &[])
+    }
+
+    /// Resolve a raw identity (`Name <email> <timestamp> <tz>` bytes, as found in
+    /// commit/tag headers) through the mailmap, returning rewritten name and email
+    /// bytes. The trailing date is preserved untouched.
+    pub(crate) fn rewrite_identity(&self, identity: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let name = for_each_ref_identity_name(identity).unwrap_or(b"");
+        // The bracketed email, including angle brackets; strip them for lookup.
+        let email = for_each_ref_identity_email(identity, ForEachRefEmailMode::Trim).unwrap_or(b"");
+        let contact = MailmapContact {
+            name: (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned()),
+            email: String::from_utf8_lossy(email).into_owned(),
+        };
+        let resolved = self.resolve_contact_struct(&contact);
+        let resolved_name = resolved
+            .name
+            .map(String::into_bytes)
+            .unwrap_or_else(|| name.to_vec());
+        (resolved_name, resolved.email.into_bytes())
+    }
+
+    fn resolve_contact_struct(&self, contact: &MailmapContact) -> MailmapContact {
+        let mut resolved = contact.clone();
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.matches(&resolved))
+        {
+            if let Some(name) = &entry.new_name {
+                resolved.name = Some(name.clone());
+            }
+            resolved.email.clone_from(&entry.new_email);
+        }
+        resolved
+    }
+
     fn load(
         git_dir: &Path,
         format: ObjectFormat,

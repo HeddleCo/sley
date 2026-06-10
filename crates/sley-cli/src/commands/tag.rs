@@ -1561,6 +1561,7 @@ fn print_tag_list(
         let objectname_abbrev = repository_abbrev(git_dir, format)?;
         let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
         let deltabase = zero_oid(format)?;
+        let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
         let mut stdout = io::stdout();
         for entry in entries {
             let Some((oid, symref)) = resolve_for_each_ref_target(store, &entry.reference)? else {
@@ -1594,6 +1595,7 @@ fn print_tag_list(
                 push_track: None,
                 contents,
                 peeled_object,
+                mailmap: &mailmap,
             };
             let mut line = Vec::new();
             print_for_each_ref_format(&mut line, &format_spec, &format_context)?;

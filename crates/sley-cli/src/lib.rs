@@ -3450,6 +3450,7 @@ struct ForEachRefFormatContext<'a> {
     push_track: Option<ForEachRefTrack>,
     contents: Option<ForEachRefContents<'a>>,
     peeled_object: Option<ForEachRefPeeledObject<'a>>,
+    mailmap: &'a commands::utility::Mailmap,
 }
 
 struct ForEachRefPeeledObject<'a> {
@@ -3743,34 +3744,14 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.author.as_deref()),
             )?,
-            "authorname" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authorname" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "authoremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authoremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
+            "authorname" | "*authorname" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "authoremail" | "*authoremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "committer" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -3785,34 +3766,14 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.committer.as_deref()),
             )?,
-            "committername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "committeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
+            "committername" | "*committername" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "committeremail" | "*committeremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "tagger" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -3821,22 +3782,14 @@ fn print_for_each_ref_format(
                     .and_then(|contents| contents.tagger.as_deref()),
             )?,
             "*tagger" => write_for_each_ref_identity(stdout, None)?,
-            "taggername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggername" => write_for_each_ref_identity_name(stdout, None)?,
-            "taggeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggeremail" => write_for_each_ref_identity_email(stdout, None)?,
+            "taggername" | "*taggername" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "taggeremail" | "*taggeremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "creator" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -4107,10 +4060,12 @@ fn print_for_each_ref_format(
                             .as_bytes(),
                         )?;
                     }
+                } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context) {
+                    result?;
+                } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
+                    result?;
                 } else if let Some((identity, mode)) = for_each_ref_date_modifier(other, context) {
                     write_for_each_ref_identity_date_mode(stdout, identity, mode)?;
-                } else if let Some((identity, mode)) = for_each_ref_email_modifier(other, context) {
-                    write_for_each_ref_identity_email_mode(stdout, identity, mode)?;
                 } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                     let target = resolve_revision(context.git_dir, context.format, rev)?;
                     if let Some(track) =
@@ -4351,33 +4306,163 @@ fn for_each_ref_date_modifier<'a>(
     Some((identity, mode))
 }
 
-fn for_each_ref_email_modifier<'a>(
+/// The set of `%(...email)` options, mirroring git's `email_option` bitset
+/// (ref-filter.c `EO_TRIM`/`EO_LOCALPART`/`EO_MAILMAP`).
+#[derive(Clone, Copy, Default)]
+struct ForEachRefEmailOptions {
+    trim: bool,
+    localpart: bool,
+    mailmap: bool,
+}
+
+/// Parse the option string after `%(authoremail:...)` exactly as git's
+/// `person_email_atom_parser` does. Options are comma-separated and may repeat;
+/// each must be an exact `trim`/`localpart`/`mailmap` token between commas.
+/// On an unrecognized token, returns `Err(bad_arg)` where `bad_arg` is the
+/// unconsumed remainder at the point of failure (git reports this verbatim).
+fn parse_for_each_ref_email_options(arg: &str) -> std::result::Result<ForEachRefEmailOptions, String> {
+    let mut options = ForEachRefEmailOptions::default();
+    let mut rest = arg;
+    loop {
+        let bad_arg = rest;
+        // git's email_atom_option_parser: prefix-match a known token.
+        let consumed = if let Some(tail) = rest.strip_prefix("trim") {
+            options.trim = true;
+            tail
+        } else if let Some(tail) = rest.strip_prefix("localpart") {
+            options.localpart = true;
+            tail
+        } else if let Some(tail) = rest.strip_prefix("mailmap") {
+            options.mailmap = true;
+            tail
+        } else {
+            return Err(bad_arg.to_string());
+        };
+        rest = consumed;
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail;
+        } else {
+            return Err(bad_arg.to_string());
+        }
+    }
+    Ok(options)
+}
+
+/// If `placeholder` is an email atom (`(\*?)(author|committer|tagger)email`
+/// with optional `:opts`), render it. Returns `Some(Ok(()))` when handled,
+/// `Some(Err(_))` on a bad-option error (already reported to stderr), and
+/// `None` when the placeholder is not an email atom.
+fn for_each_ref_try_email_atom(
+    stdout: &mut impl Write,
     placeholder: &str,
-    context: &'a ForEachRefFormatContext<'_>,
-) -> Option<(Option<&'a [u8]>, ForEachRefEmailMode)> {
-    let (atom, modifier) = placeholder.split_once(':')?;
-    let mode = match modifier {
-        "trim" => ForEachRefEmailMode::Trim,
-        "localpart" => ForEachRefEmailMode::LocalPart,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authoremail" => (false, ForEachRefAtomIdentityRole::Author),
+        "committeremail" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggeremail" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "*authoremail" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committeremail" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggeremail" => (true, ForEachRefAtomIdentityRole::Tagger),
         _ => return None,
     };
-    let contents = context.contents.as_ref();
-    let identity = match atom {
-        "authoremail" => contents.and_then(|contents| contents.author.as_deref()),
-        "committeremail" => contents.and_then(|contents| contents.committer.as_deref()),
-        "taggeremail" => contents.and_then(|contents| contents.tagger.as_deref()),
-        "*authoremail" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.author.as_deref()),
-        "*committeremail" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.committer.as_deref()),
-        "*taggeremail" => None,
+    let options = match arg {
+        Some(arg) => match parse_for_each_ref_email_options(arg) {
+            Ok(options) => options,
+            Err(bad_arg) => {
+                let name = atom.strip_prefix('*').unwrap_or(atom);
+                eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
+                return Some(Err(GitError::Exit(128)));
+            }
+        },
+        None => ForEachRefEmailOptions::default(),
+    };
+    Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// If `placeholder` is a name atom (`(\*?)(author|committer|tagger)name` with an
+/// optional `:mailmap`/`:` argument), render it. Mirrors git's
+/// `person_name_atom_parser`: the only accepted argument is `mailmap`.
+fn for_each_ref_try_name_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authorname" => (false, ForEachRefAtomIdentityRole::Author),
+        "committername" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggername" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "*authorname" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committername" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggername" => (true, ForEachRefAtomIdentityRole::Tagger),
         _ => return None,
     };
-    Some((identity, mode))
+    let mailmap = match arg {
+        None => false,
+        Some("mailmap") => true,
+        Some(bad_arg) => {
+            let name = atom.strip_prefix('*').unwrap_or(atom);
+            eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
+            return Some(Err(GitError::Exit(128)));
+        }
+    };
+    Some((|| -> Result<()> {
+        let Some(identity) = for_each_ref_typed_identity(context, peeled, role) else {
+            return Ok(());
+        };
+        if mailmap {
+            let (name, _) = context.mailmap.rewrite_identity(identity);
+            stdout.write_all(&name)?;
+        } else {
+            write_for_each_ref_identity_name(stdout, Some(identity))?;
+        }
+        Ok(())
+    })())
+}
+
+fn for_each_ref_write_email(
+    stdout: &mut impl Write,
+    context: &ForEachRefFormatContext<'_>,
+    peeled: bool,
+    role: ForEachRefAtomIdentityRole,
+    options: ForEachRefEmailOptions,
+) -> Result<()> {
+    let Some(identity) = for_each_ref_typed_identity(context, peeled, role) else {
+        return Ok(());
+    };
+    let mode = if options.localpart {
+        ForEachRefEmailMode::LocalPart
+    } else if options.trim {
+        ForEachRefEmailMode::Trim
+    } else {
+        ForEachRefEmailMode::Bracketed
+    };
+    if options.mailmap {
+        let (_, email) = context.mailmap.rewrite_identity(identity);
+        // Reassemble a synthetic identity so the shared email extractor applies
+        // trim/localpart over the rewritten address.
+        let mut synthetic = Vec::with_capacity(email.len() + 2);
+        synthetic.push(b'<');
+        synthetic.extend_from_slice(&email);
+        synthetic.push(b'>');
+        if let Some(value) = for_each_ref_identity_email(&synthetic, mode) {
+            stdout.write_all(value)?;
+        }
+    } else if let Some(value) = for_each_ref_identity_email(identity, mode) {
+        stdout.write_all(value)?;
+    }
+    Ok(())
 }
 
 fn for_each_ref_color_escape(value: &str) -> Result<String> {

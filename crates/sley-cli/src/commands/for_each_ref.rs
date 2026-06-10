@@ -272,6 +272,9 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
         HashMap::new()
     };
     let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    // git resolves `%(...:mailmap)` atoms against the repository .mailmap plus
+    // mailmap.{file,blob} config; load it once up front (cheap when absent).
+    let mailmap = commands::utility::Mailmap::load_default(&git_dir, format)?;
     let mut stdout = io::stdout();
     let mut emitted = 0usize;
     let mut refs = store.list_refs()?;
@@ -477,6 +480,7 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             push_track,
             contents,
             peeled_object,
+            mailmap: &mailmap,
         };
         let mut line = Vec::new();
         print_for_each_ref_format(&mut line, &format_spec, &format_context)?;
