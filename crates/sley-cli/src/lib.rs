@@ -390,6 +390,13 @@ fn var_pager() -> String {
 }
 
 fn var_default_branch() -> String {
+    // git's `repo_default_branch_name`: the test override env var wins over
+    // the `init.defaultBranch` configuration.
+    if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !env.is_empty()
+    {
+        return env;
+    }
     var_effective_config_value("init.defaultBranch").unwrap_or_else(|| "master".into())
 }
 
@@ -2482,6 +2489,21 @@ fn default_init_template_dir() -> Option<PathBuf> {
     let exec_path = String::from_utf8_lossy(&output.stdout);
     let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
     candidate.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+/// git's `repo_default_branch_name`: `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
+/// overrides the `init.defaultBranch` configuration (read from the default
+/// config layers: `-c` overrides, then system/global files); the hardcoded
+/// fallback is `master`.
+fn default_initial_branch_name(global_config: &[GlobalConfigOverride]) -> Result<String> {
+    if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !env.is_empty()
+    {
+        return Ok(env);
+    }
+    Ok(init_config_value("init.defaultBranch", global_config)?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "master".to_string()))
 }
 
 fn init_config_value(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<String>> {
@@ -27868,7 +27890,19 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
         return Err(GitError::repository_not_found("not a git repository"));
     }
+    let ceilings = discovery_ceiling_directories();
     for candidate in start.as_ref().ancestors() {
+        // GIT_CEILING_DIRECTORIES: stop the upward walk before *entering* a
+        // listed directory. The starting directory itself is always examined
+        // (a ceiling only limits proper ancestors, like git's
+        // `longest_ancestor_length`).
+        if candidate != start.as_ref()
+            && ceilings
+                .iter()
+                .any(|ceiling| paths_refer_to_same_dir(ceiling, candidate))
+        {
+            break;
+        }
         let dot_git = candidate.join(".git");
         if dot_git.is_dir() {
             return Ok(dot_git);
@@ -27884,6 +27918,32 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
     }
     Err(GitError::repository_not_found("not a git repository"))
+}
+
+/// The `GIT_CEILING_DIRECTORIES` list: colon-separated absolute paths that
+/// repository discovery must not walk up into. Empty entries (including the
+/// `""` no-canonicalization marker) are ignored.
+fn discovery_ceiling_directories() -> Vec<PathBuf> {
+    match env::var("GIT_CEILING_DIRECTORIES") {
+        Ok(value) if !value.is_empty() => value
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether two paths name the same directory, tolerating symlink/relative
+/// differences via canonicalization.
+fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
