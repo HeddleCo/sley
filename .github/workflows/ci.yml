@@ -1,0 +1,100 @@
+name: Rust Tests
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: rust-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -eo pipefail
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTC_WRAPPER: sccache
+  # sccache caches to LOCAL DISK; avoids GHA cache churn.
+  # Cross-run target/ caching comes from Swatinem/rust-cache.
+  SCCACHE_GHA_ENABLED: "false"
+
+jobs:
+  # Build once, then clippy + test + format checks reuse the same target/ directory.
+  # Avoids 4 separate cold builds; total compute time is ~70% lower at modest
+  # parallelism cost.
+  check-and-test:
+    name: Check & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: mozilla-actions/sccache-action@v0.0.9
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-tests-${{ runner.os }}
+          cache-on-failure: true
+
+      # 1. Warm target/ with the full default-feature workspace build.
+      #    Everything downstream reuses these artifacts.
+      - name: Build (default features)
+        run: cargo build --locked --workspace --tests
+
+      # 2. Format check — REPORT-ONLY (non-blocking).
+      #    The base tree (b069dbe, the CLI-monolith split) is NOT `cargo fmt`-clean,
+      #    so a blocking `cargo fmt --all --check` would fail every PR on day one.
+      #    We surface the diff for visibility and leave the enforcing gate to the
+      #    sley#7 clean-up (which should land a tree-wide `cargo fmt` + flip this
+      #    to blocking). No source can be reformatted from a workflows-only change.
+      - name: Format check (report-only)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      # 3. Clippy gate — scoped to the crates that are ALREADY clippy-clean at
+      #    base, linted with --no-deps so a dirty path-dependency doesn't trip
+      #    the gate. sley has ~6,241 workspace clippy/`unwrap_used` violations
+      #    (sley#7 burn-down); even the boundary/security crates aren't all clean
+      #    yet (sley-remote has 2 `map_entry` findings in src/local.rs at base).
+      #    So the BLOCKING gate is the verified-clean subset — sley-pack (pack
+      #    format parsing) and sley-protocol (protocol parsing) — the untrusted-
+      #    input parsers where strict linting matters most. sley-remote and the
+      #    rest are covered by the report-only workspace pass (step 5) until
+      #    sley#7 cleans them and they graduate into this gate. See the burn-down
+      #    plan in reviews/sley-ci/README.md.
+      - name: Clippy (scoped, blocking)
+        run: |
+          cargo clippy --locked -p sley-pack --all-targets --no-deps -- -D warnings
+          cargo clippy --locked -p sley-protocol --all-targets --no-deps -- -D warnings
+
+      # 4. Run all workspace tests. The suite includes the t-file CLI parity
+      #    tests, unit tests across the domain crates, and the upstream
+      #    integration harness (sley-testkit, #[ignore]-gated; run on demand
+      #    with --ignored + GIT_SRC_DIR). Most tests do NOT shell out to git;
+      #    a few CLI parity tests may invoke system git, which is present on
+      #    the runner.
+      - name: Tests
+        run: cargo test --locked --workspace
+
+      # 5. Report-only full-workspace clippy. NON-BLOCKING — surfaces the
+      #    burn-down progress (warning count) without failing CI. Covers
+      #    sley-remote and every crate not yet in the step-3 blocking gate; the
+      #    real gate is step 3 (sley-pack + sley-protocol). As sley#7 cleans
+      #    crates, promote them from here into step 3.
+      - name: Clippy (workspace, report-only)
+        continue-on-error: true
+        run: |
+          cargo clippy --locked --workspace --all-targets --no-deps 2>&1 \
+            | tee /tmp/clippy-report.txt
+          warning_count=$(grep -c 'warning:' /tmp/clippy-report.txt || true)
+          echo "Found $warning_count clippy warnings across workspace (non-blocking)"
