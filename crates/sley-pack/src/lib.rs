@@ -2504,7 +2504,16 @@ fn apply_pack_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         )));
     }
     let result_size = read_delta_varint(delta, &mut cursor)?;
-    let mut result = Vec::with_capacity(result_size.min(usize::MAX as u64) as usize);
+    // `result_size` is an attacker-controlled delta varint from a network pack
+    // (install_raw_pack -> sley-fetch). On 64-bit a naive `result_size as usize`
+    // (or `.min(usize::MAX)`, a no-op there) lets a tiny delta declare
+    // `u64::MAX`/1 TiB and drive `with_capacity` to abort the process before the
+    // size-mismatch check below can fire. Route the up-front reservation through
+    // the sley#2 bound so the speculative allocation is capped; `result.extend`
+    // still grows the buffer organically and the post-decode length check
+    // (`result.len() != result_size`) rejects the lie cleanly.
+    let result_size_hint = usize::try_from(result_size).unwrap_or(usize::MAX);
+    let mut result = Vec::with_capacity(bounded_inflate_reserve(result_size_hint, delta.len()));
     while cursor < delta.len() {
         let command = delta[cursor];
         cursor += 1;
@@ -4288,6 +4297,123 @@ mod tests {
         }
     }
 
+    /// Build a 2-object pack: a real base blob followed by a delta (ref or ofs)
+    /// whose *result-size* varint lies, declaring `declared_result_size`, while
+    /// carrying a tiny real instruction stream. The delta's base-size varint is
+    /// set correctly (so the base-size check at the top of `apply_pack_delta`
+    /// passes and we reach the result reservation). Used to drive the sley#35
+    /// delta-result-size bomb.
+    fn lying_result_size_delta_pack(
+        format: ObjectFormat,
+        declared_result_size: u64,
+        delta_kind: DeltaKind,
+    ) -> Vec<u8> {
+        let base = b"hello";
+        let result = b"hello world"; // real produced length = 11
+
+        // Hand-build a delta with a truthful base-size and a LYING result-size.
+        let mut delta = Vec::new();
+        write_delta_varint(&mut delta, base.len() as u64);
+        write_delta_varint(&mut delta, declared_result_size);
+        // Real instructions: copy `base` then insert " world".
+        let suffix = &result[base.len()..];
+        delta.push(0x90); // copy, 1 size byte present (bit 0x10)
+        delta.push(base.len() as u8);
+        delta.push(suffix.len() as u8);
+        delta.extend_from_slice(suffix);
+
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+
+        let base_offset = pack.len();
+        write_entry_header(&mut pack, ObjectType::Blob, base.len() as u64);
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(base)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
+
+        let delta_offset = pack.len();
+        write_pack_entry_header_kind(
+            &mut pack,
+            match delta_kind {
+                DeltaKind::Offset => 6,
+                DeltaKind::Ref => 7,
+            },
+            delta.len() as u64,
+        );
+        match delta_kind {
+            DeltaKind::Offset => write_ofs_delta_offset(&mut pack, delta_offset - base_offset),
+            DeltaKind::Ref => {
+                let base_oid = sley_core::object_id_for_bytes(format, "blob", base)
+                    .expect("test operation should succeed");
+                pack.extend_from_slice(base_oid.as_bytes());
+            }
+        }
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(&delta)
+            .expect("test operation should succeed");
+        pack.extend_from_slice(&encoder.finish().expect("test operation should succeed"));
+
+        let checksum =
+            sley_core::digest_bytes(format, &pack).expect("test operation should succeed");
+        pack.extend_from_slice(checksum.as_bytes());
+        pack
+    }
+
+    /// Regression (sley#35): the 2nd instance of the sley#2 decompression-bomb
+    /// class. `apply_pack_delta` read an attacker-controlled `result_size` varint
+    /// from a network delta and fed it straight to `Vec::with_capacity`. A tiny
+    /// delta declaring `result_size == u64::MAX` (or ~1 TiB) aborts the process
+    /// ("capacity overflow"/alloc failure, SIGABRT) BEFORE the post-decode
+    /// size-mismatch check can reject the lie. Both ref-delta and ofs-delta paths
+    /// reach the same reservation, so both must be safe. We resolve the pack on a
+    /// worker thread so an abort/panic surfaces as a `join()` error rather than
+    /// killing the whole test binary; the fix turns the bomb into a clean `Err`.
+    #[test]
+    fn rejects_delta_result_size_bomb_without_oom() {
+        let bombs: &[u64] = &[u64::MAX, 1024 * 1024 * 1024 * 1024];
+        for &declared in bombs {
+            for delta_kind in [DeltaKind::Ref, DeltaKind::Offset] {
+                let pack =
+                    lying_result_size_delta_pack(ObjectFormat::Sha1, declared, delta_kind);
+                let handle = std::thread::spawn(move || PackFile::parse_sha1(&pack));
+                let join_result = handle.join();
+                assert!(
+                    join_result.is_ok(),
+                    "delta bomb (declared={declared}, kind={delta_kind:?}) panicked/aborted \
+                     instead of erroring cleanly"
+                );
+                let parse_result =
+                    join_result.expect("parse thread should not panic on a delta bomb");
+                assert!(
+                    parse_result.is_err(),
+                    "delta bomb (declared={declared}, kind={delta_kind:?}) should be rejected \
+                     as invalid (result.len() != declared)"
+                );
+            }
+        }
+    }
+
+    /// A legitimate (truthful) delta whose result-size varint matches the real
+    /// produced length must still resolve correctly — the bound only caps the
+    /// speculative reservation, it must not break real delta application.
+    #[test]
+    fn applies_legitimate_delta_after_result_size_bound() {
+        for delta_kind in [DeltaKind::Ref, DeltaKind::Offset] {
+            let base = b"hello";
+            let result = b"hello world";
+            let pack = two_object_delta_pack(ObjectFormat::Sha1, base, result, delta_kind);
+            let parsed = PackFile::parse_sha1(&pack).expect("legitimate delta should resolve");
+            assert_eq!(parsed.entries.len(), 2);
+            assert_eq!(parsed.entries[0].object.body, base);
+            assert_eq!(parsed.entries[1].object.body, result);
+        }
+    }
+
     #[test]
     fn bounded_inflate_reserve_caps_attacker_declared_size() {
         // A tiny compressed input can't justify a multi-gigabyte reservation.
@@ -6025,7 +6151,7 @@ mod tests {
         pack
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum DeltaKind {
         Offset,
         Ref,
