@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use sley_config::GitConfig;
 use sley_config::remotes::{remote_config_values, remote_exists, rewrite_url_with_config};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
-use sley_odb::{FileObjectDatabase, collect_reachable_object_ids};
+use sley_odb::{
+    FileObjectDatabase, collect_reachable_object_ids, collect_reachable_object_ids_excluding,
+};
 #[cfg(feature = "http")]
 use sley_protocol::ProtocolVersion;
 use sley_protocol::{
@@ -79,9 +81,9 @@ pub struct FetchOptions {
     /// the configured `remote.<name>.prune`/`fetch.prune` must not override it.
     pub prune_option_explicit: bool,
     /// Shallow fetch depth (`--depth N`): truncate history to `N` commits per tip.
-    /// `None` is a full fetch. Only honored for the HTTP and SSH transports; a
-    /// depth on a local (`file://`/path) fetch is ignored (the in-process server
-    /// has no shallow support), matching the CLI's local-clone behavior.
+    /// `None` is a full fetch. Honored by the HTTP and SSH transports and by the
+    /// in-process local (`file://`/path) server, which computes the deepen
+    /// boundary itself (see [`crate::local::compute_local_deepen`]).
     pub depth: Option<u32>,
     /// When fetching configured remote refspecs, mark the update whose `src`
     /// matches this value as eligible for merge in `FETCH_HEAD` (used by `pull`).
@@ -216,6 +218,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 options: &options,
                 store: &store,
                 reachable: None,
+                deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
             })?;
@@ -283,6 +286,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 options: &options,
                 store: &store,
                 reachable: None,
+                deepen_excluded: None,
                 format: request.format,
                 configured_remote_fetch,
             })?;
@@ -335,23 +339,63 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             let advertisements =
                 crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
             let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, request.format);
+            // Shallow fetch: the in-process upload-pack needs its deepen plan up
+            // front. The boundary walk starts from the primary planned tips
+            // (upload-pack's `want_obj`) — auto-followed tags are this path's
+            // include-tag equivalent and must not deepen the walk, and the tag
+            // auto-follow below must not see history past the boundary. The
+            // primary plan is recomputed inside `plan_and_adjust_updates`; the
+            // planner is a pure function over the same inputs, so both runs
+            // agree. A `None` depth keeps the full-fetch path.
+            let deepen_plan = match options.depth {
+                Some(depth) => {
+                    let primary = plan_fetch_ref_updates(
+                        &advertisements,
+                        &parsed_refspecs,
+                        options.auto_follow_tags,
+                    )?;
+                    let mut seen = HashSet::new();
+                    let mut heads = Vec::new();
+                    for update in &primary {
+                        if seen.insert(update.oid) {
+                            heads.push(update.oid);
+                        }
+                    }
+                    // Replay the current boundary, like the HTTP and SSH paths.
+                    let client_shallow =
+                        crate::shallow::read_shallow(request.git_dir, request.format)?;
+                    Some(crate::local::compute_local_deepen(
+                        &remote_db,
+                        request.format,
+                        &heads,
+                        client_shallow,
+                        depth,
+                    )?)
+                }
+                None => None,
+            };
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
                 options: &options,
                 store: &store,
                 reachable: Some((&remote_db, &advertisements)),
+                deepen_excluded: deepen_plan.as_ref().map(|plan| &plan.excluded),
                 format: request.format,
                 configured_remote_fetch,
             })?;
             let starts = updates.iter().map(|update| update.oid).collect();
-            crate::local::install_fetch_pack_via_local_upload_pack(
+            let shallow_info = crate::local::install_fetch_pack_via_local_upload_pack(
                 request.git_dir,
                 remote_git_dir,
                 request.format,
                 starts,
+                deepen_plan.as_ref(),
                 promisor_remote,
             )?;
+            if !options.dry_run {
+                crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
+            }
             finalize_fetch(
                 FetchFinalize {
                     git_dir: request.git_dir,
@@ -399,13 +443,16 @@ fn shallow_boundary_for_request(
 
 /// Plan the ref-map and apply the auto-follow-tag / not-for-merge adjustments
 /// shared by both transports. `reachable` (local only) enables appending tags
-/// reachable from fetched commits via the remote object database.
+/// reachable from fetched commits via the remote object database;
+/// `deepen_excluded` (local shallow fetch only) keeps that reachability walk
+/// from crossing the deepen boundary.
 struct FetchPlanInput<'a> {
     advertisements: &'a [RefAdvertisement],
     refspecs: &'a [RefSpec],
     options: &'a FetchOptions,
     store: &'a FileRefStore,
     reachable: Option<(&'a FileObjectDatabase, &'a [RefAdvertisement])>,
+    deepen_excluded: Option<&'a HashSet<ObjectId>>,
     format: ObjectFormat,
     configured_remote_fetch: bool,
 }
@@ -417,6 +464,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
         options,
         store,
         reachable,
+        deepen_excluded,
         format,
         configured_remote_fetch,
     } = input;
@@ -433,6 +481,7 @@ fn plan_and_adjust_updates(input: FetchPlanInput<'_>) -> Result<Vec<FetchRefUpda
                 format,
                 refspecs,
                 &mut updates,
+                deepen_excluded,
             )?;
         }
         retain_missing_auto_follow_tags(store, &mut updates)?;
@@ -616,6 +665,7 @@ pub fn append_reachable_auto_follow_tags(
     format: ObjectFormat,
     refspecs: &[RefSpec],
     updates: &mut Vec<FetchRefUpdate>,
+    deepen_excluded: Option<&HashSet<ObjectId>>,
 ) -> Result<()> {
     if !updates.iter().any(|update| update.dst.is_some()) {
         return Ok(());
@@ -624,7 +674,15 @@ pub fn append_reachable_auto_follow_tags(
         .iter()
         .filter(|update| update.dst.is_some() && !update.src.starts_with("refs/tags/"))
         .map(|update| update.oid);
-    let reachable = collect_reachable_object_ids(remote_db, format, starts)?;
+    // A deepen fetch must not auto-follow tags past the shallow boundary: only
+    // tags whose target lands in the truncated pack are followed (upstream's
+    // include-tag packs a tag only when its referenced object is packed).
+    let reachable = match deepen_excluded {
+        Some(excluded) => {
+            collect_reachable_object_ids_excluding(remote_db, format, starts, excluded)?
+        }
+        None => collect_reachable_object_ids(remote_db, format, starts)?,
+    };
     let mut fetched_srcs = updates
         .iter()
         .map(|update| update.src.clone())

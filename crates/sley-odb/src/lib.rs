@@ -195,6 +195,22 @@ where
     walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
 }
 
+/// [`collect_reachable_object_ids`] with a stop set: objects in `excluded` are
+/// not visited and not expanded, so the walk never sees anything reachable only
+/// through them (used to truncate history at a shallow boundary).
+pub fn collect_reachable_object_ids_excluding<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    walk_reachable_objects(reader, format, starts, excluded, |_, _| {})
+}
+
 pub fn collect_reachable_objects<R, I>(
     reader: &R,
     format: ObjectFormat,
