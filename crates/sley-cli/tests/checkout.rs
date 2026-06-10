@@ -60,7 +60,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn prepare_repo(root: &Path) -> String {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("hello.txt"), b"base\n").expect("write base file");
     git(root, &["add", "hello.txt"]);
     run_with_identity(root, &["commit", "-m", "base", "-q"]);
