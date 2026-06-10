@@ -10,9 +10,10 @@ use sley_object::{
     tree_entry_object_type,
 };
 use sley_odb::{
-    FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
-    collect_reachable_object_ids, install_bundle_pack, install_reachable_pack,
-    prune_unreachable_loose, repository_object_ids, repository_objects_dir,
+    FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
+    build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
+    install_reachable_pack, prune_unreachable_loose, repository_object_ids,
+    repository_objects_dir,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_protocol::{
@@ -3513,10 +3514,33 @@ fn cmd_fsck(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let roots = fsck_root_oids(&git_dir, format)?;
+    let mut object_ids = repository_object_ids(&git_dir, format)?;
+    // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
+    // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
+    // stderr (with git's path-form spelling) and excluding them from the object set
+    // so they neither parse nor surface as dangling.
+    let objects_dir_display = fsck_objects_dir_display(&git_dir, &cwd);
+    let mut bad_loose = HashSet::new();
+    for oid in db.loose().object_ids()? {
+        let hex = oid.to_hex();
+        let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
+        match db.loose().verify_object(&oid, &display_path)? {
+            None | Some(LooseObjectIntegrity::Ok) => {}
+            Some(LooseObjectIntegrity::HashMismatch { actual }) => {
+                eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                bad_loose.insert(oid);
+            }
+            Some(LooseObjectIntegrity::Corrupt) => {
+                eprintln!("error: {oid}: object corrupt or missing: {display_path}");
+                bad_loose.insert(oid);
+            }
+        }
+    }
+    let loose_errors = !bad_loose.is_empty();
+    object_ids.retain(|oid| !bad_loose.contains(oid));
     if roots.is_empty() && progress {
         eprintln!("notice: No default references");
     }
-    let object_ids = repository_object_ids(&git_dir, format)?;
     let report = sley_fsck::fsck_objects_with_options(
         &db,
         format,
@@ -3533,11 +3557,30 @@ fn cmd_fsck(args: &[String]) -> Result<()> {
     for issue in &report.issues {
         println!("{}", issue.message);
     }
-    if report.is_ok() {
-        Ok(())
-    } else {
+    if !report.is_ok() {
         Err(GitError::Exit(10))
+    } else if loose_errors {
+        // builtin/fsck.c exits with its `errors_found` bitmask; a corrupt or
+        // misplaced loose object sets ERROR_OBJECT (= 1).
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
     }
+}
+
+/// The directory prefix git uses when printing loose-object paths from fsck:
+/// `$GIT_DIR/objects` with GIT_DIR's textual (often relative) value — `./objects`
+/// when the cwd IS the git dir (a bare repository), `.git/objects` at a worktree
+/// root. sley's discovery yields an absolute git dir, so reconstruct the relative
+/// spelling for those shapes and fall back to the absolute path.
+fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
+    if git_dir == cwd {
+        return "./objects".to_string();
+    }
+    if let Ok(relative) = git_dir.strip_prefix(cwd) {
+        return format!("{}/objects", relative.display());
+    }
+    format!("{}/objects", git_dir.display())
 }
 
 fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
