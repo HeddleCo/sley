@@ -460,6 +460,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| default_clone_directory(&repository, bare));
+    // git reports the destination as it was given on the command line (or as
+    // derived from the source) — `dir` in upstream `builtin/clone.c` — not its
+    // absolutized form.
+    let destination_display = destination.clone();
     let cwd = env::current_dir()?;
     let destination = if destination.is_absolute() {
         destination
@@ -476,7 +480,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if destination.exists() && fs::read_dir(&destination)?.next().is_some() {
         eprintln!(
             "fatal: destination path '{}' already exists and is not an empty directory.",
-            destination.display()
+            destination_display.display()
         );
         return Err(GitError::Exit(128));
     }
@@ -485,6 +489,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return clone_http_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
+            destination_display: &destination_display,
             origin: &origin,
             quiet,
             bare,
@@ -510,6 +515,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return clone_ssh_repository(CloneHttpOptions {
             repository: &repository,
             destination: &destination,
+            destination_display: &destination_display,
             origin: &origin,
             quiet,
             bare,
@@ -562,14 +568,22 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
         }
     }
+    // git prints the trailing "done." only for clones served by `clone_local`
+    // in upstream `builtin/clone.c`, i.e. when the source is a plain local
+    // path. A `file://` source goes through the transport machinery upstream
+    // (even though sley serves it from this same local code path), so it ends
+    // without "done.".
+    let local_source = parse_remote_url(&repository)
+        .map(|url| url.transport == RemoteTransport::Local)
+        .unwrap_or(false);
     if !quiet {
         if bare {
             eprintln!(
                 "Cloning into bare repository '{}'...",
-                destination.display()
+                destination_display.display()
             );
         } else {
-            eprintln!("Cloning into '{}'...", destination.display());
+            eprintln!("Cloning into '{}'...", destination_display.display());
         }
     }
     if bare {
@@ -595,7 +609,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 submodule_active: &submodule_active,
             },
         )?;
-        if !quiet {
+        if !quiet && local_source {
             eprintln!("done.");
         }
         return Ok(());
@@ -663,7 +677,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         if let Some(separate_git_dir) = separate_git_dir.as_deref() {
             apply_clone_separate_git_dir(&destination, &git_dir, separate_git_dir)?;
         }
-        if !quiet {
+        if !quiet && local_source {
             eprintln!("done.");
         }
         return Ok(());
@@ -720,7 +734,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if let Some(separate_git_dir) = separate_git_dir.as_deref() {
         apply_clone_separate_git_dir(&destination, &git_dir, separate_git_dir)?;
     }
-    if !quiet {
+    if !quiet && local_source {
         eprintln!("done.");
     }
     Ok(())
@@ -729,6 +743,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
 struct CloneHttpOptions<'a> {
     repository: &'a str,
     destination: &'a Path,
+    /// The destination as given on the command line (or derived from the
+    /// source), for user-facing messages — `dir` in upstream `builtin/clone.c`.
+    destination_display: &'a Path,
     origin: &'a str,
     quiet: bool,
     bare: bool,
@@ -834,7 +851,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         .unwrap_or_else(|| remote_head_branch.clone());
 
     if !options.quiet {
-        eprintln!("Cloning into '{}'...", options.destination.display());
+        eprintln!("Cloning into '{}'...", options.destination_display.display());
     }
 
     let single_branch = options.single_branch;
@@ -950,7 +967,7 @@ fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         .unwrap_or_else(|| remote_head_branch.clone());
 
     if !options.quiet {
-        eprintln!("Cloning into '{}'...", options.destination.display());
+        eprintln!("Cloning into '{}'...", options.destination_display.display());
     }
 
     let single_branch = options.single_branch;
