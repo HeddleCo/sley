@@ -764,6 +764,11 @@ pub(crate) fn cmd_branch(args: &[String]) -> Result<()> {
         {
             print_branch_list_matching(store, BranchListMode::Local, patterns, false)
         }
+        [list, color, no_color, patterns @ ..]
+            if list == "--list" && branch_color_always_flag(color) && no_color == "--no-color" =>
+        {
+            print_branch_list_matching(store, BranchListMode::Local, patterns, false)
+        }
         [list, no_color, color]
             if list == "--list" && no_color == "--no-color" && branch_color_always_flag(color) =>
         {
