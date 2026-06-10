@@ -16,6 +16,9 @@ use std::path::{Path, PathBuf};
 /// half of `git remote add`/`remove`/`set-url`).
 pub mod remotes;
 
+/// Byte-faithful in-place config editing mirroring git's surgical splice writer.
+pub mod raw_edit;
+
 /// A preserved comment or blank line from the source file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigPreambleLine {
@@ -1023,10 +1026,10 @@ fn emit_parsed_config(
 /// Resolve an include path for the stack walker. Relative paths require a file
 /// base (git: "relative config includes must come from files").
 fn resolve_stack_include_path(raw: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return Ok(PathBuf::from(home).join(rest));
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return Ok(PathBuf::from(home).join(rest));
     }
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
@@ -1095,10 +1098,10 @@ fn expand_user_path_with_home(path: &str, home: Option<&str>) -> PathBuf {
         if let Some(home) = home.filter(|home| !home.is_empty()) {
             return PathBuf::from(home).join(rest);
         }
-    } else if path == "~" {
-        if let Some(home) = home.filter(|home| !home.is_empty()) {
-            return PathBuf::from(home);
-        }
+    } else if path == "~"
+        && let Some(home) = home.filter(|home| !home.is_empty())
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(path)
 }
@@ -1755,7 +1758,7 @@ impl<'a> ConfigParser<'a> {
 /// becomes `\n`; other characters (including backspace) are emitted verbatim, just
 /// as git does. The result always round-trips back through the parser to the
 /// original value.
-fn quote_config_value(value: &str) -> String {
+pub(crate) fn quote_config_value(value: &str) -> String {
     let needs_quotes = value.starts_with(' ')
         || value.ends_with(' ')
         || value.contains('\r')
@@ -2517,6 +2520,7 @@ fn env_bool(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
