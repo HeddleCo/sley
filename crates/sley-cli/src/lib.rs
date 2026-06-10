@@ -17048,16 +17048,24 @@ fn log_parse_date_cutoff(value: &str) -> Result<i64> {
             GitError::Exit(128)
         });
     }
-    let (date, time) = if let Some((date, time)) = first.split_once('T') {
-        (date, time)
+    // The timezone may be embedded directly after the time in the `T`-separated
+    // ISO 8601 form (e.g. `1970-01-01T00:00:01Z` or `...01+0000`), in which case
+    // there is no separate whitespace-delimited timezone token to consume.
+    let (date, time, embedded_tz) = if let Some((date, rest)) = first.split_once('T') {
+        let (time, tz) = log_split_embedded_timezone(rest);
+        (date, time, tz)
     } else {
         let Some(time) = parts.next() else {
             return log_invalid_date_format(value);
         };
-        (first, time)
+        (first, time, None)
     };
-    let Some(timezone) = parts.next() else {
-        return log_invalid_date_format(value);
+    let timezone = match embedded_tz {
+        Some(tz) => tz,
+        None => match parts.next() {
+            Some(tz) => tz.to_string(),
+            None => return log_invalid_date_format(value),
+        },
     };
     if parts.next().is_some() {
         return log_invalid_date_format(value);
@@ -17068,11 +17076,31 @@ fn log_parse_date_cutoff(value: &str) -> Result<i64> {
     let Some((hour, minute, second)) = log_parse_time_hms(time) else {
         return log_invalid_date_format(value);
     };
-    let Some(timezone_offset) = log_parse_timezone_offset_seconds(timezone) else {
+    let Some(timezone_offset) = log_parse_timezone_offset_seconds(&timezone) else {
         return log_invalid_date_format(value);
     };
     let days = log_days_from_civil(year, month, day);
     Ok(days * 86_400 + i64::from(hour * 3_600 + minute * 60 + second) - timezone_offset)
+}
+
+/// Split an ISO 8601 time portion (the part after `T`) into the bare time and an
+/// optional embedded timezone. Recognises a trailing `Z` (UTC, normalised to
+/// `+0000`) and a trailing `±HHMM` offset; otherwise the whole string is the time
+/// and the timezone (if any) is supplied separately.
+fn log_split_embedded_timezone(rest: &str) -> (&str, Option<String>) {
+    if let Some(time) = rest.strip_suffix('Z') {
+        return (time, Some("+0000".to_string()));
+    }
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 5 {
+        let tz_start = bytes.len() - 5;
+        if matches!(bytes[tz_start], b'+' | b'-')
+            && bytes[tz_start + 1..].iter().all(|byte| byte.is_ascii_digit())
+        {
+            return (&rest[..tz_start], Some(rest[tz_start..].to_string()));
+        }
+    }
+    (rest, None)
 }
 
 fn log_parse_date_ymd(value: &str) -> Option<(i64, u32, u32)> {
@@ -23071,9 +23099,36 @@ fn cmd_rev_parse(args: &[String]) -> Result<()> {
             "--quiet" | "-q" => quiet = true,
             "--abbrev-ref" | "--abbrev-ref=strict" | "--abbrev-ref=loose" => abbrev_ref = true,
             "--symbolic-full-name" => symbolic_full_name = true,
+            "--bisect" => rev_parse_bisect(&git_dir, format, symbolic_full_name)?,
             value if value.starts_with('-') => {
                 if let Some(value) = value.strip_prefix("--short=") {
                     short = Some(parse_abbrev(value)?.max(4));
+                    idx += 1;
+                    continue;
+                }
+                // Date-bound options are rewritten the way `git log` consumes
+                // them: `--since=`/`--after=` lower-bound the date (an upper bound
+                // on age, `--max-age=`), `--before=`/`--until=` do the reverse.
+                // The date is parsed to a Unix timestamp; `--max-age=`/`--min-age=`
+                // are already in that form and pass through verbatim.
+                if let Some(date) = value
+                    .strip_prefix("--since=")
+                    .or_else(|| value.strip_prefix("--after="))
+                {
+                    println!("--max-age={}", log_parse_date_cutoff(date)?);
+                    idx += 1;
+                    continue;
+                }
+                if let Some(date) = value
+                    .strip_prefix("--before=")
+                    .or_else(|| value.strip_prefix("--until="))
+                {
+                    println!("--min-age={}", log_parse_date_cutoff(date)?);
+                    idx += 1;
+                    continue;
+                }
+                if value.starts_with("--max-age=") || value.starts_with("--min-age=") {
+                    println!("{value}");
                     idx += 1;
                     continue;
                 }
@@ -23302,6 +23357,46 @@ fn rev_parse_symbolic_full_name(
     Err(GitError::not_found(format!("revision {rev}")))
 }
 
+/// `git rev-parse --bisect`: emit the `refs/bisect/bad*` refs as positive
+/// arguments and the `refs/bisect/good*` refs negated with a leading `^`,
+/// each group in ref-name order. The prefixes are matched as raw string
+/// prefixes (so `refs/bisect/b` and `refs/bisect/go` are excluded), mirroring
+/// git's `refs_for_each_ref_ext(prefix=...)`. With `--symbolic-full-name` the
+/// full ref name is printed; otherwise the resolved object id.
+fn rev_parse_bisect(git_dir: &Path, format: ObjectFormat, symbolic_full_name: bool) -> Result<()> {
+    let store = FileRefStore::new(git_dir, format);
+    let refs = store.list_refs()?;
+    let emit = |reference: &Ref, negate: bool| -> Result<()> {
+        let rendered = if symbolic_full_name {
+            reference.name.clone()
+        } else {
+            match resolve_ref_peeled(&store, &reference.name)? {
+                Some(oid) => oid.to_hex(),
+                None => return Ok(()),
+            }
+        };
+        if negate {
+            println!("^{rendered}");
+        } else {
+            println!("{rendered}");
+        }
+        Ok(())
+    };
+    // `list_refs` already returns refs in name order, so a single forward pass
+    // per prefix preserves git's sorted output.
+    for reference in &refs {
+        if reference.name.starts_with("refs/bisect/bad") {
+            emit(reference, false)?;
+        }
+    }
+    for reference in &refs {
+        if reference.name.starts_with("refs/bisect/good") {
+            emit(reference, true)?;
+        }
+    }
+    Ok(())
+}
+
 fn worktree_prefix(cwd: &Path, git_dir: &Path) -> Result<String> {
     let root = fs::canonicalize(worktree_root_for_git_dir(git_dir)?)?;
     let cwd = fs::canonicalize(cwd)?;
@@ -23357,8 +23452,12 @@ fn display_git_common_dir(
 ) -> Result<String> {
     match path_format {
         RevParsePathFormat::Default => display_git_common_dir_default(cwd, git_dir),
-        RevParsePathFormat::Absolute => Ok(fs::canonicalize(git_dir)?.display().to_string()),
-        RevParsePathFormat::Relative => relative_path_from(cwd, git_dir),
+        RevParsePathFormat::Absolute => {
+            Ok(common_git_dir_for_git_dir(git_dir)?.display().to_string())
+        }
+        RevParsePathFormat::Relative => {
+            relative_path_from_absolute(cwd, &common_git_dir_for_git_dir(git_dir)?)
+        }
     }
 }
 
@@ -27180,14 +27279,104 @@ fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
 
 fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
-    let config = common_git_dir.join("config");
-    let Ok(config) = GitConfig::read(config) else {
+    let config_path = common_git_dir.join("config");
+    let Ok(bytes) = fs::read(&config_path) else {
         return Ok(RefStorageFormat::Files.name());
     };
+    let Ok(config) = GitConfig::parse(&bytes) else {
+        return Ok(RefStorageFormat::Files.name());
+    };
+    // Git validates `extensions.refstorage` as the config is read and aborts on
+    // the first occurrence whose value is neither "files" nor "reftable" (the
+    // check fires per-occurrence in file order, not just on the last-one-wins
+    // value). Mirror that: report the bad value plus the physical config line.
+    for value in config.get_all("extensions", None, "refStorage") {
+        let Some(value) = value else { continue };
+        // Git compares the backend name with `strcmp` (case-sensitive): only the
+        // exact lowercase `files`/`reftable` are valid; anything else is rejected.
+        if value == "files" || value == "reftable" {
+            continue;
+        }
+        eprintln!("error: invalid value for 'extensions.refstorage': '{value}'");
+        let line = refstorage_invalid_value_line(&bytes).unwrap_or(0);
+        eprintln!(
+            "fatal: bad config line {line} in file {}",
+            ref_storage_config_display_path(git_dir, &common_git_dir)
+        );
+        return Err(GitError::Exit(128));
+    }
     Ok(match config.get("extensions", None, "refStorage") {
-        Some(value) if value.eq_ignore_ascii_case("reftable") => RefStorageFormat::Reftable.name(),
+        // Validation above guarantees any surviving value is exactly `files` or
+        // `reftable`; only the latter selects the reftable backend.
+        Some("reftable") => RefStorageFormat::Reftable.name(),
         _ => RefStorageFormat::Files.name(),
     })
+}
+
+/// Render the common config path the way git names it in a `bad config line`
+/// diagnostic: the relative `.git/config` form when the repository was found by
+/// discovery (git operates from the worktree top, so the gitdir is `.git`), or
+/// the absolute path when `GIT_DIR` was set explicitly.
+fn ref_storage_config_display_path(git_dir: &Path, common_git_dir: &Path) -> String {
+    if explicit_git_dir().is_some() {
+        return common_git_dir.join("config").display().to_string();
+    }
+    // Discovery anchors at the worktree toplevel. When the common dir is the
+    // toplevel's `.git`, git prints the relative `.git/config`.
+    if let Ok(worktree_root) = worktree_root_for_git_dir(git_dir)
+        && let Ok(worktree_root) = fs::canonicalize(&worktree_root)
+        && common_git_dir == worktree_root.join(".git")
+    {
+        return Path::new(".git").join("config").display().to_string();
+    }
+    common_git_dir.join("config").display().to_string()
+}
+
+/// Physical 1-based line number of the first `[extensions] refstorage = <value>`
+/// assignment whose value is neither `files` nor `reftable`, matching the line
+/// git reports in its `fatal: bad config line N` diagnostic. Tracks the active
+/// section like git's parser; returns `None` if no such line is found.
+fn refstorage_invalid_value_line(bytes: &[u8]) -> Option<usize> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut in_extensions = false;
+    for (idx, raw_line) in text.lines().enumerate() {
+        let line = raw_line.trim();
+        if let Some(header) = line.strip_prefix('[') {
+            // A section header opens a new scope. `[extensions]`, the quoted form
+            // `[extensions "x"]`, and the dotted form `[extensions.x]` all begin
+            // the extensions section (subsection is irrelevant for refstorage).
+            let name = header
+                .trim_end_matches(']')
+                .split([' ', '\t', '.'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            in_extensions = name.eq_ignore_ascii_case("extensions");
+            continue;
+        }
+        if !in_extensions {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case("refstorage") {
+            continue;
+        }
+        // Strip an inline comment, then surrounding whitespace, to recover the
+        // assigned value (git-written configs never quote these tokens).
+        let value = value
+            .split(['#', ';'])
+            .next()
+            .unwrap_or("")
+            .trim()
+            .trim_matches('"');
+        // Backend names are compared case-sensitively (git uses `strcmp`).
+        if value != "files" && value != "reftable" {
+            return Some(idx + 1);
+        }
+    }
+    None
 }
 
 fn repository_abbrev(git_dir: &Path, format: ObjectFormat) -> Result<Option<usize>> {
