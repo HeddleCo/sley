@@ -521,10 +521,10 @@ fn write_tree_level(
     };
 
     for (path, entry) in entries {
-        if !prefix.is_empty() {
-            if !path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/') {
-                continue;
-            }
+        if !prefix.is_empty()
+            && (!path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/'))
+        {
+            continue;
         }
         let rel = &path[prefix_len..];
         if let Some(slash) = rel.iter().position(|b| *b == b'/') {
@@ -555,7 +555,7 @@ fn write_tree_level(
     // Git tree entries are sorted by name, with a subtree collating as though its
     // name ended in `/` (so `foo` < `foo/` < `foo0`). `Tree::write` emits entries
     // verbatim, so we must impose that ordering here.
-    tree_entries.sort_by(|a, b| tree_sort_key(a).cmp(&tree_sort_key(b)));
+    tree_entries.sort_by_key(tree_sort_key);
 
     let tree = Tree {
         entries: tree_entries,
@@ -644,11 +644,9 @@ impl<'a> StreamParser<'a> {
     /// line bytes (without trailing newline) or `None` at end of stream.
     fn next_command_line(&mut self) -> Option<&'a [u8]> {
         loop {
-            let save = self.pos;
             match self.raw_line() {
-                Some(line) if line.is_empty() => continue,
+                Some([]) => continue,
                 Some(line) => {
-                    let _ = save;
                     return Some(line);
                 }
                 None => return None,
@@ -802,4 +800,71 @@ fn parse_path(bytes: &[u8]) -> Result<Vec<u8>> {
         return Err(GitError::Command("fast-import: empty path".into()));
     }
     Ok(bytes.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_filemode_normalizes_short_forms() {
+        assert_eq!(parse_filemode("644").expect("644"), 0o100644);
+        assert_eq!(parse_filemode("755").expect("755"), 0o100755);
+        assert_eq!(parse_filemode("100644").expect("100644"), 0o100644);
+        assert_eq!(parse_filemode("120000").expect("120000"), 0o120000);
+        assert_eq!(parse_filemode("160000").expect("160000"), 0o160000);
+        assert_eq!(parse_filemode("040000").expect("040000"), 0o040000);
+        assert!(parse_filemode("600").is_err());
+        assert!(parse_filemode("zz").is_err());
+    }
+
+    #[test]
+    fn read_delimited_data_drops_terminator_and_keeps_trailing_newline() {
+        // `data <<EOF` heredoc: every payload line, including the last, is
+        // newline-terminated; the EOF marker line is consumed but not stored.
+        let input = b"data <<EOF\ncommit 1\nEOF\nM 644 inline 1.t\n";
+        let mut p = StreamParser::new(input);
+        let header = p.next_command_line().expect("header");
+        let body = p.read_data(header).expect("data");
+        assert_eq!(body, b"commit 1\n");
+        // The cursor is positioned at the line after the terminator.
+        assert_eq!(p.next_command_line().expect("next"), b"M 644 inline 1.t");
+    }
+
+    #[test]
+    fn read_counted_data_reads_exact_bytes_and_optional_lf() {
+        let input = b"data 5\nhelloM 644 inline x\n";
+        let mut p = StreamParser::new(input);
+        let header = p.next_command_line().expect("header");
+        let body = p.read_data(header).expect("data");
+        assert_eq!(body, b"hello");
+        // No newline immediately followed "hello", so the next token starts at M.
+        assert_eq!(p.next_command_line().expect("next"), b"M 644 inline x");
+    }
+
+    #[test]
+    fn next_command_line_skips_blank_separators() {
+        let input = b"\n\ncommit HEAD\n\nfrom HEAD^0\n";
+        let mut p = StreamParser::new(input);
+        assert_eq!(p.next_command_line().expect("commit"), b"commit HEAD");
+        assert_eq!(p.next_command_line().expect("from"), b"from HEAD^0");
+        assert!(p.next_command_line().is_none());
+    }
+
+    #[test]
+    fn split_field_partitions_on_first_space() {
+        let (head, rest) = split_field(b"644 inline 1.t");
+        assert_eq!(head, b"644");
+        assert_eq!(rest, b"inline 1.t");
+        let (head, rest) = split_field(b"inline 1.t");
+        assert_eq!(head, b"inline");
+        assert_eq!(rest, b"1.t");
+    }
+
+    #[test]
+    fn parse_path_rejects_quoted_and_empty() {
+        assert_eq!(parse_path(b"  1.t  ").expect("path"), b"1.t");
+        assert!(parse_path(b"\"quoted\"").is_err());
+        assert!(parse_path(b"   ").is_err());
+    }
 }
