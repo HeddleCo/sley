@@ -820,8 +820,22 @@ fn config_colorbool_enabled(setting: ConfigColorBoolSetting, stdout_is_tty: Opti
     match setting {
         ConfigColorBoolSetting::Never => false,
         ConfigColorBoolSetting::Always => true,
-        ConfigColorBoolSetting::Auto => stdout_is_tty.unwrap_or_else(|| io::stdout().is_terminal()),
+        // Mirror git's `check_auto_color`: auto requires stdout to be a tty *and*
+        // a usable terminal (TERM is set and not "dumb"). The `--get-colorbool`
+        // second argument supplies the tty hint; otherwise probe the real stdout.
+        ConfigColorBoolSetting::Auto => {
+            let is_tty = stdout_is_tty.unwrap_or_else(|| io::stdout().is_terminal());
+            is_tty && config_auto_color_term_ok()
+        }
     }
+}
+
+/// Match git's `check_auto_color` terminal gate: color is permitted when `TERM`
+/// is present in the environment and is not exactly `"dumb"`. An empty `TERM`
+/// counts as present (git uses `term && strcmp(term, "dumb")`), while an unset
+/// `TERM` disables color.
+fn config_auto_color_term_ok() -> bool {
+    env::var_os("TERM").is_some_and(|term| term != "dumb")
 }
 
 fn format_config_color_value(value: &str) -> Result<String> {
