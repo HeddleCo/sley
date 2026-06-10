@@ -58,15 +58,21 @@ pub struct RawConfigEditor {
     /// header synthesis when the key/section is absent.
     section: String,
     subsection: Option<String>,
-    /// The variable name (suffix after the last dot), lower-cased.
+    /// The variable name (suffix after the last dot), lower-cased for matching.
     name: String,
+    /// The variable name as typed on the command line, written verbatim into a
+    /// newly-synthesised line (git's `write_pair` preserves the caller's case,
+    /// e.g. `git config Section.Movie x` writes `Movie`, not `movie`).
+    name_as_typed: String,
     subsection_case_sensitive: bool,
 }
 
 impl RawConfigEditor {
     /// Parse `contents` into byte-offset events for the variable `key`
     /// (`section[.subsection].name`). Section/name comparisons are
-    /// case-insensitive; quoted subsections are case-sensitive.
+    /// case-insensitive; quoted subsections are case-sensitive. The `section`
+    /// and `name` are written verbatim (preserving the caller's case) when a new
+    /// header/line must be synthesised.
     pub fn new(
         contents: Vec<u8>,
         section: &str,
@@ -79,6 +85,7 @@ impl RawConfigEditor {
             section: section.to_string(),
             subsection: subsection.map(str::to_string),
             name: name.to_ascii_lowercase(),
+            name_as_typed: name.to_string(),
             subsection_case_sensitive: subsection.is_some(),
         };
         editor.parse_events();
@@ -396,7 +403,7 @@ impl RawConfigEditor {
             if !section_seen {
                 write_section(&mut out, &self.section, self.subsection.as_deref());
             }
-            write_pair(&mut out, &self.name, value, comment);
+            write_pair(&mut out, &self.name_as_typed, value, comment);
         }
 
         if copy_begin < contents_sz {

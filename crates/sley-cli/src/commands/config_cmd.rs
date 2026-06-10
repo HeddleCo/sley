@@ -1325,7 +1325,10 @@ fn config_raw_edit(
     multi_replace: bool,
 ) -> Result<bool> {
     let Some(path) = config_write_path(source) else {
-        eprintln!("fatal: writing config blobs is not supported");
+        match source {
+            ConfigSource::Stdin => eprintln!("fatal: writing to stdin is not supported"),
+            _ => eprintln!("fatal: writing config blobs is not supported"),
+        }
         return Err(GitError::Exit(128));
     };
     let contents = match fs::read(&path) {
