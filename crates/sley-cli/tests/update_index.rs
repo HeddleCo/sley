@@ -816,6 +816,73 @@ fn update_index_refresh_matches_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// `--refresh` is order-sensitive with respect to `-q`: upstream git parses
+/// `--refresh` as a callback that fires the moment it is seen, so a `-q` that
+/// comes *after* `--refresh` does not suppress the "needs update" report or the
+/// non-zero exit. Only a `-q` placed *before* `--refresh` quiets it. This test
+/// pins both orderings against the oracle (regression for the `--refresh -q`
+/// case that previously returned rc=0 in sley while git returned rc=1).
+#[test]
+fn update_index_refresh_quiet_ordering_matches_upstream_git() {
+    let root = unique_temp_dir("update-index-refresh-quiet-ordering");
+    let expected = root.join("expected");
+    let actual = root.join("actual");
+    fs::create_dir_all(&expected).expect("create expected repo dir");
+    fs::create_dir_all(&actual).expect("create actual repo dir");
+    {
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
+
+        // The user's exact repro shape: ten files committed once, then for each
+        // case one file modified to differ from the committed content.
+        for repo in [&expected, &actual] {
+            for i in 0..10 {
+                fs::write(repo.join(format!("f{i}.txt")), format!("v{i}\n"))
+                    .expect("write fixture file");
+            }
+            run_success(sley_testkit::oracle_git(), repo, &["add", "-A"]);
+            run_success(
+                sley_testkit::oracle_git(),
+                repo,
+                &[
+                    "-c",
+                    "user.name=B",
+                    "-c",
+                    "user.email=b@x.invalid",
+                    "commit",
+                    "-q",
+                    "-m",
+                    "init",
+                ],
+            );
+        }
+
+        for args in [
+            // `-q` AFTER `--refresh`: not quieted -> rc=1 + message.
+            vec!["update-index", "--refresh", "-q"],
+            // `-q` BEFORE `--refresh`: quieted -> rc=0, no message.
+            vec!["update-index", "-q", "--refresh"],
+            // baseline, no `-q`: rc=1 + message.
+            vec!["update-index", "--refresh"],
+            // same ordering rules for `--really-refresh`.
+            vec!["update-index", "--really-refresh", "-q"],
+            vec!["update-index", "-q", "--really-refresh"],
+        ] {
+            for repo in [&expected, &actual] {
+                // Restore the committed content, then modify f3 to differ so the
+                // refresh sees exactly one needs-update entry.
+                run_success(sley_testkit::oracle_git(), repo, &["checkout", "-q", "--", "."]);
+                fs::write(repo.join("f3.txt"), b"MODIFIED LONGER CONTENT\n")
+                    .expect("modify f3");
+            }
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+            let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+            assert_same_output(actual_output, expected_output, &args);
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
 #[test]
 fn update_index_refresh_ignore_missing_matches_upstream_git() {
     let root = unique_temp_dir("update-index-refresh-ignore-missing");

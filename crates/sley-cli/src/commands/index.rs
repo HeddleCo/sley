@@ -1091,6 +1091,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut refresh = false;
     let mut really_refresh = false;
     let mut refresh_ignore_missing = false;
+    // Upstream git parses `--refresh`/`--really-refresh` as a callback that
+    // fires the moment the flag is seen, so only a `-q` placed *before* the
+    // refresh flag sets REFRESH_QUIET; a `-q` that comes after does not quiet
+    // the refresh. Snapshot the quiet state at the point the refresh flag is
+    // parsed to mirror that order-sensitivity.
+    let mut refresh_quiet = false;
     let mut quiet = false;
     let mut ignore_missing = false;
     let mut assume_unchanged = None;
@@ -1157,12 +1163,14 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                 refresh = true;
                 really_refresh = false;
                 refresh_ignore_missing = ignore_missing;
+                refresh_quiet = quiet;
                 allow_no_input = true;
             }
             "--really-refresh" => {
                 refresh = true;
                 really_refresh = true;
                 refresh_ignore_missing = ignore_missing;
+                refresh_quiet = quiet;
                 allow_no_input = true;
             }
             "--ignore-missing" => {
@@ -1382,7 +1390,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             git_dir.clone(),
             format,
             &resolved_paths,
-            quiet,
+            refresh_quiet,
             refresh_ignore_missing,
             really_refresh,
         )?;
