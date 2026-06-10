@@ -11,6 +11,24 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("sley-{name}-{}-{nanos}", std::process::id()))
 }
 
+/// Fixed author/committer identity + dates for any commit-creating oracle run.
+///
+/// Without this, `git commit` stamps the current wall-clock time as the
+/// author/committer date. The two-repo parity tests below create the same
+/// commit independently in an `expected` and an `actual` repo; if those two
+/// `git commit` calls straddle a one-second boundary the commits get different
+/// timestamps and therefore different SHAs, so the cross-repo `rev-parse`
+/// comparisons flake (~1 in 5 on a clean base). Pinning every input — name,
+/// email, and both dates — makes both repos mint byte-identical commits.
+const COMMIT_ENV: [(&str, &str); 6] = [
+    ("GIT_AUTHOR_NAME", "Example User"),
+    ("GIT_AUTHOR_EMAIL", "example@example.invalid"),
+    ("GIT_AUTHOR_DATE", "@0 +0000"),
+    ("GIT_COMMITTER_NAME", "Example User"),
+    ("GIT_COMMITTER_EMAIL", "example@example.invalid"),
+    ("GIT_COMMITTER_DATE", "@0 +0000"),
+];
+
 fn run(program: &str, cwd: &Path, args: &[&str]) -> Output {
     Command::new(program)
         .current_dir(cwd)
@@ -21,6 +39,25 @@ fn run(program: &str, cwd: &Path, args: &[&str]) -> Output {
 
 fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
     let output = run(program, cwd, args);
+    assert!(
+        output.status.success(),
+        "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
+}
+
+/// Like [`run_success`], but pins the commit identity/date environment via
+/// [`COMMIT_ENV`] so commit-creating runs produce deterministic SHAs.
+fn run_success_pinned(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
+    let output = Command::new(program)
+        .current_dir(cwd)
+        .args(args)
+        .envs(COMMIT_ENV.iter().copied())
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
     assert!(
         output.status.success(),
         "{program} {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -234,12 +271,16 @@ fn symbolic_ref_onelevel_names_match_upstream_git() {
     {
         run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
         run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
-        run_success(
+        run_success_pinned(
             sley_testkit::oracle_git(),
             &expected,
             &["commit", "--allow-empty", "-qm", "seed"],
         );
-        run_success(sley_testkit::oracle_git(), &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+        run_success_pinned(
+            sley_testkit::oracle_git(),
+            &actual,
+            &["commit", "--allow-empty", "-qm", "seed"],
+        );
 
         for args in [
             vec!["symbolic-ref", "NOTHEAD", "refs/heads/foo"],
@@ -262,7 +303,11 @@ fn symbolic_ref_short_edge_cases_match_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
-        run_success(sley_testkit::oracle_git(), &root, &["commit", "--allow-empty", "-qm", "seed"]);
+        run_success_pinned(
+            sley_testkit::oracle_git(),
+            &root,
+            &["commit", "--allow-empty", "-qm", "seed"],
+        );
 
         for (set_args, read_args) in [
             (
@@ -306,9 +351,17 @@ fn symbolic_ref_df_conflict_matches_upstream_git() {
         run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
         run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "seed"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "seed"],
+            );
             run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "df"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "df"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "df"],
+            );
         }
 
         let args = ["symbolic-ref", "refs/heads/df/conflict", "refs/heads/df"];
@@ -326,12 +379,16 @@ fn assert_symbolic_ref_matches_git(root: &Path, setup: impl Fn(&Path, &str)) {
     fs::create_dir_all(&actual).expect("create actual repo dir");
     run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
     run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
-    run_success(
+    run_success_pinned(
         sley_testkit::oracle_git(),
         &expected,
         &["commit", "--allow-empty", "-qm", "seed"],
     );
-    run_success(sley_testkit::oracle_git(), &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+    run_success_pinned(
+        sley_testkit::oracle_git(),
+        &actual,
+        &["commit", "--allow-empty", "-qm", "seed"],
+    );
     let head = run_success(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]);
     let oid = String::from_utf8_lossy(&head).trim().to_string();
     setup(&expected, &oid);
@@ -376,11 +433,23 @@ fn symbolic_ref_head_reflog_matches_upstream_git() {
         for repo in [&expected, &actual] {
             run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
             run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "file"],
+            );
             run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "log1"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "one"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "one"],
+            );
             run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "log2"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "two"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "two"],
+            );
             run_success(sley_testkit::oracle_git(), repo, &["checkout", "--orphan", "orphan"]);
         }
         let args = ["symbolic-ref", "-m", "create", "HEAD", "refs/heads/log1"];
@@ -409,7 +478,11 @@ fn symbolic_ref_top_level_target_matches_upstream_git() {
         for repo in [&expected, &actual] {
             run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
             run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "file"],
+            );
         }
         for args in [
             vec!["symbolic-ref", "refs/heads/top-level", "ORIG_HEAD"],
@@ -436,7 +509,11 @@ fn symbolic_ref_checkout_chain_matches_upstream_git() {
         for repo in [&expected, &actual] {
             run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
             run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success_pinned(
+                sley_testkit::oracle_git(),
+                repo,
+                &["commit", "--allow-empty", "-qm", "file"],
+            );
             run_success(
                 sley_testkit::oracle_git(),
                 repo,
