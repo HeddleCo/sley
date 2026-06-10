@@ -279,6 +279,7 @@ impl CatFileOptions {
                 // Upstream defaults `--buffer` to on when `--batch-all-objects` is in effect,
                 // off otherwise; an explicit `--[no-]buffer` overrides.
                 buffer: self.buffer.unwrap_or(batch_all_objects),
+                follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
             }));
         }
@@ -412,6 +413,10 @@ impl RepositoryObjectView {
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         self.repo.resolve_path(rev, path)
+    }
+
+    fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
+        self.repo.resolve_path_follow_symlinks(rev, path)
     }
 
     fn all_object_ids(&self) -> Result<Vec<ObjectId>> {
@@ -585,6 +590,7 @@ struct CatFileBatchRequest {
     output_nul: bool,
     batch_all_objects: bool,
     buffer: bool,
+    follow_symlinks: bool,
     filter: CatFileObjectsFilter,
 }
 
@@ -723,6 +729,7 @@ impl CatFileBatchRequest {
                     check_only,
                     terminator,
                     apply_replace,
+                    follow_symlinks: self.follow_symlinks,
                     filter: self.filter,
                     all_objects: self.batch_all_objects,
                 },
@@ -847,6 +854,7 @@ impl CatFileBatchRequest {
                 check_only,
                 terminator,
                 apply_replace,
+                follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
                 all_objects: false,
             },
@@ -975,6 +983,9 @@ struct CatFileBatchRecord<'a> {
     check_only: bool,
     terminator: u8,
     apply_replace: bool,
+    /// `--follow-symlinks`: resolve in-tree symlinks in `<rev>:<path>` specs
+    /// (upstream `GET_OID_FOLLOW_SYMLINKS`).
+    follow_symlinks: bool,
     filter: CatFileObjectsFilter,
     /// True when the record comes from `--batch-all-objects`; upstream silently skips
     /// filter-excluded objects in that mode instead of emitting `<name> excluded`.
@@ -989,8 +1000,61 @@ fn print_cat_file_batch_record(
         view: record.view,
         name: record.object_name,
     };
-    let Ok(oid) = record.view.resolve_object_name(record.object_name) else {
-        return report_object_missing(stdout, &record, &query);
+    // `--follow-symlinks` only alters `<rev>:<path>` resolution (upstream's
+    // `GET_OID_FOLLOW_SYMLINKS` is consulted solely in the `<rev>:<path>`
+    // branch of `get_oid_with_context`); every other spelling resolves as
+    // usual.
+    let resolved_through_symlinks = if record.follow_symlinks
+        && let Some((rev, path)) = sley_rev::split_rev_path_spec(record.object_name)
+    {
+        match record.view.resolve_path_follow_symlinks(rev, path) {
+            sley_rev::SymlinkedTreePath::Found(oid) => Some(oid),
+            sley_rev::SymlinkedTreePath::OutOfRepo(link_path) => {
+                return print_cat_file_symlink_status(stdout, &record, "symlink", &link_path);
+            }
+            sley_rev::SymlinkedTreePath::Missing => {
+                // Upstream's `MISSING_OBJECT` branch in `batch_one_object`
+                // reports the input name directly, with no gitlink/submodule
+                // dispatch (a gitlink reached through the symlink walk reports
+                // `missing`, not `submodule`).
+                write!(stdout, "{} missing", record.object_name)?;
+                stdout.write_all(&[record.terminator])?;
+                return Ok(());
+            }
+            sley_rev::SymlinkedTreePath::Dangling => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "dangling",
+                    record.object_name.as_bytes(),
+                );
+            }
+            sley_rev::SymlinkedTreePath::Loop => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "loop",
+                    record.object_name.as_bytes(),
+                );
+            }
+            sley_rev::SymlinkedTreePath::NotDir => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "notdir",
+                    record.object_name.as_bytes(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let oid = match resolved_through_symlinks {
+        Some(oid) => oid,
+        None => match record.view.resolve_object_name(record.object_name) {
+            Ok(oid) => oid,
+            Err(_) => return report_object_missing(stdout, &record, &query),
+        },
     };
     let read_oid = if record.apply_replace {
         record.view.replacement_oid(&oid)?
@@ -1124,6 +1188,26 @@ fn report_object_missing(
         write!(stdout, "{} missing", record.object_name)?;
     }
     stdout.write_all(&[record.terminator])?;
+    Ok(())
+}
+
+/// Emit one of the `--follow-symlinks` notification records (`symlink`/`dangling`/`loop`/
+/// `notdir`): the status word plus the payload's byte length, then the payload itself, each
+/// terminated by the output delimiter — the special-result `printf`s of upstream's
+/// `batch_one_object`. The payload is the original query for `dangling`/`loop`/`notdir` and
+/// the unresolvable link remainder for `symlink`. Upstream flushes after each of these
+/// regardless of `--buffer`; mirror that.
+fn print_cat_file_symlink_status(
+    stdout: &mut io::Stdout,
+    record: &CatFileBatchRecord<'_>,
+    status: &str,
+    payload: &[u8],
+) -> Result<()> {
+    write!(stdout, "{status} {}", payload.len())?;
+    stdout.write_all(&[record.terminator])?;
+    stdout.write_all(payload)?;
+    stdout.write_all(&[record.terminator])?;
+    stdout.flush()?;
     Ok(())
 }
 

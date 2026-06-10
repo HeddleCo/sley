@@ -123,6 +123,18 @@ impl RepositoryContext {
         self.revision_resolver().resolve_path(rev, path)
     }
 
+    /// `<rev>:<path>` resolution that follows in-tree symlinks (the
+    /// `cat-file --follow-symlinks` walk).
+    pub(crate) fn resolve_path_follow_symlinks(
+        &self,
+        rev: &str,
+        path: &str,
+    ) -> sley_rev::SymlinkedTreePath {
+        warn_ambiguous_refname_for_object_prefix(&self.git_dir, self.format, rev);
+        self.revision_resolver()
+            .resolve_path_follow_symlinks(rev, path)
+    }
+
     pub(crate) fn revision_resolver(&self) -> sley_rev::RevisionResolver<'_, FileObjectDatabase> {
         sley_rev::RevisionResolver::new(&self.git_dir, self.format, &self.objects)
     }
