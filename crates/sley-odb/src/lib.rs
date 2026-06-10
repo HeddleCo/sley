@@ -1637,7 +1637,10 @@ impl FileObjectDatabase {
                 return Ok(true);
             }
         }
-        Ok(false)
+        // Reprepare-on-miss: the loose set may predate a sibling write (see
+        // `read_object`). Rescan once before reporting absence.
+        self.loose.invalidate_cache();
+        self.loose.exists(oid)
     }
 
     pub fn object_ids(&self) -> Result<Vec<ObjectId>> {
@@ -1668,6 +1671,15 @@ impl FileObjectDatabase {
             {
                 return Ok(Some(info));
             }
+        }
+        // Reprepare-on-miss: rescan the loose set once before reporting absence
+        // (see `read_object`).
+        self.loose.invalidate_cache();
+        if let Some(disk_size) = self.loose.disk_size(oid)? {
+            return Ok(Some(ObjectStorageInfo {
+                disk_size,
+                deltabase: zero_oid(self.format)?,
+            }));
         }
         Ok(None)
     }
@@ -1742,6 +1754,12 @@ impl FileObjectDatabase {
             {
                 return Ok(Some(header));
             }
+        }
+        // Reprepare-on-miss: rescan the loose set once before reporting absence
+        // (see `read_object`).
+        self.loose.invalidate_cache();
+        if let Some(header) = self.loose.read_header(oid)? {
+            return Ok(Some(header));
         }
         Ok(None)
     }
@@ -2180,6 +2198,20 @@ impl ObjectReader for FileObjectDatabase {
                 Err(GitError::NotFound(_)) => {}
                 Err(err) => return Err(err),
             }
+        }
+        // Hard miss against every store. The loose set is consulted before the
+        // filesystem, so an object written loose *after* this handle's set was
+        // scanned — e.g. by a sibling handle or sub-operation within the same
+        // process — would be falsely reported absent. Mirror git's
+        // `oid_object_info_extended` reprepare-on-miss: drop the loose set, rescan,
+        // and retry the loose read once before declaring the object missing. The
+        // rescan only happens on a genuine miss, so the steady-state hot path
+        // (objects found in pack) never pays for it.
+        self.loose.invalidate_cache();
+        match self.loose.read_object(oid) {
+            Ok(object) => return Ok(object),
+            Err(GitError::NotFound(_)) => {}
+            Err(err) => return Err(err),
         }
         Err(GitError::object_not_found(*oid))
     }
