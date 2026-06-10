@@ -42,7 +42,24 @@ pub(crate) enum ConfigSubcommand {
 pub(crate) enum ConfigSource {
     Repository(PathBuf),
     File(PathBuf),
+    /// `--global`: the single global config file git chose (the user file, or
+    /// the XDG file when only it exists). Reads and writes both target this
+    /// one file, exactly like git's `given_config_source.file`.
+    Global(PathBuf),
+    /// `--system`: `$GIT_CONFIG_SYSTEM` or `/etc/gitconfig`.
+    System(PathBuf),
     Stdin,
+}
+
+/// Which config file family an explicit scope option selected. Git rejects
+/// combining two of these (or a scope with `--file`) with "only one config
+/// file at a time".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ConfigScope {
+    #[default]
+    Default,
+    Global,
+    System,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -193,10 +210,13 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut subcommand_get_regexp = false;
     let mut subcommand_show_names = false;
     let mut subcommand_value_pattern: Option<String> = None;
+    let mut scope = ConfigScope::Default;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--local" => {}
+            "--global" => scope = ConfigScope::Global,
+            "--system" => scope = ConfigScope::System,
             "-f" | "--file" => {
                 let value = iter
                     .next()
@@ -519,9 +539,13 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let source = match config_file {
         Some(value) if value == "-" => ConfigSource::Stdin,
         Some(value) => ConfigSource::File(PathBuf::from(value)),
-        None => match git_config_env {
-            Some(path) => ConfigSource::File(PathBuf::from(path)),
-            None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
+        None => match scope {
+            ConfigScope::Global => ConfigSource::Global(global_config_file_path()?),
+            ConfigScope::System => ConfigSource::System(system_config_file_path()),
+            ConfigScope::Default => match git_config_env {
+                Some(path) => ConfigSource::File(PathBuf::from(path)),
+                None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
+            },
         },
     };
     let loaded = read_config_source(&source, action)?;
@@ -574,7 +598,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             if let Some(err) = loaded.tail_error {
                 let path = match &source {
                     ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
-                    ConfigSource::File(path) => Some(path.clone()),
+                    ConfigSource::File(path)
+                    | ConfigSource::Global(path)
+                    | ConfigSource::System(path) => Some(path.clone()),
                     ConfigSource::Stdin => None,
                 };
                 return Err(report_config_parse_error(err, path.as_deref()));
@@ -813,6 +839,42 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The single file `git config --global` reads and writes: `$GIT_CONFIG_GLOBAL`
+/// when set; otherwise `~/.gitconfig`, unless it is missing and the XDG file
+/// (`$XDG_CONFIG_HOME/git/config`, default `~/.config/git/config`) exists, in
+/// which case the XDG file is chosen (builtin/config.c).
+fn global_config_file_path() -> Result<PathBuf> {
+    if let Ok(path) = env::var("GIT_CONFIG_GLOBAL") {
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
+        }
+    }
+    let Ok(home) = env::var("HOME") else {
+        eprintln!("fatal: $HOME not set");
+        return Err(GitError::Exit(128));
+    };
+    let user = PathBuf::from(&home).join(".gitconfig");
+    let xdg = match env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("git").join("config"),
+        _ => PathBuf::from(&home).join(".config").join("git").join("config"),
+    };
+    if !user.exists() && xdg.exists() {
+        Ok(xdg)
+    } else {
+        Ok(user)
+    }
+}
+
+/// The file `git config --system` reads and writes: `$GIT_CONFIG_SYSTEM` when
+/// set, otherwise `/etc/gitconfig`. (Unlike implicit reads, the explicit
+/// `--system` option ignores `GIT_CONFIG_NOSYSTEM`.)
+fn system_config_file_path() -> PathBuf {
+    match env::var("GIT_CONFIG_SYSTEM") {
+        Ok(path) if !path.is_empty() => PathBuf::from(path),
+        _ => PathBuf::from("/etc/gitconfig"),
+    }
+}
+
 struct LoadedConfig {
     config: GitConfig,
     tail_error: Option<GitError>,
@@ -830,7 +892,7 @@ fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<Loa
                 Err(err) => Err(report_config_parse_error(err, Some(&path))),
             }
         }
-        ConfigSource::File(path) => match fs::read(path) {
+        ConfigSource::File(path) | ConfigSource::Global(path) | ConfigSource::System(path) => match fs::read(path) {
             Ok(bytes) => load_config_bytes(&bytes, action, Some(path.as_path())),
             Err(err) if err.kind() == io::ErrorKind::NotFound && action != ConfigAction::List => {
                 Ok(LoadedConfig {
@@ -894,7 +956,7 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
 fn write_config_source(source: &ConfigSource, config: &GitConfig) -> Result<()> {
     match source {
         ConfigSource::Repository(git_dir) => write_repo_config(git_dir, config),
-        ConfigSource::File(path) => {
+        ConfigSource::File(path) | ConfigSource::Global(path) | ConfigSource::System(path) => {
             fs::write(path, config.to_canonical_bytes())?;
             Ok(())
         }
@@ -2046,6 +2108,8 @@ fn write_config_metadata_field(
 fn config_source_scope(source: &ConfigSource) -> &'static str {
     match source {
         ConfigSource::Repository(_) => "local",
+        ConfigSource::Global(_) => "global",
+        ConfigSource::System(_) => "system",
         ConfigSource::File(_) | ConfigSource::Stdin => "command",
     }
 }
@@ -2053,7 +2117,9 @@ fn config_source_scope(source: &ConfigSource) -> &'static str {
 fn config_source_origin(source: &ConfigSource) -> String {
     match source {
         ConfigSource::Repository(_) => "file:.git/config".to_string(),
-        ConfigSource::File(path) => format!("file:{}", path.display()),
+        ConfigSource::File(path) | ConfigSource::Global(path) | ConfigSource::System(path) => {
+            format!("file:{}", path.display())
+        }
         ConfigSource::Stdin => "standard input:".to_string(),
     }
 }

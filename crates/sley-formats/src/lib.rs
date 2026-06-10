@@ -1700,6 +1700,14 @@ impl RefStorageFormat {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InitOptions {
     pub worktree: PathBuf,
+    /// Explicit git directory (e.g. from `GIT_DIR` during `git init`). When set,
+    /// the repository's git directory lives here instead of `<worktree>/.git`,
+    /// and *no* `gitdir:` link file is written into the worktree — exactly like
+    /// `GIT_DIR=<dir> git init` (init-db.c leaves the worktree untouched).
+    pub git_dir_override: Option<PathBuf>,
+    /// Value to record as `core.worktree` in the new repository's config
+    /// (init-db.c writes it when the git directory is not `<worktree>/.git`).
+    pub core_worktree: Option<String>,
     pub object_format: ObjectFormat,
     /// Whether `object_format` came from an explicit `--object-format` flag (as
     /// opposed to an env/config default). On reinit, an explicit format that differs
@@ -1758,7 +1766,9 @@ impl RepositoryBootstrap {
             dot_git.clone()
         };
         let mut write_git_link = false;
-        let git_dir = if options.bare {
+        let git_dir = if let Some(git_dir_override) = options.git_dir_override.clone() {
+            git_dir_override
+        } else if options.bare {
             worktree.clone()
         } else if git_link.is_file() {
             let existing = read_gitdir_file(&git_link)?.ok_or_else(|| {
@@ -1771,6 +1781,10 @@ impl RepositoryBootstrap {
                             create_shared_dir(parent, options.shared_repository.as_deref())?;
                         }
                         fs::rename(&existing, &new_separate)?;
+                        // git's `separate_git_dir()` calls
+                        // `repair_worktrees_after_gitdir_move()` so the linked
+                        // worktrees keep resolving to the relocated git dir.
+                        repair_worktrees_after_gitdir_move(&existing, &new_separate)?;
                     }
                     write_git_link = true;
                     new_separate
@@ -1790,6 +1804,10 @@ impl RepositoryBootstrap {
             // symlink. `is_dir()` follows symlinks, so it is true in both cases.
             if git_link.is_dir() && !separate_git_dir.exists() {
                 fs::rename(&git_link, &separate_git_dir)?;
+                // After moving the common git dir, repoint every linked
+                // worktree's `.git`/`gitdir` link pair (init-db.c →
+                // `separate_git_dir` → `repair_worktrees_after_gitdir_move`).
+                repair_worktrees_after_gitdir_move(&git_link, &separate_git_dir)?;
             }
             separate_git_dir
         } else {
@@ -1870,6 +1888,7 @@ impl RepositoryBootstrap {
                     options.bare,
                     &options.shared_repository,
                     ref_storage,
+                    options.core_worktree.as_deref(),
                 )
                 .to_canonical_bytes(),
             )?;
@@ -1937,6 +1956,8 @@ impl RepositoryLayout {
         initial_branch: &str,
     ) -> Result<Self> {
         RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
             worktree: path.as_ref().to_path_buf(),
             object_format,
             object_format_explicit: false,
@@ -1957,6 +1978,7 @@ fn build_init_config(
     bare: bool,
     shared_repository: &Option<String>,
     ref_storage: RefStorageFormat,
+    core_worktree: Option<&str>,
 ) -> GitConfig {
     let uses_extensions =
         object_format == ObjectFormat::Sha256 || ref_storage == RefStorageFormat::Reftable;
@@ -1968,6 +1990,15 @@ fn build_init_config(
         ConfigEntry::new("filemode", Some("true".into())),
         ConfigEntry::new("bare", Some(if bare { "true" } else { "false" }.into())),
     ];
+    if !bare {
+        // init-db.c `create_default_files`: a non-bare init records
+        // `core.logallrefupdates = true` (unless a template config already
+        // chose a value, which `apply_init_template` honours by overriding).
+        core_entries.push(ConfigEntry::new("logallrefupdates", Some("true".into())));
+        if let Some(worktree) = core_worktree {
+            core_entries.push(ConfigEntry::new("worktree", Some(worktree.into())));
+        }
+    }
     if let Some(shared) = shared_repository
         && let Some(value) = shared_repository_config_value(shared)
     {
@@ -2056,6 +2087,142 @@ fn copy_init_template_entries(
     Ok(())
 }
 
+/// Port of git's `repair_worktrees_after_gitdir_move()` (worktree.c). After the
+/// common git directory is relocated from `old_git_dir` to `new_git_dir`
+/// (`git init --separate-git-dir` on a repository that owns linked worktrees),
+/// every linked worktree's `.git` gitfile and its admin `gitdir` backlink must
+/// be rewritten so the two keep pointing at each other through the new location.
+fn repair_worktrees_after_gitdir_move(old_git_dir: &Path, new_git_dir: &Path) -> Result<()> {
+    let worktrees_dir = new_git_dir.join("worktrees");
+    let entries = match fs::read_dir(&worktrees_dir) {
+        Ok(entries) => entries,
+        // No linked worktrees: nothing to repair (matches git skipping the loop).
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let admin_dir = entry.path();
+        if !admin_dir.is_dir() {
+            continue;
+        }
+        repair_worktree_after_gitdir_move(&admin_dir, old_git_dir)?;
+    }
+    Ok(())
+}
+
+/// Port of git's `repair_worktree_after_gitdir_move()`. `admin_dir` is the
+/// already-relocated `<new_git_dir>/worktrees/<id>` directory; `old_git_dir` is
+/// the pre-move common git dir, used to resolve a *relative* backlink that was
+/// written against the old location.
+fn repair_worktree_after_gitdir_move(admin_dir: &Path, old_git_dir: &Path) -> Result<()> {
+    let gitdir_file = admin_dir.join("gitdir");
+    let Ok(raw) = fs::read_to_string(&gitdir_file) else {
+        return Ok(());
+    };
+    let backlink = raw.trim();
+    if backlink.is_empty() {
+        return Ok(());
+    }
+    let backlink_path = PathBuf::from(backlink);
+    let is_relative = backlink_path.is_relative();
+    // Resolve the worktree's `.git` path. git stores the backlink either
+    // absolute or relative to the worktree's *old* admin dir
+    // (`<old_git_dir>/worktrees/<id>/`).
+    let id = admin_dir.file_name().unwrap_or_default();
+    let dotgit_abs = if is_relative {
+        let old_admin = old_git_dir.join("worktrees").join(id);
+        normalize_lexical(&old_admin.join(&backlink_path))
+    } else {
+        normalize_lexical(&backlink_path)
+    };
+    if !dotgit_abs.exists() {
+        return Ok(());
+    }
+    write_worktree_linking_files(&dotgit_abs, &gitdir_file, is_relative)?;
+    Ok(())
+}
+
+/// Port of git's `write_worktree_linking_files()`. `dotgit` is the worktree's
+/// `.git` gitfile (absolute); `gitdir_file` is the admin `gitdir` backlink. When
+/// `use_relative` both links are written relative to one another, otherwise both
+/// are absolute. The two paths used by git are the worktree root (`dotgit`
+/// minus the trailing `/.git`) and the admin dir (`gitdir_file` minus the
+/// trailing `/gitdir`), each `realpath`-resolved.
+fn write_worktree_linking_files(dotgit: &Path, gitdir_file: &Path, use_relative: bool) -> Result<()> {
+    let worktree_root = dotgit.parent().unwrap_or(Path::new("."));
+    let worktree_root = fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
+    let admin_dir = gitdir_file.parent().unwrap_or(Path::new("."));
+    let admin_dir = fs::canonicalize(admin_dir).unwrap_or_else(|_| admin_dir.to_path_buf());
+    let worktree_dotgit = worktree_root.join(".git");
+    if use_relative {
+        // gitdir backlink: path to the worktree's `.git`, relative to the admin dir.
+        let backlink = relative_path_lexical(&worktree_dotgit, &admin_dir);
+        fs::write(gitdir_file, format!("{backlink}\n"))?;
+        // worktree `.git`: path to the admin dir, relative to the worktree root.
+        let link = relative_path_lexical(&admin_dir, &worktree_root);
+        fs::write(&worktree_dotgit, format!("gitdir: {link}\n"))?;
+    } else {
+        fs::write(
+            gitdir_file,
+            format!("{}\n", worktree_dotgit.display()),
+        )?;
+        fs::write(
+            &worktree_dotgit,
+            format!("gitdir: {}\n", admin_dir.display()),
+        )?;
+    }
+    Ok(())
+}
+
+/// Lexically normalize a path (collapse `.`/`..`, no filesystem access), so a
+/// path built from a relative backlink against a non-existent (already-moved)
+/// old admin dir still resolves. Mirrors the cleanup git's
+/// `strbuf_realpath_forgiving` performs on the components that do exist.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// Compute `target` expressed relative to `base`, both absolute. Mirrors git's
+/// `relative_path()` for the common ancestor case (the only one that arises for
+/// sibling worktree/admin directories under a shared parent).
+fn relative_path_lexical(target: &Path, base: &Path) -> String {
+    let target = normalize_lexical(target);
+    let base = normalize_lexical(base);
+    let target_components: Vec<_> = target.components().collect();
+    let base_components: Vec<_> = base.components().collect();
+    let common = target_components
+        .iter()
+        .zip(base_components.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut result = PathBuf::new();
+    for _ in common..base_components.len() {
+        result.push("..");
+    }
+    for component in &target_components[common..] {
+        result.push(component.as_os_str());
+    }
+    if result.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        result.display().to_string()
+    }
+}
+
 fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
     let contents = fs::read_to_string(path)?;
     let Some(target) = contents.trim().strip_prefix("gitdir:") else {
@@ -2097,14 +2264,18 @@ fn apply_shared_dir_mode(path: &Path, shared_repository: Option<&str>) -> Result
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let Some(mode) = shared_dir_mode(shared_repository) else {
+        let Some(perm) = shared_repository.and_then(parse_shared_repository_perm) else {
             return Ok(());
         };
         let metadata = fs::metadata(path)?;
         if metadata.is_dir() {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(mode);
-            fs::set_permissions(path, permissions)?;
+            let old_mode = metadata.permissions().mode();
+            let new_mode = calc_shared_perm(perm, old_mode, true);
+            if new_mode & 0o7777 != old_mode & 0o7777 {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(new_mode & 0o7777);
+                fs::set_permissions(path, permissions)?;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -2118,14 +2289,18 @@ fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Resul
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let Some(mode) = shared_file_mode(shared_repository) else {
+        let Some(perm) = shared_repository.and_then(parse_shared_repository_perm) else {
             return Ok(());
         };
         let metadata = fs::metadata(path)?;
         if metadata.is_file() {
-            let mut permissions = metadata.permissions();
-            permissions.set_mode(mode);
-            fs::set_permissions(path, permissions)?;
+            let old_mode = metadata.permissions().mode();
+            let new_mode = calc_shared_perm(perm, old_mode, false);
+            if new_mode & 0o7777 != old_mode & 0o7777 {
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(new_mode & 0o7777);
+                fs::set_permissions(path, permissions)?;
+            }
         }
     }
     #[cfg(not(unix))]
@@ -2136,7 +2311,8 @@ fn apply_shared_file_mode(path: &Path, shared_repository: Option<&str>) -> Resul
 }
 
 /// Canonical `core.sharedRepository` value written at init, matching git's
-/// numeric compatibility encoding (`group` → `1`, `all` → `2`, etc.).
+/// numeric compatibility encoding (`group` → `1`, `all` → `2`, octal filemodes
+/// verbatim).
 fn shared_repository_config_value(shared_repository: &str) -> Option<String> {
     match shared_repository {
         "false" | "0" | "umask" => None,
@@ -2147,22 +2323,72 @@ fn shared_repository_config_value(shared_repository: &str) -> Option<String> {
     }
 }
 
-fn shared_dir_mode(shared_repository: Option<&str>) -> Option<u32> {
-    match shared_repository? {
-        "false" | "0" | "umask" => None,
-        "group" | "2" => Some(0o2775),
-        "all" | "world" | "everybody" | "3" | "true" | "1" => Some(0o777),
-        _ => None,
+/// A parsed `core.sharedRepository` permission request, mirroring git's
+/// `git_config_perm` (setup.c): keywords map to the group/everybody OR-in
+/// tweaks, while an octal filemode (other than the 0/1/2 compatibility values)
+/// *replaces* the permission bits outright.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SharedPerm {
+    /// `PERM_GROUP` (0660): OR group read/write into the existing mode.
+    Group,
+    /// `PERM_EVERYBODY` (0664): OR group rw + world read into the existing mode.
+    Everybody,
+    /// A literal octal filemode (`-(mode & 0666)` in git): replace the bits.
+    Exact(u32),
+}
+
+#[cfg(unix)]
+fn parse_shared_repository_perm(value: &str) -> Option<SharedPerm> {
+    match value {
+        "umask" | "false" | "no" | "off" => None,
+        "group" | "true" | "yes" | "on" => Some(SharedPerm::Group),
+        "all" | "world" | "everybody" => Some(SharedPerm::Everybody),
+        _ => {
+            let parsed = u32::from_str_radix(value, 8).ok()?;
+            match parsed {
+                0 => None,
+                1 => Some(SharedPerm::Group),
+                2 => Some(SharedPerm::Everybody),
+                // git dies when the owner would lose read/write; we skip the
+                // adjustment instead (init has already validated the value).
+                mode if (mode & 0o600) == 0o600 => Some(SharedPerm::Exact(mode & 0o666)),
+                _ => None,
+            }
+        }
     }
 }
 
-fn shared_file_mode(shared_repository: Option<&str>) -> Option<u32> {
-    match shared_repository? {
-        "false" | "0" | "umask" => None,
-        "group" | "2" => Some(0o664),
-        "all" | "world" | "everybody" | "3" | "true" | "1" => Some(0o666),
-        _ => None,
+/// Port of git's `calc_shared_perm` + the directory tweaks from
+/// `adjust_shared_perm` (path.c): never grant group/other write to a file the
+/// owner cannot write, copy read bits to execute bits for executables and
+/// directories, and set-gid directories that grant any group access.
+#[cfg(unix)]
+fn calc_shared_perm(perm: SharedPerm, mode: u32, is_dir: bool) -> u32 {
+    let (base, exact) = match perm {
+        SharedPerm::Group => (0o660, false),
+        SharedPerm::Everybody => (0o664, false),
+        SharedPerm::Exact(bits) => (bits, true),
+    };
+    let mut tweak = base;
+    if mode & 0o200 == 0 {
+        tweak &= !0o222;
     }
+    if mode & 0o100 != 0 {
+        tweak |= (tweak & 0o444) >> 2;
+    }
+    let mut new_mode = if exact {
+        (mode & !0o777) | tweak
+    } else {
+        mode | tweak
+    };
+    if is_dir {
+        new_mode |= (new_mode & 0o444) >> 2;
+        if new_mode & 0o060 != 0 {
+            new_mode |= 0o2000;
+        }
+    }
+    new_mode
 }
 
 fn u32_be(bytes: &[u8]) -> u32 {
@@ -2960,6 +3186,8 @@ mod tests {
             .expect("write template config");
 
         let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
             worktree: repo.clone(),
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -2990,6 +3218,8 @@ mod tests {
         let worktree = root.join("worktree");
         let gitdir = root.join("external.git");
         let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
             worktree: worktree.clone(),
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -3016,6 +3246,8 @@ mod tests {
         let root = unique_temp_dir("init-reftable");
         let repo = root.join("repo");
         let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
             worktree: repo,
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
@@ -3045,6 +3277,8 @@ mod tests {
         let root = unique_temp_dir("init-shared");
         let repo = root.join("repo");
         let layout = RepositoryBootstrap::init(InitOptions {
+            git_dir_override: None,
+            core_worktree: None,
             worktree: repo,
             object_format: ObjectFormat::Sha1,
             object_format_explicit: false,
