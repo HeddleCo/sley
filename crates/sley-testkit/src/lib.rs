@@ -5284,6 +5284,31 @@ fn upstream_git_hash_object_in_dir(cwd: &Path, object_type: &str, body: &[u8]) -
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Write `bytes` to a spawned child's stdin, tolerating the child closing the
+/// pipe before draining its input.
+///
+/// Integration tests pipe input to `git` (and `sley`) subprocesses and then call
+/// `wait_with_output` to capture the real result. But both `git` and `sley`
+/// legitimately exit *before* reading stdin when the arguments are a usage or
+/// option error — they print to stderr and exit non-zero without draining fd 0.
+/// When that happens the kernel tears down the pipe and our `write_all` races
+/// the child's close, surfacing `io::ErrorKind::BrokenPipe`. That is not a test
+/// failure: the child's actual exit status and output are still captured by the
+/// subsequent `wait_with_output`, so swallowing the broken pipe here is correct
+/// robustness, not masking. (Verified by strace on the interpret-trailers usage
+/// path: git exits on the bad option before reading fd 0.)
+///
+/// Any *other* write error is a genuine harness fault and panics with context.
+pub fn write_stdin_tolerating_early_exit(stdin: &mut std::process::ChildStdin, bytes: &[u8]) {
+    match stdin.write_all(bytes) {
+        Ok(()) => {}
+        // The child exited before draining stdin (usage/option error path). Its
+        // real result is still captured by `wait_with_output`; ignore the race.
+        Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(err) => panic!("failed to write child stdin: {err}"),
+    }
+}
+
 fn init_repo_for_format(cwd: &Path, format: ObjectFormat) -> Result<()> {
     match format {
         ObjectFormat::Sha1 => run_git(cwd, ["init", "-q"], &[]),

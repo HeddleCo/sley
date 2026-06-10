@@ -22,6 +22,7 @@ pub(crate) mod diff_tree;
 pub(crate) mod format_patch;
 pub(crate) mod grep;
 pub(crate) mod hash_object;
+pub(crate) mod hash_object_fsck;
 pub(crate) mod interpret_trailers;
 pub(crate) mod merge_file;
 pub(crate) mod merge_rebase;
