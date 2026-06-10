@@ -282,6 +282,131 @@ struct MergeOptions {
     quiet: bool,
 }
 
+/// The short name of the branch HEAD points at (`refs/heads/<name>` → `<name>`),
+/// or `None` when HEAD is detached or unborn-without-a-symref. git only reads
+/// `branch.<name>.mergeoptions` when there is such a branch.
+fn current_branch_short_name(refs: &FileRefStore) -> Result<Option<String>> {
+    match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(target)) => {
+            Ok(target.strip_prefix("refs/heads/").map(str::to_string))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `branch.<branch>.mergeoptions` from the effective config (all layers plus
+/// `-c`/env injection), exactly the value git's `git_merge_config` picks up.
+fn branch_mergeoptions_value(branch: &str) -> Option<String> {
+    identity_effective_config()?
+        .get("branch", Some(branch), "mergeoptions")
+        .map(str::to_string)
+}
+
+/// git's `parse_branch_merge_options`: split the stored string with
+/// `split_cmdline` (dying on malformed quoting), then apply each token as a
+/// merge option. Unknown options are rejected just like git's `parse_options`.
+fn apply_branch_merge_options(raw: &str, branch: &str, options: &mut MergeOptions) -> Result<()> {
+    let tokens = split_cmdline(raw).map_err(|err| {
+        eprintln!("fatal: Bad branch.{branch}.mergeoptions string: {}", err.message());
+        GitError::Exit(128)
+    })?;
+    let mut iter = tokens.iter();
+    while let Some(token) = iter.next() {
+        match token.as_str() {
+            "--no-ff" => options.no_ff = true,
+            "--ff" => options.no_ff = false,
+            "--ff-only" => options.ff_only = true,
+            "--no-commit" => options.no_commit = true,
+            "--commit" => options.no_commit = false,
+            "-q" | "--quiet" => options.quiet = true,
+            "--no-quiet" => options.quiet = false,
+            "-m" | "--message" => {
+                options.message = Some(
+                    iter.next()
+                        .ok_or_else(|| {
+                            GitError::Command("merge -m requires a value".into())
+                        })?
+                        .clone(),
+                );
+            }
+            value if value.starts_with("--message=") => {
+                options.message = value
+                    .strip_prefix("--message=")
+                    .map(|value| value.to_string());
+            }
+            value => {
+                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
+                return Err(GitError::Exit(129));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The split_cmdline failure modes git distinguishes (`split_cmdline_errors`).
+enum SplitCmdlineError {
+    BadEnding,
+    UnclosedQuote,
+}
+
+impl SplitCmdlineError {
+    fn message(&self) -> &'static str {
+        match self {
+            SplitCmdlineError::BadEnding => "cmdline ends with \\",
+            SplitCmdlineError::UnclosedQuote => "unclosed quote",
+        }
+    }
+}
+
+/// Port of git's `split_cmdline` (`alias.c`): shell-like tokenization honouring
+/// single/double quotes and backslash escapes (outside single quotes). Returns
+/// an error for an unbalanced quote or a trailing backslash, matching git.
+fn split_cmdline(cmdline: &str) -> std::result::Result<Vec<String>, SplitCmdlineError> {
+    let bytes = cmdline.as_bytes();
+    let mut argv: Vec<String> = Vec::new();
+    let mut current: Vec<u8> = Vec::new();
+    let mut started = false;
+    let mut quoted: u8 = 0;
+    let mut src = 0;
+    while src < bytes.len() {
+        let c = bytes[src];
+        if quoted == 0 && c.is_ascii_whitespace() {
+            if started {
+                argv.push(String::from_utf8_lossy(&current).into_owned());
+                current.clear();
+                started = false;
+            }
+            src += 1;
+        } else if quoted == 0 && (c == b'\'' || c == b'"') {
+            quoted = c;
+            started = true;
+            src += 1;
+        } else if c == quoted {
+            quoted = 0;
+            src += 1;
+        } else {
+            started = true;
+            if c == b'\\' && quoted != b'\'' {
+                src += 1;
+                if src >= bytes.len() {
+                    return Err(SplitCmdlineError::BadEnding);
+                }
+                current.push(bytes[src]);
+            } else {
+                current.push(c);
+            }
+            src += 1;
+        }
+    }
+    if quoted != 0 {
+        return Err(SplitCmdlineError::UnclosedQuote);
+    }
+    if started {
+        argv.push(String::from_utf8_lossy(&current).into_owned());
+    }
+    Ok(argv)
+}
+
 pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut options = MergeOptions::default();
     let mut abort = false;
@@ -344,6 +469,17 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(129));
         }
         return cmd_merge_continue();
+    }
+
+    // git's `git_merge_config` reads `branch.<current>.mergeoptions` from the
+    // effective config and prepends it to the command-line options
+    // (`parse_branch_merge_options`). The stored string is split with
+    // git's `split_cmdline`, which dies on an unbalanced quote or a trailing
+    // backslash — exposing malformed values before any merge work happens.
+    if let Some(branch) = current_branch_short_name(&refs)?
+        && let Some(raw) = branch_mergeoptions_value(&branch)
+    {
+        apply_branch_merge_options(&raw, &branch, &mut options)?;
     }
 
     if git_dir.join("MERGE_HEAD").exists() {
