@@ -788,7 +788,7 @@ impl FileRefStore {
     }
 
     pub fn delete_tag(&self, tag: &str) -> Result<TagDelete> {
-        let name = tag_ref_name(tag)?;
+        let name = TagRefNameBuf::from_tag_name_unrestricted(tag)?.into_string();
         let oid = self.delete_direct_ref(&name, "tag", tag)?;
         Ok(TagDelete { name, oid })
     }
@@ -1839,9 +1839,22 @@ pub struct TagRefNameBuf {
 
 impl TagRefNameBuf {
     pub fn from_tag_name(tag: &str) -> Result<Self> {
-        validate_short_ref_name("tag", tag)?;
+        // Mirror git's check_tag_ref(): reject a leading '-' or the literal
+        // "HEAD", then validate refs/tags/<tag> with check_refname_format().
+        if tag.starts_with('-') || tag == "HEAD" {
+            return Err(GitError::InvalidPath(format!("invalid tag name {tag}")));
+        }
+        Self::from_tag_name_unrestricted(tag)
+    }
+
+    /// Build `refs/tags/<tag>` validating only the refname format, without the
+    /// creation-only restrictions (leading `-`, literal `HEAD`). Git's delete
+    /// path does not run check_tag_ref(), so a tag literally named `HEAD` can
+    /// still be removed.
+    pub fn from_tag_name_unrestricted(tag: &str) -> Result<Self> {
         let name = format!("{}{}", TagRefName::PREFIX, tag);
-        Self::from_full(name)
+        check_refname_format(&name, false)?;
+        Ok(Self { name })
     }
 
     pub fn from_full(name: impl Into<String>) -> Result<Self> {
