@@ -14,7 +14,6 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use sley_core::{GitError, Result};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
