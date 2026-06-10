@@ -232,6 +232,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut fixed_value = false;
     let mut null_terminate = false;
     let mut value_type = ConfigValueType::Raw;
+    // git's `to_type`: 0 (Raw) means "no explicit type". Setting a *different*
+    // explicit type errors ("only one type at a time"); `--no-type` resets to 0.
+    let mut type_set = false;
     let mut positional = Vec::new();
     // Subcommand-mode `git config get` filter options (git 2.54). These only
     // exist on the `get` subcommand; the classic flag form rejects them.
@@ -374,22 +377,31 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                         .to_string(),
                 );
             }
-            "--bool" => value_type = ConfigValueType::Bool,
-            "--int" => value_type = ConfigValueType::Int,
-            "--bool-or-int" => value_type = ConfigValueType::BoolOrInt,
-            "--expiry-date" => value_type = ConfigValueType::ExpiryDate,
-            "--path" => value_type = ConfigValueType::Path,
+            "--bool" => set_config_type(&mut value_type, &mut type_set, ConfigValueType::Bool)?,
+            "--int" => set_config_type(&mut value_type, &mut type_set, ConfigValueType::Int)?,
+            "--bool-or-int" => {
+                set_config_type(&mut value_type, &mut type_set, ConfigValueType::BoolOrInt)?;
+            }
+            "--expiry-date" => {
+                set_config_type(&mut value_type, &mut type_set, ConfigValueType::ExpiryDate)?;
+            }
+            "--path" => set_config_type(&mut value_type, &mut type_set, ConfigValueType::Path)?,
+            // git's `--no-type` resets to the untyped state.
+            "--no-type" => {
+                value_type = ConfigValueType::Raw;
+                type_set = false;
+            }
             "--type" => {
                 let kind = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--type requires a value".into()))?;
-                value_type = parse_config_value_type(kind)?;
+                let parsed = parse_config_type_arg(kind)?;
+                set_config_type(&mut value_type, &mut type_set, parsed)?;
             }
             value if value.starts_with("--type=") => {
-                let kind = value
-                    .strip_prefix("--type=")
-                    .ok_or_else(|| GitError::Command("--type requires a value".into()))?;
-                value_type = parse_config_value_type(kind)?;
+                let kind = &value["--type=".len()..];
+                let parsed = parse_config_type_arg(kind)?;
+                set_config_type(&mut value_type, &mut type_set, parsed)?;
             }
             "--append" if subcommand == Some(ConfigSubcommand::Set) => {
                 action = Some(ConfigAction::Add);
@@ -874,7 +886,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     }
     match action {
         ConfigAction::List => {
-            config_list(&entries, display, name_only, null_terminate)?;
+            config_list(&entries, display, name_only, null_terminate, value_type)?;
             if let Some(err) = loaded.tail_error {
                 let path = match &source {
                     ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
@@ -1563,7 +1575,10 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
     }
 }
 
-fn parse_config_value_type(value: &str) -> Result<ConfigValueType> {
+/// git's `option_parse_type` argument decode: the `--type=<arg>` list. `string`
+/// is NOT accepted (git only exposes the untyped default implicitly), and an
+/// unknown argument dies with git's exact message + exit 128.
+fn parse_config_type_arg(value: &str) -> Result<ConfigValueType> {
     match value {
         "bool" => Ok(ConfigValueType::Bool),
         "int" => Ok(ConfigValueType::Int),
@@ -1571,15 +1586,51 @@ fn parse_config_value_type(value: &str) -> Result<ConfigValueType> {
         "expiry-date" => Ok(ConfigValueType::ExpiryDate),
         "color" => Ok(ConfigValueType::Color),
         "path" => Ok(ConfigValueType::Path),
-        "string" => Ok(ConfigValueType::Raw),
-        other => Err(GitError::Unsupported(format!(
-            "config value type {other} is not supported"
-        ))),
+        other => {
+            eprintln!("fatal: unrecognized --type argument, {other}");
+            Err(GitError::Exit(128))
+        }
     }
+}
+
+/// git's `option_parse_type` conflict check: applying a *different* explicit
+/// type than one already chosen errors "only one type at a time" (exit 129);
+/// re-applying the same type is allowed.
+fn set_config_type(
+    current: &mut ConfigValueType,
+    type_set: &mut bool,
+    new: ConfigValueType,
+) -> Result<()> {
+    if *type_set && *current != new {
+        eprintln!("error: only one type at a time");
+        return Err(GitError::Exit(129));
+    }
+    *current = new;
+    *type_set = true;
+    Ok(())
 }
 
 fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<String> {
     format_config_value_with(value, value_type, None, None)
+}
+
+/// Side-effect-free predicate: can `value` be canonicalised as `value_type`?
+/// Used by `--list --type=<T>` to silently drop non-conforming values without
+/// printing the formatter's `fatal:` diagnostic. `Raw` and `Path` always pass
+/// (a path is stored verbatim / tilde-expanded, never rejected here).
+fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
+    match value_type {
+        ConfigValueType::Raw | ConfigValueType::Path => true,
+        ConfigValueType::Bool => sley_config::parse_config_bool(value).is_some(),
+        ConfigValueType::Int => sley_config::parse_config_int(value).is_some(),
+        ConfigValueType::BoolOrInt => sley_config::parse_config_bool_or_int(value).is_some(),
+        ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
+        ConfigValueType::ExpiryDate => {
+            // Side-effect-free: accept the literal forms the formatter accepts
+            // without invoking it (the formatter prints on failure).
+            value == "now" || value == "never" || value.bytes().all(|b| b.is_ascii_digit())
+        }
+    }
 }
 
 /// Format a typed value, attributing parse failures to the key and the
@@ -1727,6 +1778,13 @@ fn config_auto_color_term_ok() -> bool {
 }
 
 fn format_config_color_value(value: &str) -> Result<String> {
+    try_format_config_color_value(value).map_err(|()| config_bad_color_value(value))
+}
+
+/// The side-effect-free core of [`format_config_color_value`]: returns `Err(())`
+/// (no diagnostic) when the value is not a valid color, so callers like
+/// `--list --type=color` can silently skip it.
+fn try_format_config_color_value(value: &str) -> std::result::Result<String, ()> {
     let mut codes = Vec::new();
     let mut color_slot = 0usize;
     for token in value.split_whitespace() {
@@ -1738,12 +1796,10 @@ fn format_config_color_value(value: &str) -> Result<String> {
             continue;
         }
         if color_slot >= 2 {
-            return Err(config_bad_color_value(value));
+            return Err(());
         }
         let foreground = color_slot == 0;
-        codes.extend(
-            config_color_code(token, foreground).ok_or_else(|| config_bad_color_value(value))?,
-        );
+        codes.extend(config_color_code(token, foreground).ok_or(())?);
         color_slot += 1;
     }
     if codes.is_empty() {
@@ -2603,10 +2659,22 @@ fn config_list(
     display: ConfigDisplayOptions,
     name_only: bool,
     null_terminate: bool,
+    value_type: ConfigValueType,
 ) -> Result<()> {
     let mut stdout = io::stdout();
     for entry in entries {
         let name = stack_entry_name(entry);
+        // git's `--list --type=<T>` shows only values that canonicalise as that
+        // type, silently dropping the rest (e.g. `--type=int` skips non-ints).
+        // The untyped default (`Raw`) prints everything. The check must be
+        // side-effect-free — the formatter prints a `fatal:` diagnostic on
+        // failure, which the list path must NOT emit.
+        if value_type != ConfigValueType::Raw
+            && let Some(value) = entry.value.as_deref()
+            && !value_canonicalizes_as(value, value_type)
+        {
+            continue;
+        }
         write_config_entry(
             &mut stdout,
             &ConfigValueMeta::of(entry),
@@ -2616,7 +2684,7 @@ fn config_list(
                 display,
                 name_only,
                 show_keys: true,
-                value_type: ConfigValueType::Raw,
+                value_type,
                 null_terminate,
                 equals_separator: true,
             },
