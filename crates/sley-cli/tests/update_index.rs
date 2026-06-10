@@ -290,6 +290,97 @@ fn update_index_path_modes_match_upstream_git() {
     let _ = fs::remove_dir_all(&root);
 }
 
+/// `git update-index --add <symlink>` stages the symlink itself (mode 120000,
+/// blob = the raw link target) and never follows it to its target. Regression
+/// guard for the bug where sley stat-ed through the link: a symlink-to-directory
+/// died with "Is a directory", a broken symlink was rejected as missing, and a
+/// symlink-to-file was staged with the *target's* content and a regular-file
+/// mode. Each scenario builds identical worktree state in both repos, runs the
+/// command, and asserts byte-identical stdout/stderr/exit plus an identical
+/// resulting index. Also covers `--chmod` on a symlink, which git rejects.
+#[cfg(unix)]
+#[test]
+fn update_index_add_symlink_matches_upstream_git() {
+    use std::os::unix::fs::symlink;
+
+    // Each scenario: a name, a worktree-setup closure run inside a repo, and the
+    // update-index argv to run + diff against upstream git.
+    let scenarios: Vec<(&str, fn(&Path), Vec<&str>)> = vec![
+        (
+            "symlink-to-directory",
+            |repo: &Path| {
+                fs::create_dir(repo.join("realdir")).expect("mkdir realdir");
+                fs::write(repo.join("realdir/file.txt"), b"content\n").expect("write target file");
+                symlink("realdir", repo.join("symdir")).expect("create symlink-to-dir");
+            },
+            vec!["update-index", "--add", "symdir"],
+        ),
+        (
+            "symlink-to-file",
+            |repo: &Path| {
+                fs::write(repo.join("target.txt"), b"hi\n").expect("write target file");
+                symlink("target.txt", repo.join("link.txt")).expect("create symlink-to-file");
+            },
+            vec!["update-index", "--add", "link.txt"],
+        ),
+        (
+            "broken-symlink",
+            |repo: &Path| {
+                symlink("does-not-exist", repo.join("broken")).expect("create broken symlink");
+            },
+            vec!["update-index", "--add", "broken"],
+        ),
+        (
+            "symlink-target-with-parent-dirs",
+            |repo: &Path| {
+                fs::create_dir_all(repo.join("a/b")).expect("mkdir a/b");
+                symlink("../..", repo.join("a/b/up")).expect("create dotdot symlink");
+            },
+            vec!["update-index", "--add", "a/b/up"],
+        ),
+        (
+            "chmod-plus-x-on-symlink-rejected",
+            |repo: &Path| {
+                fs::write(repo.join("t.txt"), b"hi\n").expect("write target file");
+                symlink("t.txt", repo.join("l.txt")).expect("create symlink");
+            },
+            vec!["update-index", "--add", "--chmod=+x", "l.txt"],
+        ),
+        (
+            "chmod-minus-x-on-symlink-rejected",
+            |repo: &Path| {
+                fs::write(repo.join("t.txt"), b"hi\n").expect("write target file");
+                symlink("t.txt", repo.join("l.txt")).expect("create symlink");
+            },
+            vec!["update-index", "--add", "--chmod=-x", "l.txt"],
+        ),
+    ];
+
+    for (name, setup, args) in scenarios {
+        let root = unique_temp_dir(&format!("update-index-symlink-{name}"));
+        let expected = root.join("expected");
+        let actual = root.join("actual");
+        fs::create_dir_all(&expected).expect("create expected repo dir");
+        fs::create_dir_all(&actual).expect("create actual repo dir");
+
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
+        setup(&expected);
+        setup(&actual);
+
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
+        let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
+        let expected_success = expected_output.status.success();
+        assert_same_output(actual_output, expected_output, &args);
+        // The index must match whether the command succeeded (the symlink was
+        // staged) or failed (it was left untouched).
+        assert_index_matches_for_label(&expected, &actual, name);
+        let _ = expected_success;
+
+        let _ = fs::remove_dir_all(&root);
+    }
+}
+
 #[test]
 fn update_index_no_input_compat_flags_match_upstream_git() {
     let root = unique_temp_dir("update-index-no-input-compat");
