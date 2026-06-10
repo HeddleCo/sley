@@ -1049,6 +1049,163 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (year, month as u32, day as u32)
 }
 
+/// The signature begin-markers git recognizes (`gpg-interface.c` format table).
+/// A message line beginning with one of these starts the trailing signature.
+const FOR_EACH_REF_SIGNATURE_MARKERS: [&[u8]; 4] = [
+    b"-----BEGIN PGP SIGNATURE-----",
+    b"-----BEGIN PGP MESSAGE-----",
+    b"-----BEGIN SIGNED MESSAGE-----",
+    b"-----BEGIN SSH SIGNATURE-----",
+];
+
+/// Offset into `message` where the trailing signature begins, or the message
+/// length when unsigned. Mirrors gpg-interface.c `parse_signed_buffer`: the
+/// LAST line that starts with a signature marker wins.
+fn for_each_ref_signature_start(message: &[u8]) -> usize {
+    let mut start = 0;
+    let mut sig = message.len();
+    while start < message.len() {
+        let line = &message[start..];
+        if FOR_EACH_REF_SIGNATURE_MARKERS
+            .iter()
+            .any(|marker| line.starts_with(marker))
+        {
+            sig = start;
+        }
+        match line.iter().position(|byte| *byte == b'\n') {
+            Some(eol) => start += eol + 1,
+            None => break,
+        }
+    }
+    sig
+}
+
+/// The split of a commit/tag message into the regions git's for-each-ref atoms
+/// expose, mirroring ref-filter.c `find_subpos`.
+pub struct ForEachRefMessageParts<'a> {
+    /// The subject line(s), with no trailing newline (raw bytes; callers run
+    /// `for_each_ref_copy_subject` to collapse embedded newlines).
+    pub subject: &'a [u8],
+    /// `%(contents:body)` — body with the signature removed.
+    pub body_without_sig: &'a [u8],
+    /// `%(body)` (legacy) — body *including* the signature.
+    pub body_with_sig: &'a [u8],
+    /// `%(contents:signature)` — the trailing signature block (may be empty).
+    pub signature: &'a [u8],
+    /// `%(contents)` / `%(contents:size)` — the message from the subject start
+    /// (after leading blank lines) to the end.
+    pub bare: &'a [u8],
+}
+
+/// Split a commit/tag message into the for-each-ref content regions, mirroring
+/// ref-filter.c `find_subpos`. `message` is the header-stripped message (sley
+/// already strips object headers before this point).
+pub fn for_each_ref_message_parts(message: &[u8]) -> ForEachRefMessageParts<'_> {
+    // Skip any leading empty lines (the header/body separator is already gone).
+    let mut start = 0;
+    while message.get(start) == Some(&b'\n') {
+        start += 1;
+    }
+    let buf = &message[start..];
+    let bare = buf;
+    let sigstart = for_each_ref_signature_start(buf);
+    let signature = &buf[sigstart..];
+
+    // Subject runs to the first blank line before the signature, else to the
+    // signature start (treating the whole pre-sig message as subject).
+    let subject_region = &buf[..sigstart];
+    let subject_end = for_each_ref_blank_line(subject_region).unwrap_or(sigstart);
+    let mut sublen = subject_end;
+    while sublen > 0 && matches!(buf[sublen - 1], b'\n' | b'\r') {
+        sublen -= 1;
+    }
+    let subject = &buf[..sublen];
+
+    // Body begins after the subject's trailing blank lines.
+    let mut body_start = subject_end;
+    while body_start < buf.len() && matches!(buf[body_start], b'\n' | b'\r') {
+        body_start += 1;
+    }
+    let body_with_sig = &buf[body_start..];
+    let body_without_sig = &buf[body_start..sigstart.max(body_start)];
+    ForEachRefMessageParts {
+        subject,
+        body_without_sig,
+        body_with_sig,
+        signature,
+        bare,
+    }
+}
+
+/// Find the byte offset of the first blank-line separator (`\n\n` or
+/// `\r\n\r\n`) in `buf`, returning the offset of the first newline of the pair.
+fn for_each_ref_blank_line(buf: &[u8]) -> Option<usize> {
+    let lf = buf.windows(2).position(|window| window == b"\n\n");
+    let crlf = buf.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// `copy_subject`: render the subject with embedded newlines turned into single
+/// spaces (CRLF's CR is dropped), matching ref-filter.c.
+pub fn for_each_ref_copy_subject(subject: &[u8]) -> String {
+    let mut out = String::with_capacity(subject.len());
+    let mut idx = 0;
+    while idx < subject.len() {
+        let byte = subject[idx];
+        if byte == b'\r' && subject.get(idx + 1) == Some(&b'\n') {
+            idx += 1;
+            continue;
+        }
+        if byte == b'\n' {
+            out.push(' ');
+        } else {
+            out.push(byte as char);
+        }
+        idx += 1;
+    }
+    out
+}
+
+/// `format_sanitized_subject`: replace non-title-character runs with a single
+/// `-`, collapse consecutive `.`, and trim trailing `.`/`-` (pretty.c).
+pub fn for_each_ref_sanitize_subject(subject: &str) -> String {
+    let bytes = subject.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut space = 2u8; // git's initial `space = 2`
+    let mut idx = 0;
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+        if for_each_ref_istitlechar(byte) {
+            if space == 1 {
+                out.push(b'-');
+            }
+            space = 0;
+            out.push(byte);
+            if byte == b'.' {
+                while bytes.get(idx + 1) == Some(&b'.') {
+                    idx += 1;
+                }
+            }
+        } else {
+            space |= 1;
+        }
+        idx += 1;
+    }
+    while matches!(out.last(), Some(b'.') | Some(b'-')) {
+        out.pop();
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn for_each_ref_istitlechar(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'_'
+}
+
 pub fn for_each_ref_short_name(refname: &str) -> &str {
     if let Some(remote) = refname.strip_prefix("refs/remotes/")
         && let Some(remote_name) = remote.strip_suffix("/HEAD")

@@ -3661,73 +3661,79 @@ fn print_for_each_ref_format(
                 }
             }
             "subject" | "contents:subject" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_subject(&contents.message).as_bytes())?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    let parts = for_each_ref_message_parts(message);
+                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
                 }
             }
             "*subject" | "*contents:subject" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_subject(message).as_bytes())?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    let parts = for_each_ref_message_parts(message);
+                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
+                }
+            }
+            "subject:sanitize" => {
+                if let Some(message) = for_each_ref_message(context, false) {
+                    let parts = for_each_ref_message_parts(message);
+                    let subject = for_each_ref_copy_subject(parts.subject);
+                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
+                }
+            }
+            "*subject:sanitize" => {
+                if let Some(message) = for_each_ref_message(context, true) {
+                    let parts = for_each_ref_message_parts(message);
+                    let subject = for_each_ref_copy_subject(parts.subject);
+                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
                 }
             }
             "contents:body" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_body(&contents.message))?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
                 }
             }
             "*contents:body" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_body(message))?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
+                }
+            }
+            "contents:signature" => {
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
+                }
+            }
+            "*contents:signature" => {
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
                 }
             }
             "body" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_body(&contents.message))?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
                 }
             }
             "*body" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_body(message))?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
                 }
             }
             "contents" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(&contents.message)?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
                 }
             }
             "*contents" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(message)?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
                 }
             }
             "contents:size" => {
-                if let Some(contents) = &context.contents {
-                    write!(stdout, "{}", contents.message.len())?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
                 }
             }
             "*contents:size" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    write!(stdout, "{}", message.len())?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
                 }
             }
             "author" => write_for_each_ref_identity(
@@ -4250,21 +4256,27 @@ fn parse_for_each_ref_email_options(arg: &str) -> std::result::Result<ForEachRef
     let mut options = ForEachRefEmailOptions::default();
     let mut rest = arg;
     loop {
-        let bad_arg = rest;
-        // git's email_atom_option_parser: prefix-match a known token.
-        let consumed = if let Some(tail) = rest.strip_prefix("trim") {
+        // git's email_atom_option_parser advances past a matched prefix; the
+        // `bad_arg` it later reports is the *remaining* string AFTER that
+        // consume (so `mailmaptrim` reports `trim`, not `mailmaptrim`).
+        let matched = if let Some(tail) = rest.strip_prefix("trim") {
             options.trim = true;
-            tail
+            Some(tail)
         } else if let Some(tail) = rest.strip_prefix("localpart") {
             options.localpart = true;
-            tail
+            Some(tail)
         } else if let Some(tail) = rest.strip_prefix("mailmap") {
             options.mailmap = true;
-            tail
+            Some(tail)
         } else {
-            return Err(bad_arg.to_string());
+            None
         };
-        rest = consumed;
+        let Some(tail) = matched else {
+            // No prefix consumed: the bad argument is the whole remainder.
+            return Err(rest.to_string());
+        };
+        rest = tail;
+        let bad_arg = rest;
         if rest.is_empty() {
             break;
         }
@@ -4311,6 +4323,22 @@ fn for_each_ref_try_email_atom(
         None => ForEachRefEmailOptions::default(),
     };
     Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// The raw message bytes for the ref's own object (`peeled == false`) or the
+/// peeled tag target (`peeled == true`), if available.
+fn for_each_ref_message<'a>(
+    context: &'a ForEachRefFormatContext<'_>,
+    peeled: bool,
+) -> Option<&'a [u8]> {
+    if peeled {
+        context
+            .peeled_object
+            .as_ref()
+            .and_then(|peeled| peeled.message.as_deref())
+    } else {
+        context.contents.as_ref().map(|contents| &*contents.message)
+    }
 }
 
 /// If `placeholder` is a date atom (`(\*?)(author|committer|tagger|creator)date`
