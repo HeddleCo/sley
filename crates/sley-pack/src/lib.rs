@@ -4381,6 +4381,85 @@ mod tests {
         }
     }
 
+    /// A [`HeaderTypeCache`] over a plain map, for asserting the cached header
+    /// read is byte-identical to the uncached one cold and warm (sley#26).
+    #[derive(Default)]
+    struct MapHeaderTypeCache(HashMap<u64, (ObjectType, u64)>);
+
+    impl HeaderTypeCache for MapHeaderTypeCache {
+        fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
+            self.0.get(&pack_offset).copied()
+        }
+        fn put(&mut self, pack_offset: u64, header: (ObjectType, u64)) {
+            self.0.insert(pack_offset, header);
+        }
+    }
+
+    #[test]
+    fn read_object_header_at_cached_matches_uncached_cold_and_warm_for_ofs_delta() {
+        let (base, changed) = similar_blob_objects();
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(
+            &[base, changed],
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
+        let mut second = written.entries[1].offset as usize;
+        assert_eq!(
+            parse_entry_header(&written.pack, &mut second)
+                .expect("test operation should succeed")
+                .kind,
+            PackObjectKind::OfsDelta
+        );
+
+        let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
+        let mut cache = MapHeaderTypeCache::default();
+        for po in &parsed.entries {
+            let uncached =
+                read_object_header_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
+                    Ok(None)
+                })
+                .expect("test operation should succeed");
+            // Type inherited from the chain base; size is the inflated body length.
+            assert_eq!(
+                uncached,
+                (po.object.object_type, po.object.body.len() as u64),
+                "uncached header at offset {}",
+                po.entry.offset
+            );
+            // Cold cache: must agree with the uncached read and populate the memo.
+            let cold = read_object_header_at_with_cache(
+                &written.pack,
+                po.entry.offset,
+                ObjectFormat::Sha1,
+                |_| Ok(None),
+                &mut cache,
+            )
+            .expect("test operation should succeed");
+            assert_eq!(cold, uncached, "cold cache at offset {}", po.entry.offset);
+        }
+        // Warm cache: every offset now resolves from the memo and is still correct,
+        // proving the fast path does not change behavior (sley#26).
+        for po in &parsed.entries {
+            let warm = read_object_header_at_with_cache(
+                &written.pack,
+                po.entry.offset,
+                ObjectFormat::Sha1,
+                |_| panic!("warm cache must not re-walk the chain"),
+                &mut cache,
+            )
+            .expect("test operation should succeed");
+            assert_eq!(
+                warm,
+                (po.object.object_type, po.object.body.len() as u64),
+                "warm cache at offset {}",
+                po.entry.offset
+            );
+        }
+    }
+
     #[test]
     fn read_object_at_matches_full_parse_for_ref_delta_pack() {
         let (base, changed) = similar_blob_objects();

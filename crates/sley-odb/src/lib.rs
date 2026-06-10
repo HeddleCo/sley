@@ -1050,8 +1050,10 @@ type PackDeltaCaches = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<LruOffsetCache>>>>>;
 /// chain base, so memoizing `offset -> type` lets each chain be walked at most
 /// once across a batch. Keyed by pack path so an offset key is never applied to
 /// the wrong pack's bytes; shared across cloned handles.
-type PackHeaderTypeCaches =
-    Arc<Mutex<HashMap<PathBuf, Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>>>>;
+/// One pack's offset-keyed header memo (see [`PackHeaderTypeCaches`]).
+type PackHeaderTypeCache = Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>;
+
+type PackHeaderTypeCaches = Arc<Mutex<HashMap<PathBuf, PackHeaderTypeCache>>>;
 
 /// Default approximate byte budget for the decoded-object LRU. Sized to comfortably
 /// hold the working set of a history walk (commits/trees/blobs and their delta
@@ -1242,7 +1244,7 @@ impl sley_pack::PackDeltaCache for PackDeltaCacheAdapter<'_> {
 /// Bridges a per-pack `offset -> ObjectType` memo into the header fast path so
 /// the ofs-delta chain walk is performed at most once per chain across a batch
 /// of `read_object_header` calls (sley#26).
-struct PackHeaderTypeCacheAdapter<'a>(&'a Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>);
+struct PackHeaderTypeCacheAdapter<'a>(&'a PackHeaderTypeCache);
 
 impl sley_pack::HeaderTypeCache for PackHeaderTypeCacheAdapter<'_> {
     fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
@@ -1813,10 +1815,7 @@ impl FileObjectDatabase {
     /// The per-pack header-type memo for `pack_path`, creating it on first use.
     /// Returns `None` only if the shared map's lock is poisoned, in which case the
     /// caller falls back to an unmemoized header walk (correctness preserved).
-    fn pack_header_type_cache(
-        &self,
-        pack_path: &Path,
-    ) -> Option<Arc<Mutex<HashMap<u64, (ObjectType, u64)>>>> {
+    fn pack_header_type_cache(&self, pack_path: &Path) -> Option<PackHeaderTypeCache> {
         let mut caches = self.pack_header_types.lock().ok()?;
         let cache = caches
             .entry(pack_path.to_path_buf())
