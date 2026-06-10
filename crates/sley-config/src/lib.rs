@@ -1452,6 +1452,455 @@ fn eq_ignore_ascii_case(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+// ---------------------------------------------------------------------------
+// Command-line / environment config injection (`-c`, `--config-env`,
+// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`_VALUE_n`).
+//
+// This mirrors git's `config.c` machinery exactly: every injection source is
+// flattened into a single ordered stream of `(canonical-key, value)` pairs,
+// processed env-count pairs first, then `GIT_CONFIG_PARAMETERS` (into which `-c`
+// and `--config-env` are appended in left-to-right command-line order). The
+// stream is layered *on top* of the config files, so the document model's
+// existing last-one-wins / case-insensitive lookup yields git's precedence
+// (file < env-count < parameters, and within parameters left-to-right).
+
+/// A parsed config-injection pair: a git-canonicalised key plus an optional
+/// value. `value == None` denotes a bare boolean-true entry (`-c foo.flag`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigParameter {
+    /// The canonical key: `section` and the final variable name are lowercased
+    /// (git's `git_config_parse_key`), while any subsection in between is kept
+    /// verbatim. Stored as the full `section[.subsection].key` string.
+    pub canonical_key: String,
+    /// `Some(value)` for `key=value` (value may be empty); `None` for a bare key.
+    pub value: Option<String>,
+}
+
+impl ConfigParameter {
+    /// Split the canonical key into `(section, subsection, key)`, matching how
+    /// [`GitConfig`] indexes entries. The split is on the first and last `.`:
+    /// section before the first dot, key after the last dot, subsection (if any)
+    /// in between. The key is guaranteed valid because it was canonicalised.
+    pub fn split_key(&self) -> (&str, Option<&str>, &str) {
+        let first = self
+            .canonical_key
+            .find('.')
+            .expect("canonical key has a section");
+        let last = self
+            .canonical_key
+            .rfind('.')
+            .expect("canonical key has a key");
+        let section = &self.canonical_key[..first];
+        let key = &self.canonical_key[last + 1..];
+        let subsection = if first == last {
+            None
+        } else {
+            Some(&self.canonical_key[first + 1..last])
+        };
+        (section, subsection, key)
+    }
+}
+
+/// Error categories raised while parsing config injection, each carrying git's
+/// exact `error:`/`fatal:` wording. The caller (CLI) prints the message and the
+/// trailing `fatal: unable to parse command-line config` line where git does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigParameterError {
+    /// `error: empty config key`
+    EmptyKey,
+    /// `error: key does not contain a section: <key>`
+    NoSection(String),
+    /// `error: key does not contain variable name: <key>`
+    NoVariableName(String),
+    /// `error: invalid key: <key>`
+    InvalidKey(String),
+    /// `error: invalid key (newline): <key>`
+    InvalidKeyNewline(String),
+    /// `error: bogus config parameter: <text>`
+    BogusParameter(String),
+    /// `error: bogus format in GIT_CONFIG_PARAMETERS`
+    BogusEnvFormat,
+    /// `error: bogus count in GIT_CONFIG_COUNT`
+    BogusCount,
+    /// `error: too many entries in GIT_CONFIG_COUNT`
+    TooManyEntries,
+    /// `error: missing config key GIT_CONFIG_KEY_<n>`
+    MissingKey(String),
+    /// `error: missing config value GIT_CONFIG_VALUE_<n>`
+    MissingValue(String),
+}
+
+impl ConfigParameterError {
+    /// The single `error:` line git prints for this failure (without the
+    /// trailing `fatal: unable to parse command-line config`).
+    pub fn message(&self) -> String {
+        match self {
+            Self::EmptyKey => "empty config key".to_string(),
+            Self::NoSection(key) => format!("key does not contain a section: {key}"),
+            Self::NoVariableName(key) => format!("key does not contain variable name: {key}"),
+            Self::InvalidKey(key) => format!("invalid key: {key}"),
+            Self::InvalidKeyNewline(key) => format!("invalid key (newline): {key}"),
+            Self::BogusParameter(text) => format!("bogus config parameter: {text}"),
+            Self::BogusEnvFormat => "bogus format in GIT_CONFIG_PARAMETERS".to_string(),
+            Self::BogusCount => "bogus count in GIT_CONFIG_COUNT".to_string(),
+            Self::TooManyEntries => "too many entries in GIT_CONFIG_COUNT".to_string(),
+            Self::MissingKey(name) => format!("missing config key {name}"),
+            Self::MissingValue(name) => format!("missing config value {name}"),
+        }
+    }
+}
+
+fn is_key_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
+/// Canonicalise a config key exactly as git's `git_config_parse_key`: split on
+/// the last `.` (section/variable boundary), lowercase the section and variable
+/// name while validating each character is a key char (the first variable-name
+/// char must be alphabetic), and leave the subsection verbatim (rejecting only
+/// an embedded newline).
+pub fn canonicalize_config_key(key: &str) -> std::result::Result<String, ConfigParameterError> {
+    let bytes = key.as_bytes();
+    let Some(last_dot) = key.rfind('.') else {
+        return Err(ConfigParameterError::NoSection(key.to_string()));
+    };
+    if last_dot == 0 {
+        return Err(ConfigParameterError::NoSection(key.to_string()));
+    }
+    if last_dot + 1 == bytes.len() {
+        return Err(ConfigParameterError::NoVariableName(key.to_string()));
+    }
+    let baselen = last_dot;
+    // git validates and lowercases byte-by-byte; section/variable bytes are
+    // constrained to ASCII key chars, while the subsection is copied verbatim
+    // (any bytes but a newline). Work on bytes to keep multi-byte subsections
+    // intact, then re-wrap as UTF-8 (the input was already valid UTF-8 and we
+    // only ASCII-lowercase, so this never fails).
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut dot = false;
+    for (i, &c) in bytes.iter().enumerate() {
+        let mut c = c;
+        if c == b'.' {
+            dot = true;
+        }
+        if !dot || i > baselen {
+            // Section name (before the first dot) and variable name (after the
+            // last dot): must be key chars; the first variable char must be a
+            // letter. Lowercased for case-insensitive matching.
+            if !is_key_char(c) || (i == baselen + 1 && !c.is_ascii_alphabetic()) {
+                return Err(ConfigParameterError::InvalidKey(key.to_string()));
+            }
+            c = c.to_ascii_lowercase();
+        } else if c == b'\n' {
+            // Subsection: only a newline is rejected; everything else is kept.
+            return Err(ConfigParameterError::InvalidKeyNewline(key.to_string()));
+        }
+        out.push(c);
+    }
+    Ok(String::from_utf8(out).expect("ascii-lowercased valid utf-8 stays valid utf-8"))
+}
+
+/// Parse a single `key[=value]` parameter (git's `git_config_parse_parameter`,
+/// used for `-c` and old-style `GIT_CONFIG_PARAMETERS` entries). The value is
+/// split off at the *first* `=`; a missing `=` is a bare boolean entry; an empty
+/// key is rejected.
+fn parse_config_parameter(text: &str) -> std::result::Result<ConfigParameter, ConfigParameterError> {
+    let (key, value) = match text.split_once('=') {
+        Some((key, value)) => (key, Some(value.to_string())),
+        None => (text, None),
+    };
+    if key.is_empty() {
+        // git's git_config_parse_parameter reports an empty key (no '=' or a
+        // leading '=') as a "bogus config parameter", before canonicalisation.
+        return Err(ConfigParameterError::BogusParameter(text.to_string()));
+    }
+    let canonical_key = canonicalize_config_key(key)?;
+    Ok(ConfigParameter {
+        canonical_key,
+        value,
+    })
+}
+
+/// Parse a `key` paired with an explicit `value` (git's `config_parse_pair`,
+/// used for env-count entries and the new-style `'key'='value'` form). An empty
+/// key yields `empty config key`.
+fn parse_config_pair(
+    key: &str,
+    value: Option<String>,
+) -> std::result::Result<ConfigParameter, ConfigParameterError> {
+    if key.is_empty() {
+        return Err(ConfigParameterError::EmptyKey);
+    }
+    let canonical_key = canonicalize_config_key(key)?;
+    Ok(ConfigParameter {
+        canonical_key,
+        value,
+    })
+}
+
+/// Dequote one single-quoted shell word starting at `bytes[pos]`, returning the
+/// dequoted string and the index just past it. Mirrors git's `sq_dequote_step`:
+/// the word must begin with `'`; characters are copied until the closing `'`;
+/// after the close, end-of-string or whitespace terminates the word, and a
+/// `'\X'` sequence (where X is `'` or `!`) resumes quoting with the escaped
+/// char. Any other trailing byte (when there is no following separator) is a
+/// format error, signalled by `Ok(None)` here and mapped to BogusEnvFormat.
+fn sq_dequote_step(bytes: &[u8], pos: usize) -> Option<(String, usize)> {
+    if bytes.get(pos) != Some(&b'\'') {
+        return None;
+    }
+    let mut out = Vec::new();
+    // Mirror git's pointer model exactly: `src` indexes the *current* byte and is
+    // pre-incremented (`*++src`) before each read, so the index arithmetic of the
+    // `'\X'` resume-quoting case lines up byte-for-byte with the C original.
+    let mut src = pos;
+    loop {
+        src += 1; // c = *++src
+        let Some(&c) = bytes.get(src) else {
+            // Reached end of buffer without a closing quote.
+            return None;
+        };
+        if c != b'\'' {
+            out.push(c);
+            continue;
+        }
+        // Stepped out of the single-quoted run; inspect the byte after the quote.
+        src += 1; // switch (*++src)
+        match bytes.get(src).copied() {
+            None => {
+                // End of string right after the closing quote: word complete.
+                return Some((String::from_utf8_lossy(&out).into_owned(), src));
+            }
+            Some(b'\\') => {
+                // `'\X'` outside the quotes is allowed only when X needs escaping
+                // (`'` or `!`) AND a single quote resumes immediately after, in
+                // which case the escaped char is emitted and quoting resumes.
+                let escaped = bytes.get(src + 1).copied();
+                let resumes = bytes.get(src + 2).copied() == Some(b'\'');
+                if matches!(escaped, Some(b'\'') | Some(b'!')) && resumes {
+                    out.push(escaped.expect("escaped byte present"));
+                    src += 2; // src now indexes the resuming quote; loop pre-incs past it
+                    continue;
+                }
+                // Otherwise the word ends here; `src` indexes the separator byte.
+                return Some((String::from_utf8_lossy(&out).into_owned(), src));
+            }
+            Some(_) => {
+                // Any other following byte (whitespace, `=`, ...) ends the word;
+                // `src` indexes it so the caller can classify the separator.
+                return Some((String::from_utf8_lossy(&out).into_owned(), src));
+            }
+        }
+    }
+}
+
+/// Parse `GIT_CONFIG_PARAMETERS` (git's `parse_config_env_list`): a sequence of
+/// single-quoted words. Each word is a key; if it is followed by end/whitespace
+/// it is an old-style `key=value` parameter, if followed by `=` it is the
+/// new-style `'key'='value'` (quoted value), `'key'=` (implicit bool), and
+/// anything else is a format error.
+fn parse_config_env_list(
+    env: &str,
+) -> std::result::Result<Vec<ConfigParameter>, ConfigParameterError> {
+    let bytes = env.as_bytes();
+    let mut out = Vec::new();
+    let mut cur = 0;
+    while cur < bytes.len() {
+        let Some((key, next)) = sq_dequote_step(bytes, cur) else {
+            return Err(ConfigParameterError::BogusEnvFormat);
+        };
+        cur = next;
+        if cur >= bytes.len() || bytes[cur].is_ascii_whitespace() {
+            // old-style 'key=value'
+            out.push(parse_config_parameter(&key)?);
+        } else if bytes[cur] == b'=' {
+            // new-style 'key'='value'
+            cur += 1;
+            let value = match bytes.get(cur) {
+                Some(&b'\'') => {
+                    let Some((value, next)) = sq_dequote_step(bytes, cur) else {
+                        return Err(ConfigParameterError::BogusEnvFormat);
+                    };
+                    // A quoted value must be followed by end-of-string or space.
+                    if next < bytes.len() && !bytes[next].is_ascii_whitespace() {
+                        return Err(ConfigParameterError::BogusEnvFormat);
+                    }
+                    cur = next;
+                    Some(value)
+                }
+                None => None,
+                Some(b) if b.is_ascii_whitespace() => None,
+                Some(_) => return Err(ConfigParameterError::BogusEnvFormat),
+            };
+            out.push(parse_config_pair(&key, value)?);
+        } else {
+            return Err(ConfigParameterError::BogusEnvFormat);
+        }
+        // Skip the run of whitespace separating words.
+        while cur < bytes.len() && bytes[cur].is_ascii_whitespace() {
+            cur += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Parse `GIT_CONFIG_COUNT` the way git does: `strtoul(env, &endp, 10)` followed
+/// by a `*endp` check. That means leading ASCII whitespace and an optional sign
+/// are consumed, a digit run is read base-10 with C's unsigned wraparound, and
+/// any *trailing* non-digit byte (e.g. the `a` in `"10a"`) makes the count bogus.
+///
+/// Returns:
+/// * `Ok(Some(n))` for a clean numeric parse (`n` is the wrapped `unsigned long`,
+///   later range-checked against `INT_MAX` by the caller);
+/// * `Ok(None)` for an empty / all-whitespace value, which strtoul reads as `0`
+///   with no trailing garbage (git then silently uses zero pairs);
+/// * `Err(BogusCount)` when there is trailing garbage or no digits at all.
+fn parse_strtoul_count(value: &str) -> std::result::Result<Option<u64>, ConfigParameterError> {
+    let bytes = value.as_bytes();
+    let mut i = 0;
+    // strtoul skips leading whitespace.
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == bytes.len() {
+        // Empty or all-whitespace: strtoul yields 0 with endp at the end.
+        return Ok(None);
+    }
+    // Optional sign.
+    let negative = match bytes[i] {
+        b'+' => {
+            i += 1;
+            false
+        }
+        b'-' => {
+            i += 1;
+            true
+        }
+        _ => false,
+    };
+    let digits_start = i;
+    let mut acc: u64 = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        // Wrapping mirrors C's unsigned long overflow behaviour; an oversized
+        // value still trips the caller's INT_MAX "too many entries" check.
+        acc = acc
+            .wrapping_mul(10)
+            .wrapping_add((bytes[i] - b'0') as u64);
+        i += 1;
+    }
+    if i == digits_start {
+        // No digits consumed (e.g. "+", "-", "abc") — strtoul leaves endp at the
+        // first char and conversion fails; *endp != 0 is bogus.
+        return Err(ConfigParameterError::BogusCount);
+    }
+    if i != bytes.len() {
+        // Trailing garbage after the number ("10a", "5 ") — *endp != 0.
+        return Err(ConfigParameterError::BogusCount);
+    }
+    if negative {
+        // strtoul negates by wrapping: -n => ULONG_MAX + 1 - n. Any non-zero
+        // magnitude wraps far above INT_MAX, so the caller reports "too many".
+        return Ok(Some(acc.wrapping_neg()));
+    }
+    Ok(Some(acc))
+}
+
+/// Read `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` into
+/// the ordered parameter stream (git's count-driven block in
+/// `git_config_from_parameters`). Returns an empty vector when the count env var
+/// is absent or zero.
+fn env_count_parameters() -> std::result::Result<Vec<ConfigParameter>, ConfigParameterError> {
+    let Some(count) = std::env::var_os("GIT_CONFIG_COUNT") else {
+        return Ok(Vec::new());
+    };
+    let count = count.to_string_lossy();
+    // An empty (or all-whitespace) count parses as 0 under strtoul (`None` here),
+    // i.e. no pairs and no error — git silently ignores any GIT_CONFIG_KEY_* then.
+    let count = parse_strtoul_count(&count)?.unwrap_or(0);
+    if count > i32::MAX as u64 {
+        return Err(ConfigParameterError::TooManyEntries);
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let key_name = format!("GIT_CONFIG_KEY_{index}");
+        let value_name = format!("GIT_CONFIG_VALUE_{index}");
+        let Some(key) = std::env::var_os(&key_name) else {
+            return Err(ConfigParameterError::MissingKey(key_name));
+        };
+        let Some(value) = std::env::var_os(&value_name) else {
+            return Err(ConfigParameterError::MissingValue(value_name));
+        };
+        out.push(parse_config_pair(
+            &key.to_string_lossy(),
+            Some(value.to_string_lossy().into_owned()),
+        )?);
+    }
+    Ok(out)
+}
+
+/// Build the full ordered config-injection parameter stream: `GIT_CONFIG_COUNT`
+/// pairs (read from the process environment) first, then the supplied
+/// `GIT_CONFIG_PARAMETERS` value (`parameters_env`), into which the caller has
+/// already folded `-c` / `--config-env` in command-line order. The result is
+/// lowest-to-highest precedence and is layered on top of the config files by the
+/// caller.
+///
+/// `parameters_env` is passed explicitly rather than read here because the CLI
+/// cannot mutate the process env (the workspace forbids `unsafe`/`set_var`), so
+/// it reconstructs the effective `GIT_CONFIG_PARAMETERS` (inherited env plus the
+/// command-line fragment) itself.
+pub fn injected_config_parameters(
+    parameters_env: Option<&str>,
+) -> std::result::Result<Vec<ConfigParameter>, ConfigParameterError> {
+    let mut out = env_count_parameters()?;
+    if let Some(env) = parameters_env.filter(|env| !env.is_empty()) {
+        out.extend(parse_config_env_list(env)?);
+    }
+    Ok(out)
+}
+
+/// Convert the injection parameter stream into config sections suitable for
+/// appending to a [`GitConfig`] at the end (highest precedence). Each parameter
+/// becomes its own one-entry section so duplicate keys and `--get-all`/`--list`
+/// ordering match git's "each `-c` is a distinct config event" semantics.
+pub fn injected_config_sections(
+    parameters: &[ConfigParameter],
+) -> Vec<ConfigSection> {
+    parameters
+        .iter()
+        .map(|param| {
+            let (section, subsection, key) = param.split_key();
+            ConfigSection::new(
+                section.to_string(),
+                subsection.map(str::to_string),
+                vec![ConfigEntry::new(key.to_string(), param.value.clone())],
+            )
+        })
+        .collect()
+}
+
+/// Quote a string as a single shell word, exactly as git's `sq_quote_buf`:
+/// wrap in `'...'`, escaping each `'` or `!` as `'\''` / `'\!'`. Used by the CLI
+/// to fold `-c` / `--config-env` entries into `GIT_CONFIG_PARAMETERS` the way
+/// `git_config_push_split_parameter` does, so aliases and subprocesses inherit
+/// them and the env-list parser round-trips them.
+pub fn sq_quote(src: &str) -> String {
+    let mut out = String::with_capacity(src.len() + 2);
+    out.push('\'');
+    for ch in src.chars() {
+        if ch == '\'' || ch == '!' {
+            out.push('\'');
+            out.push('\\');
+            out.push(ch);
+            out.push('\'');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Load the *effective* configuration for a repository, merging the system,
 /// global, and repository config files in git's precedence order.
 ///
@@ -1602,6 +2051,214 @@ fn env_bool(name: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn canonicalize_config_key_lowercases_section_and_variable() {
+        // Section and final variable are lowercased; subsection is verbatim.
+        assert_eq!(
+            canonicalize_config_key("Foo.Bar").unwrap(),
+            "foo.bar".to_string()
+        );
+        assert_eq!(
+            canonicalize_config_key("foo.CamelCase").unwrap(),
+            "foo.camelcase".to_string()
+        );
+        // Three-level: middle (subsection) keeps its case.
+        assert_eq!(
+            canonicalize_config_key("V.A.r").unwrap(),
+            "v.A.r".to_string()
+        );
+        // Subsection with dots and spaces is preserved verbatim.
+        assert_eq!(
+            canonicalize_config_key("a.b c.d").unwrap(),
+            "a.b c.d".to_string()
+        );
+        assert_eq!(
+            canonicalize_config_key("key.ambiguous=section.whatever").unwrap(),
+            "key.ambiguous=section.whatever".to_string()
+        );
+    }
+
+    #[test]
+    fn canonicalize_config_key_rejects_invalid_keys() {
+        assert_eq!(
+            canonicalize_config_key("name"),
+            Err(ConfigParameterError::NoSection("name".into()))
+        );
+        assert_eq!(
+            canonicalize_config_key(".a"),
+            Err(ConfigParameterError::NoSection(".a".into()))
+        );
+        assert_eq!(
+            canonicalize_config_key("a."),
+            Err(ConfigParameterError::NoVariableName("a.".into()))
+        );
+        // First variable char must be alphabetic.
+        assert_eq!(
+            canonicalize_config_key("a.0b"),
+            Err(ConfigParameterError::InvalidKey("a.0b".into()))
+        );
+        // Section char must be a key char.
+        assert_eq!(
+            canonicalize_config_key("a b.c"),
+            Err(ConfigParameterError::InvalidKey("a b.c".into()))
+        );
+    }
+
+    #[test]
+    fn parse_config_parameter_splits_first_equals() {
+        // Value split at the FIRST '='; remaining '=' stays in the value.
+        let p = parse_config_parameter("section.foo=value with = in it").unwrap();
+        assert_eq!(p.canonical_key, "section.foo");
+        assert_eq!(p.value.as_deref(), Some("value with = in it"));
+        // No '=' is a bare boolean.
+        let p = parse_config_parameter("foo.flag").unwrap();
+        assert_eq!(p.canonical_key, "foo.flag");
+        assert_eq!(p.value, None);
+        // Empty value after '=' is the empty string, not a bare bool.
+        let p = parse_config_parameter("foo.empty=").unwrap();
+        assert_eq!(p.value.as_deref(), Some(""));
+        // Empty key (leading '=') is a bogus parameter.
+        assert_eq!(
+            parse_config_parameter("=foo"),
+            Err(ConfigParameterError::BogusParameter("=foo".into()))
+        );
+    }
+
+    #[test]
+    fn split_key_round_trips_section_subsection_key() {
+        let p = ConfigParameter {
+            canonical_key: "a.b c.d".to_string(),
+            value: Some("v".to_string()),
+        };
+        assert_eq!(p.split_key(), ("a", Some("b c"), "d"));
+        let p = ConfigParameter {
+            canonical_key: "foo.bar".to_string(),
+            value: None,
+        };
+        assert_eq!(p.split_key(), ("foo", None, "bar"));
+        let p = ConfigParameter {
+            canonical_key: "key.ambiguous=section.whatever".to_string(),
+            value: Some("value".to_string()),
+        };
+        assert_eq!(
+            p.split_key(),
+            ("key", Some("ambiguous=section"), "whatever")
+        );
+    }
+
+    #[test]
+    fn parse_env_list_handles_old_and_new_style() {
+        // old-style 'key=value'
+        let params = parse_config_env_list("'key.one=foo' 'key.two=bar'").unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].canonical_key, "key.one");
+        assert_eq!(params[0].value.as_deref(), Some("foo"));
+        assert_eq!(params[1].value.as_deref(), Some("bar"));
+
+        // new-style 'key'='value'
+        let params = parse_config_env_list("'key.one'='foo'").unwrap();
+        assert_eq!(params[0].canonical_key, "key.one");
+        assert_eq!(params[0].value.as_deref(), Some("foo"));
+
+        // new-style implicit bool 'key'=
+        let params = parse_config_env_list("'key.flag'=").unwrap();
+        assert_eq!(params[0].value, None);
+
+        // old-style ambiguous: the FIRST '=' splits key from value, so the
+        // remaining '=' stays in the value (matches git's left-to-right split).
+        let params = parse_config_env_list("'key.a=section.b=value'").unwrap();
+        assert_eq!(params[0].canonical_key, "key.a");
+        assert_eq!(params[0].value.as_deref(), Some("section.b=value"));
+
+        // new-style ambiguous: the quote boundary fixes the key, so the '=' is
+        // part of the (canonical) subsection and the quoted value stands alone.
+        let params = parse_config_env_list("'key.a=section.b'='value'").unwrap();
+        assert_eq!(params[0].canonical_key, "key.a=section.b");
+        assert_eq!(params[0].value.as_deref(), Some("value"));
+    }
+
+    #[test]
+    fn parse_env_list_dequote_escape_resumes_quoting() {
+        // 'env.one=one'\'''  ->  key "env.one=one'" -> env.one = one'
+        let params = parse_config_env_list("'env.one=one'\\''' 'env.two=two'").unwrap();
+        assert_eq!(params.len(), 2);
+        assert_eq!(params[0].canonical_key, "env.one");
+        assert_eq!(params[0].value.as_deref(), Some("one'"));
+        assert_eq!(params[1].value.as_deref(), Some("two"));
+    }
+
+    #[test]
+    fn parse_env_list_rejects_bogus_format() {
+        // A backslash that does not resume quoting is bogus.
+        assert_eq!(
+            parse_config_env_list("'env.one=one'\\' 'env.two=two'"),
+            Err(ConfigParameterError::BogusEnvFormat)
+        );
+        // A bare empty string parses as a single (empty-key) old-style param.
+        assert_eq!(
+            parse_config_env_list("''"),
+            Err(ConfigParameterError::BogusParameter(String::new()))
+        );
+        // Unquoted leading content is bogus.
+        assert_eq!(
+            parse_config_env_list("notquoted"),
+            Err(ConfigParameterError::BogusEnvFormat)
+        );
+    }
+
+    #[test]
+    fn strtoul_count_matches_git_edge_cases() {
+        assert_eq!(parse_strtoul_count("1"), Ok(Some(1)));
+        assert_eq!(parse_strtoul_count("0"), Ok(Some(0)));
+        // Empty / whitespace -> 0 pairs, no error.
+        assert_eq!(parse_strtoul_count(""), Ok(None));
+        assert_eq!(parse_strtoul_count("   "), Ok(None));
+        // Trailing garbage -> bogus.
+        assert_eq!(
+            parse_strtoul_count("10a"),
+            Err(ConfigParameterError::BogusCount)
+        );
+        // No digits -> bogus.
+        assert_eq!(
+            parse_strtoul_count("+"),
+            Err(ConfigParameterError::BogusCount)
+        );
+        // Negative wraps far past INT_MAX (caller turns this into "too many").
+        assert!(parse_strtoul_count("-1").unwrap().unwrap() > i32::MAX as u64);
+    }
+
+    #[test]
+    fn sq_quote_round_trips_through_dequote() {
+        for value in ["plain", "with space", "with'quote", "with!bang", "a'b!c"] {
+            let quoted = sq_quote(value);
+            let bytes = quoted.as_bytes();
+            let (dequoted, next) =
+                sq_dequote_step(bytes, 0).expect("sq_quote output must dequote");
+            assert_eq!(dequoted, value, "round-trip failed for {value:?}");
+            assert_eq!(next, bytes.len(), "consumed whole word for {value:?}");
+        }
+    }
+
+    #[test]
+    fn injected_sections_become_highest_precedence_entries() {
+        let params = vec![
+            ConfigParameter {
+                canonical_key: "sec.var".to_string(),
+                value: Some("val".to_string()),
+            },
+            ConfigParameter {
+                canonical_key: "sec.var".to_string(),
+                value: Some("VAL".to_string()),
+            },
+        ];
+        let mut config = GitConfig::default();
+        config.sections.extend(injected_config_sections(&params));
+        // Last one wins, case-insensitive on section + variable.
+        assert_eq!(config.get("sec", None, "VAR"), Some("VAL"));
+        // Both values are preserved for --get-all in order.
+        assert_eq!(config.get_all("SEC", None, "var"), vec![Some("val"), Some("VAL")]);
+    }
 
     #[test]
     fn config_parses_sections_values_and_comments() {

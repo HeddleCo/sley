@@ -52,6 +52,61 @@ fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
 }
 
+/// Run a program with an explicit environment overlay, capturing status, stdout,
+/// and stderr. Inherited `GIT_CONFIG*` variables are cleared first so the
+/// config-injection tests are hermetic regardless of the caller's environment.
+fn run_output_with_env(program: &str, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+    let mut command = Command::new(program);
+    command.current_dir(cwd).args(args);
+    for key in [
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_CONFIG_KEY_1",
+        "GIT_CONFIG_VALUE_1",
+    ] {
+        command.env_remove(key);
+    }
+    // Sandbox system/global config so `config --list` (effective) compares only
+    // the repository config plus any injected overrides — identically for the git
+    // oracle and sley, regardless of the developer's real ~/.gitconfig.
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("HOME", cwd)
+        .env("XDG_CONFIG_HOME", cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
+        .output()
+        .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"))
+}
+
+/// Assert that sley matches the git oracle on status + stdout + stderr for the
+/// given args and environment overlay.
+fn assert_env_match(upstream: &Path, rust: &Path, args: &[&str], envs: &[(&str, &str)]) {
+    let expected = run_output_with_env(sley_testkit::oracle_git(), upstream, args, envs);
+    let actual = run_output_with_env(env!("CARGO_BIN_EXE_sley"), rust, args, envs);
+    assert_eq!(
+        actual.status.code(),
+        expected.status.code(),
+        "sley status differed for {args:?} env={envs:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&actual.stdout),
+        String::from_utf8_lossy(&actual.stderr)
+    );
+    assert_eq!(
+        actual.stdout, expected.stdout,
+        "sley stdout differed for {args:?} env={envs:?}"
+    );
+    assert_eq!(
+        actual.stderr, expected.stderr,
+        "sley stderr differed for {args:?} env={envs:?}"
+    );
+}
+
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
     run(sley_testkit::oracle_git(), cwd, args)
 }
@@ -1454,6 +1509,280 @@ fn config_get_set_add_and_unset_match_upstream_git() {
             &upstream,
             &rust,
             &["config", "--local", "--get-all", "remote.origin.fetch"],
+        );
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn config_injection_matches_upstream_git() {
+    let root = unique_temp_dir("config-injection");
+    let upstream = root.join("upstream");
+    let rust = root.join("rust");
+    fs::create_dir_all(&upstream).expect("create upstream repo");
+    fs::create_dir_all(&rust).expect("create rust repo");
+    {
+        git(&upstream, &["init", "-q"]);
+        git(&rust, &["init", "-q"]);
+
+        // --- global `-c key=value` injection -------------------------------
+        // basic, CamelCase folding, bare bool, empty value, value with '='.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "section.name=value", "config", "section.name"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "foo.CamelCase=value", "config", "foo.camelcase"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "foo.flag", "config", "--bool", "foo.flag"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "foo.empty=", "config", "--path", "foo.empty"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "section.foo=value with = in it", "config", "section.foo"],
+            &[],
+        );
+        // last one wins (two-level: case-insensitive on first+last level).
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "sec.var=val", "-c", "sec.VAR=VAL", "config", "--get", "sec.var"],
+            &[],
+        );
+        // three-level: middle level is case-sensitive, so these are distinct.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "v.a.r=val", "-c", "v.A.r=VAL", "config", "--get", "v.a.r"],
+            &[],
+        );
+        // injected entries show up in --list.
+        assert_env_match(&upstream, &rust, &["-c", "x.one=1", "config", "--list"], &[]);
+
+        // --- invalid `-c` keys are rejected --------------------------------
+        for bad in ["name=value", "=foo", "", "a.0b=VAL", ".a=VAL", "a.=VAL"] {
+            assert_env_match(&upstream, &rust, &["-c", bad, "config", "--list"], &[]);
+        }
+
+        // --- `--config-env` ------------------------------------------------
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["--config-env=core.name=ENVVAR", "config", "core.name"],
+            &[("ENVVAR", "value")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["--config-env", "core.name=ENVVAR", "config", "core.name"],
+            &[("ENVVAR", "value")],
+        );
+        // key with '=' splits at the LAST '=' (key vs envvar name).
+        assert_env_match(
+            &upstream,
+            &rust,
+            &[
+                "--config-env=section.subsection=with=equals.key=ENVVAR",
+                "config",
+                "section.subsection=with=equals.key",
+            ],
+            &[("ENVVAR", "value=with=equals")],
+        );
+        // `--config-env` error wording.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["--config-env=foo.flag", "config", "--bool", "foo.flag"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["--config-env=foo.flag=", "config", "--bool", "foo.flag"],
+            &[],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["--config-env=foo.flag=NONEXISTENT", "config", "--bool", "foo.flag"],
+            &[],
+        );
+        // `-c` and `--config-env` combine and override left-to-right.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &[
+                "-c",
+                "bar.cmd=cmd-value",
+                "--config-env=bar.env=ENVVAR",
+                "config",
+                "--get-regexp",
+                "^bar.*",
+            ],
+            &[("ENVVAR", "env-value")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &[
+                "-c",
+                "bar.bar=cmd",
+                "--config-env=bar.bar=ENVVAR",
+                "config",
+                "bar.bar",
+            ],
+            &[("ENVVAR", "env")],
+        );
+
+        // --- GIT_CONFIG_PARAMETERS ----------------------------------------
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "key.*"],
+            &[(
+                "GIT_CONFIG_PARAMETERS",
+                "'key.one=foo'  'key.two=bar' 'key.ambiguous=section.whatever=value'",
+            )],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "key.*"],
+            &[(
+                "GIT_CONFIG_PARAMETERS",
+                "'key.one'='foo'  'key.two'='bar' 'key.ambiguous=section.whatever'='value'",
+            )],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "key.*"],
+            &[(
+                "GIT_CONFIG_PARAMETERS",
+                "'key.with=equals.oldbool' 'key.with=equals.newbool'=",
+            )],
+        );
+        // bogus GIT_CONFIG_PARAMETERS (trailing backslash that does not resume).
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "env.*"],
+            &[("GIT_CONFIG_PARAMETERS", "'env.one=one'\\' 'env.two=two'")],
+        );
+        // backslash-escape that resumes quoting keeps the quote in the value.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "env.*"],
+            &[("GIT_CONFIG_PARAMETERS", "'env.one=one'\\''' 'env.two=two'")],
+        );
+
+        // --- GIT_CONFIG_COUNT / KEY / VALUE -------------------------------
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get-regexp", "pair.*"],
+            &[
+                ("GIT_CONFIG_COUNT", "2"),
+                ("GIT_CONFIG_KEY_0", "pair.one"),
+                ("GIT_CONFIG_VALUE_0", "foo"),
+                ("GIT_CONFIG_KEY_1", "pair.two"),
+                ("GIT_CONFIG_VALUE_1", "bar"),
+            ],
+        );
+        // invalid / boundary counts.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--list"],
+            &[("GIT_CONFIG_COUNT", "10a")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--list"],
+            &[("GIT_CONFIG_COUNT", "9999999999999999")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--list"],
+            &[("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_VALUE_0", "value")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--list"],
+            &[("GIT_CONFIG_COUNT", "1"), ("GIT_CONFIG_KEY_0", "pair.one")],
+        );
+
+        // --- precedence: command line beats env beats file ----------------
+        let set_pair = ["config", "set", "--local", "pair.one", "fromfile"];
+        assert_eq!(git(&upstream, &set_pair), git_rs(&rust, &set_pair));
+        // env-count overrides the file.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get", "pair.one"],
+            &[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "pair.one"),
+                ("GIT_CONFIG_VALUE_0", "fromenv"),
+            ],
+        );
+        // command-line `-c` overrides env-count.
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "pair.one=fromcmd", "config", "--get", "pair.one"],
+            &[
+                ("GIT_CONFIG_COUNT", "1"),
+                ("GIT_CONFIG_KEY_0", "pair.one"),
+                ("GIT_CONFIG_VALUE_0", "fromenv"),
+            ],
+        );
+
+        // --- `-c` does NOT leak into an explicit `-f` file read -----------
+        let other = rust.join("other.cfg");
+        fs::write(&other, "[pair]\n\tone = fromotherfile\n").expect("write other.cfg");
+        let other_up = upstream.join("other.cfg");
+        fs::write(&other_up, "[pair]\n\tone = fromotherfile\n").expect("write other.cfg");
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["-c", "pair.one=fromcmd", "config", "-f", "other.cfg", "pair.one"],
+            &[],
+        );
+
+        // --- legacy GIT_CONFIG=<file> source ------------------------------
+        fs::write(rust.join("alt.cfg"), "[ein]\n\tbahn = strasse\n").expect("write alt.cfg");
+        fs::write(upstream.join("alt.cfg"), "[ein]\n\tbahn = strasse\n").expect("write alt.cfg");
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--list"],
+            &[("GIT_CONFIG", "alt.cfg")],
+        );
+        assert_env_match(
+            &upstream,
+            &rust,
+            &["config", "--get", "ein.bahn"],
+            &[("GIT_CONFIG", "alt.cfg")],
         );
     };
     let _ = fs::remove_dir_all(&root);
