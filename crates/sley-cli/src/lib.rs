@@ -1752,14 +1752,9 @@ fn print_global_usage() {
 
 fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
     let mut bare = global_bare();
-    let mut object_format = None::<ObjectFormat>;
+    let mut object_format = None::<String>;
     let mut ref_format = None::<Option<String>>;
-    let mut initial_branch = global_config
-        .iter()
-        .rev()
-        .find(|entry| entry.key.eq_ignore_ascii_case("init.defaultBranch"))
-        .map(|entry| entry.value.clone())
-        .unwrap_or_else(|| "main".to_string());
+    let mut initial_branch = None::<String>;
     let mut initial_branch_explicit = false;
     let mut quiet = false;
     let mut path = PathBuf::from(".");
@@ -1775,19 +1770,18 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
             "-s" | "--shared" => shared_repository = Some(Some("group".into())),
             "--no-shared" => shared_repository = Some(None),
             "-b" | "--initial-branch" => {
-                initial_branch = iter
-                    .next()
-                    .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?
-                    .to_string();
+                initial_branch = Some(
+                    iter.next()
+                        .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?
+                        .to_string(),
+                );
                 initial_branch_explicit = true;
             }
-            "--object-format=sha1" => object_format = Some(ObjectFormat::Sha1),
-            "--object-format=sha256" => object_format = Some(ObjectFormat::Sha256),
             "--object-format" => {
                 let value = iter
                     .next()
                     .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
-                object_format = Some(value.parse()?);
+                object_format = Some(value.to_string());
             }
             "--template" => {
                 template = Some(Some(
@@ -1819,17 +1813,21 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
             }
             "--no-ref-format" => ref_format = Some(None),
             value if value.starts_with("--initial-branch=") => {
-                initial_branch = value
-                    .strip_prefix("--initial-branch=")
-                    .ok_or_else(|| GitError::Command("--initial-branch requires a value".into()))?
-                    .to_string();
+                initial_branch = Some(
+                    value
+                        .strip_prefix("--initial-branch=")
+                        .ok_or_else(|| {
+                            GitError::Command("--initial-branch requires a value".into())
+                        })?
+                        .to_string(),
+                );
                 initial_branch_explicit = true;
             }
             value if value.starts_with("--object-format=") => {
                 let value = value
                     .strip_prefix("--object-format=")
                     .ok_or_else(|| GitError::Command("--object-format requires a value".into()))?;
-                object_format = Some(value.parse()?);
+                object_format = Some(value.to_string());
             }
             value if value.starts_with("--template=") => {
                 template = Some(Some(
@@ -1879,6 +1877,13 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         bare = true;
     }
 
+    let initial_branch = match initial_branch {
+        Some(branch) => branch,
+        None => init_config_value("init.defaultBranch", global_config)?
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "master".to_string()),
+    };
+
     validate_ref_name(&format!("refs/heads/{initial_branch}"))?;
 
     let cwd = env::current_dir()?;
@@ -1890,14 +1895,17 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         return Err(GitError::Exit(128));
     }
 
-    let object_format = resolve_init_object_format(object_format, global_config)?;
-    let ref_storage = resolve_init_ref_storage(ref_format, global_config)?;
+    let (object_format, object_format_explicit) =
+        resolve_init_object_format(object_format, global_config)?;
+    let (ref_storage, ref_storage_explicit) =
+        resolve_init_ref_storage(ref_format, global_config)?;
     let shared_repository = resolve_init_shared_repository(shared_repository, global_config, bare)?;
     let template_dir = resolve_init_template_dir(template, template_config, global_config, &cwd)?;
 
     let layout = RepositoryBootstrap::init(InitOptions {
         worktree,
         object_format,
+        object_format_explicit,
         bare,
         initial_branch: initial_branch.clone(),
         template_dir,
@@ -1905,6 +1913,17 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         separate_git_dir,
         shared_repository,
         ref_storage,
+        ref_storage_explicit,
+    })
+    .map_err(|err| match err {
+        // Bootstrap reports fatal init failures (e.g. reinitializing with a different
+        // object/ref format) as `GitError::Command`; git prints these as `fatal: <msg>`
+        // and exits 128.
+        GitError::Command(message) => {
+            eprintln!("fatal: {message}");
+            GitError::Exit(128)
+        }
+        other => other,
     })?;
 
     if layout.reinitialized && initial_branch_explicit {
@@ -1922,55 +1941,82 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     Ok(())
 }
 
+/// Resolve the object format for a *fresh* init, returning the chosen format and
+/// whether it was specified explicitly on the command line.
+///
+/// Mirrors git's `repository_format_configure` precedence: an explicit
+/// `--object-format` wins (and a bad value is fatal); otherwise `GIT_DEFAULT_HASH`
+/// is consulted (also fatal on a bad value); otherwise the `init.defaultObjectFormat`
+/// config default is used (a bad value here only warns and falls back to sha1). The
+/// reinitialize-with-different-hash guard is applied later in
+/// [`RepositoryBootstrap::init`], once the existing repository format is known.
 fn resolve_init_object_format(
-    cli_format: Option<ObjectFormat>,
+    cli_format: Option<String>,
     global_config: &[GlobalConfigOverride],
-) -> Result<ObjectFormat> {
-    if let Some(format) = cli_format {
-        return Ok(format);
+) -> Result<(ObjectFormat, bool)> {
+    if let Some(value) = cli_format {
+        return Ok((parse_init_object_format(&value)?, true));
     }
     if let Ok(hash) = env::var("GIT_DEFAULT_HASH") {
         if !hash.is_empty() {
-            return hash.parse();
+            return Ok((parse_init_object_format(&hash)?, false));
         }
     }
     if let Some(value) = init_config_value("init.defaultObjectFormat", global_config)? {
         match value.parse::<ObjectFormat>() {
-            Ok(format) => return Ok(format),
+            Ok(format) => return Ok((format, false)),
             Err(_) => {
-                eprintln!("warning: unknown hash algorithm option: {value}");
+                eprintln!("warning: unknown hash algorithm '{value}'");
             }
         }
     }
-    Ok(ObjectFormat::Sha1)
+    Ok((ObjectFormat::Sha1, false))
 }
 
+/// Parse an object-format name the way git's `init` does: an unrecognised value is a
+/// `fatal: unknown hash algorithm '<value>'` with exit status 128.
+fn parse_init_object_format(value: &str) -> Result<ObjectFormat> {
+    value.parse::<ObjectFormat>().map_err(|_| {
+        eprintln!("fatal: unknown hash algorithm '{value}'");
+        GitError::Exit(128)
+    })
+}
+
+/// Resolve the ref storage format for a *fresh* init, returning the chosen format and
+/// whether it was specified explicitly on the command line.
+///
+/// Mirrors git's `repository_format_configure` precedence: an explicit `--ref-format`
+/// wins (and a bad value is fatal); otherwise `GIT_DEFAULT_REF_FORMAT` is consulted
+/// (also fatal on a bad value); otherwise the `init.defaultRefFormat` config default is
+/// used (a bad value here only warns and falls back to the default), with
+/// `feature.experimental` selecting reftable as the last resort. The
+/// reinitialize-with-different-format guard is applied later in
+/// [`RepositoryBootstrap::init`], once the existing repository format is known.
 fn resolve_init_ref_storage(
     cli_ref_format: Option<Option<String>>,
     global_config: &[GlobalConfigOverride],
-) -> Result<RefStorageFormat> {
+) -> Result<(RefStorageFormat, bool)> {
     if let Some(value) = cli_ref_format {
-        return parse_init_ref_storage(value.as_deref().unwrap_or(""));
+        return Ok((parse_init_ref_storage(value.as_deref().unwrap_or(""))?, true));
     }
     if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {
-        return parse_init_ref_storage(&value);
+        return Ok((parse_init_ref_storage(&value)?, false));
     }
     if let Some(value) = init_config_value("init.defaultRefFormat", global_config)? {
         if value.is_empty() {
-            return Ok(RefStorageFormat::Files);
+            return Ok((RefStorageFormat::Files, false));
         }
-        match parse_init_ref_storage(&value) {
-            Ok(format) => return Ok(format),
-            Err(GitError::Exit(128)) => return Err(GitError::Exit(128)),
+        match RefStorageFormat::parse(&value) {
+            Ok(format) => return Ok((format, false)),
             Err(_) => {
-                eprintln!("warning: unknown ref format option: {value}");
+                eprintln!("warning: unknown ref storage format '{value}'");
             }
         }
     }
     if init_config_bool("feature.experimental", global_config)?.unwrap_or(false) {
-        return Ok(RefStorageFormat::Reftable);
+        return Ok((RefStorageFormat::Reftable, false));
     }
-    Ok(RefStorageFormat::Files)
+    Ok((RefStorageFormat::Files, false))
 }
 
 fn parse_init_ref_storage(value: &str) -> Result<RefStorageFormat> {

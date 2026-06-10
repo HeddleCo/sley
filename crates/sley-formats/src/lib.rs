@@ -1701,6 +1701,10 @@ impl RefStorageFormat {
 pub struct InitOptions {
     pub worktree: PathBuf,
     pub object_format: ObjectFormat,
+    /// Whether `object_format` came from an explicit `--object-format` flag (as
+    /// opposed to an env/config default). On reinit, an explicit format that differs
+    /// from the existing repository is a fatal error; a defaulted one is ignored.
+    pub object_format_explicit: bool,
     pub bare: bool,
     pub initial_branch: String,
     pub template_dir: Option<PathBuf>,
@@ -1708,6 +1712,10 @@ pub struct InitOptions {
     pub separate_git_dir: Option<PathBuf>,
     pub shared_repository: Option<String>,
     pub ref_storage: RefStorageFormat,
+    /// Whether `ref_storage` came from an explicit `--ref-format` flag (as opposed to
+    /// an env/config default). On reinit, an explicit format that differs from the
+    /// existing repository is a fatal error; a defaulted one is ignored.
+    pub ref_storage_explicit: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1773,6 +1781,31 @@ impl RepositoryBootstrap {
         };
 
         let reinitialized = git_dir.join("HEAD").exists();
+
+        // On reinit the existing repository's formats are authoritative. Git refuses an
+        // explicit `--object-format`/`--ref-format` that disagrees with the existing
+        // repository (it could corrupt the object store), but silently ignores env/config
+        // defaults that disagree. A defaulted format never rewrites an existing repo, so
+        // the effective formats below drive both the on-disk layout and the returned
+        // `RepositoryLayout`.
+        let (object_format, ref_storage) = if reinitialized {
+            let existing = read_existing_repository_formats(&git_dir)?;
+            if options.object_format_explicit && options.object_format != existing.0 {
+                return Err(GitError::Command(
+                    "attempt to reinitialize repository with different hash".into(),
+                ));
+            }
+            if options.ref_storage_explicit && options.ref_storage != existing.1 {
+                return Err(GitError::Command(
+                    "attempt to reinitialize repository with different reference storage format"
+                        .into(),
+                ));
+            }
+            existing
+        } else {
+            (options.object_format, options.ref_storage)
+        };
+
         create_shared_dir(&git_dir, options.shared_repository.as_deref())?;
         create_shared_dir(
             git_dir.join("objects/info"),
@@ -1783,7 +1816,7 @@ impl RepositoryBootstrap {
             options.shared_repository.as_deref(),
         )?;
 
-        if options.ref_storage == RefStorageFormat::Files {
+        if ref_storage == RefStorageFormat::Files {
             create_shared_dir(
                 git_dir.join("refs/heads"),
                 options.shared_repository.as_deref(),
@@ -1800,7 +1833,7 @@ impl RepositoryBootstrap {
         }
 
         let head_path = git_dir.join("HEAD");
-        if options.ref_storage == RefStorageFormat::Files {
+        if ref_storage == RefStorageFormat::Files {
             if !head_path.exists() {
                 fs::write(
                     &head_path,
@@ -1809,7 +1842,7 @@ impl RepositoryBootstrap {
             }
         } else if !head_path.exists() {
             fs::write(&head_path, b"ref: refs/heads/.invalid\n")?;
-            write_initial_reftable(&git_dir, options.object_format, &options.initial_branch)?;
+            write_initial_reftable(&git_dir, object_format, &options.initial_branch)?;
         }
 
         let config_path = git_dir.join("config");
@@ -1817,10 +1850,10 @@ impl RepositoryBootstrap {
             fs::write(
                 config_path,
                 build_init_config(
-                    options.object_format,
+                    object_format,
                     options.bare,
                     &options.shared_repository,
-                    options.ref_storage,
+                    ref_storage,
                 )
                 .to_canonical_bytes(),
             )?;
@@ -1844,12 +1877,29 @@ impl RepositoryBootstrap {
         Ok(RepositoryLayout {
             git_dir,
             worktree,
-            object_format: options.object_format,
+            object_format,
             bare: options.bare,
-            ref_storage: options.ref_storage,
+            ref_storage,
             reinitialized,
         })
     }
+}
+
+/// Read the object and ref storage formats recorded in an existing repository's config.
+///
+/// `git_dir` must be the repository's (common) git directory. A missing or unreadable
+/// config — or an absent `extensions.*` key — falls back to git's defaults (sha1 /
+/// files), matching how git treats a freshly created v0 repository.
+fn read_existing_repository_formats(git_dir: &Path) -> Result<(ObjectFormat, RefStorageFormat)> {
+    let Ok(config) = GitConfig::read(git_dir.join("config")) else {
+        return Ok((ObjectFormat::Sha1, RefStorageFormat::Files));
+    };
+    let object_format = config.repository_object_format()?;
+    let ref_storage = match config.get("extensions", None, "refStorage") {
+        Some(value) if value.eq_ignore_ascii_case("reftable") => RefStorageFormat::Reftable,
+        _ => RefStorageFormat::Files,
+    };
+    Ok((object_format, ref_storage))
 }
 
 impl RepositoryLayout {
@@ -1870,6 +1920,7 @@ impl RepositoryLayout {
         RepositoryBootstrap::init(InitOptions {
             worktree: path.as_ref().to_path_buf(),
             object_format,
+            object_format_explicit: false,
             bare,
             initial_branch: initial_branch.into(),
             template_dir: None,
@@ -1877,6 +1928,7 @@ impl RepositoryLayout {
             separate_git_dir: None,
             shared_repository: None,
             ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
         })
     }
 }
@@ -2910,6 +2962,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             worktree: repo.clone(),
             object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
             bare: false,
             initial_branch: "main".into(),
             template_dir: Some(template),
@@ -2917,6 +2970,7 @@ mod tests {
             separate_git_dir: None,
             shared_repository: None,
             ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
         })
         .expect("init should succeed");
 
@@ -2938,6 +2992,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             worktree: worktree.clone(),
             object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
             bare: false,
             initial_branch: "main".into(),
             template_dir: None,
@@ -2945,6 +3000,7 @@ mod tests {
             separate_git_dir: Some(gitdir.clone()),
             shared_repository: None,
             ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
         })
         .expect("init should succeed");
 
@@ -2962,6 +3018,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             worktree: repo,
             object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
             bare: false,
             initial_branch: "main".into(),
             template_dir: None,
@@ -2969,6 +3026,7 @@ mod tests {
             separate_git_dir: None,
             shared_repository: None,
             ref_storage: RefStorageFormat::Reftable,
+            ref_storage_explicit: false,
         })
         .expect("init should succeed");
 
@@ -2989,6 +3047,7 @@ mod tests {
         let layout = RepositoryBootstrap::init(InitOptions {
             worktree: repo,
             object_format: ObjectFormat::Sha1,
+            object_format_explicit: false,
             bare: false,
             initial_branch: "main".into(),
             template_dir: None,
@@ -2996,6 +3055,7 @@ mod tests {
             separate_git_dir: None,
             shared_repository: Some("group".into()),
             ref_storage: RefStorageFormat::Files,
+            ref_storage_explicit: false,
         })
         .expect("init should succeed");
 
