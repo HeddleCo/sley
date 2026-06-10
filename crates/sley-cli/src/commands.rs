@@ -38,6 +38,7 @@ pub(crate) mod patch_id;
 pub(crate) mod read_tree;
 pub(crate) mod refs;
 pub(crate) mod remote_cmds;
+pub(crate) mod rev_list;
 pub(crate) mod rev_parse;
 pub(crate) mod shortlog;
 pub(crate) mod show;
