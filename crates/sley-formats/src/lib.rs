@@ -1744,12 +1744,25 @@ impl RepositoryBootstrap {
         }
 
         let dot_git = worktree.join(".git");
+        // git computes `original_git_dir = real_pathdup(git_dir)` and writes the
+        // `gitdir:` link there. When `.git` is a symlink to the real git directory,
+        // git therefore moves the *resolved* directory and rewrites the gitlink
+        // through the symlink (so `.git` stays a symlink and its target becomes the
+        // gitlink file). `git_link` is the path that receives the `gitdir:` line.
+        let dot_git_is_symlink = fs::symlink_metadata(&dot_git)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        let git_link = if dot_git_is_symlink {
+            fs::canonicalize(&dot_git).unwrap_or_else(|_| dot_git.clone())
+        } else {
+            dot_git.clone()
+        };
         let mut write_git_link = false;
         let git_dir = if options.bare {
             worktree.clone()
-        } else if dot_git.is_file() {
-            let existing = read_gitdir_file(&dot_git)?.ok_or_else(|| {
-                GitError::InvalidFormat(format!("invalid gitfile {}", dot_git.display()))
+        } else if git_link.is_file() {
+            let existing = read_gitdir_file(&git_link)?.ok_or_else(|| {
+                GitError::InvalidFormat(format!("invalid gitfile {}", git_link.display()))
             })?;
             if let Some(new_separate) = options.separate_git_dir.clone() {
                 if existing != new_separate {
@@ -1772,8 +1785,11 @@ impl RepositoryBootstrap {
             if let Some(parent) = separate_git_dir.parent() {
                 create_shared_dir(parent, options.shared_repository.as_deref())?;
             }
-            if dot_git.is_dir() && !separate_git_dir.exists() {
-                fs::rename(&dot_git, &separate_git_dir)?;
+            // Move the *resolved* git directory (`git_link`), which is `.git` itself
+            // when it is a real directory or its symlink target when `.git` is a
+            // symlink. `is_dir()` follows symlinks, so it is true in both cases.
+            if git_link.is_dir() && !separate_git_dir.exists() {
+                fs::rename(&git_link, &separate_git_dir)?;
             }
             separate_git_dir
         } else {
@@ -1870,8 +1886,11 @@ impl RepositoryBootstrap {
 
         if write_git_link {
             let link_target = gitdir_link_path(&worktree, &git_dir)?;
-            fs::write(&dot_git, format!("gitdir: {link_target}\n"))?;
-            apply_shared_file_mode(&dot_git, options.shared_repository.as_deref())?;
+            // Write through `git_link`: identical to `.git` in the common case, but
+            // the symlink *target* when `.git` is a symlink (git leaves the symlink
+            // itself intact and turns its target into the gitlink file).
+            fs::write(&git_link, format!("gitdir: {link_target}\n"))?;
+            apply_shared_file_mode(&git_link, options.shared_repository.as_deref())?;
         }
 
         Ok(RepositoryLayout {
@@ -2052,34 +2071,15 @@ fn read_gitdir_file(path: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
-fn gitdir_link_path(worktree: &Path, git_dir: &Path) -> Result<String> {
-    if let (Ok(worktree), Ok(git_dir)) = (fs::canonicalize(worktree), fs::canonicalize(git_dir)) {
-        if let Some(relative) = relative_path_from(&worktree, &git_dir) {
-            return Ok(relative);
-        }
-    }
-    Ok(git_dir.display().to_string())
-}
-
-fn relative_path_from(base: &Path, target: &Path) -> Option<String> {
-    let base = base.components().collect::<Vec<_>>();
-    let target = target.components().collect::<Vec<_>>();
-    let common = base
-        .iter()
-        .zip(target.iter())
-        .take_while(|(left, right)| left == right)
-        .count();
-    if common == 0 {
-        return None;
-    }
-    let mut out = PathBuf::new();
-    for _ in common..base.len() {
-        out.push("..");
-    }
-    for component in &target[common..] {
-        out.push(component);
-    }
-    out.to_str().map(str::to_string)
+/// Compute the value git writes into the worktree's `.git` link file.
+///
+/// git's `separate_git_dir()` writes `gitdir: <real_git_dir>`, where `real_git_dir`
+/// was made absolute via `real_pathdup()` (resolving symlinks) up front in
+/// `init-db.c`. So the link always holds an *absolute, symlink-resolved* path — never
+/// a relative one. We mirror that by canonicalizing the now-created git directory.
+fn gitdir_link_path(_worktree: &Path, git_dir: &Path) -> Result<String> {
+    let resolved = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+    Ok(resolved.display().to_string())
 }
 
 fn create_shared_dir(path: impl AsRef<Path>, shared_repository: Option<&str>) -> Result<()> {

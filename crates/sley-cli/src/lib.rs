@@ -1850,8 +1850,71 @@ fn print_global_usage() {
     );
 }
 
+/// Replicate git's implicit-bare determination for `git init --separate-git-dir`.
+///
+/// git computes `is_bare_repository_cfg = guess_repository_type(git_dir)` only when
+/// `--bare` was not given (init-db.c). `git_dir` is `GIT_DIR` when set; otherwise it
+/// defaults to `.git`, *unless* `.git` is a gitfile for a linked worktree — i.e. the
+/// gitfile's target contains a `commondir` file — in which case git chdir's to the
+/// main worktree and inspects the resolved *common* git directory instead. A plain
+/// `--separate-git-dir` gitfile (no `commondir`) leaves `git_dir == ".git"`, which is
+/// never bare. `guess_repository_type` treats `GIT_DIR=.` / `GIT_DIR=$cwd` and any
+/// path not ending in `/.git` as bare, and `.git` / `*/.git` as non-bare; for a bare
+/// clone behind a worktree (e.g. `git clone --bare` + `git worktree add`) the common
+/// dir is `…/bare.git`, which `guess_repository_type` already reports as bare.
+fn init_repo_is_implicitly_bare(cwd: &Path) -> Result<bool> {
+    // Determine the effective git directory git would inspect.
+    if let Some(git_dir) = environment_git_dir() {
+        return Ok(guess_repository_type(&git_dir, cwd));
+    }
+    // No GIT_DIR: git_dir defaults to ".git". Only a linked-worktree gitfile (whose
+    // target has a `commondir`) redirects the inspection to the common repository;
+    // a plain separate-git-dir gitfile does not.
+    let dot_git = cwd.join(".git");
+    if dot_git.is_file()
+        && let Some(target) = read_gitdir_file(&dot_git)?
+        && target.join("commondir").is_file()
+    {
+        let common = common_git_dir_for_git_dir(&target)?;
+        return Ok(guess_repository_type(&common, cwd));
+    }
+    // Otherwise git_dir is ".git", which guess_repository_type treats as non-bare.
+    Ok(false)
+}
+
+/// Mirror of git's `guess_repository_type()` (builtin/init-db.c): decide whether a
+/// git directory path implies a bare repository.
+fn guess_repository_type(git_dir: &Path, cwd: &Path) -> bool {
+    // "GIT_DIR=. git init" — and "GIT_DIR=$(pwd) git init" — are always bare.
+    if git_dir == Path::new(".") {
+        return true;
+    }
+    if git_dir == cwd {
+        return true;
+    }
+    // "GIT_DIR=.git" or "GIT_DIR=something/.git" is usually NOT bare.
+    if git_dir == Path::new(".git") {
+        return false;
+    }
+    if git_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == ".git")
+    {
+        return false;
+    }
+    // Otherwise it is often bare. At this point git is just guessing.
+    true
+}
+
 fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<()> {
     let mut bare = global_bare();
+    // git distinguishes an *explicitly requested* bare repo (`--bare`/global
+    // `--bare`) from one merely *guessed* from the environment. The former pairs
+    // with `--separate-git-dir` as "cannot be used together"; the latter as
+    // "incompatible with bare repository". Track the explicit signal separately
+    // from the `.git`-suffix path heuristic applied further down.
+    let mut bare_explicit = global_bare();
     let mut object_format = None::<String>;
     let mut ref_format = None::<Option<String>>;
     let mut initial_branch = None::<String>;
@@ -1865,7 +1928,10 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--bare" => bare = true,
+            "--bare" => {
+                bare = true;
+                bare_explicit = true;
+            }
             "-q" | "--quiet" => quiet = true,
             "-s" | "--shared" => shared_repository = Some(Some("group".into())),
             "--no-shared" => shared_repository = Some(None),
@@ -1990,9 +2056,21 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     let worktree = resolve_cli_path(&cwd, path.to_string_lossy().as_ref());
     let separate_git_dir = separate_git_dir.map(|value| resolve_cli_path(&cwd, &value));
 
-    if bare && separate_git_dir.is_some() {
-        eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
-        return Err(GitError::Exit(128));
+    if separate_git_dir.is_some() {
+        if bare_explicit {
+            // init-db.c: `real_git_dir && is_bare_repository_cfg == 1` where the
+            // `1` came from the `--bare` option.
+            eprintln!("fatal: options '--bare' and '--separate-git-dir' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+        // init-db.c later sets `is_bare_repository_cfg = guess_repository_type(git_dir)`
+        // when bare was not explicit, then rejects `--separate-git-dir` against an
+        // implicitly-bare repository (e.g. `GIT_DIR=.`, or inside a linked worktree
+        // whose common repository is bare).
+        if init_repo_is_implicitly_bare(&cwd)? {
+            eprintln!("fatal: --separate-git-dir incompatible with bare repository");
+            return Err(GitError::Exit(128));
+        }
     }
 
     let (object_format, object_format_explicit) =
