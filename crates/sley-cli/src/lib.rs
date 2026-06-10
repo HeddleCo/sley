@@ -17247,7 +17247,11 @@ fn log_inter_hunk_context_requires_number_error() -> Result<()> {
 }
 
 fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
-    if value.chars().count() <= 1 {
+    // git's diff_opt_char (diff.c) accepts the value only when it is exactly one
+    // byte long: it errors via `if (arg[1])` and the empty string is rejected too,
+    // so the contract is a single byte. A multibyte single Unicode scalar (len 2+)
+    // is therefore rejected, matching git 2.54.
+    if value.len() == 1 {
         return Ok(());
     }
     eprintln!("error: {option} expects a character, got '{value}'");
@@ -20006,7 +20010,7 @@ fn parse_simple_log_regex_class(
         }
     }
     let Some(end) = end else {
-        return log_regex_unbalanced_brackets_error(pattern, error_context);
+        return log_regex_unterminated_class_error(bytes, pattern, error_context);
     };
     let mut class = &bytes[..end];
     let negated = class.first().copied().is_some_and(|byte| byte == b'^');
@@ -20027,11 +20031,25 @@ fn parse_simple_log_regex_class(
     Ok((SimpleLogRegexClass { negated, items }, end))
 }
 
-fn log_regex_unbalanced_brackets_error(
+fn log_regex_unterminated_class_error(
+    class_bytes: &[u8],
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    eprintln!("fatal: {error_context}, '{pattern}': brackets ([ ]) not balanced");
+    // `class_bytes` is everything after the opening `[`. git (via POSIX regerror)
+    // distinguishes two cases: an opening bracket with no class content at all —
+    // `[` or `[^` at end of pattern — reports a generic "Invalid regular
+    // expression"; an unterminated class that does have content (e.g. `[a`, `[]`,
+    // `[[:alpha:]`) reports the bracket-specific "Unmatched" diagnostic. In POSIX
+    // BRE a `]` immediately following `[`/`[^` is a literal member, so it counts as
+    // content. Match that split exactly for git 2.54 parity.
+    let after_caret = class_bytes.strip_prefix(b"^").unwrap_or(class_bytes);
+    let message = if after_caret.is_empty() {
+        "Invalid regular expression"
+    } else {
+        "Unmatched [, [^, [:, [., or [="
+    };
+    eprintln!("fatal: {error_context}, '{pattern}': {message}");
     Err(GitError::Exit(128))
 }
 
