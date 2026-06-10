@@ -3404,15 +3404,22 @@ fn for_each_ref_upstream_track(
     oid: &ObjectId,
     upstream: &str,
 ) -> Result<Option<ForEachRefTrack>> {
+    // git: a configured-but-unresolvable upstream reports `[gone]`, distinct
+    // from "no upstream configured" (which the caller already filtered out).
+    let gone_track = ForEachRefTrack {
+        ahead: 0,
+        behind: 0,
+        gone: true,
+    };
     let Some(upstream_target) = store.read_ref(upstream)? else {
-        return Ok(None);
+        return Ok(Some(gone_track));
     };
     let upstream_ref = sley_refs::Ref {
         name: upstream.to_string(),
         target: upstream_target,
     };
     let Some((upstream_oid, _)) = resolve_for_each_ref_target(store, &upstream_ref)? else {
-        return Ok(None);
+        return Ok(Some(gone_track));
     };
     for_each_ref_ahead_behind(db, format, oid, &upstream_oid)
 }
@@ -3439,7 +3446,11 @@ fn for_each_ref_ahead_behind(
         .collect::<HashSet<_>>();
     let ahead = local_reachable.difference(&target_reachable).count();
     let behind = target_reachable.difference(&local_reachable).count();
-    Ok(Some(ForEachRefTrack { ahead, behind }))
+    Ok(Some(ForEachRefTrack {
+        ahead,
+        behind,
+        gone: false,
+    }))
 }
 
 struct ForEachRefContents<'a> {
@@ -3538,6 +3549,7 @@ struct ForEachRefFormatContext<'a> {
     push_track: Option<ForEachRefTrack>,
     contents: Option<ForEachRefContents<'a>>,
     peeled_object: Option<ForEachRefPeeledObject<'a>>,
+    mailmap: &'a commands::utility::Mailmap,
 }
 
 struct ForEachRefPeeledObject<'a> {
@@ -3689,7 +3701,7 @@ fn print_for_each_ref_format(
                     write_for_each_ref_track(stdout, track, true)?;
                 }
             }
-            "upstream:track,nobracket" => {
+            "upstream:track,nobracket" | "upstream:nobracket,track" => {
                 if let Some(track) = context.upstream_track {
                     write_for_each_ref_track(stdout, track, false)?;
                 }
@@ -3737,7 +3749,7 @@ fn print_for_each_ref_format(
                     write_for_each_ref_track(stdout, track, true)?;
                 }
             }
-            "push:track,nobracket" => {
+            "push:track,nobracket" | "push:nobracket,track" => {
                 if let Some(track) = context.push_track {
                     write_for_each_ref_track(stdout, track, false)?;
                 }
@@ -3748,73 +3760,79 @@ fn print_for_each_ref_format(
                 }
             }
             "subject" | "contents:subject" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_subject(&contents.message).as_bytes())?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    let parts = for_each_ref_message_parts(message);
+                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
                 }
             }
             "*subject" | "*contents:subject" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_subject(message).as_bytes())?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    let parts = for_each_ref_message_parts(message);
+                    stdout.write_all(for_each_ref_copy_subject(parts.subject).as_bytes())?;
+                }
+            }
+            "subject:sanitize" => {
+                if let Some(message) = for_each_ref_message(context, false) {
+                    let parts = for_each_ref_message_parts(message);
+                    let subject = for_each_ref_copy_subject(parts.subject);
+                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
+                }
+            }
+            "*subject:sanitize" => {
+                if let Some(message) = for_each_ref_message(context, true) {
+                    let parts = for_each_ref_message_parts(message);
+                    let subject = for_each_ref_copy_subject(parts.subject);
+                    stdout.write_all(for_each_ref_sanitize_subject(&subject).as_bytes())?;
                 }
             }
             "contents:body" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_body(&contents.message))?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
                 }
             }
             "*contents:body" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_body(message))?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_without_sig)?;
+                }
+            }
+            "contents:signature" => {
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
+                }
+            }
+            "*contents:signature" => {
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).signature)?;
                 }
             }
             "body" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(commit_body(&contents.message))?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
                 }
             }
             "*body" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(commit_body(message))?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).body_with_sig)?;
                 }
             }
             "contents" => {
-                if let Some(contents) = &context.contents {
-                    stdout.write_all(&contents.message)?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
                 }
             }
             "*contents" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    stdout.write_all(message)?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    stdout.write_all(for_each_ref_message_parts(message).bare)?;
                 }
             }
             "contents:size" => {
-                if let Some(contents) = &context.contents {
-                    write!(stdout, "{}", contents.message.len())?;
+                if let Some(message) = for_each_ref_message(context, false) {
+                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
                 }
             }
             "*contents:size" => {
-                if let Some(message) = context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.message.as_ref())
-                {
-                    write!(stdout, "{}", message.len())?;
+                if let Some(message) = for_each_ref_message(context, true) {
+                    write!(stdout, "{}", for_each_ref_message_parts(message).bare.len())?;
                 }
             }
             "author" => write_for_each_ref_identity(
@@ -3831,34 +3849,14 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.author.as_deref()),
             )?,
-            "authorname" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authorname" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "authoremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authoremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
+            "authorname" | "*authorname" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "authoremail" | "*authoremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "committer" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -3873,34 +3871,14 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.committer.as_deref()),
             )?,
-            "committername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "committeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
+            "committername" | "*committername" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "committeremail" | "*committeremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "tagger" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -3909,22 +3887,14 @@ fn print_for_each_ref_format(
                     .and_then(|contents| contents.tagger.as_deref()),
             )?,
             "*tagger" => write_for_each_ref_identity(stdout, None)?,
-            "taggername" => write_for_each_ref_identity_name(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggername" => write_for_each_ref_identity_name(stdout, None)?,
-            "taggeremail" => write_for_each_ref_identity_email(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggeremail" => write_for_each_ref_identity_email(stdout, None)?,
+            "taggername" | "*taggername" => {
+                for_each_ref_try_name_atom(stdout, placeholder, context)
+                    .expect("name atom recognized")?
+            }
+            "taggeremail" | "*taggeremail" => {
+                for_each_ref_try_email_atom(stdout, placeholder, context)
+                    .expect("email atom recognized")?
+            }
             "creator" => write_for_each_ref_identity(
                 stdout,
                 context
@@ -3939,106 +3909,11 @@ fn print_for_each_ref_format(
                     .as_ref()
                     .and_then(|peeled| peeled.creator.as_deref()),
             )?,
-            "authordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "committerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "taggerdate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggerdate" => write_for_each_ref_identity_date(stdout, None)?,
-            "creatordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.creator.as_deref()),
-            )?,
-            "*creatordate" => write_for_each_ref_identity_date(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.creator.as_deref()),
-            )?,
-            "authordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.author.as_deref()),
-            )?,
-            "*authordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.author.as_deref()),
-            )?,
-            "committerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.committer.as_deref()),
-            )?,
-            "*committerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.committer.as_deref()),
-            )?,
-            "taggerdate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.tagger.as_deref()),
-            )?,
-            "*taggerdate:raw" => write_for_each_ref_identity_date_raw(stdout, None)?,
-            "creatordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.creator.as_deref()),
-            )?,
-            "*creatordate:raw" => write_for_each_ref_identity_date_raw(
-                stdout,
-                context
-                    .peeled_object
-                    .as_ref()
-                    .and_then(|peeled| peeled.creator.as_deref()),
-            )?,
+            "authordate" | "*authordate" | "committerdate" | "*committerdate" | "taggerdate"
+            | "*taggerdate" | "creatordate" | "*creatordate" => {
+                for_each_ref_try_date_atom(stdout, placeholder, context)
+                    .expect("date atom recognized")?
+            }
             "tree" => {
                 if let Some(tree) = context
                     .contents
@@ -4173,6 +4048,17 @@ fn print_for_each_ref_format(
                         .and_then(|push| push.refname.as_deref())
                         .unwrap_or("");
                     stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
+                } else if let Some(value) = other
+                    .strip_prefix("symref:lstrip=")
+                    .or_else(|| other.strip_prefix("symref:strip="))
+                {
+                    let count = parse_for_each_ref_strip_count(value)?;
+                    let symref = context.symref.unwrap_or("");
+                    stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
+                } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
+                    let count = parse_for_each_ref_strip_count(value)?;
+                    let symref = context.symref.unwrap_or("");
+                    stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
                 } else if let Some(width) = other.strip_prefix("objectname:short=") {
                     let width = parse_for_each_ref_abbrev_width(width)?;
                     stdout.write_all(
@@ -4195,10 +4081,72 @@ fn print_for_each_ref_format(
                             .as_bytes(),
                         )?;
                     }
-                } else if let Some((identity, mode)) = for_each_ref_date_modifier(other, context) {
-                    write_for_each_ref_identity_date_mode(stdout, identity, mode)?;
-                } else if let Some((identity, mode)) = for_each_ref_email_modifier(other, context) {
-                    write_for_each_ref_identity_email_mode(stdout, identity, mode)?;
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "tree") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(tree) = context
+                        .contents
+                        .as_ref()
+                        .and_then(|contents| contents.tree.as_ref())
+                    {
+                        stdout.write_all(
+                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                .as_bytes(),
+                        )?;
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*tree") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(tree) = context
+                        .peeled_object
+                        .as_ref()
+                        .and_then(|peeled| peeled.tree.as_ref())
+                    {
+                        stdout.write_all(
+                            for_each_ref_abbrev_oid(tree, width, context.objectname_candidates)
+                                .as_bytes(),
+                        )?;
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "parent") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(contents) = &context.contents {
+                        for (idx, parent) in contents.parents.iter().enumerate() {
+                            if idx > 0 {
+                                stdout.write_all(b" ")?;
+                            }
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(
+                                    parent,
+                                    width,
+                                    context.objectname_candidates,
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                    }
+                } else if let Some(arg) = for_each_ref_oid_atom_arg(other, "*parent") {
+                    let width = for_each_ref_oid_atom_width(arg, other)?;
+                    if let Some(peeled) = &context.peeled_object {
+                        for (idx, parent) in peeled.parents.iter().enumerate() {
+                            if idx > 0 {
+                                stdout.write_all(b" ")?;
+                            }
+                            stdout.write_all(
+                                for_each_ref_abbrev_oid(
+                                    parent,
+                                    width,
+                                    context.objectname_candidates,
+                                )
+                                .as_bytes(),
+                            )?;
+                        }
+                    }
+                } else if let Some(result) = for_each_ref_try_trailers_atom(stdout, other, context) {
+                    result?;
+                } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context) {
+                    result?;
+                } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
+                    result?;
+                } else if let Some(result) = for_each_ref_try_date_atom(stdout, other, context) {
+                    result?;
                 } else if let Some(rev) = other.strip_prefix("ahead-behind:") {
                     let target = resolve_revision(context.git_dir, context.format, rev)?;
                     if let Some(track) =
@@ -4220,6 +4168,14 @@ fn print_for_each_ref_format(
                     {
                         write_for_each_ref_contents_lines(stdout, message, count)?;
                     }
+                } else if let Some(arg) = other
+                    .strip_prefix("contents:")
+                    .or_else(|| other.strip_prefix("*contents:"))
+                {
+                    // A `%(contents:XXX)` that none of the contents sub-atoms
+                    // above recognized — git reports the bare contents arg.
+                    eprintln!("fatal: unrecognized %(contents) argument: {arg}");
+                    return Err(GitError::Exit(128));
                 } else {
                     return Err(GitError::Command(format!(
                         "unsupported for-each-ref format placeholder %({other})"
@@ -4401,71 +4357,314 @@ fn write_for_each_ref_contents_lines(
     Ok(())
 }
 
-fn for_each_ref_date_modifier<'a>(
-    placeholder: &str,
-    context: &'a ForEachRefFormatContext<'_>,
-) -> Option<(Option<&'a [u8]>, ForEachRefDateMode)> {
-    let (atom, modifier) = placeholder.split_once(':')?;
-    let mode = match modifier {
-        "raw" => ForEachRefDateMode::Raw,
-        "unix" => ForEachRefDateMode::Unix,
-        "short" => ForEachRefDateMode::Short,
-        "iso" | "iso8601" => ForEachRefDateMode::Iso,
-        "iso8601-strict" => ForEachRefDateMode::IsoStrict,
-        "rfc2822" => ForEachRefDateMode::Rfc2822,
-        _ => return None,
-    };
-    let contents = context.contents.as_ref();
-    let identity = match atom {
-        "authordate" => contents.and_then(|contents| contents.author.as_deref()),
-        "committerdate" => contents.and_then(|contents| contents.committer.as_deref()),
-        "taggerdate" => contents.and_then(|contents| contents.tagger.as_deref()),
-        "creatordate" => contents.and_then(|contents| contents.creator.as_deref()),
-        "*authordate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.author.as_deref()),
-        "*committerdate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.committer.as_deref()),
-        "*taggerdate" => None,
-        "*creatordate" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.creator.as_deref()),
-        _ => return None,
-    };
-    Some((identity, mode))
+
+/// The set of `%(...email)` options, mirroring git's `email_option` bitset
+/// (ref-filter.c `EO_TRIM`/`EO_LOCALPART`/`EO_MAILMAP`).
+#[derive(Clone, Copy, Default)]
+struct ForEachRefEmailOptions {
+    trim: bool,
+    localpart: bool,
+    mailmap: bool,
 }
 
-fn for_each_ref_email_modifier<'a>(
+/// Parse the option string after `%(authoremail:...)` exactly as git's
+/// `person_email_atom_parser` does. Options are comma-separated and may repeat;
+/// each must be an exact `trim`/`localpart`/`mailmap` token between commas.
+/// On an unrecognized token, returns `Err(bad_arg)` where `bad_arg` is the
+/// unconsumed remainder at the point of failure (git reports this verbatim).
+fn parse_for_each_ref_email_options(arg: &str) -> std::result::Result<ForEachRefEmailOptions, String> {
+    let mut options = ForEachRefEmailOptions::default();
+    let mut rest = arg;
+    loop {
+        // git's email_atom_option_parser advances past a matched prefix; the
+        // `bad_arg` it later reports is the *remaining* string AFTER that
+        // consume (so `mailmaptrim` reports `trim`, not `mailmaptrim`).
+        let matched = if let Some(tail) = rest.strip_prefix("trim") {
+            options.trim = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("localpart") {
+            options.localpart = true;
+            Some(tail)
+        } else if let Some(tail) = rest.strip_prefix("mailmap") {
+            options.mailmap = true;
+            Some(tail)
+        } else {
+            None
+        };
+        let Some(tail) = matched else {
+            // No prefix consumed: the bad argument is the whole remainder.
+            return Err(rest.to_string());
+        };
+        rest = tail;
+        let bad_arg = rest;
+        if rest.is_empty() {
+            break;
+        }
+        if let Some(tail) = rest.strip_prefix(',') {
+            rest = tail;
+        } else {
+            return Err(bad_arg.to_string());
+        }
+    }
+    Ok(options)
+}
+
+/// If `placeholder` is an email atom (`(\*?)(author|committer|tagger)email`
+/// with optional `:opts`), render it. Returns `Some(Ok(()))` when handled,
+/// `Some(Err(_))` on a bad-option error (already reported to stderr), and
+/// `None` when the placeholder is not an email atom.
+fn for_each_ref_try_email_atom(
+    stdout: &mut impl Write,
     placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authoremail" => (false, ForEachRefAtomIdentityRole::Author),
+        "committeremail" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggeremail" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "*authoremail" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committeremail" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggeremail" => (true, ForEachRefAtomIdentityRole::Tagger),
+        _ => return None,
+    };
+    let options = match arg {
+        Some(arg) => match parse_for_each_ref_email_options(arg) {
+            Ok(options) => options,
+            Err(bad_arg) => {
+                let name = atom.strip_prefix('*').unwrap_or(atom);
+                eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
+                return Some(Err(GitError::Exit(128)));
+            }
+        },
+        None => ForEachRefEmailOptions::default(),
+    };
+    Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// If `placeholder` is a trailers atom (`%(trailers[:opts])` or
+/// `%(contents:trailers[:opts])`, with optional `*` peel), render it. Returns
+/// `Some(Err(_))` (after reporting to stderr) for the bad-argument cases.
+fn for_each_ref_try_trailers_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (base, peeled) = placeholder
+        .strip_prefix('*')
+        .map(|rest| (rest, true))
+        .unwrap_or((placeholder, false));
+
+    // Accept `trailers`, `trailers:ARG`, `contents:trailers`,
+    // `contents:trailers:ARG`. The `contents:` prefix shares git's
+    // `%(contents)` bad-argument error for `contents:trailersXXX`.
+    let arg: Option<&str> = if base == "trailers" {
+        None
+    } else if let Some(rest) = base.strip_prefix("trailers:") {
+        Some(rest)
+    } else if let Some(rest) = base.strip_prefix("contents:") {
+        if rest == "trailers" {
+            None
+        } else if let Some(rest) = rest.strip_prefix("trailers:") {
+            Some(rest)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let options = match arg {
+        None => commands::for_each_ref::ForEachRefTrailerOptions::default(),
+        Some(arg) => match commands::for_each_ref::parse_for_each_ref_trailer_options(arg) {
+            Ok(options) => options,
+            Err(None) => {
+                eprintln!("fatal: expected %(trailers:key=<value>)");
+                return Some(Err(GitError::Exit(128)));
+            }
+            Err(Some(invalid)) => {
+                eprintln!("fatal: unknown %(trailers) argument: {invalid}");
+                return Some(Err(GitError::Exit(128)));
+            }
+        },
+    };
+
+    Some((|| -> Result<()> {
+        if let Some(message) = for_each_ref_message(context, peeled) {
+            // git formats trailers over the message from the subject start to
+            // the signature start (sig stripped).
+            let parts = for_each_ref_message_parts(message);
+            let sig_len = parts.signature.len();
+            let trailer_src = &parts.bare[..parts.bare.len().saturating_sub(sig_len)];
+            let rendered =
+                commands::for_each_ref::for_each_ref_format_trailers(trailer_src, &options);
+            stdout.write_all(&rendered)?;
+        }
+        Ok(())
+    })())
+}
+
+/// The raw message bytes for the ref's own object (`peeled == false`) or the
+/// peeled tag target (`peeled == true`), if available.
+fn for_each_ref_message<'a>(
     context: &'a ForEachRefFormatContext<'_>,
-) -> Option<(Option<&'a [u8]>, ForEachRefEmailMode)> {
-    let (atom, modifier) = placeholder.split_once(':')?;
-    let mode = match modifier {
-        "trim" => ForEachRefEmailMode::Trim,
-        "localpart" => ForEachRefEmailMode::LocalPart,
-        _ => return None,
-    };
-    let contents = context.contents.as_ref();
-    let identity = match atom {
-        "authoremail" => contents.and_then(|contents| contents.author.as_deref()),
-        "committeremail" => contents.and_then(|contents| contents.committer.as_deref()),
-        "taggeremail" => contents.and_then(|contents| contents.tagger.as_deref()),
-        "*authoremail" => context
+    peeled: bool,
+) -> Option<&'a [u8]> {
+    if peeled {
+        context
             .peeled_object
             .as_ref()
-            .and_then(|peeled| peeled.author.as_deref()),
-        "*committeremail" => context
-            .peeled_object
-            .as_ref()
-            .and_then(|peeled| peeled.committer.as_deref()),
-        "*taggeremail" => None,
+            .and_then(|peeled| peeled.message.as_deref())
+    } else {
+        context.contents.as_ref().map(|contents| &*contents.message)
+    }
+}
+
+/// If `placeholder` is a date atom (`(\*?)(author|committer|tagger|creator)date`
+/// with an optional `:spec`), render it through the full date grammar. Returns
+/// `Some(Err(_))` (after reporting to stderr) on an invalid specifier.
+fn for_each_ref_try_date_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authordate" => (false, ForEachRefAtomIdentityRole::Author),
+        "committerdate" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggerdate" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "creatordate" => (false, ForEachRefAtomIdentityRole::Creator),
+        "*authordate" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committerdate" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggerdate" => (true, ForEachRefAtomIdentityRole::Tagger),
+        "*creatordate" => (true, ForEachRefAtomIdentityRole::Creator),
         _ => return None,
     };
-    Some((identity, mode))
+    let Some(spec) = ForEachRefDateSpec::parse(arg) else {
+        let name = atom.strip_prefix('*').unwrap_or(atom);
+        eprintln!(
+            "fatal: unrecognized %({name}) argument: {}",
+            arg.unwrap_or("")
+        );
+        return Some(Err(GitError::Exit(128)));
+    };
+    Some((|| -> Result<()> {
+        if let Some(identity) = for_each_ref_typed_identity(context, peeled, role)
+            && let Some(value) = for_each_ref_identity_date_spec(identity, &spec)
+        {
+            stdout.write_all(value.as_bytes())?;
+        }
+        Ok(())
+    })())
+}
+
+/// For an oid atom like `tree:short` / `parent:short=7`, return the option
+/// argument (`short` or `short=7`) when `placeholder` is exactly `atom:<arg>`.
+fn for_each_ref_oid_atom_arg<'a>(placeholder: &'a str, atom: &str) -> Option<&'a str> {
+    let rest = placeholder.strip_prefix(atom)?;
+    rest.strip_prefix(':')
+}
+
+/// Parse the `short`/`short=N` argument of an oid atom into an abbreviation
+/// width, mirroring git's `oid_atom_parser` validation.
+fn for_each_ref_oid_atom_width(arg: &str, atom: &str) -> Result<Option<usize>> {
+    if arg == "short" {
+        Ok(None)
+    } else if let Some(value) = arg.strip_prefix("short=") {
+        Ok(Some(parse_for_each_ref_abbrev_width(value).map_err(
+            |_| {
+                eprintln!("fatal: positive value expected '{value}' in %({atom})");
+                GitError::Exit(128)
+            },
+        )?))
+    } else {
+        eprintln!("fatal: unrecognized %({atom}) argument: {arg}");
+        Err(GitError::Exit(128))
+    }
+}
+
+/// If `placeholder` is a name atom (`(\*?)(author|committer|tagger)name` with an
+/// optional `:mailmap`/`:` argument), render it. Mirrors git's
+/// `person_name_atom_parser`: the only accepted argument is `mailmap`.
+fn for_each_ref_try_name_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (atom, arg) = match placeholder.split_once(':') {
+        Some((atom, arg)) => (atom, Some(arg)),
+        None => (placeholder, None),
+    };
+    let (peeled, role) = match atom {
+        "authorname" => (false, ForEachRefAtomIdentityRole::Author),
+        "committername" => (false, ForEachRefAtomIdentityRole::Committer),
+        "taggername" => (false, ForEachRefAtomIdentityRole::Tagger),
+        "*authorname" => (true, ForEachRefAtomIdentityRole::Author),
+        "*committername" => (true, ForEachRefAtomIdentityRole::Committer),
+        "*taggername" => (true, ForEachRefAtomIdentityRole::Tagger),
+        _ => return None,
+    };
+    let mailmap = match arg {
+        None => false,
+        Some("mailmap") => true,
+        Some(bad_arg) => {
+            let name = atom.strip_prefix('*').unwrap_or(atom);
+            eprintln!("fatal: unrecognized %({name}) argument: {bad_arg}");
+            return Some(Err(GitError::Exit(128)));
+        }
+    };
+    Some((|| -> Result<()> {
+        let Some(identity) = for_each_ref_typed_identity(context, peeled, role) else {
+            return Ok(());
+        };
+        if mailmap {
+            let (name, _) = context.mailmap.rewrite_identity(identity);
+            stdout.write_all(&name)?;
+        } else {
+            write_for_each_ref_identity_name(stdout, Some(identity))?;
+        }
+        Ok(())
+    })())
+}
+
+fn for_each_ref_write_email(
+    stdout: &mut impl Write,
+    context: &ForEachRefFormatContext<'_>,
+    peeled: bool,
+    role: ForEachRefAtomIdentityRole,
+    options: ForEachRefEmailOptions,
+) -> Result<()> {
+    let Some(identity) = for_each_ref_typed_identity(context, peeled, role) else {
+        return Ok(());
+    };
+    let mode = if options.localpart {
+        ForEachRefEmailMode::LocalPart
+    } else if options.trim {
+        ForEachRefEmailMode::Trim
+    } else {
+        ForEachRefEmailMode::Bracketed
+    };
+    if options.mailmap {
+        let (_, email) = context.mailmap.rewrite_identity(identity);
+        // Reassemble a synthetic identity so the shared email extractor applies
+        // trim/localpart over the rewritten address.
+        let mut synthetic = Vec::with_capacity(email.len() + 2);
+        synthetic.push(b'<');
+        synthetic.extend_from_slice(&email);
+        synthetic.push(b'>');
+        if let Some(value) = for_each_ref_identity_email(&synthetic, mode) {
+            stdout.write_all(value)?;
+        }
+    } else if let Some(value) = for_each_ref_identity_email(identity, mode) {
+        stdout.write_all(value)?;
+    }
+    Ok(())
 }
 
 fn for_each_ref_color_escape(value: &str) -> Result<String> {

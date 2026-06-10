@@ -8085,6 +8085,7 @@ fn print_branch_list_format_omit_empty(
     let objectname_abbrev = repository_abbrev(git_dir, format)?;
     let objectname_candidates = cat_file_all_object_ids(git_dir, format)?;
     let deltabase = zero_oid(format)?;
+    let mailmap = commands::utility::Mailmap::load_default(git_dir, format)?;
     let mut stdout = io::stdout().lock();
     for reference in store.list_refs()? {
         if !branch_ref_matches_mode(&reference.name, options.mode) {
@@ -8149,6 +8150,7 @@ fn print_branch_list_format_omit_empty(
             push_track,
             contents,
             peeled_object: None,
+            mailmap: &mailmap,
         };
         let mut line = Vec::new();
         print_for_each_ref_format(&mut line, &format_spec, &context)?;

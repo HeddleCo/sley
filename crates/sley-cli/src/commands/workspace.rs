@@ -2621,10 +2621,13 @@ fn print_status_long_tracking(
         StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0,
             behind: 0,
+            ..
         }) => {
             println!("Your branch is up to date with '{}'.", tracking.upstream);
         }
-        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind: 0 }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack {
+            ahead, behind: 0, ..
+        }) => {
             println!(
                 "Your branch is ahead of '{}' by {ahead} {}.",
                 tracking.upstream,
@@ -2632,7 +2635,9 @@ fn print_status_long_tracking(
             );
             println!("  (use \"git push\" to publish your local commits)");
         }
-        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead: 0, behind }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack {
+            ahead: 0, behind, ..
+        }) => {
             println!(
                 "Your branch is behind '{}' by {behind} {}, and can be fast-forwarded.",
                 tracking.upstream,
@@ -2640,7 +2645,7 @@ fn print_status_long_tracking(
             );
             println!("  (use \"git pull\" to update your local branch)");
         }
-        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind }) => {
+        StatusBranchTrackingState::Counts(ForEachRefTrack { ahead, behind, .. }) => {
             println!("Your branch and '{}' have diverged,", tracking.upstream);
             println!("and have {ahead} and {behind} different commits each, respectively.");
             println!("  (use \"git pull\" if you want to integrate the remote branch with yours)");
@@ -2838,6 +2843,7 @@ fn status_branch_tracking_without_ahead_behind(
         Ok(StatusBranchTrackingState::Counts(ForEachRefTrack {
             ahead: 0,
             behind: 0,
+            gone: false,
         }))
     } else {
         Ok(StatusBranchTrackingState::Different)
