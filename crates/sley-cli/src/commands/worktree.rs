@@ -171,6 +171,15 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
             return Err(GitError::Exit(128));
         }
     }
+    // git prints the "Preparing worktree ..." line in `add()` and then runs
+    // `check_candidate_path` as the first step of `add_worktree`, so the
+    // missing-but-registered / already-exists fatals appear *after* the prepare
+    // line. Emit the prepare line here (for the non-orphan path) to match, then
+    // run the candidate-path check before allocating the admin dir.
+    if !options.quiet && !add_head.orphan {
+        eprintln!("{}", add_head.prepare_message);
+    }
+    check_worktree_candidate_path(&common_git_dir, &path, &options.path, options.force)?;
     let admin_dir = create_linked_worktree_admin_dir(&common_git_dir, &path)?;
     fs::create_dir_all(&path)?;
     fs::write(
@@ -222,11 +231,10 @@ pub(crate) fn cmd_worktree_add(args: &[String]) -> Result<()> {
         &add_head.oid,
         options.checkout,
     )?;
-    if !options.quiet {
-        eprintln!("{}", add_head.prepare_message);
-        if options.checkout {
-            print_reset_hard_head(&common_git_dir, format, &add_head.oid)?;
-        }
+    // The prepare line was already printed (before check_candidate_path); only
+    // the post-checkout "HEAD is now at ..." reset line remains.
+    if !options.quiet && options.checkout {
+        print_reset_hard_head(&common_git_dir, format, &add_head.oid)?;
     }
     Ok(())
 }
@@ -1403,6 +1411,46 @@ fn default_worktree_add_branch_name(path: &Path) -> Result<String> {
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
         .ok_or_else(|| GitError::InvalidPath(format!("invalid worktree path {}", path.display())))
+}
+
+/// Port of git's `check_candidate_path` (builtin/worktree.c): when the
+/// destination path is already a *registered* worktree (its admin dir exists
+/// even though the directory on disk may be gone), `worktree add` must refuse
+/// unless forced. A locked registered worktree needs `-f -f`; an unlocked one
+/// needs `-f`. With sufficient force we delete the stale admin dir so the add
+/// can re-register the path.
+fn check_worktree_candidate_path(
+    common_git_dir: &Path,
+    path: &Path,
+    original: &str,
+    force: usize,
+) -> Result<()> {
+    let canonical = fs::canonicalize(path).ok();
+    for admin in collect_linked_worktree_admins(common_git_dir)? {
+        let matches = match (&canonical, fs::canonicalize(&admin.path).ok()) {
+            (Some(a), Some(b)) => *a == b,
+            _ => normalize_lexical_path(path) == normalize_lexical_path(&admin.path),
+        };
+        if !matches {
+            continue;
+        }
+        let locked = admin.locked_reason.is_some();
+        if (!locked && force >= 1) || (locked && force >= 2) {
+            fs::remove_dir_all(&admin.admin_dir)?;
+            return Ok(());
+        }
+        if locked {
+            eprintln!(
+                "fatal: '{original}' is a missing but locked worktree;\nuse 'add -f -f' to override, or 'unlock' and 'prune' or 'remove' to clear"
+            );
+        } else {
+            eprintln!(
+                "fatal: '{original}' is a missing but already registered worktree;\nuse 'add -f' to override, or 'prune' or 'remove' to clear"
+            );
+        }
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 fn validate_worktree_add_destination(path: &Path, original: &str) -> Result<()> {
