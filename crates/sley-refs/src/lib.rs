@@ -660,7 +660,7 @@ impl FileRefStore {
             )));
         }
         let oid = self.delete_direct_ref(&name, "branch", branch)?;
-        let _ = fs::remove_file(self.reflog_path(&name));
+        self.remove_reflog_file(&name);
         Ok(BranchDelete { name, oid })
     }
 
@@ -682,6 +682,30 @@ impl FileRefStore {
         committer: Vec<u8>,
     ) -> Result<()> {
         self.copy_or_move_branch(old_branch, new_branch, force, true, committer)
+    }
+
+    /// Find an existing ref (other than `exclude`) that would have a
+    /// directory/file conflict with creating `new_name`: either an existing ref
+    /// is a path-prefix of `new_name` (it occupies a directory component
+    /// `new_name` needs), or `new_name` is a path-prefix of an existing ref
+    /// (`new_name` would occupy a directory another ref needs). Returns the
+    /// conflicting ref name.
+    fn conflicting_ref_for_path(&self, new_name: &str, exclude: &str) -> Result<Option<String>> {
+        for reference in self.list_refs()? {
+            let name = &reference.name;
+            if name == new_name || name == exclude {
+                continue;
+            }
+            // `name` sits above `new_name`: name = refs/heads/r, new = refs/heads/r/q
+            if new_name.starts_with(&format!("{name}/")) {
+                return Ok(Some(name.clone()));
+            }
+            // `name` sits below `new_name`: new = refs/heads/r, name = refs/heads/r/q
+            if name.starts_with(&format!("{new_name}/")) {
+                return Ok(Some(name.clone()));
+            }
+        }
+        Ok(None)
     }
 
     fn copy_or_move_branch(
@@ -707,20 +731,43 @@ impl FileRefStore {
                 "branch {old_branch} is symbolic"
             )));
         };
-        if self.read_ref(&new_name)?.is_some() {
-            if !force {
-                return Err(GitError::Transaction(format!(
-                    "branch {new_branch} already exists"
-                )));
+        // Detect a directory/file conflict against some *other* ref before
+        // mutating anything (git's rename_ref fails up front, leaving the old
+        // branch intact): e.g. renaming `q` -> `r/q` while `r` exists, or `q` ->
+        // `r` while `r/x` exists. The old ref itself is excluded because a
+        // self-nesting rename (`m` -> `m/m`) is handled by removing it first.
+        if let Some(conflict) = self.conflicting_ref_for_path(&new_name, &old_name)? {
+            return Err(GitError::Transaction(format!(
+                "'{conflict}' exists; cannot create '{new_name}'"
+            )));
+        }
+        // git's validate_branchname uses refs_ref_exists (RESOLVE_REF_READING):
+        // a *dangling* symref destination does not "exist", so a rename onto it
+        // proceeds without --force and overwrites the symref file (t3200 #16).
+        let dest_entry = self.read_ref(&new_name)?;
+        let dest_resolves = resolve_ref_peeled(self, &new_name)?.is_some();
+        if dest_resolves && !force {
+            return Err(GitError::Transaction(format!(
+                "branch {new_branch} already exists"
+            )));
+        }
+        // Remove any existing destination ref (direct or symbolic) before
+        // writing. A dangling symref must be removed as a symref; a real branch
+        // as a direct ref.
+        match dest_entry {
+            Some(RefTarget::Symbolic(_)) => {
+                self.delete_symbolic_ref(&new_name)?;
+                self.remove_reflog_file(&new_name);
             }
-            let _ = self.delete_direct_ref(&new_name, "branch", new_branch)?;
-            let _ = fs::remove_file(self.reflog_path(&new_name));
+            Some(RefTarget::Direct(_)) => {
+                let _ = self.delete_direct_ref(&new_name, "branch", new_branch)?;
+                self.remove_reflog_file(&new_name);
+            }
+            None => {}
         }
 
-        self.write_loose_ref(&Ref {
-            name: new_name.clone(),
-            target: RefTarget::Direct(oid),
-        })?;
+        // Capture the old reflog before removing anything; it is carried over
+        // to the new ref.
         let mut reflog = self.read_reflog(&old_name)?;
         reflog.push(ReflogEntry {
             old_oid: oid,
@@ -732,18 +779,29 @@ impl FileRefStore {
                 format!("Branch: renamed {old_name} to {new_name}").into_bytes()
             },
         });
-        self.write_reflog(&new_name, &reflog)?;
 
+        // A directory/file conflict can occur when the new ref's path nests
+        // under the old ref (`m` -> `m/m`) or vice-versa; remove the old loose
+        // ref AND its reflog first so neither file blocks creating the new
+        // directory under refs/ or logs/refs/ (t3200 #17, #18).
         if !copy {
             let _ = self.delete_direct_ref(&old_name, "branch", old_branch)?;
-            let _ = fs::remove_file(self.reflog_path(&old_name));
-            if matches!(self.read_ref("HEAD")?, Some(RefTarget::Symbolic(head)) if head == old_name)
-            {
-                self.write_loose_ref(&Ref {
-                    name: "HEAD".into(),
-                    target: RefTarget::Symbolic(new_name),
-                })?;
-            }
+            self.remove_reflog_file(&old_name);
+        }
+
+        self.write_loose_ref(&Ref {
+            name: new_name.clone(),
+            target: RefTarget::Direct(oid),
+        })?;
+        self.write_reflog(&new_name, &reflog)?;
+
+        if !copy
+            && matches!(self.read_ref("HEAD")?, Some(RefTarget::Symbolic(head)) if head == old_name)
+        {
+            self.write_loose_ref(&Ref {
+                name: "HEAD".into(),
+                target: RefTarget::Symbolic(new_name),
+            })?;
         }
         Ok(())
     }
@@ -796,7 +854,7 @@ impl FileRefStore {
     pub fn delete_ref(&self, name: &str) -> Result<RefDelete> {
         validate_ref_name(name)?;
         let oid = self.delete_direct_ref(name, "ref", name)?;
-        let _ = fs::remove_file(self.reflog_path(name));
+        self.remove_reflog_file(name);
         Ok(RefDelete {
             name: name.into(),
             oid,
@@ -817,7 +875,7 @@ impl FileRefStore {
                 update_index: 0,
                 value: ReftableRefValue::Deletion,
             }])?;
-            let _ = fs::remove_file(self.reflog_path(name));
+            self.remove_reflog_file(name);
             return Ok(true);
         }
         let Some(reference) = self.read_loose_ref(name)? else {
@@ -827,7 +885,7 @@ impl FileRefStore {
             return Ok(false);
         }
         self.delete_loose_ref(name)?;
-        let _ = fs::remove_file(self.reflog_path(name));
+        self.remove_reflog_file(name);
         Ok(true)
     }
 
@@ -1089,12 +1147,41 @@ impl FileRefStore {
         match fs::remove_file(&path) {
             Ok(()) => {
                 fs::remove_file(lock_path)?;
+                self.prune_empty_ref_dirs(name);
                 Ok(())
             }
             Err(err) => {
                 let _ = fs::remove_file(lock_path);
                 Err(GitError::Io(err.to_string()))
             }
+        }
+    }
+
+    /// Remove now-empty parent directories left after deleting a loose ref,
+    /// stopping at the `refs/` boundary. git does this so that, e.g., deleting
+    /// `refs/heads/l/m` lets `refs/heads/l` be created as a file afterwards
+    /// (t3200 #14). Pruning stops at the first non-empty directory and never
+    /// removes the `refs` directory itself.
+    fn prune_empty_ref_dirs(&self, name: &str) {
+        let base = self.ref_base_dir(name).to_path_buf();
+        let refs_root = base.join("refs");
+        if let Some(parent) = self.ref_path(name).parent() {
+            prune_empty_dirs_up_to(parent, &refs_root);
+        }
+    }
+
+    /// Remove a ref's reflog file and prune any empty parent directories it
+    /// leaves behind under `logs/refs/`, stopping at the `logs/refs` boundary.
+    /// Without this, deleting `refs/heads/l/m` leaves `logs/refs/heads/l/` and a
+    /// later `refs/heads/l` cannot create its own `logs/refs/heads/l` reflog
+    /// file (t3200 #14, #18).
+    fn remove_reflog_file(&self, name: &str) {
+        let path = self.reflog_path(name);
+        let _ = fs::remove_file(&path);
+        let base = self.ref_base_dir(name).to_path_buf();
+        let logs_refs_root = base.join("logs").join("refs");
+        if let Some(parent) = path.parent() {
+            prune_empty_dirs_up_to(parent, &logs_refs_root);
         }
     }
 
@@ -2158,6 +2245,22 @@ pub fn validate_symref_target(name: &str) -> Result<()> {
 }
 
 /// Follow symbolic ref chains until a direct OID is reached.
+/// Remove empty directories starting at `start` and walking up toward
+/// `boundary`, stopping at the first non-empty directory or when `boundary` is
+/// reached (exclusive). `boundary` itself is never removed.
+fn prune_empty_dirs_up_to(start: &Path, boundary: &Path) {
+    let mut dir = start.to_path_buf();
+    while dir.starts_with(boundary) && dir != *boundary {
+        if fs::remove_dir(&dir).is_err() {
+            break;
+        }
+        dir = match dir.parent() {
+            Some(parent) => parent.to_path_buf(),
+            None => break,
+        };
+    }
+}
+
 pub fn resolve_ref_peeled(store: &FileRefStore, name: &str) -> Result<Option<ObjectId>> {
     let mut current = name.to_string();
     for _ in 0..16 {

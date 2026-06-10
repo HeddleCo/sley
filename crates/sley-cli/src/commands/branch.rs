@@ -6202,7 +6202,10 @@ fn run_branch_move_options(
         }
         return Err(GitError::Exit(128));
     }
-    if !options.force && store.read_ref(&new_ref)?.is_some() {
+    // A dangling symref destination does not "exist" for the purposes of the
+    // rename collision check (git's validate_branchname uses RESOLVE_REF_READING),
+    // so `branch -m m broken_symref` overwrites it without --force (t3200 #16).
+    if !options.force && sley_refs::resolve_ref_peeled(store, &new_ref)?.is_some() {
         eprintln!("fatal: a branch named '{new_branch}' already exists");
         return Err(GitError::Exit(128));
     }
@@ -7374,6 +7377,27 @@ fn branch_option_takes_no_value<T>(option: &str) -> Result<T> {
     Err(GitError::Exit(129))
 }
 
+/// If `name` is a symbolic ref, delete the symref itself (not its target),
+/// printing git's `Deleted branch <branch> (was <raw-target>).` message and
+/// returning `Ok(Some(()))`. Mirrors builtin/branch.c, which resolves the
+/// branch with `RESOLVE_REF_NO_RECURSE`, so the merge check is bypassed and the
+/// reported value is the symref's immediate target verbatim (t3200 #81-#83).
+fn try_delete_symref_branch(
+    store: &FileRefStore,
+    name: &str,
+    branch: &str,
+    quiet: bool,
+) -> Result<Option<()>> {
+    let Some(RefTarget::Symbolic(target)) = store.read_ref(name)? else {
+        return Ok(None);
+    };
+    store.delete_symbolic_ref(name)?;
+    if !quiet {
+        println!("Deleted branch {branch} (was {target}).");
+    }
+    Ok(Some(()))
+}
+
 fn force_delete_branches(
     git_dir: &Path,
     store: &FileRefStore,
@@ -7400,6 +7424,9 @@ fn force_delete_branches(
                 worktree_root.display()
             );
             failed = true;
+            continue;
+        }
+        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
             continue;
         }
         let deleted = store.delete_branch(branch)?;
@@ -7520,6 +7547,11 @@ fn delete_merged_branches(
                 worktree_root.display()
             );
             failed = true;
+            continue;
+        }
+        // A symbolic-ref branch is deleted without a merge check (git resolves
+        // it with RESOLVE_REF_NO_RECURSE); the symref itself is removed.
+        if try_delete_symref_branch(store, &name, branch, quiet)?.is_some() {
             continue;
         }
         let RefTarget::Direct(oid) = target else {
