@@ -48,7 +48,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_output("git", cwd, args)
+    run_output(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -75,13 +75,13 @@ fn count_objects_git_object_directory_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
     {
-        run("git", &expected, &["init", "-q"]);
-        run("git", &actual, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
-            let output = run_output_with_env("git", repo, &["hash-object", "-w", "one.txt"], &envs);
+            let output = run_output_with_env(sley_testkit::oracle_git(), repo, &["hash-object", "-w", "one.txt"], &envs);
             assert!(
                 output.status.success(),
                 "hash-object failed:\n{}",
@@ -94,7 +94,7 @@ fn count_objects_git_object_directory_matches_upstream_git() {
             vec!["count-objects", "-v"],
             vec!["count-objects", "-vH"],
         ] {
-            let expected_output = run_output_with_env("git", &expected, &args, &envs);
+            let expected_output = run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
             let actual_output =
                 run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
@@ -108,11 +108,11 @@ fn count_objects_matches_upstream_git_for_loose_objects() {
     let root = unique_temp_dir("count-objects");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
-        run("git", &root, &["hash-object", "-w", "one.txt"]);
-        run("git", &root, &["hash-object", "-w", "two.txt"]);
+        run(sley_testkit::oracle_git(), &root, &["hash-object", "-w", "one.txt"]);
+        run(sley_testkit::oracle_git(), &root, &["hash-object", "-w", "two.txt"]);
 
         for args in [
             vec!["count-objects"],
@@ -141,12 +141,12 @@ fn count_objects_matches_upstream_git_for_packed_objects() {
     let root = unique_temp_dir("count-objects-packed");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
-        run("git", &root, &["add", "."]);
+        run(sley_testkit::oracle_git(), &root, &["add", "."]);
         run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -158,7 +158,7 @@ fn count_objects_matches_upstream_git_for_packed_objects() {
                 "init",
             ],
         );
-        run("git", &root, &["gc", "--quiet"]);
+        run(sley_testkit::oracle_git(), &root, &["gc", "--quiet"]);
 
         for args in [
             vec!["count-objects"],
@@ -182,7 +182,7 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
     let root = unique_temp_dir("count-objects-prune-garbage");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         let hash_output = git(&root, &["hash-object", "-w", "one.txt"]);
         assert!(hash_output.status.success(), "hash-object failed");
@@ -192,9 +192,9 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
             .to_string();
         let loose_path = root.join(".git/objects").join(&oid[..2]).join(&oid[2..]);
         let loose_body = fs::read(&loose_path).expect("read loose object");
-        run("git", &root, &["add", "one.txt"]);
+        run(sley_testkit::oracle_git(), &root, &["add", "one.txt"]);
         run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -206,7 +206,7 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
                 "init",
             ],
         );
-        run("git", &root, &["gc", "--quiet"]);
+        run(sley_testkit::oracle_git(), &root, &["gc", "--quiet"]);
         fs::create_dir_all(loose_path.parent().expect("loose parent")).expect("recreate fanout");
         fs::write(&loose_path, loose_body).expect("restore packed loose object");
         let garbage_dir = root.join(".git/objects/aa");
@@ -232,10 +232,10 @@ fn count_objects_verbose_lists_alternates_like_upstream_git() {
     fs::create_dir_all(&repo).expect("create repo");
     fs::create_dir_all(&alternate).expect("create alternate repo");
     {
-        run("git", &alternate, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &alternate, &["init", "-q"]);
         fs::write(alternate.join("alt.txt"), b"alt\n").expect("write alternate object");
-        run("git", &alternate, &["hash-object", "-w", "alt.txt"]);
-        run("git", &repo, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &alternate, &["hash-object", "-w", "alt.txt"]);
+        run(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
         fs::create_dir_all(repo.join(".git/objects/info")).expect("create info dir");
         fs::write(
             repo.join(".git/objects/info/alternates"),

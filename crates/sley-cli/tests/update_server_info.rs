@@ -35,16 +35,16 @@ fn copy_dir(src: &Path, dst: &Path) {
 
 fn create_update_server_info_fixture(root: &Path) {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output("git", root, &["init", "-b", "main"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init", "-b", "main"]);
     assert!(
         init.status.success(),
         "git init failed\nstderr:\n{}",
         String::from_utf8_lossy(&init.stderr)
     );
     fs::write(root.join("file.txt"), b"payload\n").expect("write file");
-    let add = run_output("git", root, &["add", "file.txt"]);
+    let add = run_output(sley_testkit::oracle_git(), root, &["add", "file.txt"]);
     assert!(add.status.success(), "git add failed");
-    let commit = Command::new("git")
+    let commit = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .args(["commit", "-m", "one"])
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -68,7 +68,7 @@ fn create_update_server_info_fixture(root: &Path) {
         vec!["symbolic-ref", "refs/heads/sym", "refs/heads/main"],
         vec!["gc"],
     ] {
-        let output = run_output("git", root, &args);
+        let output = run_output(sley_testkit::oracle_git(), root, &args);
         assert!(
             output.status.success(),
             "git {args:?} failed\nstderr:\n{}",
@@ -87,7 +87,7 @@ fn create_update_server_info_fixture(root: &Path) {
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), actual, args);
     assert_eq!(
         actual_output.status.code(),

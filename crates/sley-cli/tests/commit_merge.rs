@@ -45,11 +45,11 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    run_success("git", cwd, args);
+    run_success(sley_testkit::oracle_git(), cwd, args);
 }
 
 fn git_with_identity(cwd: &Path, args: &[&str]) {
-    let output = run_output_with_identity("git", cwd, args);
+    let output = run_output_with_identity(sley_testkit::oracle_git(), cwd, args);
     assert!(
         output.status.success(),
         "git {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -93,7 +93,7 @@ fn prepare_conflict_repos(upstream: &Path, rust: &Path) {
         fs::write(root.join("conflict.txt"), b"base\n").expect("write base file");
         git(root, &["add", "conflict.txt"]);
         git_with_identity(root, &["commit", "-m", "base", "-q"]);
-        let base = String::from_utf8(run_output("git", root, &["rev-parse", "HEAD"]).stdout)
+        let base = String::from_utf8(run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]).stdout)
             .expect("base oid utf8")
             .trim()
             .to_string();
@@ -137,13 +137,13 @@ fn commit_during_resolved_merge_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
-    start_conflict_merge("git", &upstream);
+    start_conflict_merge(sley_testkit::oracle_git(), &upstream);
     start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
     resolve_conflict(&upstream);
     resolve_conflict(&rust);
 
     let args = ["commit", "-m", "custom merge message"];
-    let expected = run_output_with_identity("git", &upstream, &args);
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
     let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
     assert_same_output(actual, expected, &args);
 
@@ -164,12 +164,12 @@ fn commit_during_resolved_merge_matches_upstream_git() {
         "git-rs MERGE_MSG should be removed"
     );
     assert_eq!(
-        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after commit during merge"
     );
     assert_eq!(
-        run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -179,7 +179,7 @@ fn commit_during_resolved_merge_matches_upstream_git() {
         "merge commit parents differed"
     );
     assert_eq!(
-        run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%s"]).stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -204,11 +204,11 @@ fn commit_during_merge_with_unmerged_entries_fails() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     prepare_conflict_repos(&upstream, &rust);
-    start_conflict_merge("git", &upstream);
+    start_conflict_merge(sley_testkit::oracle_git(), &upstream);
     start_conflict_merge(env!("CARGO_BIN_EXE_sley"), &rust);
 
     let args = ["commit", "-m", "custom merge message"];
-    let expected = run_output_with_identity("git", &upstream, &args);
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
     let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
     assert_same_output(actual, expected, &args);
     let _ = fs::remove_dir_all(&root);

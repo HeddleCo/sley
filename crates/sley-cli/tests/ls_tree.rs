@@ -40,7 +40,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn init_basic_repo(root: &Path) {
@@ -77,7 +77,7 @@ fn ls_tree_usage_and_option_errors_exit_like_upstream_git() {
             vec!["ls-tree", "--format=%(path)", "--long", "HEAD"],
             vec!["ls-tree", "--object-only", "--name-only", "HEAD"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(
                 actual.status.code(),

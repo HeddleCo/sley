@@ -32,7 +32,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn run_status(program: &str, cwd: &Path, args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
@@ -197,7 +197,7 @@ fn rev_parse_worktree_path_options_match_upstream_git() {
                 ["rev-parse", "--show-prefix"],
                 ["rev-parse", "--show-cdup"],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -294,7 +294,7 @@ fn rev_parse_submodule_gitfile_matches_upstream_git() {
                 vec!["rev-parse", "--is-bare-repository"],
                 vec!["rev-parse", "--git-path", "index"],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -343,7 +343,7 @@ fn rev_parse_path_format_matches_upstream_git() {
                     "--git-common-dir",
                 ],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -393,7 +393,7 @@ fn rev_parse_git_path_matches_upstream_git() {
                 vec!["rev-parse", "--git-path"],
                 vec!["rev-parse", "--git-path", "--git-dir"],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -448,7 +448,7 @@ fn rev_parse_git_path_matches_upstream_git() {
                 vec![("GIT_INDEX_FILE", "custom-index-dir/index")],
             ),
         ] {
-            let expected = run_status_with_env("git", &root, &args, &envs);
+            let expected = run_status_with_env(sley_testkit::oracle_git(), &root, &args, &envs);
             let actual = run_status_with_env(env!("CARGO_BIN_EXE_sley"), &root, &args, &envs);
             assert_eq!(
                 actual, expected,
@@ -493,7 +493,7 @@ fn rev_parse_resolve_git_dir_matches_upstream_git() {
                     "../repo/.git",
                 ],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -526,7 +526,7 @@ fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
                 vec!["rev-parse", "--path-format=", "--git-dir"],
                 vec!["rev-parse", "--path-format=bogus", "--git-dir"],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -557,7 +557,7 @@ fn rev_parse_sq_quote_matches_upstream_git() {
                 vec!["rev-parse", "--sq-quote", ""],
                 vec!["rev-parse", "--sq-quote", "--", "--flag"],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -597,7 +597,7 @@ fn rev_parse_object_format_modes_match_upstream_git() {
                 vec!["rev-parse", "--show-object-format=bogus"],
                 vec!["rev-parse", "--show-object-format="],
             ] {
-                let expected = run_status("git", cwd, &args);
+                let expected = run_status(sley_testkit::oracle_git(), cwd, &args);
                 let actual = run_status(env!("CARGO_BIN_EXE_sley"), cwd, &args);
                 assert_eq!(
                     actual,
@@ -643,7 +643,7 @@ fn rev_parse_verify_quiet_missing_matches_upstream_git() {
             vec!["rev-parse", "--verify", "--quiet", "--", "HEAD"],
             vec!["rev-parse", "--verify", "--end-of-options", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -736,7 +736,7 @@ fn rev_parse_hex_refname_prefers_ref_and_warns_like_upstream_git() {
         git(&root, &["branch", hex_ref, "HEAD"]);
 
         let args = ["rev-parse", hex_ref];
-        let expected = run_status("git", &root, &args);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &args);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual, expected);
     };
@@ -845,12 +845,12 @@ fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
 fn setup_rev_parse_repo(dir: &Path, sha256: bool) {
     fs::create_dir_all(dir).expect("create repo dir");
     if sha256 {
-        run("git", dir, &["init", "-q", "--object-format=sha256"]);
+        run(sley_testkit::oracle_git(), dir, &["init", "-q", "--object-format=sha256"]);
     } else {
-        run("git", dir, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), dir, &["init", "-q"]);
     }
     run(
-        "git",
+        sley_testkit::oracle_git(),
         dir,
         &[
             "-c",

@@ -60,7 +60,7 @@ fn trimmed_utf8(bytes: Vec<u8>) -> String {
 /// Returns the directory holding git's helper binaries (the output of
 /// `git --exec-path`), or `None` when system `git` is not usable.
 fn git_exec_path() -> Option<PathBuf> {
-    let output = Command::new("git").arg("--exec-path").output().ok()?;
+    let output = Command::new(sley_testkit::oracle_git()).arg("--exec-path").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -325,15 +325,15 @@ fn create_upstream_repo(project_root: &Path) -> PathBuf {
     std::fs::create_dir_all(&work).expect("create seed work dir");
     std::fs::create_dir_all(&bare).expect("create bare repo dir");
 
-    run_success("git", &bare, &["init", "-q", "--bare"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare"]);
 
-    run_success("git", &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
     // Ensure the default branch is "main" regardless of the host git config.
-    run_success("git", &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     std::fs::write(work.join("payload.txt"), b"http payload\n").expect("write payload");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -347,9 +347,9 @@ fn create_upstream_repo(project_root: &Path) -> PathBuf {
         ],
     );
     std::fs::write(work.join("payload.txt"), b"http payload v2\n").expect("write payload v2");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -362,23 +362,23 @@ fn create_upstream_repo(project_root: &Path) -> PathBuf {
             "-q",
         ],
     );
-    run_success("git", &work, &["branch", "feature/topic"]);
-    run_success("git", &work, &["tag", "v1.0"]);
+    run_success(sley_testkit::oracle_git(), &work, &["branch", "feature/topic"]);
+    run_success(sley_testkit::oracle_git(), &work, &["tag", "v1.0"]);
 
     // Publish everything (branches + tags) into the bare repo.
     let bare_arg = bare.to_string_lossy().to_string();
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &["push", "-q", &bare_arg, "refs/heads/*:refs/heads/*"],
     );
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &["push", "-q", &bare_arg, "refs/tags/*:refs/tags/*"],
     );
     // Point the bare repo's HEAD at main so HTTP clients resolve a default branch.
-    run_success("git", &bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
     bare
 }
@@ -390,17 +390,17 @@ fn add_upstream_commit(project_root: &Path, bare: &Path) -> String {
     let work = project_root.join("update-work");
     std::fs::create_dir_all(&work).expect("create update work dir");
     let bare_arg = bare.to_string_lossy().to_string();
-    run_success("git", &work, &["init", "-q"]);
-    run_success("git", &work, &["fetch", "-q", &bare_arg, "main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &work, &["fetch", "-q", &bare_arg, "main"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &["checkout", "-q", "-B", "main", "FETCH_HEAD"],
     );
     std::fs::write(work.join("payload.txt"), b"http payload v3\n").expect("write payload v3");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -413,8 +413,8 @@ fn add_upstream_commit(project_root: &Path, bare: &Path) -> String {
             "-q",
         ],
     );
-    run_success("git", &work, &["push", "-q", &bare_arg, "main"]);
-    trimmed_utf8(run_success("git", bare, &["rev-parse", "refs/heads/main"]))
+    run_success(sley_testkit::oracle_git(), &work, &["push", "-q", &bare_arg, "main"]);
+    trimmed_utf8(run_success(sley_testkit::oracle_git(), bare, &["rev-parse", "refs/heads/main"]))
 }
 
 /// Creates a bare upstream repo named `repo.git` under `project_root` with a
@@ -428,15 +428,15 @@ fn create_deep_upstream_repo(project_root: &Path, commits: usize) -> PathBuf {
     std::fs::create_dir_all(&work).expect("create deep seed work dir");
     std::fs::create_dir_all(&bare).expect("create bare repo dir");
 
-    run_success("git", &bare, &["init", "-q", "--bare"]);
-    run_success("git", &work, &["init", "-q"]);
-    run_success("git", &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     for index in 0..commits {
         std::fs::write(work.join("payload.txt"), format!("payload {index}\n"))
             .expect("write payload");
-        run_success("git", &work, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &work,
             &[
                 "-c",
@@ -452,11 +452,11 @@ fn create_deep_upstream_repo(project_root: &Path, commits: usize) -> PathBuf {
     }
     let bare_arg = bare.to_string_lossy().to_string();
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &["push", "-q", &bare_arg, "refs/heads/*:refs/heads/*"],
     );
-    run_success("git", &bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     bare
 }
 
@@ -493,7 +493,7 @@ fn ls_remote_http_matches_upstream() {
         let server = HttpBackendServer::start(&project_root, &http_backend);
         let url = server.url("/repo.git");
 
-        let expected = run("git", &root, &["ls-remote", &url]);
+        let expected = run(sley_testkit::oracle_git(), &root, &["ls-remote", &url]);
         assert!(
             expected.status.success(),
             "upstream git ls-remote over http failed\nstdout:\n{}\nstderr:\n{}",
@@ -541,22 +541,22 @@ fn clone_http_smoke() {
 
         // HEAD/branch OIDs in the clone must match the upstream bare repo.
         let upstream_main =
-            trimmed_utf8(run_success("git", &bare, &["rev-parse", "refs/heads/main"]));
+            trimmed_utf8(run_success(sley_testkit::oracle_git(), &bare, &["rev-parse", "refs/heads/main"]));
         let upstream_feature = trimmed_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &bare,
             &["rev-parse", "refs/heads/feature/topic"],
         ));
-        let clone_head = trimmed_utf8(run_success("git", &dst, &["rev-parse", "HEAD"]));
+        let clone_head = trimmed_utf8(run_success(sley_testkit::oracle_git(), &dst, &["rev-parse", "HEAD"]));
         assert_eq!(clone_head, upstream_main, "cloned HEAD OID mismatch");
         let clone_main = trimmed_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &dst,
             &["rev-parse", "refs/remotes/origin/main"],
         ));
         assert_eq!(clone_main, upstream_main, "cloned origin/main OID mismatch");
         let clone_feature = trimmed_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &dst,
             &["rev-parse", "refs/remotes/origin/feature/topic"],
         ));
@@ -566,7 +566,7 @@ fn clone_http_smoke() {
         );
 
         // The cloned object store must be consistent.
-        let fsck = run("git", &dst, &["fsck", "--no-progress"]);
+        let fsck = run(sley_testkit::oracle_git(), &dst, &["fsck", "--no-progress"]);
         assert!(
             fsck.status.success(),
             "git fsck on cloned repo failed\nstdout:\n{}\nstderr:\n{}",
@@ -605,7 +605,7 @@ fn fetch_http_incremental() {
 
         // The clone should not have the new commit yet.
         let before = run(
-            "git",
+            sley_testkit::oracle_git(),
             &dst,
             &[
                 "rev-parse",
@@ -631,7 +631,7 @@ fn fetch_http_incremental() {
 
         // The new commit must now be present on the remote-tracking ref...
         let after_head = trimmed_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &dst,
             &["rev-parse", "refs/remotes/origin/main"],
         ));
@@ -640,7 +640,7 @@ fn fetch_http_incremental() {
             "sley fetch did not update origin/main to the new upstream commit"
         );
         // ...and the object itself must exist in the clone's object store.
-        let cat = run("git", &dst, &["cat-file", "-e", &new_head]);
+        let cat = run(sley_testkit::oracle_git(), &dst, &["cat-file", "-e", &new_head]);
         assert!(
             cat.status.success(),
             "fetched commit object {new_head} missing from clone\nstderr:\n{}",
@@ -661,7 +661,7 @@ fn push_http_creates_ref() {
     {
         let bare = create_upstream_repo(&project_root);
         // Enable pushing over smart HTTP on the upstream bare repo.
-        run_success("git", &bare, &["config", "http.receivepack", "true"]);
+        run_success(sley_testkit::oracle_git(), &bare, &["config", "http.receivepack", "true"]);
 
         let server = HttpBackendServer::start(&project_root, &http_backend);
         let url = server.url("/repo.git");
@@ -678,9 +678,9 @@ fn push_http_creates_ref() {
 
         // Make a local commit on top of the cloned HEAD.
         std::fs::write(dst.join("payload.txt"), b"local push payload\n").expect("write local");
-        run_success("git", &dst, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &dst, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &dst,
             &[
                 "-c",
@@ -693,7 +693,7 @@ fn push_http_creates_ref() {
                 "-q",
             ],
         );
-        let local_head = trimmed_utf8(run_success("git", &dst, &["rev-parse", "HEAD"]));
+        let local_head = trimmed_utf8(run_success(sley_testkit::oracle_git(), &dst, &["rev-parse", "HEAD"]));
 
         // Push the local commit to a brand-new branch on the upstream over HTTP.
         let push = run(
@@ -710,7 +710,7 @@ fn push_http_creates_ref() {
 
         // The bare upstream must now hold the new ref at the expected OID.
         let remote_head = trimmed_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &bare,
             &["rev-parse", "refs/heads/pushed"],
         ));
@@ -719,7 +719,7 @@ fn push_http_creates_ref() {
             "pushed ref OID on upstream did not match local HEAD"
         );
         // The pushed object must be readable on the upstream.
-        let cat = run("git", &bare, &["cat-file", "-e", &local_head]);
+        let cat = run(sley_testkit::oracle_git(), &bare, &["cat-file", "-e", &local_head]);
         assert!(
             cat.status.success(),
             "pushed commit object {local_head} missing from upstream\nstderr:\n{}",
@@ -775,7 +775,7 @@ fn clone_http_shallow_matches_upstream() {
 
             // Upstream git's shallow clone is the reference.
             let upstream = run(
-                "git",
+                sley_testkit::oracle_git(),
                 &root,
                 &["clone", "-q", &depth_arg, &url, &expected_arg],
             );
@@ -817,7 +817,7 @@ fn clone_http_shallow_matches_upstream() {
 
             // (a) History must be truncated to exactly `depth` commits.
             let count = trimmed_utf8(run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual,
                 &["rev-list", "--count", "HEAD"],
             ));
@@ -828,7 +828,7 @@ fn clone_http_shallow_matches_upstream() {
             );
             // Upstream agrees on the count (sanity check on the reference).
             let upstream_count = trimmed_utf8(run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &expected,
                 &["rev-list", "--count", "HEAD"],
             ));
@@ -839,22 +839,22 @@ fn clone_http_shallow_matches_upstream() {
             );
 
             // HEAD must point at the same commit as upstream's shallow clone.
-            let actual_head = trimmed_utf8(run_success("git", &actual, &["rev-parse", "HEAD"]));
-            let expected_head = trimmed_utf8(run_success("git", &expected, &["rev-parse", "HEAD"]));
+            let actual_head = trimmed_utf8(run_success(sley_testkit::oracle_git(), &actual, &["rev-parse", "HEAD"]));
+            let expected_head = trimmed_utf8(run_success(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]));
             assert_eq!(
                 actual_head, expected_head,
                 "sley clone {depth_arg} HEAD OID differed from upstream git"
             );
 
             // (b) The shallow object store must be consistent and walkable.
-            let fsck = run("git", &actual, &["fsck", "--no-progress"]);
+            let fsck = run(sley_testkit::oracle_git(), &actual, &["fsck", "--no-progress"]);
             assert!(
                 fsck.status.success(),
                 "git fsck on sley {depth_arg} shallow clone failed\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&fsck.stdout),
                 String::from_utf8_lossy(&fsck.stderr)
             );
-            let log = run("git", &actual, &["log", "--oneline"]);
+            let log = run(sley_testkit::oracle_git(), &actual, &["log", "--oneline"]);
             assert!(
                 log.status.success(),
                 "git log on sley {depth_arg} shallow clone failed\nstderr:\n{}",

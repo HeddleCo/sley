@@ -61,7 +61,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn archive_tar_matches_upstream_git_for_commit_tree() {
         unix_fs::symlink("a.txt", root.join("link")).expect("create symlink");
         git(&root, &["add", "."]);
         run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit", "-m", "initial", "-q"],
             &[
@@ -112,7 +112,7 @@ fn archive_output_option_writes_tar_file() {
         fs::write(root.join("a.txt"), b"hello\n").expect("write file");
         git(&root, &["add", "."]);
         run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit", "-m", "initial", "-q"],
             &[
@@ -154,7 +154,7 @@ fn archive_tar_pathspecs_match_upstream_git() {
         fs::write(root.join("other").join("o.txt"), b"other\n").expect("write other file");
         git(&root, &["add", "."]);
         run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit", "-m", "initial", "-q"],
             &[
@@ -205,7 +205,7 @@ fn archive_tar_cwd_relative_pathspecs_match_upstream_git() {
         fs::write(root.join("dir/sub").join("b.txt"), b"b\n").expect("write nested file");
         git(&root, &["add", "."]);
         run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit", "-m", "initial", "-q"],
             &[
@@ -246,7 +246,7 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
         fs::write(root.join("a.txt"), b"root\n").expect("write root file");
         git(&root, &["add", "."]);
         run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit", "-m", "initial", "-q"],
             &[
@@ -256,7 +256,7 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
         );
 
         let args = ["archive", "--format=tar", "HEAD", "missing"];
-        let expected = run_output("git", &root, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert!(

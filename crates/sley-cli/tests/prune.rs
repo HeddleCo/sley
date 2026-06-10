@@ -55,7 +55,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), actual, args);
     assert_eq!(
         actual_output.status.code(),
@@ -83,12 +83,12 @@ fn loose_object_path(repo: &Path, oid: &str) -> PathBuf {
 
 fn create_prune_fixture(root: &Path) -> String {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output("git", root, &["init", "-b", "main"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init", "-b", "main"]);
     assert!(init.status.success(), "git init failed");
     fs::write(root.join("file.txt"), b"reachable\n").expect("write file");
-    let add = run_output("git", root, &["add", "file.txt"]);
+    let add = run_output(sley_testkit::oracle_git(), root, &["add", "file.txt"]);
     assert!(add.status.success(), "git add failed");
-    let commit = Command::new("git")
+    let commit = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .args(["commit", "-m", "one"])
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -102,7 +102,7 @@ fn create_prune_fixture(root: &Path) -> String {
     assert!(commit.status.success(), "git commit failed");
 
     let dangling = run_with_input(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["hash-object", "-w", "--stdin"],
         b"dangling\n",

@@ -104,7 +104,7 @@ fn cat_file_usage_and_option_errors_exit_like_upstream_git() {
             vec!["cat-file", "-z"],
             vec!["cat-file", "--textconv=value", "HEAD"],
         ] {
-            let expected = run_output_with_stdin("git", &root, &args, b"");
+            let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
             let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
             assert_eq!(
                 actual.status.code(),
@@ -165,7 +165,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
         let args = ["cat-file", "-p", oid.as_str()];
         assert_same_output(
             run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &actual, &args, &[]),
-            run_output_with_stdin("git", &expected, &args, &[]),
+            run_output_with_stdin(sley_testkit::oracle_git(), &expected, &args, &[]),
             &args,
         );
 
@@ -199,7 +199,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
         )];
         assert_same_output(
             run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &actual_env),
-            run_output_with_env("git", &expected, &args, &expected_env),
+            run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &expected_env),
             &args,
         );
     };
@@ -221,7 +221,7 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
             fs::write(repo.join("two.txt"), b"two\n").expect("write two");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
             for path in ["one.txt", "two.txt"] {
-                let output = run_output_with_env("git", repo, &["hash-object", "-w", path], &envs);
+                let output = run_output_with_env(sley_testkit::oracle_git(), repo, &["hash-object", "-w", path], &envs);
                 assert!(
                     output.status.success(),
                     "hash-object failed:\n{}",
@@ -236,7 +236,7 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
         ] {
             assert_same_output(
                 run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs),
-                run_output_with_env("git", &expected, &args, &envs),
+                run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs),
                 &args,
             );
         }
@@ -257,7 +257,7 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
-            let output = run_output_with_env("git", repo, &["hash-object", "-w", "one.txt"], &envs);
+            let output = run_output_with_env(sley_testkit::oracle_git(), repo, &["hash-object", "-w", "one.txt"], &envs);
             assert!(
                 output.status.success(),
                 "hash-object failed:\n{}",
@@ -272,7 +272,7 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
         ];
         assert_same_output(
             run_output_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs),
-            run_output_with_env("git", &expected, &args, &envs),
+            run_output_with_env(sley_testkit::oracle_git(), &expected, &args, &envs),
             &args,
         );
     };
@@ -289,11 +289,11 @@ fn git_rs(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin("git", cwd, args, stdin)
+    run_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 #[test]
@@ -363,7 +363,7 @@ fn cat_file_batch_modes_match_upstream_git() {
             vec!["cat-file", "--no-use-mailmap=value", "-p", "HEAD"],
             vec!["cat-file", "--no-mailmap=value", "-p", "HEAD"],
         ] {
-            let expected = run_output_with_stdin("git", &root, &args, b"");
+            let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
             let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
             assert_same_output(actual, expected, &args);
         }

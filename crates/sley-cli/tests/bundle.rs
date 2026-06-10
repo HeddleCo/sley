@@ -133,11 +133,11 @@ fn create_sha256_bundle_fixture(root: &Path) -> (PathBuf, String) {
 }
 
 fn create_bundle_fixture_with_init(root: &Path, init_args: &[&str]) -> (PathBuf, String) {
-    run_success("git", root, init_args);
+    run_success(sley_testkit::oracle_git(), root, init_args);
     fs::write(root.join("payload.txt"), b"bundle payload\n").expect("write payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -150,15 +150,15 @@ fn create_bundle_fixture_with_init(root: &Path, init_args: &[&str]) -> (PathBuf,
             "-q",
         ],
     );
-    run_success("git", root, &["branch", "feature/topic"]);
-    run_success("git", root, &["tag", "v1.0"]);
-    let head = String::from_utf8(run_success("git", root, &["rev-parse", "HEAD"]))
+    run_success(sley_testkit::oracle_git(), root, &["branch", "feature/topic"]);
+    run_success(sley_testkit::oracle_git(), root, &["tag", "v1.0"]);
+    let head = String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]))
         .expect("HEAD is utf8")
         .trim()
         .to_string();
     let bundle = root.join("repo.bundle");
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "bundle",
@@ -171,11 +171,11 @@ fn create_bundle_fixture_with_init(root: &Path, init_args: &[&str]) -> (PathBuf,
 }
 
 fn create_fetch_fixture_without_tags(root: &Path) -> String {
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("payload.txt"), b"fetch payload\n").expect("write payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -188,8 +188,8 @@ fn create_fetch_fixture_without_tags(root: &Path) -> String {
             "-q",
         ],
     );
-    run_success("git", root, &["branch", "feature/topic"]);
-    String::from_utf8(run_success("git", root, &["rev-parse", "HEAD"]))
+    run_success(sley_testkit::oracle_git(), root, &["branch", "feature/topic"]);
+    String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]))
         .expect("HEAD is utf8")
         .trim()
         .to_string()
@@ -197,16 +197,16 @@ fn create_fetch_fixture_without_tags(root: &Path) -> String {
 
 fn add_tag_only_commit(root: &Path) {
     let current = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["rev-parse", "--abbrev-ref", "HEAD"],
     ))
     .expect("current branch is utf8")
     .trim()
     .to_string();
-    run_success("git", root, &["checkout", "-q", "--detach", "HEAD"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "--detach", "HEAD"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -220,8 +220,8 @@ fn add_tag_only_commit(root: &Path) {
             "-q",
         ],
     );
-    run_success("git", root, &["tag", "tag-only"]);
-    run_success("git", root, &["checkout", "-q", &current]);
+    run_success(sley_testkit::oracle_git(), root, &["tag", "tag-only"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", &current]);
 }
 
 fn file_url(path: &Path) -> String {
@@ -261,9 +261,9 @@ fn fake_ssh_script(root: &Path) -> PathBuf {
 }
 
 fn create_incremental_bundle_fixture(root: &Path) -> PathBuf {
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -277,12 +277,12 @@ fn create_incremental_bundle_fixture(root: &Path) -> PathBuf {
             "-q",
         ],
     );
-    let base = String::from_utf8(run_success("git", root, &["rev-parse", "HEAD"]))
+    let base = String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]))
         .expect("base is utf8")
         .trim()
         .to_string();
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -298,7 +298,7 @@ fn create_incremental_bundle_fixture(root: &Path) -> PathBuf {
     );
     let bundle = root.join("incremental.bundle");
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "bundle",
@@ -323,7 +323,7 @@ fn bundle_list_heads_matches_upstream_git() {
             vec!["bundle", "list-heads", bundle, "refs/heads/feature/topic"],
             vec!["bundle", "list-heads", bundle, "feature/topic"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -343,7 +343,7 @@ fn bundle_list_heads_matches_upstream_git_sha256() {
             vec!["bundle", "list-heads", bundle, "refs/heads/feature/topic"],
             vec!["bundle", "list-heads", bundle, "feature/topic"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -363,7 +363,7 @@ fn bundle_verify_matches_upstream_git() {
             vec!["bundle", "verify", "-q", bundle],
             vec!["bundle", "verify", "--quiet", bundle],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -384,13 +384,13 @@ fn bundle_verify_prerequisites_match_upstream_git() {
         let bundle = create_incremental_bundle_fixture(&source);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = ["bundle", "verify", bundle];
-        let expected = run("git", &source, &args);
+        let expected = run(sley_testkit::oracle_git(), &source, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &source, &args);
         assert_same_output(actual, expected, &args);
 
-        run_success("git", &expected_empty, &["init", "-q"]);
-        run_success("git", &actual_empty, &["init", "-q"]);
-        let expected = run("git", &expected_empty, &args);
+        run_success(sley_testkit::oracle_git(), &expected_empty, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_empty, &["init", "-q"]);
+        let expected = run(sley_testkit::oracle_git(), &expected_empty, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_empty, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -412,7 +412,7 @@ fn bundle_create_all_writes_upstream_readable_bundle() {
         );
 
         let expected_heads = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "bundle",
@@ -420,20 +420,20 @@ fn bundle_create_all_writes_upstream_readable_bundle() {
                 expected_bundle.to_str().expect("bundle path is utf8"),
             ],
         );
-        let actual_heads = run_success("git", &root, &["bundle", "list-heads", actual_bundle_arg]);
+        let actual_heads = run_success(sley_testkit::oracle_git(), &root, &["bundle", "list-heads", actual_bundle_arg]);
         assert_eq!(actual_heads, expected_heads);
 
-        run_success("git", &root, &["bundle", "verify", actual_bundle_arg]);
+        run_success(sley_testkit::oracle_git(), &root, &["bundle", "verify", actual_bundle_arg]);
         let destination = root.join("destination");
         fs::create_dir_all(&destination).expect("create destination repo");
-        run_success("git", &destination, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &destination, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["bundle", "unbundle", actual_bundle_arg],
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -457,7 +457,7 @@ fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
         );
 
         let expected_heads = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "bundle",
@@ -465,10 +465,10 @@ fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
                 expected_bundle.to_str().expect("bundle path is utf8"),
             ],
         );
-        let actual_heads = run_success("git", &root, &["bundle", "list-heads", actual_bundle_arg]);
+        let actual_heads = run_success(sley_testkit::oracle_git(), &root, &["bundle", "list-heads", actual_bundle_arg]);
         assert_eq!(actual_heads, expected_heads);
 
-        let verify_output = run_success("git", &root, &["bundle", "verify", actual_bundle_arg]);
+        let verify_output = run_success(sley_testkit::oracle_git(), &root, &["bundle", "verify", actual_bundle_arg]);
         assert!(
             String::from_utf8_lossy(&verify_output).contains("hash algorithm: sha256"),
             "verify output should mention sha256, got {}",
@@ -478,17 +478,17 @@ fn bundle_create_all_writes_upstream_readable_sha256_bundle() {
         let destination = root.join("destination");
         fs::create_dir_all(&destination).expect("create destination repo");
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["init", "-q", "--object-format=sha256"],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["bundle", "unbundle", actual_bundle_arg],
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -511,7 +511,7 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
         let actual_bundle_arg = actual_bundle.to_str().expect("actual bundle path is utf8");
 
         let args = ["bundle", "create", expected_bundle_arg, "--all", "HEAD"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
             &root,
@@ -520,7 +520,7 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
         assert_same_output(actual, expected, &args);
 
         let all_heads = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "bundle",
@@ -530,20 +530,20 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
                     .expect("all bundle path is utf8"),
             ],
         );
-        let actual_heads = run_success("git", &root, &["bundle", "list-heads", actual_bundle_arg]);
+        let actual_heads = run_success(sley_testkit::oracle_git(), &root, &["bundle", "list-heads", actual_bundle_arg]);
         assert_eq!(actual_heads, all_heads);
-        run_success("git", &root, &["bundle", "verify", actual_bundle_arg]);
+        run_success(sley_testkit::oracle_git(), &root, &["bundle", "verify", actual_bundle_arg]);
 
         let destination = root.join("destination-all-head");
         fs::create_dir_all(&destination).expect("create destination repo");
-        run_success("git", &destination, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &destination, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["bundle", "unbundle", actual_bundle_arg],
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -556,7 +556,7 @@ fn bundle_create_all_with_explicit_revisions_matches_upstream() {
             .expect("expected empty path is utf8");
         let actual_empty_arg = actual_empty.to_str().expect("actual empty path is utf8");
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["bundle", "create", expected_empty_arg, "--all", "^HEAD"],
         );
@@ -585,11 +585,11 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
     fs::create_dir_all(&expected_empty).expect("create expected empty repo");
     fs::create_dir_all(&actual_empty).expect("create actual empty repo");
     {
-        run_success("git", &source, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &source, &["init", "-q"]);
         fs::write(source.join("payload.txt"), b"base payload\n").expect("write base payload");
-        run_success("git", &source, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -602,12 +602,12 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
                 "-q",
             ],
         );
-        let base = String::from_utf8(run_success("git", &source, &["rev-parse", "HEAD"]))
+        let base = String::from_utf8(run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]))
             .expect("base is utf8")
             .trim()
             .to_string();
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "clone",
@@ -617,9 +617,9 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
             ],
         );
         fs::write(source.join("payload.txt"), b"changed payload\n").expect("write changed payload");
-        run_success("git", &source, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -632,7 +632,7 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
                 "-q",
             ],
         );
-        let head = String::from_utf8(run_success("git", &source, &["rev-parse", "HEAD"]))
+        let head = String::from_utf8(run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]))
             .expect("HEAD is utf8")
             .trim()
             .to_string();
@@ -641,7 +641,7 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
         let expected_bundle_arg = expected_bundle.to_str().expect("bundle path is utf8");
         let actual_bundle_arg = actual_bundle.to_str().expect("bundle path is utf8");
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "bundle",
@@ -664,24 +664,24 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
         );
 
         let expected_heads = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["bundle", "list-heads", expected_bundle_arg],
         );
         let actual_heads =
-            run_success("git", &source, &["bundle", "list-heads", actual_bundle_arg]);
+            run_success(sley_testkit::oracle_git(), &source, &["bundle", "list-heads", actual_bundle_arg]);
         assert_eq!(actual_heads, expected_heads);
 
-        run_success("git", &source, &["bundle", "verify", actual_bundle_arg]);
-        run_success("git", &expected_empty, &["init", "-q"]);
-        run_success("git", &actual_empty, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &source, &["bundle", "verify", actual_bundle_arg]);
+        run_success(sley_testkit::oracle_git(), &expected_empty, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_empty, &["init", "-q"]);
         let expected_missing = run(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_empty,
             &["bundle", "verify", expected_bundle_arg],
         );
         let actual_missing = run(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_empty,
             &["bundle", "verify", actual_bundle_arg],
         );
@@ -692,12 +692,12 @@ fn bundle_create_incremental_writes_upstream_readable_bundle() {
         );
 
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["bundle", "unbundle", actual_bundle_arg],
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &destination,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -717,8 +717,8 @@ fn fetch_bundle_refspec_matches_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = [
             "fetch",
@@ -727,12 +727,12 @@ fn fetch_bundle_refspec_matches_upstream_git() {
             "refs/heads/feature/topic:refs/heads/imported",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
 
-        let expected_ref = run_success("git", &expected_repo, &["show-ref", "refs/heads/imported"]);
-        let actual_ref = run_success("git", &actual_repo, &["show-ref", "refs/heads/imported"]);
+        let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", "refs/heads/imported"]);
+        let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", "refs/heads/imported"]);
         assert_eq!(actual_ref, expected_ref);
         assert_eq!(
             fs::read(expected_repo.join(".git").join("FETCH_HEAD"))
@@ -740,7 +740,7 @@ fn fetch_bundle_refspec_matches_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -760,8 +760,8 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = [
             "fetch",
@@ -771,7 +771,7 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
             "refs/heads/feature/topic:refs/heads/imported",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -779,11 +779,11 @@ fn fetch_bundle_no_tags_disables_auto_follow_like_upstream_git() {
                 .expect("read expected FETCH_HEAD"),
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
-        let expected_tag = run("git", &expected_repo, &["show-ref", "refs/tags/v1.0"]);
-        let actual_tag = run("git", &actual_repo, &["show-ref", "refs/tags/v1.0"]);
+        let expected_tag = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", "refs/tags/v1.0"]);
+        let actual_tag = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", "refs/tags/v1.0"]);
         assert_same_output(actual_tag, expected_tag, &["show-ref", "refs/tags/v1.0"]);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -806,7 +806,7 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
         add_tag_only_commit(&source);
         fs::remove_file(&bundle).expect("remove old bundle");
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "bundle",
@@ -815,8 +815,8 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
                 "--all",
             ],
         );
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = [
             "fetch",
@@ -826,7 +826,7 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
             "refs/heads/feature/topic:refs/heads/imported",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -835,12 +835,12 @@ fn fetch_bundle_tags_fetches_unfollowed_tags_like_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         for reference in ["refs/heads/imported", "refs/tags/tag-only"] {
-            let expected_ref = run_success("git", &expected_repo, &["show-ref", reference]);
-            let actual_ref = run_success("git", &actual_repo, &["show-ref", reference]);
+            let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", reference]);
+            let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", reference]);
             assert_eq!(actual_ref, expected_ref, "ref {reference} differed");
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -860,12 +860,12 @@ fn fetch_bundle_source_ref_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = ["fetch", "-q", bundle, "refs/heads/feature/topic"];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -874,11 +874,11 @@ fn fetch_bundle_source_ref_writes_fetch_head_without_ref_update() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         assert_eq!(
-            run("git", &actual_repo, &["show-ref"]).status.code(),
+            run(sley_testkit::oracle_git(), &actual_repo, &["show-ref"]).status.code(),
             Some(1)
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -898,12 +898,12 @@ fn fetch_bundle_default_head_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
         let args = ["fetch", "-q", bundle];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -912,11 +912,11 @@ fn fetch_bundle_default_head_writes_fetch_head_without_ref_update() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         assert_eq!(
-            run("git", &actual_repo, &["show-ref"]).status.code(),
+            run(sley_testkit::oracle_git(), &actual_repo, &["show-ref"]).status.code(),
             Some(1)
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -936,8 +936,8 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (_bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source = source.to_str().expect("source path is utf8");
         let args = [
             "fetch",
@@ -946,17 +946,17 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/origin/feature/topic",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
 
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
@@ -967,7 +967,7 @@ fn fetch_local_repository_refspec_matches_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -987,8 +987,8 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let head = create_fetch_fixture_without_tags(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let fake_ssh = fake_ssh_script(&root);
         let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
         let remote_url = ssh_url(&source);
@@ -1010,7 +1010,7 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
         ];
 
         let expected = run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &expected_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1024,12 +1024,12 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
         assert_same_output(actual, expected, &args);
 
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/ssh/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/ssh/feature/topic"],
         );
@@ -1040,7 +1040,7 @@ fn fetch_ssh_repository_refspec_matches_upstream_git_protocol_v0() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1064,18 +1064,18 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let head = create_fetch_fixture_without_tags(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let fake_ssh = fake_ssh_script(&root);
         let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
         let remote_url = percent_encoded_ssh_url(&source);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", remote_url.as_str()],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", remote_url.as_str()],
         );
@@ -1090,7 +1090,7 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
         ];
 
         let expected = run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &expected_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1108,18 +1108,18 @@ fn fetch_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0(
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
         assert_eq!(actual_ref, expected_ref);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1139,18 +1139,18 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let head = create_fetch_fixture_without_tags(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let fake_ssh = fake_ssh_script(&root);
         let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
         let remote_url = ssh_url(&source);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", remote_url.as_str()],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", remote_url.as_str()],
         );
@@ -1164,7 +1164,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             "origin",
         ];
         run_success_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &expected_initial_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1175,7 +1175,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             &initial_args,
             &[("GIT_SSH", fake_ssh)],
         );
-        run_success("git", &source, &["branch", "-D", "feature/topic"]);
+        run_success(sley_testkit::oracle_git(), &source, &["branch", "-D", "feature/topic"]);
 
         let args = ["fetch", "-q", "--prune", "--no-tags", "origin"];
         let expected_args = [
@@ -1188,7 +1188,7 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             "origin",
         ];
         let expected = run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &expected_args,
             &[("GIT_SSH", fake_ssh)],
@@ -1210,12 +1210,12 @@ fn fetch_configured_ssh_remote_prune_matches_upstream_git_protocol_v0() {
             "refs/remotes/origin/main",
             "refs/remotes/origin/master",
         ] {
-            let expected_ref = run("git", &expected_repo, &["show-ref", reference]);
-            let actual_ref = run("git", &actual_repo, &["show-ref", reference]);
+            let expected_ref = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", reference]);
+            let actual_ref = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", reference]);
             assert_same_output(actual_ref, expected_ref, &["show-ref", reference]);
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1235,8 +1235,8 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (_bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source = source.to_str().expect("source path is utf8");
         let args = [
             "fetch",
@@ -1246,7 +1246,7 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/origin/feature/topic",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1254,11 +1254,11 @@ fn fetch_local_repository_no_tags_disables_auto_follow_like_upstream_git() {
                 .expect("read expected FETCH_HEAD"),
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
-        let expected_tag = run("git", &expected_repo, &["show-ref", "refs/tags/v1.0"]);
-        let actual_tag = run("git", &actual_repo, &["show-ref", "refs/tags/v1.0"]);
+        let expected_tag = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", "refs/tags/v1.0"]);
+        let actual_tag = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", "refs/tags/v1.0"]);
         assert_same_output(actual_tag, expected_tag, &["show-ref", "refs/tags/v1.0"]);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1279,8 +1279,8 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         add_tag_only_commit(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source = source.to_str().expect("source path is utf8");
         let args = [
             "fetch",
@@ -1290,7 +1290,7 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/origin/feature/topic",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1299,12 +1299,12 @@ fn fetch_local_repository_tags_fetches_unfollowed_tags_like_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         for reference in ["refs/remotes/origin/feature/topic", "refs/tags/tag-only"] {
-            let expected_ref = run_success("git", &expected_repo, &["show-ref", reference]);
-            let actual_ref = run_success("git", &actual_repo, &["show-ref", reference]);
+            let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", reference]);
+            let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", reference]);
             assert_eq!(actual_ref, expected_ref, "ref {reference} differed");
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1324,12 +1324,12 @@ fn fetch_local_repository_default_head_writes_fetch_head_without_ref_update() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (_bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source = source.to_str().expect("source path is utf8");
         let args = ["fetch", "-q", source];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1338,11 +1338,11 @@ fn fetch_local_repository_default_head_writes_fetch_head_without_ref_update() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         assert_eq!(
-            run("git", &actual_repo, &["show-ref"]).status.code(),
+            run(sley_testkit::oracle_git(), &actual_repo, &["show-ref"]).status.code(),
             Some(1)
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1359,7 +1359,7 @@ fn fetch_configured_local_remote_matches_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -1376,20 +1376,20 @@ fn fetch_configured_local_remote_matches_upstream_git() {
             let actual_repo = root.join(format!("actual-{label}"));
             fs::create_dir_all(&expected_repo).expect("create expected repo");
             fs::create_dir_all(&actual_repo).expect("create actual repo");
-            run_success("git", &expected_repo, &["init", "-q"]);
-            run_success("git", &actual_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &expected_repo,
                 &["remote", "add", "origin", source_arg],
             );
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["remote", "add", "origin", source_arg],
             );
 
-            let expected = run("git", &expected_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -1404,12 +1404,12 @@ fn fetch_configured_local_remote_matches_upstream_git() {
                 "refs/remotes/origin/feature/topic".to_string(),
                 format!("refs/remotes/origin/{head_branch}"),
             ] {
-                let expected_ref = run_success("git", &expected_repo, &["show-ref", &reference]);
-                let actual_ref = run_success("git", &actual_repo, &["show-ref", &reference]);
+                let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", &reference]);
+                let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", &reference]);
                 assert_eq!(actual_ref, expected_ref, "ref {reference} differed");
             }
             let imported = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["cat-file", "-p", &format!("{head}:payload.txt")],
             );
@@ -1453,12 +1453,12 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
             let actual_repo = root.join(format!("actual-{label}"));
             fs::create_dir_all(&expected_repo).expect("create expected repo");
             fs::create_dir_all(&actual_repo).expect("create actual repo");
-            run_success("git", &expected_repo, &["init", "-q"]);
-            run_success("git", &actual_repo, &["init", "-q"]);
-            run_success("git", &expected_repo, &remote_args);
-            run_success("git", &actual_repo, &remote_args);
+            run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &expected_repo, &remote_args);
+            run_success(sley_testkit::oracle_git(), &actual_repo, &remote_args);
 
-            let expected = run("git", &expected_repo, &fetch_args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
             assert_same_output(actual, expected, &fetch_args);
             assert_eq!(
@@ -1469,19 +1469,19 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
                 "FETCH_HEAD differed for {fetch_args:?}"
             );
             let expected_ref = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &expected_repo,
                 &["show-ref", "refs/remotes/origin/feature/topic"],
             );
             let actual_ref = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["show-ref", "refs/remotes/origin/feature/topic"],
             );
             assert_eq!(actual_ref, expected_ref);
 
-            let expected_tag = run("git", &expected_repo, &["show-ref", "refs/tags/tag-only"]);
-            let actual_tag = run("git", &actual_repo, &["show-ref", "refs/tags/tag-only"]);
+            let expected_tag = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", "refs/tags/tag-only"]);
+            let actual_tag = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", "refs/tags/tag-only"]);
             let actual_tag_present = actual_tag.status.success();
             assert_same_output(
                 actual_tag,
@@ -1493,7 +1493,7 @@ fn fetch_configured_local_remote_tagopt_matches_upstream_git() {
                 "tag-only presence differed for {label}"
             );
             let imported = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["cat-file", "-p", &format!("{head}:payload.txt")],
             );
@@ -1515,7 +1515,7 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -1523,28 +1523,28 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
         .trim()
         .to_string();
         let source_arg = source.to_str().expect("source path is utf8");
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", source_arg],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", source_arg],
         );
-        run_success("git", &expected_repo, &["fetch", "-q", "origin"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["fetch", "-q", "origin"]);
         run_success(
             env!("CARGO_BIN_EXE_sley"),
             &actual_repo,
             &["fetch", "-q", "origin"],
         );
-        run_success("git", &source, &["branch", "-D", "feature/topic"]);
+        run_success(sley_testkit::oracle_git(), &source, &["branch", "-D", "feature/topic"]);
 
         let dry_run_args = ["fetch", "-q", "--dry-run", "--prune", "origin"];
-        let expected = run("git", &expected_repo, &dry_run_args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &dry_run_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &dry_run_args);
         assert_same_output(actual, expected, &dry_run_args);
         assert_eq!(
@@ -1554,12 +1554,12 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
                 .expect("read actual FETCH_HEAD after dry-run prune")
         );
         let stale_ref = "refs/remotes/origin/feature/topic";
-        let expected_ref = run_success("git", &expected_repo, &["show-ref", stale_ref]);
-        let actual_ref = run_success("git", &actual_repo, &["show-ref", stale_ref]);
+        let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", stale_ref]);
+        let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", stale_ref]);
         assert_eq!(actual_ref, expected_ref, "dry-run pruned {stale_ref}");
 
         let args = ["fetch", "-q", "--prune", "origin"];
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1571,12 +1571,12 @@ fn fetch_configured_local_remote_prune_matches_upstream_git() {
             "refs/remotes/origin/feature/topic".to_string(),
             format!("refs/remotes/origin/{head_branch}"),
         ] {
-            let expected_ref = run("git", &expected_repo, &["show-ref", &reference]);
-            let actual_ref = run("git", &actual_repo, &["show-ref", &reference]);
+            let expected_ref = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", &reference]);
+            let actual_ref = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", &reference]);
             assert_same_output(actual_ref, expected_ref, &["show-ref", &reference]);
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1600,7 +1600,7 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
                 fs::create_dir_all(&actual_repo).expect("create actual repo");
                 let (_bundle, _head) = create_bundle_fixture(&source);
                 let head_branch = String::from_utf8(run_success(
-                    "git",
+                    sley_testkit::oracle_git(),
                     &source,
                     &["rev-parse", "--abbrev-ref", "HEAD"],
                 ))
@@ -1608,31 +1608,31 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
                 .trim()
                 .to_string();
                 let source_arg = source.to_str().expect("source path is utf8");
-                run_success("git", &expected_repo, &["init", "-q"]);
-                run_success("git", &actual_repo, &["init", "-q"]);
+                run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+                run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
                 run_success(
-                    "git",
+                    sley_testkit::oracle_git(),
                     &expected_repo,
                     &["remote", "add", "origin", source_arg],
                 );
                 run_success(
-                    "git",
+                    sley_testkit::oracle_git(),
                     &actual_repo,
                     &["remote", "add", "origin", source_arg],
                 );
-                run_success("git", &expected_repo, &["fetch", "-q", "origin"]);
+                run_success(sley_testkit::oracle_git(), &expected_repo, &["fetch", "-q", "origin"]);
                 run_success(
                     env!("CARGO_BIN_EXE_sley"),
                     &actual_repo,
                     &["fetch", "-q", "origin"],
                 );
-                run_success("git", &source, &["branch", "-D", "feature/topic"]);
+                run_success(sley_testkit::oracle_git(), &source, &["branch", "-D", "feature/topic"]);
                 for args in &config_args {
-                    run_success("git", &expected_repo, args);
-                    run_success("git", &actual_repo, args);
+                    run_success(sley_testkit::oracle_git(), &expected_repo, args);
+                    run_success(sley_testkit::oracle_git(), &actual_repo, args);
                 }
 
-                let expected = run("git", &expected_repo, &fetch_args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
                 let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
                 assert_same_output(actual, expected, &fetch_args);
                 assert_eq!(
@@ -1646,12 +1646,12 @@ fn fetch_configured_local_remote_prune_config_matches_upstream_git() {
                     "refs/remotes/origin/feature/topic".to_string(),
                     format!("refs/remotes/origin/{head_branch}"),
                 ] {
-                    let expected_ref = run("git", &expected_repo, &["show-ref", &reference]);
-                    let actual_ref = run("git", &actual_repo, &["show-ref", &reference]);
+                    let expected_ref = run(sley_testkit::oracle_git(), &expected_repo, &["show-ref", &reference]);
+                    let actual_ref = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref", &reference]);
                     assert_same_output(actual_ref, expected_ref, &["show-ref", &reference]);
                 }
                 let expected_stale = run(
-                    "git",
+                    sley_testkit::oracle_git(),
                     &expected_repo,
                     &["show-ref", "refs/remotes/origin/feature/topic"],
                 );
@@ -1705,7 +1705,7 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -1713,21 +1713,21 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
         .trim()
         .to_string();
         let source_arg = source.to_str().expect("source path is utf8");
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", source_arg],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", source_arg],
         );
 
         let dry_run_args = ["fetch", "-q", "--dry-run", "origin"];
-        let expected = run("git", &expected_repo, &dry_run_args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &dry_run_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &dry_run_args);
         assert_same_output(actual, expected, &dry_run_args);
         assert_eq!(
@@ -1739,13 +1739,13 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
             vec!["show-ref", "refs/remotes/origin/feature/topic"],
             vec!["cat-file", "-e", &head],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 
         let fetch_args = ["fetch", "-q", "--dry-run", "--no-dry-run", "origin"];
-        let expected = run("git", &expected_repo, &fetch_args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &fetch_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &fetch_args);
         assert_same_output(actual, expected, &fetch_args);
         assert_eq!(
@@ -1757,12 +1757,12 @@ fn fetch_configured_local_remote_dry_run_matches_upstream_git() {
             "refs/remotes/origin/feature/topic".to_string(),
             format!("refs/remotes/origin/{head_branch}"),
         ] {
-            let expected_ref = run_success("git", &expected_repo, &["show-ref", &reference]);
-            let actual_ref = run_success("git", &actual_repo, &["show-ref", &reference]);
+            let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", &reference]);
+            let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", &reference]);
             assert_eq!(actual_ref, expected_ref, "ref {reference} differed");
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1783,15 +1783,15 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         let source_arg = source.to_str().expect("source path is utf8");
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", source_arg],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", source_arg],
         );
@@ -1801,7 +1801,7 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
             vec!["fetch", "-q", "--append", "origin"],
             vec!["fetch", "-q", "--append", "--no-append", "origin"],
         ] {
-            let expected = run("git", &expected_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -1814,7 +1814,7 @@ fn fetch_configured_local_remote_append_matches_upstream_git() {
         }
 
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1835,7 +1835,7 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
     {
         let (_bundle, head) = create_bundle_fixture(&source);
         let head_branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -1843,21 +1843,21 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
         .trim()
         .to_string();
         let source_arg = source.to_str().expect("source path is utf8");
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", source_arg],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["remote", "add", "origin", source_arg],
         );
 
         let args = ["fetch", "-q", "--no-write-fetch-head", "origin"];
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1869,12 +1869,12 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
             "refs/remotes/origin/feature/topic".to_string(),
             format!("refs/remotes/origin/{head_branch}"),
         ] {
-            let expected_ref = run_success("git", &expected_repo, &["show-ref", &reference]);
-            let actual_ref = run_success("git", &actual_repo, &["show-ref", &reference]);
+            let expected_ref = run_success(sley_testkit::oracle_git(), &expected_repo, &["show-ref", &reference]);
+            let actual_ref = run_success(sley_testkit::oracle_git(), &actual_repo, &["show-ref", &reference]);
             assert_eq!(actual_ref, expected_ref, "ref {reference} differed");
         }
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -1887,7 +1887,7 @@ fn fetch_configured_local_remote_no_write_fetch_head_matches_upstream_git() {
             "--write-fetch-head",
             "origin",
         ];
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1910,11 +1910,11 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
     fs::create_dir_all(&expected_repo).expect("create expected repo");
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
-        run_success("git", &source, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &source, &["init", "-q"]);
         fs::write(source.join("main.txt"), b"main payload\n").expect("write main payload");
-        run_success("git", &source, &["add", "main.txt"]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "main.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -1928,18 +1928,18 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
             ],
         );
         let default_branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
         .expect("default branch is utf8")
         .trim()
         .to_string();
-        run_success("git", &source, &["checkout", "-q", "-b", "feature"]);
+        run_success(sley_testkit::oracle_git(), &source, &["checkout", "-q", "-b", "feature"]);
         fs::write(source.join("feature.txt"), b"feature payload\n").expect("write feature payload");
-        run_success("git", &source, &["add", "feature.txt"]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "feature.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -1952,22 +1952,22 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
                 "-q",
             ],
         );
-        let feature_head = String::from_utf8(run_success("git", &source, &["rev-parse", "HEAD"]))
+        let feature_head = String::from_utf8(run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]))
             .expect("feature head is utf8")
             .trim()
             .to_string();
-        run_success("git", &source, &["checkout", "-q", &default_branch]);
+        run_success(sley_testkit::oracle_git(), &source, &["checkout", "-q", &default_branch]);
         let linked_arg = linked.to_str().expect("linked path is utf8");
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["worktree", "add", "-q", linked_arg, "feature"],
         );
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
 
         let args = ["fetch", "-q", linked_arg];
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -1976,7 +1976,7 @@ fn fetch_local_repository_linked_worktree_head_matches_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{feature_head}:feature.txt")],
         );
@@ -2025,16 +2025,16 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
             let actual_repo = root.join(format!("actual-{label}"));
             fs::create_dir_all(&expected_repo).expect("create expected repo");
             fs::create_dir_all(&actual_repo).expect("create actual repo");
-            run_success("git", &expected_repo, &["init", "-q"]);
-            run_success("git", &actual_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
             for command in &setup {
                 let command = command.iter().map(String::as_str).collect::<Vec<_>>();
-                run_success("git", &expected_repo, &command);
-                run_success("git", &actual_repo, &command);
+                run_success(sley_testkit::oracle_git(), &expected_repo, &command);
+                run_success(sley_testkit::oracle_git(), &actual_repo, &command);
             }
 
             let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let expected = run("git", &expected_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
             assert_eq!(
@@ -2045,18 +2045,18 @@ fn fetch_file_url_and_rewritten_url_match_upstream_git() {
                 "FETCH_HEAD differed for {args:?}"
             );
             let expected_ref = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &expected_repo,
                 &["show-ref", "refs/remotes/file/feature/topic"],
             );
             let actual_ref = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["show-ref", "refs/remotes/file/feature/topic"],
             );
             assert_eq!(actual_ref, expected_ref);
             let imported = run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 &actual_repo,
                 &["cat-file", "-p", &format!("{head}:payload.txt")],
             );
@@ -2077,8 +2077,8 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (_bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source_file_url = percent_encoded_file_url(&source);
         let args = [
             "fetch",
@@ -2087,7 +2087,7 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/file/feature/topic",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -2096,18 +2096,18 @@ fn fetch_file_url_percent_encoded_path_matches_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/file/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/file/feature/topic"],
         );
         assert_eq!(actual_ref, expected_ref);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -2127,11 +2127,11 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (_bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let source_file_url = percent_encoded_file_url(&source);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["remote", "add", "origin", source_file_url.as_str()],
         );
@@ -2147,7 +2147,7 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
             "refs/heads/feature/topic:refs/remotes/origin/feature/topic",
         ];
 
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -2156,18 +2156,18 @@ fn fetch_configured_file_url_percent_encoded_path_matches_upstream_git() {
             fs::read(actual_repo.join(".git").join("FETCH_HEAD")).expect("read actual FETCH_HEAD")
         );
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/origin/feature/topic"],
         );
         assert_eq!(actual_ref, expected_ref);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -2189,12 +2189,12 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
         let (_bundle, head) = create_sha256_bundle_fixture(&source);
         let source_file_url = file_url(&source);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["init", "-q", "--object-format=sha256"],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["init", "-q", "--object-format=sha256"],
         );
@@ -2204,30 +2204,30 @@ fn fetch_sha256_file_url_imports_objects_like_upstream_git() {
             &source_file_url,
             "refs/heads/feature/topic:refs/remotes/file/feature/topic",
         ];
-        let expected = run("git", &expected_repo, &args);
+        let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
         assert_same_output(actual, expected, &args);
         let actual_git_dir = actual_repo.join(".git");
         let (_pack_path, index_path) = repository_pack_pair(&actual_git_dir);
         let index_arg = index_path.to_string_lossy();
-        run_success("git", &actual_repo, &["verify-pack", "-v", &index_arg]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["verify-pack", "-v", &index_arg]);
         assert!(
             !loose_object_path(&actual_git_dir, &head).exists(),
             "fetched commit should be stored in pack, not as loose object"
         );
         let expected_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["show-ref", "refs/remotes/file/feature/topic"],
         );
         let actual_ref = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["show-ref", "refs/remotes/file/feature/topic"],
         );
         assert_eq!(actual_ref, expected_ref);
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -2246,7 +2246,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
     {
         let (_bundle, base) = create_bundle_fixture(&source);
         let branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -2254,7 +2254,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         .trim()
         .to_string();
         let source_arg = source.to_str().expect("source path is utf8");
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let refspec = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
         run_success(
             env!("CARGO_BIN_EXE_sley"),
@@ -2267,9 +2267,9 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
             .collect::<std::collections::HashSet<_>>();
 
         fs::write(source.join("payload.txt"), b"changed payload\n").expect("write changed");
-        run_success("git", &source, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -2282,7 +2282,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
                 "-q",
             ],
         );
-        let head = String::from_utf8(run_success("git", &source, &["rev-parse", "HEAD"]))
+        let head = String::from_utf8(run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]))
             .expect("head is utf8")
             .trim()
             .to_string();
@@ -2300,7 +2300,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
         assert_eq!(new_indexes.len(), 1, "expected one new fetch pack index");
         let index_arg = new_indexes[0].to_string_lossy();
         let verify = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["verify-pack", "-v", &index_arg],
         ))
@@ -2314,7 +2314,7 @@ fn fetch_local_repository_protocol_pack_excludes_existing_haves() {
             "new fetch pack should exclude existing have {base}\n{verify}"
         );
         let imported = run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_repo,
             &["cat-file", "-p", &format!("{head}:payload.txt")],
         );
@@ -2334,30 +2334,30 @@ fn bundle_unbundle_matches_upstream_git_and_imports_objects() {
     fs::create_dir_all(&actual_repo).expect("create actual repo");
     {
         let (bundle, head) = create_bundle_fixture(&source);
-        run_success("git", &expected_repo, &["init", "-q"]);
-        run_success("git", &actual_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected_repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["init", "-q"]);
         let bundle = bundle.to_str().expect("bundle path is utf8");
 
         for args in [
             vec!["bundle", "unbundle", bundle],
             vec!["bundle", "unbundle", bundle, "refs/heads/feature/topic"],
         ] {
-            let expected = run("git", &expected_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 
-        let imported_type = run_success("git", &actual_repo, &["cat-file", "-t", head.as_str()]);
+        let imported_type = run_success(sley_testkit::oracle_git(), &actual_repo, &["cat-file", "-t", head.as_str()]);
         assert_eq!(imported_type, b"commit\n");
         let actual_git_dir = actual_repo.join(".git");
         let (_pack_path, index_path) = repository_pack_pair(&actual_git_dir);
         let index_arg = index_path.to_string_lossy();
-        run_success("git", &actual_repo, &["verify-pack", "-v", &index_arg]);
+        run_success(sley_testkit::oracle_git(), &actual_repo, &["verify-pack", "-v", &index_arg]);
         assert!(
             !loose_object_path(&actual_git_dir, &head).exists(),
             "unbundled commit should be stored in pack, not as loose object"
         );
-        let refs = run("git", &actual_repo, &["show-ref"]);
+        let refs = run(sley_testkit::oracle_git(), &actual_repo, &["show-ref"]);
         assert_eq!(refs.status.code(), Some(1));
         assert!(refs.stdout.is_empty(), "unbundle should not create refs");
     };

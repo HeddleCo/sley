@@ -45,11 +45,11 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    run_success("git", cwd, args);
+    run_success(sley_testkit::oracle_git(), cwd, args);
 }
 
 fn git_with_identity(cwd: &Path, args: &[&str]) {
-    let output = run_output_with_identity("git", cwd, args);
+    let output = run_output_with_identity(sley_testkit::oracle_git(), cwd, args);
     assert!(
         output.status.success(),
         "git {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -86,7 +86,7 @@ fn prepare_fast_forward_upstream(upstream: &Path) {
     fs::write(upstream.join("hello.txt"), b"base\n").expect("write base file");
     git(upstream, &["add", "hello.txt"]);
     git_with_identity(upstream, &["commit", "-m", "base", "-q"]);
-    let base = String::from_utf8(run_output("git", upstream, &["rev-parse", "HEAD"]).stdout)
+    let base = String::from_utf8(run_output(sley_testkit::oracle_git(), upstream, &["rev-parse", "HEAD"]).stdout)
         .expect("base oid utf8")
         .trim()
         .to_string();
@@ -138,7 +138,7 @@ fn pull_fast_forward_matches_upstream_git() {
     prepare_fast_forward_clone(&upstream, &expected);
     prepare_fast_forward_clone(&upstream, &actual);
     let args = ["pull"];
-    let expected_output = run_output_with_identity("git", &expected, &args);
+    let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
     let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
@@ -156,7 +156,7 @@ fn pull_fast_forward_matches_upstream_git() {
         "expected Fast-forward in output"
     );
     assert_eq!(
-        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after fast-forward pull"
     );
@@ -176,7 +176,7 @@ fn pull_three_way_clean_matches_upstream_git() {
     prepare_three_way_clone(&upstream, &expected);
     prepare_three_way_clone(&upstream, &actual);
     let args = ["pull"];
-    let expected_output = run_output_with_identity("git", &expected, &args);
+    let expected_output = run_output_with_identity(sley_testkit::oracle_git(), &expected, &args);
     let actual_output = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual, &args);
     assert_eq!(
         actual_output.status.code(),
@@ -193,7 +193,7 @@ fn pull_three_way_clean_matches_upstream_git() {
         "expected ort merge summary in output"
     );
     assert_eq!(
-        run_output("git", &expected, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after three-way pull"
     );

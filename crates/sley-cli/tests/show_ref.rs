@@ -73,19 +73,19 @@ fn show_ref_exists_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exists");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         for args in [
             vec!["show-ref", "--exists"],
             vec!["show-ref", "--exists", "HEAD"],
             vec!["show-ref", "--exists", "--", "HEAD"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
 
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -99,7 +99,7 @@ fn show_ref_exists_matches_upstream_git() {
                 "-q",
             ],
         );
-        let head_ref = String::from_utf8(run_success("git", &root, &["symbolic-ref", "HEAD"]))
+        let head_ref = String::from_utf8(run_success(sley_testkit::oracle_git(), &root, &["symbolic-ref", "HEAD"]))
             .expect("HEAD ref is utf8")
             .trim()
             .to_string();
@@ -111,7 +111,7 @@ fn show_ref_exists_matches_upstream_git() {
             vec!["show-ref", "--exists", "main"],
             vec!["show-ref", "--exists", "refs/heads/foo..bar"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -124,9 +124,9 @@ fn show_ref_head_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-head");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -140,15 +140,15 @@ fn show_ref_head_matches_upstream_git() {
                 "-q",
             ],
         );
-        run_success("git", &root, &["tag", "v1.0"]);
-        run_success("git", &root, &["branch", "feature/topic"]);
+        run_success(sley_testkit::oracle_git(), &root, &["tag", "v1.0"]);
+        run_success(sley_testkit::oracle_git(), &root, &["branch", "feature/topic"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["update-ref", "refs/remotes/origin/main", "HEAD"],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "symbolic-ref",
@@ -157,7 +157,7 @@ fn show_ref_head_matches_upstream_git() {
             ],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -249,7 +249,7 @@ fn show_ref_head_matches_upstream_git() {
             vec!["show-ref", "--no-exists", "--exists", "refs/heads/main"],
             vec!["show-ref", "--verify", "--head", "HEAD", "refs/heads/main"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -262,9 +262,9 @@ fn show_ref_exclude_existing_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exclude-existing");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -278,14 +278,14 @@ fn show_ref_exclude_existing_matches_upstream_git() {
                 "-q",
             ],
         );
-        run_success("git", &root, &["tag", "v1.0"]);
+        run_success(sley_testkit::oracle_git(), &root, &["tag", "v1.0"]);
 
         let input = b"refs/heads/main\nrefs/heads/new\nabc refs/tags/v1.0\nabc refs/tags/new^{}\ninvalid..ref\nHEAD\n";
         for args in [
             vec!["show-ref", "--exclude-existing"],
             vec!["show-ref", "--exclude-existing=refs/heads/"],
         ] {
-            let expected = run_with_stdin("git", &root, &args, input);
+            let expected = run_with_stdin(sley_testkit::oracle_git(), &root, &args, input);
             let actual = run_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, input);
             assert_same_output(actual, expected, &args);
         }
@@ -298,9 +298,9 @@ fn show_ref_reftable_repository_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-reftable");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q", "--ref-format=reftable"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "--ref-format=reftable"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -314,8 +314,8 @@ fn show_ref_reftable_repository_matches_upstream_git() {
                 "-q",
             ],
         );
-        run_success("git", &root, &["tag", "v1.0"]);
-        run_success("git", &root, &["branch", "feature"]);
+        run_success(sley_testkit::oracle_git(), &root, &["tag", "v1.0"]);
+        run_success(sley_testkit::oracle_git(), &root, &["branch", "feature"]);
 
         for args in [
             vec!["show-ref"],
@@ -326,7 +326,7 @@ fn show_ref_reftable_repository_matches_upstream_git() {
             vec!["show-ref", "--verify", "refs/heads/main"],
             vec!["show-ref", "--exists", "refs/tags/v1.0"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }

@@ -24,7 +24,7 @@ const IDENTITY_ENV: &[(&str, &str)] = &[
 ];
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -119,13 +119,13 @@ fn prepare_pair(name: &str, root: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn prepare_repo(root: &Path) {
-    run_success("git", root, &["init", "-q"]);
-    run_success("git", root, &["config", "core.autocrlf", "false"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["config", "core.autocrlf", "false"]);
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     fs::create_dir_all(root.join("dir")).expect("create dir");
     fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested");
-    run_success("git", root, &["add", "file.txt", "dir/nested.txt"]);
-    run_success("git", root, &["commit", "-q", "-m", "base"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "file.txt", "dir/nested.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["commit", "-q", "-m", "base"]);
 }
 
 /// Remove the worktree files sley and git will recreate, leaving the index.
@@ -136,11 +136,11 @@ fn clear_worktree(root: &Path, paths: &[&str]) {
 }
 
 fn worktree_status(root: &Path) -> Vec<u8> {
-    run_success("git", root, &["status", "--porcelain"])
+    run_success(sley_testkit::oracle_git(), root, &["status", "--porcelain"])
 }
 
 fn staged_index(root: &Path) -> Vec<u8> {
-    run_success("git", root, &["ls-files", "--stage"])
+    run_success(sley_testkit::oracle_git(), root, &["ls-files", "--stage"])
 }
 
 #[test]
@@ -155,7 +155,7 @@ fn checkout_index_all_matches_upstream_git() {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
         let args = ["checkout-index", "-a"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -188,7 +188,7 @@ fn checkout_index_existing_without_force_matches_upstream_git() {
     {
         // Leave the worktree populated so each entry already exists on disk.
         let args = ["checkout-index", "-a"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -207,7 +207,7 @@ fn checkout_index_force_overwrites_match_upstream_git() {
             fs::write(repo.join("file.txt"), b"dirty\n").expect("dirty worktree");
         }
         let args = ["checkout-index", "-a", "-f"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -237,7 +237,7 @@ fn checkout_index_explicit_paths_match_upstream_git() {
             clear_worktree(repo, &["file.txt", "dir/nested.txt"]);
         }
         let args = ["checkout-index", "file.txt", "dir/nested.txt"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -264,13 +264,13 @@ fn checkout_index_missing_path_matches_upstream_git() {
     let (upstream, rust) = prepare_pair("missing", &root);
     {
         let args = ["checkout-index", "absent.txt"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
         // Quiet form suppresses the warning but keeps the nonzero exit.
         let quiet_args = ["checkout-index", "-q", "absent.txt"];
-        let expected = run("git", &upstream, &quiet_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &quiet_args);
         let actual = run(GIT_RS, &rust, &quiet_args);
         assert_same_output(actual, expected, &quiet_args);
     };
@@ -294,7 +294,7 @@ fn checkout_index_prefix_matches_upstream_git() {
             "file.txt",
             "dir/nested.txt",
         ];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -325,7 +325,7 @@ fn checkout_index_stdin_matches_upstream_git() {
         }
         let args = ["checkout-index", "--stdin"];
         let stdin = b"file.txt\ndir/nested.txt\n";
-        let expected = run_with_stdin("git", &upstream, &args, stdin);
+        let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, stdin);
         let actual = run_with_stdin(GIT_RS, &rust, &args, stdin);
         assert_same_output(actual, expected, &args);
 
@@ -351,7 +351,7 @@ fn checkout_index_stdin_nul_matches_upstream_git() {
         }
         let args = ["checkout-index", "--stdin", "-z"];
         let stdin = b"file.txt\0dir/nested.txt\0";
-        let expected = run_with_stdin("git", &upstream, &args, stdin);
+        let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, stdin);
         let actual = run_with_stdin(GIT_RS, &rust, &args, stdin);
         assert_same_output(actual, expected, &args);
 
@@ -378,7 +378,7 @@ fn checkout_index_update_stat_matches_upstream_git() {
             clear_worktree(repo, &["file.txt"]);
         }
         let args = ["checkout-index", "-u", "-f", "file.txt"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -394,8 +394,8 @@ fn checkout_index_update_stat_matches_upstream_git() {
         );
         // diff-files should agree (both clean) once stat info is refreshed.
         let diff_args = ["diff-files", "--name-only"];
-        let expected = run("git", &upstream, &diff_args);
-        let actual = run("git", &rust, &diff_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &diff_args);
+        let actual = run(sley_testkit::oracle_git(), &rust, &diff_args);
         assert_same_output(actual, expected, &diff_args);
     };
     let _ = fs::remove_dir_all(&root);
@@ -410,7 +410,7 @@ fn checkout_index_mix_all_and_paths_matches_upstream_git() {
     let (upstream, rust) = prepare_pair("mix-all", &root);
     {
         let args = ["checkout-index", "-a", "file.txt"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -426,7 +426,7 @@ fn checkout_index_mix_stdin_and_paths_matches_upstream_git() {
     let (upstream, rust) = prepare_pair("mix-stdin", &root);
     {
         let args = ["checkout-index", "--stdin", "file.txt"];
-        let expected = run_with_stdin("git", &upstream, &args, b"");
+        let expected = run_with_stdin(sley_testkit::oracle_git(), &upstream, &args, b"");
         let actual = run_with_stdin(GIT_RS, &rust, &args, b"");
         assert_same_output(actual, expected, &args);
     };
@@ -445,18 +445,18 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            run_success("git", repo, &["init", "-q"]);
-            run_success("git", repo, &["config", "core.autocrlf", "false"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["config", "core.autocrlf", "false"]);
             fs::write(repo.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("write script");
             set_executable(&repo.join("run.sh"));
             std::os::unix::fs::symlink("run.sh", repo.join("link")).expect("create symlink");
             fs::write(repo.join("plain.txt"), b"plain\n").expect("write plain");
-            run_success("git", repo, &["add", "run.sh", "link", "plain.txt"]);
-            run_success("git", repo, &["commit", "-q", "-m", "modes"]);
+            run_success(sley_testkit::oracle_git(), repo, &["add", "run.sh", "link", "plain.txt"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "-q", "-m", "modes"]);
             clear_worktree(repo, &["run.sh", "link", "plain.txt"]);
         }
         let args = ["checkout-index", "-a"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run(GIT_RS, &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -502,7 +502,7 @@ fn checkout_index_subdir_all_matches_upstream_git() {
         let args = ["checkout-index", "-a"];
         let upstream_sub = upstream.join("dir");
         let rust_sub = rust.join("dir");
-        let expected = run("git", &upstream_sub, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream_sub, &args);
         let actual = run(GIT_RS, &rust_sub, &args);
         assert_same_output(actual, expected, &args);
 

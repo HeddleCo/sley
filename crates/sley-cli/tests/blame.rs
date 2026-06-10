@@ -50,7 +50,7 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
 /// name/email and author/committer dates so blame output exercises varying
 /// metadata. A failure aborts the test.
 fn git_commit_env(cwd: &Path, args: &[&str], author_name: &str, author_email: &str, date: &str) {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .args(args)
         .env("GIT_AUTHOR_NAME", author_name)
@@ -69,7 +69,7 @@ fn git_commit_env(cwd: &Path, args: &[&str], author_name: &str, author_email: &s
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -86,7 +86,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())

@@ -44,7 +44,7 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn run_success_with_identity_at(cwd: &Path, args: &[&str], date: &str) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", date)
         .env("GIT_COMMITTER_DATE", date)
@@ -89,18 +89,18 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "one"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "two"]);
-    run_success("git", root, &["branch", "topic", "HEAD~1"]);
-    run_success("git", root, &["checkout", "-q", "topic"]);
+    run_success(sley_testkit::oracle_git(), root, &["branch", "topic", "HEAD~1"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "topic"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "topic"]);
-    run_success("git", root, &["checkout", "-q", "main"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "main"]);
 }
 
 fn prepare_drop_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     run_success_with_identity_at(
         root,
         &["commit", "--allow-empty", "-qm", "one"],
@@ -120,10 +120,10 @@ fn prepare_drop_reflog_repo(root: &Path) {
 
 fn prepare_linear_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     for (index, message) in ["one", "two", "three"].iter().enumerate() {
         let date = format!("1970-01-01T00:00:0{} +0000", index + 1);
-        let output = Command::new("git")
+        let output = Command::new(sley_testkit::oracle_git())
             .current_dir(root)
             .env("GIT_AUTHOR_DATE", &date)
             .env("GIT_COMMITTER_DATE", &date)
@@ -148,7 +148,7 @@ fn prepare_linear_reflog_repo(root: &Path) {
 
 fn prepare_reflog_repo_with_unreachable_entry(root: &Path) {
     prepare_linear_reflog_repo(root);
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:04 +0000")
         .env("GIT_REFLOG_ACTION", "reset")
@@ -226,7 +226,7 @@ fn reflog_show_default_and_formats_match_upstream_git() {
             vec!["reflog", "show", "--max-count=1"],
             vec!["reflog", "show", "HEAD"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -248,7 +248,7 @@ fn reflog_exists_status_matches_upstream_git() {
             vec!["reflog", "exists"],
             vec!["reflog", "exists", "HEAD", "extra"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -261,7 +261,7 @@ fn reflog_list_matches_upstream_git() {
     let root = unique_temp_dir("reflog-list");
     {
         prepare_reflog_repo(&root);
-        run_success("git", &root, &["tag", "--create-reflog", "v1"]);
+        run_success(sley_testkit::oracle_git(), &root, &["tag", "--create-reflog", "v1"]);
 
         for args in [
             vec!["reflog", "list"],
@@ -270,7 +270,7 @@ fn reflog_list_matches_upstream_git() {
             vec!["reflog", "list", "HEAD"],
             vec!["reflog", "list", "--", "HEAD"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -295,7 +295,7 @@ fn reflog_delete_matches_upstream_git() {
         prepare_linear_reflog_repo(&upstream);
         prepare_linear_reflog_repo(&actual);
 
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
@@ -327,7 +327,7 @@ fn reflog_delete_updateref_matches_upstream_git() {
         prepare_linear_reflog_repo(&upstream);
         prepare_linear_reflog_repo(&actual);
 
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
@@ -342,7 +342,7 @@ fn reflog_delete_updateref_matches_upstream_git() {
         );
         assert_eq!(
             run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
-            run("git", &upstream, &["rev-parse", "main"]).stdout,
+            run(sley_testkit::oracle_git(), &upstream, &["rev-parse", "main"]).stdout,
             "main ref differed after {args:?}"
         );
     }
@@ -375,7 +375,7 @@ fn reflog_drop_matches_upstream_git() {
             copy_dir_all(&upstream_template, &upstream);
             copy_dir_all(&actual_template, &actual);
 
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
@@ -397,7 +397,7 @@ fn reflog_write_matches_upstream_git() {
         prepare_drop_reflog_repo(&upstream_template);
         prepare_drop_reflog_repo(&actual_template);
         let head = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream_template,
             &["rev-parse", "HEAD"],
         ))
@@ -457,7 +457,7 @@ fn reflog_write_matches_upstream_git() {
             copy_dir_all(&upstream_template, &upstream);
             copy_dir_all(&actual_template, &actual);
 
-            let expected = run_with_committer("git", &upstream, &args);
+            let expected = run_with_committer(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run_with_committer(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected, &args);
             assert_eq!(
@@ -527,7 +527,7 @@ fn reflog_expire_matches_upstream_git() {
         prepare_linear_reflog_repo(&upstream);
         prepare_linear_reflog_repo(&actual);
 
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
@@ -542,7 +542,7 @@ fn reflog_expire_matches_upstream_git() {
         );
         assert_eq!(
             run(env!("CARGO_BIN_EXE_sley"), &actual, &["rev-parse", "main"]).stdout,
-            run("git", &upstream, &["rev-parse", "main"]).stdout,
+            run(sley_testkit::oracle_git(), &upstream, &["rev-parse", "main"]).stdout,
             "main ref differed after {args:?}"
         );
     }
@@ -588,7 +588,7 @@ fn reflog_expire_unreachable_matches_upstream_git() {
         prepare_reflog_repo_with_unreachable_entry(&upstream);
         prepare_reflog_repo_with_unreachable_entry(&actual);
 
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(

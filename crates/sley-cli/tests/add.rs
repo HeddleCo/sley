@@ -33,11 +33,11 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -114,7 +114,7 @@ fn add_dry_run_reports_without_staging_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-n", "file.txt", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -139,7 +139,7 @@ fn add_verbose_stages_and_reports_directory_paths_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-v", "dir", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -164,7 +164,7 @@ fn add_combined_dry_run_verbose_matches_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-nv", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -189,7 +189,7 @@ fn add_no_dry_run_overrides_dry_run_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-n", "--no-dry-run", "-v", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -214,7 +214,7 @@ fn add_no_verbose_overrides_verbose_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-v", "--no-verbose", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -239,7 +239,7 @@ fn add_no_update_overrides_update_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-u", "--no-update", "-v", "new.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -264,7 +264,7 @@ fn add_ignore_missing_dry_run_skips_missing_pathspec_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-n", "--ignore-missing", "missing.txt", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -289,7 +289,7 @@ fn add_ignore_missing_requires_dry_run_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "--ignore-missing", "missing.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -314,7 +314,7 @@ fn add_no_ignore_missing_restores_missing_pathspec_error_like_upstream_git() {
             "--no-ignore-missing",
             "missing.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -338,7 +338,7 @@ fn add_path_stages_tracked_deletion_like_upstream_git() {
         }
 
         let args = ["add", "gone.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -371,12 +371,12 @@ fn add_directory_stages_tracked_deletions_like_upstream_git() {
         }
 
         let args = ["add", "-nv", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["add", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -404,7 +404,7 @@ fn add_clean_path_dry_run_is_quiet_like_upstream_git() {
         }
 
         let args = ["add", "-nv", "clean.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -424,7 +424,7 @@ fn add_missing_pathspec_matches_upstream_git() {
         }
 
         let args = ["add", "missing.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -443,7 +443,7 @@ fn add_ignore_removal_stages_adds_and_modifications_only_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "--ignore-removal", "-v", "."];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -467,7 +467,7 @@ fn add_ignore_removal_dry_run_leaves_deletions_unstaged_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "--ignore-removal", "-n", "."];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -491,7 +491,7 @@ fn add_no_all_alias_matches_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "--no-all", "-v", "."];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -520,7 +520,7 @@ fn add_ignore_removal_explicit_deleted_path_is_noop_like_upstream_git() {
         }
 
         let args = ["add", "--ignore-removal", "gone.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -544,7 +544,7 @@ fn add_update_stages_tracked_modifications_and_deletions_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-u"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -569,7 +569,7 @@ fn add_update_verbose_reports_tracked_actions_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-uv"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -594,7 +594,7 @@ fn add_update_dry_run_reports_without_staging_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-un"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -619,7 +619,7 @@ fn add_all_stages_tracked_and_untracked_changes_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-A"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -644,7 +644,7 @@ fn add_all_verbose_reports_all_actions_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-Av"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -669,7 +669,7 @@ fn add_all_dry_run_reports_without_staging_like_upstream_git() {
         prepare_tracked_repo(&rust);
 
         let args = ["add", "-An"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -715,7 +715,7 @@ fn add_all_pathspec_limits_actions_like_upstream_git() {
         }
 
         let args = ["add", "-Av", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -740,7 +740,7 @@ fn add_all_missing_pathspec_matches_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-A", "missing.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -759,7 +759,7 @@ fn add_all_ignore_missing_dry_run_skips_missing_pathspec_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "-n", "--ignore-missing", "-A", "missing.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -780,7 +780,7 @@ fn add_chmod_stages_executable_bit_like_upstream_git() {
         }
 
         let args = ["add", "--chmod=+x", "run.sh"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -810,7 +810,7 @@ fn add_chmod_removes_executable_bit_like_upstream_git() {
         }
 
         let args = ["add", "--chmod=-x", "run.sh"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -842,7 +842,7 @@ fn add_chmod_invalid_value_matches_upstream_git() {
         }
 
         let args = ["add", "--chmod=bad", "run.sh"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -863,7 +863,7 @@ fn add_no_chmod_overrides_chmod_like_upstream_git() {
         }
 
         let args = ["add", "--chmod=+x", "--no-chmod", "run.sh"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -895,7 +895,7 @@ fn add_sparse_and_ignore_errors_flags_are_accepted_like_upstream_git() {
             "--no-ignore-errors",
             "file.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -924,7 +924,7 @@ fn add_pathspec_from_file_matches_upstream_git() {
         }
 
         let args = ["add", "--pathspec-from-file=pathspecs"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -958,7 +958,7 @@ fn add_pathspec_file_nul_matches_upstream_git() {
             "--pathspec-from-file",
             "pathspecs",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -993,7 +993,7 @@ fn add_no_pathspec_file_nul_overrides_previous_value_like_upstream_git() {
             "--pathspec-from-file=pathspecs",
             "-v",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -1026,7 +1026,7 @@ fn add_no_pathspec_from_file_keeps_inline_rejection_like_upstream_git() {
             "--no-pathspec-from-file",
             "dir/nested.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -1048,7 +1048,7 @@ fn add_pathspec_from_file_rejects_inline_pathspecs_like_upstream_git() {
         }
 
         let args = ["add", "--pathspec-from-file=pathspecs", "dir/nested.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -1067,7 +1067,7 @@ fn add_pathspec_file_nul_requires_pathspec_from_file_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["add", "--pathspec-file-nul", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };

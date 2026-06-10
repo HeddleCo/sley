@@ -25,7 +25,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 
 /// True when a system `git` is available; the suite no-ops otherwise.
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -84,7 +84,7 @@ fn run_ok(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run_ok("git", cwd, args)
+    run_ok(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs_bin() -> &'static str {
@@ -114,7 +114,7 @@ fn assert_same_output(actual: &Output, expected: &Output, args: &[&str]) {
 /// Initialize a repo with `count` commits ("c1", "c2", ...) and a worktree
 /// file per commit, using deterministic identity/date.
 fn init_repo_with_commits(root: &Path, count: usize) {
-    run_ok("git", root, &["init", "-q"]);
+    run_ok(sley_testkit::oracle_git(), root, &["init", "-q"]);
     for i in 1..=count {
         let name = format!("f{i}.txt");
         std::fs::write(root.join(&name), format!("content {i}\n")).expect("write worktree file");
@@ -141,7 +141,7 @@ fn make_repo_pair(root: &Path, label: &str, commits: usize) -> (PathBuf, PathBuf
 /// The system git runs in the "-expected" repo and sley in the "-actual"
 /// repo, so each tool mutates its own copy.
 fn assert_notes_match(expected_root: &Path, actual_root: &Path, args: &[&str]) {
-    let expected = run_output("git", expected_root, args);
+    let expected = run_output(sley_testkit::oracle_git(), expected_root, args);
     let actual = run_output(git_rs_bin(), actual_root, args);
     assert_same_output(&actual, &expected, args);
 }
@@ -149,7 +149,7 @@ fn assert_notes_match(expected_root: &Path, actual_root: &Path, args: &[&str]) {
 /// Assert that a notes ref resolves to byte-identical commit/tree content in
 /// both repos (so the on-disk object graph sley produced matches git's).
 fn assert_notes_object_match(expected_root: &Path, actual_root: &Path, notes_ref: &str) {
-    let expected = run_output("git", expected_root, &["rev-parse", notes_ref]);
+    let expected = run_output(sley_testkit::oracle_git(), expected_root, &["rev-parse", notes_ref]);
     let actual = run_output(git_rs_bin(), actual_root, &["rev-parse", notes_ref]);
     assert_same_output(&actual, &expected, &["rev-parse", notes_ref]);
     if !expected.status.success() {
@@ -404,7 +404,7 @@ fn notes_custom_ref_matches_git() {
 
         // GIT_NOTES_REF selects the ref when no --ref is given.
         let env = [("GIT_NOTES_REF", "refs/notes/review")];
-        let expected_out = run_output_env("git", &expected, &["notes", "get-ref"], &env);
+        let expected_out = run_output_env(sley_testkit::oracle_git(), &expected, &["notes", "get-ref"], &env);
         let actual_out = run_output_env(git_rs_bin(), &actual, &["notes", "get-ref"], &env);
         assert_same_output(&actual_out, &expected_out, &["notes", "get-ref"]);
     });

@@ -47,11 +47,11 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) {
 }
 
 fn git(cwd: &Path, args: &[&str]) {
-    run_success("git", cwd, args);
+    run_success(sley_testkit::oracle_git(), cwd, args);
 }
 
 fn git_with_identity(cwd: &Path, args: &[&str]) {
-    let output = run_output_with_identity("git", cwd, args);
+    let output = run_output_with_identity(sley_testkit::oracle_git(), cwd, args);
     assert!(
         output.status.success(),
         "git {args:?} failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -171,7 +171,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     prepare_conflict_clone(&origin, &upstream);
     prepare_conflict_clone(&origin, &rust);
 
-    let upstream_pre_pull = start_conflict_pull_rebase("git", &upstream);
+    let upstream_pre_pull = start_conflict_pull_rebase(sley_testkit::oracle_git(), &upstream);
     let rust_pre_pull = start_conflict_pull_rebase(env!("CARGO_BIN_EXE_sley"), &rust);
     assert_eq!(upstream_pre_pull, rust_pre_pull, "pre-pull HEAD differed");
 
@@ -179,7 +179,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
     resolve_conflict(&rust);
 
     let args = ["rebase", "--continue"];
-    let expected = run_output_with_identity("git", &upstream, &args);
+    let expected = run_output_with_identity(sley_testkit::oracle_git(), &upstream, &args);
     let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &rust, &args);
     assert_same_output(actual, expected, &args);
 
@@ -197,17 +197,17 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "REBASE_HEAD presence differed after rebase --continue"
     );
     assert_eq!(
-        run_output("git", &upstream, &["rev-parse", "HEAD"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "HEAD"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "HEAD"]).stdout,
         "HEAD differed after rebase --continue"
     );
     assert_eq!(
-        run_output("git", &upstream, &["log", "--oneline"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["log", "--oneline"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["log", "--oneline"]).stdout,
         "log order differed after rebase --continue"
     );
     assert_eq!(
-        run_output("git", &upstream, &["rev-parse", "master"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["rev-parse", "master"]).stdout,
         run_output(env!("CARGO_BIN_EXE_sley"), &rust, &["rev-parse", "master"]).stdout,
         "master branch differed after rebase --continue"
     );
@@ -217,7 +217,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "worktree content differed after rebase --continue"
     );
     assert_eq!(
-        run_output("git", &upstream, &["log", "-1", "--format=%s"]).stdout,
+        run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%s"]).stdout,
         run_output(
             env!("CARGO_BIN_EXE_sley"),
             &rust,
@@ -227,7 +227,7 @@ fn pull_rebase_conflict_then_continue_matches_upstream_git() {
         "latest commit subject differed after rebase --continue"
     );
     let upstream_pre_pull_parent =
-        String::from_utf8(run_output("git", &upstream, &["log", "-1", "--format=%P"]).stdout)
+        String::from_utf8(run_output(sley_testkit::oracle_git(), &upstream, &["log", "-1", "--format=%P"]).stdout)
             .expect("upstream parents utf8");
     assert_eq!(
         upstream_pre_pull_parent.split_whitespace().count(),

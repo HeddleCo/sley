@@ -81,10 +81,10 @@ fn repository_promisor_sidecars(git_dir: &Path) -> Vec<PathBuf> {
 fn assert_reachable_objects_stored_in_pack(repo: &Path, git_dir: &Path) {
     let (_pack_path, index_path) = repository_pack_pair(git_dir);
     let index_arg = index_path.to_string_lossy();
-    run_success("git", repo, &["verify-pack", "-v", &index_arg]);
+    run_success(sley_testkit::oracle_git(), repo, &["verify-pack", "-v", &index_arg]);
 
     let objects = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         repo,
         &["rev-list", "--objects", "--all", "HEAD"],
     ))
@@ -182,11 +182,11 @@ fn assert_same_output_with_normalized_paths(
 }
 
 fn create_source_repo(root: &Path) {
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -199,20 +199,20 @@ fn create_source_repo(root: &Path) {
             "-q",
         ],
     );
-    run_success("git", root, &["branch", "feature/topic"]);
-    run_success("git", root, &["tag", "v1.0"]);
+    run_success(sley_testkit::oracle_git(), root, &["branch", "feature/topic"]);
+    run_success(sley_testkit::oracle_git(), root, &["tag", "v1.0"]);
 }
 
 fn create_sha256_nested_source_repo(root: &Path) {
-    run_success("git", root, &["init", "-q", "--object-format=sha256"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256"]);
     fs::create_dir_all(root.join("dir")).expect("create source dir");
     fs::create_dir_all(root.join("deep/nested")).expect("create source nested dir");
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
     fs::write(root.join("dir/file.txt"), b"dir\n").expect("write dir payload");
     fs::write(root.join("deep/nested/file.txt"), b"deep\n").expect("write deep payload");
-    run_success("git", root, &["add", "."]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "."]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -228,11 +228,11 @@ fn create_sha256_nested_source_repo(root: &Path) {
 }
 
 fn add_feature_commit(root: &Path) {
-    run_success("git", root, &["checkout", "-q", "feature/topic"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "feature/topic"]);
     fs::write(root.join("payload.txt"), b"feature payload\n").expect("write feature payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -245,7 +245,7 @@ fn add_feature_commit(root: &Path) {
             "-q",
         ],
     );
-    run_success("git", root, &["checkout", "-q", "main"]);
+    run_success(sley_testkit::oracle_git(), root, &["checkout", "-q", "main"]);
 }
 
 #[test]
@@ -261,7 +261,7 @@ fn clone_local_repository_matches_upstream_git() {
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
-        let expected = run("git", &root, &["clone", "-q", source_arg, expected_arg]);
+        let expected = run(sley_testkit::oracle_git(), &root, &["clone", "-q", source_arg, expected_arg]);
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
             &root,
@@ -275,13 +275,13 @@ fn clone_local_repository_matches_upstream_git() {
             vec!["status", "--short"],
             vec!["config", "--get", "remote.origin.url"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 
         let branch = String::from_utf8(run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_repo,
             &["rev-parse", "--abbrev-ref", "HEAD"],
         ))
@@ -292,8 +292,8 @@ fn clone_local_repository_matches_upstream_git() {
             format!("branch.{branch}.remote"),
             format!("branch.{branch}.merge"),
         ] {
-            let expected = run("git", &expected_repo, &["config", "--get", &key]);
-            let actual = run("git", &actual_repo, &["config", "--get", &key]);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &["config", "--get", &key]);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &["config", "--get", &key]);
             assert_same_output(actual, expected, &["config", "--get", &key]);
         }
         assert_eq!(
@@ -322,7 +322,7 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
             .expect("source git path is utf8")
             .to_string();
 
-        let expected = run("git", &expected_root, &["clone", "-q", &source_arg]);
+        let expected = run(sley_testkit::oracle_git(), &expected_root, &["clone", "-q", &source_arg]);
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
             &actual_root,
@@ -338,8 +338,8 @@ fn clone_local_repository_default_directory_matches_upstream_git() {
             vec!["status", "--short"],
             vec!["config", "--get", "remote.origin.url"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -361,7 +361,7 @@ fn clone_local_repository_bare_matches_upstream_git() {
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["clone", "-q", "--bare", source_arg, expected_arg],
         );
@@ -383,8 +383,8 @@ fn clone_local_repository_bare_matches_upstream_git() {
             vec!["config", "--get", "remote.origin.url"],
             vec!["config", "--get-all", "remote.origin.fetch"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
         assert_eq!(
@@ -421,7 +421,7 @@ fn clone_local_repository_bare_options_match_upstream_git() {
             .to_string();
 
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_root,
             &[
                 "clone",
@@ -471,8 +471,8 @@ fn clone_local_repository_bare_options_match_upstream_git() {
             vec!["config", "--get", "remote.origin.tagOpt"],
             vec!["config", "--get-all", "remote.origin.fetch"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -496,7 +496,7 @@ fn clone_local_repository_bare_and_mirror_origin_option_match_upstream_git() {
             let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
             let expected = run(
-                "git",
+                sley_testkit::oracle_git(),
                 &root,
                 &[
                     "clone",
@@ -532,8 +532,8 @@ fn clone_local_repository_bare_and_mirror_origin_option_match_upstream_git() {
                 vec!["config", "--get", "remote.upstream.tagOpt"],
                 vec!["config", "--get", "remote.origin.url"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -553,7 +553,7 @@ fn clone_local_repository_mirror_matches_upstream_git() {
     {
         create_source_repo(&source);
         add_feature_commit(&source);
-        run_success("git", &source, &["update-ref", "refs/notes/test", "HEAD"]);
+        run_success(sley_testkit::oracle_git(), &source, &["update-ref", "refs/notes/test", "HEAD"]);
         let source_arg = source
             .join(".git")
             .to_str()
@@ -561,7 +561,7 @@ fn clone_local_repository_mirror_matches_upstream_git() {
             .to_string();
 
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_root,
             &["clone", "-q", "--mirror", &source_arg],
         );
@@ -585,8 +585,8 @@ fn clone_local_repository_mirror_matches_upstream_git() {
             vec!["config", "--get", "remote.origin.tagOpt"],
             vec!["config", "--get-all", "remote.origin.fetch"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
         assert_eq!(
@@ -612,7 +612,7 @@ fn clone_local_repository_no_mirror_restores_non_bare_clone_like_upstream_git() 
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "clone",
@@ -656,8 +656,8 @@ fn clone_local_repository_no_mirror_restores_non_bare_clone_like_upstream_git() 
             vec!["config", "--get", "remote.origin.mirror"],
             vec!["config", "--get", "remote.origin.fetch"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -693,7 +693,7 @@ fn clone_local_repository_single_branch_matches_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -704,8 +704,8 @@ fn clone_local_repository_single_branch_matches_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -742,7 +742,7 @@ fn clone_local_repository_bare_and_mirror_single_branch_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -753,8 +753,8 @@ fn clone_local_repository_bare_and_mirror_single_branch_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["config", "--get", "remote.origin.tagOpt"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -776,7 +776,7 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
 
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["clone", "-q", "--no-checkout", source_arg, expected_arg],
         );
@@ -797,8 +797,8 @@ fn clone_local_repository_no_checkout_matches_upstream_git() {
             vec!["status", "--short"],
             vec!["ls-files", "--stage"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
         assert_eq!(
@@ -834,7 +834,7 @@ fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -844,8 +844,8 @@ fn clone_sha256_no_checkout_and_sparse_match_upstream_git() {
                 vec!["status", "--short"],
                 vec!["ls-files", "--stage"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -877,7 +877,7 @@ fn clone_local_repository_tag_options_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -886,8 +886,8 @@ fn clone_local_repository_tag_options_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.tagOpt"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -922,7 +922,7 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
             actual_args.extend(branch_args.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -936,8 +936,8 @@ fn clone_local_repository_branch_option_matches_upstream_git() {
                 vec!["symbolic-ref", "refs/remotes/origin/HEAD"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
             assert_eq!(
@@ -980,7 +980,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -993,8 +993,8 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
                 vec!["config", "--get-all", "remote.origin.fetch"],
                 vec!["config", "--get", "core.bare"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
 
@@ -1031,7 +1031,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
         let expected_arg = expected_repo.to_str().expect("expected path is utf8");
         let actual_arg = actual_repo.to_str().expect("actual path is utf8");
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "clone",
@@ -1075,8 +1075,8 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             vec!["symbolic-ref", "-q", "HEAD"],
             vec!["config", "--get-all", "remote.origin.fetch"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1101,7 +1101,7 @@ fn clone_local_repository_revision_option_matches_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
@@ -1136,7 +1136,7 @@ fn clone_local_repository_origin_option_matches_upstream_git() {
             actual_args.extend(origin_args.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1156,8 +1156,8 @@ fn clone_local_repository_origin_option_matches_upstream_git() {
                 vec!["show-ref", "refs/remotes/upstream/feature/topic"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -1199,7 +1199,7 @@ fn clone_local_repository_config_options_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1212,13 +1212,13 @@ fn clone_local_repository_config_options_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["config", "--get", "remote.origin.tagOpt"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
             assert_eq!(
                 String::from_utf8(run_success(
-                    "git",
+                    sley_testkit::oracle_git(),
                     &actual_repo,
                     &["config", "--get", "clone.example"],
                 ))
@@ -1291,7 +1291,7 @@ fn clone_local_repository_template_options_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1303,8 +1303,8 @@ fn clone_local_repository_template_options_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
 
@@ -1373,7 +1373,7 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1387,8 +1387,8 @@ fn clone_local_repository_filter_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.partialclonefilter"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -1424,7 +1424,7 @@ fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
             actual_arg,
         ];
 
-        let expected = run("git", &root, &expected_args);
+        let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
         assert_same_output(actual, expected, &actual_args);
 
@@ -1434,8 +1434,8 @@ fn clone_file_repository_filter_marks_promisor_pack_like_upstream_git() {
             vec!["show-ref"],
             vec!["status", "--short"],
         ] {
-            let expected = run("git", &expected_repo, &args);
-            let actual = run("git", &actual_repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
             assert_same_output(actual, expected, &args);
         }
 
@@ -1465,7 +1465,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
         let missing_bundle_arg = missing_bundle
             .to_str()
             .expect("missing bundle path is utf8");
-        run_success("git", &source, &["bundle", "create", bundle_arg, "--all"]);
+        run_success(sley_testkit::oracle_git(), &source, &["bundle", "create", bundle_arg, "--all"]);
         let bundle_equals = format!("--bundle-uri={bundle_arg}");
 
         for (label, options) in [
@@ -1491,7 +1491,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1502,8 +1502,8 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["config", "--get", "remote.origin.url"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -1533,7 +1533,7 @@ fn clone_local_repository_bundle_uri_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
@@ -1548,13 +1548,13 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
     fs::create_dir_all(source.join("dir")).expect("create source dir");
     fs::create_dir_all(source.join("deep/nested")).expect("create source nested dir");
     {
-        run_success("git", &source, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &source, &["init", "-q"]);
         fs::write(source.join("root.txt"), b"root\n").expect("write root file");
         fs::write(source.join("dir/file.txt"), b"dir\n").expect("write dir file");
         fs::write(source.join("deep/nested/file.txt"), b"deep\n").expect("write deep file");
-        run_success("git", &source, &["add", "."]);
+        run_success(sley_testkit::oracle_git(), &source, &["add", "."]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &source,
             &[
                 "-c",
@@ -1584,7 +1584,7 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1596,8 +1596,8 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
                 vec!["config", "--get", "core.sparseCheckout"],
                 vec!["config", "--get", "core.sparseCheckoutCone"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
 
@@ -1700,7 +1700,7 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
             let expected_arg_refs = expected_args.iter().map(String::as_str).collect::<Vec<_>>();
             let actual_arg_refs = actual_args.iter().map(String::as_str).collect::<Vec<_>>();
 
-            let expected = run("git", &root, &expected_arg_refs);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_arg_refs);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_arg_refs);
             let mut replacements = vec![(expected_repo.as_path(), actual_repo.as_path())];
             if let (Some(expected_git_dir), Some(actual_git_dir)) = (
@@ -1725,8 +1725,8 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "core.bare"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output_with_normalized_paths(actual, expected, &replacements, &args);
             }
 
@@ -1797,7 +1797,7 @@ fn clone_local_repository_separate_git_dir_flags_match_upstream_git() {
                 actual_arg,
             ];
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output_with_normalized_paths(
                 actual,
@@ -1823,12 +1823,12 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
     {
         create_source_repo(&source);
         add_feature_commit(&source);
-        run_success("git", &reference, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &reference, &["init", "-q"]);
         fs::write(reference.join("reference.txt"), b"reference payload\n")
             .expect("write reference payload");
-        run_success("git", &reference, &["add", "reference.txt"]);
+        run_success(sley_testkit::oracle_git(), &reference, &["add", "reference.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &reference,
             &[
                 "-c",
@@ -1908,7 +1908,7 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1920,8 +1920,8 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
 
@@ -1977,7 +1977,7 @@ fn clone_local_repository_local_transport_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -1990,8 +1990,8 @@ fn clone_local_repository_local_transport_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["config", "--get", "remote.origin.tagOpt"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2035,7 +2035,7 @@ fn clone_local_repository_upload_pack_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2048,8 +2048,8 @@ fn clone_local_repository_upload_pack_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.tagOpt"],
                 vec!["config", "--get", "remote.origin.uploadpack"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2096,7 +2096,7 @@ fn clone_local_repository_server_option_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2109,8 +2109,8 @@ fn clone_local_repository_server_option_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.tagOpt"],
                 vec!["config", "--get-all", "remote.origin.serverOption"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2152,7 +2152,7 @@ fn clone_local_repository_jobs_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2165,8 +2165,8 @@ fn clone_local_repository_jobs_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.tagOpt"],
                 vec!["config", "--get", "submodule.fetchJobs"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2205,7 +2205,7 @@ fn clone_local_repository_ref_format_files_matches_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2217,8 +2217,8 @@ fn clone_local_repository_ref_format_files_matches_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2256,7 +2256,7 @@ fn clone_local_repository_reject_shallow_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2268,8 +2268,8 @@ fn clone_local_repository_reject_shallow_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2331,7 +2331,7 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2345,8 +2345,8 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.mirror"],
                 vec!["config", "--get", "remote.origin.tagOpt"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2392,7 +2392,7 @@ fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2406,8 +2406,8 @@ fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.tagOpt"],
                 vec!["status", "--short"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2472,7 +2472,7 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2484,8 +2484,8 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.promisor"],
                 vec!["config", "--get", "remote.origin.partialclonefilter"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2529,7 +2529,7 @@ fn clone_local_repository_submodule_hint_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
         }
@@ -2567,7 +2567,7 @@ fn clone_local_repository_ip_family_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2578,8 +2578,8 @@ fn clone_local_repository_ip_family_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2639,7 +2639,7 @@ fn clone_local_repository_negative_noop_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output(actual, expected, &actual_args);
 
@@ -2654,8 +2654,8 @@ fn clone_local_repository_negative_noop_flags_match_upstream_git() {
                 vec!["config", "--get", "extensions.worktreeConfig"],
                 vec!["rev-parse", "--is-shallow-repository"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2692,7 +2692,7 @@ fn clone_local_repository_progress_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output_with_normalized_destination(
                 actual,
@@ -2709,8 +2709,8 @@ fn clone_local_repository_progress_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -2748,7 +2748,7 @@ fn clone_local_repository_verbose_flags_match_upstream_git() {
             actual_args.extend(options.iter().copied());
             actual_args.extend([source_arg, actual_arg]);
 
-            let expected = run("git", &root, &expected_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
             assert_same_output_with_normalized_destination(
                 actual,
@@ -2765,8 +2765,8 @@ fn clone_local_repository_verbose_flags_match_upstream_git() {
                 vec!["config", "--get", "remote.origin.fetch"],
                 vec!["config", "--get", "remote.origin.mirror"],
             ] {
-                let expected = run("git", &expected_repo, &args);
-                let actual = run("git", &actual_repo, &args);
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
                 assert_same_output(actual, expected, &args);
             }
         }

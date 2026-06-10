@@ -20,7 +20,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_status_stdout_stderr_match(cwd: &Path, args: &[&str]) {
-    let expected = run_output("git", cwd, args);
+    let expected = run_output(sley_testkit::oracle_git(), cwd, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), cwd, args);
     assert_eq!(
         actual.status.code(),
@@ -41,12 +41,12 @@ fn assert_status_stdout_stderr_match(cwd: &Path, args: &[&str]) {
 
 fn create_packed_repo(root: &Path) -> PathBuf {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output("git", root, &["init", "-b", "main"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init", "-b", "main"]);
     assert!(init.status.success(), "git init failed");
     fs::write(root.join("file.txt"), b"payload\n").expect("write file");
-    let add = run_output("git", root, &["add", "file.txt"]);
+    let add = run_output(sley_testkit::oracle_git(), root, &["add", "file.txt"]);
     assert!(add.status.success(), "git add failed");
-    let commit = Command::new("git")
+    let commit = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .args(["commit", "-m", "one"])
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -58,7 +58,7 @@ fn create_packed_repo(root: &Path) -> PathBuf {
         .output()
         .expect("run git commit");
     assert!(commit.status.success(), "git commit failed");
-    let gc = run_output("git", root, &["gc"]);
+    let gc = run_output(sley_testkit::oracle_git(), root, &["gc"]);
     assert!(gc.status.success(), "git gc failed");
 
     fs::read_dir(root.join(".git").join("objects").join("pack"))

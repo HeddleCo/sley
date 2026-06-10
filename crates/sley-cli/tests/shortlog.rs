@@ -22,7 +22,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -49,7 +49,7 @@ fn base_command(program: &str, cwd: &Path) -> Command {
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
-    let output = base_command("git", cwd)
+    let output = base_command(sley_testkit::oracle_git(), cwd)
         .args(args)
         .output()
         .unwrap_or_else(|err| panic!("failed to run git {args:?}: {err}"));
@@ -65,7 +65,7 @@ fn git_ok(cwd: &Path, args: &[&str]) {
 fn commit_as(cwd: &Path, name: &str, email: &str, file: &str, content: &str, message: &str) {
     fs::write(cwd.join(file), content).expect("write fixture");
     git_ok(cwd, &["add", file]);
-    let output = base_command("git", cwd)
+    let output = base_command(sley_testkit::oracle_git(), cwd)
         .env("GIT_AUTHOR_NAME", name)
         .env("GIT_AUTHOR_EMAIL", email)
         .args(["commit", "-q", "-m", message])
@@ -90,7 +90,7 @@ fn commit_as_committer(
 ) {
     fs::write(cwd.join(file), content).expect("write fixture");
     git_ok(cwd, &["add", file]);
-    let output = base_command("git", cwd)
+    let output = base_command(sley_testkit::oracle_git(), cwd)
         .env("GIT_AUTHOR_NAME", name)
         .env("GIT_AUTHOR_EMAIL", email)
         .env("GIT_COMMITTER_NAME", name)
@@ -141,7 +141,7 @@ fn assert_same(repo: &Path, args: &[&str]) {
     git_args.extend_from_slice(args);
     let mut rs_args = vec!["shortlog"];
     rs_args.extend_from_slice(args);
-    let expected = run("git", repo, &git_args);
+    let expected = run(sley_testkit::oracle_git(), repo, &git_args);
     let actual = run(git_rs_bin(), repo, &rs_args);
     assert_eq!(
         actual.status.code(),
@@ -167,7 +167,7 @@ fn assert_same_stdin(repo: &Path, args: &[&str], stdin: &[u8]) {
     git_args.extend_from_slice(args);
     let mut rs_args = vec!["shortlog"];
     rs_args.extend_from_slice(args);
-    let expected = run_with_stdin("git", repo, &git_args, stdin);
+    let expected = run_with_stdin(sley_testkit::oracle_git(), repo, &git_args, stdin);
     let actual = run_with_stdin(git_rs_bin(), repo, &rs_args, stdin);
     assert_eq!(
         actual.status.code(),
@@ -392,18 +392,18 @@ fn shortlog_stdin_matches_git() {
     }
     let repo = build_repo("shortlog-stdin");
     // Feed the canonical `git log --pretty=short` stream into both binaries.
-    let log = run("git", &repo, &["log", "--pretty=short", "HEAD"]).stdout;
+    let log = run(sley_testkit::oracle_git(), &repo, &["log", "--pretty=short", "HEAD"]).stdout;
     let cases: &[&[&str]] = &[&[], &["-s"], &["-e"], &["-se"], &["-sn"], &["--committer"]];
     for case in cases {
         assert_same_stdin(&repo, case, &log);
     }
     // Also exercise the `--format=medium` (default) stream, which includes a Date:
     // header line that must be skipped.
-    let medium = run("git", &repo, &["log", "HEAD"]).stdout;
+    let medium = run(sley_testkit::oracle_git(), &repo, &["log", "HEAD"]).stdout;
     assert_same_stdin(&repo, &["-s"], &medium);
     // The `--format=fuller` stream carries `Commit:` headers, so committer grouping
     // from stdin produces real output rather than an empty result.
-    let fuller = run("git", &repo, &["log", "--format=fuller", "HEAD"]).stdout;
+    let fuller = run(sley_testkit::oracle_git(), &repo, &["log", "--format=fuller", "HEAD"]).stdout;
     assert_same_stdin(&repo, &["-s", "--committer"], &fuller);
     assert_same_stdin(&repo, &["-se", "--committer"], &fuller);
     assert_same_stdin(&repo, &["-s"], &fuller);

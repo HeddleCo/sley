@@ -32,7 +32,7 @@ fn run_success(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn run_success_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -73,10 +73,10 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_pack_refs_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "initial"]);
-    run_success("git", root, &["branch", "topic"]);
-    run_success("git", root, &["tag", "light"]);
+    run_success(sley_testkit::oracle_git(), root, &["branch", "topic"]);
+    run_success(sley_testkit::oracle_git(), root, &["tag", "light"]);
     run_success_with_identity(root, &["tag", "-a", "ann", "-m", "annotated"]);
 }
 
@@ -118,7 +118,7 @@ fn pack_refs_modes_match_upstream_git() {
         prepare_pack_refs_repo(&upstream);
         prepare_pack_refs_repo(&actual);
 
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert_eq!(
@@ -140,7 +140,7 @@ fn pack_refs_modes_match_upstream_git() {
         }
         assert_eq!(
             run(env!("CARGO_BIN_EXE_sley"), &actual, &["show-ref"]).stdout,
-            run("git", &upstream, &["show-ref"]).stdout,
+            run(sley_testkit::oracle_git(), &upstream, &["show-ref"]).stdout,
             "show-ref differed after {args:?}"
         );
     }

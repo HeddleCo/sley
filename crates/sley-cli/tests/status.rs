@@ -56,7 +56,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 #[test]
@@ -279,7 +279,7 @@ fn status_display_option_errors_match_upstream_git() {
             vec!["status", "--null", "--long"],
             vec!["status", "--long", "--null"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }

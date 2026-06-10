@@ -80,7 +80,7 @@ fn run_success_with_committer(program: &str, cwd: &Path, args: &[&str]) -> Vec<u
 }
 
 fn run_success_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -158,12 +158,12 @@ fn normalize_output_paths(
 
 fn prepare_repo_with_linked_worktree(repo: &Path, linked: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success("git", repo, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
     run_success_with_identity(repo, &["commit", "--allow-empty", "-qm", "initial"]);
-    run_success("git", repo, &["branch", "topic"]);
+    run_success(sley_testkit::oracle_git(), repo, &["branch", "topic"]);
     let linked_path = linked.to_string_lossy().into_owned();
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         repo,
         &["worktree", "add", "-q", &linked_path, "topic"],
     );
@@ -176,21 +176,21 @@ fn prepare_repo_with_stale_linked_worktree(repo: &Path, linked: &Path) {
 
 fn prepare_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success("git", repo, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
     prepare_worktree_add_contents(repo);
 }
 
 fn prepare_sha256_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success("git", repo, &["init", "-q", "--object-format=sha256"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "--object-format=sha256"]);
     prepare_worktree_add_contents(repo);
 }
 
 fn prepare_worktree_add_contents(repo: &Path) {
     fs::write(repo.join("file.txt"), b"base\n").expect("write tracked file");
-    run_success("git", repo, &["add", "file.txt"]);
+    run_success(sley_testkit::oracle_git(), repo, &["add", "file.txt"]);
     run_success_with_identity(repo, &["commit", "-qm", "initial"]);
-    run_success("git", repo, &["branch", "topic"]);
+    run_success(sley_testkit::oracle_git(), repo, &["branch", "topic"]);
 }
 
 #[test]
@@ -201,12 +201,12 @@ fn worktree_list_matches_upstream_git() {
         let repo = root.join("repo");
         let linked = root.join("linked");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success("git", &repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
-        run_success("git", &repo, &["branch", "topic"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["branch", "topic"]);
         let linked_path = linked.to_string_lossy().into_owned();
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &repo,
             &["worktree", "add", "-q", &linked_path, "topic"],
         );
@@ -218,7 +218,7 @@ fn worktree_list_matches_upstream_git() {
             vec!["worktree", "list", "--porcelain", "--no-porcelain"],
             vec!["worktree", "list", "-z"],
         ] {
-            let expected = run("git", &repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -233,15 +233,15 @@ fn worktree_list_detached_head_matches_upstream_git() {
     {
         let repo = root.join("repo");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success("git", &repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
-        run_success("git", &repo, &["checkout", "-q", "--detach", "HEAD"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 
         for args in [
             vec!["worktree", "list"],
             vec!["worktree", "list", "--porcelain"],
         ] {
-            let expected = run("git", &repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -266,7 +266,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
         let upstream_topic_arg = upstream_topic.to_string_lossy().into_owned();
         let actual_topic_arg = actual_topic.to_string_lossy().into_owned();
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "add", &upstream_topic_arg, "topic"],
         );
@@ -292,7 +292,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
         let upstream_default_arg = upstream_default.to_string_lossy().into_owned();
         let actual_default_arg = actual_default.to_string_lossy().into_owned();
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "add", "-q", &upstream_default_arg],
         );
@@ -312,7 +312,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
         let upstream_detached_arg = upstream_detached.to_string_lossy().into_owned();
         let actual_detached_arg = actual_detached.to_string_lossy().into_owned();
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &[
                 "worktree",
@@ -346,7 +346,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
         let upstream_locked_arg = upstream_locked.to_string_lossy().into_owned();
         let actual_locked_arg = actual_locked.to_string_lossy().into_owned();
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &[
                 "worktree",
@@ -383,7 +383,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
             ],
         );
 
-        let expected_list = run("git", &upstream, &["worktree", "list", "--porcelain"]);
+        let expected_list = run(sley_testkit::oracle_git(), &upstream, &["worktree", "list", "--porcelain"]);
         let actual_list = run(
             env!("CARGO_BIN_EXE_sley"),
             &actual,
@@ -403,7 +403,7 @@ fn worktree_add_branch_detach_default_and_lock_match_upstream_git() {
                 &["status", "--short"]
             )
             .stdout,
-            run("git", &upstream_topic, &["status", "--short"]).stdout
+            run(sley_testkit::oracle_git(), &upstream_topic, &["status", "--short"]).stdout
         );
     };
     let _ = fs::remove_dir_all(&root);
@@ -426,7 +426,7 @@ fn worktree_add_sha256_branch_matches_upstream_git() {
         let upstream_topic_arg = upstream_topic.to_string_lossy().into_owned();
         let actual_topic_arg = actual_topic.to_string_lossy().into_owned();
         let expected = run(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "add", "-q", &upstream_topic_arg, "topic"],
         );
@@ -445,8 +445,8 @@ fn worktree_add_sha256_branch_matches_upstream_git() {
             vec!["status", "--short"],
             vec!["ls-files", "--stage"],
         ] {
-            let expected = run("git", &upstream_topic, &args);
-            let actual = run("git", &actual_topic, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream_topic, &args);
+            let actual = run(sley_testkit::oracle_git(), &actual_topic, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -470,7 +470,7 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
         let upstream_linked_arg = upstream_linked.to_string_lossy().into_owned();
         let actual_linked_arg = actual_linked.to_string_lossy().into_owned();
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "add", "-q", &upstream_linked_arg, "topic"],
         );
@@ -485,13 +485,13 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
             vec!["cat-file", "-t", "HEAD"],
             vec!["status", "--short", "-uall"],
         ] {
-            let expected = run("git", &upstream_linked, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream_linked, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_linked, &args);
             assert_same_output(actual, expected, &args);
         }
 
         let expected_oid = run_success_with_stdin(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream_linked,
             &["hash-object", "-w", "--stdin"],
             b"linked object\n",
@@ -520,7 +520,7 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
 
         fs::write(upstream_linked.join("linked.txt"), b"linked\n").expect("write upstream file");
         fs::write(actual_linked.join("linked.txt"), b"linked\n").expect("write actual file");
-        run_success("git", &upstream_linked, &["add", "linked.txt"]);
+        run_success(sley_testkit::oracle_git(), &upstream_linked, &["add", "linked.txt"]);
         run_success(
             env!("CARGO_BIN_EXE_sley"),
             &actual_linked,
@@ -530,12 +530,12 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
             vec!["diff", "--cached", "--name-status", "HEAD"],
             vec!["write-tree"],
         ] {
-            let expected = run("git", &upstream_linked, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream_linked, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &actual_linked, &args);
             assert_same_output(actual, expected, &args);
         }
 
-        let upstream_head = run_success("git", &upstream_linked, &["rev-parse", "HEAD"]);
+        let upstream_head = run_success(sley_testkit::oracle_git(), &upstream_linked, &["rev-parse", "HEAD"]);
         let actual_head = run_success(
             env!("CARGO_BIN_EXE_sley"),
             &actual_linked,
@@ -551,7 +551,7 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
             .trim()
             .to_string();
         run_success_with_committer(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream_linked,
             &[
                 "reflog",
@@ -589,7 +589,7 @@ fn sha256_linked_worktree_commands_use_common_git_dir() {
         );
 
         run_success_with_committer(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream_linked,
             &[
                 "update-ref",
@@ -654,7 +654,7 @@ fn worktree_add_error_paths_match_upstream_git() {
             vec!["worktree", "add", "--bogus"],
             vec!["worktree", "add", "../linked", "main"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -687,7 +687,7 @@ fn worktree_stale_list_and_prune_match_upstream_git() {
             vec!["worktree", "prune", "-n", "-v", "--no-expire"],
             vec!["worktree", "prune", "--expire"],
         ] {
-            let expected = run("git", &repo, &args);
+            let expected = run(sley_testkit::oracle_git(), &repo, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -708,7 +708,7 @@ fn worktree_prune_removes_stale_admin_dirs_like_upstream_git() {
         prepare_repo_with_stale_linked_worktree(&actual, &actual_linked);
 
         let args = vec!["worktree", "prune", "-v", "--expire", "now"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected, &args);
         assert!(
@@ -749,7 +749,7 @@ fn worktree_lock_unlock_and_list_match_upstream_git() {
             vec!["worktree", "unlock"],
             vec!["worktree", "lock", "."],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -775,7 +775,7 @@ fn worktree_prune_skips_locked_stale_worktrees_like_upstream_git() {
         prepare_repo_with_linked_worktree(&upstream, &upstream_linked);
         prepare_repo_with_linked_worktree(&actual, &actual_linked);
         let lock_args = vec!["worktree", "lock", "--reason=keep it", "../linked"];
-        let expected = run("git", &upstream, &lock_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &lock_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &lock_args);
         assert_same_output_normalized(
             actual_output,
@@ -792,7 +792,7 @@ fn worktree_prune_skips_locked_stale_worktrees_like_upstream_git() {
             vec!["worktree", "list", "-v"],
             vec!["worktree", "prune", "-n", "-v", "--expire", "now"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -819,7 +819,7 @@ fn worktree_remove_clean_and_error_paths_match_upstream_git() {
         prepare_repo_with_linked_worktree(&actual, &actual_linked);
 
         let args = vec!["worktree", "remove", "../linked"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output_normalized(
             actual_output,
@@ -847,7 +847,7 @@ fn worktree_remove_clean_and_error_paths_match_upstream_git() {
             vec!["worktree", "remove", "."],
             vec!["worktree", "remove", "../missing"],
         ] {
-            let expected = run("git", &upstream_errors, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream_errors, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual_errors, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -879,7 +879,7 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
             vec!["worktree", "remove", "../linked"],
             vec!["worktree", "remove", "-f", "../linked"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -896,10 +896,10 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
 
         let upstream_locked = root.join("upstream/locked");
         let actual_locked = root.join("actual/locked");
-        run_success("git", &upstream, &["branch", "locked"]);
-        run_success("git", &actual, &["branch", "locked"]);
+        run_success(sley_testkit::oracle_git(), &upstream, &["branch", "locked"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["branch", "locked"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &[
                 "worktree",
@@ -910,7 +910,7 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
             ],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual,
             &[
                 "worktree",
@@ -921,7 +921,7 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
             ],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "lock", "--reason", "keep", "../locked"],
         );
@@ -935,7 +935,7 @@ fn worktree_remove_force_dirty_and_locked_match_upstream_git() {
             vec!["worktree", "remove", "-f", "../locked"],
             vec!["worktree", "remove", "-f", "-f", "../locked"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -966,7 +966,7 @@ fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
         prepare_repo_with_linked_worktree(&actual, &actual_linked);
 
         let args = vec!["worktree", "move", "../linked", "../moved"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output_normalized(
             actual_output,
@@ -981,7 +981,7 @@ fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
             "destination should exist"
         );
         let list_args = vec!["worktree", "list"];
-        let expected = run("git", &upstream, &list_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &list_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &list_args);
         assert_same_output_normalized(
             actual_output,
@@ -1000,7 +1000,7 @@ fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
         fs::write(upstream_dirty_linked.join("untracked"), b"x\n").expect("write upstream dirty");
         fs::write(actual_dirty_linked.join("untracked"), b"x\n").expect("write actual dirty");
         let args = vec!["worktree", "move", "../linked", "../moved"];
-        let expected = run("git", &upstream_dirty, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream_dirty, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual_dirty, &args);
         assert_same_output_normalized(
             actual_output,
@@ -1023,7 +1023,7 @@ fn worktree_move_clean_dirty_and_directory_destination_match_upstream_git() {
         fs::create_dir_all(root.join("upstream-dir/destination")).expect("create upstream dest");
         fs::create_dir_all(root.join("actual-dir/destination")).expect("create actual dest");
         let args = vec!["worktree", "move", "../linked", "../destination"];
-        let expected = run("git", &upstream_dir, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream_dir, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual_dir, &args);
         assert_same_output_normalized(
             actual_output,
@@ -1052,7 +1052,7 @@ fn worktree_move_locked_and_error_paths_match_upstream_git() {
         prepare_repo_with_linked_worktree(&upstream, &upstream_linked);
         prepare_repo_with_linked_worktree(&actual, &actual_linked);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &upstream,
             &["worktree", "lock", "--reason", "keep", "../linked"],
         );
@@ -1066,7 +1066,7 @@ fn worktree_move_locked_and_error_paths_match_upstream_git() {
             vec!["worktree", "move", "-f", "../linked", "../moved"],
             vec!["worktree", "move", "-f", "-f", "../linked", "../moved"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -1097,7 +1097,7 @@ fn worktree_move_locked_and_error_paths_match_upstream_git() {
             vec!["worktree", "move", "../missing", "../x"],
             vec!["worktree", "move", "../linked", "../filedest"],
         ] {
-            let expected = run("git", &upstream_errors, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream_errors, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual_errors, &args);
             assert_same_output_normalized(
                 actual_output,
@@ -1128,7 +1128,7 @@ fn worktree_repair_updates_moved_worktree_metadata_like_upstream_git() {
         fs::rename(&actual_linked, &actual_moved).expect("move actual linked worktree");
 
         let args = vec!["worktree", "repair", "../moved"];
-        let expected = run("git", &upstream, &args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output_normalized(
             actual_output,
@@ -1138,7 +1138,7 @@ fn worktree_repair_updates_moved_worktree_metadata_like_upstream_git() {
             &root.join("upstream"),
         );
         let list_args = vec!["worktree", "list"];
-        let expected = run("git", &upstream, &list_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream, &list_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &list_args);
         assert_same_output_normalized(
             actual_output,
@@ -1161,7 +1161,7 @@ fn worktree_repair_updates_moved_worktree_metadata_like_upstream_git() {
         fs::rename(&actual_noarg_linked, &actual_noarg_moved)
             .expect("move actual noarg linked worktree");
         let no_args = vec!["worktree", "repair"];
-        let expected = run("git", &upstream_noarg_moved, &no_args);
+        let expected = run(sley_testkit::oracle_git(), &upstream_noarg_moved, &no_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual_noarg_moved, &no_args);
         assert_same_output_normalized(
             actual_output,
@@ -1190,7 +1190,7 @@ fn worktree_repair_error_paths_match_upstream_git() {
             vec!["worktree", "repair", "../missing"],
             vec!["worktree", "repair", "--foo"],
         ] {
-            let expected = run("git", &upstream, &args);
+            let expected = run(sley_testkit::oracle_git(), &upstream, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output_normalized(
                 actual_output,

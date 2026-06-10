@@ -48,7 +48,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_fixed_commit_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    let init = run("git", root, &["init", "-q"]);
+    let init = run(sley_testkit::oracle_git(), root, &["init", "-q"]);
     assert!(init.status.success(), "git init failed");
     fs::write(
         root.join("commit.txt"),
@@ -56,13 +56,13 @@ fn prepare_fixed_commit_repo(root: &Path) {
     )
     .expect("write fixed commit");
     let oid_output = run(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["hash-object", "-w", "-t", "commit", "commit.txt"],
     );
     assert!(oid_output.status.success(), "git hash-object commit failed");
     let oid = String::from_utf8(oid_output.stdout).expect("commit oid utf8");
-    let update = run("git", root, &["update-ref", "HEAD", oid.trim()]);
+    let update = run(sley_testkit::oracle_git(), root, &["update-ref", "HEAD", oid.trim()]);
     assert!(update.status.success(), "git update-ref HEAD failed");
 }
 
@@ -91,7 +91,7 @@ fn global_version_and_noop_flags_match_upstream_git() {
                 "--show-prefix",
             ],
         ] {
-            let expected_output = run("git", &repo, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &repo, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &repo, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -130,7 +130,7 @@ fn global_git_dir_and_work_tree_match_upstream_git_for_rev_parse() {
             ),
             (&sub, vec!["--work-tree=..", "rev-parse", "--show-prefix"]),
         ] {
-            let expected_output = run("git", cwd, &args);
+            let expected_output = run(sley_testkit::oracle_git(), cwd, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), cwd, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -189,7 +189,7 @@ fn repository_environment_matches_upstream_git_for_rev_parse() {
                 vec![("GIT_WORK_TREE", "..")],
             ),
         ] {
-            let expected_output = run_with_env("git", cwd, &args, &envs);
+            let expected_output = run_with_env(sley_testkit::oracle_git(), cwd, &args, &envs);
             let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), cwd, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -204,7 +204,7 @@ fn global_bare_matches_upstream_git_for_rev_parse() {
     {
         fs::create_dir_all(&root).expect("create root dir");
         let init = run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "init",
@@ -229,7 +229,7 @@ fn global_bare_matches_upstream_git_for_rev_parse() {
             ],
             vec!["--bare", "--work-tree=.", "rev-parse", "--show-toplevel"],
         ] {
-            let expected_output = run("git", &bare, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &bare, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &bare, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -243,7 +243,7 @@ fn global_c_option_matches_upstream_git() {
     let repo = root.join("repo");
     {
         fs::create_dir_all(repo.join("sub")).expect("create repo dirs");
-        let expected_init = run("git", &root, &["-C", "repo", "init", "-q"]);
+        let expected_init = run(sley_testkit::oracle_git(), &root, &["-C", "repo", "init", "-q"]);
         let actual_init = run(
             env!("CARGO_BIN_EXE_sley"),
             &root,
@@ -252,12 +252,12 @@ fn global_c_option_matches_upstream_git() {
         assert_same_output(actual_init, expected_init, &["-C", "repo", "init", "-q"]);
 
         let args = ["-C", "repo", "-C", "sub", "rev-parse", "--show-prefix"];
-        let expected_output = run("git", &root, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &root, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual_output, expected_output, &args);
 
         let args = ["-C"];
-        let expected_output = run("git", &root, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &root, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
@@ -279,7 +279,7 @@ fn global_config_core_abbrev_matches_upstream_git_for_rev_parse_short() {
             vec!["-c", "core.abbrev=4", "rev-parse", "--short", "HEAD"],
             vec!["-c", "core.abbrev=no", "rev-parse", "--short", "HEAD"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -308,7 +308,7 @@ fn global_config_core_abbrev_matches_upstream_git_for_rev_parse_short() {
             ],
         ] {
             let expected_output =
-                run_with_env("git", &expected, &args, &[("GIT_RS_TEST_ABBREV", "12")]);
+                run_with_env(sley_testkit::oracle_git(), &expected, &args, &[("GIT_RS_TEST_ABBREV", "12")]);
             let actual_output = run_with_env(
                 env!("CARGO_BIN_EXE_sley"),
                 &actual,
@@ -361,7 +361,7 @@ fn global_config_core_abbrev_matches_upstream_git_for_rev_parse_short() {
                 vec![("GIT_CONFIG_COUNT", "-1")],
             ),
         ] {
-            let expected_output = run_with_env("git", &expected, &args, &envs);
+            let expected_output = run_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
             let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -377,7 +377,7 @@ fn global_config_log_all_ref_updates_matches_upstream_git_for_update_ref() {
     {
         prepare_fixed_commit_repo(&expected);
         prepare_fixed_commit_repo(&actual);
-        let oid = String::from_utf8(run("git", &expected, &["rev-parse", "HEAD"]).stdout)
+        let oid = String::from_utf8(run(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]).stdout)
             .expect("HEAD oid utf8");
         let oid = oid.trim();
 
@@ -395,7 +395,7 @@ fn global_config_log_all_ref_updates_matches_upstream_git_for_update_ref() {
             "refs/heads/global-false",
             oid,
         ];
-        let expected_output = run("git", &expected, &expected_args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &expected_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(
@@ -417,7 +417,7 @@ fn global_config_log_all_ref_updates_matches_upstream_git_for_update_ref() {
             "refs/tags/global-always",
             oid,
         ];
-        let expected_output = run("git", &expected, &expected_args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &expected_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(
@@ -446,7 +446,7 @@ fn global_config_init_default_branch_matches_upstream_git() {
             "-q",
             expected.to_str().expect("expected path utf8"),
         ];
-        let expected_output = run("git", &root, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &root, &args);
         let args = [
             "-c",
             "init.defaultBranch=trunk",
@@ -479,7 +479,7 @@ fn global_config_init_default_branch_matches_upstream_git() {
             "-q",
             actual_last.to_str().expect("actual-last path utf8"),
         ];
-        let expected_output = run("git", &root, &expected_args);
+        let expected_output = run(sley_testkit::oracle_git(), &root, &expected_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(
@@ -505,7 +505,7 @@ fn global_config_init_default_branch_matches_upstream_git() {
             "cli",
             actual_cli.to_str().expect("actual-cli path utf8"),
         ];
-        let expected_output = run("git", &root, &expected_args);
+        let expected_output = run(sley_testkit::oracle_git(), &root, &expected_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
         assert_same_output(actual_output, expected_output, &expected_args);
         assert_eq!(

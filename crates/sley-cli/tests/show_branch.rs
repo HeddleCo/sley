@@ -62,7 +62,7 @@ fn base_date() -> String {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env_dated("git", cwd, args, &base_date())
+    run_env_dated(sley_testkit::oracle_git(), cwd, args, &base_date())
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -79,7 +79,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -118,7 +118,7 @@ impl RepoBuilder {
     fn commit_file(&mut self, file: &str, content: &str, message: &str) {
         fs::write(self.repo.join(file), content).expect("write file");
         git_ok(&self.repo, &["add", file]);
-        let out = run_env_dated("git", &self.repo, &["commit", "-qm", message], &self.date());
+        let out = run_env_dated(sley_testkit::oracle_git(), &self.repo, &["commit", "-qm", message], &self.date());
         assert!(
             out.status.success(),
             "commit failed: {}",
@@ -130,7 +130,7 @@ impl RepoBuilder {
     /// `--no-ff` merge of `branch` into the current branch.
     fn merge_no_ff(&mut self, branch: &str, message: &str) {
         let out = run_env_dated(
-            "git",
+            sley_testkit::oracle_git(),
             &self.repo,
             &["merge", "-q", "--no-ff", "--no-edit", "-m", message, branch],
             &self.date(),

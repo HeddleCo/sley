@@ -69,7 +69,7 @@ fn run_env_stdin(program: &str, cwd: &Path, args: &[&str], stdin_data: &str) -> 
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -86,7 +86,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -145,7 +145,7 @@ fn assert_same_bytes(cwd: &Path, args: &[&str]) {
 
 /// As [`assert_same`] but with data on stdin (for `--stdin`).
 fn assert_same_stdin(cwd: &Path, args: &[&str], stdin_data: &str) {
-    let g = run_env_stdin("git", cwd, args, stdin_data);
+    let g = run_env_stdin(sley_testkit::oracle_git(), cwd, args, stdin_data);
     let r = run_env_stdin(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin_data);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),

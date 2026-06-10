@@ -60,7 +60,7 @@ fn symbolic_ref_quiet_matches_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-quiet");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         for args in [
             vec!["symbolic-ref", "--quiet", "HEAD"],
             vec!["symbolic-ref", "-q", "HEAD"],
@@ -71,7 +71,7 @@ fn symbolic_ref_quiet_matches_upstream_git() {
             vec!["symbolic-ref", "--no-quiet", "--quiet", "refs/heads/main"],
             vec!["symbolic-ref", "-q", "refs/heads/main"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -88,8 +88,8 @@ fn symbolic_ref_reftable_repository_matches_upstream_git() {
     {
         fs::create_dir_all(&expected).expect("create expected repo dir");
         fs::create_dir_all(&actual).expect("create actual repo dir");
-        run_success("git", &expected, &["init", "-q", "--ref-format=reftable"]);
-        run_success("git", &actual, &["init", "-q", "--ref-format=reftable"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "--ref-format=reftable"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "--ref-format=reftable"]);
 
         for args in [
             vec!["symbolic-ref", "refs/alias/rust", "refs/heads/main"],
@@ -97,7 +97,7 @@ fn symbolic_ref_reftable_repository_matches_upstream_git() {
             vec!["symbolic-ref", "--delete", "refs/alias/rust"],
             vec!["symbolic-ref", "--quiet", "refs/alias/rust"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -114,8 +114,8 @@ fn symbolic_ref_update_options_match_upstream_git() {
     {
         fs::create_dir_all(&expected).expect("create expected repo dir");
         fs::create_dir_all(&actual).expect("create actual repo dir");
-        run_success("git", &expected, &["init", "-q"]);
-        run_success("git", &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
 
         for args in [
             vec!["symbolic-ref", "-m", "reason", "HEAD", "refs/heads/topic"],
@@ -152,7 +152,7 @@ fn symbolic_ref_update_options_match_upstream_git() {
             fs::write(actual.join(".git").join("HEAD"), b"ref: refs/heads/main\n")
                 .expect("reset actual HEAD");
 
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_eq!(
@@ -173,8 +173,8 @@ fn symbolic_ref_delete_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success("git", &expected, &["init", "-q"]);
-        run_success("git", &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
 
         for args in [
             vec!["symbolic-ref", "--delete", "refs/alias/two"],
@@ -206,7 +206,7 @@ fn symbolic_ref_delete_matches_upstream_git() {
                 .expect("write direct alias");
             }
 
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
             assert_eq!(
@@ -232,14 +232,14 @@ fn symbolic_ref_onelevel_names_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success("git", &expected, &["init", "-q"]);
-        run_success("git", &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected,
             &["commit", "--allow-empty", "-qm", "seed"],
         );
-        run_success("git", &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["commit", "--allow-empty", "-qm", "seed"]);
 
         for args in [
             vec!["symbolic-ref", "NOTHEAD", "refs/heads/foo"],
@@ -248,7 +248,7 @@ fn symbolic_ref_onelevel_names_match_upstream_git() {
             vec!["symbolic-ref", "refs/heads/top-level", "ORIG_HEAD"],
             vec!["symbolic-ref", "refs/heads/invalid", "foo..bar"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -261,8 +261,8 @@ fn symbolic_ref_short_edge_cases_match_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-short-edge");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
-        run_success("git", &root, &["commit", "--allow-empty", "-qm", "seed"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["commit", "--allow-empty", "-qm", "seed"]);
 
         for (set_args, read_args) in [
             (
@@ -286,8 +286,8 @@ fn symbolic_ref_short_edge_cases_match_upstream_git() {
                 vec!["symbolic-ref", "--short", "TEST_SYMREF"],
             ),
         ] {
-            run_success("git", &root, &set_args);
-            let expected = run("git", &root, &read_args);
+            run_success(sley_testkit::oracle_git(), &root, &set_args);
+            let expected = run(sley_testkit::oracle_git(), &root, &read_args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &read_args);
             assert_same_output(actual, expected, &read_args);
         }
@@ -303,16 +303,16 @@ fn symbolic_ref_df_conflict_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success("git", &expected, &["init", "-q"]);
-        run_success("git", &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
         for repo in [&expected, &actual] {
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "seed"]);
-            run_success("git", repo, &["checkout", "-b", "df"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "df"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "seed"]);
+            run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "df"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "df"]);
         }
 
         let args = ["symbolic-ref", "refs/heads/df/conflict", "refs/heads/df"];
-        let expected_output = run("git", &expected, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
@@ -324,20 +324,20 @@ fn assert_symbolic_ref_matches_git(root: &Path, setup: impl Fn(&Path, &str)) {
     let actual = root.join("actual");
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
-    run_success("git", &expected, &["init", "-q"]);
-    run_success("git", &actual, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &expected,
         &["commit", "--allow-empty", "-qm", "seed"],
     );
-    run_success("git", &actual, &["commit", "--allow-empty", "-qm", "seed"]);
-    let head = run_success("git", &expected, &["rev-parse", "HEAD"]);
+    run_success(sley_testkit::oracle_git(), &actual, &["commit", "--allow-empty", "-qm", "seed"]);
+    let head = run_success(sley_testkit::oracle_git(), &expected, &["rev-parse", "HEAD"]);
     let oid = String::from_utf8_lossy(&head).trim().to_string();
     setup(&expected, &oid);
     setup(&actual, &oid);
     let args = ["symbolic-ref", "HEAD"];
-    let expected_output = run("git", &expected, &args);
+    let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
     let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
     assert_same_output(actual_output, expected_output, &args);
 }
@@ -348,18 +348,18 @@ fn symbolic_ref_df_resolution_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp root");
     {
         assert_symbolic_ref_matches_git(&root.join("eisdir"), |repo, oid| {
-            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/outer"]);
+            run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/outer"]);
             fs::create_dir_all(repo.join(".git/refs/heads/outer")).expect("outer dir");
             fs::write(repo.join(".git/refs/heads/outer/inner"), format!("{oid}\n"))
                 .expect("inner ref");
         });
         assert_symbolic_ref_matches_git(&root.join("enotdir"), |repo, oid| {
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &["symbolic-ref", "HEAD", "refs/heads/outer/inner"],
             );
-            run_success("git", repo, &["update-ref", "refs/heads/outer", oid]);
+            run_success(sley_testkit::oracle_git(), repo, &["update-ref", "refs/heads/outer", oid]);
         });
     };
     let _ = fs::remove_dir_all(&root);
@@ -374,24 +374,24 @@ fn symbolic_ref_head_reflog_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
         for repo in [&expected, &actual] {
-            run_success("git", repo, &["init", "-q"]);
-            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "file"]);
-            run_success("git", repo, &["checkout", "-b", "log1"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "one"]);
-            run_success("git", repo, &["checkout", "-b", "log2"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "two"]);
-            run_success("git", repo, &["checkout", "--orphan", "orphan"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "log1"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "one"]);
+            run_success(sley_testkit::oracle_git(), repo, &["checkout", "-b", "log2"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "two"]);
+            run_success(sley_testkit::oracle_git(), repo, &["checkout", "--orphan", "orphan"]);
         }
         let args = ["symbolic-ref", "-m", "create", "HEAD", "refs/heads/log1"];
-        run_success("git", &expected, &args);
+        run_success(sley_testkit::oracle_git(), &expected, &args);
         run_success(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         let args = ["symbolic-ref", "-m", "update", "HEAD", "refs/heads/log2"];
-        run_success("git", &expected, &args);
+        run_success(sley_testkit::oracle_git(), &expected, &args);
         run_success(env!("CARGO_BIN_EXE_sley"), &actual, &args);
 
         let read_args = ["log", "--format=%gs", "-g", "-2"];
-        let expected_output = run("git", &expected, &read_args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &read_args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &read_args);
         assert_same_output(actual_output, expected_output, &read_args);
     };
@@ -407,9 +407,9 @@ fn symbolic_ref_top_level_target_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
         for repo in [&expected, &actual] {
-            run_success("git", repo, &["init", "-q"]);
-            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
         }
         for args in [
             vec!["symbolic-ref", "refs/heads/top-level", "ORIG_HEAD"],
@@ -417,7 +417,7 @@ fn symbolic_ref_top_level_target_matches_upstream_git() {
             vec!["rev-parse", "--verify", "top-level"],
             vec!["rev-parse", "--verify", "HEAD"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -434,26 +434,26 @@ fn symbolic_ref_checkout_chain_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
         for repo in [&expected, &actual] {
-            run_success("git", repo, &["init", "-q"]);
-            run_success("git", repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
-            run_success("git", repo, &["commit", "--allow-empty", "-qm", "file"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["symbolic-ref", "HEAD", "refs/heads/foo"]);
+            run_success(sley_testkit::oracle_git(), repo, &["commit", "--allow-empty", "-qm", "file"]);
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &["update-ref", "refs/heads/maint-2.37", "HEAD"],
             );
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &["symbolic-ref", "refs/heads/maint", "refs/heads/maint-2.37"],
             );
-            run_success("git", repo, &["checkout", "maint"]);
+            run_success(sley_testkit::oracle_git(), repo, &["checkout", "maint"]);
         }
         for args in [
             vec!["symbolic-ref", "HEAD"],
             vec!["symbolic-ref", "--no-recurse", "HEAD"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }
@@ -466,7 +466,7 @@ fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
     let root = unique_temp_dir("symbolic-ref-short-no-recurse");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::create_dir_all(root.join(".git").join("refs").join("meta"))
             .expect("create meta refs dir");
         fs::create_dir_all(root.join(".git").join("refs").join("alias"))
@@ -506,7 +506,7 @@ fn symbolic_ref_short_and_no_recurse_match_upstream_git() {
             vec!["symbolic-ref", "--short", "refs/heads/main"],
             vec!["symbolic-ref", "refs/heads/main"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }

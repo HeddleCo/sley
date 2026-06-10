@@ -20,7 +20,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
     assert_eq!(
         actual.status.code(),
@@ -66,7 +66,7 @@ fn alias_init_via_config_matches_upstream_git_outside_repo() {
     fs::create_dir_all(&rust).expect("create rust dir");
     {
         for (dir, config_path, program) in [
-            (&upstream, &upstream_config, "git"),
+            (&upstream, &upstream_config, sley_testkit::oracle_git()),
             (&rust, &rust_config, env!("CARGO_BIN_EXE_sley")),
         ] {
             let output = Command::new(program)
@@ -91,7 +91,7 @@ fn alias_init_via_config_matches_upstream_git_outside_repo() {
             );
         }
         for (dir, config_path) in [(&upstream, &upstream_config), (&rust, &rust_config)] {
-            let expected = Command::new("git")
+            let expected = Command::new(sley_testkit::oracle_git())
                 .current_dir(dir)
                 .env("GIT_CONFIG_GLOBAL", config_path)
                 .env_remove("GIT_CONFIG_SYSTEM")

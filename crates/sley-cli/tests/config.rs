@@ -53,7 +53,7 @@ fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -67,7 +67,7 @@ fn assert_outputs_match(upstream: &Path, rust: &Path, args: &[&str]) {
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
     assert_eq!(
         actual.status.code(),
@@ -87,7 +87,7 @@ fn assert_status_stdout_stderr_match(upstream: &Path, rust: &Path, args: &[&str]
 }
 
 fn assert_status_match(upstream: &Path, rust: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), rust, args);
     assert_eq!(
         actual.status.code(),
@@ -104,7 +104,7 @@ fn assert_status_stdout_stderr_match_with_input(
     args: &[&str],
     stdin: &[u8],
 ) {
-    let expected = run_output_with_input("git", upstream, args, stdin);
+    let expected = run_output_with_input(sley_testkit::oracle_git(), upstream, args, stdin);
     let actual = run_output_with_input(env!("CARGO_BIN_EXE_sley"), rust, args, stdin);
     assert_eq!(
         actual.status.code(),

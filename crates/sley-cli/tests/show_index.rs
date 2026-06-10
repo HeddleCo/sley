@@ -40,7 +40,7 @@ fn run_output_with_input(program: &str, cwd: &Path, args: &[&str], stdin: &[u8])
 }
 
 fn assert_stdin_match(cwd: &Path, args: &[&str], stdin: &[u8]) {
-    let expected = run_output_with_input("git", cwd, args, stdin);
+    let expected = run_output_with_input(sley_testkit::oracle_git(), cwd, args, stdin);
     let actual = run_output_with_input(env!("CARGO_BIN_EXE_sley"), cwd, args, stdin);
     assert_eq!(
         actual.status.code(),
@@ -64,16 +64,16 @@ fn show_index_matches_upstream_git() {
     let root = unique_temp_dir("show-index");
     std::fs::create_dir_all(&root).expect("create temp dir");
     {
-        let status = Command::new("git")
+        let status = Command::new(sley_testkit::oracle_git())
             .arg("init")
             .arg(&root)
             .status()
             .expect("run git init");
         assert!(status.success(), "git init failed");
         std::fs::write(root.join("one.txt"), b"one\n").expect("write file");
-        let add = run_output("git", &root, &["add", "one.txt"]);
+        let add = run_output(sley_testkit::oracle_git(), &root, &["add", "one.txt"]);
         assert!(add.status.success(), "git add failed");
-        let commit = Command::new("git")
+        let commit = Command::new(sley_testkit::oracle_git())
             .current_dir(&root)
             .args(["commit", "-m", "one"])
             .env("GIT_AUTHOR_NAME", "Tester")
@@ -85,7 +85,7 @@ fn show_index_matches_upstream_git() {
             .output()
             .expect("run git commit");
         assert!(commit.status.success(), "git commit failed");
-        let gc = run_output("git", &root, &["gc"]);
+        let gc = run_output(sley_testkit::oracle_git(), &root, &["gc"]);
         assert!(gc.status.success(), "git gc failed");
 
         let pack_dir = root.join(".git/objects/pack");

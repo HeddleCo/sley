@@ -100,7 +100,7 @@ fn parse_oid(format: ObjectFormat, output: &[u8]) -> ObjectId {
 
 fn pack_objects(repo: &Path, revs: &str) -> Vec<u8> {
     let output = run_with_stdin(
-        "git",
+        sley_testkit::oracle_git(),
         repo,
         &["pack-objects", "--stdout", "--revs"],
         revs.as_bytes(),
@@ -121,11 +121,11 @@ fn create_work_repo(root: &Path, object_format: Option<&str>) {
         init_args.push("--object-format");
         init_args.push(format);
     }
-    run_success("git", root, &init_args);
+    run_success(sley_testkit::oracle_git(), root, &init_args);
     fs::write(root.join("payload.txt"), b"push payload\n").expect("write payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -146,7 +146,7 @@ fn create_bare_repo(root: &Path, object_format: Option<&str>) {
         init_args.push("--object-format");
         init_args.push(format);
     }
-    run_success("git", root, &init_args);
+    run_success(sley_testkit::oracle_git(), root, &init_args);
 }
 
 fn percent_encoded_file_url(path: &Path) -> String {
@@ -228,7 +228,7 @@ fn repository_pack_pair(git_dir: &Path) -> (PathBuf, PathBuf) {
 
 fn assert_remote_stored_pushed_objects_in_pack(remote: &Path) {
     let head = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         remote,
         &["rev-parse", "refs/heads/main"],
     ))
@@ -236,7 +236,7 @@ fn assert_remote_stored_pushed_objects_in_pack(remote: &Path) {
     .trim()
     .to_string();
     let tree = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         remote,
         &["rev-parse", "refs/heads/main^{tree}"],
     ))
@@ -244,7 +244,7 @@ fn assert_remote_stored_pushed_objects_in_pack(remote: &Path) {
     .trim()
     .to_string();
     let blob = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         remote,
         &["rev-parse", "refs/heads/main:payload.txt"],
     ))
@@ -253,7 +253,7 @@ fn assert_remote_stored_pushed_objects_in_pack(remote: &Path) {
     .to_string();
     let (_pack_path, index_path) = repository_pack_pair(remote);
     let index_arg = index_path.to_string_lossy();
-    run_success("git", remote, &["verify-pack", "-v", &index_arg]);
+    run_success(sley_testkit::oracle_git(), remote, &["verify-pack", "-v", &index_arg]);
     for oid in [&head, &tree, &blob] {
         assert!(
             !loose_object_path(remote, oid).exists(),
@@ -263,7 +263,7 @@ fn assert_remote_stored_pushed_objects_in_pack(remote: &Path) {
 }
 
 fn assert_ref_missing(repo: &Path, name: &str) {
-    let output = run("git", repo, &["show-ref", "--verify", name]);
+    let output = run(sley_testkit::oracle_git(), repo, &["show-ref", "--verify", name]);
     assert!(
         !output.status.success(),
         "{name} should be missing\nstdout:\n{}\nstderr:\n{}",
@@ -284,11 +284,11 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
     create_bare_repo(&remote, None);
 
     let remote_arg = remote.to_string_lossy();
-    run_success("git", &work, &["push", "-q", &remote_arg, "main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["push", "-q", &remote_arg, "main"]);
     fs::write(work.join("payload.txt"), b"receive-pack update\n").expect("write update");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -304,11 +304,11 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
 
     let old_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     let new_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &work, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]),
     );
     let packfile = pack_objects(&work, &format!("{new_id}\n"));
     let features = ReceivePackFeatures {
@@ -376,11 +376,11 @@ fn receive_pack_service_updates_bare_repo_with_raw_pack() {
 
     let remote_head = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     assert_eq!(remote_head, new_id);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["cat-file", "-p", "refs/heads/main:payload.txt"],
     );
@@ -400,13 +400,13 @@ fn receive_pack_service_accepts_push_options() {
     fs::create_dir_all(&work).expect("create work");
     create_bare_repo(&remote, None);
     create_work_repo(&work, None);
-    run_success("git", &work, &["remote", "add", "origin", &remote_arg]);
-    run_success("git", &work, &["push", "-q", "origin", "main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["remote", "add", "origin", &remote_arg]);
+    run_success(sley_testkit::oracle_git(), &work, &["push", "-q", "origin", "main"]);
 
     fs::write(work.join("payload.txt"), b"receive-pack push option\n").expect("write update");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -422,11 +422,11 @@ fn receive_pack_service_accepts_push_options() {
 
     let old_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     let new_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &work, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]),
     );
     let packfile = pack_objects(&work, &format!("{new_id}\n"));
     let features = ReceivePackFeatures {
@@ -490,7 +490,7 @@ fn receive_pack_service_accepts_push_options() {
 
     let remote_head = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     assert_eq!(remote_head, new_id);
 
@@ -508,13 +508,13 @@ fn receive_pack_service_accepts_empty_push_options_section() {
     fs::create_dir_all(&work).expect("create work");
     create_bare_repo(&remote, None);
     create_work_repo(&work, None);
-    run_success("git", &work, &["remote", "add", "origin", &remote_arg]);
-    run_success("git", &work, &["push", "-q", "origin", "main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["remote", "add", "origin", &remote_arg]);
+    run_success(sley_testkit::oracle_git(), &work, &["push", "-q", "origin", "main"]);
 
     fs::write(work.join("payload.txt"), b"empty push options section\n").expect("write update");
-    run_success("git", &work, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -530,11 +530,11 @@ fn receive_pack_service_accepts_empty_push_options_section() {
 
     let old_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     let new_id = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &work, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]),
     );
     let packfile = pack_objects(&work, &format!("{new_id}\n"));
     let request = sley_protocol::ReceivePackPushRequest {
@@ -602,7 +602,7 @@ fn receive_pack_service_accepts_empty_push_options_section() {
 
     let remote_head = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+        &run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
     );
     assert_eq!(remote_head, new_id);
 
@@ -622,7 +622,7 @@ fn upload_pack_service_serves_raw_pack() {
 
     let head = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &source, &["rev-parse", "HEAD"]),
+        &run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]),
     );
     let request = UploadPackRequest {
         wants: vec![head.clone()],
@@ -713,7 +713,7 @@ fn upload_pack_service_serves_sideband_64k_pack() {
 
     let head = parse_oid(
         ObjectFormat::Sha1,
-        &run_success("git", &source, &["rev-parse", "HEAD"]),
+        &run_success(sley_testkit::oracle_git(), &source, &["rev-parse", "HEAD"]),
     );
     let request = UploadPackRequest {
         wants: vec![head.clone()],
@@ -807,11 +807,11 @@ fn push_local_branch_to_bare_repo_matches_upstream_ref_and_objects() {
         &["push", "-q", &remote_arg, "main"],
     );
 
-    let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
-    let remote_head = run_success("git", &remote, &["rev-parse", "refs/heads/main"]);
+    let local_head = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]);
+    let remote_head = run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]);
     assert_eq!(remote_head, local_head);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["cat-file", "-e", "refs/heads/main^{tree}"],
     );
@@ -850,7 +850,7 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
         let actual_args = ["push", "-q", actual_url.as_str(), "main"];
 
         let expected = run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_work,
             &expected_args,
             &[("GIT_SSH", fake_ssh)],
@@ -863,16 +863,16 @@ fn push_ssh_branch_to_bare_repo_matches_upstream_git_protocol_v0() {
         );
         assert_same_output(actual, expected, &actual_args);
 
-        let expected_head = run_success("git", &expected_work, &["rev-parse", "refs/heads/main"]);
+        let expected_head = run_success(sley_testkit::oracle_git(), &expected_work, &["rev-parse", "refs/heads/main"]);
         assert_eq!(
-            run_success("git", &expected_remote, &["rev-parse", "refs/heads/main"]),
+            run_success(sley_testkit::oracle_git(), &expected_remote, &["rev-parse", "refs/heads/main"]),
             expected_head
         );
-        let actual_work_head = run_success("git", &actual_work, &["rev-parse", "refs/heads/main"]);
-        let actual_head = run_success("git", &actual_remote, &["rev-parse", "refs/heads/main"]);
+        let actual_work_head = run_success(sley_testkit::oracle_git(), &actual_work, &["rev-parse", "refs/heads/main"]);
+        let actual_head = run_success(sley_testkit::oracle_git(), &actual_remote, &["rev-parse", "refs/heads/main"]);
         assert_eq!(actual_head, actual_work_head);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_remote,
             &["cat-file", "-p", "refs/heads/main:payload.txt"],
         );
@@ -902,12 +902,12 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
         let expected_url = percent_encoded_ssh_url(&expected_remote);
         let actual_url = percent_encoded_ssh_url(&actual_remote);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_work,
             &["remote", "add", "origin", expected_url.as_str()],
         );
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_work,
             &["remote", "add", "origin", actual_url.as_str()],
         );
@@ -915,7 +915,7 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
         let actual_args = ["push", "-q", "origin", "main"];
 
         let expected = run_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             &expected_work,
             &expected_args,
             &[("GIT_SSH", fake_ssh)],
@@ -927,16 +927,16 @@ fn push_configured_percent_encoded_ssh_remote_matches_upstream_git_protocol_v0()
             &[("GIT_SSH", fake_ssh)],
         );
         assert_same_output(actual, expected, &actual_args);
-        let expected_head = run_success("git", &expected_work, &["rev-parse", "refs/heads/main"]);
+        let expected_head = run_success(sley_testkit::oracle_git(), &expected_work, &["rev-parse", "refs/heads/main"]);
         assert_eq!(
-            run_success("git", &expected_remote, &["rev-parse", "refs/heads/main"]),
+            run_success(sley_testkit::oracle_git(), &expected_remote, &["rev-parse", "refs/heads/main"]),
             expected_head
         );
-        let actual_work_head = run_success("git", &actual_work, &["rev-parse", "refs/heads/main"]);
-        let actual_head = run_success("git", &actual_remote, &["rev-parse", "refs/heads/main"]);
+        let actual_work_head = run_success(sley_testkit::oracle_git(), &actual_work, &["rev-parse", "refs/heads/main"]);
+        let actual_head = run_success(sley_testkit::oracle_git(), &actual_remote, &["rev-parse", "refs/heads/main"]);
         assert_eq!(actual_head, actual_work_head);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &actual_remote,
             &["cat-file", "-p", "refs/heads/main:payload.txt"],
         );
@@ -957,7 +957,7 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
         create_bare_repo(&remote, None);
         let remote_url = percent_encoded_file_url(&remote);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &work,
             &["remote", "add", "origin", remote_url.as_str()],
         );
@@ -974,8 +974,8 @@ fn push_configured_percent_encoded_file_remote_updates_bare_repo() {
             String::from_utf8_lossy(&actual.stdout),
             String::from_utf8_lossy(&actual.stderr)
         );
-        let remote_head = run_success("git", &remote, &["rev-parse", "refs/heads/main"]);
-        let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
+        let remote_head = run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]);
+        let local_head = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]);
         assert_eq!(remote_head, local_head);
         assert_remote_stored_pushed_objects_in_pack(&remote);
     };
@@ -995,13 +995,13 @@ fn push_rejects_non_fast_forward_without_force() {
         create_work_repo(&work, None);
         create_bare_repo(&remote, None);
         let remote_arg = remote.to_string_lossy();
-        run_success("git", &work, &["push", "-q", &remote_arg, "main"]);
-        run_success("git", &root, &["clone", "-q", &remote_arg, "other"]);
+        run_success(sley_testkit::oracle_git(), &work, &["push", "-q", &remote_arg, "main"]);
+        run_success(sley_testkit::oracle_git(), &root, &["clone", "-q", &remote_arg, "other"]);
 
         fs::write(other.join("payload.txt"), b"remote side\n").expect("write remote side");
-        run_success("git", &other, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &other, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &other,
             &[
                 "-c",
@@ -1014,13 +1014,13 @@ fn push_rejects_non_fast_forward_without_force() {
                 "-q",
             ],
         );
-        run_success("git", &other, &["push", "-q", "origin", "main"]);
-        let remote_head = run_success("git", &remote, &["rev-parse", "refs/heads/main"]);
+        run_success(sley_testkit::oracle_git(), &other, &["push", "-q", "origin", "main"]);
+        let remote_head = run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]);
 
         fs::write(work.join("payload.txt"), b"local side\n").expect("write local side");
-        run_success("git", &work, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &work,
             &[
                 "-c",
@@ -1033,7 +1033,7 @@ fn push_rejects_non_fast_forward_without_force() {
                 "-q",
             ],
         );
-        let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
+        let local_head = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]);
 
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
@@ -1052,7 +1052,7 @@ fn push_rejects_non_fast_forward_without_force() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+            run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
             remote_head
         );
         assert_ne!(remote_head, local_head);
@@ -1073,13 +1073,13 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
         create_work_repo(&work, None);
         create_bare_repo(&remote, None);
         let remote_arg = remote.to_string_lossy();
-        run_success("git", &work, &["push", "-q", &remote_arg, "main"]);
-        run_success("git", &root, &["clone", "-q", &remote_arg, "other"]);
+        run_success(sley_testkit::oracle_git(), &work, &["push", "-q", &remote_arg, "main"]);
+        run_success(sley_testkit::oracle_git(), &root, &["clone", "-q", &remote_arg, "other"]);
 
         fs::write(other.join("payload.txt"), b"remote side\n").expect("write remote side");
-        run_success("git", &other, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &other, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &other,
             &[
                 "-c",
@@ -1092,12 +1092,12 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
                 "-q",
             ],
         );
-        run_success("git", &other, &["push", "-q", "origin", "main"]);
+        run_success(sley_testkit::oracle_git(), &other, &["push", "-q", "origin", "main"]);
 
         fs::write(work.join("payload.txt"), b"local side\n").expect("write local side");
-        run_success("git", &work, &["add", "payload.txt"]);
+        run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &work,
             &[
                 "-c",
@@ -1110,7 +1110,7 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
                 "-q",
             ],
         );
-        let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
+        let local_head = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]);
 
         run_success(
             env!("CARGO_BIN_EXE_sley"),
@@ -1118,7 +1118,7 @@ fn push_force_refspec_updates_non_fast_forward_branch() {
             &["push", "-q", &remote_arg, "+main"],
         );
         assert_eq!(
-            run_success("git", &remote, &["rev-parse", "refs/heads/main"]),
+            run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]),
             local_head
         );
         assert_remote_stored_pushed_objects_in_pack(&remote);
@@ -1144,7 +1144,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
         &["push", "-q", &remote_arg, "main"],
     );
     let old_head = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["rev-parse", "refs/heads/main"],
     ))
@@ -1152,7 +1152,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
     .trim()
     .to_string();
     let old_tree = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["rev-parse", "refs/heads/main^{tree}"],
     ))
@@ -1160,7 +1160,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
     .trim()
     .to_string();
     let old_blob = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["rev-parse", "refs/heads/main:payload.txt"],
     ))
@@ -1172,7 +1172,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
         .collect::<HashSet<_>>();
 
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &work,
         &[
             "-c",
@@ -1186,7 +1186,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
             "-q",
         ],
     );
-    let new_head = String::from_utf8(run_success("git", &work, &["rev-parse", "refs/heads/main"]))
+    let new_head = String::from_utf8(run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]))
         .expect("new head is utf8")
         .trim()
         .to_string();
@@ -1205,7 +1205,7 @@ fn push_update_pack_excludes_objects_reachable_from_remote_refs() {
     assert_eq!(new_indexes.len(), 1, "expected one new push pack index");
     let index_arg = new_indexes[0].to_string_lossy();
     let verify = String::from_utf8(run_success(
-        "git",
+        sley_testkit::oracle_git(),
         &remote,
         &["verify-pack", "-v", &index_arg],
     ))
@@ -1239,7 +1239,7 @@ fn push_delete_refspec_removes_remote_branch() {
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
-    run_success("git", &remote, &["branch", "old", "main"]);
+    run_success(sley_testkit::oracle_git(), &remote, &["branch", "old", "main"]);
 
     run_success(
         env!("CARGO_BIN_EXE_sley"),
@@ -1267,7 +1267,7 @@ fn push_delete_option_removes_remote_branch() {
         &work,
         &["push", "-q", &remote_arg, "main"],
     );
-    run_success("git", &remote, &["branch", "old", "main"]);
+    run_success(sley_testkit::oracle_git(), &remote, &["branch", "old", "main"]);
 
     run_success(
         env!("CARGO_BIN_EXE_sley"),
@@ -1320,11 +1320,11 @@ fn push_sha256_branch_to_file_remote_sets_upstream() {
         &["push", "-q", "-u", &remote_url, "main"],
     );
 
-    let local_head = run_success("git", &work, &["rev-parse", "refs/heads/main"]);
-    let remote_head = run_success("git", &remote, &["rev-parse", "refs/heads/main"]);
+    let local_head = run_success(sley_testkit::oracle_git(), &work, &["rev-parse", "refs/heads/main"]);
+    let remote_head = run_success(sley_testkit::oracle_git(), &remote, &["rev-parse", "refs/heads/main"]);
     assert_eq!(remote_head, local_head);
     assert_eq!(
-        run_success("git", &work, &["config", "--get", "branch.main.remote"]),
+        run_success(sley_testkit::oracle_git(), &work, &["config", "--get", "branch.main.remote"]),
         remote_url
             .as_bytes()
             .iter()
@@ -1333,7 +1333,7 @@ fn push_sha256_branch_to_file_remote_sets_upstream() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        run_success("git", &work, &["config", "--get", "branch.main.merge"]),
+        run_success(sley_testkit::oracle_git(), &work, &["config", "--get", "branch.main.merge"]),
         b"refs/heads/main\n"
     );
     assert_remote_stored_pushed_objects_in_pack(&remote);
@@ -1356,7 +1356,7 @@ fn push_delete_sha256_remote_branch() {
         &work,
         &["push", "-q", &remote_url, "main"],
     );
-    run_success("git", &remote, &["branch", "old", "main"]);
+    run_success(sley_testkit::oracle_git(), &remote, &["branch", "old", "main"]);
 
     run_success(
         env!("CARGO_BIN_EXE_sley"),

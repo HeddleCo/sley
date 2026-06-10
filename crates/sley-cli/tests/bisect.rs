@@ -49,7 +49,7 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
 /// each commit gets a distinct, deterministic timestamp (and therefore a stable
 /// object id). Aborts on failure.
 fn git_at(cwd: &Path, args: &[&str], date: &str) {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .args(args)
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -68,7 +68,7 @@ fn git_at(cwd: &Path, args: &[&str], date: &str) {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs(cwd: &Path, args: &[&str]) -> Output {
@@ -76,7 +76,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())

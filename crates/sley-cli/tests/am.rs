@@ -42,7 +42,7 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs(cwd: &Path, args: &[&str]) -> Output {
@@ -62,7 +62,7 @@ fn git_ok(cwd: &Path, args: &[&str]) -> String {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -149,7 +149,7 @@ fn am_clean_series_matches_git() {
     write(&source, "file.txt", "line1\nCHANGED\nline3\n");
     git_ok(&source, &["add", "file.txt"]);
     run_env(
-        "git",
+        sley_testkit::oracle_git(),
         &source,
         &[
             "commit",

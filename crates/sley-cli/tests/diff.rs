@@ -45,7 +45,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn utf8_trimmed(bytes: Vec<u8>) -> String {
@@ -229,7 +229,7 @@ fn diff_name_only_matches_upstream_git() {
             vec!["diff", "--name-status", "--break-rewrites=foo", "HEAD"],
             vec!["diff", "--name-status", "--break-rewrites=1/2/3", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -449,7 +449,7 @@ fn diff_filter_matches_upstream_git() {
             vec!["diff", "--name-status", "--diff-filter=Z", "HEAD"],
             vec!["diff", "--name-status", "--diff-filter", "Z", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -534,7 +534,7 @@ fn diff_pickaxe_matches_upstream_git() {
             vec!["diff", "--name-status", "-S"],
             vec!["diff", "--name-status", "-S", "", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -682,7 +682,7 @@ fn diff_find_object_matches_upstream_git() {
         ];
         for args in status_cases {
             let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -874,7 +874,7 @@ fn diff_renames_match_upstream_git() {
                 "HEAD",
             ],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -1168,7 +1168,7 @@ fn diff_copies_match_upstream_git() {
                 "HEAD",
             ],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -1263,7 +1263,7 @@ fn diff_empty_rename_controls_match_upstream_git() {
                 "HEAD",
             ],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -1738,7 +1738,7 @@ fn diff_patch_matches_upstream_git_for_simple_text_changes() {
         }
         git(&root, &["config", "--unset", "core.abbrev"]);
 
-        let expected = run_status("git", &root, &["diff", "--exit-code"]);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &["diff", "--exit-code"]);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &["diff", "--exit-code"]);
         assert_eq!(
             actual, expected,
@@ -2620,7 +2620,7 @@ fn diff_exit_code_and_quiet_match_upstream_git() {
             vec!["diff", "--exit-code", "--no-patch", "HEAD"],
             vec!["diff", "--quiet", "--no-patch", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -2634,7 +2634,7 @@ fn diff_exit_code_and_quiet_match_upstream_git() {
             vec!["diff", "--cached", "--exit-code", "--no-patch", "HEAD"],
             vec!["diff", "--staged", "--quiet", "--no-patch", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }
@@ -2661,7 +2661,7 @@ fn diff_exit_code_and_quiet_match_upstream_git() {
             vec!["diff", "--exit-code", "--no-patch", "HEAD"],
             vec!["diff", "--cached", "--quiet", "--no-patch", "HEAD"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(actual, expected, "sley result differed for {args:?}");
         }

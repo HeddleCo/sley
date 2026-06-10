@@ -88,7 +88,7 @@ fn run_env_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) ->
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -103,7 +103,7 @@ fn git_ok(cwd: &Path, args: &[&str]) {
 /// Run a repository-building `git` command at a specific author/committer date so
 /// commits get distinct, deterministic timestamps (and thus distinct ids).
 fn git_at(cwd: &Path, args: &[&str], date: &str) {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .args(args)
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -126,7 +126,7 @@ fn git_rs_bin() -> &'static str {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -166,7 +166,7 @@ fn git_capture_bytes(cwd: &Path, args: &[&str]) -> Vec<u8> {
 /// Assert git and sley produce byte-identical stdout/stderr and the same exit
 /// code for `patch-id args` fed `stdin`.
 fn assert_same_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) {
-    let g = run_env_with_stdin("git", cwd, args, stdin);
+    let g = run_env_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin);
     let r = run_env_with_stdin(git_rs_bin(), cwd, args, stdin);
     assert_eq!(
         String::from_utf8_lossy(&r.stdout),

@@ -41,7 +41,7 @@ fn run_with_input(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Out
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), actual, args);
     assert_eq!(
         actual_output.status.code(),
@@ -83,12 +83,12 @@ fn loose_object_path(repo: &Path, oid: &str) -> PathBuf {
 
 fn create_repo_with_packable_loose_objects(root: &Path) -> String {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output("git", root, &["init"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init"]);
     assert!(init.status.success(), "git init failed");
     fs::write(root.join("file.txt"), b"payload\n").expect("write file");
-    let add = run_output("git", root, &["add", "file.txt"]);
+    let add = run_output(sley_testkit::oracle_git(), root, &["add", "file.txt"]);
     assert!(add.status.success(), "git add failed");
-    let commit = Command::new("git")
+    let commit = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .args(["commit", "-m", "one"])
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -100,15 +100,15 @@ fn create_repo_with_packable_loose_objects(root: &Path) -> String {
         .output()
         .expect("run git commit");
     assert!(commit.status.success(), "git commit failed");
-    let blob = run_output("git", root, &["rev-parse", "HEAD:file.txt"]);
+    let blob = run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD:file.txt"]);
     assert!(blob.status.success(), "git rev-parse failed");
     let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
     let blob = blob.trim().to_string();
 
-    let object_list = run_output("git", root, &["rev-list", "--objects", "--all"]);
+    let object_list = run_output(sley_testkit::oracle_git(), root, &["rev-list", "--objects", "--all"]);
     assert!(object_list.status.success(), "git rev-list failed");
     let pack = run_with_input(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["pack-objects", ".git/objects/pack/pack-test"],
         &object_list.stdout,

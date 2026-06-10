@@ -76,9 +76,9 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_commit_repo(root: &Path) {
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked file");
-    run_success("git", root, &["add", "tracked.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "tracked.txt"]);
     fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
     fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
     fs::write(root.join("message-empty.txt"), b"").expect("write empty message");
@@ -153,7 +153,7 @@ fn commit_empty_message_errors_match_upstream_git() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
     }
@@ -181,12 +181,12 @@ fn commit_clean_index_requires_allow_empty_like_upstream_git() {
         let actual_root = root.join(format!("{name}-actual"));
         fs::create_dir_all(&expected_root).expect("create expected repo");
         fs::create_dir_all(&actual_root).expect("create actual repo");
-        create_initial_commit("git", &expected_root);
+        create_initial_commit(sley_testkit::oracle_git(), &expected_root);
         create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
         remove_message_fixtures(&expected_root);
         remove_message_fixtures(&actual_root);
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
     }
@@ -198,19 +198,19 @@ fn commit_message_option_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-message-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
         for args in [
             vec!["commit", "-m"],
             vec!["commit", "-m", "one", "-m"],
             vec!["commit", "-t"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
         let args = vec!["commit", "--cleanup=bad", "-m", "subject"];
-        let expected = run_output("git", &root, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &root, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
         for args in [
@@ -358,7 +358,7 @@ fn commit_message_option_errors_match_upstream_git() {
             vec!["commit", "--amend=value", "-m", "subject"],
             vec!["commit", "--no-amend=value", "-m", "subject"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -884,7 +884,7 @@ fn commit_file_messages_match_upstream_git_objects() {
             fs::write(actual_root.join("pathspecs"), b"tracked.txt\n")
                 .expect("write actual pathspec file");
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             assert!(
                 expected.status.success(),
                 "git {args:?} failed: {}",
@@ -906,8 +906,8 @@ fn commit_file_messages_match_upstream_git_objects() {
                 assert_eq!(actual.stderr, expected.stderr, "quiet stderr differed");
             }
             assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
+                cat_head(sley_testkit::oracle_git(), &actual_root),
+                cat_head(sley_testkit::oracle_git(), &expected_root),
                 "committed object differed for {args:?}"
             );
         }
@@ -919,7 +919,7 @@ fn commit_file_messages_match_upstream_git_objects() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
         let args = ["commit", "-F", "message-no-lf.txt", "-m", "inline"];
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
         assert_same_output(actual, expected, &args);
 
@@ -930,7 +930,7 @@ fn commit_file_messages_match_upstream_git_objects() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
         let args = ["commit", "--trailer", "Acked-by=Alice"];
-        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -944,8 +944,8 @@ fn commit_file_messages_match_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for trailer-only"
         );
 
@@ -960,7 +960,7 @@ fn commit_file_messages_match_upstream_git_objects() {
             prepare_commit_repo(&expected_root);
             prepare_commit_repo(&actual_root);
 
-            let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+            let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
             assert!(
                 expected.status.success(),
                 "git {args:?} failed: {}",
@@ -977,8 +977,8 @@ fn commit_file_messages_match_upstream_git_objects() {
                 String::from_utf8_lossy(&actual.stderr)
             );
             assert_eq!(
-                cat_head("git", &actual_root),
-                cat_head("git", &expected_root),
+                cat_head(sley_testkit::oracle_git(), &actual_root),
+                cat_head(sley_testkit::oracle_git(), &expected_root),
                 "committed object differed for {args:?}"
             );
         }
@@ -1038,12 +1038,12 @@ fn commit_status_preview_modes_match_upstream_git() {
             prepare_commit_repo(&expected_root);
             prepare_commit_repo(&actual_root);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
 
             for (program, repo) in [
-                ("git", expected_root.as_path()),
+                (sley_testkit::oracle_git(), expected_root.as_path()),
                 (env!("CARGO_BIN_EXE_sley"), actual_root.as_path()),
             ] {
                 let head = run_output(program, repo, &["rev-parse", "--verify", "HEAD"]);
@@ -1069,10 +1069,10 @@ fn commit_status_preview_modes_match_upstream_git() {
             let actual_root = root.join(format!("{name}-actual"));
             fs::create_dir_all(&expected_root).expect("create expected repo");
             fs::create_dir_all(&actual_root).expect("create actual repo");
-            run_success("git", &expected_root, &["init", "-q"]);
-            run_success("git", &actual_root, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &expected_root, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &actual_root, &["init", "-q"]);
 
-            let expected = run_output_with_identity("git", &expected_root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1094,7 +1094,7 @@ fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
         let actual_root = root.join(format!("{name}-actual"));
         fs::create_dir_all(&expected_root).expect("create expected repo");
         fs::create_dir_all(&actual_root).expect("create actual repo");
-        create_initial_commit("git", &expected_root);
+        create_initial_commit(sley_testkit::oracle_git(), &expected_root);
         create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
         remove_message_fixtures(&expected_root);
         remove_message_fixtures(&actual_root);
@@ -1112,7 +1112,7 @@ fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
         fs::write(actual_root.join("untracked.txt"), b"untracked\n")
             .expect("write actual untracked");
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1125,8 +1125,8 @@ fn commit_all_stages_tracked_changes_like_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1195,7 +1195,7 @@ fn commit_reuse_message_matches_upstream_git_objects() {
             "-m",
             "reused body",
         ];
-        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        let expected_initial = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &initial_args);
         assert!(
             expected_initial.status.success(),
             "git initial commit failed: {}",
@@ -1213,10 +1213,10 @@ fn commit_reuse_message_matches_upstream_git_objects() {
         fs::write(expected_root.join("tracked.txt"), b"changed\n")
             .expect("modify expected tracked");
         fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1229,8 +1229,8 @@ fn commit_reuse_message_matches_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1272,7 +1272,7 @@ fn commit_reedit_message_matches_upstream_git_objects_when_editor_is_noop() {
             "-m",
             "reused body",
         ];
-        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        let expected_initial = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &initial_args);
         assert!(
             expected_initial.status.success(),
             "git initial commit failed: {}",
@@ -1290,10 +1290,10 @@ fn commit_reedit_message_matches_upstream_git_objects_when_editor_is_noop() {
         fs::write(expected_root.join("tracked.txt"), b"changed\n")
             .expect("modify expected tracked");
         fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
 
-        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1307,8 +1307,8 @@ fn commit_reedit_message_matches_upstream_git_objects_when_editor_is_noop() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1353,15 +1353,15 @@ fn commit_amend_matches_upstream_git_objects() {
         let actual_root = root.join(format!("{name}-actual"));
         fs::create_dir_all(&expected_root).expect("create expected repo");
         fs::create_dir_all(&actual_root).expect("create actual repo");
-        create_initial_commit("git", &expected_root);
+        create_initial_commit(sley_testkit::oracle_git(), &expected_root);
         create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
         remove_message_fixtures(&expected_root);
         remove_message_fixtures(&actual_root);
 
         fs::write(expected_root.join("tracked.txt"), b"old\n").expect("modify expected old");
         fs::write(actual_root.join("tracked.txt"), b"old\n").expect("modify actual old");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
         let old_args = [
             "commit",
             "--author=Reuse User <reuse@example.invalid>",
@@ -1371,7 +1371,7 @@ fn commit_amend_matches_upstream_git_objects() {
             "-m",
             "old body",
         ];
-        let expected_old = run_output_with_identity("git", &expected_root, &old_args);
+        let expected_old = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &old_args);
         assert!(
             expected_old.status.success(),
             "git old commit failed: {}",
@@ -1387,10 +1387,10 @@ fn commit_amend_matches_upstream_git_objects() {
 
         fs::write(expected_root.join("tracked.txt"), b"amended\n").expect("modify expected amend");
         fs::write(actual_root.join("tracked.txt"), b"amended\n").expect("modify actual amend");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
 
-        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1404,8 +1404,8 @@ fn commit_amend_matches_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1433,7 +1433,7 @@ fn commit_fixup_matches_upstream_git_objects() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
         let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
-        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        let expected_initial = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &initial_args);
         assert!(
             expected_initial.status.success(),
             "git initial commit failed: {}",
@@ -1449,10 +1449,10 @@ fn commit_fixup_matches_upstream_git_objects() {
         fs::write(expected_root.join("tracked.txt"), b"changed\n")
             .expect("modify expected tracked");
         fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
 
-        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1466,8 +1466,8 @@ fn commit_fixup_matches_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1504,7 +1504,7 @@ fn commit_squash_matches_upstream_git_objects() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
         let initial_args = ["commit", "-m", "initial subject", "-m", "initial body"];
-        let expected_initial = run_output_with_identity("git", &expected_root, &initial_args);
+        let expected_initial = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &initial_args);
         assert!(
             expected_initial.status.success(),
             "git initial commit failed: {}",
@@ -1520,10 +1520,10 @@ fn commit_squash_matches_upstream_git_objects() {
         fs::write(expected_root.join("tracked.txt"), b"changed\n")
             .expect("modify expected tracked");
         fs::write(actual_root.join("tracked.txt"), b"changed\n").expect("modify actual tracked");
-        run_success("git", &expected_root, &["add", "tracked.txt"]);
-        run_success("git", &actual_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &expected_root, &["add", "tracked.txt"]);
+        run_success(sley_testkit::oracle_git(), &actual_root, &["add", "tracked.txt"]);
 
-        let expected = run_output_with_identity_and_editor("git", &expected_root, &args);
+        let expected = run_output_with_identity_and_editor(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1537,8 +1537,8 @@ fn commit_squash_matches_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1569,12 +1569,12 @@ fn commit_allow_empty_matches_upstream_git_objects() {
         let actual_root = root.join(format!("{name}-actual"));
         fs::create_dir_all(&expected_root).expect("create expected repo");
         fs::create_dir_all(&actual_root).expect("create actual repo");
-        create_initial_commit("git", &expected_root);
+        create_initial_commit(sley_testkit::oracle_git(), &expected_root);
         create_initial_commit(env!("CARGO_BIN_EXE_sley"), &actual_root);
         remove_message_fixtures(&expected_root);
         remove_message_fixtures(&actual_root);
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1587,8 +1587,8 @@ fn commit_allow_empty_matches_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1659,7 +1659,7 @@ fn commit_author_and_date_options_match_upstream_git_objects() {
         prepare_commit_repo(&expected_root);
         prepare_commit_repo(&actual_root);
 
-        let expected = run_output_with_identity("git", &expected_root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
         assert!(
             expected.status.success(),
             "git {args:?} failed: {}",
@@ -1672,8 +1672,8 @@ fn commit_author_and_date_options_match_upstream_git_objects() {
             String::from_utf8_lossy(&actual.stderr)
         );
         assert_eq!(
-            cat_head("git", &actual_root),
-            cat_head("git", &expected_root),
+            cat_head(sley_testkit::oracle_git(), &actual_root),
+            cat_head(sley_testkit::oracle_git(), &expected_root),
             "committed object differed for {args:?}"
         );
     }
@@ -1685,7 +1685,7 @@ fn commit_tree_argument_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-argument-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         for args in [
             vec!["commit-tree", empty_tree, "-m"],
@@ -1694,7 +1694,7 @@ fn commit_tree_argument_errors_match_upstream_git() {
             vec!["commit-tree", "-m", "message"],
             vec!["commit-tree", empty_tree, empty_tree, "-m", "message"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1707,7 +1707,7 @@ fn commit_tree_file_messages_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-file-messages");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success("git", &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -1734,12 +1734,12 @@ fn commit_tree_file_messages_match_upstream_git() {
             ],
             vec!["commit-tree", empty_tree, "-F"],
         ] {
-            let expected = run_output_with_identity("git", &root, &args);
+            let expected = run_output_with_identity(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
         let parent =
-            run_output_with_identity("git", &root, &["commit-tree", empty_tree, "-mparent"]);
+            run_output_with_identity(sley_testkit::oracle_git(), &root, &["commit-tree", empty_tree, "-mparent"]);
         assert!(
             parent.status.success(),
             "parent commit creation failed: {}",
@@ -1756,7 +1756,7 @@ fn commit_tree_file_messages_match_upstream_git() {
             "-mchild".to_string(),
         ];
         let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-        let expected = run_output_with_identity("git", &root, &args);
+        let expected = run_output_with_identity(sley_testkit::oracle_git(), &root, &args);
         let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -1764,7 +1764,7 @@ fn commit_tree_file_messages_match_upstream_git() {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -1828,15 +1828,15 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
 
         for repo in [&upstream, &rust] {
             fs::create_dir_all(repo).expect("create repo dir");
-            run_success("git", repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
             fs::write(repo.join("tracked.txt"), b"tracked\n").expect("write tracked file");
-            run_success("git", repo, &["add", "tracked.txt"]);
+            run_success(sley_testkit::oracle_git(), repo, &["add", "tracked.txt"]);
         }
 
         // (1) Pure global fallback: identity comes only from ~/.gitconfig.
         // `git commit` and sley `commit` print different success summaries, so we
         // compare the resulting commit objects (via cat-file) rather than stdout.
-        let expected = commit_with_global_identity("git", &upstream, &home, &[]);
+        let expected = commit_with_global_identity(sley_testkit::oracle_git(), &upstream, &home, &[]);
         assert!(
             expected.status.success(),
             "git commit with global-only identity failed: {}",
@@ -1848,8 +1848,8 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
             "sley commit with global-only identity failed: {}",
             String::from_utf8_lossy(&actual.stderr)
         );
-        let upstream_head = cat_head("git", &upstream);
-        let rust_head = cat_head("git", &rust);
+        let upstream_head = cat_head(sley_testkit::oracle_git(), &upstream);
+        let rust_head = cat_head(sley_testkit::oracle_git(), &rust);
         assert_eq!(
             rust_head, upstream_head,
             "sley HEAD differs from git when identity comes from global config"
@@ -1862,16 +1862,16 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
 
         // (2) Repo-level user.* must override the global config (git parity).
         for repo in [&upstream, &rust] {
-            run_success("git", repo, &["config", "user.name", "Repo Person"]);
+            run_success(sley_testkit::oracle_git(), repo, &["config", "user.name", "Repo Person"]);
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &["config", "user.email", "repo@example.invalid"],
             );
             fs::write(repo.join("tracked.txt"), b"tracked 2\n").expect("update tracked file");
-            run_success("git", repo, &["add", "tracked.txt"]);
+            run_success(sley_testkit::oracle_git(), repo, &["add", "tracked.txt"]);
         }
-        let expected = commit_with_global_identity("git", &upstream, &home, &[]);
+        let expected = commit_with_global_identity(sley_testkit::oracle_git(), &upstream, &home, &[]);
         assert!(
             expected.status.success(),
             "git commit with repo identity failed: {}",
@@ -1883,18 +1883,18 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
             "sley commit with repo identity failed: {}",
             String::from_utf8_lossy(&actual.stderr)
         );
-        let rust_head = cat_head("git", &rust);
+        let rust_head = cat_head(sley_testkit::oracle_git(), &rust);
         let head_text = String::from_utf8_lossy(&rust_head);
         assert!(
             head_text.contains("Repo Person <repo@example.invalid>"),
             "expected repo identity to override global, got:\n{head_text}"
         );
-        assert_eq!(rust_head, cat_head("git", &upstream));
+        assert_eq!(rust_head, cat_head(sley_testkit::oracle_git(), &upstream));
 
         // (3) `-c user.*` must override both repo and global config (git parity).
         for repo in [&upstream, &rust] {
             fs::write(repo.join("tracked.txt"), b"tracked 3\n").expect("update tracked file");
-            run_success("git", repo, &["add", "tracked.txt"]);
+            run_success(sley_testkit::oracle_git(), repo, &["add", "tracked.txt"]);
         }
         let overrides = [
             "-c",
@@ -1902,7 +1902,7 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
             "-c",
             "user.email=cli@example.invalid",
         ];
-        let expected = commit_with_global_identity("git", &upstream, &home, &overrides);
+        let expected = commit_with_global_identity(sley_testkit::oracle_git(), &upstream, &home, &overrides);
         assert!(
             expected.status.success(),
             "git commit with -c identity failed: {}",
@@ -1915,13 +1915,13 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
             "sley commit with -c identity failed: {}",
             String::from_utf8_lossy(&actual.stderr)
         );
-        let rust_head = cat_head("git", &rust);
+        let rust_head = cat_head(sley_testkit::oracle_git(), &rust);
         let head_text = String::from_utf8_lossy(&rust_head);
         assert!(
             head_text.contains("Cli Person <cli@example.invalid>"),
             "expected -c identity to override repo and global, got:\n{head_text}"
         );
-        assert_eq!(rust_head, cat_head("git", &upstream));
+        assert_eq!(rust_head, cat_head(sley_testkit::oracle_git(), &upstream));
     });
     let _ = fs::remove_dir_all(&root);
     if let Err(panic) = result {

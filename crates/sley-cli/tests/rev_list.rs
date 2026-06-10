@@ -33,7 +33,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
@@ -69,11 +69,11 @@ fn git_rs_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 }
 
 fn git_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin("git", cwd, args, stdin)
+    run_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 fn git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(sley_testkit::oracle_git());
     command.current_dir(cwd).args(args);
     for (key, value) in env {
         command.env(key, value);

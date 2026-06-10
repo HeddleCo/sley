@@ -20,7 +20,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_status_stderr_match(cwd: &Path, args: &[&str]) {
-    let expected = run_output("git", cwd, args);
+    let expected = run_output(sley_testkit::oracle_git(), cwd, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), cwd, args);
     assert_eq!(
         actual.status.code(),
@@ -63,12 +63,12 @@ fn unpack_file_matches_upstream_git() {
     let root = unique_temp_dir("unpack-file");
     fs::create_dir_all(&root).expect("create temp dir");
     {
-        let init = run_output("git", &root, &["init"]);
+        let init = run_output(sley_testkit::oracle_git(), &root, &["init"]);
         assert!(init.status.success(), "git init failed");
         fs::write(root.join("file.txt"), b"payload\n").expect("write file");
-        let add = run_output("git", &root, &["add", "file.txt"]);
+        let add = run_output(sley_testkit::oracle_git(), &root, &["add", "file.txt"]);
         assert!(add.status.success(), "git add failed");
-        let commit = Command::new("git")
+        let commit = Command::new(sley_testkit::oracle_git())
             .current_dir(&root)
             .args(["commit", "-m", "one"])
             .env("GIT_AUTHOR_NAME", "Tester")
@@ -92,18 +92,18 @@ fn unpack_file_matches_upstream_git() {
             assert_status_stderr_match(&root, &args);
         }
 
-        let blob = run_output("git", &root, &["rev-parse", "HEAD:file.txt"]);
+        let blob = run_output(sley_testkit::oracle_git(), &root, &["rev-parse", "HEAD:file.txt"]);
         assert!(blob.status.success(), "git rev-parse failed");
         let blob = String::from_utf8(blob.stdout).expect("utf8 oid");
         let blob = blob.trim();
-        let (_git_path, git_contents) = unpack_file("git", &root, blob);
+        let (_git_path, git_contents) = unpack_file(sley_testkit::oracle_git(), &root, blob);
         let (_sley_path, sley_contents) = unpack_file(env!("CARGO_BIN_EXE_sley"), &root, blob);
         assert_eq!(
             sley_contents, git_contents,
             "unpacked blob contents differed"
         );
 
-        let (_git_path, git_contents) = unpack_file("git", &root, "HEAD:file.txt");
+        let (_git_path, git_contents) = unpack_file(sley_testkit::oracle_git(), &root, "HEAD:file.txt");
         let (_sley_path, sley_contents) =
             unpack_file(env!("CARGO_BIN_EXE_sley"), &root, "HEAD:file.txt");
         assert_eq!(

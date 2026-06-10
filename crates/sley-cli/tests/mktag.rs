@@ -78,7 +78,7 @@ fn run_env_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Outp
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -95,7 +95,7 @@ fn git_rs() -> &'static str {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -124,7 +124,7 @@ fn git_capture(cwd: &Path, args: &[&str]) -> String {
 fn assert_same_mktag(repo: &Path, args: &[&str], stdin: &[u8]) {
     let mut full = vec!["mktag"];
     full.extend_from_slice(args);
-    let g = run_env_stdin("git", repo, &full, stdin);
+    let g = run_env_stdin(sley_testkit::oracle_git(), repo, &full, stdin);
     let r = run_env_stdin(git_rs(), repo, &full, stdin);
     let label = format!("args={args:?} stdin={:?}", String::from_utf8_lossy(stdin));
     assert_eq!(

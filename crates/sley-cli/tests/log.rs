@@ -53,7 +53,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
@@ -89,11 +89,11 @@ fn git_rs_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
 }
 
 fn git_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Vec<u8> {
-    run_with_stdin("git", cwd, args, stdin)
+    run_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 fn git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
-    let mut command = Command::new("git");
+    let mut command = Command::new(sley_testkit::oracle_git());
     command.current_dir(cwd).args(args);
     for (key, value) in env {
         command.env(key, value);
@@ -577,7 +577,7 @@ fn log_minimal_format_matches_upstream_git() {
             vec!["log", "--decorate-refs"],
             vec!["log", "--decorate-refs-exclude"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -965,7 +965,7 @@ fn log_author_filter_matches_upstream_git() {
             vec!["log", "--author=["],
             vec!["log", "--no-author"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1039,7 +1039,7 @@ fn log_committer_filter_matches_upstream_git() {
             vec!["log", "--committer=["],
             vec!["log", "--no-committer"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1118,7 +1118,7 @@ fn log_epoch_age_filters_match_upstream_git() {
             vec!["log", "--no-since", "--format=%s"],
             vec!["log", "--no-before", "--format=%s"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1198,7 +1198,7 @@ fn log_regexp_ignore_case_filters_match_upstream_git() {
             vec!["log", "--no-regexp-ignore-case", "--format=%s"],
             vec!["log", "--no-regexp-ignore-case=yes", "--format=%s"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1314,7 +1314,7 @@ fn log_fixed_string_filters_match_upstream_git() {
             vec!["log", "--extended-regexp=yes", "--format=%s"],
             vec!["log", "--no-extended-regexp", "--format=%s"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -1418,7 +1418,7 @@ fn log_grep_filter_matches_upstream_git() {
             vec!["log", "--all-match=yes"],
             vec!["log", "--no-all-match"],
         ] {
-            let expected = run_output("git", &root, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &root, &args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }

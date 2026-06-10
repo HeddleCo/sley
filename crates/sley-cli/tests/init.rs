@@ -45,7 +45,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
     {
         let repo = root.join("repo");
         let repo_arg = repo.to_str().expect("utf8 temp path");
-        let expected = run_status("git", &root, &["init", "-b", "topic", repo_arg]);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "-b", "topic", repo_arg]);
         assert_eq!(expected.0, 0, "upstream init failed");
         fs::remove_dir_all(&repo).expect("remove upstream repo");
         let actual = run_status(
@@ -98,7 +98,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
 
         let bare = root.join("bare.git");
         let bare_arg = bare.to_str().expect("utf8 temp path");
-        let expected = run_status("git", &root, &["init", "--bare", "-b", "topic", bare_arg]);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--bare", "-b", "topic", bare_arg]);
         assert_eq!(expected.0, 0, "upstream bare init failed");
         fs::remove_dir_all(&bare).expect("remove upstream bare repo");
         let actual = run_status(
@@ -115,7 +115,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
         let reinit = root.join("reinit");
         let reinit_arg = reinit.to_str().expect("utf8 temp path");
         git(&root, &["init", "-q", "-b", "topic", reinit_arg]);
-        let expected = run_status("git", &root, &["init", "-b", "other", reinit_arg]);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "-b", "other", reinit_arg]);
         let expected_head = git(&reinit, &["symbolic-ref", "HEAD"]);
         fs::remove_dir_all(&reinit).expect("remove upstream reinit repo");
         git_rs(&root, &["init", "-q", "-b", "topic", reinit_arg]);
@@ -134,7 +134,7 @@ fn init_bare_stdout_and_reinit_match_upstream_git() {
             &root,
             &["init", "-q", "--bare", "-b", "topic", bare_reinit_arg],
         );
-        let expected = run_status("git", &root, &["init", "--bare", bare_reinit_arg]);
+        let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--bare", bare_reinit_arg]);
         let expected_head = git(
             &root,
             &["--git-dir", bare_reinit_arg, "symbolic-ref", "HEAD"],
@@ -224,7 +224,7 @@ fn init_templatedir_config_and_tilde_expansion_match_upstream_git() {
     let rust_path = rust.to_str().expect("utf8 temp path");
 
     for (program, path) in [
-        ("git", upstream_path),
+        (sley_testkit::oracle_git(), upstream_path),
         (env!("CARGO_BIN_EXE_sley"), rust_path),
     ] {
         let output = Command::new(program)
@@ -289,7 +289,7 @@ fn init_shared_and_object_format_match_upstream_git() {
         upstream_args.push(upstream.to_str().expect("utf8 temp path"));
         let mut rust_args = args;
         rust_args.push(rust.to_str().expect("utf8 temp path"));
-        let mut upstream_cmd = Command::new("git");
+        let mut upstream_cmd = Command::new(sley_testkit::oracle_git());
         upstream_cmd.current_dir(&root).args(&upstream_args);
         let mut rust_cmd = Command::new(env!("CARGO_BIN_EXE_sley"));
         rust_cmd.current_dir(&root).args(&rust_args);
@@ -362,7 +362,7 @@ fn init_unknown_ref_format_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp root");
     let repo = root.join("repo");
     let repo_arg = repo.to_str().expect("utf8 temp path");
-    let expected = run_status("git", &root, &["init", "--ref-format=garbage", repo_arg]);
+    let expected = run_status(sley_testkit::oracle_git(), &root, &["init", "--ref-format=garbage", repo_arg]);
     let actual = run_status(
         env!("CARGO_BIN_EXE_sley"),
         &root,

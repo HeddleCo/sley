@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -56,7 +56,7 @@ fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn prepare_repo(root: &Path) -> String {
@@ -125,25 +125,25 @@ fn checkout_branch_creation_and_quiet_match_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["checkout", "-b", "topic", base_oid.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"base\n");
 
         let args = ["checkout", "-q", "--no-quiet", "main"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["checkout", "-q", "-b", "side"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["checkout", "-B", "topic"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
@@ -157,19 +157,19 @@ fn checkout_branch_creation_and_quiet_match_upstream_git() {
             "--no-recurse-submodules",
             "main",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["checkout", "-B", "fresh", base_oid.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"base\n");
 
         let args = ["checkout", "-q", "-B", "quiet", "main"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
@@ -192,19 +192,19 @@ fn switch_branch_creation_and_force_create_match_upstream_git() {
         git(&rust, &["branch", "topic", base_oid.as_str()]);
 
         let args = ["switch", "topic"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"base\n");
 
         let args = ["switch", "-q", "--no-quiet", "main"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["switch", "-c", "side", base_oid.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"base\n");
@@ -218,19 +218,19 @@ fn switch_branch_creation_and_force_create_match_upstream_git() {
             "--no-recurse-submodules",
             "main",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["switch", "-C", "topic"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");
 
         let args = ["switch", "-q", "--create=quiet"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_same_state(&upstream, &rust, b"main\n");

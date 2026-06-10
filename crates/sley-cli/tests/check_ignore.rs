@@ -54,7 +54,7 @@ fn git_rs(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
-    run_output("git", cwd, args, stdin)
+    run_output(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -74,12 +74,12 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn fixture(root: &Path) {
-    run("git", root, &["init", "-q"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q"]);
     write_fixture_contents(root);
 }
 
 fn sha256_fixture(root: &Path) {
-    run("git", root, &["init", "-q", "--object-format=sha256"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256"]);
     write_fixture_contents(root);
 }
 
@@ -88,7 +88,7 @@ fn write_fixture_contents(root: &Path) {
     fs::write(root.join(".git/info/exclude"), b"*.cache\n").expect("write info exclude");
     fs::write(root.join("global-excludes"), b"*.global\n").expect("write global excludes");
     run(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["config", "core.excludesFile", "global-excludes"],
     );
@@ -100,7 +100,7 @@ fn write_fixture_contents(root: &Path) {
     fs::write(root.join("visible.txt"), b"visible\n").expect("write visible file");
     fs::create_dir_all(root.join("dir")).expect("create ignored dir");
     fs::write(root.join("dir/a.txt"), b"ignored\n").expect("write ignored dir file");
-    run("git", root, &["add", "-f", "tracked.log"]);
+    run(sley_testkit::oracle_git(), root, &["add", "-f", "tracked.log"]);
 }
 
 #[test]

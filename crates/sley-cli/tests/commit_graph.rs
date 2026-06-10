@@ -74,23 +74,23 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn create_commit_graph_fixture(root: &Path) {
-    run_success("git", root, &["init", "-q", "-b", "main"]);
-    run_success("git", root, &["config", "user.name", "Example User"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(sley_testkit::oracle_git(), root, &["config", "user.name", "Example User"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["config", "user.email", "example@example.invalid"],
     );
     for name in ["one", "two", "three"] {
         fs::write(root.join(format!("{name}.txt")), format!("{name}\n")).expect("write fixture");
-        run_success("git", root, &["add", "."]);
+        run_success(sley_testkit::oracle_git(), root, &["add", "."]);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             root,
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", name],
         );
     }
-    run_success("git", root, &["commit-graph", "write", "--reachable"]);
+    run_success(sley_testkit::oracle_git(), root, &["commit-graph", "write", "--reachable"]);
     assert!(
         root.join(".git")
             .join("objects")
@@ -102,18 +102,18 @@ fn create_commit_graph_fixture(root: &Path) {
 }
 
 fn create_commit_graph_fixture_with_env(root: &Path, envs: &[(&str, &str)]) {
-    run_success("git", root, &["init", "-q", "-b", "main"]);
-    run_success("git", root, &["config", "user.name", "Example User"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
+    run_success(sley_testkit::oracle_git(), root, &["config", "user.name", "Example User"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["config", "user.email", "example@example.invalid"],
     );
     for name in ["one", "two", "three"] {
         fs::write(root.join(format!("{name}.txt")), format!("{name}\n")).expect("write fixture");
-        run_success_with_env("git", root, &["add", "."], envs);
+        run_success_with_env(sley_testkit::oracle_git(), root, &["add", "."], envs);
         run_success_with_env(
-            "git",
+            sley_testkit::oracle_git(),
             root,
             &["-c", "commit.gpgsign=false", "commit", "-q", "-m", name],
             envs,
@@ -143,7 +143,7 @@ fn commit_graph_verify_matches_upstream_git() {
             vec!["commit-graph", "verify", "--object-dir=.git/objects"],
             vec!["commit-graph", "verify", "--no-progress"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -159,7 +159,7 @@ fn commit_graph_verify_split_chain_matches_upstream_git() {
         create_commit_graph_fixture(&root);
         remove_single_commit_graph(&root);
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &["commit-graph", "write", "--reachable", "--split"],
         );
@@ -178,7 +178,7 @@ fn commit_graph_verify_split_chain_matches_upstream_git() {
             vec!["commit-graph", "verify", "--object-dir=.git/objects"],
             vec!["commit-graph", "verify", "--no-progress"],
         ] {
-            let expected = run("git", &root, &args);
+            let expected = run(sley_testkit::oracle_git(), &root, &args);
             let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_same_output(actual, expected, &args);
         }
@@ -211,9 +211,9 @@ fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
         assert!(actual.stdout.is_empty(), "unexpected stdout");
         assert!(actual.stderr.is_empty(), "unexpected stderr");
         assert!(graph_path.exists(), "sley did not write commit-graph");
-        run_success("git", &root, &["commit-graph", "verify"]);
+        run_success(sley_testkit::oracle_git(), &root, &["commit-graph", "verify"]);
 
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         fs::remove_file(&graph_path).expect("remove upstream commit-graph");
         let actual = run(
             env!("CARGO_BIN_EXE_sley"),
@@ -226,7 +226,7 @@ fn commit_graph_write_reachable_writes_upstream_verifiable_graph() {
             ],
         );
         assert_same_output(actual, expected, &args);
-        run_success("git", &root, &["commit-graph", "verify"]);
+        run_success(sley_testkit::oracle_git(), &root, &["commit-graph", "verify"]);
     };
     let _ = fs::remove_dir_all(&root);
 }
@@ -240,9 +240,9 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
         for repo in [&expected, &actual] {
-            run_success("git", repo, &["init", "-q", "-b", "main"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
             run_success(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &[
                     "-c",
@@ -259,7 +259,7 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
         }
 
         let args = ["commit-graph", "write"];
-        let expected_output = run("git", &expected, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
         for repo in [&expected, &actual] {
@@ -278,9 +278,9 @@ fn commit_graph_write_without_selector_matches_upstream_noop() {
         let empty_actual = root.join("empty-actual");
         fs::create_dir_all(&empty_expected).expect("create empty expected repo dir");
         fs::create_dir_all(&empty_actual).expect("create empty actual repo dir");
-        run_success("git", &empty_expected, &["init", "-q", "-b", "main"]);
-        run_success("git", &empty_actual, &["init", "-q", "-b", "main"]);
-        let expected_output = run("git", &empty_expected, &args);
+        run_success(sley_testkit::oracle_git(), &empty_expected, &["init", "-q", "-b", "main"]);
+        run_success(sley_testkit::oracle_git(), &empty_actual, &["init", "-q", "-b", "main"]);
+        let expected_output = run(sley_testkit::oracle_git(), &empty_expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &empty_actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     };
@@ -302,7 +302,7 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
         }
 
         let args = ["commit-graph", "write", "--reachable"];
-        let expected_output = run_with_env("git", &expected, &args, &envs);
+        let expected_output = run_with_env(sley_testkit::oracle_git(), &expected, &args, &envs);
         let actual_output = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &args, &envs);
         assert_same_output(actual_output, expected_output, &args);
 
@@ -326,10 +326,10 @@ fn commit_graph_git_object_directory_default_matches_upstream_git() {
         }
 
         let verify_args = ["commit-graph", "verify"];
-        let expected_verify = run_with_env("git", &expected, &verify_args, &envs);
+        let expected_verify = run_with_env(sley_testkit::oracle_git(), &expected, &verify_args, &envs);
         let actual_verify = run_with_env(env!("CARGO_BIN_EXE_sley"), &actual, &verify_args, &envs);
         assert_same_output(actual_verify, expected_verify, &verify_args);
-        run_success_with_env("git", &actual, &verify_args, &envs);
+        run_success_with_env(sley_testkit::oracle_git(), &actual, &verify_args, &envs);
     };
     let _ = fs::remove_dir_all(&root);
 }

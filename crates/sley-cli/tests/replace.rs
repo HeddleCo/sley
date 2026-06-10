@@ -55,7 +55,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 }
 
 fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), actual, args);
     assert_eq!(
         actual_output.status.code(),
@@ -75,7 +75,7 @@ fn assert_status_stdout_stderr_match(upstream: &Path, actual: &Path, args: &[&st
 }
 
 fn assert_stdin_match(upstream: &Path, actual: &Path, args: &[&str], input: &[u8]) {
-    let expected = run_with_input("git", upstream, args, input);
+    let expected = run_with_input(sley_testkit::oracle_git(), upstream, args, input);
     let actual_output = run_with_input(env!("CARGO_BIN_EXE_sley"), actual, args, input);
     assert_eq!(
         actual_output.status.code(),
@@ -96,7 +96,7 @@ fn assert_stdin_match(upstream: &Path, actual: &Path, args: &[&str], input: &[u8
 
 fn create_replace_fixture(root: &Path) -> (String, String) {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output("git", root, &["init", "-b", "main"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init", "-b", "main"]);
     assert!(init.status.success(), "git init failed");
 
     let first = commit_empty(root, "one");
@@ -105,7 +105,7 @@ fn create_replace_fixture(root: &Path) -> (String, String) {
 }
 
 fn commit_empty(root: &Path, message: &str) -> String {
-    let commit = Command::new("git")
+    let commit = Command::new(sley_testkit::oracle_git())
         .current_dir(root)
         .args(["commit", "--allow-empty", "-m", message])
         .env("GIT_AUTHOR_NAME", "Tester")
@@ -121,7 +121,7 @@ fn commit_empty(root: &Path, message: &str) -> String {
         "git commit failed\nstderr:\n{}",
         String::from_utf8_lossy(&commit.stderr)
     );
-    let rev = run_output("git", root, &["rev-parse", "HEAD"]);
+    let rev = run_output(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD"]);
     assert!(rev.status.success(), "git rev-parse failed");
     String::from_utf8(rev.stdout)
         .expect("utf8 oid")

@@ -28,7 +28,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 
 /// Whether a usable `git` binary is available; the suite no-ops otherwise.
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|output| output.status.success())
@@ -69,7 +69,7 @@ fn run_ok(program: &str, cwd: &Path, args: &[&str]) -> Vec<u8> {
 
 /// Convenience wrapper for a system-`git` command expected to succeed.
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run_ok("git", cwd, args)
+    run_ok(sley_testkit::oracle_git(), cwd, args)
 }
 
 /// Path to the `sley` binary under test.
@@ -187,8 +187,8 @@ fn oid_string(bytes: Vec<u8>) -> String {
 fn paired_history(root: &Path) -> (PathBuf, PathBuf, String, String) {
     let upstream = root.join("upstream");
     let rust = root.join("rust");
-    init_repo("git", &upstream);
-    init_repo("git", &rust);
+    init_repo(sley_testkit::oracle_git(), &upstream);
+    init_repo(sley_testkit::oracle_git(), &rust);
     let (tree1, tree2) = prepare_history(&upstream);
     let (tree1_b, tree2_b) = prepare_history(&rust);
     assert_eq!(tree1, tree1_b, "fixture tree1 ids diverged");
@@ -199,7 +199,7 @@ fn paired_history(root: &Path) -> (PathBuf, PathBuf, String, String) {
 /// Run the same `read-tree` invocation in both repos and assert the binaries
 /// agree on output *and* on the resulting index listing.
 fn assert_read_tree_parity(upstream: &Path, rust: &Path, args: &[&str]) {
-    let expected = run_output("git", upstream, args);
+    let expected = run_output(sley_testkit::oracle_git(), upstream, args);
     let actual = run_output(git_rs(), rust, args);
     assert_same_output(&actual, &expected, args);
     assert_eq!(
@@ -345,7 +345,7 @@ fn read_tree_reset_update_resets_index_and_worktree() {
         // --reset -u rewrites the index AND the worktree to tree1, removing
         // c.txt from disk in both repos.
         let args = ["read-tree", "--reset", "-u", &tree1];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
         assert_eq!(
@@ -377,7 +377,7 @@ fn read_tree_u_without_merge_mode_is_rejected() {
         // -u is meaningless for a plain read; both binaries must reject it the
         // same way (fatal + exit 128) without disturbing the index.
         let args = ["read-tree", "-u", &tree1];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
         assert_eq!(
@@ -399,7 +399,7 @@ fn read_tree_invalid_tree_ish_is_rejected() {
     let result = std::panic::catch_unwind(|| {
         let (upstream, rust, _t1, _t2) = paired_history(&root);
         let args = ["read-tree", "definitely-not-a-real-object"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
@@ -416,7 +416,7 @@ fn read_tree_empty_with_tree_argument_conflicts() {
     let result = std::panic::catch_unwind(|| {
         let (upstream, rust, tree1, _tree2) = paired_history(&root);
         let args = ["read-tree", "--empty", &tree1];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
@@ -434,7 +434,7 @@ fn read_tree_merge_and_prefix_together_conflict() {
         let (upstream, rust, tree1, _tree2) = paired_history(&root);
         // -m together with --prefix is rejected ("Which one?").
         let args = ["read-tree", "-m", "--prefix=x/", &tree1];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
@@ -451,7 +451,7 @@ fn read_tree_merge_requires_a_tree() {
     let result = std::panic::catch_unwind(|| {
         let (upstream, rust, _t1, _t2) = paired_history(&root);
         let args = ["read-tree", "-m"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(git_rs(), &rust, &args);
         assert_same_output(&actual, &expected, &args);
     });
@@ -484,8 +484,8 @@ fn read_tree_three_way_merge_produces_matching_stages() {
     let result = std::panic::catch_unwind(|| {
         let upstream = root.join("upstream");
         let rust = root.join("rust");
-        init_repo("git", &upstream);
-        init_repo("git", &rust);
+        init_repo(sley_testkit::oracle_git(), &upstream);
+        init_repo(sley_testkit::oracle_git(), &rust);
         let (base, ours, theirs) = prepare_three_way_fixture(&upstream);
         let (base_b, ours_b, theirs_b) = prepare_three_way_fixture(&rust);
         assert_eq!((&base, &ours, &theirs), (&base_b, &ours_b, &theirs_b));
@@ -576,7 +576,7 @@ fn prepare_three_way_fixture(root: &Path) -> (String, String, String) {
 
 /// Hash `content` into the object store with `git hash-object -w`.
 fn hash_blob(root: &Path, content: &[u8]) -> String {
-    let mut child = with_fixed_env(Command::new("git").current_dir(root).args([
+    let mut child = with_fixed_env(Command::new(sley_testkit::oracle_git()).current_dir(root).args([
         "hash-object",
         "-w",
         "--stdin",
@@ -604,7 +604,7 @@ fn make_tree(root: &Path, entries: &[(&str, &str)]) -> String {
     for (name, oid) in entries {
         input.push_str(&format!("100644 blob {oid}\t{name}\n"));
     }
-    let mut child = with_fixed_env(Command::new("git").current_dir(root).arg("mktree"))
+    let mut child = with_fixed_env(Command::new(sley_testkit::oracle_git()).current_dir(root).arg("mktree"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

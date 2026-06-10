@@ -37,7 +37,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_output("git", cwd, args)
+    run_output(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -58,7 +58,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn commit_empty(cwd: &Path, message: &str) {
     run(
-        "git",
+        sley_testkit::oracle_git(),
         cwd,
         &[
             "-c",
@@ -74,7 +74,7 @@ fn commit_empty(cwd: &Path, message: &str) {
 }
 
 fn rev_parse(cwd: &Path, rev: &str) -> String {
-    let output = run_output("git", cwd, &["rev-parse", rev]);
+    let output = run_output(sley_testkit::oracle_git(), cwd, &["rev-parse", rev]);
     assert!(output.status.success(), "rev-parse {rev} failed");
     String::from_utf8(output.stdout)
         .expect("rev-parse output is utf8")
@@ -87,24 +87,24 @@ fn merge_base_two_commits_matches_upstream_git() {
     let root = unique_temp_dir("merge-base");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-qb", "left"]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "left"]);
         commit_empty(&root, "left");
         let left = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-qb", "right", &base]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "right", &base]);
         commit_empty(&root, "right");
         let right = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-qb", "right-child"]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "right-child"]);
         commit_empty(&root, "right child");
         let right_child = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-qb", "third", &base]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "third", &base]);
         commit_empty(&root, "third");
         let third = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-q", "left"]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-q", "left"]);
         run(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -154,10 +154,10 @@ fn merge_base_no_common_history_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-unrelated");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let first = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "--orphan", "unrelated", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "--orphan", "unrelated", "-q"]);
         commit_empty(&root, "unrelated");
         let second = rev_parse(&root, "HEAD");
 
@@ -189,17 +189,17 @@ fn merge_base_fork_point_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-fork-point");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run("git", &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
-        run("git", &root, &["branch", "-m", "main"]);
+        run(sley_testkit::oracle_git(), &root, &["branch", "-m", "main"]);
         commit_empty(&root, "upstream");
         let upstream = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-qb", "topic"]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "topic"]);
         commit_empty(&root, "topic");
         let topic = rev_parse(&root, "HEAD");
-        run("git", &root, &["checkout", "-q", "main"]);
-        run("git", &root, &["reset", "-q", "--hard", &base]);
+        run(sley_testkit::oracle_git(), &root, &["checkout", "-q", "main"]);
+        run(sley_testkit::oracle_git(), &root, &["reset", "-q", "--hard", &base]);
 
         for args in [
             vec!["merge-base", "main", &topic],

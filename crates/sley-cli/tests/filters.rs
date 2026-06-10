@@ -40,7 +40,7 @@ fn ok(program: &str, cwd: &Path, args: &[&str]) {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -71,8 +71,12 @@ fn autocrlf_true_round_trip_matches_git() {
     let crlf: &[u8] = b"line one\r\nline two\r\nline three\r\n";
     let lf: &[u8] = b"line one\nline two\nline three\n";
 
-    for program in [GIT_RS, "git"] {
-        let repo = root.join(if program == "git" { "ref" } else { "cand" });
+    for program in [GIT_RS, sley_testkit::oracle_git()] {
+        let repo = root.join(if program == sley_testkit::oracle_git() {
+            "ref"
+        } else {
+            "cand"
+        });
         ok(
             program,
             &root,
@@ -116,7 +120,7 @@ fn autocrlf_true_round_trip_matches_git() {
 
     // Both implementations stored the identical blob OID.
     assert_eq!(
-        run_env("git", &root.join("ref"), &["rev-parse", "HEAD:f.txt"]).stdout,
+        run_env(sley_testkit::oracle_git(), &root.join("ref"), &["rev-parse", "HEAD:f.txt"]).stdout,
         run_env(GIT_RS, &root.join("cand"), &["rev-parse", "HEAD:f.txt"]).stdout,
         "blob OID differs between git and sley under autocrlf"
     );
@@ -134,8 +138,12 @@ fn gitattributes_eol_crlf_matches_git() {
     }
     let root = unique_temp_dir("attr-eol");
 
-    for program in [GIT_RS, "git"] {
-        let repo = root.join(if program == "git" { "ref" } else { "cand" });
+    for program in [GIT_RS, sley_testkit::oracle_git()] {
+        let repo = root.join(if program == sley_testkit::oracle_git() {
+            "ref"
+        } else {
+            "cand"
+        });
         ok(
             program,
             &root,
@@ -187,7 +195,7 @@ fn no_filter_default_is_passthrough() {
 
     let cand = root.join("cand");
     let reference = root.join("ref");
-    for (program, repo) in [(GIT_RS, &cand), ("git", &reference)] {
+    for (program, repo) in [(GIT_RS, &cand), (sley_testkit::oracle_git(), &reference)] {
         ok(
             program,
             &root,
@@ -204,7 +212,7 @@ fn no_filter_default_is_passthrough() {
         assert!(porcelain(program, repo).is_empty());
     }
     assert_eq!(
-        run_env("git", &reference, &["rev-parse", "HEAD:m.bin"]).stdout,
+        run_env(sley_testkit::oracle_git(), &reference, &["rev-parse", "HEAD:m.bin"]).stdout,
         run_env(GIT_RS, &cand, &["rev-parse", "HEAD:m.bin"]).stdout,
     );
 

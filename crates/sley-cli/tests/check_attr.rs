@@ -72,7 +72,7 @@ fn git_rs(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str], stdin: Option<&[u8]>) -> Output {
-    run_output("git", cwd, args, stdin)
+    run_output(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 fn git_rs_with_env(
@@ -99,7 +99,7 @@ fn git_with_env(
     envs: &[(&str, &Path)],
     env_remove: &[&str],
 ) -> Output {
-    run_output_with_env("git", cwd, args, stdin, envs, env_remove)
+    run_output_with_env(sley_testkit::oracle_git(), cwd, args, stdin, envs, env_remove)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -119,9 +119,9 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn fixture(root: &Path) {
-    run("git", root, &["init", "-q"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q"]);
     run(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["config", "core.attributesFile", "global-attributes"],
     );
@@ -268,8 +268,8 @@ fn check_attr_cached_toggle_matches_upstream_git() {
     {
         fixture(&upstream);
         fixture(&rust);
-        run("git", &upstream, &["add", "."]);
-        run("git", &rust, &["add", "."]);
+        run(sley_testkit::oracle_git(), &upstream, &["add", "."]);
+        run(sley_testkit::oracle_git(), &rust, &["add", "."]);
         for repo in [&upstream, &rust] {
             fs::write(
                 repo.join(".gitattributes"),
@@ -378,9 +378,9 @@ fn check_attr_source_option_matches_upstream_when_tree_matches_worktree() {
         fixture(&upstream);
         fixture(&rust);
         for repo in [&upstream, &rust] {
-            run("git", repo, &["add", "."]);
+            run(sley_testkit::oracle_git(), repo, &["add", "."]);
             run(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &[
                     "-c",
@@ -398,7 +398,7 @@ fn check_attr_source_option_matches_upstream_when_tree_matches_worktree() {
                 b"*.txt -text\nmacro.js -vendored\n",
             )
             .expect("change index attributes");
-            run("git", repo, &["add", ".gitattributes"]);
+            run(sley_testkit::oracle_git(), repo, &["add", ".gitattributes"]);
             fs::write(repo.join(".gitattributes"), b"*.txt custom\n")
                 .expect("change worktree attributes");
         }
@@ -484,7 +484,7 @@ fn check_attr_cached_honors_git_index_file_like_upstream_git() {
         for (repo, index) in [(&upstream, &upstream_index), (&rust, &rust_index)] {
             let index_env = [("GIT_INDEX_FILE", index.as_path())];
             let output = run_output_with_env(
-                "git",
+                sley_testkit::oracle_git(),
                 repo,
                 &["add", ".gitattributes", "a.txt", "macro.js"],
                 None,
@@ -538,8 +538,8 @@ fn check_attr_default_global_attributes_match_upstream_git() {
     fs::create_dir_all(home.join(".config/git")).expect("create home attributes dir");
     fs::create_dir_all(xdg.join("git")).expect("create xdg attributes dir");
     {
-        run("git", &upstream, &["init", "-q"]);
-        run("git", &rust, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &upstream, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &rust, &["init", "-q"]);
         fs::write(
             home.join(".config/git/attributes"),
             b"*.data homeattr shared=home\n",

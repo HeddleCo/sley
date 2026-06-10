@@ -36,11 +36,11 @@ fn loose_object_path(git_dir: &Path, oid: &str) -> PathBuf {
 }
 
 fn create_single_commit_repo(root: &Path) -> String {
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
-    run_success("git", root, &["add", "payload.txt"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &[
             "-c",
@@ -53,7 +53,7 @@ fn create_single_commit_repo(root: &Path) -> String {
             "-q",
         ],
     );
-    String::from_utf8(run_success("git", root, &["rev-parse", "HEAD^{tree}"]))
+    String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["rev-parse", "HEAD^{tree}"]))
         .expect("tree oid is utf8")
         .trim()
         .to_string()
@@ -66,7 +66,7 @@ fn fsck_clean_repository_no_progress_matches_upstream_git() {
     {
         create_single_commit_repo(&root);
         let args = ["fsck", "--no-progress"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
@@ -83,7 +83,7 @@ fn fsck_missing_tree_reports_broken_link_like_upstream_git() {
         let tree = create_single_commit_repo(&root);
         fs::remove_file(loose_object_path(&root.join(".git"), &tree)).expect("remove tree object");
         let args = ["fsck", "--no-progress"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         let stdout = String::from_utf8(actual.stdout).expect("stdout is utf8");
@@ -105,16 +105,16 @@ fn fsck_dangling_blob_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         create_single_commit_repo(&root);
-        run_success("git", &root, &["hash-object", "-w", "--stdin"]);
+        run_success(sley_testkit::oracle_git(), &root, &["hash-object", "-w", "--stdin"]);
         let args = ["fsck", "--no-progress"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
         assert_eq!(actual.stderr, expected.stderr);
 
         let args = ["fsck", "--no-progress", "--no-dangling"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);
@@ -129,11 +129,11 @@ fn fsck_unreachable_commit_matches_upstream_git() {
     fs::create_dir_all(&root).expect("create temp repo");
     {
         create_single_commit_repo(&root);
-        let tree = String::from_utf8(run_success("git", &root, &["rev-parse", "HEAD^{tree}"]))
+        let tree = String::from_utf8(run_success(sley_testkit::oracle_git(), &root, &["rev-parse", "HEAD^{tree}"]))
             .expect("tree oid is utf8");
         let tree = tree.trim();
         run_success(
-            "git",
+            sley_testkit::oracle_git(),
             &root,
             &[
                 "-c",
@@ -148,7 +148,7 @@ fn fsck_unreachable_commit_matches_upstream_git() {
         );
 
         let args = ["fsck", "--no-progress", "--unreachable", "--no-dangling"];
-        let expected = run("git", &root, &args);
+        let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);
         assert_eq!(actual.status.code(), expected.status.code());
         assert_eq!(actual.stdout, expected.stdout);

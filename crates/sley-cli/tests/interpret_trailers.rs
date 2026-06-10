@@ -29,7 +29,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 }
 
 fn git_available() -> bool {
-    Command::new("git")
+    Command::new(sley_testkit::oracle_git())
         .arg("--version")
         .output()
         .map(|out| out.status.success())
@@ -96,7 +96,7 @@ fn assert_same_stdin(args: &[&str], stdin: &[u8]) {
     let mut rs_args = vec!["interpret-trailers"];
     rs_args.extend_from_slice(args);
 
-    let expected = run_with_stdin("git", &cwd, &git_args, stdin);
+    let expected = run_with_stdin(sley_testkit::oracle_git(), &cwd, &git_args, stdin);
     let actual = run_with_stdin(git_rs_bin(), &cwd, &rs_args, stdin);
 
     assert_eq!(
@@ -132,7 +132,7 @@ fn assert_same_args(cwd: &Path, args: &[&str]) {
     let mut rs_args = vec!["interpret-trailers"];
     rs_args.extend_from_slice(args);
 
-    let expected = run("git", cwd, &git_args);
+    let expected = run(sley_testkit::oracle_git(), cwd, &git_args);
     let actual = run(git_rs_bin(), cwd, &rs_args);
 
     assert_eq!(
@@ -577,7 +577,7 @@ fn in_place_rewrites_file_identically() {
     fs::write(rs_dir.join("m.txt"), content).expect("write rs fixture");
 
     let git_out = run(
-        "git",
+        sley_testkit::oracle_git(),
         &git_dir,
         &[
             "interpret-trailers",

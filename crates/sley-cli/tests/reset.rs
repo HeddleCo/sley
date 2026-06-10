@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -56,7 +56,7 @@ fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -108,7 +108,7 @@ fn reset_path_unstages_modified_file_like_upstream_git() {
         }
 
         let args = ["reset", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -144,12 +144,12 @@ fn reset_sha256_mixed_and_hard_match_upstream_git() {
     }
     {
         let args = ["reset", "--mixed", "HEAD~1"];
-        let expected = run_output("git", &upstream_mixed, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream_mixed, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust_mixed, &args);
         assert_same_output(actual, expected, &args);
 
         let args = ["reset", "--hard", "HEAD~1"];
-        let expected = run_output("git", &upstream_hard, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream_hard, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust_hard, &args);
         assert_same_output(actual, expected, &args);
 
@@ -159,8 +159,8 @@ fn reset_sha256_mixed_and_hard_match_upstream_git() {
                 vec!["status", "--short"],
                 vec!["ls-files", "--stage"],
             ] {
-                let expected = run_output("git", upstream, &args);
-                let actual = run_output("git", rust, &args);
+                let expected = run_output(sley_testkit::oracle_git(), upstream, &args);
+                let actual = run_output(sley_testkit::oracle_git(), rust, &args);
                 assert_same_output(actual, expected, &args);
             }
         }
@@ -185,7 +185,7 @@ fn reset_path_unstages_added_file_like_upstream_git() {
         }
 
         let args = ["reset", "new.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -220,7 +220,7 @@ fn reset_quiet_suppresses_unstaged_summary_like_upstream_git() {
         }
 
         let args = ["reset", "-q", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -244,7 +244,7 @@ fn reset_no_quiet_restores_unstaged_summary_like_upstream_git() {
         }
 
         let args = ["reset", "-q", "--no-quiet", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -270,7 +270,7 @@ fn reset_pathspec_from_file_matches_upstream_git() {
         }
 
         let args = ["reset", "--pathspec-from-file=pathspecs"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -307,7 +307,7 @@ fn reset_pathspec_file_nul_matches_upstream_git() {
             "--pathspec-from-file",
             "pathspecs",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -346,7 +346,7 @@ fn reset_pathspec_file_option_errors_match_upstream_git() {
             .as_slice(),
             ["reset", "--hard", "--pathspec-from-file=pathspecs"].as_slice(),
         ] {
-            let expected = run_output("git", &upstream, args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
             assert_same_output(actual, expected, args);
         }
@@ -381,7 +381,7 @@ fn reset_source_path_updates_index_without_moving_head_like_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", target.as_str(), "--", "file.txt", "new.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -439,7 +439,7 @@ fn reset_source_path_without_separator_matches_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", target.as_str(), "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -485,7 +485,7 @@ fn reset_hard_restores_index_and_worktree_like_upstream_git() {
         }
 
         let args = ["reset", "--hard"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -528,7 +528,7 @@ fn reset_hard_quiet_suppresses_head_summary_like_upstream_git() {
         }
 
         let args = ["reset", "--hard", "-q"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -557,7 +557,7 @@ fn reset_hard_to_commit_moves_head_like_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", "--hard", target.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -607,7 +607,7 @@ fn reset_soft_to_commit_moves_head_only_like_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", "--soft", target.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -647,7 +647,7 @@ fn reset_soft_rejects_paths_like_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["reset", "--soft", "HEAD", "--", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -676,7 +676,7 @@ fn reset_mixed_to_commit_moves_head_and_index_like_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", "--mixed", target.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -726,7 +726,7 @@ fn reset_mixed_quiet_to_commit_suppresses_summary_like_upstream_git() {
             .trim()
             .to_string();
         let args = ["reset", "--mixed", "-q", target.as_str()];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };

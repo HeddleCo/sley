@@ -25,7 +25,7 @@ fn unique_temp_dir(name: &str) -> PathBuf {
 fn init_repo(name: &str) -> PathBuf {
     let root = unique_temp_dir(name);
     std::fs::create_dir_all(&root).expect("create temp dir");
-    let status = Command::new("git")
+    let status = Command::new(sley_testkit::oracle_git())
         .arg("init")
         .arg(&root)
         .status()
@@ -54,7 +54,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn assert_status_stdout_stderr_match(cwd: &Path, args: &[&str]) {
-    let expected = run_output("git", cwd, args);
+    let expected = run_output(sley_testkit::oracle_git(), cwd, args);
     let actual = run_output(env!("CARGO_BIN_EXE_sley"), cwd, args);
     assert_eq!(
         actual.status.code(),
@@ -107,7 +107,7 @@ fn var_named_values_match_upstream_git() {
 #[test]
 fn var_list_reports_config_overrides_and_computed_values() {
     let repo = init_repo("var-list");
-    let status = Command::new("git")
+    let status = Command::new(sley_testkit::oracle_git())
         .current_dir(&repo)
         .args(["config", "init.defaultBranch", "localmain"])
         .status()

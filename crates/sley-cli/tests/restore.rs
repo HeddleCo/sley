@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -56,7 +56,7 @@ fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -112,7 +112,7 @@ fn restore_worktree_paths_from_index_match_upstream_git() {
         }
 
         let args = ["restore", "file.txt", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -150,7 +150,7 @@ fn restore_sha256_worktree_and_staged_paths_match_upstream_git() {
             fs::write(repo.join("file.txt"), b"changed\n").expect("modify file");
         }
         let args = ["restore", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -159,13 +159,13 @@ fn restore_sha256_worktree_and_staged_paths_match_upstream_git() {
             git(repo, &["add", "file.txt"]);
         }
         let args = ["restore", "--staged", "file.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
         for args in [vec!["status", "--short"], vec!["ls-files", "--stage"]] {
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output("git", &rust, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+            let actual = run_output(sley_testkit::oracle_git(), &rust, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -196,7 +196,7 @@ fn restore_sha256_source_staged_and_worktree_paths_match_upstream_git() {
             "file.txt",
             "new.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -210,8 +210,8 @@ fn restore_sha256_source_staged_and_worktree_paths_match_upstream_git() {
             "restored new file presence differed"
         );
         for args in [vec!["status", "--short"], vec!["ls-files", "--stage"]] {
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output("git", &rust, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+            let actual = run_output(sley_testkit::oracle_git(), &rust, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -238,7 +238,7 @@ fn restore_pathspec_from_file_matches_upstream_git() {
         }
 
         let args = ["restore", "--pathspec-from-file=pathspecs"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -276,7 +276,7 @@ fn restore_pathspec_file_nul_matches_upstream_git() {
             "--pathspec-from-file",
             "pathspecs",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -319,7 +319,7 @@ fn restore_pathspec_file_option_errors_match_upstream_git() {
             ]
             .as_slice(),
         ] {
-            let expected = run_output("git", &upstream, args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
             assert_same_output(actual, expected, args);
         }
@@ -357,7 +357,7 @@ fn restore_accepted_noop_options_match_upstream_git() {
             "--no-recurse-submodules",
             "file.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -389,7 +389,7 @@ fn restore_staged_paths_from_head_match_upstream_git() {
         }
 
         let args = ["restore", "--staged", "file.txt", "new.txt", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -440,7 +440,7 @@ fn restore_source_head_worktree_paths_match_upstream_git() {
         }
 
         let args = ["restore", "--source=HEAD", "file.txt", "new.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -494,7 +494,7 @@ fn restore_source_commit_worktree_paths_match_upstream_git() {
             .to_string();
         let source_arg = format!("--source={target}");
         let args = ["restore", source_arg.as_str(), "file.txt", "new.txt", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -560,7 +560,7 @@ fn restore_source_commit_staged_paths_match_upstream_git() {
             "file.txt",
             "new.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -621,7 +621,7 @@ fn restore_source_commit_staged_and_worktree_paths_match_upstream_git() {
             "file.txt",
             "new.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -668,7 +668,7 @@ fn restore_staged_and_worktree_paths_from_head_match_upstream_git() {
         }
 
         let args = ["restore", "-SW", "file.txt", "new.txt", "dir"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 

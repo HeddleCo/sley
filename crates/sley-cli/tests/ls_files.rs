@@ -105,13 +105,13 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn prepare_unmerged_index(root: &Path) {
     git(root, &["init", "-q"]);
     let one = String::from_utf8(run_with_stdin(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["hash-object", "-w", "--stdin"],
         b"one",
@@ -120,7 +120,7 @@ fn prepare_unmerged_index(root: &Path) {
     .trim()
     .to_string();
     let two = String::from_utf8(run_with_stdin(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["hash-object", "-w", "--stdin"],
         b"two",
@@ -132,7 +132,7 @@ fn prepare_unmerged_index(root: &Path) {
         "0 0000000000000000000000000000000000000000\tconflict\n100644 {one} 1\tconflict\n100644 {two} 2\tconflict\n100644 {one}\tnormal\n"
     );
     run_with_stdin(
-        "git",
+        sley_testkit::oracle_git(),
         root,
         &["update-index", "--index-info"],
         input.as_bytes(),
@@ -507,7 +507,7 @@ fn ls_files_ignored_and_exclude_standard_match_upstream_git() {
         }
 
         let args = ["ls-files", "--others", "--exclude-from=missing.txt"];
-        let expected = run_status("git", &upstream, &args);
+        let expected = run_status(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_eq!(actual, expected, "sley status/output differed for {args:?}");
     };
@@ -548,7 +548,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
             ],
             vec!["ls-files", "-o", "-i", "--exclude-standard", "-z"],
         ] {
-            let expected_output = run_with_global_env("git", &upstream, &args, &home, Some(&xdg));
+            let expected_output = run_with_global_env(sley_testkit::oracle_git(), &upstream, &args, &home, Some(&xdg));
             let actual_output =
                 run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
             assert_eq!(
@@ -562,7 +562,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
         fs::write(upstream.join("repo-excludes"), b"*.tmp\n").expect("write upstream excludes");
         fs::write(rust.join("repo-excludes"), b"*.tmp\n").expect("write rust excludes");
         let args = ["ls-files", "--others", "--exclude-standard"];
-        let expected_output = run_with_global_env("git", &upstream, &args, &home, Some(&xdg));
+        let expected_output = run_with_global_env(sley_testkit::oracle_git(), &upstream, &args, &home, Some(&xdg));
         let actual_output =
             run_with_global_env(env!("CARGO_BIN_EXE_sley"), &rust, &args, &home, Some(&xdg));
         assert_eq!(
@@ -578,7 +578,7 @@ fn ls_files_default_global_excludes_match_upstream_git() {
         prepare_default_global_excludes_fixture(&fallback_upstream);
         prepare_default_global_excludes_fixture(&fallback_rust);
         let args = ["ls-files", "--others", "--exclude-standard"];
-        let expected_output = run_with_global_env("git", &fallback_upstream, &args, &home, None);
+        let expected_output = run_with_global_env(sley_testkit::oracle_git(), &fallback_upstream, &args, &home, None);
         let actual_output = run_with_global_env(
             env!("CARGO_BIN_EXE_sley"),
             &fallback_rust,
@@ -927,7 +927,7 @@ fn checkout_b_on_fresh_init_matches_upstream_git() {
         vec!["checkout", "-b", "feature"],
         vec!["checkout", "-q", "--orphan", "orphan"],
     ] {
-        let expected = run_status("git", &upstream, &args);
+        let expected = run_status(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_status(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_eq!(
             actual, expected,
@@ -981,7 +981,7 @@ fn ls_files_error_unmatch_matches_upstream_git() {
             vec!["ls-files", "-o", "--error-unmatch", "tracked.txt"],
             vec!["ls-files", "--error-unmatch", "--", "--dash.txt"],
         ] {
-            let expected = run_status("git", &root, &args);
+            let expected = run_status(sley_testkit::oracle_git(), &root, &args);
             let actual = run_status(env!("CARGO_BIN_EXE_sley"), &root, &args);
             assert_eq!(
                 actual, expected,

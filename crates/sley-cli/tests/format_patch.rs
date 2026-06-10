@@ -49,7 +49,7 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Output {
-    run_env("git", cwd, args)
+    run_env(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_ok(cwd: &Path, args: &[&str]) {
@@ -69,7 +69,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Output {
 /// the one sley targets, because the patch signature trailer embeds that
 /// version string.
 fn interop_enabled() -> bool {
-    let Ok(git_version) = Command::new("git").arg("--version").output() else {
+    let Ok(git_version) = Command::new(sley_testkit::oracle_git()).arg("--version").output() else {
         return false;
     };
     if !git_version.status.success() {

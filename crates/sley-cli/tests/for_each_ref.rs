@@ -57,7 +57,7 @@ fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs_raw(cwd: &Path, args: &[&str]) -> Output {
@@ -65,7 +65,7 @@ fn git_rs_raw(cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git_raw(cwd: &Path, args: &[&str]) -> Output {
-    run_raw("git", cwd, args)
+    run_raw(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
@@ -73,7 +73,7 @@ fn git_rs_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
 }
 
 fn git_raw_with_stdin(cwd: &Path, args: &[&str], stdin: &[u8]) -> Output {
-    run_raw_with_stdin("git", cwd, args, stdin)
+    run_raw_with_stdin(sley_testkit::oracle_git(), cwd, args, stdin)
 }
 
 #[test]

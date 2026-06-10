@@ -48,7 +48,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn indexed_oid(root: &Path) -> String {
-    let output = String::from_utf8(run_success("git", root, &["ls-files", "--stage"]))
+    let output = String::from_utf8(run_success(sley_testkit::oracle_git(), root, &["ls-files", "--stage"]))
         .expect("ls-files output is utf8");
     output
         .split_whitespace()
@@ -65,9 +65,9 @@ fn remove_loose_object(root: &Path, oid: &str) {
 
 fn prepare_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("a"), b"data").expect("write fixture");
-    run_success("git", root, &["add", "a"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "a"]);
     let oid = indexed_oid(root);
     remove_loose_object(root, &oid);
 }
@@ -75,10 +75,10 @@ fn prepare_repo(root: &Path) {
 fn prepare_prefix_repo(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("create src dir");
     fs::create_dir_all(root.join("other")).expect("create other dir");
-    run_success("git", root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
     fs::write(root.join("src").join("a"), b"a").expect("write src fixture");
     fs::write(root.join("other").join("b"), b"b").expect("write other fixture");
-    run_success("git", root, &["add", "src/a", "other/b"]);
+    run_success(sley_testkit::oracle_git(), root, &["add", "src/a", "other/b"]);
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn write_tree_missing_ok_matches_upstream_git() {
         let actual = root.join(format!("{case}-actual"));
         prepare_repo(&expected);
         prepare_repo(&actual);
-        let expected_output = run("git", &expected, &args);
+        let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
         let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
         assert_same_output(actual_output, expected_output, &args);
     }
@@ -124,7 +124,7 @@ fn write_tree_prefix_matches_upstream_git() {
             vec!["write-tree", "--prefix", "src/", "--no-prefix"],
             vec!["write-tree", "--prefix=missing/"],
         ] {
-            let expected_output = run("git", &expected, &args);
+            let expected_output = run(sley_testkit::oracle_git(), &expected, &args);
             let actual_output = run(env!("CARGO_BIN_EXE_sley"), &actual, &args);
             assert_same_output(actual_output, expected_output, &args);
         }

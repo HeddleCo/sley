@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    let output = Command::new("git")
+    let output = Command::new(sley_testkit::oracle_git())
         .current_dir(cwd)
         .env("GIT_AUTHOR_DATE", "1970-01-01T00:00:00 +0000")
         .env("GIT_COMMITTER_DATE", "1970-01-01T00:00:00 +0000")
@@ -56,7 +56,7 @@ fn run_with_identity(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
@@ -103,7 +103,7 @@ fn mv_tracked_file_matches_upstream_git() {
         prepare_repo(&rust);
 
         let args = ["mv", "file.txt", "renamed.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -139,7 +139,7 @@ fn mv_sha256_tracked_file_matches_upstream_git() {
         prepare_sha256_repo(&rust);
 
         let args = ["mv", "file.txt", "renamed.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -156,8 +156,8 @@ fn mv_sha256_tracked_file_matches_upstream_git() {
             vec!["diff", "--cached", "--name-status"],
             vec!["status", "--short"],
         ] {
-            let expected = run_output("git", &upstream, &args);
-            let actual = run_output("git", &rust, &args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
+            let actual = run_output(sley_testkit::oracle_git(), &rust, &args);
             assert_same_output(actual, expected, &args);
         }
     };
@@ -180,7 +180,7 @@ fn mv_modified_file_matches_upstream_git() {
         }
 
         let args = ["mv", "file.txt", "renamed.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -225,7 +225,7 @@ fn mv_accepted_noop_options_match_upstream_git() {
             "file.txt",
             "renamed.txt",
         ];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -264,7 +264,7 @@ fn mv_dry_run_and_verbose_match_upstream_git() {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
 
@@ -313,7 +313,7 @@ fn mv_multiple_sources_to_directory_match_upstream_git() {
             run_with_identity(repo, &["commit", "-m", "multi", "-q"]);
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -352,7 +352,7 @@ fn mv_tracked_directory_matches_upstream_git() {
             run_with_identity(repo, &["commit", "-m", "base", "-q"]);
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -389,7 +389,7 @@ fn mv_destination_error_paths_match_upstream_git() {
         prepare_repo(&upstream);
         prepare_repo(&rust);
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -427,7 +427,7 @@ fn mv_dry_run_error_paths_match_upstream_git() {
             }
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -464,7 +464,7 @@ fn mv_bad_source_errors_match_upstream_git() {
             fs::write(repo.join("untracked.txt"), b"untracked\n").expect("write untracked");
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -498,7 +498,7 @@ fn mv_skip_errors_matches_upstream_git() {
             fs::create_dir(repo.join("dir")).expect("create destination directory");
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -532,7 +532,7 @@ fn mv_combined_short_options_match_upstream_git() {
             fs::create_dir(repo.join("dir")).expect("create destination directory");
         }
 
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(

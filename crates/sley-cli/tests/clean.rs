@@ -32,7 +32,7 @@ fn run_output(program: &str, cwd: &Path, args: &[&str]) -> Output {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
-    run("git", cwd, args)
+    run(sley_testkit::oracle_git(), cwd, args)
 }
 
 fn git_rs(cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -179,7 +179,7 @@ fn clean_long_option_negations_match_upstream_git() {
         fixture(&rust);
 
         let args = ["clean", "-n", "--no-dry-run", "-f", "top.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -189,7 +189,7 @@ fn clean_long_option_negations_match_upstream_git() {
         );
 
         let args = ["clean", "-q", "--no-quiet", "-f", "tracked/extra.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -213,7 +213,7 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
         fixture(&rust);
 
         let args = ["clean", "-f", "--no-force"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
         assert_eq!(
@@ -223,7 +223,7 @@ fn clean_no_force_and_no_interactive_match_upstream_git() {
         );
 
         let args = ["clean", "--no-interactive", "-n", "top.txt"];
-        let expected = run_output("git", &upstream, &args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, &args);
         assert_same_output(actual, expected, &args);
     };
@@ -299,7 +299,7 @@ fn clean_include_ignored_option_matches_upstream_git_without_ignored_files() {
             ["clean", "-fx"].as_slice(),
             ["clean", "-fxd"].as_slice(),
         ] {
-            let expected = run_output("git", &upstream, args);
+            let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
             let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
             assert_same_output(actual, expected, args);
             assert_eq!(
@@ -330,7 +330,7 @@ fn clean_exclude_patterns_match_upstream_git() {
         exclude_fixture(&upstream);
         exclude_fixture(&rust);
 
-        let expected = run_output("git", &upstream, args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
         assert_same_output(actual, expected, args);
         assert_eq!(
@@ -360,7 +360,7 @@ fn clean_respects_root_gitignore_and_x_matches_upstream_git() {
         ignore_fixture(&upstream);
         ignore_fixture(&rust);
 
-        let expected = run_output("git", &upstream, args);
+        let expected = run_output(sley_testkit::oracle_git(), &upstream, args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &rust, args);
         assert_same_output(actual, expected, args);
         assert_eq!(
@@ -378,7 +378,7 @@ fn clean_requires_force_or_dry_run_like_upstream_git() {
     fs::create_dir_all(&root).expect("create repo");
     {
         fixture(&root);
-        let expected = run_output("git", &root, &["clean"]);
+        let expected = run_output(sley_testkit::oracle_git(), &root, &["clean"]);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &root, &["clean"]);
         assert_eq!(
             actual.status.code(),
