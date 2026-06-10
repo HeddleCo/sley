@@ -114,7 +114,7 @@ fn git_stash_push_with_dates(cwd: &Path, message: &str, author_date: &str, commi
 
 fn prepare_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -128,7 +128,7 @@ fn prepare_stash_repo(root: &Path) {
 
 fn prepare_stash_identity_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -156,7 +156,7 @@ fn prepare_stash_identity_repo(root: &Path) {
 
 fn prepare_stash_age_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -183,7 +183,7 @@ fn prepare_stash_age_repo(root: &Path) {
 
 fn prepare_untracked_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("z.txt"), b"base\n").expect("write base fixture");
@@ -196,7 +196,7 @@ fn prepare_untracked_stash_repo(root: &Path) {
 
 fn prepare_tracked_only_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -208,7 +208,7 @@ fn prepare_tracked_only_stash_repo(root: &Path) {
 
 fn prepare_single_stash_repo(root: &Path) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -220,7 +220,7 @@ fn prepare_single_stash_repo(root: &Path) {
 
 fn prepare_stash_store_repo(root: &Path) -> String {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -946,7 +946,7 @@ fn stash_create_matches_upstream_git() {
 
 fn prepare_stash_create_repo(root: &Path, setup: &str) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     if setup == "unborn" {
@@ -1349,7 +1349,7 @@ fn stash_push_sha256_tracked_changes_match_upstream_git() {
         let actual = root.join("actual");
         for repo in [&upstream, &actual] {
             fs::create_dir_all(repo).expect("create repo");
-            git(repo, &["init", "-q", "--object-format=sha256"]);
+            git(repo, &["init", "-q", "--object-format=sha256", "-b", "main"]);
             git(repo, &["config", "user.name", "Example User"]);
             git(repo, &["config", "user.email", "example@example.invalid"]);
             fs::write(repo.join("a.txt"), b"base\n").expect("write base fixture");
@@ -1941,7 +1941,7 @@ fn stash_apply_pop_matches_upstream_git_for_moved_head_unchanged_paths() {
 
 fn prepare_stash_moved_head_repo(root: &Path, setup: &str) {
     fs::create_dir_all(root).expect("create temp repo");
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     git(root, &["config", "user.name", "Example User"]);
     git(root, &["config", "user.email", "example@example.invalid"]);
     fs::write(root.join("a.txt"), b"base a\n").expect("write first base fixture");
@@ -2253,7 +2253,7 @@ fn stash_list_empty_matches_upstream_git() {
     let root = unique_temp_dir("stash-list-empty");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for args in [
             vec!["stash", "list"],
             vec!["stash", "list", "--oneline"],
@@ -2306,7 +2306,7 @@ fn stash_clear_empty_and_errors_match_upstream_git() {
     let root = unique_temp_dir("stash-clear-empty-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
 
         for args in [
             vec!["stash", "clear"],
@@ -2710,7 +2710,7 @@ fn stash_show_empty_and_errors_match_upstream_git() {
 
         let empty = root.join("empty-repo");
         fs::create_dir_all(&empty).expect("create empty repo");
-        git(&empty, &["init", "-q"]);
+        git(&empty, &["init", "-q", "-b", "main"]);
         let args = ["stash", "show"];
         let expected = run_output(sley_testkit::oracle_git(), &empty, &args);
         let actual = run_output(env!("CARGO_BIN_EXE_sley"), &empty, &args);

@@ -60,7 +60,7 @@ fn diff_name_only_matches_upstream_git() {
     let root = unique_temp_dir("diff-name-only");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         git(&root, &["add", "delete.txt", "modify.txt"]);
@@ -242,7 +242,7 @@ fn diff_sha256_name_status_matches_upstream_git() {
     let root = unique_temp_dir("diff-sha256-name-status");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q", "--object-format=sha256"]);
+        git(&root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         git(&root, &["add", "delete.txt", "modify.txt"]);
@@ -293,7 +293,7 @@ fn diff_quoted_paths_match_upstream_git() {
         let root = unique_temp_dir(&format!("diff-quoted-paths-{case}"));
         fs::create_dir_all(&root).expect("create temp repo");
         {
-            git(&root, &["init", "-q"]);
+            git(&root, &["init", "-q", "-b", "main"]);
             fs::write(root.join(path), b"before\n").expect("write fixture");
             git(&root, &["add", path]);
             git(
@@ -363,7 +363,7 @@ fn diff_filter_matches_upstream_git() {
     let root = unique_temp_dir("diff-filter");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         git(&root, &["add", "delete.txt", "modify.txt"]);
@@ -462,7 +462,7 @@ fn diff_pickaxe_matches_upstream_git() {
     let root = unique_temp_dir("diff-pickaxe");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create nested directory");
         fs::write(root.join("change.txt"), b"needle\nkeep\n").expect("write change fixture");
         fs::write(root.join("delete.txt"), b"needle\n").expect("write delete fixture");
@@ -547,7 +547,7 @@ fn diff_find_object_matches_upstream_git() {
     let root = unique_temp_dir("diff-find-object");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create nested directory");
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested fixture");
@@ -695,7 +695,7 @@ fn diff_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("diff-pathspecs");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create dir");
         fs::write(root.join("dir/a.txt"), b"before\n").expect("write dir fixture");
         fs::write(root.join("b.txt"), b"before\n").expect("write root fixture");
@@ -784,7 +784,7 @@ fn diff_renames_match_upstream_git() {
     let root = unique_temp_dir("diff-renames");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("old.txt"), b"same\n").expect("write old fixture");
         git(&root, &["add", "old.txt"]);
         git(
@@ -922,7 +922,7 @@ fn diff_relative_renames_match_upstream_git() {
     let root = unique_temp_dir("diff-relative-renames");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create dir");
         fs::create_dir_all(root.join("other")).expect("create other dir");
         fs::write(root.join("dir/old.txt"), b"one\n").expect("write old fixture");
@@ -996,7 +996,7 @@ fn diff_copies_match_upstream_git() {
     let root = unique_temp_dir("diff-copies");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("old.txt"), b"same\n").expect("write old fixture");
         git(&root, &["add", "old.txt"]);
         git(
@@ -1199,7 +1199,7 @@ fn diff_empty_rename_controls_match_upstream_git() {
     let root = unique_temp_dir("diff-empty-renames");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("old-empty.txt"), b"").expect("write empty fixture");
         git(&root, &["add", "old-empty.txt"]);
         git(
@@ -1276,7 +1276,7 @@ fn diff_empty_copy_controls_match_upstream_git() {
     let root = unique_temp_dir("diff-empty-copies");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("source-empty.txt"), b"").expect("write empty fixture");
         git(&root, &["add", "source-empty.txt"]);
         git(
@@ -1346,7 +1346,7 @@ fn diff_summary_matches_upstream_git() {
     let root = unique_temp_dir("diff-summary");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("rename-old.txt"), b"rename\n").expect("write rename fixture");
@@ -1457,7 +1457,7 @@ fn diff_raw_matches_upstream_git() {
     let root = unique_temp_dir("diff-raw");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("rename-old.txt"), b"rename\n").expect("write rename fixture");
@@ -1551,7 +1551,7 @@ fn diff_raw_abbrev_matches_upstream_git() {
     let root = unique_temp_dir("diff-raw-abbrev");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("file.txt"), b"before\n").expect("write fixture");
         git(&root, &["add", "file.txt"]);
         git(
@@ -1612,7 +1612,7 @@ fn diff_patch_matches_upstream_git_for_simple_text_changes() {
     let root = unique_temp_dir("diff-patch-text");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("modify.txt"), b"one\ntwo\nthree\n").expect("write modify fixture");
         fs::write(root.join("delete.txt"), b"delete-one\ndelete-two\n")
             .expect("write delete fixture");
@@ -1753,7 +1753,7 @@ fn diff_patch_hunk_ranges_for_single_line_changes_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-single-line-ranges");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("delete.txt"), b"gone\n").expect("write delete fixture");
         git(&root, &["add", "modify.txt", "delete.txt"]);
@@ -1794,7 +1794,7 @@ fn diff_patch_mode_changes_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-mode-changes");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("script.sh"), b"#!/bin/sh\necho old\n").expect("write fixture");
         git(&root, &["add", "script.sh"]);
         git(
@@ -1848,7 +1848,7 @@ fn diff_patch_binary_files_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-binary");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("bin-mod.dat"), b"old\0bin\n").expect("write binary modify fixture");
         fs::write(root.join("bin-del.dat"), b"gone\0bin\n").expect("write binary delete fixture");
         fs::write(root.join("bin-mode.dat"), b"same\0bin\n").expect("write binary mode fixture");
@@ -1890,7 +1890,7 @@ fn diff_patch_binary_files_match_upstream_git() {
 
         let mode_root = root.join("mode-only");
         fs::create_dir_all(&mode_root).expect("create mode-only repo");
-        git(&mode_root, &["init", "-q"]);
+        git(&mode_root, &["init", "-q", "-b", "main"]);
         fs::write(mode_root.join("bin-mode.dat"), b"same\0bin\n")
             .expect("write binary mode-only fixture");
         git(&mode_root, &["add", "bin-mode.dat"]);
@@ -1924,7 +1924,7 @@ fn diff_patch_renames_and_copies_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-renames-copies");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("old.txt"), b"same\n").expect("write rename fixture");
         fs::write(root.join("source.txt"), b"copy\n").expect("write copy source");
         fs::write(root.join("mode-old.sh"), b"mode\n").expect("write mode rename fixture");
@@ -1983,7 +1983,7 @@ fn diff_patch_quoted_paths_match_upstream_git() {
     let root = unique_temp_dir("diff-patch-quoted-paths");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("space name.txt"), b"before\n").expect("write space fixture");
         fs::write(root.join("quote\"name.txt"), b"before\n").expect("write quote fixture");
         fs::write(root.join("tab\tname.txt"), b"before\n").expect("write tab fixture");
@@ -2028,7 +2028,7 @@ fn diff_patch_quoted_paths_match_upstream_git() {
 
         let rename_root = root.join("rename");
         fs::create_dir_all(&rename_root).expect("create rename repo");
-        git(&rename_root, &["init", "-q"]);
+        git(&rename_root, &["init", "-q", "-b", "main"]);
         fs::write(rename_root.join("quote\"old.txt"), b"same\n").expect("write rename fixture");
         git(&rename_root, &["add", "quote\"old.txt"]);
         git(
@@ -2062,7 +2062,7 @@ fn diff_numstat_matches_upstream_git() {
     let root = unique_temp_dir("diff-numstat");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete-one\ndelete-two\n")
             .expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"one\ntwo\nthree\n").expect("write modify fixture");
@@ -2168,7 +2168,7 @@ fn diff_shortstat_matches_upstream_git() {
     let root = unique_temp_dir("diff-shortstat");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete-one\ndelete-two\n")
             .expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"one\ntwo\nthree\n").expect("write modify fixture");
@@ -2285,7 +2285,7 @@ fn diff_numstat_and_shortstat_binary_files_match_upstream_git() {
     let root = unique_temp_dir("diff-binary-stats");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("bin-mod.dat"), b"a\0b\n").expect("write binary modify fixture");
         fs::write(root.join("bin-del.dat"), b"x\0y\n").expect("write binary delete fixture");
         git(&root, &["add", "bin-mod.dat", "bin-del.dat"]);
@@ -2332,7 +2332,7 @@ fn diff_stat_matches_upstream_git() {
     let root = unique_temp_dir("diff-stat");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete-one\ndelete-two\n")
             .expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"one\ntwo\nthree\n").expect("write modify fixture");
@@ -2495,7 +2495,7 @@ fn diff_compact_summary_matches_upstream_git() {
     let root = unique_temp_dir("diff-compact-summary");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("modify.txt"), b"one\ntwo\n").expect("write modify fixture");
         fs::write(root.join("rename-old.txt"), b"rename\n").expect("write rename fixture");
@@ -2592,7 +2592,7 @@ fn diff_exit_code_and_quiet_match_upstream_git() {
     let root = unique_temp_dir("diff-exit-code-quiet");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("modify.txt"), b"before\n").expect("write fixture");
         git(&root, &["add", "modify.txt"]);
         git(
@@ -2675,7 +2675,7 @@ fn diff_between_revisions_matches_upstream_git() {
     // mis-parsed as pathspecs and silently fell back to an index-vs-worktree diff.
     let root = unique_temp_dir("diff-between-revisions");
     fs::create_dir_all(&root).expect("create repo root");
-    git(&root, &["init", "-q"]);
+    git(&root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("a.txt"), b"line1\nline2\n").expect("write a");
     fs::create_dir_all(root.join("sub")).expect("mkdir sub");
     fs::write(root.join("sub/b.txt"), b"x\n").expect("write b");
@@ -2734,7 +2734,7 @@ fn diff_two_tree_uses_committed_content_not_dirty_worktree() {
     // consume the first HEAD as the head-vs-worktree shortcut.
     let root = unique_temp_dir("diff-two-tree-dirty");
     fs::create_dir_all(&root).expect("create repo root");
-    git(&root, &["init", "-q"]);
+    git(&root, &["init", "-q", "-b", "main"]);
     let commit = |msg: &str| {
         git(
             &root,

@@ -70,7 +70,7 @@ fn archive_tar_matches_upstream_git_for_commit_tree() {
     let root = unique_temp_dir("archive-tar");
     fs::create_dir_all(root.join("dir")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"hello\n").expect("write file");
@@ -106,7 +106,7 @@ fn archive_output_option_writes_tar_file() {
     let root = unique_temp_dir("archive-output");
     fs::create_dir_all(&root).expect("create fixture dir");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"hello\n").expect("write file");
@@ -145,7 +145,7 @@ fn archive_tar_pathspecs_match_upstream_git() {
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     fs::create_dir_all(root.join("other")).expect("create other dir");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"root\n").expect("write root file");
@@ -197,7 +197,7 @@ fn archive_tar_cwd_relative_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("archive-cwd-pathspecs");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("root.txt"), b"root\n").expect("write root file");
@@ -240,7 +240,7 @@ fn archive_missing_pathspec_errors_match_upstream_git() {
     let root = unique_temp_dir("archive-missing-pathspec");
     fs::create_dir_all(&root).expect("create fixture dir");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"root\n").expect("write root file");

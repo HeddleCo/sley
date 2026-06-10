@@ -82,6 +82,8 @@ fn autocrlf_true_round_trip_matches_git() {
             &root,
             &[
                 "init",
+                "-b",
+                "main",
                 "-q",
                 repo.to_str().expect("test operation should succeed"),
             ],
@@ -149,6 +151,8 @@ fn gitattributes_eol_crlf_matches_git() {
             &root,
             &[
                 "init",
+                "-b",
+                "main",
                 "-q",
                 repo.to_str().expect("test operation should succeed"),
             ],
@@ -201,6 +205,8 @@ fn no_filter_default_is_passthrough() {
             &root,
             &[
                 "init",
+                "-b",
+                "main",
                 "-q",
                 repo.to_str().expect("test operation should succeed"),
             ],

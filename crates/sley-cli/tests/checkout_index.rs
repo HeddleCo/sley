@@ -116,7 +116,7 @@ fn prepare_pair(name: &str, root: &Path) -> (PathBuf, PathBuf) {
 }
 
 fn prepare_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     run_success(sley_testkit::oracle_git(), root, &["config", "core.autocrlf", "false"]);
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     fs::create_dir_all(root.join("dir")).expect("create dir");
@@ -442,7 +442,7 @@ fn checkout_index_executable_and_symlink_modes_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
             run_success(sley_testkit::oracle_git(), repo, &["config", "core.autocrlf", "false"]);
             fs::write(repo.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("write script");
             set_executable(&repo.join("run.sh"));

@@ -76,12 +76,12 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_repo(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     prepare_repo_contents(root);
 }
 
 fn prepare_sha256_repo(root: &Path) {
-    git(root, &["init", "-q", "--object-format=sha256"]);
+    git(root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     prepare_repo_contents(root);
 }
 
@@ -343,7 +343,7 @@ fn mv_tracked_directory_matches_upstream_git() {
         fs::create_dir_all(&upstream).expect("create upstream repo");
         fs::create_dir_all(&rust).expect("create rust repo");
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("src/sub")).expect("create source directory");
             fs::write(repo.join("src/a.txt"), b"first\n").expect("write first");
             fs::write(repo.join("src/sub/b.txt"), b"second\n").expect("write second");

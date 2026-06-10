@@ -183,8 +183,8 @@ fn config_modern_subcommands_match_upstream_git_for_local_config() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
 
         let set_name = ["config", "set", "--local", "user.name", "Ada Lovelace"];
         assert_eq!(git(&upstream, &set_name), git_rs(&rust, &set_name));
@@ -653,8 +653,8 @@ fn config_trailing_cr_round_trip_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
         let value = format!("bar{}", '\r');
         let set_args = ["config", "set", "core.foo", value.as_str()];
         assert_eq!(git(&upstream, &set_args), git_rs(&rust, &set_args));
@@ -739,8 +739,8 @@ fn config_get_set_add_and_unset_match_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
 
         let set_name = ["config", "user.name", "Ada Lovelace"];
         assert_eq!(git(&upstream, &set_name), git_rs(&rust, &set_name));
@@ -1519,8 +1519,8 @@ fn config_injection_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
 
         // --- global `-c key=value` injection -------------------------------
         // basic, CamelCase folding, bare bool, empty value, value with '='.

@@ -155,7 +155,7 @@ fn normalize_output_paths(
 
 fn prepare_repo_with_linked_worktree(repo: &Path, linked: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
     run_success_with_identity(repo, &["commit", "--allow-empty", "-qm", "initial"]);
     run_success(sley_testkit::oracle_git(), repo, &["branch", "topic"]);
     let linked_path = linked.to_string_lossy().into_owned();
@@ -173,13 +173,13 @@ fn prepare_repo_with_stale_linked_worktree(repo: &Path, linked: &Path) {
 
 fn prepare_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
     prepare_worktree_add_contents(repo);
 }
 
 fn prepare_sha256_repo_for_worktree_add(repo: &Path) {
     fs::create_dir_all(repo).expect("create repo");
-    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "--object-format=sha256"]);
+    run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     prepare_worktree_add_contents(repo);
 }
 
@@ -198,7 +198,7 @@ fn worktree_list_matches_upstream_git() {
         let repo = root.join("repo");
         let linked = root.join("linked");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q", "-b", "main"]);
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
         run_success(sley_testkit::oracle_git(), &repo, &["branch", "topic"]);
         let linked_path = linked.to_string_lossy().into_owned();
@@ -230,7 +230,7 @@ fn worktree_list_detached_head_matches_upstream_git() {
     {
         let repo = root.join("repo");
         fs::create_dir_all(&repo).expect("create repo");
-        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &repo, &["init", "-q", "-b", "main"]);
         run_success_with_identity(&repo, &["commit", "--allow-empty", "-qm", "initial"]);
         run_success(sley_testkit::oracle_git(), &repo, &["checkout", "-q", "--detach", "HEAD"]);
 

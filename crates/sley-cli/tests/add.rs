@@ -77,14 +77,14 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_repo(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::create_dir_all(root.join("dir")).expect("create dir");
     fs::write(root.join("file.txt"), b"base\n").expect("write file");
     fs::write(root.join("dir/nested.txt"), b"nested\n").expect("write nested");
 }
 
 fn prepare_tracked_repo(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("tracked.txt"), b"base\n").expect("write tracked file");
     fs::write(root.join("gone.txt"), b"gone\n").expect("write deleted fixture");
     git(root, &["add", "tracked.txt", "gone.txt"]);
@@ -330,7 +330,7 @@ fn add_path_stages_tracked_deletion_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("gone.txt"), b"gone\n").expect("write deleted fixture");
             git(repo, &["add", "gone.txt"]);
             run_with_identity(repo, &["commit", "-m", "base", "-q"]);
@@ -360,7 +360,7 @@ fn add_directory_stages_tracked_deletions_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("dir")).expect("create dir");
             fs::write(repo.join("dir/keep.txt"), b"base\n").expect("write kept file");
             fs::write(repo.join("dir/gone.txt"), b"gone\n").expect("write deleted fixture");
@@ -397,7 +397,7 @@ fn add_clean_path_dry_run_is_quiet_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("clean.txt"), b"clean\n").expect("write clean file");
             git(repo, &["add", "clean.txt"]);
             run_with_identity(repo, &["commit", "-m", "base", "-q"]);
@@ -420,7 +420,7 @@ fn add_missing_pathspec_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
         }
 
         let args = ["add", "missing.txt"];
@@ -512,7 +512,7 @@ fn add_ignore_removal_explicit_deleted_path_is_noop_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("gone.txt"), b"gone\n").expect("write deleted fixture");
             git(repo, &["add", "gone.txt"]);
             run_with_identity(repo, &["commit", "-m", "base", "-q"]);
@@ -691,7 +691,7 @@ fn add_all_pathspec_limits_actions_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("dir")).expect("create dir");
             fs::create_dir_all(repo.join("other")).expect("create other dir");
             fs::write(repo.join("dir/tracked.txt"), b"base\n").expect("write tracked");
@@ -775,7 +775,7 @@ fn add_chmod_stages_executable_bit_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("run.sh"), b"run\n").expect("write script");
         }
 
@@ -802,7 +802,7 @@ fn add_chmod_removes_executable_bit_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("run.sh"), b"run\n").expect("write script");
             make_executable(&repo.join("run.sh"));
             git(repo, &["add", "run.sh"]);
@@ -837,7 +837,7 @@ fn add_chmod_invalid_value_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("run.sh"), b"run\n").expect("write script");
         }
 
@@ -858,7 +858,7 @@ fn add_no_chmod_overrides_chmod_like_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("run.sh"), b"run\n").expect("write script");
         }
 

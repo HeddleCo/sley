@@ -48,7 +48,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_fixed_commit_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    let init = run(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    let init = run(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     assert!(init.status.success(), "git init failed");
     fs::write(
         root.join("commit.txt"),

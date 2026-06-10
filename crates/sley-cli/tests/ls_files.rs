@@ -106,7 +106,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn prepare_unmerged_index(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     let one = String::from_utf8(run_with_stdin(
         sley_testkit::oracle_git(),
         root,
@@ -137,7 +137,7 @@ fn prepare_unmerged_index(root: &Path) {
 }
 
 fn prepare_ignored_fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(
         root.join(".gitignore"),
         b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\nslash/*.tmp\nslash/**/*.deep\nslash/**/wild.tmp\n*.log\n!important.log\nignored-dir/\n",
@@ -217,7 +217,7 @@ fn prepare_ignored_fixture(root: &Path) {
 }
 
 fn prepare_default_global_excludes_fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("ignored.global"), b"ignored\n").expect("write xdg ignored fixture");
     fs::write(root.join("important.global"), b"visible\n").expect("write xdg negated fixture");
     fs::write(root.join("home-only.home"), b"visible\n").expect("write home-only fixture");
@@ -227,7 +227,7 @@ fn prepare_default_global_excludes_fixture(root: &Path) {
 }
 
 fn prepare_per_directory_exclude_fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join(".ignore"), b"*.root\n").expect("write root exclude");
     fs::write(root.join("hidden.root"), b"ignored\n").expect("write root ignored fixture");
     fs::write(root.join("tracked.root"), b"tracked\n").expect("write root tracked fixture");
@@ -245,7 +245,7 @@ fn ls_files_short_option_aliases_match_upstream_git() {
     let root = unique_temp_dir("ls-files-short-options");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete");
         fs::write(root.join("--dash.txt"), b"dash\n").expect("write dash path");
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify");
@@ -335,7 +335,7 @@ fn ls_files_sha256_stage_cached_and_modified_match_upstream_git() {
     let root = unique_temp_dir("ls-files-sha256");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q", "--object-format=sha256"]);
+        git(&root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
         fs::write(root.join("modify.txt"), b"before\n").expect("write modify fixture");
         fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked fixture");
         git(&root, &["add", "modify.txt", "tracked.txt"]);
@@ -400,7 +400,7 @@ fn ls_files_directory_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo");
     {
         for repo in [&expected, &actual] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("dir").join("sub")).expect("create untracked dir");
             fs::create_dir_all(repo.join("empty")).expect("create empty dir");
             fs::create_dir_all(repo.join("tracked-dir")).expect("create tracked dir");
@@ -658,7 +658,7 @@ fn ls_files_quoted_paths_match_upstream_git() {
     ] {
         let repo = root.join(case);
         fs::create_dir_all(&repo).expect("create case repo");
-        git(&repo, &["init", "-q"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
         let deleted = format!("deleted-{path}");
         let untracked = format!("untracked-{path}");
         fs::write(repo.join(path), b"base\n").expect("write tracked fixture");
@@ -717,7 +717,7 @@ fn ls_files_others_symlink_matches_upstream_git() {
         fs::create_dir_all(&upstream).expect("create upstream repo");
         fs::create_dir_all(&rust).expect("create rust repo");
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("target.txt"), b"target\n").expect("write target");
             symlink(repo.join("target.txt"), repo.join("path1")).expect("create symlink");
         }
@@ -739,11 +739,11 @@ fn ls_files_others_nested_git_matches_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     for repo in [&upstream, &rust] {
-        git(repo, &["init", "-q"]);
+        git(repo, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(repo.join("not-a-submodule")).expect("create nested dir");
         fs::write(repo.join("not-a-submodule").join("file.txt"), b"inside\n")
             .expect("write nested file");
-        git(&repo.join("not-a-submodule"), &["init", "-q"]);
+        git(&repo.join("not-a-submodule"), &["init", "-q", "-b", "main"]);
     }
 
     for args in [
@@ -783,7 +783,7 @@ fn prepare_upstream_ls_files_others_fixture(repo: &Path) {
 }
 
 fn prepare_upstream_nested_pathspec_fixture(repo: &Path) {
-    git(repo, &["init", "-q"]);
+    git(repo, &["init", "-q", "-b", "main"]);
     fs::create_dir_all(repo.join("partially_tracked/untracked_dir")).expect("create tracked dir");
     fs::write(repo.join("partially_tracked/content"), b"content\n").expect("write tracked content");
     fs::write(repo.join("partially_tracked/untracked_dir/file"), b"file\n")
@@ -801,8 +801,8 @@ fn ls_files_others_basic_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    git(&upstream, &["init", "-q"]);
-    git(&rust, &["init", "-q"]);
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    git(&rust, &["init", "-q", "-b", "main"]);
     prepare_upstream_ls_files_others_fixture(&upstream);
     prepare_upstream_ls_files_others_fixture(&rust);
 
@@ -830,8 +830,8 @@ fn ls_files_others_non_submodule_git_file_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    git(&upstream, &["init", "-q"]);
-    git(&rust, &["init", "-q"]);
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    git(&rust, &["init", "-q", "-b", "main"]);
     prepare_upstream_ls_files_others_fixture(&upstream);
     prepare_upstream_ls_files_others_fixture(&rust);
     fs::create_dir_all(upstream.join("not-a-submodule")).expect("create upstream nested dir");
@@ -899,8 +899,8 @@ fn ls_files_others_directory_pathspec_matches_upstream_git() {
     let nested_empty_rust = rust.join("untracked/deep/empty");
     fs::create_dir_all(&nested_empty_upstream).expect("create nested empty gitdir");
     fs::create_dir_all(&nested_empty_rust).expect("create nested empty gitdir");
-    git(&nested_empty_upstream, &["init", "-q"]);
-    git(&nested_empty_rust, &["init", "-q"]);
+    git(&nested_empty_upstream, &["init", "-q", "-b", "main"]);
+    git(&nested_empty_rust, &["init", "-q", "-b", "main"]);
     let args = ["ls-files", "--others", "untracked/*.c"];
     let expected = git(&upstream, &args);
     let actual = git_rs(&rust, &args);
@@ -918,8 +918,8 @@ fn checkout_b_on_fresh_init_matches_upstream_git() {
     let rust = root.join("rust");
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
-    git(&upstream, &["init", "-q"]);
-    git_rs(&rust, &["init", "-q"]);
+    git(&upstream, &["init", "-q", "-b", "main"]);
+    git_rs(&rust, &["init", "-q", "-b", "main"]);
 
     for args in [
         vec!["checkout", "-B", "main"],
@@ -941,7 +941,7 @@ fn ls_files_error_unmatch_matches_upstream_git() {
     let root = unique_temp_dir("ls-files-error-unmatch");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked");
         fs::write(root.join("delete.txt"), b"delete\n").expect("write delete");
         fs::write(root.join("--dash.txt"), b"dash\n").expect("write dash path");

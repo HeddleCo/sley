@@ -187,7 +187,7 @@ fn assert_same_stdin(repo: &Path, args: &[&str], stdin: &[u8]) {
 /// committer story for grouping tests.
 fn build_repo(name: &str) -> PathBuf {
     let repo = unique_temp_dir(name);
-    git_ok(&repo, &["init", "-q"]);
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
     git_ok(&repo, &["config", "user.name", "Tester"]);
     git_ok(&repo, &["config", "user.email", "tester@example.com"]);
 
@@ -283,7 +283,7 @@ fn shortlog_committer_grouping_matches_git() {
         return;
     }
     let repo = unique_temp_dir("shortlog-committer");
-    git_ok(&repo, &["init", "-q"]);
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
     git_ok(&repo, &["config", "user.name", "Tester"]);
     git_ok(&repo, &["config", "user.email", "tester@example.com"]);
     // Authors differ from committers so author vs committer grouping diverges.
@@ -333,7 +333,7 @@ fn shortlog_wrap_matches_git() {
         return;
     }
     let repo = unique_temp_dir("shortlog-wrap");
-    git_ok(&repo, &["init", "-q"]);
+    git_ok(&repo, &["init", "-q", "-b", "main"]);
     git_ok(&repo, &["config", "user.name", "Tester"]);
     git_ok(&repo, &["config", "user.email", "tester@example.com"]);
     commit_as(

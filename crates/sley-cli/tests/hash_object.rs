@@ -100,7 +100,7 @@ fn hash_object_usage_and_option_errors_exit_like_upstream_git() {
     let root = unique_temp_dir("hash-object-usage");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         let stdin = b"stdin\n";
         for args in [
             vec!["hash-object"],
@@ -136,8 +136,8 @@ fn hash_object_git_object_directory_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
-        run(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
+        run(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
         for repo in [&expected, &actual] {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom object dir");
         }
@@ -204,7 +204,7 @@ fn hash_object_multiple_inputs_match_upstream_git() {
     let root = unique_temp_dir("hash-object-multiple-inputs");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
         fs::write(root.join("--stdin"), b"dash stdin\n").expect("write option-like path");
@@ -239,8 +239,8 @@ fn hash_object_sha256_repo_default_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run(sley_testkit::oracle_git(), &expected, &["init", "-q", "--object-format=sha256"]);
-        run(sley_testkit::oracle_git(), &actual, &["init", "-q", "--object-format=sha256"]);
+        run(sley_testkit::oracle_git(), &expected, &["init", "-q", "--object-format=sha256", "-b", "main"]);
+        run(sley_testkit::oracle_git(), &actual, &["init", "-q", "--object-format=sha256", "-b", "main"]);
         for repo in [&expected, &actual] {
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             fs::write(repo.join("two.txt"), b"two\n").expect("write two");
@@ -279,7 +279,7 @@ fn hash_object_filter_path_and_option_errors_match_upstream_git() {
     let root = unique_temp_dir("hash-object-filter-path");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         let stdin = b"stdin\n";
 
@@ -336,7 +336,7 @@ fn hash_object_stdin_paths_matches_upstream_git() {
     let root = unique_temp_dir("hash-object-stdin-paths");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
 

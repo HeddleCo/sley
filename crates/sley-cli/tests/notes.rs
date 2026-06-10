@@ -114,7 +114,7 @@ fn assert_same_output(actual: &Output, expected: &Output, args: &[&str]) {
 /// Initialize a repo with `count` commits ("c1", "c2", ...) and a worktree
 /// file per commit, using deterministic identity/date.
 fn init_repo_with_commits(root: &Path, count: usize) {
-    run_ok(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_ok(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     for i in 1..=count {
         let name = format!("f{i}.txt");
         std::fs::write(root.join(&name), format!("content {i}\n")).expect("write worktree file");

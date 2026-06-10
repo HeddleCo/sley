@@ -70,7 +70,7 @@ fn show_ref_exists_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exists");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         for args in [
             vec!["show-ref", "--exists"],
             vec!["show-ref", "--exists", "HEAD"],
@@ -121,7 +121,7 @@ fn show_ref_head_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-head");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &root,
@@ -259,7 +259,7 @@ fn show_ref_exclude_existing_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-exclude-existing");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &root,
@@ -295,7 +295,7 @@ fn show_ref_reftable_repository_matches_upstream_git() {
     let root = unique_temp_dir("show-ref-reftable");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "--ref-format=reftable"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "--ref-format=reftable", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &root,

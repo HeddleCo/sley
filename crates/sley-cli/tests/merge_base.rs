@@ -87,7 +87,7 @@ fn merge_base_two_commits_matches_upstream_git() {
     let root = unique_temp_dir("merge-base");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
         run(sley_testkit::oracle_git(), &root, &["checkout", "-qb", "left"]);
@@ -154,7 +154,7 @@ fn merge_base_no_common_history_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-unrelated");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         commit_empty(&root, "base");
         let first = rev_parse(&root, "HEAD");
         run(sley_testkit::oracle_git(), &root, &["checkout", "--orphan", "unrelated", "-q"]);
@@ -189,7 +189,7 @@ fn merge_base_fork_point_matches_upstream_git() {
     let root = unique_temp_dir("merge-base-fork-point");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         commit_empty(&root, "base");
         let base = rev_parse(&root, "HEAD");
         run(sley_testkit::oracle_git(), &root, &["branch", "-m", "main"]);

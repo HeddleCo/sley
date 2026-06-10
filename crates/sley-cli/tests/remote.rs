@@ -80,8 +80,8 @@ fn remote_add_list_get_url_and_remove_match_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
 
         let add_args = [
             "remote",
@@ -469,7 +469,7 @@ fn remote_rename_moves_packed_remote_tracking_refs_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(
                 repo,
                 &[
@@ -538,7 +538,7 @@ fn remote_remove_cleans_refs_and_branch_config_match_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(
                 repo,
                 &[
@@ -657,8 +657,8 @@ fn remote_set_url_old_url_errors_match_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
         for repo in [&upstream, &rust] {
             git(repo, &["remote", "add", "origin", "one"]);
             git(repo, &["remote", "set-url", "--add", "origin", "two"]);
@@ -801,8 +801,8 @@ fn remote_set_branches_negations_match_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
         for repo in [&upstream, &rust] {
             git(
                 repo,
@@ -861,7 +861,7 @@ fn remote_set_head_option_order_matches_upstream_git() {
     fs::create_dir_all(&rust).expect("create rust repo");
     {
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(
                 repo,
                 &[
@@ -941,7 +941,7 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
     }
     {
         for repo in [&expected_remote, &actual_remote] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(repo, &["checkout", "-q", "-b", "main"]);
             git(repo, &["config", "user.email", "a@b.c"]);
             git(repo, &["config", "user.name", "A"]);
@@ -949,8 +949,8 @@ fn remote_set_head_auto_local_remote_matches_upstream_git() {
             git(repo, &["add", "f"]);
             git(repo, &["commit", "-qm", "init"]);
         }
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
         git(
             &upstream,
             &["remote", "add", "origin", "../expected-remote"],
@@ -1008,7 +1008,7 @@ fn remote_show_local_remote_matches_upstream_git() {
         fs::create_dir_all(repo).expect("create repo dir");
     }
     {
-        git(&remote, &["init", "-q"]);
+        git(&remote, &["init", "-q", "-b", "main"]);
         git(&remote, &["checkout", "-q", "-b", "main"]);
         git(&remote, &["config", "user.email", "a@b.c"]);
         git(&remote, &["config", "user.name", "A"]);
@@ -1021,7 +1021,7 @@ fn remote_show_local_remote_matches_upstream_git() {
         git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(repo, &["remote", "add", "origin", "../remote"]);
             git(repo, &["fetch", "-q", "origin", "main", "dev"]);
         }
@@ -1079,7 +1079,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
         fs::create_dir_all(repo).expect("create repo dir");
     }
     {
-        git(&remote, &["init", "-q"]);
+        git(&remote, &["init", "-q", "-b", "main"]);
         git(&remote, &["checkout", "-q", "-b", "main"]);
         git(&remote, &["config", "user.email", "a@b.c"]);
         git(&remote, &["config", "user.name", "A"]);
@@ -1092,7 +1092,7 @@ fn remote_prune_local_remote_matches_upstream_git() {
         git(&remote, &["symbolic-ref", "HEAD", "refs/heads/main"]);
 
         for repo in [&upstream, &rust] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             git(repo, &["remote", "add", "origin", "../remote"]);
             git(repo, &["fetch", "-q", "origin", "main", "dev"]);
             git(repo, &["update-ref", "-d", "refs/remotes/origin/dev"]);
@@ -1202,8 +1202,8 @@ fn remote_add_track_branches_match_upstream_git() {
     fs::create_dir_all(&upstream).expect("create upstream repo");
     fs::create_dir_all(&rust).expect("create rust repo");
     {
-        git(&upstream, &["init", "-q"]);
-        git(&rust, &["init", "-q"]);
+        git(&upstream, &["init", "-q", "-b", "main"]);
+        git(&rust, &["init", "-q", "-b", "main"]);
 
         let args = [
             "remote",
@@ -1380,8 +1380,8 @@ fn remote_add_config_options_match_upstream_git() {
         let actual = root.join(format!("actual-{label}"));
         fs::create_dir_all(&expected).expect("create expected repo");
         fs::create_dir_all(&actual).expect("create actual repo");
-        git(&expected, &["init", "-q"]);
-        git(&actual, &["init", "-q"]);
+        git(&expected, &["init", "-q", "-b", "main"]);
+        git(&actual, &["init", "-q", "-b", "main"]);
 
         let expected_output = run_output(sley_testkit::oracle_git(), &expected, &args);
         let actual_output = run_output(env!("CARGO_BIN_EXE_sley"), &actual, &args);

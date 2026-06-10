@@ -36,7 +36,7 @@ fn loose_object_path(git_dir: &Path, oid: &str) -> PathBuf {
 }
 
 fn create_single_commit_repo(root: &Path) -> String {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
     run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(

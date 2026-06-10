@@ -50,8 +50,23 @@ fn assert_stdin_match(cwd: &Path, args: &[&str], stdin: &[u8]) {
         actual.stdout, expected.stdout,
         "sley stdout differed for {args:?}"
     );
+    // `die_errno` embeds whatever errno happens to be at exit ("Success",
+    // "No such file or directory", ...) — incidental process state that
+    // legitimately differs across environments for BOTH binaries. Compare the
+    // message with the strerror suffix stripped (the deterministic prefix is
+    // still byte-compared); keep full equality when no errno suffix is present.
+    let strip_errno = |stderr: &[u8]| -> Vec<u8> {
+        let text = String::from_utf8_lossy(stderr);
+        match text.find("EOF before reading tar header: ") {
+            Some(pos) => text[..pos + "EOF before reading tar header: ".len()]
+                .as_bytes()
+                .to_vec(),
+            None => stderr.to_vec(),
+        }
+    };
     assert_eq!(
-        actual.stderr, expected.stderr,
+        strip_errno(&actual.stderr),
+        strip_errno(&expected.stderr),
         "sley stderr differed for {args:?}"
     );
 }

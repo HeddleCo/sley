@@ -63,7 +63,7 @@ fn unpack_file_matches_upstream_git() {
     let root = unique_temp_dir("unpack-file");
     fs::create_dir_all(&root).expect("create temp dir");
     {
-        let init = run_output(sley_testkit::oracle_git(), &root, &["init"]);
+        let init = run_output(sley_testkit::oracle_git(), &root, &["init", "-b", "main"]);
         assert!(init.status.success(), "git init failed");
         fs::write(root.join("file.txt"), b"payload\n").expect("write file");
         let add = run_output(sley_testkit::oracle_git(), &root, &["add", "file.txt"]);

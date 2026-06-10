@@ -33,7 +33,7 @@ fn tree_builder_matches_git_write_tree() {
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
-    assert!(run_git(&tmp, &["init", "-q"]).is_some());
+    assert!(run_git(&tmp, &["init", "-q", "-b", "main"]).is_some());
 
     // A file set that exercises every entry kind plus the dir-suffix sort: a
     // plain blob, an executable, a subtree ("foo"), and a blob ("foo.txt") that

@@ -89,7 +89,7 @@ fn cat_file_usage_and_option_errors_exit_like_upstream_git() {
     let root = unique_temp_dir("cat-file-usage");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for args in [
             vec!["cat-file", "-e", "--batch"],
             vec!["cat-file", "-p", "--batch-check"],
@@ -127,7 +127,7 @@ fn cat_file_reads_alternate_object_directories_like_upstream_git() {
     {
         for repo in [&expected, &actual, &expected_alt, &actual_alt] {
             fs::create_dir_all(repo).expect("create repo dir");
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
         }
         fs::write(expected_alt.join("blob.txt"), b"alternate blob\n").expect("write expected blob");
         fs::write(actual_alt.join("blob.txt"), b"alternate blob\n").expect("write actual blob");
@@ -213,7 +213,7 @@ fn cat_file_batch_all_objects_git_object_directory_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo");
     {
         for repo in [&expected, &actual] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             fs::write(repo.join("two.txt"), b"two\n").expect("write two");
@@ -251,7 +251,7 @@ fn cat_file_storage_atoms_git_object_directory_match_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo");
     {
         for repo in [&expected, &actual] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
             let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
@@ -299,7 +299,7 @@ fn cat_file_batch_modes_match_upstream_git() {
     let root = unique_temp_dir("cat-file-batch-check");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
         git(
@@ -594,7 +594,7 @@ fn cat_file_batch_storage_atoms_match_upstream_for_delta_pack() {
     let root = unique_temp_dir("cat-file-delta-storage-atoms");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let mut base = Vec::new();
         for idx in 0..4000 {
             writeln!(&mut base, "common payload line {idx:04}").expect("write base fixture");
@@ -699,7 +699,7 @@ fn cat_file_broken_loose_headers_match_upstream_git() {
     let root = unique_temp_dir("cat-file-broken-headers");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         // 33-char type → 35-byte header, overflowing the 32-byte window (upstream's bogus_long).
         let long_oid = write_loose_object(&root, "abcdefghijklmnopqrstuvwxyz1234679", b"bogus");
         // Short, unknown type → header fits but the type is rejected (upstream's bogus_short).

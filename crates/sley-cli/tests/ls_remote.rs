@@ -59,7 +59,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 fn prepare_remote_repo(root: &Path) -> PathBuf {
     let remote = root.join("remote");
     fs::create_dir_all(&remote).expect("create remote");
-    run_success(sley_testkit::oracle_git(), &remote, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &remote, &["init", "-q", "-b", "main"]);
     run_success(
         sley_testkit::oracle_git(),
         &remote,
@@ -250,7 +250,7 @@ fn ls_remote_local_repository_matches_upstream_git() {
         }
 
         let client = root.join("client");
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &client,
@@ -333,7 +333,7 @@ fn ls_remote_configured_percent_encoded_ssh_remote_matches_upstream_git() {
         let fake_ssh = fake_ssh.to_str().expect("fake ssh path is utf8");
         let remote_url = percent_encoded_ssh_url(&remote);
         let client = root.join("client");
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client", "-b", "main"]);
         run_success(sley_testkit::oracle_git(), &client, &["remote", "add", "origin", &remote_url]);
 
         for args in [
@@ -365,7 +365,7 @@ fn ls_remote_configured_local_remote_matches_upstream_git() {
         let remote_file_url = file_url(&root.join("remote"));
         let root_file_url = file_url(&root);
         let client = root.join("client");
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client", "-b", "main"]);
         run_success(sley_testkit::oracle_git(), &client, &["remote", "add", "origin", "../remote"]);
         run_success(
             sley_testkit::oracle_git(),
@@ -428,7 +428,7 @@ fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
         fs::create_dir_all(&root).expect("create root");
         let remote = root.join("remote repo");
         fs::create_dir_all(&remote).expect("create remote");
-        run_success(sley_testkit::oracle_git(), &remote, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &remote, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &remote,
@@ -445,7 +445,7 @@ fn ls_remote_configured_percent_encoded_file_remote_matches_upstream_git() {
         );
         run_success(sley_testkit::oracle_git(), &remote, &["branch", "feature/topic"]);
         let client = root.join("client");
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "client", "-b", "main"]);
         let remote_file_url = percent_encoded_file_url(&remote);
         run_success(
             sley_testkit::oracle_git(),

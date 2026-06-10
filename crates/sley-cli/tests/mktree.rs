@@ -79,7 +79,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
 }
 
 fn git_rs() -> &'static str {

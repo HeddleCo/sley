@@ -149,7 +149,7 @@ fn signature_parse_view_matches_system_git_for_offset_and_negative_zero() {
         let _ = std::fs::remove_dir_all(&repo_dir);
         return;
     }
-    assert!(run_git(&repo_dir, &["init", "-q"]).is_some());
+    assert!(run_git(&repo_dir, &["init", "-q", "-b", "main"]).is_some());
 
     // 1) A commit made the ordinary way with a non-UTC +HHMM offset. git keeps
     //    the offset verbatim, so author/committer both read +0530.
@@ -265,7 +265,7 @@ fn tag_signature_parse_view_matches_system_git() {
         let _ = std::fs::remove_dir_all(&repo_dir);
         return;
     }
-    assert!(run_git(&repo_dir, &["init", "-q"]).is_some());
+    assert!(run_git(&repo_dir, &["init", "-q", "-b", "main"]).is_some());
     run_git_dated(
         &repo_dir,
         &["commit", "-q", "--allow-empty", "-m", "base"],

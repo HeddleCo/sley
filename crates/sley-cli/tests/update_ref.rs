@@ -128,8 +128,8 @@ fn update_ref_old_oid_and_deref_options_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
 
         let oid = write_blob(&expected, "payload.txt", b"payload\n");
         let actual_oid = write_blob(&actual, "payload.txt", b"payload\n");
@@ -527,8 +527,8 @@ fn update_ref_reftable_repository_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "--ref-format=reftable"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "--ref-format=reftable"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "--ref-format=reftable", "-b", "main"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "--ref-format=reftable", "-b", "main"]);
 
         let oid = write_blob(&expected, "payload.txt", b"payload\n");
         let actual_oid = write_blob(&actual, "payload.txt", b"payload\n");
@@ -556,8 +556,8 @@ fn update_ref_stdin_basic_commands_match_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo dir");
     fs::create_dir_all(&actual).expect("create actual repo dir");
     {
-        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
-        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
+        run_success(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
 
         let oid = write_blob(&expected, "payload.txt", b"payload\n");
         let actual_oid = write_blob(&actual, "payload.txt", b"payload\n");

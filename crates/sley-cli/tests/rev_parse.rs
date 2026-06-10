@@ -89,7 +89,7 @@ fn rev_parse_is_shallow_repository_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-shallow");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let args = ["rev-parse", "--is-shallow-repository"];
 
         assert_eq!(git_rs(&root, &args), git(&root, &args));
@@ -100,7 +100,7 @@ fn rev_parse_is_shallow_repository_matches_upstream_git() {
         assert_eq!(git_rs(&root, &args), git(&root, &args));
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         fs::write(bare.join("shallow"), b"").expect("write bare shallow marker");
         assert_eq!(git_rs(&bare, &args), git(&bare, &args));
     };
@@ -112,7 +112,7 @@ fn rev_parse_git_common_dir_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-git-common-dir");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         fs::create_dir_all(&nested).expect("create nested worktree dir");
 
@@ -132,7 +132,7 @@ fn rev_parse_git_common_dir_matches_upstream_git() {
         }
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -159,7 +159,7 @@ fn rev_parse_inside_repository_flags_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-inside-flags");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
         let git_nested = git_root.join("objects").join("probe");
@@ -167,7 +167,7 @@ fn rev_parse_inside_repository_flags_match_upstream_git() {
         fs::create_dir_all(&git_nested).expect("create nested git dir");
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -201,7 +201,7 @@ fn rev_parse_core_bare_config_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-core-bare");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(
             &root,
             &[
@@ -288,7 +288,7 @@ fn rev_parse_worktree_path_options_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-worktree-path-options");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
         let git_nested = git_root.join("objects").join("probe");
@@ -296,7 +296,7 @@ fn rev_parse_worktree_path_options_match_upstream_git() {
         fs::create_dir_all(&git_nested).expect("create nested git dir");
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -325,12 +325,12 @@ fn rev_parse_show_ref_format_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-show-ref-format");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         fs::create_dir_all(&nested).expect("create nested worktree dir");
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -356,7 +356,7 @@ fn rev_parse_submodule_gitfile_matches_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        git(&child, &["init", "-q"]);
+        git(&child, &["init", "-q", "-b", "main"]);
         git(
             &child,
             &[
@@ -370,7 +370,7 @@ fn rev_parse_submodule_gitfile_matches_upstream_git() {
                 "child",
             ],
         );
-        git(&superproject, &["init", "-q"]);
+        git(&superproject, &["init", "-q", "-b", "main"]);
         git(
             &superproject,
             &[
@@ -422,7 +422,7 @@ fn rev_parse_path_format_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-path-format");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
         let git_nested = git_root.join("objects").join("probe");
@@ -430,7 +430,7 @@ fn rev_parse_path_format_matches_upstream_git() {
         fs::create_dir_all(&git_nested).expect("create nested git dir");
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -471,7 +471,7 @@ fn rev_parse_git_path_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-git-path");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let nested = root.join("sub").join("dir");
         let git_root = root.join(".git");
         let git_nested = git_root.join("objects").join("probe");
@@ -479,7 +479,7 @@ fn rev_parse_git_path_matches_upstream_git() {
         fs::create_dir_all(&git_nested).expect("create nested git dir");
 
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let bare_nested = bare.join("objects").join("probe");
         fs::create_dir_all(&bare_nested).expect("create nested bare dir");
 
@@ -573,8 +573,8 @@ fn rev_parse_resolve_git_dir_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-resolve-git-dir");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q", "repo"]);
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "repo", "-b", "main"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
         let repo = root.join("repo");
         let nested = repo.join("sub").join("dir");
         let outside = root.join("outside");
@@ -624,7 +624,7 @@ fn rev_parse_local_env_vars_and_path_format_errors_match_upstream_git() {
         let outside = root.join("outside");
         fs::create_dir_all(&outside).expect("create outside dir");
         let repo = root.join("repo");
-        git(&root, &["init", "-q", "repo"]);
+        git(&root, &["init", "-q", "repo", "-b", "main"]);
 
         for cwd in [&outside, &repo] {
             for args in [
@@ -657,7 +657,7 @@ fn rev_parse_sq_quote_matches_upstream_git() {
         let outside = root.join("outside");
         fs::create_dir_all(&outside).expect("create outside dir");
         let repo = root.join("repo");
-        git(&root, &["init", "-q", "repo"]);
+        git(&root, &["init", "-q", "repo", "-b", "main"]);
 
         for cwd in [&outside, &repo] {
             for args in [
@@ -685,10 +685,10 @@ fn rev_parse_object_format_modes_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-object-format-modes");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         let git_root = root.join(".git");
         let bare = root.join("bare.git");
-        git(&root, &["init", "-q", "--bare", "bare.git"]);
+        git(&root, &["init", "-q", "--bare", "bare.git", "-b", "main"]);
 
         for cwd in [&root, &git_root, &bare] {
             for args in [
@@ -725,7 +725,7 @@ fn rev_parse_verify_quiet_missing_matches_upstream_git() {
     let root = unique_temp_dir("rev-parse-verify-missing");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(
             &root,
             &[
@@ -765,7 +765,7 @@ fn rev_parse_abbreviated_object_ids_match_upstream_git() {
     let root = unique_temp_dir("rev-parse-abbrev-object-id");
     fs::create_dir_all(&root).expect("create temp root");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("payload.txt"), b"payload\n").expect("write payload");
         git(&root, &["add", "payload.txt"]);
         git(
@@ -954,9 +954,9 @@ fn rev_parse_terminates(cwd: &Path, args: &[&str]) -> String {
 fn setup_rev_parse_repo(dir: &Path, sha256: bool) {
     fs::create_dir_all(dir).expect("create repo dir");
     if sha256 {
-        run(sley_testkit::oracle_git(), dir, &["init", "-q", "--object-format=sha256"]);
+        run(sley_testkit::oracle_git(), dir, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     } else {
-        run(sley_testkit::oracle_git(), dir, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), dir, &["init", "-q", "-b", "main"]);
     }
     run(
         sley_testkit::oracle_git(),

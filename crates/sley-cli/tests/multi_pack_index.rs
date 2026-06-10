@@ -184,7 +184,7 @@ fn multi_pack_index_write_matches_upstream_and_verifies() {
     let root = unique_temp_dir("midx-write");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         let first = create_pack(&root, b"first midx object\n");
         let second = create_pack(&root, b"second midx object\n");
         let args = ["multi-pack-index", "write"];
@@ -221,7 +221,7 @@ fn multi_pack_index_write_object_dir_matches_upstream() {
     let root = unique_temp_dir("midx-write-object-dir");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         create_pack(&root, b"object-dir midx object\n");
         let args = ["multi-pack-index", "write", "--object-dir=.git/objects"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
@@ -253,7 +253,7 @@ fn multi_pack_index_git_object_directory_default_matches_upstream_git() {
     {
         let envs = [("GIT_OBJECT_DIRECTORY", "custom-objects")];
         for repo in [&expected, &actual] {
-            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
             create_named_pack_in_object_dir(repo, "custom-objects", b"custom midx object\n");
         }
 
@@ -301,7 +301,7 @@ fn multi_pack_index_write_stdin_packs_matches_upstream() {
     let root = unique_temp_dir("midx-write-stdin-packs");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         let (_first, first_pack) = create_named_pack(&root, b"stdin first midx object\n");
         let (_second, second_pack) = create_named_pack(&root, b"stdin second midx object\n");
         let args = ["multi-pack-index", "write", "--stdin-packs"];
@@ -338,7 +338,7 @@ fn multi_pack_index_verify_matches_upstream_git() {
     let root = unique_temp_dir("midx-verify");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         create_pack(&root, b"verify first midx object\n");
         create_pack(&root, b"verify second midx object\n");
         run_success(sley_testkit::oracle_git(), &root, &["multi-pack-index", "write"]);
@@ -361,7 +361,7 @@ fn multi_pack_index_expire_quiet_baseline_matches_upstream_git() {
     let root = unique_temp_dir("midx-expire");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         let args = ["multi-pack-index", "expire"];
         let expected = run(sley_testkit::oracle_git(), &root, &args);
         let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &args);

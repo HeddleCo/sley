@@ -76,12 +76,12 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_repo(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     prepare_repo_contents(root);
 }
 
 fn prepare_sha256_repo(root: &Path) {
-    git(root, &["init", "-q", "--object-format=sha256"]);
+    git(root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     prepare_repo_contents(root);
 }
 

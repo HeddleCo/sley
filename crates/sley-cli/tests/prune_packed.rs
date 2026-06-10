@@ -80,7 +80,7 @@ fn loose_object_path(repo: &Path, oid: &str) -> PathBuf {
 
 fn create_repo_with_packable_loose_objects(root: &Path) -> String {
     fs::create_dir_all(root).expect("create repo root");
-    let init = run_output(sley_testkit::oracle_git(), root, &["init"]);
+    let init = run_output(sley_testkit::oracle_git(), root, &["init", "-b", "main"]);
     assert!(init.status.success(), "git init failed");
     fs::write(root.join("file.txt"), b"payload\n").expect("write file");
     let add = run_output(sley_testkit::oracle_git(), root, &["add", "file.txt"]);

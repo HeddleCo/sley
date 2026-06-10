@@ -113,7 +113,7 @@ fn pack_objects(repo: &Path, revs: &str) -> Vec<u8> {
 }
 
 fn create_work_repo(root: &Path, object_format: Option<&str>) {
-    let mut init_args = vec!["init", "-q"];
+    let mut init_args = vec!["init", "-q", "-b", "main"];
     if let Some(format) = object_format {
         init_args.push("--object-format");
         init_args.push(format);
@@ -138,7 +138,7 @@ fn create_work_repo(root: &Path, object_format: Option<&str>) {
 }
 
 fn create_bare_repo(root: &Path, object_format: Option<&str>) {
-    let mut init_args = vec!["init", "-q", "--bare"];
+    let mut init_args = vec!["init", "-q", "--bare", "-b", "main"];
     if let Some(format) = object_format {
         init_args.push("--object-format");
         init_args.push(format);

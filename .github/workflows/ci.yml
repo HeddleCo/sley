@@ -87,6 +87,13 @@ jobs:
       #    a few CLI parity tests may invoke system git, which is present on
       #    the runner.
       - name: Tests
+        env:
+          # Standard test identity (mirrors upstream test-lib.sh): integration
+          # fixtures must not depend on the runner's git identity config.
+          GIT_AUTHOR_NAME: A U Thor
+          GIT_AUTHOR_EMAIL: author@example.com
+          GIT_COMMITTER_NAME: C O Mitter
+          GIT_COMMITTER_EMAIL: committer@example.com
         run: cargo test --locked --workspace
 
       # 5. Report-only full-workspace clippy. NON-BLOCKING — surfaces the

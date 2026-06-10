@@ -102,7 +102,7 @@ fn submodule_status_sha256_superproject_matches_upstream_git() {
         let actual_super = root.join("actual-super");
         for child in [&upstream_child, &actual_child] {
             fs::create_dir_all(child).expect("create child repo");
-            run_success(sley_testkit::oracle_git(), child, &["init", "-q", "--object-format=sha256"]);
+            run_success(sley_testkit::oracle_git(), child, &["init", "-q", "--object-format=sha256", "-b", "main"]);
             run_success_with_fixed_identity(
                 sley_testkit::oracle_git(),
                 child,
@@ -117,7 +117,7 @@ fn submodule_status_sha256_superproject_matches_upstream_git() {
             run_success(
                 sley_testkit::oracle_git(),
                 superproject,
-                &["init", "-q", "--object-format=sha256"],
+                &["init", "-q", "--object-format=sha256", "-b", "main"],
             );
             let child_arg = child.to_string_lossy().into_owned();
             run_success(
@@ -158,7 +158,7 @@ fn submodule_status_matches_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -173,7 +173,7 @@ fn submodule_status_matches_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -305,7 +305,7 @@ fn submodule_status_sorts_multiple_submodules_like_upstream_git() {
         fs::create_dir_all(&child_b).expect("create child b repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
         for child in [&child_a, &child_b] {
-            run_success(sley_testkit::oracle_git(), child, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), child, &["init", "-q", "-b", "main"]);
             run_success(
                 sley_testkit::oracle_git(),
                 child,
@@ -321,7 +321,7 @@ fn submodule_status_sorts_multiple_submodules_like_upstream_git() {
                 ],
             );
         }
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -377,7 +377,7 @@ fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -408,7 +408,7 @@ fn submodule_status_prefers_exact_tag_suffix_like_upstream_git() {
             ],
         );
         run_success(sley_testkit::oracle_git(), &child, &["tag", "v2"]);
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -461,7 +461,7 @@ fn submodule_status_directory_pathspecs_match_upstream_git() {
         fs::create_dir_all(&child_b).expect("create child b repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
         for child in [&child_a, &child_b] {
-            run_success(sley_testkit::oracle_git(), child, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), child, &["init", "-q", "-b", "main"]);
             run_success(
                 sley_testkit::oracle_git(),
                 child,
@@ -477,7 +477,7 @@ fn submodule_status_directory_pathspecs_match_upstream_git() {
                 ],
             );
         }
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -542,7 +542,7 @@ fn submodule_status_recursive_matches_upstream_git() {
         fs::create_dir_all(&grandchild).expect("create grandchild repo");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &grandchild, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &grandchild, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &grandchild,
@@ -557,7 +557,7 @@ fn submodule_status_recursive_matches_upstream_git() {
                 "grandchild",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -584,7 +584,7 @@ fn submodule_status_recursive_matches_upstream_git() {
                 "add nested submodule",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &superproject,
@@ -629,7 +629,7 @@ fn submodule_init_registers_local_config_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -644,7 +644,7 @@ fn submodule_init_registers_local_config_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -727,7 +727,7 @@ fn submodule_sync_updates_registered_urls_like_upstream_git() {
         fs::create_dir_all(&child_b).expect("create child b repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
         for child in [&child_a, &child_b] {
-            run_success(sley_testkit::oracle_git(), child, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), child, &["init", "-q", "-b", "main"]);
             run_success(
                 sley_testkit::oracle_git(),
                 child,
@@ -743,7 +743,7 @@ fn submodule_sync_updates_registered_urls_like_upstream_git() {
                 ],
             );
         }
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_a_url = child_a.to_string_lossy().into_owned();
         let child_b_url = child_b.to_string_lossy().into_owned();
         run_success(
@@ -833,7 +833,7 @@ fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -848,7 +848,7 @@ fn submodule_set_url_updates_gitmodules_and_local_config_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -960,7 +960,7 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -975,7 +975,7 @@ fn submodule_set_branch_updates_gitmodules_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1097,7 +1097,7 @@ fn submodule_foreach_runs_commands_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -1112,7 +1112,7 @@ fn submodule_foreach_runs_commands_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1159,7 +1159,7 @@ fn submodule_foreach_recursive_matches_upstream_git() {
         fs::create_dir_all(&grandchild).expect("create grandchild repo");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &grandchild, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &grandchild, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &grandchild,
@@ -1174,7 +1174,7 @@ fn submodule_foreach_recursive_matches_upstream_git() {
                 "grandchild",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         let grandchild_url = grandchild.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1202,7 +1202,7 @@ fn submodule_foreach_recursive_matches_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1253,7 +1253,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         let child_branch = String::from_utf8(run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -1276,7 +1276,7 @@ fn submodule_summary_clean_cases_match_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1428,7 +1428,7 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -1443,7 +1443,7 @@ fn submodule_absorbgitdirs_migrates_embedded_gitdir_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),
@@ -1519,7 +1519,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
         let superproject = root.join("super");
         fs::create_dir_all(&child).expect("create child repo");
         fs::create_dir_all(&superproject).expect("create superproject repo");
-        run_success(sley_testkit::oracle_git(), &child, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &child, &["init", "-q", "-b", "main"]);
         run_success(
             sley_testkit::oracle_git(),
             &child,
@@ -1534,7 +1534,7 @@ fn submodule_deinit_unregisters_local_config_like_upstream_git() {
                 "child",
             ],
         );
-        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &superproject, &["init", "-q", "-b", "main"]);
         let child_url = child.to_string_lossy().into_owned();
         run_success(
             sley_testkit::oracle_git(),

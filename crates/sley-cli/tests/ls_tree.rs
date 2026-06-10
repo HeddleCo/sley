@@ -44,7 +44,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn init_basic_repo(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("a.txt"), b"a\n").expect("write a");
     git(root, &["add", "."]);
     git(
@@ -96,7 +96,7 @@ fn ls_tree_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-pathspecs");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("--dash.txt"), b"dash\n").expect("write dash path");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
@@ -143,7 +143,7 @@ fn ls_tree_show_trees_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-show-trees");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         fs::write(root.join("dir/sub/c.txt"), b"c\n").expect("write c");
@@ -187,7 +187,7 @@ fn ls_tree_directories_only_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-directories-only");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         fs::write(root.join("dir/sub/c.txt"), b"c\n").expect("write c");
@@ -231,7 +231,7 @@ fn ls_tree_name_status_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-name-status");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         fs::write(root.join("dir/sub/c.txt"), b"c\n").expect("write c");
@@ -277,7 +277,7 @@ fn ls_tree_quoted_paths_match_upstream_git() {
     ] {
         let repo = root.join(case);
         fs::create_dir_all(&repo).expect("create case repo");
-        git(&repo, &["init", "-q"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join(path), b"content\n").expect("write quoted fixture");
         git(&repo, &["add", path]);
         git(
@@ -323,7 +323,7 @@ fn ls_tree_abbrev_matches_upstream_git() {
     let root = unique_temp_dir("ls-tree-abbrev");
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         fs::write(root.join("dir/sub/c.txt"), b"c\n").expect("write c");
@@ -368,7 +368,7 @@ fn ls_tree_nested_cwd_full_name_and_full_tree_match_upstream_git() {
     fs::create_dir_all(root.join("dir/sub")).expect("create fixture dirs");
     fs::create_dir_all(root.join("other")).expect("create other dir");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         fs::write(root.join("dir/sub/c.txt"), b"c\n").expect("write c");
@@ -432,7 +432,7 @@ fn ls_tree_format_placeholders_match_upstream_git() {
     let root = unique_temp_dir("ls-tree-format");
     fs::create_dir_all(root.join("dir")).expect("create fixture dirs");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"a\n").expect("write a");
         fs::write(root.join("dir/b.txt"), b"b\n").expect("write b");
         git(&root, &["add", "."]);

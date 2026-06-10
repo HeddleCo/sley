@@ -64,7 +64,7 @@ fn status_z_matches_upstream_git() {
     let root = unique_temp_dir("status-z");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write staged fixture");
         fs::write(root.join("extra.txt"), b"extra\n").expect("write untracked fixture");
         fs::create_dir_all(root.join("dir/sub")).expect("create untracked directory fixture");
@@ -243,7 +243,7 @@ fn status_display_option_errors_match_upstream_git() {
     let root = unique_temp_dir("status-display-option-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("u.txt"), b"untracked\n").expect("write untracked fixture");
 
         for args in [
@@ -292,7 +292,7 @@ fn status_porcelain_v2_tracked_changes_match_upstream_git() {
     let root = unique_temp_dir("status-v2-tracked");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("staged-delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("worktree-delete.txt"), b"delete\n").expect("write delete fixture");
         fs::write(root.join("staged-modify.txt"), b"base\n").expect("write modify fixture");
@@ -346,7 +346,7 @@ fn status_long_matches_upstream_git() {
     let root = unique_temp_dir("status-long");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("a.txt"), b"base\n").expect("write modify fixture");
         fs::write(root.join("d.txt"), b"delete\n").expect("write delete fixture");
         git(&root, &["add", "."]);
@@ -396,7 +396,7 @@ fn status_long_unborn_clean_matches_upstream_git() {
     let root = unique_temp_dir("status-long-unborn-clean");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for args in [
             vec!["status"],
             vec!["status", "--long"],
@@ -418,7 +418,7 @@ fn status_show_stash_matches_upstream_git() {
     let root = unique_temp_dir("status-show-stash");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"base\n").expect("write tracked fixture");
@@ -572,7 +572,7 @@ fn status_detached_head_matches_upstream_git() {
     let root = unique_temp_dir("status-detached-head");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["config", "user.name", "Example User"]);
         git(&root, &["config", "user.email", "example@example.invalid"]);
         fs::write(root.join("a.txt"), b"base\n").expect("write base fixture");
@@ -605,7 +605,7 @@ fn status_hides_root_gitignore_matches_like_upstream_git() {
     let root = unique_temp_dir("status-gitignore");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(
             root.join(".gitignore"),
             b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\n*.log\n!important.log\nignored-dir/\n",
@@ -698,7 +698,7 @@ fn status_pathspecs_match_upstream_git() {
     let root = unique_temp_dir("status-pathspecs");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create dir fixture");
         fs::create_dir_all(root.join("other")).expect("create other fixture");
         fs::write(root.join("a.txt"), b"base\n").expect("write root fixture");
@@ -738,7 +738,7 @@ fn status_nested_cwd_paths_match_upstream_git() {
     let root = unique_temp_dir("status-nested-cwd");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(root.join("dir")).expect("create dir fixture");
         fs::create_dir_all(root.join("other")).expect("create other fixture");
         fs::write(root.join("dir/a.txt"), b"base\n").expect("write dir fixture");
@@ -784,7 +784,7 @@ fn status_quoted_paths_match_upstream_git() {
     ] {
         let repo = root.join(case);
         fs::create_dir_all(&repo).expect("create case repo");
-        git(&repo, &["init", "-q"]);
+        git(&repo, &["init", "-q", "-b", "main"]);
         fs::write(repo.join(path), b"initial\n").expect("write untracked fixture");
 
         for args in [

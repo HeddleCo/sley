@@ -325,9 +325,9 @@ fn create_upstream_repo(project_root: &Path) -> PathBuf {
     std::fs::create_dir_all(&work).expect("create seed work dir");
     std::fs::create_dir_all(&bare).expect("create bare repo dir");
 
-    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare", "-b", "main"]);
 
-    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q", "-b", "main"]);
     // Ensure the default branch is "main" regardless of the host git config.
     run_success(sley_testkit::oracle_git(), &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     std::fs::write(work.join("payload.txt"), b"http payload\n").expect("write payload");
@@ -390,7 +390,7 @@ fn add_upstream_commit(project_root: &Path, bare: &Path) -> String {
     let work = project_root.join("update-work");
     std::fs::create_dir_all(&work).expect("create update work dir");
     let bare_arg = bare.to_string_lossy().to_string();
-    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q", "-b", "main"]);
     run_success(sley_testkit::oracle_git(), &work, &["fetch", "-q", &bare_arg, "main"]);
     run_success(
         sley_testkit::oracle_git(),
@@ -428,8 +428,8 @@ fn create_deep_upstream_repo(project_root: &Path, commits: usize) -> PathBuf {
     std::fs::create_dir_all(&work).expect("create deep seed work dir");
     std::fs::create_dir_all(&bare).expect("create bare repo dir");
 
-    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare"]);
-    run_success(sley_testkit::oracle_git(), &work, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), &bare, &["init", "-q", "--bare", "-b", "main"]);
+    run_success(sley_testkit::oracle_git(), &work, &["init", "-q", "-b", "main"]);
     run_success(sley_testkit::oracle_git(), &work, &["symbolic-ref", "HEAD", "refs/heads/main"]);
     for index in 0..commits {
         std::fs::write(work.join("payload.txt"), format!("payload {index}\n"))

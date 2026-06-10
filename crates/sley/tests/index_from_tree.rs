@@ -29,7 +29,7 @@ fn index_from_tree_matches_git_read_tree() {
         let _ = std::fs::remove_dir_all(&tmp);
         return;
     }
-    assert!(run_git(&tmp, &["init", "-q"]).is_some());
+    assert!(run_git(&tmp, &["init", "-q", "-b", "main"]).is_some());
 
     std::fs::write(tmp.join("a.txt"), b"alpha\n").expect("test operation should succeed");
     std::fs::create_dir_all(tmp.join("dir/sub")).expect("test operation should succeed");

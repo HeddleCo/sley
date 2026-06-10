@@ -89,7 +89,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 
 fn prepare_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "one"]);
     run_success_with_identity(root, &["commit", "--allow-empty", "-qm", "two"]);
     run_success(sley_testkit::oracle_git(), root, &["branch", "topic", "HEAD~1"]);
@@ -100,7 +100,7 @@ fn prepare_reflog_repo(root: &Path) {
 
 fn prepare_drop_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     run_success_with_identity_at(
         root,
         &["commit", "--allow-empty", "-qm", "one"],
@@ -120,7 +120,7 @@ fn prepare_drop_reflog_repo(root: &Path) {
 
 fn prepare_linear_reflog_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     for (index, message) in ["one", "two", "three"].iter().enumerate() {
         let date = format!("1970-01-01T00:00:0{} +0000", index + 1);
         let output = Command::new(sley_testkit::oracle_git())

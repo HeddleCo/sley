@@ -145,7 +145,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
 /// Initialize an empty repository driven by either binary's `init`.
 fn init_repo(program: &str, root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    run_ok(program, root, &["init", "-q"]);
+    run_ok(program, root, &["init", "-q", "-b", "main"]);
 }
 
 /// Build a two-commit history in `root` using the system `git` (object ids are

@@ -79,7 +79,7 @@ fn for_each_ref_minimal_formats_match_upstream_git() {
     let linked = unique_temp_dir("for-each-ref-linked");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("file"), b"file\n").expect("write fixture");
         git(&root, &["add", "file"]);
         git(
@@ -1204,7 +1204,7 @@ fn for_each_ref_direct_remote_refspecs_match_upstream_git() {
     let root = unique_temp_dir("for-each-ref-direct-refspecs");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("file"), b"file\n").expect("write fixture");
         git(&root, &["add", "file"]);
         git(

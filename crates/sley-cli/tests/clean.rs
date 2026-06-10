@@ -56,7 +56,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::create_dir_all(root.join("tracked")).expect("create tracked dir");
     fs::write(root.join("tracked/keep.txt"), b"keep\n").expect("write tracked fixture");
     git(root, &["add", "tracked/keep.txt"]);
@@ -67,7 +67,7 @@ fn fixture(root: &Path) {
 }
 
 fn exclude_fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("drop.tmp"), b"drop\n").expect("write drop fixture");
     fs::write(root.join("keep.tmp"), b"keep\n").expect("write keep fixture");
     fs::create_dir_all(root.join("scratch")).expect("create scratch dir");
@@ -75,7 +75,7 @@ fn exclude_fixture(root: &Path) {
 }
 
 fn ignore_fixture(root: &Path) {
-    git(root, &["init", "-q"]);
+    git(root, &["init", "-q", "-b", "main"]);
     fs::write(
         root.join(".gitignore"),
         b"\\#ignored.hash\n\\!ignored.bang\n\\*.literal\nliteral-\\?.tmp\nliteral-\\[ab\\].tmp\ntrailing.log   \nliteral-space\\ \nclass-[ab].tmp\nrange-[0-2].tmp\nnegclass-[!z].tmp\nslash/*.tmp\nslash/**/*.deep\nslash/**/wild.tmp\n*.log\n!important.log\nignored-dir/\n",

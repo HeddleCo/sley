@@ -148,7 +148,7 @@ fn git(cwd: &Path, args: &[&str]) -> Vec<u8> {
 }
 
 fn prepare_tag_message_repo(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     let commit = run_output_with_identity(
         sley_testkit::oracle_git(),
         root,
@@ -189,7 +189,7 @@ fn tag_create_errors_match_upstream_git() {
     let root = unique_temp_dir("tag-create-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -422,7 +422,7 @@ fn tag_delete_missing_matches_upstream_git() {
     let root = unique_temp_dir("tag-delete-missing");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -801,7 +801,7 @@ fn tag_force_create_and_update_match_upstream_git() {
     let root = unique_temp_dir("tag-force");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -1011,7 +1011,7 @@ fn tag_create_reflog_matches_upstream_git() {
         fs::create_dir_all(&expected_root).expect("create expected repo");
         fs::create_dir_all(&actual_root).expect("create actual repo");
         for repo in [&expected_root, &actual_root] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             run_with_named_identity_at(
                 sley_testkit::oracle_git(),
                 repo,
@@ -1165,7 +1165,7 @@ fn tag_verify_unsigned_and_lightweight_match_upstream_git() {
     let root = unique_temp_dir("tag-verify");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -1253,7 +1253,7 @@ fn tag_list_ignore_case_sorts_metadata_like_upstream_git() {
     let root = unique_temp_dir("tag-list-ignore-case-sort-metadata");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_named_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -1403,7 +1403,7 @@ fn tag_list_column_modes_match_upstream_git() {
     let root = unique_temp_dir("tag-list-column");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,
@@ -1459,7 +1459,7 @@ fn tag_list_patterns_match_upstream_git() {
     let root = unique_temp_dir("tag-list-patterns");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             sley_testkit::oracle_git(),
             &root,

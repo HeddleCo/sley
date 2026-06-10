@@ -76,7 +76,7 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn prepare_commit_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("tracked.txt"), b"tracked\n").expect("write tracked file");
     run_success(sley_testkit::oracle_git(), root, &["add", "tracked.txt"]);
     fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
@@ -198,7 +198,7 @@ fn commit_message_option_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-message-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
         for args in [
             vec!["commit", "-m"],
@@ -1069,8 +1069,8 @@ fn commit_status_preview_modes_match_upstream_git() {
             let actual_root = root.join(format!("{name}-actual"));
             fs::create_dir_all(&expected_root).expect("create expected repo");
             fs::create_dir_all(&actual_root).expect("create actual repo");
-            run_success(sley_testkit::oracle_git(), &expected_root, &["init", "-q"]);
-            run_success(sley_testkit::oracle_git(), &actual_root, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), &expected_root, &["init", "-q", "-b", "main"]);
+            run_success(sley_testkit::oracle_git(), &actual_root, &["init", "-q", "-b", "main"]);
 
             let expected = run_output_with_identity(sley_testkit::oracle_git(), &expected_root, &args);
             let actual = run_output_with_identity(env!("CARGO_BIN_EXE_sley"), &actual_root, &args);
@@ -1685,7 +1685,7 @@ fn commit_tree_argument_errors_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-argument-errors");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
         for args in [
             vec!["commit-tree", empty_tree, "-m"],
@@ -1707,7 +1707,7 @@ fn commit_tree_file_messages_match_upstream_git() {
     let root = unique_temp_dir("commit-tree-file-messages");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run_success(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("message-no-lf.txt"), b"file one").expect("write no-lf message");
         fs::write(root.join("message-lf.txt"), b"file two\n").expect("write lf message");
         let empty_tree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -1828,7 +1828,7 @@ fn commit_identity_falls_back_to_global_gitconfig_like_upstream_git() {
 
         for repo in [&upstream, &rust] {
             fs::create_dir_all(repo).expect("create repo dir");
-            run_success(sley_testkit::oracle_git(), repo, &["init", "-q"]);
+            run_success(sley_testkit::oracle_git(), repo, &["init", "-q", "-b", "main"]);
             fs::write(repo.join("tracked.txt"), b"tracked\n").expect("write tracked file");
             run_success(sley_testkit::oracle_git(), repo, &["add", "tracked.txt"]);
         }

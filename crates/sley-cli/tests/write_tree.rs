@@ -65,7 +65,7 @@ fn remove_loose_object(root: &Path, oid: &str) {
 
 fn prepare_repo(root: &Path) {
     fs::create_dir_all(root).expect("create repo dir");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("a"), b"data").expect("write fixture");
     run_success(sley_testkit::oracle_git(), root, &["add", "a"]);
     let oid = indexed_oid(root);
@@ -75,7 +75,7 @@ fn prepare_repo(root: &Path) {
 fn prepare_prefix_repo(root: &Path) {
     fs::create_dir_all(root.join("src")).expect("create src dir");
     fs::create_dir_all(root.join("other")).expect("create other dir");
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("src").join("a"), b"a").expect("write src fixture");
     fs::write(root.join("other").join("b"), b"b").expect("write other fixture");
     run_success(sley_testkit::oracle_git(), root, &["add", "src/a", "other/b"]);

@@ -182,7 +182,7 @@ fn assert_same_output_with_normalized_paths(
 }
 
 fn create_source_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
     run_success(sley_testkit::oracle_git(), root, &["add", "payload.txt"]);
     run_success(
@@ -204,7 +204,7 @@ fn create_source_repo(root: &Path) {
 }
 
 fn create_sha256_nested_source_repo(root: &Path) {
-    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256"]);
+    run_success(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     fs::create_dir_all(root.join("dir")).expect("create source dir");
     fs::create_dir_all(root.join("deep/nested")).expect("create source nested dir");
     fs::write(root.join("payload.txt"), b"clone payload\n").expect("write payload");
@@ -1548,7 +1548,7 @@ fn clone_local_repository_sparse_flags_match_upstream_git() {
     fs::create_dir_all(source.join("dir")).expect("create source dir");
     fs::create_dir_all(source.join("deep/nested")).expect("create source nested dir");
     {
-        run_success(sley_testkit::oracle_git(), &source, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &source, &["init", "-q", "-b", "main"]);
         fs::write(source.join("root.txt"), b"root\n").expect("write root file");
         fs::write(source.join("dir/file.txt"), b"dir\n").expect("write dir file");
         fs::write(source.join("deep/nested/file.txt"), b"deep\n").expect("write deep file");
@@ -1823,7 +1823,7 @@ fn clone_local_repository_reference_flags_match_upstream_git() {
     {
         create_source_repo(&source);
         add_feature_commit(&source);
-        run_success(sley_testkit::oracle_git(), &reference, &["init", "-q"]);
+        run_success(sley_testkit::oracle_git(), &reference, &["init", "-q", "-b", "main"]);
         fs::write(reference.join("reference.txt"), b"reference payload\n")
             .expect("write reference payload");
         run_success(sley_testkit::oracle_git(), &reference, &["add", "reference.txt"]);

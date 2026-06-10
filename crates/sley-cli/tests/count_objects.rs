@@ -75,8 +75,8 @@ fn count_objects_git_object_directory_matches_upstream_git() {
     fs::create_dir_all(&expected).expect("create expected repo");
     fs::create_dir_all(&actual).expect("create actual repo");
     {
-        run(sley_testkit::oracle_git(), &expected, &["init", "-q"]);
-        run(sley_testkit::oracle_git(), &actual, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &expected, &["init", "-q", "-b", "main"]);
+        run(sley_testkit::oracle_git(), &actual, &["init", "-q", "-b", "main"]);
         for repo in [&expected, &actual] {
             fs::create_dir_all(repo.join("custom-objects")).expect("create custom objects dir");
             fs::write(repo.join("one.txt"), b"one\n").expect("write one");
@@ -108,7 +108,7 @@ fn count_objects_matches_upstream_git_for_loose_objects() {
     let root = unique_temp_dir("count-objects");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
         run(sley_testkit::oracle_git(), &root, &["hash-object", "-w", "one.txt"]);
@@ -141,7 +141,7 @@ fn count_objects_matches_upstream_git_for_packed_objects() {
     let root = unique_temp_dir("count-objects-packed");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         fs::write(root.join("two.txt"), b"two\n").expect("write two");
         run(sley_testkit::oracle_git(), &root, &["add", "."]);
@@ -182,7 +182,7 @@ fn count_objects_prune_packable_and_garbage_match_upstream_git() {
     let root = unique_temp_dir("count-objects-prune-garbage");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        run(sley_testkit::oracle_git(), &root, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("one.txt"), b"one\n").expect("write one");
         let hash_output = git(&root, &["hash-object", "-w", "one.txt"]);
         assert!(hash_output.status.success(), "hash-object failed");
@@ -232,10 +232,10 @@ fn count_objects_verbose_lists_alternates_like_upstream_git() {
     fs::create_dir_all(&repo).expect("create repo");
     fs::create_dir_all(&alternate).expect("create alternate repo");
     {
-        run(sley_testkit::oracle_git(), &alternate, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &alternate, &["init", "-q", "-b", "main"]);
         fs::write(alternate.join("alt.txt"), b"alt\n").expect("write alternate object");
         run(sley_testkit::oracle_git(), &alternate, &["hash-object", "-w", "alt.txt"]);
-        run(sley_testkit::oracle_git(), &repo, &["init", "-q"]);
+        run(sley_testkit::oracle_git(), &repo, &["init", "-q", "-b", "main"]);
         fs::create_dir_all(repo.join(".git/objects/info")).expect("create info dir");
         fs::write(
             repo.join(".git/objects/info/alternates"),

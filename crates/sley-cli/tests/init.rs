@@ -177,11 +177,11 @@ fn init_template_and_templatedir_match_upstream_git() {
         let rust = root.join(format!("rust-{name}"));
         let upstream_path = upstream.to_str().expect("utf8 temp path");
         let rust_path = rust.to_str().expect("utf8 temp path");
-        let mut upstream_args = vec!["init", "-q"];
+        let mut upstream_args = vec!["init", "-q", "-b", "main"];
         upstream_args.extend_from_slice(&extra_args);
         upstream_args.push(upstream_path);
         git(&root, &upstream_args);
-        let mut rust_args = vec!["init", "-q"];
+        let mut rust_args = vec!["init", "-q", "-b", "main"];
         rust_args.extend_from_slice(&extra_args);
         rust_args.push(rust_path);
         git_rs(&root, &rust_args);
@@ -280,8 +280,8 @@ fn init_shared_and_object_format_match_upstream_git() {
     let root = unique_temp_dir("init-shared-object-format");
     fs::create_dir_all(&root).expect("create temp root");
     for (name, args) in [
-        ("shared", vec!["init", "-q", "--shared=group"]),
-        ("sha256-env", vec!["init", "-q"]),
+        ("shared", vec!["init", "-q", "--shared=group", "-b", "main"]),
+        ("sha256-env", vec!["init", "-q", "-b", "main"]),
     ] {
         let upstream = root.join(format!("git-{name}"));
         let rust = root.join(format!("rust-{name}"));
@@ -564,25 +564,25 @@ fn init_object_format_env_and_cli_precedence_match_upstream_git() {
     let cases = [
         Case {
             name: "env-sha256-overrides-config",
-            args: &["init", "-q"],
+            args: &["init", "-q", "-b", "main"],
             envs: &[("HOME", home_arg), ("GIT_DEFAULT_HASH", "sha256")],
             show_format: true,
         },
         Case {
             name: "cli-overrides-env",
-            args: &["init", "-q", "--object-format=sha256"],
+            args: &["init", "-q", "--object-format=sha256", "-b", "main"],
             envs: &[("HOME", home_arg), ("GIT_DEFAULT_HASH", "sha1")],
             show_format: true,
         },
         Case {
             name: "env-garbage-fatal",
-            args: &["init", "-q"],
+            args: &["init", "-q", "-b", "main"],
             envs: &[("HOME", home_arg), ("GIT_DEFAULT_HASH", "garbage")],
             show_format: false,
         },
         Case {
             name: "cli-garbage-fatal",
-            args: &["init", "-q", "--object-format=garbage"],
+            args: &["init", "-q", "--object-format=garbage", "-b", "main"],
             envs: &[("HOME", home_arg)],
             show_format: false,
         },

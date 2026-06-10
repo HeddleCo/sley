@@ -123,7 +123,7 @@ fn log_minimal_format_matches_upstream_git() {
     let root = unique_temp_dir("log-minimal-format");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
         git(
@@ -587,7 +587,7 @@ fn log_oneline_matches_upstream_git() {
     let root = unique_temp_dir("log-oneline");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
         git(
@@ -664,7 +664,7 @@ fn log_pretty_oneline_aliases_match_upstream_git() {
     let root = unique_temp_dir("log-pretty-oneline");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
         git(
@@ -757,7 +757,7 @@ fn log_first_parent_matches_upstream_git() {
     let root = unique_temp_dir("log-first-parent");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("base.txt"), b"base\n").expect("write fixture");
         git(&root, &["add", "base.txt"]);
         git(
@@ -919,7 +919,7 @@ fn log_author_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-author-filter");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (author, subject) in [
             ("Alpha Author <alpha@example.invalid>", "alpha"),
             ("Beta Writer <beta@example.invalid>", "beta"),
@@ -975,7 +975,7 @@ fn log_committer_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-committer-filter");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (committer_name, committer_email, subject) in [
             ("Alpha Committer", "alpha-commit@example.invalid", "alpha"),
             ("Beta Committer", "beta-commit@example.invalid", "beta"),
@@ -1049,7 +1049,7 @@ fn log_epoch_age_filters_match_upstream_git() {
     let root = unique_temp_dir("log-age-filter");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (timestamp, subject) in [(1000, "one"), (2000, "two"), (3000, "three")] {
             let date = format!("@{timestamp} +0000");
             git_with_env(
@@ -1128,7 +1128,7 @@ fn log_regexp_ignore_case_filters_match_upstream_git() {
     let root = unique_temp_dir("log-regexp-ignore-case");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (author, committer_name, committer_email, subject, body) in [
             (
                 "Alpha Author <alpha-author@example.invalid>",
@@ -1208,7 +1208,7 @@ fn log_fixed_string_filters_match_upstream_git() {
     let root = unique_temp_dir("log-fixed-strings");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (author, committer_name, committer_email, subject) in [
             (
                 "A.B Author <ab-author@example.invalid>",
@@ -1324,7 +1324,7 @@ fn log_grep_filter_matches_upstream_git() {
     let root = unique_temp_dir("log-grep-filter");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (author, subject, body) in [
             (
                 "Alpha Author <alpha@example.invalid>",
@@ -1428,7 +1428,7 @@ fn log_custom_format_placeholders_match_upstream_git() {
     let root = unique_temp_dir("log-custom-format");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         fs::write(root.join("hello.txt"), b"hello\n").expect("write fixture");
         git(&root, &["add", "hello.txt"]);
         git(
@@ -1588,7 +1588,7 @@ fn log_reverse_matches_upstream_git() {
     let root = unique_temp_dir("log-reverse");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         for (path, subject) in [
             ("one.txt", "first subject"),
             ("two.txt", "second subject"),

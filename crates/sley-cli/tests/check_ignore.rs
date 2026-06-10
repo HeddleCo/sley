@@ -71,12 +71,12 @@ fn assert_same_output(actual: Output, expected: Output, args: &[&str]) {
 }
 
 fn fixture(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q", "-b", "main"]);
     write_fixture_contents(root);
 }
 
 fn sha256_fixture(root: &Path) {
-    run(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256"]);
+    run(sley_testkit::oracle_git(), root, &["init", "-q", "--object-format=sha256", "-b", "main"]);
     write_fixture_contents(root);
 }
 

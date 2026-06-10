@@ -73,7 +73,7 @@ fn parses_and_round_trips_git_add_dash_n_index_byte_for_byte() {
         return;
     }
 
-    assert!(git_ok(&tmp, &["init", "-q"]));
+    assert!(git_ok(&tmp, &["init", "-q", "-b", "main"]));
     std::fs::write(tmp.join("tracked.txt"), b"already\n").expect("test operation should succeed");
     assert!(git_ok(&tmp, &["add", "tracked.txt"]));
     std::fs::write(tmp.join("pending.txt"), b"pending\n").expect("test operation should succeed");
