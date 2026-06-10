@@ -1561,17 +1561,98 @@ fn validate_worktree_add_destination(path: &Path, original: &str) -> Result<()> 
     Ok(())
 }
 
+/// git's `refname_disposition` table (refs.c): per-byte classification used to
+/// sanitize a single refname component. 0 = allowed, 1 = terminator (`\0`/`/`),
+/// 2 = `.`, 3 = `{`, 4 = forbidden, 5 = `*`.
+const REFNAME_DISPOSITION: [u8; 256] = [
+    1, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, //
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, //
+    4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 2, 1, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 4, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 0, 4, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 4, 4, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+];
+
+const LOCK_SUFFIX: &[u8] = b".lock";
+
+/// Port of git's single-component `sanitize_refname_component`
+/// (`check_or_sanitize_refname` + `check_refname_component` with
+/// `REFNAME_ALLOW_ONELEVEL`): forbidden bytes (and `*`, `@{`) become `-`, ".."
+/// collapses to ".", a leading "." becomes "-", and trailing ".lock" suffixes
+/// are stripped. Operates on bytes (refnames are byte strings) and returns a
+/// lossy UTF-8 string for use as a directory name.
+fn sanitize_refname_component(input: &str) -> String {
+    let bytes = input.as_bytes();
+    if bytes == b"@" {
+        return "-".to_string();
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut last: u8 = 0;
+    for &ch in bytes {
+        let disp = REFNAME_DISPOSITION[ch as usize];
+        if disp != 1 {
+            out.push(ch);
+        }
+        match disp {
+            1 => break, // terminator (no interior '/' in a basename, but be safe)
+            2 => {
+                if last == b'.' {
+                    // collapse ".." to a single "."
+                    out.pop();
+                }
+            }
+            3 => {
+                if last == b'@' {
+                    // "@{" -> "@-" (replace the just-pushed '{')
+                    let n = out.len();
+                    out[n - 1] = b'-';
+                }
+            }
+            4 | 5 => {
+                // forbidden char (and '*' outside a refspec pattern) -> '-'
+                let n = out.len();
+                out[n - 1] = b'-';
+            }
+            _ => {}
+        }
+        last = ch;
+    }
+    if out.first() == Some(&b'.') {
+        out[0] = b'-';
+    }
+    while out.len() >= LOCK_SUFFIX.len() && out.ends_with(LOCK_SUFFIX) {
+        out.truncate(out.len() - LOCK_SUFFIX.len());
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 fn create_linked_worktree_admin_dir(common_git_dir: &Path, path: &Path) -> Result<PathBuf> {
     let worktrees_dir = common_git_dir.join("worktrees");
     fs::create_dir_all(&worktrees_dir)?;
-    let base = path
+    let raw = path
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
-        .unwrap_or("worktree")
-        .chars()
-        .map(|ch| if ch == '/' || ch == '\\' { '-' } else { ch })
-        .collect::<String>();
+        .unwrap_or("worktree");
+    // git derives the admin name via `sanitize_refname_component` (refs.c), not
+    // a naive '/'->'-' map: forbidden chars become '-', "@{" / leading '.'
+    // become '-', ".." collapses, and trailing ".lock"s are stripped.
+    let base = sanitize_refname_component(raw);
+    let base = if base.is_empty() {
+        "worktree".to_string()
+    } else {
+        base
+    };
     for suffix in 0..1000 {
         let name = if suffix == 0 {
             base.clone()
