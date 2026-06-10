@@ -65,7 +65,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/git-src
-          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}
+          key: git-src-${{ env.GIT_VERSION }}-${{ runner.os }}-v2
 
       - name: Fetch upstream git (cache miss)
         if: steps.git-cache.outputs.cache-hit != 'true'
