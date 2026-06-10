@@ -4040,6 +4040,8 @@ fn print_for_each_ref_format(
                             )?;
                         }
                     }
+                } else if let Some(result) = for_each_ref_try_trailers_atom(stdout, other, context) {
+                    result?;
                 } else if let Some(result) = for_each_ref_try_email_atom(stdout, other, context) {
                     result?;
                 } else if let Some(result) = for_each_ref_try_name_atom(stdout, other, context) {
@@ -4067,6 +4069,14 @@ fn print_for_each_ref_format(
                     {
                         write_for_each_ref_contents_lines(stdout, message, count)?;
                     }
+                } else if let Some(arg) = other
+                    .strip_prefix("contents:")
+                    .or_else(|| other.strip_prefix("*contents:"))
+                {
+                    // A `%(contents:XXX)` that none of the contents sub-atoms
+                    // above recognized — git reports the bare contents arg.
+                    eprintln!("fatal: unrecognized %(contents) argument: {arg}");
+                    return Err(GitError::Exit(128));
                 } else {
                     return Err(GitError::Command(format!(
                         "unsupported for-each-ref format placeholder %({other})"
@@ -4334,6 +4344,68 @@ fn for_each_ref_try_email_atom(
         None => ForEachRefEmailOptions::default(),
     };
     Some(for_each_ref_write_email(stdout, context, peeled, role, options))
+}
+
+/// If `placeholder` is a trailers atom (`%(trailers[:opts])` or
+/// `%(contents:trailers[:opts])`, with optional `*` peel), render it. Returns
+/// `Some(Err(_))` (after reporting to stderr) for the bad-argument cases.
+fn for_each_ref_try_trailers_atom(
+    stdout: &mut impl Write,
+    placeholder: &str,
+    context: &ForEachRefFormatContext<'_>,
+) -> Option<Result<()>> {
+    let (base, peeled) = placeholder
+        .strip_prefix('*')
+        .map(|rest| (rest, true))
+        .unwrap_or((placeholder, false));
+
+    // Accept `trailers`, `trailers:ARG`, `contents:trailers`,
+    // `contents:trailers:ARG`. The `contents:` prefix shares git's
+    // `%(contents)` bad-argument error for `contents:trailersXXX`.
+    let arg: Option<&str> = if base == "trailers" {
+        None
+    } else if let Some(rest) = base.strip_prefix("trailers:") {
+        Some(rest)
+    } else if let Some(rest) = base.strip_prefix("contents:") {
+        if rest == "trailers" {
+            None
+        } else if let Some(rest) = rest.strip_prefix("trailers:") {
+            Some(rest)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let options = match arg {
+        None => commands::for_each_ref::ForEachRefTrailerOptions::default(),
+        Some(arg) => match commands::for_each_ref::parse_for_each_ref_trailer_options(arg) {
+            Ok(options) => options,
+            Err(None) => {
+                eprintln!("fatal: expected %(trailers:key=<value>)");
+                return Some(Err(GitError::Exit(128)));
+            }
+            Err(Some(invalid)) => {
+                eprintln!("fatal: unknown %(trailers) argument: {invalid}");
+                return Some(Err(GitError::Exit(128)));
+            }
+        },
+    };
+
+    Some((|| -> Result<()> {
+        if let Some(message) = for_each_ref_message(context, peeled) {
+            // git formats trailers over the message from the subject start to
+            // the signature start (sig stripped).
+            let parts = for_each_ref_message_parts(message);
+            let sig_len = parts.signature.len();
+            let trailer_src = &parts.bare[..parts.bare.len().saturating_sub(sig_len)];
+            let rendered =
+                commands::for_each_ref::for_each_ref_format_trailers(trailer_src, &options);
+            stdout.write_all(&rendered)?;
+        }
+        Ok(())
+    })())
 }
 
 /// The raw message bytes for the ref's own object (`peeled == false`) or the

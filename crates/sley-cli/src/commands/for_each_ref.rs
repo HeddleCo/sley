@@ -729,6 +729,8 @@ impl ForEachRefNeeds {
                     || other.starts_with("creatorname:")
                     || other.starts_with("subject:")
                     || other.starts_with("contents:")
+                    || other == "trailers"
+                    || other.starts_with("trailers:")
                 {
                     // subject:sanitize, contents:{signature,body,subject,lines,
                     // size,trailers}, name/email/date option variants — all read
@@ -749,6 +751,461 @@ impl ForEachRefNeeds {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// %(trailers) / %(contents:trailers) — a focused port of git's
+// format_trailers_from_commit (trailer.c) restricted to the for-each-ref atom
+// option set: only, unfold, keyonly, valueonly, key, separator,
+// key_value_separator.
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+pub(crate) struct ForEachRefTrailerOptions {
+    only: bool,
+    unfold: bool,
+    key_only: bool,
+    value_only: bool,
+    /// `Some` when any `key=` filter was given; lookups are case-insensitive.
+    filter: Option<Vec<String>>,
+    separator: Option<String>,
+    key_value_separator: Option<String>,
+}
+
+/// Parse the `%(trailers:...)` option string (the part after the colon, with a
+/// synthetic trailing `)` removed). `Err(None)` => `expected %(trailers:key=...)`;
+/// `Err(Some(arg))` => `unknown %(trailers) argument: arg`.
+pub(crate) fn parse_for_each_ref_trailer_options(
+    arg: &str,
+) -> std::result::Result<ForEachRefTrailerOptions, Option<String>> {
+    let mut options = ForEachRefTrailerOptions::default();
+    let mut rest = arg;
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "key") {
+            // git: a `key` with no `=value` is an error (-1 -> expected ...).
+            let Some(value) = value else {
+                return Err(None);
+            };
+            let value = value.strip_suffix(':').unwrap_or(value);
+            options
+                .filter
+                .get_or_insert_with(Vec::new)
+                .push(value.to_string());
+            options.only = true;
+            rest = tail;
+        } else if let Some((value, tail)) = for_each_ref_match_arg_value(rest, "separator") {
+            options.separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
+            rest = tail;
+        } else if let Some((value, tail)) =
+            for_each_ref_match_arg_value(rest, "key_value_separator")
+        {
+            options.key_value_separator = Some(for_each_ref_expand_string_arg(value.unwrap_or("")));
+            rest = tail;
+        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "only", &mut options.only) {
+            rest = tail;
+        } else if let Some(tail) = for_each_ref_match_bool_arg(rest, "unfold", &mut options.unfold) {
+            rest = tail;
+        } else if let Some(tail) =
+            for_each_ref_match_bool_arg(rest, "keyonly", &mut options.key_only)
+        {
+            rest = tail;
+        } else if let Some(tail) =
+            for_each_ref_match_bool_arg(rest, "valueonly", &mut options.value_only)
+        {
+            rest = tail;
+        } else {
+            // git: invalid_arg = up to the next ',' or ')'.
+            let len = rest
+                .find([',', ')'])
+                .unwrap_or(rest.len());
+            return Err(Some(rest[..len].to_string()));
+        }
+    }
+    Ok(options)
+}
+
+/// git `match_placeholder_arg_value`: match `candidate` at the start of `to_parse`
+/// followed by `=value` (until `,`/`)`), or bare (followed by `,`/end). Returns
+/// `(value, remainder)` on a match. The input has no trailing `)` (we operate on
+/// the comma-joined option list directly), so end-of-string acts like `)`.
+fn for_each_ref_match_arg_value<'a>(
+    to_parse: &'a str,
+    candidate: &str,
+) -> Option<(Option<&'a str>, &'a str)> {
+    let p = to_parse.strip_prefix(candidate)?;
+    if let Some(after_eq) = p.strip_prefix('=') {
+        let len = after_eq.find([',', ')']).unwrap_or(after_eq.len());
+        let value = &after_eq[..len];
+        let p = &after_eq[len..];
+        let tail = p.strip_prefix(',').unwrap_or(p);
+        Some((Some(value), tail))
+    } else if let Some(tail) = p.strip_prefix(',') {
+        Some((None, tail))
+    } else if p.is_empty() || p.starts_with(')') {
+        Some((None, p.strip_prefix(')').unwrap_or(p)))
+    } else {
+        None
+    }
+}
+
+/// git `match_placeholder_bool_arg` for the value-less boolean options used by
+/// for-each-ref (`only`/`unfold`/`keyonly`/`valueonly`), incl. `=yes/no/...`.
+fn for_each_ref_match_bool_arg<'a>(
+    to_parse: &'a str,
+    candidate: &str,
+    out: &mut bool,
+) -> Option<&'a str> {
+    let (value, tail) = for_each_ref_match_arg_value(to_parse, candidate)?;
+    match value {
+        None => {
+            *out = true;
+            Some(tail)
+        }
+        Some(value) => match for_each_ref_parse_maybe_bool(value) {
+            Some(v) => {
+                *out = v;
+                Some(tail)
+            }
+            // git returns 0 here (no match) so the option falls through to the
+            // unknown-argument path.
+            None => None,
+        },
+    }
+}
+
+fn for_each_ref_parse_maybe_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "yes" | "true" => Some(true),
+        "0" | "no" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+/// git `expand_string_arg`: only `%%` and `%x##` literal escapes are expanded;
+/// any other `%` is emitted verbatim.
+fn for_each_ref_expand_string_arg(arg: &str) -> String {
+    let bytes = arg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] != b'%' {
+            out.push(bytes[idx]);
+            idx += 1;
+            continue;
+        }
+        if bytes.get(idx + 1) == Some(&b'%') {
+            out.push(b'%');
+            idx += 2;
+        } else if bytes.get(idx + 1) == Some(&b'x')
+            && let (Some(h), Some(l)) = (
+                bytes.get(idx + 2).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(idx + 3).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            idx += 4;
+        } else {
+            out.push(b'%');
+            idx += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+struct ForEachRefTrailerItem {
+    /// `Some(token)` for a real trailer; `None` for a preserved non-trailer line.
+    token: Option<String>,
+    value: String,
+}
+
+/// Render `%(trailers)` for `message` under `options`, mirroring git's
+/// `format_trailers_from_commit` + `format_trailers`.
+pub(crate) fn for_each_ref_format_trailers(message: &[u8], options: &ForEachRefTrailerOptions) -> Vec<u8> {
+    let text = String::from_utf8_lossy(message);
+    let block = for_each_ref_trailer_block(&text);
+    // Fast path: unmodified whole block.
+    if !options.only
+        && !options.unfold
+        && options.filter.is_none()
+        && options.separator.is_none()
+        && !options.key_only
+        && !options.value_only
+        && options.key_value_separator.is_none()
+    {
+        return block.as_bytes().to_vec();
+    }
+    let items = for_each_ref_parse_trailer_items(&block, options);
+    let mut out = String::new();
+    let orig_len = out.len();
+    for item in &items {
+        match &item.token {
+            Some(token) => {
+                let mut value = item.value.clone();
+                if options.unfold {
+                    value = for_each_ref_unfold(&value);
+                }
+                if let Some(filter) = &options.filter
+                    && !filter.iter().any(|key| key.eq_ignore_ascii_case(token))
+                {
+                    continue;
+                }
+                if let Some(sep) = &options.separator
+                    && out.len() != orig_len
+                {
+                    out.push_str(sep);
+                }
+                if !options.value_only {
+                    out.push_str(token);
+                }
+                if !options.key_only && !options.value_only {
+                    if let Some(kvsep) = &options.key_value_separator {
+                        out.push_str(kvsep);
+                    } else {
+                        // git appends "%c " using separators[0] (':') only when
+                        // the token doesn't already end with a separator char.
+                        let last = token.trim_end().chars().last();
+                        if last != Some(':') {
+                            out.push_str(": ");
+                        }
+                    }
+                }
+                if !options.key_only {
+                    out.push_str(&value);
+                }
+                if options.separator.is_none() {
+                    out.push('\n');
+                }
+            }
+            None => {
+                if options.only {
+                    continue;
+                }
+                if let Some(sep) = &options.separator
+                    && out.len() != orig_len
+                {
+                    out.push_str(sep);
+                }
+                out.push_str(&item.value);
+                if options.separator.is_some() {
+                    while out.ends_with([' ', '\t', '\n', '\r']) {
+                        out.pop();
+                    }
+                } else {
+                    out.push('\n');
+                }
+            }
+        }
+    }
+    out.into_bytes()
+}
+
+/// The trailer block text (`[start, end)`) of a message, with `no_divider=1`
+/// (the whole message is the log region).
+fn for_each_ref_trailer_block(message: &str) -> String {
+    let bytes = message.as_bytes();
+    let len = bytes.len();
+    let start = for_each_ref_find_trailer_block_start(message, len);
+    message[start..].to_string()
+}
+
+/// Port of trailer.c `find_trailer_block_start` (no comment prefix; default
+/// `:` separator; `Signed-off-by: ` / `(cherry picked from commit ` prefixes).
+fn for_each_ref_find_trailer_block_start(buf: &str, len: usize) -> usize {
+    let bytes = buf.as_bytes();
+    // Skip the title paragraph up to the first blank line.
+    let mut s = 0usize;
+    while s < len {
+        if for_each_ref_is_blank_line(bytes, s) {
+            break;
+        }
+        s = for_each_ref_next_line(bytes, s, len);
+    }
+    let end_of_title = s;
+
+    let mut only_spaces = true;
+    let mut recognized_prefix = false;
+    let mut trailer_lines = 0i64;
+    let mut non_trailer_lines = 0i64;
+    let mut possible_continuation = 0i64;
+
+    let mut maybe_l = for_each_ref_last_line(bytes, len);
+    while let Some(l) = maybe_l {
+        if l < end_of_title {
+            break;
+        }
+        if for_each_ref_is_blank_line(bytes, l) {
+            if only_spaces {
+                // trailing blank; keep scanning upward
+            } else {
+                non_trailer_lines += possible_continuation;
+                if (recognized_prefix && trailer_lines * 3 >= non_trailer_lines)
+                    || (trailer_lines > 0 && non_trailer_lines == 0)
+                {
+                    return for_each_ref_next_line(bytes, l, len);
+                }
+                return len;
+            }
+        } else {
+            only_spaces = false;
+            let line = for_each_ref_line_text(buf, l, len);
+            if line.starts_with("Signed-off-by: ")
+                || line.starts_with("(cherry picked from commit ")
+            {
+                trailer_lines += 1;
+                possible_continuation = 0;
+                recognized_prefix = true;
+            } else if for_each_ref_find_separator(line).is_some_and(|pos| pos >= 1)
+                && !bytes[l].is_ascii_whitespace()
+            {
+                trailer_lines += 1;
+                possible_continuation = 0;
+            } else if bytes[l].is_ascii_whitespace() {
+                possible_continuation += 1;
+            } else {
+                non_trailer_lines += 1;
+                non_trailer_lines += possible_continuation;
+                possible_continuation = 0;
+            }
+        }
+        if l == 0 {
+            break;
+        }
+        maybe_l = for_each_ref_last_line(bytes, l);
+    }
+    len
+}
+
+/// Parse the trailer block into items, joining continuation lines (git's
+/// `trailer_block_get` split + `parse_trailers`).
+fn for_each_ref_parse_trailer_items(
+    block: &str,
+    options: &ForEachRefTrailerOptions,
+) -> Vec<ForEachRefTrailerItem> {
+    // Split on '\n' keeping each line; fold continuation lines (leading
+    // whitespace) into the previous line *only if it had a separator*.
+    let mut lines: Vec<String> = Vec::new();
+    let mut last_had_sep = false;
+    for raw in block.split_inclusive('\n') {
+        if last_had_sep
+            && raw.starts_with([' ', '\t'])
+            && let Some(prev) = lines.last_mut()
+        {
+            prev.push_str(raw);
+            continue;
+        }
+        let has_sep = for_each_ref_find_separator(raw).is_some_and(|pos| pos >= 1);
+        last_had_sep = has_sep;
+        lines.push(raw.to_string());
+    }
+
+    let mut items = Vec::new();
+    for line in &lines {
+        // Trim a single trailing newline for separator analysis / raw value.
+        let trimmed_nl = line.strip_suffix('\n').unwrap_or(line);
+        match for_each_ref_find_separator(line).filter(|pos| *pos >= 1) {
+            Some(sep) => {
+                let token = line[..sep].trim().to_string();
+                let value = line[sep + 1..].trim().to_string();
+                items.push(ForEachRefTrailerItem {
+                    token: Some(token),
+                    value,
+                });
+            }
+            None => {
+                if !options.only {
+                    items.push(ForEachRefTrailerItem {
+                        token: None,
+                        value: trimmed_nl.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    items
+}
+
+/// git `find_separator` restricted to the default `:` separator.
+fn for_each_ref_find_separator(line: &str) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let mut whitespace_found = false;
+    for (idx, &c) in bytes.iter().enumerate() {
+        if c == b':' {
+            return Some(idx);
+        }
+        if !whitespace_found && (c.is_ascii_alphanumeric() || c == b'-') {
+            continue;
+        }
+        if idx != 0 && (c == b' ' || c == b'\t') {
+            whitespace_found = true;
+            continue;
+        }
+        break;
+    }
+    None
+}
+
+/// git `unfold_value`: a newline plus following whitespace run collapses to one
+/// space; result is trimmed.
+fn for_each_ref_unfold(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out.trim().to_string()
+}
+
+fn for_each_ref_is_blank_line(bytes: &[u8], pos: usize) -> bool {
+    let mut idx = pos;
+    while idx < bytes.len() && bytes[idx] != b'\n' {
+        if !bytes[idx].is_ascii_whitespace() {
+            return false;
+        }
+        idx += 1;
+    }
+    true
+}
+
+fn for_each_ref_next_line(bytes: &[u8], pos: usize, len: usize) -> usize {
+    match bytes[pos..len].iter().position(|&b| b == b'\n') {
+        Some(rel) => pos + rel + 1,
+        None => len,
+    }
+}
+
+/// The byte offset of the start of the last line within `bytes[..len]`.
+fn for_each_ref_last_line(bytes: &[u8], len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    // If the region ends with '\n', that newline terminates the prior line.
+    let end = if bytes[len - 1] == b'\n' { len - 1 } else { len };
+    if end == 0 {
+        return Some(0);
+    }
+    match bytes[..end].iter().rposition(|&b| b == b'\n') {
+        Some(nl) => Some(nl + 1),
+        None => Some(0),
+    }
+}
+
+fn for_each_ref_line_text(buf: &str, pos: usize, len: usize) -> &str {
+    let bytes = buf.as_bytes();
+    let end = match bytes[pos..len].iter().position(|&b| b == b'\n') {
+        Some(rel) => pos + rel,
+        None => len,
+    };
+    &buf[pos..end]
 }
 
 /// Whether the format contains a bare `%(raw)` / `%(*raw)` atom (not

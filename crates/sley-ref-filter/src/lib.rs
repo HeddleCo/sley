@@ -705,10 +705,10 @@ fn for_each_ref_relative_date(timestamp: i64) -> String {
         }
         return "1 year ago".to_string();
     }
-    if years_scaled % 10 != 0 {
-        format!("{}.{} years ago", years_scaled / 10, years_scaled % 10)
-    } else {
+    if years_scaled.is_multiple_of(10) {
         format!("{} years ago", years_scaled / 10)
+    } else {
+        format!("{}.{} years ago", years_scaled / 10, years_scaled % 10)
     }
 }
 
