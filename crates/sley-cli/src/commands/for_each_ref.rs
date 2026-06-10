@@ -556,6 +556,10 @@ enum ForEachRefSort {
     BodyDescending,
     ContentsSize,
     ContentsSizeDescending,
+    Raw,
+    RawDescending,
+    RawSize,
+    RawSizeDescending,
     PeeledSubject,
     PeeledSubjectDescending,
     PeeledBody,
@@ -719,8 +723,16 @@ impl ForEachRefNeeds {
                     || other.starts_with("authoremail:")
                     || other.starts_with("committeremail:")
                     || other.starts_with("taggeremail:")
-                    || other.starts_with("contents:lines=")
+                    || other.starts_with("authorname:")
+                    || other.starts_with("committername:")
+                    || other.starts_with("taggername:")
+                    || other.starts_with("creatorname:")
+                    || other.starts_with("subject:")
+                    || other.starts_with("contents:")
                 {
+                    // subject:sanitize, contents:{signature,body,subject,lines,
+                    // size,trailers}, name/email/date option variants — all read
+                    // the object (or peeled target).
                     true
                 } else {
                     // refname*, symref*, upstream*, push*, color:, HEAD, ahead-behind:,
@@ -789,6 +801,10 @@ fn parse_for_each_ref_sort(value: &str) -> Result<ForEachRefSort> {
         "-body" | "-contents:body" => Ok(ForEachRefSort::BodyDescending),
         "contents:size" => Ok(ForEachRefSort::ContentsSize),
         "-contents:size" => Ok(ForEachRefSort::ContentsSizeDescending),
+        "raw" => Ok(ForEachRefSort::Raw),
+        "-raw" => Ok(ForEachRefSort::RawDescending),
+        "raw:size" => Ok(ForEachRefSort::RawSize),
+        "-raw:size" => Ok(ForEachRefSort::RawSizeDescending),
         "*subject" | "*contents:subject" => Ok(ForEachRefSort::PeeledSubject),
         "-*subject" | "-*contents:subject" => Ok(ForEachRefSort::PeeledSubjectDescending),
         "*body" | "*contents:body" => Ok(ForEachRefSort::PeeledBody),
@@ -919,6 +935,8 @@ impl ForEachRefSort {
                 | ForEachRefSort::SubjectDescending
                 | ForEachRefSort::BodyDescending
                 | ForEachRefSort::ContentsSizeDescending
+                | ForEachRefSort::RawDescending
+                | ForEachRefSort::RawSizeDescending
                 | ForEachRefSort::PeeledSubjectDescending
                 | ForEachRefSort::PeeledBodyDescending
                 | ForEachRefSort::PeeledContentsSizeDescending
@@ -1026,6 +1044,20 @@ fn for_each_ref_sort_key(
                     .unwrap_or(0),
             )
         }
+        ForEachRefSort::Raw | ForEachRefSort::RawDescending => ForEachRefSortKey::Bytes(
+            if let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? {
+                context.db.read_object(&oid)?.body.clone()
+            } else {
+                Vec::new()
+            },
+        ),
+        ForEachRefSort::RawSize | ForEachRefSort::RawSizeDescending => ForEachRefSortKey::Number(
+            if let Some((oid, _)) = resolve_for_each_ref_target(context.store, reference)? {
+                context.db.read_object(&oid)?.body.len() as i128
+            } else {
+                0
+            },
+        ),
         ForEachRefSort::PeeledSubject | ForEachRefSort::PeeledSubjectDescending => {
             ForEachRefSortKey::Text(
                 for_each_ref_sort_peeled_contents(reference, context)?
@@ -1307,6 +1339,9 @@ enum ForEachRefSortKey {
     Number(i128),
     Text(String),
     Version(String),
+    /// Raw object bytes (`--sort=raw`): git compares with memcmp over the
+    /// shared prefix, then by length — Rust's `Vec<u8>` Ord matches exactly.
+    Bytes(Vec<u8>),
 }
 
 impl Ord for ForEachRefSortKey {
@@ -1317,6 +1352,7 @@ impl Ord for ForEachRefSortKey {
             (ForEachRefSortKey::Version(left), ForEachRefSortKey::Version(right)) => {
                 version_sort_cmp(left, right)
             }
+            (ForEachRefSortKey::Bytes(left), ForEachRefSortKey::Bytes(right)) => left.cmp(right),
             (left, right) => {
                 for_each_ref_sort_key_rank(left).cmp(&for_each_ref_sort_key_rank(right))
             }
@@ -1335,6 +1371,7 @@ fn for_each_ref_sort_key_rank(key: &ForEachRefSortKey) -> u8 {
         ForEachRefSortKey::Number(_) => 0,
         ForEachRefSortKey::Text(_) => 1,
         ForEachRefSortKey::Version(_) => 2,
+        ForEachRefSortKey::Bytes(_) => 3,
     }
 }
 

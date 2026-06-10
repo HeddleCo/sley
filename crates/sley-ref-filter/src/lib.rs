@@ -188,99 +188,45 @@ fn parse_for_each_ref_identity_atom(value: &str) -> Option<ForEachRefAtom> {
         .strip_prefix('*')
         .map(|value| (value, true))
         .unwrap_or((value, false));
-    let (atom, modifier) = value.split_once(':').unwrap_or((value, ""));
+    let (atom, has_modifier) = value.split_once(':').map_or((value, false), |(atom, _)| {
+        (atom, true)
+    });
+    // `name` and the bare-identity atoms take no modifier in this typed path;
+    // anything with a `:` (e.g. `authorname:mailmap`, `author:foo`) falls through
+    // to the string/Raw renderer which owns the full option grammar + errors.
+    let plain = |part: ForEachRefAtomIdentityPart| if has_modifier { None } else { Some(part) };
     let (role, part) = match atom {
         "author" => (
             ForEachRefAtomIdentityRole::Author,
-            ForEachRefAtomIdentityPart::Full,
+            plain(ForEachRefAtomIdentityPart::Full)?,
         ),
         "authorname" => (
             ForEachRefAtomIdentityRole::Author,
-            ForEachRefAtomIdentityPart::Name,
-        ),
-        "authoremail" => (
-            ForEachRefAtomIdentityRole::Author,
-            parse_for_each_ref_email_part(modifier)?,
-        ),
-        "authordate" => (
-            ForEachRefAtomIdentityRole::Author,
-            parse_for_each_ref_date_part(modifier)?,
+            plain(ForEachRefAtomIdentityPart::Name)?,
         ),
         "committer" => (
             ForEachRefAtomIdentityRole::Committer,
-            ForEachRefAtomIdentityPart::Full,
+            plain(ForEachRefAtomIdentityPart::Full)?,
         ),
         "committername" => (
             ForEachRefAtomIdentityRole::Committer,
-            ForEachRefAtomIdentityPart::Name,
-        ),
-        "committeremail" => (
-            ForEachRefAtomIdentityRole::Committer,
-            parse_for_each_ref_email_part(modifier)?,
-        ),
-        "committerdate" => (
-            ForEachRefAtomIdentityRole::Committer,
-            parse_for_each_ref_date_part(modifier)?,
+            plain(ForEachRefAtomIdentityPart::Name)?,
         ),
         "tagger" => (
             ForEachRefAtomIdentityRole::Tagger,
-            ForEachRefAtomIdentityPart::Full,
+            plain(ForEachRefAtomIdentityPart::Full)?,
         ),
         "taggername" => (
             ForEachRefAtomIdentityRole::Tagger,
-            ForEachRefAtomIdentityPart::Name,
-        ),
-        "taggeremail" => (
-            ForEachRefAtomIdentityRole::Tagger,
-            parse_for_each_ref_email_part(modifier)?,
-        ),
-        "taggerdate" => (
-            ForEachRefAtomIdentityRole::Tagger,
-            parse_for_each_ref_date_part(modifier)?,
+            plain(ForEachRefAtomIdentityPart::Name)?,
         ),
         "creator" => (
             ForEachRefAtomIdentityRole::Creator,
-            ForEachRefAtomIdentityPart::Full,
-        ),
-        "creatordate" => (
-            ForEachRefAtomIdentityRole::Creator,
-            parse_for_each_ref_date_part(modifier)?,
+            plain(ForEachRefAtomIdentityPart::Full)?,
         ),
         _ => return None,
     };
     Some(ForEachRefAtom::Identity { peeled, role, part })
-}
-
-fn parse_for_each_ref_email_part(modifier: &str) -> Option<ForEachRefAtomIdentityPart> {
-    match modifier {
-        "" => Some(ForEachRefAtomIdentityPart::Email(
-            ForEachRefEmailMode::Bracketed,
-        )),
-        "trim" => Some(ForEachRefAtomIdentityPart::Email(ForEachRefEmailMode::Trim)),
-        "localpart" => Some(ForEachRefAtomIdentityPart::Email(
-            ForEachRefEmailMode::LocalPart,
-        )),
-        _ => None,
-    }
-}
-
-fn parse_for_each_ref_date_part(modifier: &str) -> Option<ForEachRefAtomIdentityPart> {
-    match modifier {
-        "" => Some(ForEachRefAtomIdentityPart::Date(
-            ForEachRefDateMode::Default,
-        )),
-        "raw" => Some(ForEachRefAtomIdentityPart::DateRaw),
-        "unix" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Unix)),
-        "short" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Short)),
-        "iso" | "iso8601" => Some(ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::Iso)),
-        "iso8601-strict" => Some(ForEachRefAtomIdentityPart::Date(
-            ForEachRefDateMode::IsoStrict,
-        )),
-        "rfc2822" => Some(ForEachRefAtomIdentityPart::Date(
-            ForEachRefDateMode::Rfc2822,
-        )),
-        _ => None,
-    }
 }
 
 pub fn parse_for_each_ref_contents_lines_count(value: &str) -> Result<usize> {
@@ -1342,17 +1288,15 @@ mod tests {
                     abbrev: Some(7),
                 }),
                 ForEachRefFormatSegment::Literal(b" ".to_vec()),
-                ForEachRefFormatSegment::Atom(ForEachRefAtom::Identity {
-                    peeled: false,
-                    role: ForEachRefAtomIdentityRole::Author,
-                    part: ForEachRefAtomIdentityPart::Email(ForEachRefEmailMode::Trim),
-                }),
+                // `name`/`email`/`date` atoms that carry a `:modifier` are now
+                // kept as Raw placeholders; the CLI's string renderer owns the
+                // full option grammar (mailmap, multi-option, all date modes)
+                // and the byte-exact bad-argument errors.
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw("authoremail:trim".to_string())),
                 ForEachRefFormatSegment::Literal(b" ".to_vec()),
-                ForEachRefFormatSegment::Atom(ForEachRefAtom::Identity {
-                    peeled: false,
-                    role: ForEachRefAtomIdentityRole::Author,
-                    part: ForEachRefAtomIdentityPart::Date(ForEachRefDateMode::IsoStrict),
-                }),
+                ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(
+                    "authordate:iso8601-strict".to_string(),
+                )),
                 ForEachRefFormatSegment::Literal(b" ".to_vec()),
                 ForEachRefFormatSegment::Atom(ForEachRefAtom::ContentsLines {
                     peeled: true,
