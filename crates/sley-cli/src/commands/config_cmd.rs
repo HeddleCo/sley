@@ -40,9 +40,49 @@ pub(crate) enum ConfigSubcommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfigSource {
+    /// No explicit source: reads see git's full default sequence
+    /// (system → global → local → worktree → command), writes go to the
+    /// repository config. Carries the discovered git dir.
     Repository(PathBuf),
+    /// An explicit single-layer source (`--local` / `--global` / `--system` /
+    /// `--worktree`): reads and writes use exactly this file, attributed to
+    /// the given scope. Includes are not resolved unless `--includes`.
+    ScopedFile {
+        path: PathBuf,
+        scope: sley_config::ConfigScope,
+    },
+    /// `--file <path>` / `GIT_CONFIG`: scope `command`.
     File(PathBuf),
+    /// `--blob <spec>`: scope `command`, read-only.
+    Blob(String),
+    /// `--file -`: scope `command`, read-only.
     Stdin,
+}
+
+/// Scope + origin attribution for one displayed config value, mirroring git's
+/// `key_value_info`. Stack entries carry their own; synthesized values
+/// (`--default`) are attributed to the command line.
+#[derive(Debug, Clone)]
+struct ConfigValueMeta {
+    scope: sley_config::ConfigScope,
+    origin: sley_config::ConfigOrigin,
+}
+
+impl ConfigValueMeta {
+    fn of(entry: &sley_config::ConfigStackEntry) -> Self {
+        Self {
+            scope: entry.scope,
+            origin: entry.origin.clone(),
+        }
+    }
+
+    /// git attributes `--default` fallbacks to the command line.
+    fn command_line() -> Self {
+        Self {
+            scope: sley_config::ConfigScope::Command,
+            origin: sley_config::ConfigOrigin::command_line(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -193,10 +233,45 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut subcommand_get_regexp = false;
     let mut subcommand_show_names = false;
     let mut subcommand_value_pattern: Option<String> = None;
+    let mut subcommand_url: Option<String> = None;
+    let mut use_local = false;
+    let mut use_global = false;
+    let mut use_system = false;
+    let mut use_worktree = false;
+    let mut blob = None;
+    // `--includes` / `--no-includes`; `None` = git's default (respect includes
+    // only when no explicit config file source was given).
+    let mut respect_includes_opt: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--local" => {}
+            "--local" => use_local = true,
+            "--global" => use_global = true,
+            "--system" => use_system = true,
+            "--worktree" => use_worktree = true,
+            "--includes" => respect_includes_opt = Some(true),
+            "--no-includes" => respect_includes_opt = Some(false),
+            "--blob" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--blob requires a value".into()))?;
+                blob = Some(value.to_string());
+            }
+            value if value.starts_with("--blob=") => {
+                blob = Some(value["--blob=".len()..].to_string());
+            }
+            // `git config get --url=<url>`: route through the urlmatch lookup.
+            "--url" if subcommand == Some(ConfigSubcommand::Get) => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--url requires a value".into()))?;
+                subcommand_url = Some(value.to_string());
+            }
+            value
+                if subcommand == Some(ConfigSubcommand::Get) && value.starts_with("--url=") =>
+            {
+                subcommand_url = Some(value["--url=".len()..].to_string());
+            }
             "-f" | "--file" => {
                 let value = iter
                     .next()
@@ -433,18 +508,30 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             eprintln!("fatal: --fixed-value only applies with 'value-pattern'");
             return Err(GitError::Exit(128));
         }
-        if default_value.is_some() && action == ConfigAction::GetAll {
+        if default_value.is_some()
+            && (action == ConfigAction::GetAll || subcommand_url.is_some())
+        {
             eprintln!("fatal: --default= cannot be used with --all or --url=");
+            return Err(GitError::Exit(128));
+        }
+        if subcommand_url.is_some()
+            && (action == ConfigAction::GetAll
+                || subcommand_get_regexp
+                || subcommand_value_pattern.is_some())
+        {
+            eprintln!("fatal: --url= cannot be used with --all, --regexp or --value");
             return Err(GitError::Exit(128));
         }
     } else if default_value.is_some() && action != ConfigAction::Get {
         eprintln!("error: --default is only applicable to --get");
         return Err(GitError::Exit(129));
     }
+    // git restricts `--show-origin` to the four read actions; `--show-scope`
+    // carries no such check (it works with `--get-urlmatch`, see t1300).
     if matches!(
         action,
         ConfigAction::GetColor | ConfigAction::GetColorBool | ConfigAction::GetUrlMatch
-    ) && (display.show_origin || display.show_scope)
+    ) && display.show_origin
     {
         eprintln!(
             "error: --show-origin is only applicable to --get, --get-all, --get-regexp, and --list"
@@ -503,43 +590,220 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             | ConfigAction::GetRegexp
             | ConfigAction::RenameSection
             | ConfigAction::RemoveSection
-    ) || (is_subcommand_get && subcommand_get_regexp)
+    ) || (is_subcommand_get && (subcommand_get_regexp || subcommand_url.is_some()))
     {
         // Under `git config get --regexp` the positional is a key pattern, not a
-        // concrete key, so it must not be validated/parsed as one.
+        // concrete key, and under `get --url=` it may be a bare section name, so
+        // it must not be validated/parsed as one.
         None
     } else {
         Some(parse_config_key(positional[0])?)
     };
-    // Source precedence for `git config`: an explicit `--file`/`-f` (or `-` for
-    // stdin) wins; otherwise the legacy `GIT_CONFIG` env var names a single file
-    // to read and write (like `--file`, and like `--file` it suppresses the `-c`
-    // / env config-injection overlay); otherwise the repository config is used.
+    // Source selection mirrors git's `location_options_init`: at most one of
+    // the scope flags / `--file` (or the legacy `GIT_CONFIG` env var) /
+    // `--blob`; `--file -` reads stdin; `--local`, `--worktree`, and `--blob`
+    // require a repository.
     let git_config_env = env::var_os("GIT_CONFIG").filter(|value| !value.is_empty());
-    let source = match config_file {
-        Some(value) if value == "-" => ConfigSource::Stdin,
-        Some(value) => ConfigSource::File(PathBuf::from(value)),
-        None => match git_config_env {
-            Some(path) => ConfigSource::File(PathBuf::from(path)),
-            None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
-        },
+    let effective_file = match config_file {
+        Some(value) => Some(value),
+        None => git_config_env.map(|path| path.to_string_lossy().into_owned()),
     };
-    let loaded = read_config_source(&source, action)?;
-    let mut config = loaded.config;
-    // Command-line / environment config injection (`-c`, `--config-env`,
-    // `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) applies only to the default
-    // (repository) config read, never to an explicit `-f <file>` or stdin source
-    // — git layers these on top of the file stack at highest precedence, so the
-    // document model's last-one-wins lookup yields the right value. Reads also
+    let file_sources = usize::from(use_global)
+        + usize::from(use_system)
+        + usize::from(use_local)
+        + usize::from(use_worktree)
+        + usize::from(effective_file.is_some())
+        + usize::from(blob.is_some());
+    if file_sources > 1 {
+        eprintln!("error: only one config file at a time");
+        return Err(GitError::Exit(129));
+    }
+    let repo_git_dir = discover_git_dir(env::current_dir()?);
+    if repo_git_dir.is_err() {
+        if use_local {
+            eprintln!("fatal: --local can only be used inside a git repository");
+            return Err(GitError::Exit(128));
+        }
+        if blob.is_some() {
+            eprintln!("fatal: --blob can only be used inside a git repository");
+            return Err(GitError::Exit(128));
+        }
+        if use_worktree {
+            eprintln!("fatal: --worktree can only be used inside a git repository");
+            return Err(GitError::Exit(128));
+        }
+    }
+    let source = if use_global {
+        ConfigSource::ScopedFile {
+            path: global_config_file_path()?,
+            scope: sley_config::ConfigScope::Global,
+        }
+    } else if use_system {
+        ConfigSource::ScopedFile {
+            path: system_config_file_path(),
+            scope: sley_config::ConfigScope::System,
+        }
+    } else if use_local {
+        let git_dir = repo_git_dir?;
+        let common = common_git_dir_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
+        ConfigSource::ScopedFile {
+            path: config_display_path(common.join("config")),
+            scope: sley_config::ConfigScope::Local,
+        }
+    } else if use_worktree {
+        // git: with the worktreeConfig extension this is `config.worktree`;
+        // with a single worktree it falls back to the shared local config; with
+        // multiple worktrees and no extension it refuses. The explicit-source
+        // scope stays `local` (mirrors `location_options_init`).
+        let git_dir = repo_git_dir?;
+        let common = common_git_dir_for_git_dir(&git_dir).unwrap_or_else(|_| git_dir.clone());
+        let path = if worktree_config_extension_enabled(&common) {
+            git_dir.join("config.worktree")
+        } else if has_multiple_worktrees(&common) {
+            eprintln!(
+                "fatal: --worktree cannot be used with multiple working trees unless the config\nextension worktreeConfig is enabled. Please read \"CONFIGURATION FILE\"\nsection in \"git help worktree\" for details"
+            );
+            return Err(GitError::Exit(128));
+        } else {
+            common.join("config")
+        };
+        ConfigSource::ScopedFile {
+            path: config_display_path(path),
+            scope: sley_config::ConfigScope::Local,
+        }
+    } else if let Some(value) = effective_file {
+        if value == "-" {
+            ConfigSource::Stdin
+        } else {
+            ConfigSource::File(PathBuf::from(value))
+        }
+    } else if let Some(spec) = blob {
+        ConfigSource::Blob(spec)
+    } else {
+        ConfigSource::Repository(repo_git_dir?)
+    };
+
+    let is_write_action = matches!(
+        action,
+        ConfigAction::Set
+            | ConfigAction::Add
+            | ConfigAction::ReplaceAll
+            | ConfigAction::Unset
+            | ConfigAction::UnsetAll
+            | ConfigAction::RenameSection
+            | ConfigAction::RemoveSection
+    );
+    if is_write_action {
+        // git parses the `-c`/`GIT_CONFIG_*` injection during startup even for
+        // writes; surface a bogus entry the same way.
+        if matches!(source, ConfigSource::Repository(_)) {
+            crate::injected_config_parameters()?;
+        }
+        // Writes operate on the target file's document alone — never on the
+        // merged stack, and never with includes spliced in (git edits the file
+        // in place and leaves include directives untouched).
+        let mut config = load_write_document(&source)?;
+        match action {
+            ConfigAction::Set => {
+                let key = key.expect("validated config key");
+                if config_value_count(&config, &key) > 1 {
+                    return Err(GitError::Exit(5));
+                }
+                config_set_value_with_comment(
+                    &mut config,
+                    &key,
+                    positional[1],
+                    false,
+                    comment.as_deref(),
+                );
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::ReplaceAll => {
+                let key = key.expect("validated config key");
+                config_replace_all_value(
+                    &mut config,
+                    &key,
+                    positional[1],
+                    value_matcher,
+                    comment.as_deref(),
+                );
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::Add => {
+                let key = key.expect("validated config key");
+                config_set_value_with_comment(
+                    &mut config,
+                    &key,
+                    positional[1],
+                    true,
+                    comment.as_deref(),
+                );
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::Unset => {
+                let key = key.expect("validated config key");
+                if value_matcher.is_none() && config_value_count(&config, &key) > 1 {
+                    return Err(GitError::Exit(5));
+                }
+                if !config_unset_value(&mut config, &key, false, value_matcher) {
+                    return Err(GitError::Exit(5));
+                }
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::UnsetAll => {
+                let key = key.expect("validated config key");
+                if !config_unset_value(&mut config, &key, true, value_matcher) {
+                    return Err(GitError::Exit(5));
+                }
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::RenameSection => {
+                let old = parse_config_section_name(positional[0])?;
+                let new = parse_config_section_name(positional[1])?;
+                if !config_rename_section(&mut config, &old, &new) {
+                    return Err(GitError::Exit(128));
+                }
+                write_config_source(&source, &config)?;
+            }
+            ConfigAction::RemoveSection => {
+                let section = parse_config_section_name(positional[0])?;
+                if !config_remove_section(&mut config, &section) {
+                    return Err(GitError::Exit(128));
+                }
+                write_config_source(&source, &config)?;
+            }
+            _ => unreachable!("write actions handled above"),
+        }
+        return Ok(());
+    }
+
+    // Read path: build the flattened, metadata-carrying config event stream.
+    // For the default (repository) source this is git's full config sequence —
+    // system, global (XDG then `~/.gitconfig`), local, worktree — with the
+    // command-line / environment injection (`-c`, `--config-env`,
+    // `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) layered on top at `command`
+    // scope. Explicit sources contribute exactly their own entries. Reads also
     // validate the injection stream here, surfacing a bogus `-c`/env entry the
     // same way git does.
+    let loaded = load_read_entries(&source, action, respect_includes_opt)?;
+    let mut entries = loaded.entries;
     if matches!(source, ConfigSource::Repository(_)) {
         let parameters = crate::injected_config_parameters()?;
-        config
-            .sections
-            .extend(sley_config::injected_config_sections(&parameters));
+        let mut stack = sley_config::ConfigStack { entries };
+        stack.push_parameters(&parameters);
+        entries = stack.entries;
     }
+    let entries = entries;
     if is_subcommand_get {
+        // `git config get --url=<url>` routes through the urlmatch lookup,
+        // exactly like the classic `--get-urlmatch`.
+        if let Some(url) = subcommand_url.as_deref() {
+            let target = parse_config_urlmatch_target(positional[0])?;
+            if !config_get_urlmatch(&entries, &target, url, null_terminate, display, value_type)? {
+                return Err(GitError::Exit(1));
+            }
+            return Ok(());
+        }
         // `--all` is surfaced as the `GetAll` action by the parser; `--regexp`
         // and `--show-names` were captured separately above.
         let all = action == ConfigAction::GetAll;
@@ -552,8 +816,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             .as_deref()
             .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value));
         if !config_subcommand_get(
-            &config,
-            &source,
+            &entries,
             get_key,
             value_filter.as_ref(),
             display,
@@ -570,12 +833,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     }
     match action {
         ConfigAction::List => {
-            config_list(&config, &source, display, name_only, null_terminate)?;
+            config_list(&entries, display, name_only, null_terminate)?;
             if let Some(err) = loaded.tail_error {
                 let path = match &source {
                     ConfigSource::Repository(git_dir) => Some(git_dir.join("config")),
-                    ConfigSource::File(path) => Some(path.clone()),
-                    ConfigSource::Stdin => None,
+                    ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => {
+                        Some(path.clone())
+                    }
+                    ConfigSource::Blob(_) | ConfigSource::Stdin => None,
                 };
                 return Err(report_config_parse_error(err, path.as_deref()));
             }
@@ -589,8 +854,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             if let Some(pattern) = positional.get(1) {
                 let filter = ConfigValuePatternFilter::parse(pattern, fixed_value);
                 if !config_subcommand_get(
-                    &config,
-                    &source,
+                    &entries,
                     SubcommandGetKey::Exact(key),
                     Some(&filter),
                     display,
@@ -605,34 +869,60 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
+            let entry = entries_get(&entries, &key);
+            // git attributes a `--default` fallback to the command line.
+            let meta = entry
+                .map(ConfigValueMeta::of)
+                .unwrap_or_else(ConfigValueMeta::command_line);
+            let name = config_key_name(&key);
             let formatted = match value_type {
                 ConfigValueType::Bool => {
-                    let Some(value) = config
-                        .get_bool(&key.section, key.subsection.as_deref(), &key.key)
-                        .or_else(|| {
-                            default_value
+                    let value = match entry {
+                        Some(entry) => match entry.value.as_deref() {
+                            None => true,
+                            Some(value) => match sley_config::parse_config_bool(value) {
+                                Some(parsed) => parsed,
+                                None => {
+                                    eprintln!(
+                                        "fatal: bad boolean config value '{value}' for '{name}'"
+                                    );
+                                    return Err(GitError::Exit(128));
+                                }
+                            },
+                        },
+                        None => {
+                            let Some(value) = default_value
                                 .as_deref()
                                 .and_then(sley_config::parse_config_bool)
-                        })
-                    else {
-                        return Err(GitError::Exit(1));
+                            else {
+                                return Err(GitError::Exit(1));
+                            };
+                            value
+                        }
                     };
                     value.to_string()
                 }
-                _ => match config.get_entry(&key.section, key.subsection.as_deref(), &key.key) {
-                    Some(Some(value)) => format_config_value(value, value_type)?,
-                    Some(None) => String::new(),
+                _ => match entry {
+                    Some(entry) => match entry.value.as_deref() {
+                        Some(value) => format_config_value_with(
+                            value,
+                            value_type,
+                            Some(&name),
+                            Some(&entry.origin),
+                        )?,
+                        None => String::new(),
+                    },
                     None => {
                         let Some(default) = default_value.as_deref() else {
                             return Err(GitError::Exit(1));
                         };
-                        format_config_value(default, value_type)?
+                        format_config_value_with(default, value_type, Some(&name), None)?
                     }
                 },
             };
             write_config_value(
                 &mut io::stdout(),
-                &source,
+                &meta,
                 display,
                 &formatted,
                 null_terminate,
@@ -640,7 +930,8 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetColor => {
             let key = parse_config_key(positional[0])?;
-            if let Some(value) = config.get(&key.section, key.subsection.as_deref(), &key.key) {
+            let value = entries_get(&entries, &key).and_then(|entry| entry.value.as_deref());
+            if let Some(value) = value {
                 write!(io::stdout(), "{}", format_config_value(value, value_type)?)?;
             } else if let Some(default) = positional.get(1) {
                 write!(
@@ -664,9 +955,15 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
                 None => None,
             };
-            let value = config
-                .get(&key.section, key.subsection.as_deref(), &key.key)
-                .or_else(|| config.get("color", None, "ui"));
+            let value = entries_get(&entries, &key)
+                .and_then(|entry| entry.value.as_deref())
+                .or_else(|| {
+                    entries
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.matches("color", None, "ui"))
+                        .and_then(|entry| entry.value.as_deref())
+                });
             let setting = match value {
                 Some(value) => config_colorbool_setting(&key, value)?,
                 None => ConfigColorBoolSetting::Auto,
@@ -680,7 +977,14 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetUrlMatch => {
             let target = parse_config_urlmatch_target(positional[0])?;
-            if !config_get_urlmatch(&config, &target, positional[1], null_terminate)? {
+            if !config_get_urlmatch(
+                &entries,
+                &target,
+                positional[1],
+                null_terminate,
+                display,
+                value_type,
+            )? {
                 return Err(GitError::Exit(1));
             }
         }
@@ -692,8 +996,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             if let Some(pattern) = positional.get(1) {
                 let filter = ConfigValuePatternFilter::parse(pattern, fixed_value);
                 if !config_subcommand_get(
-                    &config,
-                    &source,
+                    &entries,
                     SubcommandGetKey::Exact(key),
                     Some(&filter),
                     display,
@@ -708,18 +1011,30 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 }
                 return Ok(());
             }
-            let values = config.get_all(&key.section, key.subsection.as_deref(), &key.key);
+            let name = config_key_name(&key);
+            let values = entries_get_all(&entries, &key);
             if values.is_empty() {
                 return Err(GitError::Exit(1));
             }
             let mut stdout = io::stdout();
-            for value in values {
-                let formatted = match value {
+            for entry in values {
+                let formatted = match entry.value.as_deref() {
                     None if value_type == ConfigValueType::Bool => "true".to_string(),
                     None => String::new(),
-                    Some(value) => format_config_value(value, value_type)?,
+                    Some(value) => format_config_value_with(
+                        value,
+                        value_type,
+                        Some(&name),
+                        Some(&entry.origin),
+                    )?,
                 };
-                write_config_value(&mut stdout, &source, display, &formatted, null_terminate)?;
+                write_config_value(
+                    &mut stdout,
+                    &ConfigValueMeta::of(entry),
+                    display,
+                    &formatted,
+                    null_terminate,
+                )?;
             }
         }
         ConfigAction::GetRegexp => {
@@ -729,8 +1044,7 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 .get(1)
                 .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value));
             if !config_get_regexp(
-                &config,
-                &source,
+                &entries,
                 positional[0],
                 value_filter.as_ref(),
                 display,
@@ -741,135 +1055,314 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 return Err(GitError::Exit(1));
             }
         }
-        ConfigAction::Set => {
-            let key = key.expect("validated config key");
-            if config_value_count(&config, &key) > 1 {
-                return Err(GitError::Exit(5));
-            }
-            config_set_value_with_comment(
-                &mut config,
-                &key,
-                positional[1],
-                false,
-                comment.as_deref(),
-            );
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::ReplaceAll => {
-            let key = key.expect("validated config key");
-            config_replace_all_value(
-                &mut config,
-                &key,
-                positional[1],
-                value_matcher,
-                comment.as_deref(),
-            );
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::Add => {
-            let key = key.expect("validated config key");
-            config_set_value_with_comment(
-                &mut config,
-                &key,
-                positional[1],
-                true,
-                comment.as_deref(),
-            );
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::Unset => {
-            let key = key.expect("validated config key");
-            if value_matcher.is_none() && config_value_count(&config, &key) > 1 {
-                return Err(GitError::Exit(5));
-            }
-            if !config_unset_value(&mut config, &key, false, value_matcher) {
-                return Err(GitError::Exit(5));
-            }
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::UnsetAll => {
-            let key = key.expect("validated config key");
-            if !config_unset_value(&mut config, &key, true, value_matcher) {
-                return Err(GitError::Exit(5));
-            }
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::RenameSection => {
-            let old = parse_config_section_name(positional[0])?;
-            let new = parse_config_section_name(positional[1])?;
-            if !config_rename_section(&mut config, &old, &new) {
-                return Err(GitError::Exit(128));
-            }
-            write_config_source(&source, &config)?;
-        }
-        ConfigAction::RemoveSection => {
-            let section = parse_config_section_name(positional[0])?;
-            if !config_remove_section(&mut config, &section) {
-                return Err(GitError::Exit(128));
-            }
-            write_config_source(&source, &config)?;
-        }
+        _ => unreachable!("write actions handled above"),
     }
     Ok(())
 }
 
-struct LoadedConfig {
-    config: GitConfig,
+struct LoadedEntries {
+    entries: Vec<sley_config::ConfigStackEntry>,
     tail_error: Option<GitError>,
 }
 
-fn read_config_source(source: &ConfigSource, action: ConfigAction) -> Result<LoadedConfig> {
+/// Build the read-side config event stream for a source.
+///
+/// The default (repository) source walks git's `do_git_config_sequence`:
+/// system → global (XDG, then `~/.gitconfig`) → local → worktree (when the
+/// `worktreeConfig` extension is enabled), resolving includes per file and
+/// attributing every entry to its layer. Explicit sources contribute exactly
+/// one layer; includes are then only resolved under `--includes` for file
+/// sources (git's `respect_includes = !source.file`), but by default for
+/// stdin and blob sources.
+fn load_read_entries(
+    source: &ConfigSource,
+    action: ConfigAction,
+    respect_includes_opt: Option<bool>,
+) -> Result<LoadedEntries> {
+    let context = config_include_context();
+    let mut stack = sley_config::ConfigStack::new();
+    let mut tail_error = None;
     match source {
         ConfigSource::Repository(git_dir) => {
-            let path = git_dir.join("config");
-            match read_repo_config(git_dir) {
-                Ok(config) => Ok(LoadedConfig {
-                    config,
-                    tail_error: None,
-                }),
-                Err(err) => Err(report_config_parse_error(err, Some(&path))),
+            for (path, scope) in sley_config::default_config_layer_paths() {
+                stack
+                    .push_file(&path, scope, true, &context)
+                    .map_err(|err| report_config_parse_error(err, Some(&path)))?;
+            }
+            // An explicit-but-missing git dir (e.g. `--git-dir=nonexistent`)
+            // still lists the non-repo layers, like git.
+            let common =
+                common_git_dir_for_git_dir(git_dir).unwrap_or_else(|_| git_dir.clone());
+            let local_path = config_display_path(common.join("config"));
+            stack
+                .push_file(&local_path, sley_config::ConfigScope::Local, true, &context)
+                .map_err(|err| report_config_parse_error(err, Some(&local_path)))?;
+            if worktree_config_extension_enabled(&common) {
+                let worktree_path = config_display_path(git_dir.join("config.worktree"));
+                stack
+                    .push_file(
+                        &worktree_path,
+                        sley_config::ConfigScope::Worktree,
+                        true,
+                        &context,
+                    )
+                    .map_err(|err| report_config_parse_error(err, Some(&worktree_path)))?;
             }
         }
-        ConfigSource::File(path) => match fs::read(path) {
-            Ok(bytes) => load_config_bytes(&bytes, action, Some(path.as_path())),
-            Err(err) if err.kind() == io::ErrorKind::NotFound && action != ConfigAction::List => {
-                Ok(LoadedConfig {
-                    config: GitConfig::default(),
-                    tail_error: None,
-                })
-            }
-            Err(err) => {
-                eprintln!(
-                    "fatal: unable to read config file '{}': {err}",
-                    path.display()
-                );
-                Err(GitError::Exit(128))
-            }
-        },
+        ConfigSource::ScopedFile { path, scope } => {
+            tail_error = load_entries_from_file(
+                &mut stack,
+                path,
+                *scope,
+                action,
+                respect_includes_opt.unwrap_or(false),
+                &context,
+            )?;
+        }
+        ConfigSource::File(path) => {
+            tail_error = load_entries_from_file(
+                &mut stack,
+                path,
+                sley_config::ConfigScope::Command,
+                action,
+                respect_includes_opt.unwrap_or(false),
+                &context,
+            )?;
+        }
         ConfigSource::Stdin => {
             let mut bytes = Vec::new();
             io::stdin().read_to_end(&mut bytes)?;
-            load_config_bytes(&bytes, action, None)
+            let (parsed, tail) = parse_config_bytes(&bytes, action, None)?;
+            tail_error = tail;
+            stack
+                .push_parsed(
+                    &parsed,
+                    sley_config::ConfigOrigin::stdin(),
+                    sley_config::ConfigScope::Command,
+                    respect_includes_opt.unwrap_or(true),
+                    &context,
+                )
+                .map_err(|err| report_config_parse_error(err, None))?;
+        }
+        ConfigSource::Blob(spec) => {
+            let bytes = read_config_blob(spec)?;
+            let (parsed, tail) = parse_config_bytes(&bytes, action, None)?;
+            tail_error = tail;
+            stack
+                .push_parsed(
+                    &parsed,
+                    sley_config::ConfigOrigin::blob(spec.clone()),
+                    sley_config::ConfigScope::Command,
+                    respect_includes_opt.unwrap_or(true),
+                    &context,
+                )
+                .map_err(|err| report_config_parse_error(err, None))?;
+        }
+    }
+    Ok(LoadedEntries {
+        entries: stack.entries,
+        tail_error,
+    })
+}
+
+/// Read one explicit config file into the stack. A missing file is fatal for
+/// `--list` (git: "unable to read config file") and empty otherwise.
+fn load_entries_from_file(
+    stack: &mut sley_config::ConfigStack,
+    path: &Path,
+    scope: sley_config::ConfigScope,
+    action: ConfigAction,
+    respect_includes: bool,
+    context: &sley_config::ConfigIncludeContext,
+) -> Result<Option<GitError>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound && action != ConfigAction::List => {
+            return Ok(None);
+        }
+        Err(err) => {
+            eprintln!(
+                "fatal: unable to read config file '{}': {err}",
+                path.display()
+            );
+            return Err(GitError::Exit(128));
+        }
+    };
+    let (parsed, tail_error) = parse_config_bytes(&bytes, action, Some(path))?;
+    stack
+        .push_parsed(
+            &parsed,
+            sley_config::ConfigOrigin::file(path.to_string_lossy().into_owned()),
+            scope,
+            respect_includes,
+            context,
+        )
+        .map_err(|err| report_config_parse_error(err, Some(path)))?;
+    Ok(tail_error)
+}
+
+/// Parse config bytes; for `--list` the well-formed prefix is kept and the
+/// parse error deferred (git prints what it read before dying).
+fn parse_config_bytes(
+    bytes: &[u8],
+    action: ConfigAction,
+    path: Option<&Path>,
+) -> Result<(GitConfig, Option<GitError>)> {
+    if action == ConfigAction::List {
+        let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
+        Ok((config, tail_error))
+    } else {
+        GitConfig::parse(bytes)
+            .map(|config| (config, None))
+            .map_err(|err| report_config_parse_error(err, path))
+    }
+}
+
+/// The document writes operate on: the target file parsed alone, includes left
+/// in place. Missing files start empty.
+fn load_write_document(source: &ConfigSource) -> Result<GitConfig> {
+    let path = match source {
+        ConfigSource::Repository(git_dir) => git_dir.join("config"),
+        ConfigSource::ScopedFile { path, .. } => path.clone(),
+        ConfigSource::File(path) => path.clone(),
+        ConfigSource::Blob(_) => {
+            eprintln!("fatal: writing config blobs is not supported");
+            return Err(GitError::Exit(128));
+        }
+        ConfigSource::Stdin => {
+            eprintln!("fatal: writing to stdin is not supported");
+            return Err(GitError::Exit(128));
+        }
+    };
+    match fs::read(&path) {
+        Ok(bytes) => GitConfig::parse(&bytes).map_err(|err| {
+            report_config_parse_error(err, Some(&path))
+        }),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(GitConfig::default()),
+        Err(err) => {
+            eprintln!(
+                "fatal: unable to read config file '{}': {err}",
+                path.display()
+            );
+            Err(GitError::Exit(128))
         }
     }
 }
 
-fn load_config_bytes(
-    bytes: &[u8],
-    action: ConfigAction,
-    path: Option<&Path>,
-) -> Result<LoadedConfig> {
-    if action == ConfigAction::List {
-        let (config, tail_error) = GitConfig::parse_collecting(bytes)?;
-        Ok(LoadedConfig { config, tail_error })
-    } else {
-        GitConfig::parse(bytes)
-            .map(|config| LoadedConfig {
-                config,
-                tail_error: None,
-            })
-            .map_err(|err| report_config_parse_error(err, path))
+/// Include-condition context shared by every layer: the repository (when one
+/// is discoverable) supplies `gitdir:` and `onbranch:`.
+fn config_include_context() -> sley_config::ConfigIncludeContext {
+    let Ok(cwd) = env::current_dir() else {
+        return sley_config::ConfigIncludeContext::default();
+    };
+    match discover_git_dir(&cwd) {
+        Ok(git_dir) => {
+            let git_dir_abs = fs::canonicalize(&git_dir).unwrap_or_else(|_| git_dir.clone());
+            sley_config::ConfigIncludeContext::new(
+                Some(git_dir_abs),
+                repo_current_branch_name(&git_dir),
+            )
+        }
+        Err(_) => sley_config::ConfigIncludeContext::default(),
     }
+}
+
+/// Display a config path the way git reports it: relative to the working
+/// directory when it lies underneath (git's repo paths are themselves
+/// relative, e.g. `.git/config` at the worktree root).
+fn config_display_path(path: PathBuf) -> PathBuf {
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(relative) = path.strip_prefix(&cwd)
+    {
+        return relative.to_path_buf();
+    }
+    path
+}
+
+/// The file `--global` reads and writes: `GIT_CONFIG_GLOBAL` when set,
+/// otherwise `~/.gitconfig` — except when that does not exist but the XDG
+/// config does, in which case the XDG file is used (git's
+/// `git_global_config`).
+fn global_config_file_path() -> Result<PathBuf> {
+    if let Some(path) = env::var("GIT_CONFIG_GLOBAL")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(PathBuf::from(path));
+    }
+    let Some(home) = sley_config::home_dir() else {
+        eprintln!("fatal: $HOME not set");
+        return Err(GitError::Exit(128));
+    };
+    let user = PathBuf::from(&home).join(".gitconfig");
+    if !user.exists() {
+        let xdg = match env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|value| !value.is_empty())
+        {
+            Some(xdg) => PathBuf::from(xdg).join("git").join("config"),
+            None => PathBuf::from(&home).join(".config").join("git").join("config"),
+        };
+        if xdg.exists() {
+            return Ok(xdg);
+        }
+    }
+    Ok(user)
+}
+
+/// The file `--system` reads and writes: `GIT_CONFIG_SYSTEM` when set,
+/// otherwise `/etc/gitconfig`. (The explicit flag ignores
+/// `GIT_CONFIG_NOSYSTEM`, like git.)
+fn system_config_file_path() -> PathBuf {
+    env::var("GIT_CONFIG_SYSTEM")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/etc/gitconfig"))
+}
+
+/// Whether `extensions.worktreeConfig` is enabled in the shared local config.
+fn worktree_config_extension_enabled(common_git_dir: &Path) -> bool {
+    GitConfig::read(common_git_dir.join("config"))
+        .ok()
+        .and_then(|config| config.get_bool("extensions", None, "worktreeconfig"))
+        .unwrap_or(false)
+}
+
+/// Whether any linked worktrees exist (`$GIT_COMMON_DIR/worktrees` non-empty).
+fn has_multiple_worktrees(common_git_dir: &Path) -> bool {
+    fs::read_dir(common_git_dir.join("worktrees"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
+}
+
+/// Read the config blob for `--blob=<spec>` (a blob id or `<rev>:<path>`).
+fn read_config_blob(spec: &str) -> Result<Vec<u8>> {
+    let repo = crate::repository::RepositoryContext::discover_current()?;
+    let oid = if let Some((rev, path)) = sley_rev::split_rev_path_spec(spec) {
+        match repo.resolve_path(rev, path) {
+            Ok(resolved) => resolved.oid,
+            Err(_) => return config_blob_resolve_error(spec),
+        }
+    } else {
+        match repo.resolve_revision(spec) {
+            Ok(oid) => oid,
+            Err(_) => return config_blob_resolve_error(spec),
+        }
+    };
+    let Ok(object) = repo.objects().read_object(&oid) else {
+        return config_blob_resolve_error(spec);
+    };
+    if object.object_type != ObjectType::Blob {
+        eprintln!("fatal: reference '{spec}' does not point to a blob");
+        return Err(GitError::Exit(128));
+    }
+    Ok(object.body.clone())
+}
+
+fn config_blob_resolve_error<T>(spec: &str) -> Result<T> {
+    eprintln!("fatal: unable to resolve config blob '{spec}'");
+    Err(GitError::Exit(128))
 }
 
 fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
@@ -894,9 +1387,13 @@ fn report_config_parse_error(err: GitError, path: Option<&Path>) -> GitError {
 fn write_config_source(source: &ConfigSource, config: &GitConfig) -> Result<()> {
     match source {
         ConfigSource::Repository(git_dir) => write_repo_config(git_dir, config),
-        ConfigSource::File(path) => {
+        ConfigSource::ScopedFile { path, .. } | ConfigSource::File(path) => {
             fs::write(path, config.to_canonical_bytes())?;
             Ok(())
+        }
+        ConfigSource::Blob(_) => {
+            eprintln!("fatal: writing config blobs is not supported");
+            Err(GitError::Exit(128))
         }
         ConfigSource::Stdin => {
             eprintln!("fatal: writing to stdin is not supported");
@@ -921,21 +1418,33 @@ fn parse_config_value_type(value: &str) -> Result<ConfigValueType> {
 }
 
 fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<String> {
+    format_config_value_with(value, value_type, None, None)
+}
+
+/// Format a typed value, attributing parse failures to the key and the
+/// config source the value came from (git's `die_bad_number` /
+/// `git_config_bool`).
+fn format_config_value_with(
+    value: &str,
+    value_type: ConfigValueType,
+    name: Option<&str>,
+    origin: Option<&sley_config::ConfigOrigin>,
+) -> Result<String> {
     match value_type {
         ConfigValueType::Raw => Ok(value.to_string()),
         ConfigValueType::Bool => match sley_config::parse_config_bool(value) {
             Some(true) => Ok("true".into()),
             Some(false) => Ok("false".into()),
-            None => config_bad_bool_value(value),
+            None => config_bad_bool_value(value, name),
         },
         ConfigValueType::Int => sley_config::parse_config_int(value)
             .map(|value| value.to_string())
-            .ok_or_else(|| config_bad_numeric_value(value)),
+            .ok_or_else(|| config_bad_numeric_value(value, name, origin)),
         ConfigValueType::BoolOrInt => match sley_config::parse_config_bool_or_int(value) {
             Some(ConfigBoolOrInt::Bool(true)) => Ok("true".into()),
             Some(ConfigBoolOrInt::Bool(false)) => Ok("false".into()),
             Some(ConfigBoolOrInt::Int(value)) => Ok(value.to_string()),
-            None => Err(config_bad_numeric_value(value)),
+            None => Err(config_bad_numeric_value(value, name, origin)),
         },
         ConfigValueType::ExpiryDate => format_config_expiry_date_value(value),
         ConfigValueType::Color => format_config_color_value(value),
@@ -943,13 +1452,40 @@ fn format_config_value(value: &str, value_type: ConfigValueType) -> Result<Strin
     }
 }
 
-fn config_bad_bool_value<T>(value: &str) -> Result<T> {
-    eprintln!("fatal: bad boolean config value '{value}'");
+fn config_bad_bool_value<T>(value: &str, name: Option<&str>) -> Result<T> {
+    match name {
+        Some(name) => eprintln!("fatal: bad boolean config value '{value}' for '{name}'"),
+        None => eprintln!("fatal: bad boolean config value '{value}'"),
+    }
     Err(GitError::Exit(128))
 }
 
-fn config_bad_numeric_value(value: &str) -> GitError {
-    eprintln!("fatal: bad numeric config value '{value}': invalid unit");
+/// git's `die_bad_number`: the message names the key and the source when they
+/// are known ("in file .git/config", "in blob <spec>", "in standard input").
+fn config_bad_numeric_value(
+    value: &str,
+    name: Option<&str>,
+    origin: Option<&sley_config::ConfigOrigin>,
+) -> GitError {
+    let location = origin.and_then(|origin| match origin.kind {
+        sley_config::ConfigOriginKind::File if !origin.name.is_empty() => {
+            Some(format!(" in file {}", origin.name))
+        }
+        sley_config::ConfigOriginKind::Blob if !origin.name.is_empty() => {
+            Some(format!(" in blob {}", origin.name))
+        }
+        sley_config::ConfigOriginKind::Stdin => Some(" in standard input".to_string()),
+        _ => None,
+    });
+    match (name, location) {
+        (Some(name), Some(location)) => eprintln!(
+            "fatal: bad numeric config value '{value}' for '{name}'{location}: invalid unit"
+        ),
+        (Some(name), None) => {
+            eprintln!("fatal: bad numeric config value '{value}' for '{name}': invalid unit")
+        }
+        _ => eprintln!("fatal: bad numeric config value '{value}': invalid unit"),
+    }
     GitError::Exit(128)
 }
 
@@ -1277,64 +1813,67 @@ fn config_section_name_matches(section: &ConfigSection, name: &ConfigSectionName
 }
 
 fn config_get_urlmatch(
-    config: &GitConfig,
+    entries: &[sley_config::ConfigStackEntry],
     target: &ConfigUrlMatchTarget,
     url: &str,
     null_terminate: bool,
+    display: ConfigDisplayOptions,
+    value_type: ConfigValueType,
 ) -> Result<bool> {
-    let mut values = BTreeMap::<String, (usize, String)>::new();
-    for section in &config.sections {
-        if !section.name.eq_ignore_ascii_case(&target.section) {
+    let mut values = BTreeMap::<String, (usize, Option<String>, ConfigValueMeta)>::new();
+    for entry in entries {
+        if !entry.section.eq_ignore_ascii_case(&target.section) {
             continue;
         }
-        let match_len = match section.subsection.as_deref() {
+        let match_len = match entry.subsection.as_deref() {
             None => 0,
             Some(base) => match config_urlmatch_score(base, url) {
                 Some(score) => score,
                 None => continue,
             },
         };
-        for entry in &section.entries {
-            if let Some(key) = &target.key
-                && !entry.key.eq_ignore_ascii_case(key)
-            {
-                continue;
-            }
-            let Some(value) = entry.value.as_deref() else {
-                continue;
-            };
-            let name = format!(
-                "{}.{}",
-                target.section.to_ascii_lowercase(),
-                entry.key.to_ascii_lowercase()
-            );
-            let replace = values
-                .get(&name)
-                .is_none_or(|(previous_len, _)| match_len >= *previous_len);
-            if replace {
-                values.insert(name, (match_len, value.to_string()));
-            }
+        if let Some(key) = &target.key
+            && !entry.key.eq_ignore_ascii_case(key)
+        {
+            continue;
+        }
+        let name = format!(
+            "{}.{}",
+            target.section.to_ascii_lowercase(),
+            entry.key.to_ascii_lowercase()
+        );
+        let replace = values
+            .get(&name)
+            .is_none_or(|(previous_len, _, _)| match_len >= *previous_len);
+        if replace {
+            values.insert(name, (match_len, entry.value.clone(), ConfigValueMeta::of(entry)));
         }
     }
     if values.is_empty() {
         return Ok(false);
     }
+    // git's `get_urlmatch`: a concrete `section.key` prints the value alone,
+    // while a bare section dumps `key value` pairs — both via `format_config`,
+    // so `--show-scope` prefixes and `--type` formatting apply.
+    let show_keys = target.key.is_none();
     let mut stdout = io::stdout();
-    if target.key.is_some() {
-        if let Some((_, value)) = values.values().next() {
-            if null_terminate {
-                write!(stdout, "{value}\0")?;
-            } else {
-                writeln!(stdout, "{value}")?;
-            }
-        }
-        return Ok(true);
-    }
-    for (name, (_, value)) in values {
-        if null_terminate {
-            write!(stdout, "{name}\n{value}\0")?;
-        } else {
-            writeln!(stdout, "{name} {value}")?;
+    for (name, (_, value, meta)) in &values {
+        write_config_entry(
+            &mut stdout,
+            meta,
+            name,
+            value.as_deref(),
+            ConfigEntryWriteOptions {
+                display,
+                name_only: false,
+                show_keys,
+                value_type,
+                null_terminate,
+                equals_separator: false,
+            },
+        )?;
+        if target.key.is_some() {
+            break;
         }
     }
     Ok(true)
@@ -1503,8 +2042,7 @@ fn config_value_count(config: &GitConfig, key: &ConfigKey) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn config_get_regexp(
-    config: &GitConfig,
-    source: &ConfigSource,
+    entries: &[sley_config::ConfigStackEntry],
     pattern: &str,
     value_filter: Option<&ConfigValuePatternFilter>,
     display: ConfigDisplayOptions,
@@ -1515,35 +2053,33 @@ fn config_get_regexp(
     let regex = SimpleConfigRegex::parse(pattern);
     let mut matched = false;
     let mut stdout = io::stdout();
-    for section in &config.sections {
-        for entry in &section.entries {
-            let name = config_entry_name(section, &entry.key);
-            if !regex.is_match(&name) {
-                continue;
-            }
-            // `--get-regexp <name-regex> <value-pattern>` additionally filters
-            // on the value, matching git's shared `get_value` collector.
-            if let Some(filter) = value_filter
-                && !filter.matches(entry.value.as_deref())
-            {
-                continue;
-            }
-            matched = true;
-            write_config_entry(
-                &mut stdout,
-                source,
-                &name,
-                entry.value.as_deref(),
-                ConfigEntryWriteOptions {
-                    display,
-                    name_only,
-                    show_keys: true,
-                    value_type,
-                    null_terminate,
-                    equals_separator: false,
-                },
-            )?;
+    for entry in entries {
+        let name = stack_entry_name(entry);
+        if !regex.is_match(&name) {
+            continue;
         }
+        // `--get-regexp <name-regex> <value-pattern>` additionally filters
+        // on the value, matching git's shared `get_value` collector.
+        if let Some(filter) = value_filter
+            && !filter.matches(entry.value.as_deref())
+        {
+            continue;
+        }
+        matched = true;
+        write_config_entry(
+            &mut stdout,
+            &ConfigValueMeta::of(entry),
+            &name,
+            entry.value.as_deref(),
+            ConfigEntryWriteOptions {
+                display,
+                name_only,
+                show_keys: true,
+                value_type,
+                null_terminate,
+                equals_separator: false,
+            },
+        )?;
     }
     Ok(matched)
 }
@@ -1602,8 +2138,7 @@ impl ConfigValuePatternFilter {
 /// Returns `false` (mapped by the caller to exit code 1) when nothing matched.
 #[allow(clippy::too_many_arguments)]
 fn config_subcommand_get(
-    config: &GitConfig,
-    source: &ConfigSource,
+    entries: &[sley_config::ConfigStackEntry],
     key: SubcommandGetKey,
     value_filter: Option<&ConfigValuePatternFilter>,
     display: ConfigDisplayOptions,
@@ -1617,34 +2152,31 @@ fn config_subcommand_get(
     // Collect matching (name, value) pairs in config (file) order, exactly as
     // git's `collect_config` callback does, so that "last match wins" without
     // `--all` picks the same entry git would.
-    let mut matches: Vec<(String, Option<String>)> = Vec::new();
-    for section in &config.sections {
-        for entry in &section.entries {
-            let name = config_entry_name(section, &entry.key);
-            let key_matches = match &key {
-                SubcommandGetKey::Exact(exact) => {
-                    config_section_matches(section, exact)
-                        && entry.key.eq_ignore_ascii_case(&exact.key)
-                }
-                SubcommandGetKey::Regexp(regex) => regex.is_match(&name),
-            };
-            if !key_matches {
-                continue;
+    let mut matches: Vec<(String, Option<String>, ConfigValueMeta)> = Vec::new();
+    for entry in entries {
+        let name = stack_entry_name(entry);
+        let key_matches = match &key {
+            SubcommandGetKey::Exact(exact) => {
+                entry.matches(&exact.section, exact.subsection.as_deref(), &exact.key)
             }
-            if let Some(filter) = value_filter
-                && !filter.matches(entry.value.as_deref())
-            {
-                continue;
-            }
-            matches.push((name, entry.value.clone()));
+            SubcommandGetKey::Regexp(regex) => regex.is_match(&name),
+        };
+        if !key_matches {
+            continue;
         }
+        if let Some(filter) = value_filter
+            && !filter.matches(entry.value.as_deref())
+        {
+            continue;
+        }
+        matches.push((name, entry.value.clone(), ConfigValueMeta::of(entry)));
     }
 
     // git falls back to `--default` only when nothing matched. The default is
     // attributed to the requested name (for an exact key) so `--show-names`
     // renders it; under `--regexp` there is no single key, matching git which
     // disallows `--default` together with `--all`/`--url` but still formats the
-    // default against the pattern string.
+    // default against the pattern string. Defaults belong to the command line.
     if matches.is_empty()
         && let Some(default) = default_value
     {
@@ -1652,7 +2184,11 @@ fn config_subcommand_get(
             SubcommandGetKey::Exact(exact) => config_key_name(exact),
             SubcommandGetKey::Regexp(_) => String::new(),
         };
-        matches.push((name, Some(default.to_string())));
+        matches.push((
+            name,
+            Some(default.to_string()),
+            ConfigValueMeta::command_line(),
+        ));
     }
 
     if matches.is_empty() {
@@ -1661,13 +2197,13 @@ fn config_subcommand_get(
 
     let mut stdout = io::stdout();
     let last = matches.len() - 1;
-    for (idx, (name, value)) in matches.iter().enumerate() {
+    for (idx, (name, value, meta)) in matches.iter().enumerate() {
         if !all && idx != last {
             continue;
         }
         write_config_entry(
             &mut stdout,
-            source,
+            meta,
             name,
             value.as_deref(),
             ConfigEntryWriteOptions {
@@ -1922,43 +2458,63 @@ pub(crate) fn has_unescaped_trailing_dollar(bytes: &[u8]) -> bool {
 }
 
 fn config_list(
-    config: &GitConfig,
-    source: &ConfigSource,
+    entries: &[sley_config::ConfigStackEntry],
     display: ConfigDisplayOptions,
     name_only: bool,
     null_terminate: bool,
 ) -> Result<()> {
     let mut stdout = io::stdout();
-    for section in &config.sections {
-        for entry in &section.entries {
-            let name = config_entry_name(section, &entry.key);
-            write_config_entry(
-                &mut stdout,
-                source,
-                &name,
-                entry.value.as_deref(),
-                ConfigEntryWriteOptions {
-                    display,
-                    name_only,
-                    show_keys: true,
-                    value_type: ConfigValueType::Raw,
-                    null_terminate,
-                    equals_separator: true,
-                },
-            )?;
-        }
+    for entry in entries {
+        let name = stack_entry_name(entry);
+        write_config_entry(
+            &mut stdout,
+            &ConfigValueMeta::of(entry),
+            &name,
+            entry.value.as_deref(),
+            ConfigEntryWriteOptions {
+                display,
+                name_only,
+                show_keys: true,
+                value_type: ConfigValueType::Raw,
+                null_terminate,
+                equals_separator: true,
+            },
+        )?;
     }
     Ok(())
 }
 
+/// The last (highest-precedence) entry matching the key, including value-less
+/// boolean-true entries.
+fn entries_get<'a>(
+    entries: &'a [sley_config::ConfigStackEntry],
+    key: &ConfigKey,
+) -> Option<&'a sley_config::ConfigStackEntry> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
+}
+
+/// Every entry matching the key, in precedence order (lowest first).
+fn entries_get_all<'a>(
+    entries: &'a [sley_config::ConfigStackEntry],
+    key: &ConfigKey,
+) -> Vec<&'a sley_config::ConfigStackEntry> {
+    entries
+        .iter()
+        .filter(|entry| entry.matches(&key.section, key.subsection.as_deref(), &key.key))
+        .collect()
+}
+
 fn write_config_value(
     stdout: &mut impl Write,
-    source: &ConfigSource,
+    meta: &ConfigValueMeta,
     display: ConfigDisplayOptions,
     value: &str,
     null_terminate: bool,
 ) -> Result<()> {
-    write_config_metadata(stdout, source, display, null_terminate)?;
+    write_config_metadata(stdout, meta, display, null_terminate)?;
     if null_terminate {
         write!(stdout, "{value}\0")?;
     } else {
@@ -1969,7 +2525,7 @@ fn write_config_value(
 
 fn write_config_entry(
     stdout: &mut impl Write,
-    source: &ConfigSource,
+    meta: &ConfigValueMeta,
     name: &str,
     value: Option<&str>,
     options: ConfigEntryWriteOptions,
@@ -1978,7 +2534,7 @@ fn write_config_entry(
     // key delimiter and the (typed) value, then the terminator. The key is only
     // emitted when `show_keys` is set; `name_only` (git's `omit_values`) stops
     // after the key and never prints a value or delimiter.
-    write_config_metadata(stdout, source, options.display, options.null_terminate)?;
+    write_config_metadata(stdout, meta, options.display, options.null_terminate)?;
     let terminator = if options.null_terminate { '\0' } else { '\n' };
     if options.name_only {
         if options.show_keys {
@@ -2001,7 +2557,12 @@ fn write_config_entry(
         // A value-less entry with no requested type prints just the key (git
         // backs out the key delimiter), so there is no value to render.
         None => None,
-        Some(value) => Some(format_config_value(value, options.value_type)?),
+        Some(value) => Some(format_config_value_with(
+            value,
+            options.value_type,
+            Some(name),
+            Some(&meta.origin),
+        )?),
     };
     if options.show_keys {
         write!(stdout, "{name}")?;
@@ -2017,15 +2578,19 @@ fn write_config_entry(
 
 fn write_config_metadata(
     stdout: &mut impl Write,
-    source: &ConfigSource,
+    meta: &ConfigValueMeta,
     display: ConfigDisplayOptions,
     null_terminate: bool,
 ) -> Result<()> {
     if display.show_scope {
-        write_config_metadata_field(stdout, config_source_scope(source), null_terminate)?;
+        write_config_metadata_field(stdout, meta.scope.name(), null_terminate)?;
     }
     if display.show_origin {
-        write_config_metadata_field(stdout, &config_source_origin(source), null_terminate)?;
+        write_config_metadata_field(
+            stdout,
+            &config_origin_display(&meta.origin, null_terminate),
+            null_terminate,
+        )?;
     }
     Ok(())
 }
@@ -2043,18 +2608,28 @@ fn write_config_metadata_field(
     Ok(())
 }
 
-fn config_source_scope(source: &ConfigSource) -> &'static str {
-    match source {
-        ConfigSource::Repository(_) => "local",
-        ConfigSource::File(_) | ConfigSource::Stdin => "command",
+/// `--show-origin` rendering: `<kind>:<name>`, with the name C-quoted exactly
+/// as git's `quote_c_style` does — except under `-z`, where git emits it raw.
+fn config_origin_display(origin: &sley_config::ConfigOrigin, null_terminate: bool) -> String {
+    if null_terminate {
+        format!("{}:{}", origin.kind.name(), origin.name)
+    } else {
+        format!(
+            "{}:{}",
+            origin.kind.name(),
+            crate::status_quote_path(origin.name.as_bytes(), false)
+        )
     }
 }
 
-fn config_source_origin(source: &ConfigSource) -> String {
-    match source {
-        ConfigSource::Repository(_) => "file:.git/config".to_string(),
-        ConfigSource::File(path) => format!("file:{}", path.display()),
-        ConfigSource::Stdin => "standard input:".to_string(),
+/// The display name of a stack entry: section and key lower-cased, the
+/// subsection byte-for-byte as written — git's canonical `--list` form.
+fn stack_entry_name(entry: &sley_config::ConfigStackEntry) -> String {
+    let section = entry.section.to_ascii_lowercase();
+    let key = entry.key.to_ascii_lowercase();
+    match &entry.subsection {
+        Some(subsection) => format!("{section}.{subsection}.{key}"),
+        None => format!("{section}.{key}"),
     }
 }
 
