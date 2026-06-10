@@ -1053,6 +1053,12 @@ fn print_cat_file_batch_record(
             eprintln!("fatal: invalid object type");
             return Err(GitError::Exit(128));
         }
+        // An over-long loose header is non-fatal in batch mode: git emits the `error:` line and
+        // reports the oid as `missing`, then continues.
+        Err(GitError::InvalidObject(message)) if is_loose_header_too_long(&message) => {
+            eprintln!("error: {message}");
+            return report_object_missing(stdout, &record, &query);
+        }
         Err(_) => return report_object_missing(stdout, &record, &query),
     };
     print_cat_file_batch_header(
@@ -1088,7 +1094,15 @@ fn batch_object_header(
             eprintln!("fatal: invalid object type");
             Err(GitError::Exit(128))
         }
-        Err(_) => {
+        Err(err) => {
+            // An over-long loose header is not fatal in batch mode: git prints the
+            // `error:`-level diagnostic to stderr, reports the oid as `missing`, and keeps
+            // going (exit 0). Any other read error is likewise reported as missing.
+            if let GitError::InvalidObject(message) = &err
+                && is_loose_header_too_long(message)
+            {
+                eprintln!("error: {message}");
+            }
             report_object_missing(stdout, record, query)?;
             Ok(None)
         }
@@ -1417,27 +1431,51 @@ enum CatFileObjectInfoUser<'a> {
     Pretty { name: &'a str },
 }
 
-/// Map an object-database read error to upstream's `cmd_object` diagnostics. Today this covers
-/// the unknown-type header (`fatal: invalid object type`); other errors propagate unchanged so
-/// their existing diagnostics surface.
+/// Map an object-database read error to upstream's `cmd_object` diagnostics. This covers the
+/// unknown-type header (`fatal: invalid object type`) and the over-long loose header (a non-fatal
+/// `error:` line followed by the per-cmd `fatal:`); other errors propagate unchanged so their
+/// existing diagnostics surface.
 fn cat_file_object_info_error<T>(
     err: &GitError,
     _oid: &ObjectId,
     user: CatFileObjectInfoUser<'_>,
 ) -> Result<T> {
-    if let GitError::InvalidObject(message) = err
-        && message.starts_with("unknown object type")
-    {
-        // `parse_loose_header` sets the type to "invalid" and upstream dies with this exact,
-        // oid-less message for both `-t`/`-s` and `-p`.
-        eprintln!("fatal: invalid object type");
-        return Err(GitError::Exit(128));
+    if let GitError::InvalidObject(message) = err {
+        if message.starts_with("unknown object type") {
+            // `parse_loose_header` sets the type to "invalid" and upstream dies with this exact,
+            // oid-less message for both `-t`/`-s` and `-p`.
+            eprintln!("fatal: invalid object type");
+            return Err(GitError::Exit(128));
+        }
+        if is_loose_header_too_long(message) {
+            // The odb already formatted git's exact `error:`-level text
+            // (`header for <oid> too long, exceeds 32 bytes`); print it, then fall through to
+            // the per-cmd trailing `fatal:` below (object-file.c emits the `error()`, then the
+            // caller's `die()`).
+            eprintln!("error: {message}");
+            return cat_file_object_info_failed(user);
+        }
     }
     match user {
         // Other `-t`/`-s` errors keep their own diagnostics.
         CatFileObjectInfoUser::Header => Err(err.clone()),
         // `-p` reads object info via `odb_read_object_info`; any non-type failure becomes
         // "Not a valid object name" to mirror its single `die`.
+        CatFileObjectInfoUser::Pretty { name } => cat_file_not_a_valid_object_name(name),
+    }
+}
+
+/// The over-long-loose-header diagnostic the odb raises (`header for <oid> too long, exceeds
+/// <n> bytes`), matched on the stable suffix so it stays independent of the embedded oid.
+fn is_loose_header_too_long(message: &str) -> bool {
+    message.starts_with("header for ") && message.contains(" too long, exceeds ")
+}
+
+/// The trailing `fatal:` git prints after a failed object-info lookup, chosen per `cmd_object`
+/// path: `-t`/`-s` die with "could not get object info", `-p` with "Not a valid object name".
+fn cat_file_object_info_failed<T>(user: CatFileObjectInfoUser<'_>) -> Result<T> {
+    match user {
+        CatFileObjectInfoUser::Header => cat_file_could_not_get_object_info(),
         CatFileObjectInfoUser::Pretty { name } => cat_file_not_a_valid_object_name(name),
     }
 }

@@ -646,3 +646,95 @@ fn cat_file_batch_storage_atoms_match_upstream_for_delta_pack() {
     };
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Adler-32 checksum (RFC 1950) over `data`, for the hand-rolled zlib trailer below.
+fn adler32(data: &[u8]) -> u32 {
+    let mut a: u32 = 1;
+    let mut b: u32 = 0;
+    for &byte in data {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+/// Wrap `raw` in a minimal zlib stream using a single uncompressed ("stored") DEFLATE block.
+/// This lets the test mint arbitrary (including deliberately broken) loose objects without a
+/// compression dependency; `ZlibDecoder` — and git — inflate stored blocks the same as any other.
+fn zlib_stored(raw: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01]; // zlib header: CMF=0x78 (deflate, 32K window), FLG=0x01
+    let len = u16::try_from(raw.len()).expect("stored block fixture stays under 64 KiB");
+    out.push(0x01); // one block, BFINAL=1, BTYPE=00 (stored)
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(&(!len).to_le_bytes()); // one's-complement of LEN
+    out.extend_from_slice(raw);
+    out.extend_from_slice(&adler32(raw).to_be_bytes());
+    out
+}
+
+/// Hand-write a loose object whose framed bytes are `"<otype> <content.len>\0<content>"`, named
+/// by its real sha1 (so git and sley agree on the path). `otype` may be bogus, letting us probe
+/// the broken-header diagnostics. Returns the lowercase-hex oid.
+fn write_loose_object(root: &Path, otype: &str, content: &[u8]) -> String {
+    let mut raw = format!("{otype} {}\0", content.len()).into_bytes();
+    raw.extend_from_slice(content);
+    let oid = sley_core::digest_bytes(sley_core::ObjectFormat::Sha1, &raw)
+        .expect("sha1 over framed bytes")
+        .to_hex();
+    let (fanout, rest) = oid.split_at(2);
+    let dir = root.join(".git").join("objects").join(fanout);
+    fs::create_dir_all(&dir).expect("create object fanout dir");
+    fs::write(dir.join(rest), zlib_stored(&raw)).expect("write loose object");
+    oid
+}
+
+/// A loose object whose `"<type> <size>\0"` header overflows git's 32-byte `MAX_HEADER_LEN`
+/// must surface git's exact diagnostics: the `error: header for <oid> too long, exceeds 32 bytes`
+/// line, then the per-cmd trailing `fatal:` (`-t`/`-s`: "could not get object info"; `-p`: "Not a
+/// valid object name <oid>"). A short-but-broken-type header keeps reporting `invalid object
+/// type`. Mirrors upstream t1006's "error on bogus full/short OID" cells (#208/#212/#216). Batch
+/// mode reports the over-long object as `missing` (with the `error:` line) and keeps going.
+#[test]
+fn cat_file_broken_loose_headers_match_upstream_git() {
+    let root = unique_temp_dir("cat-file-broken-headers");
+    fs::create_dir_all(&root).expect("create temp repo");
+    {
+        git(&root, &["init", "-q"]);
+        // 33-char type → 35-byte header, overflowing the 32-byte window (upstream's bogus_long).
+        let long_oid = write_loose_object(&root, "abcdefghijklmnopqrstuvwxyz1234679", b"bogus");
+        // Short, unknown type → header fits but the type is rejected (upstream's bogus_short).
+        let short_oid = write_loose_object(&root, "bogus", b"bogus");
+
+        for oid in [long_oid.as_str(), short_oid.as_str()] {
+            for flag in ["-s", "-t", "-p", "-e"] {
+                let args = vec!["cat-file", flag, oid];
+                let expected = run_output_with_stdin(sley_testkit::oracle_git(), &root, &args, b"");
+                let actual = run_output_with_stdin(env!("CARGO_BIN_EXE_sley"), &root, &args, b"");
+                assert_same_output(actual, expected, &args);
+            }
+        }
+
+        // Batch over each broken object: the over-long one is `missing` (non-fatal, with the
+        // `error:` line), the unknown-type one is a hard `fatal: invalid object type`.
+        for oid in [long_oid.as_str(), short_oid.as_str()] {
+            let input = format!("{oid}\n");
+            for mode in ["--batch", "--batch-check"] {
+                let args = vec!["cat-file", mode];
+                let expected = run_output_with_stdin(
+                    sley_testkit::oracle_git(),
+                    &root,
+                    &args,
+                    input.as_bytes(),
+                );
+                let actual = run_output_with_stdin(
+                    env!("CARGO_BIN_EXE_sley"),
+                    &root,
+                    &args,
+                    input.as_bytes(),
+                );
+                assert_same_output(actual, expected, &args);
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&root);
+}
