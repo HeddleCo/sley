@@ -2103,6 +2103,22 @@ fn write_promisor_pack_sidecar(
     Ok(Some(path))
 }
 
+/// Maximum number of bytes git will inflate when reading a loose object's
+/// `"<type> <size>\0"` header (git's `MAX_HEADER_LEN` in object-file.c). The NUL
+/// terminator must land within this window, so a header of 32 or more non-NUL
+/// bytes is rejected as too long.
+const MAX_LOOSE_HEADER_LEN: usize = 32;
+
+/// git's exact `error:`-level diagnostic for a loose object whose header overflows
+/// `MAX_LOOSE_HEADER_LEN` (object-file.c: `error(_("header for %s too long, exceeds
+/// %d bytes"), ...)`). Shared by the header-only and full-read paths so both surface
+/// byte-identical text.
+fn loose_header_too_long(oid: &ObjectId) -> GitError {
+    GitError::InvalidObject(format!(
+        "header for {oid} too long, exceeds {MAX_LOOSE_HEADER_LEN} bytes"
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct LooseObjectStore {
     objects_dir: PathBuf,
@@ -2160,19 +2176,22 @@ impl LooseObjectStore {
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
         loop {
+            // git inflates only the first `MAX_LOOSE_HEADER_LEN` bytes
+            // (object-file.c `unpack_loose_header`) and reports ULHR_TOO_LONG when no
+            // NUL terminator lands within them — whether the stream simply ends early
+            // or overflows the window. Both collapse to the same `error:`-level
+            // diagnostic, so a header that ends before its NUL is "too long" too.
             if decoder.read(&mut byte)? == 0 {
-                return Err(GitError::InvalidObject(format!(
-                    "loose object {oid} header is not terminated"
-                )));
+                return Err(loose_header_too_long(oid));
             }
             if byte[0] == 0 {
                 break;
             }
             header.push(byte[0]);
-            if header.len() > 64 {
-                return Err(GitError::InvalidObject(format!(
-                    "loose object {oid} header is too long"
-                )));
+            // A 31-byte header (NUL at the 32nd byte) is the longest that fits; 32
+            // non-NUL bytes overflow the window.
+            if header.len() >= MAX_LOOSE_HEADER_LEN {
+                return Err(loose_header_too_long(oid));
             }
         }
         let header =
@@ -2201,6 +2220,17 @@ impl ObjectReader for LooseObjectStore {
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();
         decoder.read_to_end(&mut framed)?;
+        // git only inflates the first `MAX_LOOSE_HEADER_LEN` bytes looking for the
+        // header's NUL terminator before parsing the type; an over-long header is
+        // rejected here (with git's diagnostic) rather than failing later as an
+        // "unknown object type". Mirror that so `cat-file -p` matches upstream.
+        if framed
+            .iter()
+            .take(MAX_LOOSE_HEADER_LEN)
+            .all(|byte| *byte != 0)
+        {
+            return Err(loose_header_too_long(oid));
+        }
         let object = parse_framed_object(&framed)?;
         // Trust the loose object's on-disk name rather than re-hashing its full body
         // on every read (see `verify_reads_enabled`); use `validate`/fsck or
