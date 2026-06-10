@@ -54,7 +54,13 @@ pub(crate) struct ConfigDisplayOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConfigEntryWriteOptions {
     display: ConfigDisplayOptions,
+    /// Mirror git's `omit_values`: print the key (or nothing) but never the
+    /// value.
     name_only: bool,
+    /// Mirror git's `show_keys`: prefix the value with its key. The classic
+    /// `--list` / `--get-regexp` paths always show keys; the modern
+    /// `git config get` subcommand only shows them under `--show-names`.
+    show_keys: bool,
     value_type: ConfigValueType,
     null_terminate: bool,
     equals_separator: bool,
@@ -182,6 +188,11 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     let mut null_terminate = false;
     let mut value_type = ConfigValueType::Raw;
     let mut positional = Vec::new();
+    // Subcommand-mode `git config get` filter options (git 2.54). These only
+    // exist on the `get` subcommand; the classic flag form rejects them.
+    let mut subcommand_get_regexp = false;
+    let mut subcommand_show_names = false;
+    let mut subcommand_value_pattern: Option<String> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -226,6 +237,33 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             }
             "--all" if subcommand == Some(ConfigSubcommand::Unset) => {
                 action = Some(ConfigAction::UnsetAll);
+            }
+            // `git config get --regexp <name-regex>`: the positional is a key
+            // pattern rather than an exact key. Unlike the classic
+            // `--get-regexp`, the subcommand only prints key names when
+            // `--show-names` is given and only prints all matches with `--all`.
+            "--regexp" if subcommand == Some(ConfigSubcommand::Get) => {
+                subcommand_get_regexp = true;
+            }
+            // `--show-names` mirrors git's `show_keys`: prefix each value with
+            // its key (only meaningful for the `get` subcommand).
+            "--show-names" if subcommand == Some(ConfigSubcommand::Get) => {
+                subcommand_show_names = true;
+            }
+            // `--value=<pattern>` filters matches by their value (a regexp by
+            // default, an exact string under `--fixed-value`; a leading `!`
+            // negates). Subcommand `get` only.
+            "--value" if subcommand == Some(ConfigSubcommand::Get) => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("--value requires a value".into()))?;
+                subcommand_value_pattern = Some(value.to_string());
+            }
+            value
+                if subcommand == Some(ConfigSubcommand::Get)
+                    && value.starts_with("--value=") =>
+            {
+                subcommand_value_pattern = Some(value["--value=".len()..].to_string());
             }
             "--name-only" => name_only = true,
             "--show-origin" => display.show_origin = true,
@@ -320,9 +358,9 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 "config --list does not accept positional arguments".into(),
             ));
         }
-        ConfigAction::GetRegexp if positional.len() != 1 => {
+        ConfigAction::GetRegexp if !(1..=2).contains(&positional.len()) => {
             return Err(GitError::Command(
-                "config --get-regexp requires exactly one pattern".into(),
+                "config --get-regexp requires <name-regex> [<value-pattern>]".into(),
             ));
         }
         ConfigAction::RenameSection if positional.len() != 2 => {
@@ -335,9 +373,22 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
                 "config --remove-section requires <name>".into(),
             ));
         }
-        ConfigAction::Get | ConfigAction::GetAll if positional.len() != 1 => {
+        // The modern `get` subcommand always takes exactly the key/pattern (any
+        // value filter arrives via `--value=`), while the classic
+        // `--get`/`--get-all` forms accept an optional value-pattern positional.
+        ConfigAction::Get | ConfigAction::GetAll
+            if subcommand == Some(ConfigSubcommand::Get) && positional.len() != 1 =>
+        {
             return Err(GitError::Command(
                 "config action requires exactly one key".into(),
+            ));
+        }
+        ConfigAction::Get | ConfigAction::GetAll
+            if subcommand != Some(ConfigSubcommand::Get)
+                && !(1..=2).contains(&positional.len()) =>
+        {
+            return Err(GitError::Command(
+                "config action requires <key> [<value-pattern>]".into(),
             ));
         }
         ConfigAction::GetColor if !(1..=2).contains(&positional.len()) => {
@@ -369,7 +420,24 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         _ => {}
     }
-    if default_value.is_some() && action != ConfigAction::Get {
+    // The modern `git config get` subcommand routes through a dedicated handler
+    // (`config_subcommand_get`) rather than the classic `--get`/`--get-all`/
+    // `--get-regexp` paths, because its display semantics differ (keys are only
+    // shown under `--show-names`, only the last match prints without `--all`).
+    let is_subcommand_get = subcommand == Some(ConfigSubcommand::Get);
+    if is_subcommand_get {
+        // git's `cmd_config_get` validation order. `--fixed-value` is only
+        // meaningful with a `--value=<pattern>`; `--default` cannot combine with
+        // `--all`. Both abort via `die()` (exit 128).
+        if fixed_value && subcommand_value_pattern.is_none() {
+            eprintln!("fatal: --fixed-value only applies with 'value-pattern'");
+            return Err(GitError::Exit(128));
+        }
+        if default_value.is_some() && action == ConfigAction::GetAll {
+            eprintln!("fatal: --default= cannot be used with --all or --url=");
+            return Err(GitError::Exit(128));
+        }
+    } else if default_value.is_some() && action != ConfigAction::Get {
         eprintln!("error: --default is only applicable to --get");
         return Err(GitError::Exit(129));
     }
@@ -396,6 +464,25 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         eprintln!("error: --comment is only applicable to add/set/replace operations");
         return Err(GitError::Exit(129));
     }
+    // Classic-form `--fixed-value` (git's `cmd_config_legacy`) only applies when
+    // a value-pattern is supplied in the appropriate positional, and only for
+    // the actions that take one. The modern `get` subcommand validates
+    // `--fixed-value` against `--value=<pattern>` separately above.
+    if fixed_value && !is_subcommand_get {
+        let allowed = match action {
+            ConfigAction::Get
+            | ConfigAction::GetAll
+            | ConfigAction::GetRegexp
+            | ConfigAction::Unset
+            | ConfigAction::UnsetAll => positional.len() > 1,
+            ConfigAction::Set | ConfigAction::ReplaceAll => positional.len() > 2,
+            _ => false,
+        };
+        if !allowed {
+            eprintln!("error: --fixed-value only applies with 'value-pattern'");
+            return Err(GitError::Exit(129));
+        }
+    }
     let value_matcher = match action {
         ConfigAction::ReplaceAll if positional.len() == 3 => {
             Some(ConfigValueMatcher::parse(positional[2], fixed_value))
@@ -416,7 +503,10 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             | ConfigAction::GetRegexp
             | ConfigAction::RenameSection
             | ConfigAction::RemoveSection
-    ) {
+    ) || (is_subcommand_get && subcommand_get_regexp)
+    {
+        // Under `git config get --regexp` the positional is a key pattern, not a
+        // concrete key, so it must not be validated/parsed as one.
         None
     } else {
         Some(parse_config_key(positional[0])?)
@@ -449,6 +539,35 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             .sections
             .extend(sley_config::injected_config_sections(&parameters));
     }
+    if is_subcommand_get {
+        // `--all` is surfaced as the `GetAll` action by the parser; `--regexp`
+        // and `--show-names` were captured separately above.
+        let all = action == ConfigAction::GetAll;
+        let get_key = if subcommand_get_regexp {
+            SubcommandGetKey::Regexp(SimpleConfigRegex::parse(positional[0]))
+        } else {
+            SubcommandGetKey::Exact(key.expect("validated config key"))
+        };
+        let value_filter = subcommand_value_pattern
+            .as_deref()
+            .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value));
+        if !config_subcommand_get(
+            &config,
+            &source,
+            get_key,
+            value_filter.as_ref(),
+            display,
+            all,
+            subcommand_show_names,
+            name_only,
+            value_type,
+            default_value.as_deref(),
+            null_terminate,
+        )? {
+            return Err(GitError::Exit(1));
+        }
+        return Ok(());
+    }
     match action {
         ConfigAction::List => {
             config_list(&config, &source, display, name_only, null_terminate)?;
@@ -463,6 +582,29 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::Get => {
             let key = key.expect("validated config key");
+            // Classic `--get <name> <value-pattern>` filters the (possibly
+            // multi-valued) key by value and returns the last surviving match,
+            // exactly as git's shared `get_value` collector does. Without a
+            // value-pattern the simpler last-entry lookup below is used.
+            if let Some(pattern) = positional.get(1) {
+                let filter = ConfigValuePatternFilter::parse(pattern, fixed_value);
+                if !config_subcommand_get(
+                    &config,
+                    &source,
+                    SubcommandGetKey::Exact(key),
+                    Some(&filter),
+                    display,
+                    false,
+                    false,
+                    false,
+                    value_type,
+                    default_value.as_deref(),
+                    null_terminate,
+                )? {
+                    return Err(GitError::Exit(1));
+                }
+                return Ok(());
+            }
             let formatted = match value_type {
                 ConfigValueType::Bool => {
                     let Some(value) = config
@@ -544,6 +686,28 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
         }
         ConfigAction::GetAll => {
             let key = key.expect("validated config key");
+            // Classic `--get-all <name> <value-pattern>` filters every value of
+            // the key by the pattern (git's shared `get_value` with the "all"
+            // flag set). Without a pattern, list every value directly.
+            if let Some(pattern) = positional.get(1) {
+                let filter = ConfigValuePatternFilter::parse(pattern, fixed_value);
+                if !config_subcommand_get(
+                    &config,
+                    &source,
+                    SubcommandGetKey::Exact(key),
+                    Some(&filter),
+                    display,
+                    true,
+                    false,
+                    false,
+                    value_type,
+                    None,
+                    null_terminate,
+                )? {
+                    return Err(GitError::Exit(1));
+                }
+                return Ok(());
+            }
             let values = config.get_all(&key.section, key.subsection.as_deref(), &key.key);
             if values.is_empty() {
                 return Err(GitError::Exit(1));
@@ -559,10 +723,16 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
             }
         }
         ConfigAction::GetRegexp => {
+            // `--get-regexp <name-regex> [<value-pattern>]`: the optional second
+            // positional filters matches by value.
+            let value_filter = positional
+                .get(1)
+                .map(|pattern| ConfigValuePatternFilter::parse(pattern, fixed_value));
             if !config_get_regexp(
                 &config,
                 &source,
                 positional[0],
+                value_filter.as_ref(),
                 display,
                 name_only,
                 value_type,
@@ -1331,10 +1501,12 @@ fn config_value_count(config: &GitConfig, key: &ConfigKey) -> usize {
         .sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn config_get_regexp(
     config: &GitConfig,
     source: &ConfigSource,
     pattern: &str,
+    value_filter: Option<&ConfigValuePatternFilter>,
     display: ConfigDisplayOptions,
     name_only: bool,
     value_type: ConfigValueType,
@@ -1349,6 +1521,13 @@ fn config_get_regexp(
             if !regex.is_match(&name) {
                 continue;
             }
+            // `--get-regexp <name-regex> <value-pattern>` additionally filters
+            // on the value, matching git's shared `get_value` collector.
+            if let Some(filter) = value_filter
+                && !filter.matches(entry.value.as_deref())
+            {
+                continue;
+            }
             matched = true;
             write_config_entry(
                 &mut stdout,
@@ -1358,6 +1537,7 @@ fn config_get_regexp(
                 ConfigEntryWriteOptions {
                     display,
                     name_only,
+                    show_keys: true,
                     value_type,
                     null_terminate,
                     equals_separator: false,
@@ -1368,6 +1548,141 @@ fn config_get_regexp(
     Ok(matched)
 }
 
+/// How the modern `git config get` subcommand selects a key: either an exact
+/// key (the default) or a regular expression over the full `section.var` name
+/// (`--regexp`).
+enum SubcommandGetKey {
+    Exact(ConfigKey),
+    Regexp(SimpleConfigRegex),
+}
+
+/// A value-pattern filter shared by the modern `git config get --value=<pat>`
+/// and the classic `--get-regexp <name-regex> <value-pattern>`. Git compiles
+/// the pattern as an extended regular expression (a leading `!` negates the
+/// match) unless `--fixed-value` requests exact string equality.
+struct ConfigValuePatternFilter {
+    matcher: ConfigValueMatcher,
+    negated: bool,
+}
+
+impl ConfigValuePatternFilter {
+    fn parse(pattern: &str, fixed_value: bool) -> Self {
+        // git only honours the `!` negation prefix for the regexp form; under
+        // `--fixed-value` the whole pattern (including a leading `!`) is matched
+        // literally.
+        if !fixed_value && let Some(rest) = pattern.strip_prefix('!') {
+            return Self {
+                matcher: ConfigValueMatcher::parse(rest, false),
+                negated: true,
+            };
+        }
+        Self {
+            matcher: ConfigValueMatcher::parse(pattern, fixed_value),
+            negated: false,
+        }
+    }
+
+    fn matches(&self, value: Option<&str>) -> bool {
+        // git compares the pattern against the empty string for value-less
+        // entries (`value_ ? value_ : ""`).
+        let matched = self.matcher.is_match(value.unwrap_or(""));
+        matched ^ self.negated
+    }
+}
+
+/// Handle the modern `git config get` subcommand (git 2.54), which unifies what
+/// the classic flags split across `--get`, `--get-all`, and `--get-regexp`.
+///
+/// * `--regexp` reinterprets the name as a key pattern.
+/// * `--all` prints every match (otherwise only the final one is shown).
+/// * `--show-names` prefixes each value with its key; `--name-only` prints the
+///   key alone. Without `--show-names` only values are printed.
+/// * `--value=<pattern>` filters matches by value.
+///
+/// Returns `false` (mapped by the caller to exit code 1) when nothing matched.
+#[allow(clippy::too_many_arguments)]
+fn config_subcommand_get(
+    config: &GitConfig,
+    source: &ConfigSource,
+    key: SubcommandGetKey,
+    value_filter: Option<&ConfigValuePatternFilter>,
+    display: ConfigDisplayOptions,
+    all: bool,
+    show_keys: bool,
+    name_only: bool,
+    value_type: ConfigValueType,
+    default_value: Option<&str>,
+    null_terminate: bool,
+) -> Result<bool> {
+    // Collect matching (name, value) pairs in config (file) order, exactly as
+    // git's `collect_config` callback does, so that "last match wins" without
+    // `--all` picks the same entry git would.
+    let mut matches: Vec<(String, Option<String>)> = Vec::new();
+    for section in &config.sections {
+        for entry in &section.entries {
+            let name = config_entry_name(section, &entry.key);
+            let key_matches = match &key {
+                SubcommandGetKey::Exact(exact) => {
+                    config_section_matches(section, exact)
+                        && entry.key.eq_ignore_ascii_case(&exact.key)
+                }
+                SubcommandGetKey::Regexp(regex) => regex.is_match(&name),
+            };
+            if !key_matches {
+                continue;
+            }
+            if let Some(filter) = value_filter
+                && !filter.matches(entry.value.as_deref())
+            {
+                continue;
+            }
+            matches.push((name, entry.value.clone()));
+        }
+    }
+
+    // git falls back to `--default` only when nothing matched. The default is
+    // attributed to the requested name (for an exact key) so `--show-names`
+    // renders it; under `--regexp` there is no single key, matching git which
+    // disallows `--default` together with `--all`/`--url` but still formats the
+    // default against the pattern string.
+    if matches.is_empty()
+        && let Some(default) = default_value
+    {
+        let name = match &key {
+            SubcommandGetKey::Exact(exact) => config_key_name(exact),
+            SubcommandGetKey::Regexp(_) => String::new(),
+        };
+        matches.push((name, Some(default.to_string())));
+    }
+
+    if matches.is_empty() {
+        return Ok(false);
+    }
+
+    let mut stdout = io::stdout();
+    let last = matches.len() - 1;
+    for (idx, (name, value)) in matches.iter().enumerate() {
+        if !all && idx != last {
+            continue;
+        }
+        write_config_entry(
+            &mut stdout,
+            source,
+            name,
+            value.as_deref(),
+            ConfigEntryWriteOptions {
+                display,
+                name_only,
+                show_keys,
+                value_type,
+                null_terminate,
+                equals_separator: false,
+            },
+        )?;
+    }
+    Ok(true)
+}
+
 #[derive(Debug)]
 pub(crate) struct SimpleConfigRegex {
     anchor_start: bool,
@@ -1375,11 +1690,46 @@ pub(crate) struct SimpleConfigRegex {
     tokens: Vec<SimpleConfigRegexToken>,
 }
 
+/// One matchable atom plus an optional repetition quantifier, mirroring the
+/// POSIX-ERE subset git's config code compiles with `regcomp(REG_EXTENDED)`:
+/// literals, `.`, bracket classes `[...]`/`[^...]` (with `a-z` ranges), and the
+/// `*` / `+` / `?` quantifiers applied to the preceding atom.
 #[derive(Debug)]
-enum SimpleConfigRegexToken {
+struct SimpleConfigRegexToken {
+    atom: SimpleConfigRegexAtom,
+    quantifier: SimpleConfigRegexQuantifier,
+}
+
+#[derive(Debug)]
+enum SimpleConfigRegexAtom {
     Literal(u8),
     Any,
-    AnyString,
+    Class { negated: bool, ranges: Vec<(u8, u8)> },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimpleConfigRegexQuantifier {
+    /// Exactly one (no quantifier).
+    One,
+    /// `*` — zero or more.
+    Star,
+    /// `+` — one or more.
+    Plus,
+    /// `?` — zero or one.
+    Question,
+}
+
+impl SimpleConfigRegexAtom {
+    fn matches(&self, byte: u8) -> bool {
+        match self {
+            SimpleConfigRegexAtom::Literal(expected) => byte == *expected,
+            SimpleConfigRegexAtom::Any => true,
+            SimpleConfigRegexAtom::Class { negated, ranges } => {
+                let inside = ranges.iter().any(|(lo, hi)| (*lo..=*hi).contains(&byte));
+                inside ^ negated
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1419,24 +1769,49 @@ impl SimpleConfigRegex {
         let mut tokens = Vec::new();
         let mut idx = 0;
         while idx < bytes.len() {
-            match bytes[idx] {
+            let atom = match bytes[idx] {
                 b'\\' if idx + 1 < bytes.len() => {
-                    tokens.push(SimpleConfigRegexToken::Literal(bytes[idx + 1]));
-                    idx += 2;
+                    idx += 1;
+                    let literal = SimpleConfigRegexAtom::Literal(bytes[idx]);
+                    idx += 1;
+                    literal
                 }
-                b'.' if idx + 1 < bytes.len() && bytes[idx + 1] == b'*' => {
-                    tokens.push(SimpleConfigRegexToken::AnyString);
-                    idx += 2;
+                b'[' => {
+                    if let Some((class, next)) = parse_config_regex_class(bytes, idx) {
+                        idx = next;
+                        class
+                    } else {
+                        // An unterminated `[` is a literal bracket.
+                        idx += 1;
+                        SimpleConfigRegexAtom::Literal(b'[')
+                    }
                 }
                 b'.' => {
-                    tokens.push(SimpleConfigRegexToken::Any);
                     idx += 1;
+                    SimpleConfigRegexAtom::Any
                 }
                 byte => {
-                    tokens.push(SimpleConfigRegexToken::Literal(byte));
                     idx += 1;
+                    SimpleConfigRegexAtom::Literal(byte)
                 }
-            }
+            };
+            // A quantifier (if present) binds to the atom just parsed.
+            let quantifier = match bytes.get(idx) {
+                Some(b'*') => {
+                    idx += 1;
+                    SimpleConfigRegexQuantifier::Star
+                }
+                Some(b'+') => {
+                    idx += 1;
+                    SimpleConfigRegexQuantifier::Plus
+                }
+                Some(b'?') => {
+                    idx += 1;
+                    SimpleConfigRegexQuantifier::Question
+                }
+                _ => SimpleConfigRegexQuantifier::One,
+            };
+            tokens.push(SimpleConfigRegexToken { atom, quantifier });
         }
         Self {
             anchor_start,
@@ -1457,19 +1832,80 @@ impl SimpleConfigRegex {
         let Some(token) = self.tokens.get(token_idx) else {
             return !self.anchor_end || byte_idx == bytes.len();
         };
-        match token {
-            SimpleConfigRegexToken::Literal(expected) => {
-                bytes.get(byte_idx).is_some_and(|actual| actual == expected)
-                    && self.match_from(bytes, token_idx + 1, byte_idx + 1)
+        let here_matches =
+            |idx: usize| bytes.get(idx).is_some_and(|byte| token.atom.matches(*byte));
+        match token.quantifier {
+            SimpleConfigRegexQuantifier::One => {
+                here_matches(byte_idx) && self.match_from(bytes, token_idx + 1, byte_idx + 1)
             }
-            SimpleConfigRegexToken::Any => {
-                byte_idx < bytes.len() && self.match_from(bytes, token_idx + 1, byte_idx + 1)
+            SimpleConfigRegexQuantifier::Question => {
+                // Greedy: try consuming one, then fall back to zero.
+                (here_matches(byte_idx) && self.match_from(bytes, token_idx + 1, byte_idx + 1))
+                    || self.match_from(bytes, token_idx + 1, byte_idx)
             }
-            SimpleConfigRegexToken::AnyString => {
-                (byte_idx..=bytes.len()).any(|idx| self.match_from(bytes, token_idx + 1, idx))
+            SimpleConfigRegexQuantifier::Star | SimpleConfigRegexQuantifier::Plus => {
+                // Greedy: consume as many matching bytes as possible, then
+                // backtrack toward the minimum (0 for `*`, 1 for `+`).
+                let min = if token.quantifier == SimpleConfigRegexQuantifier::Plus {
+                    1
+                } else {
+                    0
+                };
+                let mut end = byte_idx;
+                while here_matches(end) {
+                    end += 1;
+                }
+                let mut count = end - byte_idx;
+                loop {
+                    if count >= min && self.match_from(bytes, token_idx + 1, byte_idx + count) {
+                        return true;
+                    }
+                    if count == 0 {
+                        return false;
+                    }
+                    count -= 1;
+                }
             }
         }
     }
+}
+
+/// Parse a bracket expression `[...]` starting at `start` (which must point at
+/// `[`). Returns the atom and the index just past the closing `]`, or `None`
+/// when the class is unterminated. Mirrors POSIX-ERE basics: a leading `^`
+/// negates, a `]` immediately after the (optional) `^` is a literal, and `a-z`
+/// forms a range.
+fn parse_config_regex_class(bytes: &[u8], start: usize) -> Option<(SimpleConfigRegexAtom, usize)> {
+    let mut idx = start + 1;
+    let negated = bytes.get(idx) == Some(&b'^');
+    if negated {
+        idx += 1;
+    }
+    let mut ranges: Vec<(u8, u8)> = Vec::new();
+    // A `]` as the very first class member is a literal, not the terminator.
+    if bytes.get(idx) == Some(&b']') {
+        ranges.push((b']', b']'));
+        idx += 1;
+    }
+    while let Some(&byte) = bytes.get(idx) {
+        if byte == b']' {
+            return Some((SimpleConfigRegexAtom::Class { negated, ranges }, idx + 1));
+        }
+        // `a-z` range, but only when `-` is not trailing (a trailing `-` before
+        // `]` is a literal hyphen).
+        if bytes.get(idx + 1) == Some(&b'-')
+            && bytes.get(idx + 2).is_some_and(|&end| end != b']')
+        {
+            let end = bytes[idx + 2];
+            let (lo, hi) = if byte <= end { (byte, end) } else { (end, byte) };
+            ranges.push((lo, hi));
+            idx += 3;
+        } else {
+            ranges.push((byte, byte));
+            idx += 1;
+        }
+    }
+    None
 }
 
 pub(crate) fn has_unescaped_trailing_dollar(bytes: &[u8]) -> bool {
@@ -1504,6 +1940,7 @@ fn config_list(
                 ConfigEntryWriteOptions {
                     display,
                     name_only,
+                    show_keys: true,
                     value_type: ConfigValueType::Raw,
                     null_terminate,
                     equals_separator: true,
@@ -1537,35 +1974,44 @@ fn write_config_entry(
     value: Option<&str>,
     options: ConfigEntryWriteOptions,
 ) -> Result<()> {
+    // Mirror git's `format_config`: metadata, then optionally the key, then the
+    // key delimiter and the (typed) value, then the terminator. The key is only
+    // emitted when `show_keys` is set; `name_only` (git's `omit_values`) stops
+    // after the key and never prints a value or delimiter.
     write_config_metadata(stdout, source, options.display, options.null_terminate)?;
+    let terminator = if options.null_terminate { '\0' } else { '\n' };
     if options.name_only {
-        if options.null_terminate {
-            write!(stdout, "{name}\0")?;
-        } else {
-            writeln!(stdout, "{name}")?;
+        if options.show_keys {
+            write!(stdout, "{name}")?;
         }
+        write!(stdout, "{terminator}")?;
         return Ok(());
     }
-    let formatted_value = match value {
-        None if options.value_type == ConfigValueType::Bool => "true".to_string(),
-        None => {
-            if options.null_terminate {
-                write!(stdout, "{name}\0")?;
-            } else {
-                writeln!(stdout, "{name}")?;
-            }
-            return Ok(());
-        }
-        Some(value) => format_config_value(value, options.value_type)?,
-    };
-    let value = formatted_value;
-    if options.null_terminate {
-        write!(stdout, "{name}\n{value}\0")?;
+    // git uses `\n` between key and value under `-z`, `=` for `--list`, and a
+    // space everywhere else.
+    let key_delim = if options.null_terminate {
+        '\n'
     } else if options.equals_separator {
-        writeln!(stdout, "{name}={value}")?;
+        '='
     } else {
-        writeln!(stdout, "{name} {value}")?;
+        ' '
+    };
+    let formatted_value = match value {
+        None if options.value_type == ConfigValueType::Bool => Some("true".to_string()),
+        // A value-less entry with no requested type prints just the key (git
+        // backs out the key delimiter), so there is no value to render.
+        None => None,
+        Some(value) => Some(format_config_value(value, options.value_type)?),
+    };
+    if options.show_keys {
+        write!(stdout, "{name}")?;
+        if let Some(value) = &formatted_value {
+            write!(stdout, "{key_delim}{value}")?;
+        }
+    } else if let Some(value) = &formatted_value {
+        write!(stdout, "{value}")?;
     }
+    write!(stdout, "{terminator}")?;
     Ok(())
 }
 
