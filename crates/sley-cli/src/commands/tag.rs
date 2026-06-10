@@ -20,7 +20,16 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut list = false;
     let mut explicit_list = false;
     let mut ignore_case = false;
+    // Seed sort keys from `tag.sort` config (in config order). Git reads these
+    // before parsing the command line, so command-line `--sort` keys are
+    // appended after the config keys; the last key parsed is the primary sort
+    // (sort_tag_entries iterates the keys in reverse). `--no-sort` clears all
+    // accumulated keys, config included.
+    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
     let mut sorts = Vec::new();
+    for value in config.get_all("tag", None, "sort").into_iter().flatten() {
+        sorts.push(parse_tag_list_sort(value)?);
+    }
     let mut format_spec = None;
     let mut annotation_lines = None;
     let mut omit_empty = false;
@@ -454,6 +463,10 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 "tag listing currently supports: tag [-l|--list] [--format <format>|--no-format] [--sort <key>|--no-sort] [-i|--ignore-case|--no-ignore-case] [--omit-empty|--no-omit-empty] [--points-at <object-ish>|--no-points-at|--contains <commit-ish>|--no-contains <commit-ish>|--merged [<commit-ish>]|--no-merged [<commit-ish>]] [<pattern>...]".into(),
             ));
         }
+        if column != TagListColumn::None && annotation_lines.is_some() {
+            eprintln!("fatal: options '--column' and '-n' cannot be used together");
+            return Err(GitError::Exit(128));
+        }
         let points_at = points_at
             .as_deref()
             .map(|rev| resolve_tag_points_at_filter(&git_dir, format, rev))
@@ -470,6 +483,14 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 resolve_tag_merged_filter(&git_dir, format, rev).map(|oid| (oid, *include))
             })
             .transpose()?;
+        let prereleases = if sorts
+            .iter()
+            .any(|sort| matches!(sort, TagListSort::VersionRefname | TagListSort::VersionRefnameDescending))
+        {
+            resolve_versionsort_prereleases(&config)
+        } else {
+            Vec::new()
+        };
         print_tag_list(
             &git_dir,
             format,
@@ -478,6 +499,7 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
                 patterns: &positional,
                 ignore_case,
                 sorts: &sorts,
+                prereleases: &prereleases,
                 format_spec: format_spec.as_deref(),
                 annotation_lines,
                 omit_empty,
@@ -568,6 +590,7 @@ fn print_default_tag_list(
             patterns: &[],
             ignore_case: false,
             sorts: &[],
+            prereleases: &[],
             format_spec: None,
             annotation_lines: None,
             omit_empty: false,
@@ -1110,6 +1133,7 @@ struct TagListOptions<'a> {
     patterns: &'a [String],
     ignore_case: bool,
     sorts: &'a [TagListSort],
+    prereleases: &'a [String],
     format_spec: Option<&'a str>,
     annotation_lines: Option<usize>,
     omit_empty: bool,
@@ -1118,6 +1142,42 @@ struct TagListOptions<'a> {
     points_at: Option<&'a ObjectId>,
     contains: Option<(&'a ObjectId, bool)>,
     merged: Option<(&'a ObjectId, bool)>,
+}
+
+/// Resolve the version-sort prerelease/suffix list from config, mirroring
+/// git's versioncmp.c: `versionsort.suffix` overrides the older
+/// `versionsort.prereleaseSuffix`; when both are present a warning is emitted
+/// and `suffix` wins. A bare key with no value yields a per-key error (the
+/// command still succeeds) and contributes nothing.
+fn resolve_versionsort_prereleases(config: &GitConfig) -> Vec<String> {
+    fn collect(config: &GitConfig, key: &str, display: &str) -> Option<Vec<String>> {
+        let entries = config.get_all("versionsort", None, key);
+        if entries.is_empty() {
+            return None;
+        }
+        // A bare key with no value is an error in git's string getter, which
+        // then reports the source as not-found (returns nonzero); emit the
+        // diagnostic and treat the whole source as absent.
+        let mut out = Vec::new();
+        let mut missing = false;
+        for entry in entries {
+            match entry {
+                Some(value) => out.push(value.to_string()),
+                None => {
+                    eprintln!("error: missing value for '{display}'");
+                    missing = true;
+                }
+            }
+        }
+        if missing { None } else { Some(out) }
+    }
+
+    let suffix = collect(config, "suffix", "versionsort.suffix");
+    let prerelease = collect(config, "prereleasesuffix", "versionsort.prereleasesuffix");
+    if suffix.is_some() && prerelease.is_some() {
+        eprintln!("warning: ignoring versionsort.prereleasesuffix because versionsort.suffix is set");
+    }
+    suffix.or(prerelease).unwrap_or_default()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1298,13 +1358,18 @@ fn parse_tag_list_sort(value: &str) -> Result<TagListSort> {
 }
 
 fn tag_sort_key_error(key: &str) -> Result<TagListSort> {
-    if key.is_empty() {
+    // Mirror git's parse_ref_sorting(): a leading '-' (reverse) and a
+    // "version:"/"v:" prefix are stripped before the atom is parsed, so the
+    // diagnostic names only the unrecognised atom.
+    let atom = key.strip_prefix('-').unwrap_or(key);
+    let atom = atom
+        .strip_prefix("version:")
+        .or_else(|| atom.strip_prefix("v:"))
+        .unwrap_or(atom);
+    if atom.is_empty() {
         eprintln!("fatal: malformed field name: ");
     } else {
-        eprintln!(
-            "fatal: unknown field name: {}",
-            key.strip_prefix('-').unwrap_or(key)
-        );
+        eprintln!("fatal: unknown field name: {atom}");
     }
     Err(GitError::Exit(128))
 }
@@ -1554,7 +1619,12 @@ fn print_tag_list(
         &mut entries,
         options.sorts,
     )?;
-    sort_tag_entries(&mut entries, options.sorts, options.ignore_case);
+    sort_tag_entries(
+        &mut entries,
+        options.sorts,
+        options.prereleases,
+        options.ignore_case,
+    );
     if let Some(format_spec) = options.format_spec {
         let format_spec = ForEachRefFormat::parse(format_spec)?;
         let db = db.as_ref().expect("format listing creates object database");
@@ -1851,17 +1921,24 @@ fn tag_format_peeled_object(
     }))
 }
 
-fn sort_tag_entries(entries: &mut [TagListEntry], sorts: &[TagListSort], ignore_case: bool) {
+fn sort_tag_entries(
+    entries: &mut [TagListEntry],
+    sorts: &[TagListSort],
+    prereleases: &[String],
+    ignore_case: bool,
+) {
     if sorts.is_empty() && !ignore_case {
         return;
     }
-    entries.sort_by(|left, right| compare_tag_sort_keys(left, right, sorts, ignore_case));
+    entries
+        .sort_by(|left, right| compare_tag_sort_keys(left, right, sorts, prereleases, ignore_case));
 }
 
 fn compare_tag_sort_keys(
     left: &TagListEntry,
     right: &TagListEntry,
     sorts: &[TagListSort],
+    prereleases: &[String],
     ignore_case: bool,
 ) -> std::cmp::Ordering {
     if sorts.is_empty() {
@@ -1873,7 +1950,7 @@ fn compare_tag_sort_keys(
                 tag_refname_cmp(&left.name, &right.name, ignore_case)
             }
             TagListSort::VersionRefname | TagListSort::VersionRefnameDescending => {
-                tag_version_refname_cmp(&left.name, &right.name, ignore_case)
+                tag_version_refname_cmp(&left.name, &right.name, prereleases, ignore_case)
             }
             TagListSort::Objectname | TagListSort::ObjectnameDescending => {
                 tag_objectname_cmp(left, right, ignore_case)
@@ -2535,12 +2612,21 @@ fn tag_refname_cmp(left: &str, right: &str, ignore_case: bool) -> std::cmp::Orde
     }
 }
 
-fn tag_version_refname_cmp(left: &str, right: &str, ignore_case: bool) -> std::cmp::Ordering {
+fn tag_version_refname_cmp(
+    left: &str,
+    right: &str,
+    prereleases: &[String],
+    ignore_case: bool,
+) -> std::cmp::Ordering {
     if ignore_case {
-        version_sort_cmp(&left.to_ascii_lowercase(), &right.to_ascii_lowercase())
-            .then_with(|| left.cmp(right))
+        version_sort_cmp(
+            &left.to_ascii_lowercase(),
+            &right.to_ascii_lowercase(),
+            prereleases,
+        )
+        .then_with(|| left.cmp(right))
     } else {
-        version_sort_cmp(left, right)
+        version_sort_cmp(left, right, prereleases)
     }
 }
 

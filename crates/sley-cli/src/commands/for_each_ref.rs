@@ -1807,7 +1807,7 @@ impl Ord for ForEachRefSortKey {
             (ForEachRefSortKey::Number(left), ForEachRefSortKey::Number(right)) => left.cmp(right),
             (ForEachRefSortKey::Text(left), ForEachRefSortKey::Text(right)) => left.cmp(right),
             (ForEachRefSortKey::Version(left), ForEachRefSortKey::Version(right)) => {
-                version_sort_cmp(left, right)
+                version_sort_cmp(left, right, &[])
             }
             (ForEachRefSortKey::Bytes(left), ForEachRefSortKey::Bytes(right)) => left.cmp(right),
             (left, right) => {

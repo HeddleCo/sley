@@ -285,6 +285,19 @@ impl ForEachRefFormat {
     pub fn segments(&self) -> &[ForEachRefFormatSegment] {
         &self.segments
     }
+
+    /// Mirror git's `need_color_reset_at_eol`: true when the format contains at
+    /// least one `%(color:...)` atom and the last such atom is not
+    /// `%(color:reset)`. The caller still gates this on color being enabled.
+    pub fn ends_with_unreset_color(&self) -> bool {
+        let mut need_reset = false;
+        for segment in &self.segments {
+            if let ForEachRefFormatSegment::Atom(ForEachRefAtom::Color(value)) = segment {
+                need_reset = value.trim() != "reset";
+            }
+        }
+        need_reset
+    }
 }
 
 fn push_for_each_ref_literal(segments: &mut Vec<ForEachRefFormatSegment>, literal: Vec<u8>) {
@@ -302,6 +315,7 @@ pub fn write_for_each_ref_format(
     stdout: &mut impl Write,
     format: &ForEachRefFormat,
     quote: ForEachRefQuoteMode,
+    reset_color_at_eol: bool,
     mut write_atom: impl FnMut(&mut Vec<u8>, &ForEachRefAtom) -> Result<()>,
 ) -> Result<()> {
     for segment in format.segments() {
@@ -313,6 +327,9 @@ pub fn write_for_each_ref_format(
                 write_for_each_ref_quoted_atom(stdout, &value, quote)?;
             }
         }
+    }
+    if reset_color_at_eol {
+        stdout.write_all(b"\x1b[m")?;
     }
     Ok(())
 }
@@ -1343,6 +1360,7 @@ mod tests {
             &mut out,
             &format,
             ForEachRefQuoteMode::Shell,
+            false,
             |atom, name| {
                 assert_eq!(
                     name,
