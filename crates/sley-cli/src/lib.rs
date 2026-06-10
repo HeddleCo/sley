@@ -3598,7 +3598,13 @@ fn print_for_each_ref_format(
     format_spec: &ForEachRefFormat,
     context: &ForEachRefFormatContext<'_>,
 ) -> Result<()> {
-    write_for_each_ref_format(stdout, format_spec, context.quote, |stdout, atom| {
+    let reset_color_at_eol = context.color && format_spec.ends_with_unreset_color();
+    write_for_each_ref_format(
+        stdout,
+        format_spec,
+        context.quote,
+        reset_color_at_eol,
+        |stdout, atom| {
         let placeholder = match atom {
             ForEachRefAtom::Raw(placeholder) => placeholder.as_str(),
             atom => {
