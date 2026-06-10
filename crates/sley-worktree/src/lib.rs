@@ -1408,11 +1408,6 @@ fn simple_length(s: &[u8]) -> usize {
     s.len()
 }
 
-/// git `no_wildcard`.
-fn no_wildcard(s: &[u8]) -> bool {
-    simple_length(s) == s.len()
-}
-
 /// Case-aware byte comparison up to `n` bytes, honoring `icase` (git `ps_strncmp`).
 fn ps_strncmp(icase: bool, a: &[u8], b: &[u8], n: usize) -> bool {
     // Returns true when the first `n` bytes are EQUAL (mirrors `!strncmp`).
@@ -1477,10 +1472,8 @@ pub fn pathspec_item_matches(match_: &[u8], name: &[u8], magic: PathspecMatchMag
     if nowildcard_len < matchlen {
         // git strips the literal prefix off BOTH pattern and name before running
         // wildmatch (so `foo**` vs `foo/bba/arr` becomes `**` vs `/bba/arr`).
-        if nowildcard_len > 0 {
-            if !ps_strncmp(icase, match_, name, nowildcard_len) {
-                return false;
-            }
+        if nowildcard_len > 0 && !ps_strncmp(icase, match_, name, nowildcard_len) {
+            return false;
         }
         let pat = &match_[nowildcard_len..];
         if name.len() < nowildcard_len {
@@ -1723,7 +1716,7 @@ fn dowild(pattern: &[u8], text: &[u8], flags: u32) -> i32 {
             }
             b'*' => {
                 pi += 1;
-                let mut match_slash: bool;
+                let match_slash: bool;
                 if pi < p.len() && p[pi] == b'*' {
                     let prev_p = pi; // index of the second '*'
                     while pi < p.len() && p[pi] == b'*' {
@@ -1797,7 +1790,6 @@ fn dowild(pattern: &[u8], text: &[u8], flags: u32) -> i32 {
                                 tcf = wm_tolower(tcf);
                             }
                             if tcf == pc {
-                                tc = tcf;
                                 break;
                             }
                             cur_t += 1;
