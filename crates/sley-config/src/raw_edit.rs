@@ -18,6 +18,11 @@
 
 use crate::quote_config_value;
 
+/// A value-pattern predicate: given an entry's value (`None` for a bare
+/// boolean-true key), report whether it matches git's value-pattern. The
+/// `'a` borrow lets callers close over a compiled regex.
+pub type ValueMatcher<'a> = &'a dyn Fn(Option<&str>) -> bool;
+
 /// The kind of a parsed event, mirroring git's `enum config_event_t`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EventType {
@@ -99,9 +104,8 @@ impl RawConfigEditor {
         let bytes = self.contents.clone();
         let len = bytes.len();
         let mut i = 0usize;
-        // The active section's normalised name, tracked so entries know whether
-        // they belong to the target section.
-        let mut cur_section: Option<(String, Option<String>)> = None;
+        // Whether the most recent section header names the target section, so
+        // entries know whether they belong to it.
         let mut cur_is_keys_section = false;
 
         // Skip a UTF-8 BOM exactly as git does.
@@ -146,11 +150,10 @@ impl RawConfigEditor {
                 let begin = i;
                 let (section, sub, next) = parse_section_header(&bytes, i);
                 i = next;
-                let is_keys = section.as_ref().is_some_and(|s| {
-                    self.section_matches(s, sub.as_deref())
-                });
+                let is_keys = section
+                    .as_ref()
+                    .is_some_and(|s| self.section_matches(s, sub.as_deref()));
                 cur_is_keys_section = is_keys;
-                cur_section = section.map(|s| (s, sub.clone()));
                 self.events.push(Event {
                     ty: EventType::Section,
                     begin,
@@ -165,7 +168,6 @@ impl RawConfigEditor {
                 let begin = i;
                 let (key, value, next) = parse_entry(&bytes, i);
                 i = next;
-                let _ = &cur_section;
                 self.events.push(Event {
                     ty: EventType::Entry,
                     begin,
@@ -243,7 +245,7 @@ impl RawConfigEditor {
         &mut self,
         value: Option<&str>,
         comment: Option<&str>,
-        value_matches: Option<&dyn Fn(Option<&str>) -> bool>,
+        value_matches: Option<ValueMatcher>,
         multi_replace: bool,
     ) -> RawEditOutcome {
         // Faithfully replicate git's `store.seen[]` / `seen_nr` / `key_seen` /
@@ -298,13 +300,12 @@ impl RawConfigEditor {
         // git: when seen_nr == 0 here (insert, key absent), fall back to the
         // speculative slot (last entry of the target section, or the section
         // header, or — if even the section is absent — the last parsed element).
-        let mut seen_nr = seen_nr;
         if seen_nr == 0 {
-            if seen.is_empty() {
+            if seen.is_empty()
+                && let Some(last) = self.events.len().checked_sub(1)
+            {
                 // Did not see key nor section: target the last parsed element.
-                if let Some(last) = self.events.len().checked_sub(1) {
-                    seen.push(last);
-                }
+                seen.push(last);
             }
             // else: keep the speculative slot at index 0.
             seen_nr = 1;
@@ -318,7 +319,7 @@ impl RawConfigEditor {
     fn entry_matches(
         &self,
         ev: &Event,
-        value_matches: Option<&dyn Fn(Option<&str>) -> bool>,
+        value_matches: Option<ValueMatcher>,
     ) -> bool {
         // git's `matches()` compares the FULL key (`section.subsection.name`), so
         // an entry only matches when it is BOTH in the target section and has the
@@ -961,6 +962,7 @@ fn parse_value_span(bytes: &[u8], start: usize) -> (String, usize) {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::too_many_arguments)]
 mod tests {
     use super::*;
 
@@ -971,7 +973,7 @@ mod tests {
         name: &str,
         value: Option<&str>,
         comment: Option<&str>,
-        vm: Option<&dyn Fn(Option<&str>) -> bool>,
+        vm: Option<ValueMatcher>,
         multi: bool,
     ) -> (String, RawEditOutcome) {
         let mut e = RawConfigEditor::new(src.as_bytes().to_vec(), sec, sub, name);
@@ -1015,6 +1017,7 @@ mod tests {
 
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod section_tests {
     use super::*;
 

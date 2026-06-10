@@ -1026,10 +1026,10 @@ fn emit_parsed_config(
 /// Resolve an include path for the stack walker. Relative paths require a file
 /// base (git: "relative config includes must come from files").
 fn resolve_stack_include_path(raw: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return Ok(PathBuf::from(home).join(rest));
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = home_dir()
+    {
+        return Ok(PathBuf::from(home).join(rest));
     }
     let candidate = Path::new(raw);
     if candidate.is_absolute() {
@@ -1098,10 +1098,10 @@ fn expand_user_path_with_home(path: &str, home: Option<&str>) -> PathBuf {
         if let Some(home) = home.filter(|home| !home.is_empty()) {
             return PathBuf::from(home).join(rest);
         }
-    } else if path == "~" {
-        if let Some(home) = home.filter(|home| !home.is_empty()) {
-            return PathBuf::from(home);
-        }
+    } else if path == "~"
+        && let Some(home) = home.filter(|home| !home.is_empty())
+    {
+        return PathBuf::from(home);
     }
     PathBuf::from(path)
 }
@@ -2520,6 +2520,7 @@ fn env_bool(name: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
