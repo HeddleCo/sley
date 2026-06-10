@@ -43,7 +43,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::Mutex;
 
-static GLOBAL_CONFIG_OVERRIDES: Mutex<Vec<GlobalConfigOverride>> = Mutex::new(Vec::new());
+/// Accumulated sq-quoted fragment of command-line `-c` / `--config-env`
+/// parameters, in left-to-right order. Stands in for git's mutation of the
+/// process `GIT_CONFIG_PARAMETERS` env var (forbidden here, as the workspace bans
+/// `unsafe`/`set_var`); appended after any inherited `GIT_CONFIG_PARAMETERS` to
+/// form the effective parameter list.
+static CMDLINE_CONFIG_PARAMETERS: Mutex<String> = Mutex::new(String::new());
 static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
@@ -75,7 +80,10 @@ pub(crate) use repository::RepositoryContext;
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let global = apply_global_options(&args)?;
-    set_global_config_overrides(global.config.clone());
+    // `-c` / `--config-env` overrides are folded into the process
+    // `GIT_CONFIG_PARAMETERS` env var during option parsing, so the single
+    // `injected_config_parameters()` reader is the source of truth for every
+    // config read; no separate global-override store is needed.
     set_global_git_dir(global.git_dir.clone());
     set_global_work_tree(global.work_tree);
     set_global_bare(global.bare);
@@ -100,7 +108,25 @@ fn dispatch_with_aliases(
                 }
                 commands::alias::AliasExpansion::Args(mut expanded) => {
                     expanded.extend(args[1..].iter().cloned());
-                    return dispatch_with_aliases(&expanded, global_config, alias_depth + 1);
+                    // An alias body may begin with global options (`-c`, `-C`,
+                    // `--config-env`, ...), e.g. `alias.x = "-c foo=bar config foo"`.
+                    // git re-parses those before dispatching the real subcommand,
+                    // so `-c` in an alias folds into the injected parameters just
+                    // like a command-line `-c`. Re-run the global-option parser on
+                    // the expanded args (which folds any `-c`/`--config-env` and
+                    // applies `-C`); only override git-dir/work-tree when the alias
+                    // explicitly set them so a top-level `--git-dir` survives.
+                    let nested = apply_global_options(&expanded)?;
+                    if nested.git_dir.is_some() {
+                        set_global_git_dir(nested.git_dir.clone());
+                    }
+                    if nested.work_tree.is_some() {
+                        set_global_work_tree(nested.work_tree);
+                    }
+                    if nested.bare {
+                        set_global_bare(true);
+                    }
+                    return dispatch_with_aliases(nested.args, global_config, alias_depth + 1);
                 }
                 commands::alias::AliasExpansion::None => {}
             }
@@ -269,13 +295,14 @@ fn var_list() -> Result<()> {
     if let Some(config) = identity_effective_config() {
         var_print_config(&config)?;
     }
-    for entry in environment_config_overrides()? {
-        println!("{}={}", entry.key.to_ascii_lowercase(), entry.value);
-    }
-    if let Ok(overrides) = GLOBAL_CONFIG_OVERRIDES.lock() {
-        for entry in overrides.iter() {
-            println!("{}={}", entry.key.to_ascii_lowercase(), entry.value);
-        }
+    for param in injected_config_parameters()? {
+        // `git var -l` prints injected overrides as `key=value`; a bare
+        // boolean-true entry renders with an empty value, matching git.
+        println!(
+            "{}={}",
+            param.canonical_key,
+            param.value.as_deref().unwrap_or("")
+        );
     }
     for name in [
         "GIT_COMMITTER_IDENT",
@@ -1510,19 +1537,22 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
             }
             "-c" => {
                 let Some(assignment) = args.get(index + 1) else {
-                    eprintln!("error: switch `c' requires a value");
+                    eprintln!("-c expects a configuration string");
                     print_global_usage();
                     return Err(GitError::Exit(129));
                 };
-                config.push(parse_global_config_override(assignment)?);
+                if let Some(entry) = push_config_parameter(assignment) {
+                    config.push(entry);
+                }
                 index += 2;
             }
             "--config-env" => {
-                let Some(assignment) = args.get(index + 1) else {
-                    eprintln!("fatal: invalid config format: ");
-                    return Err(GitError::Exit(128));
+                let Some(spec) = args.get(index + 1) else {
+                    eprintln!("no config key given for --config-env");
+                    print_global_usage();
+                    return Err(GitError::Exit(129));
                 };
-                config.push(parse_global_config_env_override(assignment)?);
+                config.push(push_config_env(spec)?);
                 index += 2;
             }
             "-p"
@@ -1565,9 +1595,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
                 index += 1;
             }
             value if value.starts_with("--config-env=") => {
-                config.push(parse_global_config_env_override(
-                    &value["--config-env=".len()..],
-                )?);
+                config.push(push_config_env(&value["--config-env=".len()..])?);
                 index += 1;
             }
             "--bare" => {
@@ -1587,49 +1615,147 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     })
 }
 
-fn parse_global_config_override(value: &str) -> Result<GlobalConfigOverride> {
-    let Some((key, value)) = value.split_once('=') else {
-        return Ok(GlobalConfigOverride {
-            key: value.to_string(),
-            value: "true".to_string(),
-        });
-    };
-    if key.is_empty() {
-        eprintln!("error: key does not contain a section: {value}");
-        return Err(GitError::Exit(128));
+/// Fold a `-c <text>` command-line parameter into the process
+/// `GIT_CONFIG_PARAMETERS` env var, exactly as git's `git_config_push_parameter`:
+/// split off the value at the first `=` (a missing `=` is a bare boolean), then
+/// sq-quote the key and value into the env list. This makes the override visible
+/// to every config read (including aliases and any subprocess) through the single
+/// `injected_config_parameters()` reader.
+///
+/// Returns a [`GlobalConfigOverride`] (canonical-ish key + string value) for the
+/// legacy `init`/`clone` override list when the key is non-empty; an empty key
+/// (`-c ""`) yields `None` here and surfaces as a parse error at read time.
+fn push_config_parameter(text: &str) -> Option<GlobalConfigOverride> {
+    match text.split_once('=') {
+        Some((key, value)) => {
+            push_split_parameter(key, Some(value));
+            (!key.is_empty()).then(|| GlobalConfigOverride {
+                key: key.to_string(),
+                value: value.to_string(),
+            })
+        }
+        None => {
+            push_split_parameter(text, None);
+            (!text.is_empty()).then(|| GlobalConfigOverride {
+                key: text.to_string(),
+                // A bare `-c key` is boolean-true; represent it as "true" for the
+                // legacy list consumers (init reads typed values via parse_config_bool).
+                value: "true".to_string(),
+            })
+        }
     }
-    Ok(GlobalConfigOverride {
-        key: key.to_string(),
-        value: value.to_string(),
-    })
 }
 
-fn parse_global_config_env_override(value: &str) -> Result<GlobalConfigOverride> {
-    let Some((key, envvar)) = value.split_once('=') else {
-        eprintln!("fatal: invalid config format: {value}");
+/// Resolve a `--config-env=<key>=<envvar>` spec and fold it into
+/// `GIT_CONFIG_PARAMETERS`, exactly as git's `git_config_push_env`: the spec is
+/// split at the *last* `=` into the config key and the environment variable name;
+/// the variable is read from the environment and its value sq-quoted into the env
+/// list. Errors mirror git's `die()` wording (exit 128).
+fn push_config_env(spec: &str) -> Result<GlobalConfigOverride> {
+    let Some(eq) = spec.rfind('=') else {
+        eprintln!("fatal: invalid config format: {spec}");
         return Err(GitError::Exit(128));
     };
-    if key.is_empty() {
-        eprintln!("error: key does not contain a section: {value}");
+    let key = &spec[..eq];
+    let env_name = &spec[eq + 1..];
+    if env_name.is_empty() {
+        eprintln!("fatal: missing environment variable name for configuration '{key}'");
         return Err(GitError::Exit(128));
     }
-    let env_value = match env::var(envvar) {
+    let env_value = match env::var(env_name) {
         Ok(value) => value,
         Err(_) => {
-            eprintln!("fatal: missing environment variable '{envvar}' for configuration '{key}'");
+            eprintln!(
+                "fatal: missing environment variable '{env_name}' for configuration '{key}'"
+            );
             return Err(GitError::Exit(128));
         }
     };
+    push_split_parameter(key, Some(&env_value));
     Ok(GlobalConfigOverride {
         key: key.to_string(),
         value: env_value,
     })
 }
 
-fn set_global_config_overrides(config: Vec<GlobalConfigOverride>) {
-    if let Ok(mut overrides) = GLOBAL_CONFIG_OVERRIDES.lock() {
-        *overrides = config;
+/// Append a `key[=value]` pair to the command-line config-parameter fragment in
+/// sq-quoted new-style (`'key'='value'`) or bare (`'key'`) form, mirroring git's
+/// `git_config_push_split_parameter`. git mutates the process `GIT_CONFIG_PARAMETERS`
+/// env var; because the workspace forbids `unsafe` (and thus `std::env::set_var`),
+/// sley instead accumulates the fragment in a process-global store. The effective
+/// `GIT_CONFIG_PARAMETERS` — the pre-existing env value followed by this fragment —
+/// is reconstructed by [`effective_config_parameters_env`] for both in-process
+/// reads and any shell-alias subprocess, preserving git's left-to-right precedence.
+fn push_split_parameter(key: &str, value: Option<&str>) {
+    if let Ok(mut fragment) = CMDLINE_CONFIG_PARAMETERS.lock() {
+        if !fragment.is_empty() {
+            fragment.push(' ');
+        }
+        fragment.push_str(&sley_config::sq_quote(key));
+        fragment.push('=');
+        if let Some(value) = value {
+            fragment.push_str(&sley_config::sq_quote(value));
+        }
     }
+}
+
+/// The effective `GIT_CONFIG_PARAMETERS` string: the inherited env value (if any)
+/// followed by the command-line `-c`/`--config-env` fragment, space-separated.
+/// This is what git's process env would hold after folding in `-c`, and is both
+/// parsed for in-process reads and exported to shell-alias subprocesses so they
+/// inherit the parent's overrides.
+fn effective_config_parameters_env() -> Option<String> {
+    let inherited = env::var("GIT_CONFIG_PARAMETERS").ok().filter(|s| !s.is_empty());
+    let fragment = CMDLINE_CONFIG_PARAMETERS
+        .lock()
+        .ok()
+        .map(|f| f.clone())
+        .filter(|s| !s.is_empty());
+    match (inherited, fragment) {
+        (Some(inherited), Some(fragment)) => Some(format!("{inherited} {fragment}")),
+        (Some(inherited), None) => Some(inherited),
+        (None, Some(fragment)) => Some(fragment),
+        (None, None) => None,
+    }
+}
+
+/// Look up the last-set injected override for `key` (canonicalised), across the
+/// full injection stream (`GIT_CONFIG_COUNT` + `GIT_CONFIG_PARAMETERS`, the latter
+/// holding any `-c`/`--config-env`). Returns the string value (a bare boolean-true
+/// entry yields `"true"`). Used by command-side consumers (init, rev-parse's
+/// `core.abbrev`, etc.) that need a single injected value before a full config load.
+fn global_config_value(key: &str) -> Result<Option<String>> {
+    let canonical = match sley_config::canonicalize_config_key(key) {
+        Ok(canonical) => canonical,
+        // The lookup key is a fixed internal key; if it fails to canonicalise
+        // there can be no matching override.
+        Err(_) => return Ok(None),
+    };
+    let parameters = injected_config_parameters()?;
+    Ok(parameters
+        .iter()
+        .rev()
+        .find(|param| param.canonical_key.eq_ignore_ascii_case(&canonical))
+        .map(|param| param.value.clone().unwrap_or_else(|| "true".to_string())))
+}
+
+/// Parse the full config-injection stream (env-count pairs plus the effective
+/// `GIT_CONFIG_PARAMETERS` = inherited env + command-line `-c`/`--config-env`),
+/// converting any parse failure into git's `error: <msg>\nfatal: unable to parse
+/// command-line config` two-line diagnostic with exit 128.
+fn injected_config_parameters() -> Result<Vec<sley_config::ConfigParameter>> {
+    let params_env = effective_config_parameters_env();
+    sley_config::injected_config_parameters(params_env.as_deref())
+        .map_err(report_config_parameter_error)
+}
+
+/// Print git's exact diagnostic for a config-injection parse failure and return
+/// the matching exit status. Git prints the specific `error:` line followed by a
+/// generic `fatal: unable to parse command-line config` and exits 128.
+fn report_config_parameter_error(err: sley_config::ConfigParameterError) -> GitError {
+    eprintln!("error: {}", err.message());
+    eprintln!("fatal: unable to parse command-line config");
+    GitError::Exit(128)
 }
 
 fn set_global_git_dir(git_dir: Option<PathBuf>) {
@@ -1654,58 +1780,6 @@ fn set_global_replace_objects(replace_objects: bool) {
     if let Ok(mut value) = GLOBAL_REPLACE_OBJECTS.lock() {
         *value = replace_objects;
     }
-}
-
-fn global_config_value(key: &str) -> Result<Option<String>> {
-    let mut config = environment_config_overrides()?;
-    if let Ok(overrides) = GLOBAL_CONFIG_OVERRIDES.lock() {
-        config.extend(overrides.iter().cloned());
-    }
-    Ok(config
-        .iter()
-        .rev()
-        .find(|entry| entry.key.eq_ignore_ascii_case(key))
-        .map(|entry| entry.value.clone()))
-}
-
-fn environment_config_overrides() -> Result<Vec<GlobalConfigOverride>> {
-    let Some(count) = env::var_os("GIT_CONFIG_COUNT") else {
-        return Ok(Vec::new());
-    };
-    let count = count.to_string_lossy();
-    if count.starts_with('-') {
-        eprintln!("error: too many entries in GIT_CONFIG_COUNT");
-        eprintln!("fatal: unable to parse command-line config");
-        return Err(GitError::Exit(128));
-    }
-    let count = match count.parse::<usize>() {
-        Ok(count) => count,
-        Err(_) => {
-            eprintln!("error: bogus count in GIT_CONFIG_COUNT");
-            eprintln!("fatal: unable to parse command-line config");
-            return Err(GitError::Exit(128));
-        }
-    };
-    let mut config = Vec::with_capacity(count);
-    for index in 0..count {
-        let key_name = format!("GIT_CONFIG_KEY_{index}");
-        let value_name = format!("GIT_CONFIG_VALUE_{index}");
-        let Some(key) = env::var_os(&key_name) else {
-            eprintln!("error: missing config key {key_name}");
-            eprintln!("fatal: unable to parse command-line config");
-            return Err(GitError::Exit(128));
-        };
-        let Some(value) = env::var_os(&value_name) else {
-            eprintln!("error: missing config value {value_name}");
-            eprintln!("fatal: unable to parse command-line config");
-            return Err(GitError::Exit(128));
-        };
-        config.push(GlobalConfigOverride {
-            key: key.to_string_lossy().into_owned(),
-            value: value.to_string_lossy().into_owned(),
-        });
-    }
-    Ok(config)
 }
 
 fn global_git_dir() -> Option<PathBuf> {

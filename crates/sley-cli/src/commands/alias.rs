@@ -177,9 +177,17 @@ pub(crate) fn run_shell_alias(command: &str, extra_args: &[String]) -> Result<()
         script.push(' ');
         script.push_str(&shell_escape(arg));
     }
-    let status = ProcessCommand::new(&shell)
-        .arg("-c")
-        .arg(&script)
+    let mut process = ProcessCommand::new(&shell);
+    process.arg("-c").arg(&script);
+    // Propagate the effective config-injection parameters (`-c` / `--config-env`
+    // folded onto any inherited `GIT_CONFIG_PARAMETERS`) to the subprocess git,
+    // exactly as upstream git does by mutating its own env before running the
+    // shell alias. This is what makes `git -c x.one=1 <shell-alias-that-runs-git>`
+    // see x.one inside the alias's child git.
+    if let Some(params) = crate::effective_config_parameters_env() {
+        process.env("GIT_CONFIG_PARAMETERS", params);
+    }
+    let status = process
         .status()
         .map_err(|err| GitError::Io(err.to_string()))?;
     if status.success() {

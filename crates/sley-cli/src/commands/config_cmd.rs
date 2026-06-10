@@ -421,13 +421,34 @@ pub(crate) fn cmd_config(args: &[String]) -> Result<()> {
     } else {
         Some(parse_config_key(positional[0])?)
     };
+    // Source precedence for `git config`: an explicit `--file`/`-f` (or `-` for
+    // stdin) wins; otherwise the legacy `GIT_CONFIG` env var names a single file
+    // to read and write (like `--file`, and like `--file` it suppresses the `-c`
+    // / env config-injection overlay); otherwise the repository config is used.
+    let git_config_env = env::var_os("GIT_CONFIG").filter(|value| !value.is_empty());
     let source = match config_file {
         Some(value) if value == "-" => ConfigSource::Stdin,
         Some(value) => ConfigSource::File(PathBuf::from(value)),
-        None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
+        None => match git_config_env {
+            Some(path) => ConfigSource::File(PathBuf::from(path)),
+            None => ConfigSource::Repository(discover_git_dir(env::current_dir()?)?),
+        },
     };
     let loaded = read_config_source(&source, action)?;
     let mut config = loaded.config;
+    // Command-line / environment config injection (`-c`, `--config-env`,
+    // `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) applies only to the default
+    // (repository) config read, never to an explicit `-f <file>` or stdin source
+    // — git layers these on top of the file stack at highest precedence, so the
+    // document model's last-one-wins lookup yields the right value. Reads also
+    // validate the injection stream here, surfacing a bogus `-c`/env entry the
+    // same way git does.
+    if matches!(source, ConfigSource::Repository(_)) {
+        let parameters = crate::injected_config_parameters()?;
+        config
+            .sections
+            .extend(sley_config::injected_config_sections(&parameters));
+    }
     match action {
         ConfigAction::List => {
             config_list(&config, &source, display, name_only, null_terminate)?;

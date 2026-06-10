@@ -276,10 +276,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 let assignment = iter
                     .next()
                     .ok_or_else(|| GitError::Command("clone --config requires a value".into()))?;
-                config_overrides.push(parse_global_config_override(assignment)?);
+                config_overrides.push(parse_clone_config_override(assignment)?);
             }
             value if value.starts_with("--config=") => {
-                config_overrides.push(parse_global_config_override(
+                config_overrides.push(parse_clone_config_override(
                     value.strip_prefix("--config=").ok_or_else(|| {
                         GitError::Command("clone --config requires a value".into())
                     })?,
@@ -1254,6 +1254,27 @@ fn clone_bare_or_mirror_local_repository(
     );
     env::set_current_dir(previous_cwd)?;
     fetch_result
+}
+
+/// Parse a `git clone --config <key>=<value>` (a.k.a. clone's own `-c`) entry
+/// into a [`GlobalConfigOverride`] to persist into the cloned repository's config.
+/// A missing `=` makes the value boolean-true; an empty key is rejected. This is
+/// distinct from the global `git -c` injection (which never persists).
+fn parse_clone_config_override(value: &str) -> Result<GlobalConfigOverride> {
+    let Some((key, val)) = value.split_once('=') else {
+        return Ok(GlobalConfigOverride {
+            key: value.to_string(),
+            value: "true".to_string(),
+        });
+    };
+    if key.is_empty() {
+        eprintln!("error: key does not contain a section: {value}");
+        return Err(GitError::Exit(128));
+    }
+    Ok(GlobalConfigOverride {
+        key: key.to_string(),
+        value: val.to_string(),
+    })
 }
 
 fn apply_clone_config_overrides(git_dir: &Path, overrides: &[GlobalConfigOverride]) -> Result<()> {
