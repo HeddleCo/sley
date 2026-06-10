@@ -33,6 +33,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut sparse = false;
     let mut separate_git_dir = None::<String>;
     let mut depth = None::<u32>;
+    let mut local = None::<bool>;
     let mut shallow_since_ignored = false;
     let mut shallow_exclude_ignored = false;
     let mut positional = Vec::new();
@@ -250,7 +251,9 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 template_config = false;
             }
             "-4" | "--ipv4" | "-6" | "--ipv6" => {}
-            "-l" | "--local" | "--no-local" | "--hardlinks" | "--no-hardlinks" => {}
+            "-l" | "--local" => local = Some(true),
+            "--no-local" => local = Some(false),
+            "--hardlinks" | "--no-hardlinks" => {}
             "--no-ref-format" => {}
             "--ref-format" => {
                 let value = iter.next().ok_or_else(|| {
@@ -549,9 +552,37 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         .transpose()?;
     let branch_explicit = branch.is_some();
     let checkout_branch = branch.unwrap_or_else(|| remote_head_branch.clone());
-    if depth.is_some() {
-        eprintln!("warning: --depth is ignored in local clones; use file:// instead.");
+    // git only treats a clone as "local" (hardlink/copy mechanism, shallow
+    // options warned-and-ignored) when the source resolves as a plain path and
+    // `--no-local` was not given: `is_local = option_local != 0 && path &&
+    // !is_bundle` in builtin/clone.c, and a `file://` URL never resolves as a
+    // path (`get_repo_path` stats the raw string). A non-local path clone goes
+    // through the transport, which honors `--depth`. The bare and `--revision`
+    // paths below bypass the transport fetch and cannot deepen, so the
+    // warn-and-ignore is kept for them.
+    let local_mechanism = local != Some(false)
+        && !parse_remote_url(&repository)
+            .map(|url| url.transport == RemoteTransport::File)
+            .unwrap_or(false);
+    if !quiet {
+        if bare {
+            eprintln!(
+                "Cloning into bare repository '{}'...",
+                destination_display.display()
+            );
+        } else {
+            eprintln!("Cloning into '{}'...", destination_display.display());
+        }
     }
+    // The shallow-option and filter warnings follow the "Cloning into" line,
+    // matching upstream's order (builtin/clone.c prints the banner before the
+    // is_local checks).
+    let depth = if depth.is_some() && (local_mechanism || bare || revision.is_some()) {
+        eprintln!("warning: --depth is ignored in local clones; use file:// instead.");
+        None
+    } else {
+        depth
+    };
     if shallow_since_ignored {
         eprintln!("warning: --shallow-since is ignored in local clones; use file:// instead.");
     }
@@ -572,20 +603,12 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // in upstream `builtin/clone.c`, i.e. when the source is a plain local
     // path. A `file://` source goes through the transport machinery upstream
     // (even though sley serves it from this same local code path), so it ends
-    // without "done.".
+    // without "done.". This is a strictly narrower condition than
+    // `local_mechanism` (which also covers `--local` over a `file://`-less path
+    // for the depth warn-and-ignore), so the two are kept distinct.
     let local_source = parse_remote_url(&repository)
         .map(|url| url.transport == RemoteTransport::Local)
         .unwrap_or(false);
-    if !quiet {
-        if bare {
-            eprintln!(
-                "Cloning into bare repository '{}'...",
-                destination_display.display()
-            );
-        } else {
-            eprintln!("Cloning into '{}'...", destination_display.display());
-        }
-    }
     if bare {
         clone_bare_or_mirror_local_repository(
             &destination,
@@ -692,9 +715,10 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         checkout_branch: &checkout_branch,
         remote_head_branch: &remote_head_branch,
         single_branch,
-        // Local clones have no shallow support; `--depth` was warned-and-ignored
-        // above, so the local clone is always a full clone.
-        depth: None,
+        // A non-local path clone (`--no-local` / `file://`) honors `--depth`
+        // through the in-process transport; a plain local clone had its depth
+        // warned-and-ignored above, leaving `None` (a full clone).
+        depth,
         committer: commit_identity_from_env("COMMITTER")?,
     };
     let mut credentials = sley_remote::NoCredentials;
@@ -1794,10 +1818,12 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     if fetch_source_is_ssh(&source)? {
         return fetch_ssh_repository(&git_dir, format, &source, &refspecs, options);
     }
-    // Local (`file://`/path) fetches have no shallow support (the in-process server
-    // cannot deepen), so a `--depth` is warned-and-ignored, matching local-clone.
+    // Local (`file://`/path) fetches keep the historical warn-and-ignore for
+    // `--depth` (only clone wires the local deepen so far), so the depth is
+    // cleared here and must not leak into the deepen-capable fetch below.
     if options.depth.is_some() {
         eprintln!("warning: --depth is ignored in local fetches; use file:// instead.");
+        options.depth = None;
     }
     fetch_local_repository(&git_dir, format, &source, &refspecs, options)
 }

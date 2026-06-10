@@ -85,9 +85,11 @@ pub struct CloneOptions<'a> {
     /// the remote default.
     pub single_branch: bool,
     /// Shallow clone depth (`--depth N`): truncate history to `N` commits per tip,
-    /// writing `$GIT_DIR/shallow`. `None` is a full clone. Honored only for the
-    /// HTTP (and SSH) transports; a depth on a local clone is ignored upstream of
-    /// `clone` by the caller (the in-process server has no shallow support).
+    /// writing `$GIT_DIR/shallow`. `None` is a full clone. Honored by the HTTP
+    /// and SSH transports and by the in-process local server (`git clone
+    /// --no-local --depth N <path>`); a depth on a plain local clone is
+    /// warned-and-ignored upstream of `clone` by the caller, matching git's
+    /// `is_local` behavior.
     pub depth: Option<u32>,
     /// The committer identity for the branch-creation and checkout reflog entries.
     pub committer: Vec<u8>,
