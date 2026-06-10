@@ -3577,6 +3577,31 @@ impl ContentFilterPlan {
             TextDecision::Auto => self.eol != EolConversion::None && !looks_binary(content),
         }
     }
+
+    /// The smudge-side LF->CRLF safety check, mirroring convert.c
+    /// `will_convert_lf_to_crlf`. Returns false (no conversion) when:
+    ///   * there is no naked LF to convert, or
+    ///   * the action is `text=auto`-derived (the "new safer autocrlf") AND the
+    ///     content already contains a lone CR or a CRLF pair, or looks binary.
+    ///
+    /// An explicit `text`/`eol=crlf` (non-auto) path always converts naked LFs.
+    fn will_convert_lf_to_crlf(&self, content: &[u8]) -> bool {
+        let stats = gather_convert_stats(content);
+        // No naked LF? Nothing to convert.
+        if stats.lonelf == 0 {
+            return false;
+        }
+        if self.text == TextDecision::Auto {
+            // Any CR or CRLF already present: leave it untouched (irreversible).
+            if stats.lonecr > 0 || stats.crlf > 0 {
+                return false;
+            }
+            if convert_is_binary(&stats) {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 /// Derive the smudge-direction line ending from `core.autocrlf` / `core.eol`.
@@ -3897,7 +3922,10 @@ pub fn apply_smudge_filter_with_attributes_cow<'a>(
 ) -> Result<Cow<'a, [u8]>> {
     let plan = ContentFilterPlan::resolve(config, attributes);
     let mut data = Cow::Borrowed(content);
-    if plan.eol == EolConversion::Crlf && plan.convert_eol(&data) {
+    if plan.eol == EolConversion::Crlf
+        && plan.convert_eol(&data)
+        && plan.will_convert_lf_to_crlf(&data)
+    {
         data = Cow::Owned(convert_lf_to_crlf(&data));
     }
     if let Some(driver) = &plan.driver {
@@ -3967,6 +3995,258 @@ fn filter_attribute_names() -> Vec<Vec<u8>> {
         b"eol".to_vec(),
         b"filter".to_vec(),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// `ls-files --eol` line-ending information
+//
+// Git's `git ls-files --eol` prints, for each path, three fields:
+//   i/<stat>  — line-ending statistics of the *index* blob content
+//   w/<stat>  — line-ending statistics of the *worktree* file content
+//   attr/<a>  — the resolved crlf/eol attribute action (attributes only, no
+//               config) — `get_convert_attr_ascii` in convert.c
+// The two stat fields mirror `gather_convert_stats_ascii`; the attr field
+// mirrors `convert_attrs` up to `ca->attr_action` (i.e. *before* the config
+// derived `text` -> input/crlf substitution and the `core.autocrlf` fallback).
+// ---------------------------------------------------------------------------
+
+/// Line-ending statistics of a byte buffer, mirroring convert.c `gather_stats`.
+struct ConvertStats {
+    nul: u32,
+    lonecr: u32,
+    lonelf: u32,
+    crlf: u32,
+    printable: u32,
+    nonprintable: u32,
+}
+
+fn gather_convert_stats(buf: &[u8]) -> ConvertStats {
+    let mut stats = ConvertStats {
+        nul: 0,
+        lonecr: 0,
+        lonelf: 0,
+        crlf: 0,
+        printable: 0,
+        nonprintable: 0,
+    };
+    let mut i = 0;
+    while i < buf.len() {
+        let c = buf[i];
+        if c == b'\r' {
+            if buf.get(i + 1) == Some(&b'\n') {
+                stats.crlf += 1;
+                i += 1;
+            } else {
+                stats.lonecr += 1;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\n' {
+            stats.lonelf += 1;
+            i += 1;
+            continue;
+        }
+        if c == 127 {
+            // DEL
+            stats.nonprintable += 1;
+        } else if c < 32 {
+            match c {
+                // BS, HT, ESC and FF are printable.
+                0x08 | 0x09 | 0x1b | 0x0c => stats.printable += 1,
+                0 => {
+                    stats.nul += 1;
+                    stats.nonprintable += 1;
+                }
+                _ => stats.nonprintable += 1,
+            }
+        } else {
+            stats.printable += 1;
+        }
+        i += 1;
+    }
+    // A trailing EOF (^Z, 0x1a) is not counted as non-printable.
+    if buf.last() == Some(&0x1a) {
+        stats.nonprintable = stats.nonprintable.saturating_sub(1);
+    }
+    stats
+}
+
+/// Mirror of convert.c `convert_is_binary`: a lone CR or NUL, or a high
+/// non-printable ratio, marks the content as binary.
+fn convert_is_binary(stats: &ConvertStats) -> bool {
+    if stats.lonecr > 0 {
+        return true;
+    }
+    if stats.nul > 0 {
+        return true;
+    }
+    (stats.printable >> 7) < stats.nonprintable
+}
+
+/// Compute the `i/` or `w/` stat string for `content`, mirroring
+/// convert.c `gather_convert_stats_ascii`.
+fn convert_stats_ascii(content: &[u8]) -> &'static str {
+    if content.is_empty() {
+        return "none";
+    }
+    let stats = gather_convert_stats(content);
+    if convert_is_binary(&stats) {
+        return "-text";
+    }
+    match (stats.lonelf > 0, stats.crlf > 0) {
+        (true, false) => "lf",
+        (false, true) => "crlf",
+        (true, true) => "mixed",
+        (false, false) => "none",
+    }
+}
+
+/// The resolved crlf/eol attribute action for a path, mirroring convert.c
+/// `convert_attrs` up to `ca->attr_action` (attributes only, no config), and
+/// `get_convert_attr_ascii` for the ascii spelling.
+fn convert_attr_ascii(checks: &[AttributeCheck]) -> &'static str {
+    fn state_of<'a>(checks: &'a [AttributeCheck], name: &[u8]) -> Option<&'a AttributeState> {
+        checks
+            .iter()
+            .find(|check| check.attribute == name)
+            .and_then(|check| check.state.as_ref())
+    }
+
+    // git_path_check_crlf: ATTR_TRUE -> TEXT, ATTR_FALSE -> BINARY,
+    // ATTR_UNSET -> (fall through), "input" -> TEXT_INPUT, "auto" -> AUTO,
+    // anything else -> UNDEFINED.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Action {
+        Undefined,
+        Binary,
+        Text,
+        TextInput,
+        TextCrlf,
+        Auto,
+        AutoCrlf,
+        AutoInput,
+    }
+    fn check_crlf(state: Option<&AttributeState>) -> Action {
+        match state {
+            Some(AttributeState::Set) => Action::Text,
+            Some(AttributeState::Unset) => Action::Binary,
+            Some(AttributeState::Value(value)) if value == b"input" => Action::TextInput,
+            Some(AttributeState::Value(value)) if value == b"auto" => Action::Auto,
+            // ATTR_UNSET / any other value -> CRLF_UNDEFINED.
+            _ => Action::Undefined,
+        }
+    }
+
+    // Resolve from the `text` attribute, then fall back to the legacy `crlf`
+    // alias only when `text` left the action undefined.
+    let mut action = check_crlf(state_of(checks, b"text"));
+    if action == Action::Undefined {
+        action = check_crlf(state_of(checks, b"crlf"));
+    }
+
+    if action != Action::Binary {
+        // git_path_check_eol: only "lf"/"crlf" values matter.
+        let eol = match state_of(checks, b"eol") {
+            Some(AttributeState::Value(value)) if value == b"lf" => Some(false),
+            Some(AttributeState::Value(value)) if value == b"crlf" => Some(true),
+            _ => None,
+        };
+        action = match (action, eol) {
+            (Action::Auto, Some(false)) => Action::AutoInput,
+            (Action::Auto, Some(true)) => Action::AutoCrlf,
+            (_, Some(false)) if action != Action::Auto => Action::TextInput,
+            (_, Some(true)) if action != Action::Auto => Action::TextCrlf,
+            _ => action,
+        };
+    }
+
+    match action {
+        Action::Undefined => "",
+        Action::Binary => "-text",
+        Action::Text => "text",
+        Action::TextInput => "text eol=lf",
+        Action::TextCrlf => "text eol=crlf",
+        Action::Auto => "text=auto",
+        Action::AutoCrlf => "text=auto eol=crlf",
+        Action::AutoInput => "text=auto eol=lf",
+    }
+}
+
+/// The three `ls-files --eol` fields for a single path.
+pub struct EolInfo {
+    /// Stat of the index blob (`i/...`); empty when there is no index blob.
+    pub index: &'static str,
+    /// Stat of the worktree file (`w/...`); empty when the file is absent.
+    pub worktree: &'static str,
+    /// Resolved crlf/eol attribute action (`attr/...`).
+    pub attr: &'static str,
+}
+
+impl EolInfo {
+    /// Format as git's `ls-files --eol` prefix: `i/%-5s w/%-5s attr/%-17s\t`.
+    pub fn format_prefix(&self) -> String {
+        format!(
+            "i/{:<5} w/{:<5} attr/{:<17}\t",
+            self.index, self.worktree, self.attr
+        )
+    }
+}
+
+/// Compute the `ls-files --eol` info for `path`.
+///
+/// `index_content` is the raw index blob bytes (None when the path has no
+/// index entry or is not a regular file). The worktree file is read from
+/// `worktree_root/path`; if it is absent or not a regular file the `w/` field
+/// is empty. Attributes are resolved from the worktree `.gitattributes` chain
+/// via `attr_checks`.
+pub fn eol_info_for_path(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+    index_content: Option<&[u8]>,
+    attr_checks: &[AttributeCheck],
+) -> EolInfo {
+    let index = index_content.map(convert_stats_ascii).unwrap_or("");
+
+    let worktree_root = worktree_root.as_ref();
+    let worktree = match repo_path_to_os_path(path) {
+        Ok(rel) => {
+            let absolute = worktree_root.join(rel);
+            match fs::symlink_metadata(&absolute) {
+                // git: only regular files get a `w/` stat (lstat + S_ISREG).
+                Ok(meta) if meta.file_type().is_file() => match fs::read(&absolute) {
+                    Ok(content) => convert_stats_ascii_owned(&content),
+                    Err(_) => "",
+                },
+                _ => "",
+            }
+        }
+        Err(_) => "",
+    };
+
+    let attr = convert_attr_ascii(attr_checks);
+
+    EolInfo {
+        index,
+        worktree,
+        attr,
+    }
+}
+
+/// `convert_stats_ascii` over an owned buffer; the result is a `'static` str so
+/// the buffer can be dropped.
+fn convert_stats_ascii_owned(content: &[u8]) -> &'static str {
+    convert_stats_ascii(content)
+}
+
+/// Resolve the crlf/eol/text/filter attributes for `path` from the worktree
+/// `.gitattributes` chain (the set `ls-files --eol` needs for its `attr/`
+/// field).
+pub fn eol_attribute_checks(
+    worktree_root: impl AsRef<Path>,
+    path: &[u8],
+) -> Result<Vec<AttributeCheck>> {
+    filter_attribute_checks(worktree_root.as_ref(), path)
 }
 
 pub fn deleted_index_entries(
@@ -6660,6 +6940,115 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    // --- `ls-files --eol` stat/attr helpers (mirror convert.c) ---------------
+
+    #[test]
+    fn convert_stats_ascii_classifies_eol_content() {
+        assert_eq!(convert_stats_ascii(b""), "none");
+        assert_eq!(convert_stats_ascii(b"abc"), "none");
+        assert_eq!(convert_stats_ascii(b"a\nb\n"), "lf");
+        assert_eq!(convert_stats_ascii(b"a\r\nb\r\n"), "crlf");
+        assert_eq!(convert_stats_ascii(b"a\r\nb\n"), "mixed");
+        // A lone CR makes the content binary (-text), matching git.
+        assert_eq!(convert_stats_ascii(b"a\rb"), "-text");
+        // A NUL byte is binary.
+        assert_eq!(convert_stats_ascii(b"a\0b\n"), "-text");
+        // A trailing ^Z (EOF) is not counted as non-printable.
+        assert_eq!(convert_stats_ascii(b"abc\n\x1a"), "lf");
+    }
+
+    fn attr_check(name: &[u8], state: Option<AttributeState>) -> AttributeCheck {
+        AttributeCheck {
+            attribute: name.to_vec(),
+            state,
+        }
+    }
+
+    #[test]
+    fn convert_attr_ascii_matches_git_attr_action() {
+        // No attributes at all: empty attr field.
+        assert_eq!(convert_attr_ascii(&[]), "");
+        // text (set) -> "text"; -text (unset) -> "-text".
+        assert_eq!(
+            convert_attr_ascii(&[attr_check(b"text", Some(AttributeState::Set))]),
+            "text"
+        );
+        assert_eq!(
+            convert_attr_ascii(&[attr_check(b"text", Some(AttributeState::Unset))]),
+            "-text"
+        );
+        // text=auto -> "text=auto"; with eol=crlf/lf the AUTO variants.
+        assert_eq!(
+            convert_attr_ascii(&[attr_check(
+                b"text",
+                Some(AttributeState::Value(b"auto".to_vec()))
+            )]),
+            "text=auto"
+        );
+        assert_eq!(
+            convert_attr_ascii(&[
+                attr_check(b"text", Some(AttributeState::Value(b"auto".to_vec()))),
+                attr_check(b"eol", Some(AttributeState::Value(b"crlf".to_vec()))),
+            ]),
+            "text=auto eol=crlf"
+        );
+        assert_eq!(
+            convert_attr_ascii(&[
+                attr_check(b"text", Some(AttributeState::Value(b"auto".to_vec()))),
+                attr_check(b"eol", Some(AttributeState::Value(b"lf".to_vec()))),
+            ]),
+            "text=auto eol=lf"
+        );
+        // eol=crlf/lf alone (no text) forces text + the eol direction.
+        assert_eq!(
+            convert_attr_ascii(&[attr_check(
+                b"eol",
+                Some(AttributeState::Value(b"crlf".to_vec()))
+            )]),
+            "text eol=crlf"
+        );
+        assert_eq!(
+            convert_attr_ascii(&[attr_check(
+                b"eol",
+                Some(AttributeState::Value(b"lf".to_vec()))
+            )]),
+            "text eol=lf"
+        );
+        // -text overrides any eol attribute (binary wins).
+        assert_eq!(
+            convert_attr_ascii(&[
+                attr_check(b"text", Some(AttributeState::Unset)),
+                attr_check(b"eol", Some(AttributeState::Value(b"crlf".to_vec()))),
+            ]),
+            "-text"
+        );
+    }
+
+    #[test]
+    fn smudge_safety_guard_skips_irreversible_autocrlf() {
+        // text=auto eol=crlf (AUTO_CRLF): convert pure-LF, but leave content
+        // alone when it already has a CR or CRLF, or is binary.
+        let auto = ContentFilterPlan {
+            text: TextDecision::Auto,
+            eol: EolConversion::Crlf,
+            driver: None,
+        };
+        assert!(auto.will_convert_lf_to_crlf(b"a\nb\n"));
+        assert!(!auto.will_convert_lf_to_crlf(b"a\r\nb\n")); // has CRLF
+        assert!(!auto.will_convert_lf_to_crlf(b"a\nb\rc")); // lone CR (binary)
+        assert!(!auto.will_convert_lf_to_crlf(b"abc")); // no naked LF
+
+        // text eol=crlf (TEXT_CRLF): no safety guard — always convert naked LF
+        // even when a CR/CRLF is already present.
+        let text = ContentFilterPlan {
+            text: TextDecision::Text,
+            eol: EolConversion::Crlf,
+            driver: None,
+        };
+        assert!(text.will_convert_lf_to_crlf(b"a\r\nb\nc\n"));
+        assert!(!text.will_convert_lf_to_crlf(b"a\r\nb\r\n")); // no naked LF
+    }
 
     /// Build an in-memory ignore matcher from raw `.gitignore` lines (no disk).
     fn ignore_matcher(patterns: &[&[u8]]) -> IgnoreMatcher {

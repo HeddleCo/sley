@@ -436,6 +436,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut full_name = false;
     let mut deduplicate = false;
     let mut error_unmatch = false;
+    let mut show_eol = false;
     let mut oid_abbrev = None;
     let mut path_args = Vec::new();
     let mut positional_only = false;
@@ -496,11 +497,12 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             "--no-deduplicate" => deduplicate = false,
             "--error-unmatch" => error_unmatch = true,
             "--no-error-unmatch" => error_unmatch = false,
+            "--eol" => show_eol = true,
+            "--no-eol" => show_eol = false,
             "--recurse-submodules"
             | "--no-recurse-submodules"
             | "--sparse"
             | "--no-sparse"
-            | "--no-eol"
             | "--no-killed"
             | "--no-resolve-undo"
             | "--no-debug" => {}
@@ -565,6 +567,15 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout();
     let terminator = if nul { 0 } else { b'\n' };
     let pathspec = LsFilesPathspec::new(&cwd, &worktree_root, full_name, &path_args)?;
+    let eol_context = if show_eol {
+        Some(EolContext {
+            worktree_root: worktree_root.clone(),
+            db: FileObjectDatabase::from_git_dir(&git_dir, format),
+        })
+    } else {
+        None
+    };
+    let eol = eol_context.as_ref();
     let selected = cached || others || deleted || modified || unmerged;
     let output_stage = stage || unmerged;
     if ignored && !others && !cached {
@@ -596,8 +607,12 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
             },
         )?;
         for path in untracked {
-            if let Some(path) = pathspec.display(&path) {
-                write_ls_files_path(&mut stdout, &path, terminator)?;
+            if let Some(display) = pathspec.display(&path) {
+                if let Some(eol) = eol {
+                    // Untracked files have no index blob: `i/` is empty.
+                    eol.write_prefix(&mut stdout, &path, None)?;
+                }
+                write_ls_files_path(&mut stdout, &display, terminator)?;
                 stdout.write_all(&[terminator])?;
             }
         }
@@ -638,6 +653,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         deduplicate,
                         oid_abbrev,
                         oid_candidates: &oid_candidates,
+                        eol,
                     },
                 )?;
             } else {
@@ -654,6 +670,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                         deduplicate,
                         oid_abbrev,
                         oid_candidates: &oid_candidates,
+                        eol,
                     },
                 )?;
             }
@@ -674,6 +691,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 &pathspec,
                 oid_abbrev,
                 &oid_candidates,
+                eol,
             )?;
         } else if (deleted || modified) && output_stage {
             write_ls_files_index_with_selected(
@@ -689,6 +707,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                     deduplicate: false,
                     oid_abbrev,
                     oid_candidates: &oid_candidates,
+                    eol,
                 },
             )?;
         } else {
@@ -700,6 +719,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
                 &pathspec,
                 oid_abbrev,
                 &oid_candidates,
+                eol,
             )?;
         }
     }
@@ -710,6 +730,7 @@ pub(crate) fn cmd_ls_files(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_ls_files_unmerged<'a>(
     stdout: &mut io::Stdout,
     entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
@@ -717,6 +738,7 @@ fn write_ls_files_unmerged<'a>(
     pathspec: &LsFilesPathspec,
     oid_abbrev: Option<usize>,
     oid_candidates: &[ObjectId],
+    eol: Option<&EolContext>,
 ) -> Result<()> {
     for entry in entries {
         if index_entry_stage(entry) == 0 {
@@ -730,11 +752,13 @@ fn write_ls_files_unmerged<'a>(
             pathspec,
             oid_abbrev,
             oid_candidates,
+            eol,
         )?;
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_ls_files_index<'a>(
     stdout: &mut io::Stdout,
     entries: impl IntoIterator<Item = &'a sley_index::IndexEntry>,
@@ -743,11 +767,18 @@ fn write_ls_files_index<'a>(
     pathspec: &LsFilesPathspec,
     oid_abbrev: Option<usize>,
     oid_candidates: &[ObjectId],
+    eol: Option<&EolContext>,
 ) -> Result<()> {
     for entry in entries {
         let Some(path) = pathspec.display(&entry.path) else {
             continue;
         };
+        if let Some(eol) = eol {
+            // git prints the eol prefix before any `--stage` info; the `i/`
+            // field reflects the index blob only for regular files.
+            let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
+            eol.write_prefix(stdout, &entry.path, index_oid)?;
+        }
         if stage {
             let stage = index_entry_stage(entry);
             write!(
@@ -761,6 +792,12 @@ fn write_ls_files_index<'a>(
         stdout.write_all(&[terminator])?;
     }
     Ok(())
+}
+
+/// Whether an index entry mode is a regular file (git: `S_ISREG`). Symlinks
+/// (`0o120000`) and gitlinks (`0o160000`) get no `i/` eol stat.
+fn is_regular_file_mode(mode: u32) -> bool {
+    mode & 0o170000 == 0o100000
 }
 
 fn write_ls_files_index_with_selected<'a>(
@@ -786,6 +823,7 @@ fn write_ls_files_index_with_selected<'a>(
             pathspec,
             options.oid_abbrev,
             options.oid_candidates,
+            options.eol,
         )?;
     }
     Ok(())
@@ -850,6 +888,10 @@ fn write_ls_files_entry(
     if options.deduplicate && !seen.insert(path.clone()) {
         return Ok(());
     }
+    if let Some(eol) = options.eol {
+        let index_oid = is_regular_file_mode(entry.mode).then_some(&entry.oid);
+        eol.write_prefix(stdout, &entry.path, index_oid)?;
+    }
     if options.stage {
         let stage = index_entry_stage(entry);
         write!(
@@ -873,6 +915,47 @@ fn write_ls_files_path(stdout: &mut io::Stdout, path: &[u8], terminator: u8) -> 
     Ok(())
 }
 
+/// State needed to compute the `git ls-files --eol` `i/ w/ attr/` prefix.
+struct EolContext {
+    worktree_root: PathBuf,
+    db: FileObjectDatabase,
+}
+
+impl EolContext {
+    /// Read the index blob content for an entry, if it resolves to a blob.
+    /// Mirrors git's `get_cached_convert_stats_ascii` (NULL when not a regular
+    /// file is handled by the caller passing `None` for the oid).
+    fn index_blob(&self, oid: &ObjectId) -> Option<Vec<u8>> {
+        match self.db.read_object(oid) {
+            Ok(object) if object.object_type == ObjectType::Blob => Some(object.body.clone()),
+            _ => None,
+        }
+    }
+
+    /// Write the `i/%-5s w/%-5s attr/%-17s\t` prefix for `path`.
+    ///
+    /// `index_oid` is the entry's blob oid for the `i/` field (None for
+    /// untracked files, whose index field is empty), and `repo_path` is the
+    /// repo-relative path used for attribute lookup + worktree stat.
+    fn write_prefix(
+        &self,
+        stdout: &mut io::Stdout,
+        repo_path: &[u8],
+        index_oid: Option<&ObjectId>,
+    ) -> Result<()> {
+        let index_content = index_oid.and_then(|oid| self.index_blob(oid));
+        let attr_checks = sley_worktree::eol_attribute_checks(&self.worktree_root, repo_path)?;
+        let info = sley_worktree::eol_info_for_path(
+            &self.worktree_root,
+            repo_path,
+            index_content.as_deref(),
+            &attr_checks,
+        );
+        stdout.write_all(info.format_prefix().as_bytes())?;
+        Ok(())
+    }
+}
+
 fn ls_files_oid_candidates(index: &Index) -> Vec<ObjectId> {
     index.entries.iter().map(|entry| entry.oid).collect()
 }
@@ -889,6 +972,7 @@ struct LsFilesWriteOptions<'a> {
     deduplicate: bool,
     oid_abbrev: Option<usize>,
     oid_candidates: &'a [ObjectId],
+    eol: Option<&'a EolContext>,
 }
 
 pub(crate) fn cmd_ls_tree(args: &[String]) -> Result<()> {
