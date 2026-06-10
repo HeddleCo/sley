@@ -1,6 +1,9 @@
 //! # sley-bench
 //!
-//! Criterion benchmarks for `cat-file`, object-database read paths, and graph/ref/tree walks.
+//! Criterion benchmarks comparing the release `sley` binary against a real
+//! `git` binary (`GIT_BENCH_BIN`, default `git`) on the implemented command
+//! surface, plus sley-internal ODB/pack hot paths. See `README.md` for the
+//! quiet-box run procedure.
 //!
 //! Run full benchmarks:
 //!
@@ -32,10 +35,16 @@ static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub const FIXTURE_OBJECT_COUNT: usize = 500;
 
 /// Number of commits written into the commit-graph benchmark fixture.
-pub const COMMIT_FIXTURE_COUNT: usize = 200;
+pub const COMMIT_FIXTURE_COUNT: usize = 1000;
 
 /// Number of branch refs created in the commit-graph benchmark fixture.
-pub const BRANCH_REF_COUNT: usize = 10;
+pub const BRANCH_REF_COUNT: usize = 100;
+
+/// Number of tracked files in the worktree benchmark fixture.
+pub const WORKTREE_FILE_COUNT: usize = 1000;
+
+/// Number of `bench.*` config keys written into the worktree fixture config.
+pub const CONFIG_KEY_COUNT: usize = 50;
 
 #[derive(Debug)]
 pub struct BenchFixture {
@@ -325,78 +334,183 @@ fn deltifiable_blob_body(index: usize) -> Vec<u8> {
     body
 }
 
+/// Path to the release `sley` binary computed by `build.rs`.
+///
+/// Overridable at runtime via the `SLEY_BENCH_BIN` env var. The binary is NOT
+/// built automatically (a nested cargo build deadlocks on the workspace lock —
+/// see `build.rs`); run `cargo build --release -p sley-cli --bin sley` first.
+pub fn sley_bin() -> String {
+    std::env::var("SLEY_BENCH_BIN").unwrap_or_else(|_| env!("SLEY_BENCH_BIN").to_string())
+}
+
+/// Path to the comparison `git` binary.
+///
+/// Defaults to `git` on `PATH`; pin a specific build (e.g. an upstream 2.54.0)
+/// via the `GIT_BENCH_BIN` env var.
+pub fn git_bin() -> String {
+    std::env::var("GIT_BENCH_BIN").unwrap_or_else(|_| "git".to_string())
+}
+
+/// Spawn `bin` in `cwd` with `args`, feed `stdin`, and return stdout.
+///
+/// `env` entries are applied on top of the ambient environment.
+pub fn run_cli(
+    bin: &str,
+    cwd: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    env: &[(&str, &str)],
+) -> Result<Vec<u8>> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(bin);
+    command
+        .current_dir(cwd)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|err| GitError::Command(format!("{bin}: {err}")))?;
+    if !stdin.is_empty() {
+        let stdin_handle = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| GitError::Command(format!("missing {bin} stdin")))?;
+        stdin_handle
+            .write_all(stdin)
+            .map_err(|err| GitError::Io(err.to_string()))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|err| GitError::Command(err.to_string()))?;
+    if !output.status.success() {
+        return Err(GitError::Command(format!(
+            "{bin} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
 /// Run the release `sley` binary built by `build.rs`.
 pub fn run_sley(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child =
-        Command::new(std::env::var("SLEY_BENCH_BIN").map_err(|_| {
-            GitError::Command("SLEY_BENCH_BIN not set; build sley-bench first".into())
-        })?)
-        .current_dir(cwd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| GitError::Command(err.to_string()))?;
-    if !stdin.is_empty() {
-        let stdin_handle = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| GitError::Command("missing sley stdin".into()))?;
-        stdin_handle
-            .write_all(stdin)
-            .map_err(|err| GitError::Io(err.to_string()))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| GitError::Command(err.to_string()))?;
-    if !output.status.success() {
-        return Err(GitError::Command(format!(
-            "sley {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(output.stdout)
+    run_cli(&sley_bin(), cwd, args, stdin, &[])
 }
 
-/// Run the system `git` binary for head-to-head CLI comparisons.
+/// Run the comparison `git` binary ([`git_bin`]) for head-to-head CLI runs.
 pub fn run_git(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("git")
-        .current_dir(cwd)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| GitError::Command(err.to_string()))?;
-    if !stdin.is_empty() {
-        let stdin_handle = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| GitError::Command("missing git stdin".into()))?;
-        stdin_handle
-            .write_all(stdin)
-            .map_err(|err| GitError::Io(err.to_string()))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| GitError::Command(err.to_string()))?;
-    if !output.status.success() {
-        return Err(GitError::Command(format!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(output.stdout)
+    run_cli(&git_bin(), cwd, args, stdin, &[])
 }
 
-fn unique_temp_dir(prefix: &str) -> PathBuf {
+/// Run [`git_bin`] with global/system config isolated — used for fixture
+/// SETUP only, so a host-level `commit.gpgsign`/hooks config cannot break
+/// deterministic fixture creation. Bench-time invocations keep the ambient
+/// environment (symmetric for both binaries).
+fn run_git_isolated(cwd: &Path, args: &[&str], stdin: &[u8]) -> Result<Vec<u8>> {
+    run_cli(
+        &git_bin(),
+        cwd,
+        args,
+        stdin,
+        &[
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_SYSTEM", "/dev/null"),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ],
+    )
+}
+
+/// A repository with a real worktree, index, and config — fixture for the
+/// porcelain/index benchmarks (`status`, `add`, `commit`, `ls-files`,
+/// `update-index`, `hash-object`, `config`).
+///
+/// Built with the comparison `git` binary (the oracle) rather than sley
+/// internals so a sley write-path bug cannot poison the fixture.
+#[derive(Debug)]
+pub struct WorktreeBenchFixture {
+    pub repo_root: PathBuf,
+    pub git_dir: PathBuf,
+    /// Paths of all tracked files, relative to `repo_root`.
+    pub tracked_files: Vec<String>,
+}
+
+/// Build a worktree fixture: [`WORKTREE_FILE_COUNT`] tracked files across 50
+/// directories, 5 commits of history, identity + [`CONFIG_KEY_COUNT`]
+/// `bench.*` keys in the repo config.
+///
+/// Mutating benches (`add`, `commit`, `status`'s opportunistic index refresh)
+/// should build ONE FIXTURE PER ARM so the binaries never share state.
+pub fn create_worktree_fixture() -> Result<WorktreeBenchFixture> {
+    let repo_root = unique_temp_dir("sley-bench-worktree");
+    fs::create_dir_all(&repo_root)?;
+    let git_dir = repo_root.join(".git");
+
+    run_git_isolated(&repo_root, &["init", "-q", "-b", "main"], &[])?;
+
+    // Identity + deterministic config surface, written directly for speed.
+    let mut config = String::from(
+        "[user]\n\tname = Bench User\n\temail = bench@example.invalid\n\
+         [commit]\n\tgpgsign = false\n[bench]\n",
+    );
+    for index in 0..CONFIG_KEY_COUNT {
+        config.push_str(&format!("\tkey{index} = value-{index:04}\n"));
+    }
+    let config_path = git_dir.join("config");
+    let existing = fs::read_to_string(&config_path).unwrap_or_default();
+    fs::write(&config_path, format!("{existing}{config}"))?;
+
+    let dirs = 50usize;
+    let files_per_dir = WORKTREE_FILE_COUNT / dirs;
+    let mut tracked_files = Vec::with_capacity(WORKTREE_FILE_COUNT);
+    for dir_index in 0..dirs {
+        let dir = repo_root.join(format!("dir-{dir_index:02}"));
+        fs::create_dir_all(&dir)?;
+        for file_index in 0..files_per_dir {
+            let rel = format!("dir-{dir_index:02}/file-{file_index:02}.txt");
+            let mut body = String::with_capacity(256);
+            for line in 0..6 {
+                body.push_str(&format!(
+                    "deterministic payload d{dir_index} f{file_index} line {line}\n"
+                ));
+            }
+            fs::write(repo_root.join(&rel), body)?;
+            tracked_files.push(rel);
+        }
+    }
+
+    run_git_isolated(&repo_root, &["add", "."], &[])?;
+    run_git_isolated(&repo_root, &["commit", "-q", "-m", "initial import"], &[])?;
+    for round in 0..4 {
+        for file_index in 0..4 {
+            let rel = format!("dir-00/file-{file_index:02}.txt");
+            fs::write(
+                repo_root.join(&rel),
+                format!("revision {round} of file {file_index}\n"),
+            )?;
+        }
+        run_git_isolated(&repo_root, &["add", "-u"], &[])?;
+        run_git_isolated(
+            &repo_root,
+            &["commit", "-q", "-m", &format!("round {round}")],
+            &[],
+        )?;
+    }
+
+    Ok(WorktreeBenchFixture {
+        repo_root,
+        git_dir,
+        tracked_files,
+    })
+}
+
+/// Create a unique path under the system temp dir (not created on disk).
+pub fn unique_temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())

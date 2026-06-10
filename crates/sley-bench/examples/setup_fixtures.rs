@@ -5,7 +5,10 @@
 //! eval "$(cargo run -p sley-bench --example setup_fixtures 2>/dev/null)"
 //! ```
 
-use sley_bench::{BenchFixture, FIXTURE_OBJECT_COUNT, create_commit_fixture, create_fixture};
+use sley_bench::{
+    BenchFixture, FIXTURE_OBJECT_COUNT, create_commit_fixture, create_fixture,
+    create_worktree_fixture,
+};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -48,4 +51,10 @@ fn main() {
         &commit.repo_root.display().to_string(),
     );
     export("SLEY_BENCH_COMMIT_COUNT", &commit.commit_count.to_string());
+
+    let worktree = create_worktree_fixture().expect("worktree fixture");
+    export(
+        "SLEY_BENCH_WORKTREE_REPO",
+        &worktree.repo_root.display().to_string(),
+    );
 }

@@ -48,5 +48,25 @@ harness = false
 name = "tree_walk"
 harness = false
 
+[[bench]]
+name = "config_cmd"
+harness = false
+
+[[bench]]
+name = "index_ops"
+harness = false
+
+[[bench]]
+name = "log_pretty"
+harness = false
+
+[[bench]]
+name = "init_cmd"
+harness = false
+
+[[bench]]
+name = "worktree_ops"
+harness = false
+
 [lints]
 workspace = true

@@ -22,7 +22,7 @@ fn fixture() -> &'static BenchFixture {
 
 fn format_batch_line(oid: &ObjectId, object_type: ObjectType, size: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(64);
-    write!(out, "{oid} {} {size}\n", object_type.as_str()).expect("format batch line");
+    writeln!(out, "{oid} {} {size}", object_type.as_str()).expect("format batch line");
     out
 }
 
@@ -39,7 +39,10 @@ fn profile_find_and_header(c: &mut Criterion) {
         let lines = fixture.batch_input(FIXTURE_OBJECT_COUNT);
         b.iter(|| {
             let mut count = 0usize;
-            for line in std::str::from_utf8(&lines).unwrap().lines() {
+            for line in std::str::from_utf8(&lines)
+                .expect("batch input is ascii hex")
+                .lines()
+            {
                 if ObjectId::from_hex(format, black_box(line)).is_ok() {
                     count += 1;
                 }
