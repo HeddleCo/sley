@@ -1,0 +1,59 @@
+# cargo-deny configuration for sley.
+#
+# Consumed by `cargo deny check all` in .github/workflows/audit.yml. Minimal,
+# sane defaults: deny known-vulnerable advisories, allow only the permissive
+# licenses sley itself ships under (MIT / Apache-2.0) plus the common
+# permissive licenses found across the Rust ecosystem, and warn on multiple
+# versions rather than hard-failing (the workspace is pre-1.0 and dependency
+# trees still churn).
+#
+# cargo-deny schema v2 (graph/output split). See
+# https://embarkstudios.github.io/cargo-deny/ for the full reference.
+
+[graph]
+# All targets — sley is a native git impl that may build cross-platform.
+all-features = false
+
+[advisories]
+# Fail on any active RustSec advisory. Add specific IDs to `ignore` (with a
+# justifying comment) only when an advisory is unreachable in sley's usage.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Permissive licenses only. sley ships under "MIT OR Apache-2.0". This list is
+# the EXACT set present in the current dependency tree (verified via
+# `cargo deny list` on 2026-06-10): MIT, Apache-2.0, BSD-3-Clause, ISC, Zlib,
+# and CDLA-Permissive-2.0 (the Community Data License covering webpki-roots'
+# Mozilla CA root-store data, pulled transitively via ureq -> sley-transport).
+# All are OSI/permissive and compatible with sley's dual MIT/Apache license.
+# Add a license here (with a one-line justification) only when a new dependency
+# introduces one.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Warn (don't fail) on duplicate dependency versions: pre-1.0 workspace, the
+# tree is still consolidating. Flip to "deny" once it stabilises.
+multiple-versions = "warn"
+# Allow wildcard deps: every wildcard in this tree is an intra-workspace
+# `path = "../sley-*"` dependency (no version constraint, by design). cargo-deny's
+# `allow-wildcard-paths` only exempts crates marked `publish = false`, and sley's
+# crates are publishable, so it would still warn on each — flip to "allow" rather
+# than emit ~20 noise warnings per run. There are no unpinned *registry* wildcards
+# in the tree; revisit if any external dep is ever added with `version = "*"`.
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

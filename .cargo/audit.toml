@@ -1,0 +1,13 @@
+# cargo-audit configuration for sley.
+#
+# Auto-discovered by `cargo audit` (run with --deny warnings in
+# .github/workflows/audit.yml). The ignore list is intentionally empty: add a
+# specific RUSTSEC ID here, with a justifying comment, only when an advisory is
+# confirmed unreachable in sley's usage and a fix is not yet available.
+
+[advisories]
+ignore = []
+# Escalate informational advisories (unmaintained / yanked / notice) so the
+# CLI flag --deny warnings has something to trip on; the workflow passes
+# --deny warnings explicitly, this mirrors the intent in config.
+informational_warnings = ["unmaintained", "unsound", "yanked"]
