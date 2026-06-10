@@ -3949,6 +3949,17 @@ fn print_for_each_ref_format(
                         .and_then(|push| push.refname.as_deref())
                         .unwrap_or("");
                     stdout.write_all(for_each_ref_rstrip_name(push, count).as_bytes())?;
+                } else if let Some(value) = other
+                    .strip_prefix("symref:lstrip=")
+                    .or_else(|| other.strip_prefix("symref:strip="))
+                {
+                    let count = parse_for_each_ref_strip_count(value)?;
+                    let symref = context.symref.unwrap_or("");
+                    stdout.write_all(for_each_ref_lstrip_name(symref, count).as_bytes())?;
+                } else if let Some(value) = other.strip_prefix("symref:rstrip=") {
+                    let count = parse_for_each_ref_strip_count(value)?;
+                    let symref = context.symref.unwrap_or("");
+                    stdout.write_all(for_each_ref_rstrip_name(symref, count).as_bytes())?;
                 } else if let Some(width) = other.strip_prefix("objectname:short=") {
                     let width = parse_for_each_ref_abbrev_width(width)?;
                     stdout.write_all(

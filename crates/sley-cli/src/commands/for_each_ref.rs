@@ -12,6 +12,8 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
     let mut ignore_case = false;
     let mut color = false;
     let mut quote = ForEachRefQuoteMode::None;
+    // git rejects more than one quoting style (HAS_MULTI_BITS on quote_style).
+    let mut quote_styles = 0u32;
     let mut read_stdin = false;
     let mut sorts = Vec::new();
     let mut sort_explicit = false;
@@ -46,10 +48,22 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
             "--no-color" => color = false,
             "--color=always" => color = true,
             "--color=never" | "--color=auto" => color = false,
-            "--shell" | "-s" => quote = ForEachRefQuoteMode::Shell,
-            "--python" => quote = ForEachRefQuoteMode::Python,
-            "--perl" | "-p" => quote = ForEachRefQuoteMode::Perl,
-            "--tcl" => quote = ForEachRefQuoteMode::Tcl,
+            "--shell" | "-s" => {
+                quote = ForEachRefQuoteMode::Shell;
+                quote_styles += 1;
+            }
+            "--python" => {
+                quote = ForEachRefQuoteMode::Python;
+                quote_styles += 1;
+            }
+            "--perl" | "-p" => {
+                quote = ForEachRefQuoteMode::Perl;
+                quote_styles += 1;
+            }
+            "--tcl" => {
+                quote = ForEachRefQuoteMode::Tcl;
+                quote_styles += 1;
+            }
             "--ignore-case" => ignore_case = true,
             "--no-ignore-case" => ignore_case = false,
             "--stdin" => read_stdin = true,
@@ -221,7 +235,21 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
     if sorts.is_empty() {
         sorts.push(ForEachRefSort::Refname);
     }
+    // git: `if (HAS_MULTI_BITS(format.quote_style))` -> error + usage (exit 129).
+    if quote_styles > 1 {
+        eprintln!("error: more than one quoting style?");
+        return Err(GitError::Exit(129));
+    }
     let format_spec = ForEachRefFormat::parse(&format_spec)?;
+    // git: a bare %(raw) atom is incompatible with --python/--shell/--tcl.
+    if matches!(
+        quote,
+        ForEachRefQuoteMode::Python | ForEachRefQuoteMode::Shell | ForEachRefQuoteMode::Tcl
+    ) && for_each_ref_format_has_bare_raw(&format_spec)
+    {
+        eprintln!("fatal: --format=%(raw) cannot be used with --python, --shell, --tcl");
+        return Err(GitError::Exit(128));
+    }
     let needs = ForEachRefNeeds::analyze(&format_spec);
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
@@ -709,6 +737,18 @@ impl ForEachRefNeeds {
             }
         }
     }
+}
+
+/// Whether the format contains a bare `%(raw)` / `%(*raw)` atom (not
+/// `raw:size`), which git forbids under `--python`/`--shell`/`--tcl`.
+fn for_each_ref_format_has_bare_raw(format_spec: &ForEachRefFormat) -> bool {
+    format_spec.segments().iter().any(|segment| {
+        matches!(
+            segment,
+            ForEachRefFormatSegment::Atom(ForEachRefAtom::Raw(placeholder))
+                if placeholder == "raw" || placeholder == "*raw"
+        )
+    })
 }
 
 fn parse_for_each_ref_count(value: &str) -> Result<usize> {
