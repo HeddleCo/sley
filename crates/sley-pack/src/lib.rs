@@ -2112,17 +2112,85 @@ pub fn read_object_header_at<F>(
 where
     F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
 {
-    read_object_header_at_inner(pack_bytes, offset, format, &mut resolve_ref_base_type)
+    read_object_header_at_inner(
+        pack_bytes,
+        offset,
+        format,
+        &mut resolve_ref_base_type,
+        &mut NoopHeaderTypeCache,
+    )
 }
 
-fn read_object_header_at_inner<F>(
+/// Memo of `pack offset -> resolved header (end-of-chain type, result size)` for
+/// the `cat-file --batch-check` header fast path.
+///
+/// Without it, resolving the *type* of an ofs-delta walks the whole delta chain
+/// to its base on every header read, re-inflating each link's leading varints
+/// from scratch — so reading every object in a deeply-deltified pack costs
+/// O(objects x chain-depth) and goes super-linear (sley#26). Two reuses fall out
+/// of memoizing `offset -> (type, size)`:
+///
+/// * a chain's end-of-chain type is resolved at most once, so later objects on
+///   the same chain skip the walk; and
+/// * a repeated lookup of the same object (common in batch input) returns from
+///   the memo without re-inflating its delta header at all.
+///
+/// The size stored is the object's final (inflated) result size — read from its
+/// own pack/delta header, never by materializing the body.
+pub trait HeaderTypeCache {
+    /// The previously resolved header at `pack_offset`, if any.
+    fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)>;
+    /// Record the resolved header at `pack_offset` for reuse by later reads.
+    fn put(&mut self, pack_offset: u64, header: (ObjectType, u64));
+}
+
+struct NoopHeaderTypeCache;
+
+impl HeaderTypeCache for NoopHeaderTypeCache {
+    fn get(&self, _pack_offset: u64) -> Option<(ObjectType, u64)> {
+        None
+    }
+    fn put(&mut self, _pack_offset: u64, _header: (ObjectType, u64)) {}
+}
+
+/// Like [`read_object_header_at`] but threads a caller-owned [`HeaderTypeCache`]
+/// through the read so (a) the ofs-delta chain's end-of-chain type is resolved at
+/// most once per chain and (b) a repeated lookup of the same offset returns from
+/// the memo without re-inflating (sley#26). The cache is keyed by in-pack offset,
+/// so it must be scoped to a single pack's bytes by the caller.
+pub fn read_object_header_at_with_cache<F, C>(
+    pack_bytes: &[u8],
+    offset: u64,
+    format: ObjectFormat,
+    mut resolve_ref_base_type: F,
+    type_cache: &mut C,
+) -> Result<(ObjectType, u64)>
+where
+    F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
+    C: HeaderTypeCache + ?Sized,
+{
+    if let Some(header) = type_cache.get(offset) {
+        return Ok(header);
+    }
+    read_object_header_at_inner(
+        pack_bytes,
+        offset,
+        format,
+        &mut resolve_ref_base_type,
+        type_cache,
+    )
+}
+
+fn read_object_header_at_inner<F, C>(
     pack_bytes: &[u8],
     offset: u64,
     format: ObjectFormat,
     resolve_ref_base_type: &mut F,
+    type_cache: &mut C,
 ) -> Result<(ObjectType, u64)>
 where
     F: FnMut(&ObjectId) -> Result<Option<ObjectType>>,
+    C: HeaderTypeCache + ?Sized,
 {
     let trailer_offset = pack_bytes
         .len()
@@ -2133,21 +2201,30 @@ where
         .filter(|&value| value < trailer_offset)
         .ok_or_else(|| GitError::InvalidFormat("pack object offset out of range".into()))?;
     let header = parse_entry_header(pack_bytes, &mut cursor)?;
-    match header.kind {
-        PackObjectKind::Commit => Ok((ObjectType::Commit, header.size)),
-        PackObjectKind::Tree => Ok((ObjectType::Tree, header.size)),
-        PackObjectKind::Blob => Ok((ObjectType::Blob, header.size)),
-        PackObjectKind::Tag => Ok((ObjectType::Tag, header.size)),
+    let resolved = match header.kind {
+        PackObjectKind::Commit => (ObjectType::Commit, header.size),
+        PackObjectKind::Tree => (ObjectType::Tree, header.size),
+        PackObjectKind::Blob => (ObjectType::Blob, header.size),
+        PackObjectKind::Tag => (ObjectType::Tag, header.size),
         PackObjectKind::OfsDelta => {
             let base_offset = parse_ofs_delta_base_offset(pack_bytes, &mut cursor, offset)?;
             let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
-            let (base_type, _) = read_object_header_at_inner(
-                pack_bytes,
-                base_offset,
-                format,
-                resolve_ref_base_type,
-            )?;
-            Ok((base_type, size))
+            // The end-of-chain type only depends on the base, so reuse it across
+            // reads instead of re-walking the chain per object (sley#26).
+            let base_type = match type_cache.get(base_offset) {
+                Some((base_type, _)) => base_type,
+                None => {
+                    let (base_type, _) = read_object_header_at_inner(
+                        pack_bytes,
+                        base_offset,
+                        format,
+                        resolve_ref_base_type,
+                        type_cache,
+                    )?;
+                    base_type
+                }
+            };
+            (base_type, size)
         }
         PackObjectKind::RefDelta => {
             let hash_len = format.raw_len();
@@ -2161,9 +2238,13 @@ where
             let size = delta_result_size_from_stream(&pack_bytes[cursor..trailer_offset])?;
             let base_type = resolve_ref_base_type(&oid)?
                 .ok_or_else(|| GitError::not_found(format!("ref-delta base object {oid}")))?;
-            Ok((base_type, size))
+            (base_type, size)
         }
-    }
+    };
+    // Memoize the fully resolved header so a repeated lookup of this offset (or a
+    // chain that bases on it) returns without re-inflating (sley#26).
+    type_cache.put(offset, resolved);
+    Ok(resolved)
 }
 
 /// Number of inflated delta-stream bytes to read when only the leading base-size
@@ -4297,6 +4378,85 @@ mod tests {
                 })
                 .expect("test operation should succeed");
             assert_eq!(*got, po.object, "offset {}", po.entry.offset);
+        }
+    }
+
+    /// A [`HeaderTypeCache`] over a plain map, for asserting the cached header
+    /// read is byte-identical to the uncached one cold and warm (sley#26).
+    #[derive(Default)]
+    struct MapHeaderTypeCache(HashMap<u64, (ObjectType, u64)>);
+
+    impl HeaderTypeCache for MapHeaderTypeCache {
+        fn get(&self, pack_offset: u64) -> Option<(ObjectType, u64)> {
+            self.0.get(&pack_offset).copied()
+        }
+        fn put(&mut self, pack_offset: u64, header: (ObjectType, u64)) {
+            self.0.insert(pack_offset, header);
+        }
+    }
+
+    #[test]
+    fn read_object_header_at_cached_matches_uncached_cold_and_warm_for_ofs_delta() {
+        let (base, changed) = similar_blob_objects();
+        let options = delta_pack_options(true);
+        let written = PackFile::write_packed_with_options(
+            &[base, changed],
+            ObjectFormat::Sha1,
+            &options,
+        )
+        .expect("test operation should succeed");
+        // Ensure the pack genuinely contains an ofs-delta (else the test is vacuous).
+        let mut second = written.entries[1].offset as usize;
+        assert_eq!(
+            parse_entry_header(&written.pack, &mut second)
+                .expect("test operation should succeed")
+                .kind,
+            PackObjectKind::OfsDelta
+        );
+
+        let parsed = PackFile::parse_sha1(&written.pack).expect("test operation should succeed");
+        let mut cache = MapHeaderTypeCache::default();
+        for po in &parsed.entries {
+            let uncached =
+                read_object_header_at(&written.pack, po.entry.offset, ObjectFormat::Sha1, |_| {
+                    Ok(None)
+                })
+                .expect("test operation should succeed");
+            // Type inherited from the chain base; size is the inflated body length.
+            assert_eq!(
+                uncached,
+                (po.object.object_type, po.object.body.len() as u64),
+                "uncached header at offset {}",
+                po.entry.offset
+            );
+            // Cold cache: must agree with the uncached read and populate the memo.
+            let cold = read_object_header_at_with_cache(
+                &written.pack,
+                po.entry.offset,
+                ObjectFormat::Sha1,
+                |_| Ok(None),
+                &mut cache,
+            )
+            .expect("test operation should succeed");
+            assert_eq!(cold, uncached, "cold cache at offset {}", po.entry.offset);
+        }
+        // Warm cache: every offset now resolves from the memo and is still correct,
+        // proving the fast path does not change behavior (sley#26).
+        for po in &parsed.entries {
+            let warm = read_object_header_at_with_cache(
+                &written.pack,
+                po.entry.offset,
+                ObjectFormat::Sha1,
+                |_| panic!("warm cache must not re-walk the chain"),
+                &mut cache,
+            )
+            .expect("test operation should succeed");
+            assert_eq!(
+                warm,
+                (po.object.object_type, po.object.body.len() as u64),
+                "warm cache at offset {}",
+                po.entry.offset
+            );
         }
     }
 
