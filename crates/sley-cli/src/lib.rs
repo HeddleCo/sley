@@ -54,6 +54,25 @@ static GLOBAL_GIT_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_WORK_TREE: Mutex<Option<PathBuf>> = Mutex::new(None);
 static GLOBAL_BARE: Mutex<bool> = Mutex::new(false);
 static GLOBAL_REPLACE_OBJECTS: Mutex<bool> = Mutex::new(true);
+/// Default pathspec magic set by the global `--{glob,noglob,icase,literal}-pathspecs`
+/// options (and the corresponding `GIT_*_PATHSPECS` env vars). Mirrors git's
+/// `get_default_pathspec_flags()`: `--literal-pathspecs` wins and forces every
+/// pathspec to be matched literally; otherwise glob/icase magic is OR'd in.
+static GLOBAL_PATHSPEC_FLAGS: Mutex<PathspecFlags> = Mutex::new(PathspecFlags {
+    literal: false,
+    glob: false,
+    icase: false,
+});
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct PathspecFlags {
+    /// `--literal-pathspecs`: no wildcard interpretation at all.
+    pub literal: bool,
+    /// `--glob-pathspecs`: `*`/`?` are pathname-aware (`WM_PATHNAME`), `**` spans `/`.
+    pub glob: bool,
+    /// `--icase-pathspecs`: case-insensitive matching (`WM_CASEFOLD`).
+    pub icase: bool,
+}
 
 mod commands;
 mod log_format;
@@ -90,6 +109,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_work_tree(global.work_tree);
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
+    set_global_pathspec_flags(global.pathspec_flags);
     dispatch_with_aliases(global.args, &global.config, 0)
 }
 
@@ -127,6 +147,9 @@ fn dispatch_with_aliases(
                     }
                     if nested.bare {
                         set_global_bare(true);
+                    }
+                    if nested.pathspec_flags != PathspecFlags::default() {
+                        set_global_pathspec_flags(nested.pathspec_flags);
                     }
                     return dispatch_with_aliases(nested.args, global_config, alias_depth + 1);
                 }
@@ -280,6 +303,7 @@ struct GlobalOptions<'a> {
     work_tree: Option<PathBuf>,
     bare: bool,
     replace_objects: bool,
+    pathspec_flags: PathspecFlags,
 }
 
 #[derive(Debug, Clone)]
@@ -295,6 +319,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
     let mut work_tree = None;
     let mut bare = false;
     let mut replace_objects = env::var_os("GIT_NO_REPLACE_OBJECTS").is_none();
+    let mut pathspec_flags = PathspecFlags::default();
     while let Some(arg) = args.get(index) {
         match arg.as_str() {
             "-C" => {
@@ -344,6 +369,26 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
                 replace_objects = false;
                 index += 1;
             }
+            "--literal-pathspecs" => {
+                pathspec_flags.literal = true;
+                index += 1;
+            }
+            "--glob-pathspecs" => {
+                pathspec_flags.glob = true;
+                index += 1;
+            }
+            "--noglob-pathspecs" => {
+                // git treats --noglob-pathspecs as forcing literal `*`/`?`/`[`
+                // (PATHSPEC_LITERAL is not set, but glob magic is suppressed and
+                // wildcards lose their special meaning). Model it as literal for
+                // matching purposes.
+                pathspec_flags.literal = true;
+                index += 1;
+            }
+            "--icase-pathspecs" => {
+                pathspec_flags.icase = true;
+                index += 1;
+            }
             "--git-dir" => {
                 let Some(path) = args.get(index + 1) else {
                     eprintln!("no directory given for '--git-dir' option");
@@ -388,6 +433,7 @@ fn apply_global_options(args: &[String]) -> Result<GlobalOptions<'_>> {
         work_tree,
         bare,
         replace_objects,
+        pathspec_flags,
     })
 }
 
@@ -555,6 +601,47 @@ fn set_global_bare(bare: bool) {
 fn set_global_replace_objects(replace_objects: bool) {
     if let Ok(mut value) = GLOBAL_REPLACE_OBJECTS.lock() {
         *value = replace_objects;
+    }
+}
+
+fn set_global_pathspec_flags(flags: PathspecFlags) {
+    if let Ok(mut value) = GLOBAL_PATHSPEC_FLAGS.lock() {
+        *value = flags;
+    }
+}
+
+/// Effective default pathspec magic, folding in the global options *and* the
+/// `GIT_*_PATHSPECS` environment variables (git reads both). Literal magic
+/// (`--literal-pathspecs`/`--noglob-pathspecs`/`GIT_LITERAL_PATHSPECS`/
+/// `GIT_NOGLOB_PATHSPECS`) suppresses glob magic.
+pub(crate) fn effective_pathspec_flags() -> sley_worktree::PathspecMatchMagic {
+    let mut flags = GLOBAL_PATHSPEC_FLAGS
+        .lock()
+        .map(|value| *value)
+        .unwrap_or_default();
+    if git_env_bool("GIT_LITERAL_PATHSPECS") {
+        flags.literal = true;
+    }
+    if git_env_bool("GIT_NOGLOB_PATHSPECS") {
+        flags.literal = true;
+    }
+    if git_env_bool("GIT_GLOB_PATHSPECS") {
+        flags.glob = true;
+    }
+    if git_env_bool("GIT_ICASE_PATHSPECS") {
+        flags.icase = true;
+    }
+    sley_worktree::PathspecMatchMagic {
+        literal: flags.literal,
+        glob: flags.glob && !flags.literal,
+        icase: flags.icase,
+    }
+}
+
+fn git_env_bool(name: &str) -> bool {
+    match env::var(name) {
+        Ok(value) => !matches!(value.as_str(), "" | "0" | "false" | "no" | "off"),
+        Err(_) => false,
     }
 }
 
@@ -2799,7 +2886,8 @@ impl DiffPathspec {
         if self.filters.is_empty() {
             return true;
         }
-        self.filters.iter().any(|filter| filter.matches(path))
+        let magic = effective_pathspec_flags();
+        self.filters.iter().any(|filter| filter.matches(path, magic))
     }
 
     fn is_empty(&self) -> bool {
@@ -4484,6 +4572,7 @@ struct LsFilesPathspec {
     full_name: bool,
     filters: Vec<LsFilesPathFilter>,
     cwd_depth: usize,
+    magic: sley_worktree::PathspecMatchMagic,
 }
 
 impl LsFilesPathspec {
@@ -4500,10 +4589,19 @@ impl LsFilesPathspec {
         })?;
         let prefix = relative.to_string_lossy().replace('\\', "/").into_bytes();
         let cwd_depth = path_component_count(&prefix);
+        let magic = effective_pathspec_flags();
         let mut filters = Vec::new();
         for arg in path_args {
+            if arg.is_empty() {
+                // git: an empty pathspec is rejected before any matching.
+                eprintln!(
+                    "fatal: empty string is not a valid pathspec. please use . instead if you meant to match all paths"
+                );
+                return Err(GitError::Exit(128));
+            }
             let filter_path = normalize_ls_files_pathspec(&prefix, arg)?;
-            let is_glob = sley_worktree::pathspec_is_glob(&filter_path);
+            // Under literal magic, wildcard characters carry no special meaning.
+            let is_glob = !magic.literal && sley_worktree::pathspec_is_glob(&filter_path);
             let arg_path = Path::new(arg);
             let absolute = if arg_path.is_absolute() {
                 arg_path.to_path_buf()
@@ -4523,6 +4621,7 @@ impl LsFilesPathspec {
             full_name,
             filters,
             cwd_depth,
+            magic,
         })
     }
 
@@ -4573,7 +4672,7 @@ impl LsFilesPathspec {
         }
         let mut matched = false;
         for filter in &self.filters {
-            if filter.matches(path) {
+            if filter.matches(path, self.magic) {
                 filter.matched.set(true);
                 matched = true;
             }
@@ -4609,15 +4708,13 @@ struct LsFilesPathFilter {
 }
 
 impl LsFilesPathFilter {
-    fn matches(&self, path: &[u8]) -> bool {
-        sley_worktree::untracked_pathspec_matches(
-            &sley_worktree::UntrackedPathspecFilter {
-                path: self.path.clone(),
-                recursive: self.recursive,
-                is_glob: self.is_glob,
-            },
-            path,
-        )
+    fn matches(&self, path: &[u8], magic: sley_worktree::PathspecMatchMagic) -> bool {
+        // Byte-exact git `match_pathspec_item` for the tracked-index path. Handles
+        // exact / directory-prefix / wildcard matching under the active magic.
+        let path_no_slash = path.strip_suffix(b"/").unwrap_or(path);
+        sley_worktree::pathspec_item_matches(&self.path, path, magic)
+            || (path_no_slash.len() != path.len()
+                && sley_worktree::pathspec_item_matches(&self.path, path_no_slash, magic))
     }
 }
 

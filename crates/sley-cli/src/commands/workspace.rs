@@ -2371,7 +2371,8 @@ impl StatusPathspec {
     }
 
     fn matches(&self, path: &[u8]) -> bool {
-        self.filters.iter().any(|filter| filter.matches(path))
+        let magic = effective_pathspec_flags();
+        self.filters.iter().any(|filter| filter.matches(path, magic))
     }
 }
 
