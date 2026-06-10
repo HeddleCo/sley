@@ -42,7 +42,6 @@ fn run_env(program: &str, cwd: &Path, args: &[&str]) -> Output {
 /// Like [`run_env`] but feeds `stdin_data` to the process's standard input
 /// (used to exercise `diff-tree --stdin`).
 fn run_env_stdin(program: &str, cwd: &Path, args: &[&str], stdin_data: &str) -> Output {
-    use std::io::Write;
     let mut child = Command::new(program)
         .current_dir(cwd)
         .args(args)
@@ -57,12 +56,10 @@ fn run_env_stdin(program: &str, cwd: &Path, args: &[&str], stdin_data: &str) -> 
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("failed to spawn {program} {args:?}: {err}"));
-    child
-        .stdin
-        .take()
-        .expect("child stdin piped")
-        .write_all(stdin_data.as_bytes())
-        .expect("write child stdin");
+    sley_testkit::write_stdin_tolerating_early_exit(
+        child.stdin.as_mut().expect("child stdin piped"),
+        stdin_data.as_bytes(),
+    );
     child
         .wait_with_output()
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))
