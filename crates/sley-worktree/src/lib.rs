@@ -420,14 +420,26 @@ fn update_index_paths_impl(
             }
             continue;
         }
-        if !absolute.exists() {
+        // lstat (not stat): a symlink must be inspected as the link itself, never
+        // followed to its target. `Path::exists`/`fs::metadata` both stat through
+        // the link, which makes a symlink-to-directory look like a directory
+        // (fs::read then fails with "Is a directory") and a symlink-to-file get
+        // staged with the target's content + a regular-file mode. git stages a
+        // symlink as mode 120000 whose blob is the link target string, regardless
+        // of what (if anything) the target resolves to.
+        let symlink_metadata = match fs::symlink_metadata(&absolute) {
+            Ok(metadata) => Some(metadata),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        let Some(metadata) = symlink_metadata else {
             if options.remove {
                 index.entries.retain(|existing| existing.path != git_path);
                 continue;
             }
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
             return Err(GitError::Exit(128));
-        }
+        };
         if !options.add
             && !index
                 .entries
@@ -440,10 +452,17 @@ fn update_index_paths_impl(
             );
             return Err(GitError::Exit(128));
         }
-        let body = fs::read(&absolute)?;
-        let body = match clean_config {
-            Some(config) => apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?,
-            None => body,
+        let is_symlink = metadata.file_type().is_symlink();
+        let body = if is_symlink {
+            // The blob is the raw link target bytes; clean filters never apply to
+            // a symlink (git treats it as binary content, not a text path).
+            symlink_target_bytes(&absolute)?
+        } else {
+            let body = fs::read(&absolute)?;
+            match clean_config {
+                Some(config) => apply_clean_filter(worktree_root, git_dir, config, &git_path, &body)?,
+                None => body,
+            }
         };
         let object = EncodedObject::new(ObjectType::Blob, body);
         let oid = if options.info_only {
@@ -451,9 +470,23 @@ fn update_index_paths_impl(
         } else {
             odb.write_object(object)?
         };
-        let metadata = fs::metadata(&absolute)?;
         let mut entry = index_entry_from_metadata(git_path.clone(), oid, &metadata);
+        if is_symlink {
+            entry.mode = 0o120000;
+        }
         if let Some(executable) = options.chmod {
+            // git's chmod_path() refuses to flip the executable bit on anything
+            // that is not a regular file (a symlink/gitlink has no such bit). It
+            // writes the blob first, then errors with this exact message and
+            // leaves the index untouched.
+            if is_symlink {
+                eprintln!(
+                    "fatal: git update-index: cannot chmod {}x '{}'",
+                    if executable { '+' } else { '-' },
+                    String::from_utf8_lossy(&git_path)
+                );
+                return Err(GitError::Exit(128));
+            }
             entry.mode = if executable { 0o100755 } else { 0o100644 };
         }
         index.entries.retain(|existing| existing.path != git_path);
@@ -6484,6 +6517,25 @@ fn file_mode(metadata: &fs::Metadata) -> u32 {
 #[cfg(not(unix))]
 fn file_mode(_metadata: &fs::Metadata) -> u32 {
     0o100644
+}
+
+/// The blob content git stores for a symlink: the raw bytes of the link target
+/// exactly as `readlink(2)` returns them. On Unix the target is an opaque byte
+/// string, so we take the `OsStr` bytes verbatim (no UTF-8 round-trip, no path
+/// re-componentization that could rewrite separators).
+#[cfg(unix)]
+fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = fs::read_link(path)?;
+    Ok(target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(path: &Path) -> Result<Vec<u8>> {
+    let target = fs::read_link(path)?;
+    // git normalizes symlink targets to forward slashes on platforms whose
+    // native separator is `\`.
+    Ok(target.to_string_lossy().replace('\\', "/").into_bytes())
 }
 
 fn git_path_bytes(path: &Path) -> Result<Vec<u8>> {
