@@ -1592,9 +1592,14 @@ fn config_source_origin(source: &ConfigSource) -> String {
 }
 
 pub(crate) fn config_entry_name(section: &ConfigSection, key: &str) -> String {
+    // git canonicalises the section and variable (key) names to lower case on
+    // display (`--list`, `--get-regexp`, `--name-only`), but leaves the
+    // subsection byte-for-byte as written. Mirror that exactly.
+    let section_name = section.name.to_ascii_lowercase();
+    let key = key.to_ascii_lowercase();
     match &section.subsection {
-        Some(subsection) => format!("{}.{}.{}", section.name, subsection, key),
-        None => format!("{}.{}", section.name, key),
+        Some(subsection) => format!("{section_name}.{subsection}.{key}"),
+        None => format!("{section_name}.{key}"),
     }
 }
 
