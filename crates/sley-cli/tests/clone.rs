@@ -2355,6 +2355,121 @@ fn clone_local_repository_shallow_hint_flags_match_upstream_git() {
 }
 
 #[test]
+fn clone_no_local_depth_matches_upstream_git() {
+    let root = unique_temp_dir("clone-no-local-depth");
+    let source = root.join("source");
+    fs::create_dir_all(&source).expect("create source repo");
+    {
+        create_source_repo(&source);
+        add_feature_commit(&source);
+        // Deepen main past one commit so the depth-limited clones have a real
+        // shallow boundary with history (and a tag) behind it.
+        for (file, message) in [("second.txt", "second"), ("third.txt", "third")] {
+            fs::write(source.join(file), message).expect("write payload");
+            run_success(sley_testkit::oracle_git(), &source, &["add", file]);
+            run_success(
+                sley_testkit::oracle_git(),
+                &source,
+                &[
+                    "-c",
+                    "user.name=Example User",
+                    "-c",
+                    "user.email=example@example.invalid",
+                    "commit",
+                    "-m",
+                    message,
+                    "-q",
+                ],
+            );
+        }
+        run_success(sley_testkit::oracle_git(), &source, &["tag", "tip-tag"]);
+        let source_path = source.to_str().expect("source path is utf8");
+        let file_url = format!("file://{source_path}");
+
+        for (label, repository, options) in [
+            // `--no-local` routes a path clone through the transport, which
+            // honors `--depth`: the result is a true shallow repository.
+            ("depth-1", source_path, vec!["--no-local", "--depth=1"]),
+            ("depth-2", source_path, vec!["--no-local", "--depth", "2"]),
+            // NOTE: `--no-single-branch --depth` is not covered: upstream clone
+            // maps `refs/tags/*` as a primary refspec outside --single-branch
+            // (each tag tip is deepened independently), which sley's clone does
+            // not model yet — tags are auto-followed instead.
+            (
+                "branch-depth-1",
+                source_path,
+                vec!["--no-local", "--branch", "feature/topic", "--depth=1"],
+            ),
+            // A depth past the root commit leaves the clone complete.
+            (
+                "depth-past-root",
+                source_path,
+                vec!["--no-local", "--depth=10"],
+            ),
+            // `file://` URLs never resolve as a plain path, so git treats them
+            // as non-local too and the depth is honored.
+            ("file-url-depth-1", file_url.as_str(), vec!["--depth=1"]),
+            // `--no-depth` resets the depth: a plain full non-local clone.
+            (
+                "no-local-depth-reset",
+                source_path,
+                vec!["--no-local", "--depth=1", "--no-depth"],
+            ),
+            // An explicit `--local` keeps the warn-and-ignore behavior.
+            (
+                "local-depth-warns",
+                source_path,
+                vec!["--local", "--depth=1"],
+            ),
+        ] {
+            let expected_repo = root.join(format!("{label}-expected"));
+            let actual_repo = root.join(format!("{label}-actual"));
+            let expected_arg = expected_repo.to_str().expect("expected path is utf8");
+            let actual_arg = actual_repo.to_str().expect("actual path is utf8");
+            let mut expected_args = vec!["clone"];
+            expected_args.extend(options.iter().copied());
+            expected_args.extend([repository, expected_arg]);
+            let mut actual_args = vec!["clone"];
+            actual_args.extend(options.iter().copied());
+            actual_args.extend([repository, actual_arg]);
+
+            let expected = run(sley_testkit::oracle_git(), &root, &expected_args);
+            let actual = run(env!("CARGO_BIN_EXE_sley"), &root, &actual_args);
+            assert_same_output_with_normalized_destination(
+                actual,
+                expected,
+                expected_arg,
+                actual_arg,
+                &actual_args,
+            );
+
+            for args in [
+                vec!["rev-parse", "--is-shallow-repository"],
+                vec!["show-ref"],
+                vec!["symbolic-ref", "HEAD"],
+                vec!["rev-list", "--count", "HEAD"],
+                vec!["log", "--all", "--format=%H"],
+                vec!["fsck", "--strict"],
+                vec!["config", "--get", "remote.origin.fetch"],
+            ] {
+                // A local-mechanism clone diverges from upstream on fsck:
+                // git copies the whole object store (dangling objects
+                // included, here the unfetched branch tip under the implied
+                // --single-branch) while sley packs reachable objects only —
+                // a pre-existing difference unrelated to --depth.
+                if label == "local-depth-warns" && args[0] == "fsck" {
+                    continue;
+                }
+                let expected = run(sley_testkit::oracle_git(), &expected_repo, &args);
+                let actual = run(sley_testkit::oracle_git(), &actual_repo, &args);
+                assert_same_output(actual, expected, &args);
+            }
+        }
+    };
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
 fn clone_local_repository_recurse_submodules_flags_match_upstream_git() {
     let root = unique_temp_dir("clone-local-recurse-submodules-flags");
     let source = root.join("source");

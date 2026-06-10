@@ -4,12 +4,13 @@ use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 pub use sley_core::BString;
 use sley_formats::CommitGraph;
 use sley_index::Index;
-use sley_object::{Commit, ObjectType, Tag, TreeEntries};
+use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries};
 use sley_odb::{FileObjectDatabase, ObjectPrefixResolution, ObjectReader};
 use sley_refs::{FileRefStore, PackedRef, RefTarget, resolve_ref_peeled, validate_symref_name};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionSpec {
@@ -136,6 +137,13 @@ impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
 
     pub fn resolve_path(&self, rev: &str, path: &str) -> Result<ResolvedTreePath> {
         resolve_rev_path_entry(self.git_dir, self.format, self.reader, rev, path)
+    }
+
+    /// `<rev>:<path>` resolution that follows in-tree symlinks, as
+    /// `git cat-file --follow-symlinks` does. See
+    /// [`resolve_rev_path_follow_symlinks`].
+    pub fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> SymlinkedTreePath {
+        resolve_rev_path_follow_symlinks(self.git_dir, self.format, self.reader, rev, path)
     }
 }
 
@@ -1227,6 +1235,208 @@ pub fn resolve_tree_path_entry<R: ObjectReader>(
         current = oid;
     }
     None
+}
+
+/// Outcome of a `--follow-symlinks` tree-path walk (upstream's
+/// `get_tree_entry_follow_symlinks`, tree-walk.c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymlinkedTreePath {
+    /// The walk ended on an in-repo object (the symlink chain — if any —
+    /// resolved to a blob or tree inside the repository).
+    Found(ObjectId),
+    /// The symlink chain leaves the repository: an absolute link target, or
+    /// `..` escaping past the root. The unresolvable remainder of the link
+    /// path is reported verbatim (upstream sets `*mode = 0` and fills
+    /// `result_path`).
+    OutOfRepo(Vec<u8>),
+    /// A path component was not found before any symlink had been followed
+    /// (upstream `MISSING_OBJECT`).
+    Missing,
+    /// A path component was not found after at least one symlink had been
+    /// followed (upstream `DANGLING_SYMLINK`).
+    Dangling,
+    /// More than [`FOLLOW_SYMLINKS_MAX_LINKS`] symlinks were followed
+    /// (upstream `SYMLINK_LOOP`).
+    Loop,
+    /// A non-final path component resolved to a regular file (upstream
+    /// `NOT_DIR`).
+    NotDir,
+}
+
+/// Linux's built-in cap on the number of symlinks to follow; upstream adopts
+/// the same value (`GET_TREE_ENTRY_FOLLOW_SYMLINKS_MAX_LINKS`).
+pub const FOLLOW_SYMLINKS_MAX_LINKS: u32 = 40;
+
+/// Resolve `<rev>:<path>` like [`resolve_rev_path_entry`], but follow in-tree
+/// symlinks the way `git cat-file --follow-symlinks` does (upstream
+/// `get_tree_entry_follow_symlinks`). Failures on the `<rev>` side (unknown
+/// revision, non-treeish) report [`SymlinkedTreePath::Missing`], matching
+/// upstream where a failed treeish lookup yields `MISSING_OBJECT`.
+pub fn resolve_rev_path_follow_symlinks<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    path: &str,
+) -> SymlinkedTreePath {
+    let Ok(rev_oid) = resolve_revision_with_reader(git_dir, format, reader, rev) else {
+        return SymlinkedTreePath::Missing;
+    };
+    resolve_tree_path_follow_symlinks(reader, format, &rev_oid, path)
+}
+
+/// Walk `path` within the tree of `treeish` (peeled as needed), following
+/// symlink entries. This mirrors upstream's `get_tree_entry_follow_symlinks`
+/// loop: path components are consumed left to right against a stack of parent
+/// trees rooted at the repository root; a symlink entry splices its target in
+/// front of the remaining path; `..` pops a parent (escaping the root reports
+/// the remainder as out-of-repo, like an absolute link target does).
+pub fn resolve_tree_path_follow_symlinks<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    treeish: &ObjectId,
+    path: &str,
+) -> SymlinkedTreePath {
+    // Stack of (tree oid, tree object) from the root down to the directory
+    // currently being walked. Lookups always run against the top entry.
+    let mut parents: Vec<(ObjectId, Arc<EncodedObject>)> = Vec::new();
+    let mut namebuf: Vec<u8> = path.as_bytes().to_vec();
+    let mut current_oid = *treeish;
+    let mut follows_remaining = FOLLOW_SYMLINKS_MAX_LINKS;
+    // Once a symlink has been followed, a failed lookup is a dangling link
+    // rather than a missing path (upstream flips `retval` the same way).
+    let mut followed_symlink = false;
+    let mut need_load = true;
+
+    loop {
+        let fail = if followed_symlink {
+            SymlinkedTreePath::Dangling
+        } else {
+            SymlinkedTreePath::Missing
+        };
+
+        if need_load {
+            let Ok(tree_oid) = peel_to_tree(reader, format, &current_oid) else {
+                return fail;
+            };
+            let Ok(object) = reader.read_object(&tree_oid) else {
+                return fail;
+            };
+            if object.object_type != ObjectType::Tree {
+                return fail;
+            }
+            parents.push((tree_oid, object));
+            if namebuf.is_empty() {
+                // `<rev>:` (or a symlink chain that consumed the whole path)
+                // names the tree just loaded.
+                return SymlinkedTreePath::Found(tree_oid);
+            }
+            if parents.last().is_some_and(|(_, object)| object.body.is_empty()) {
+                return fail;
+            }
+            need_load = false;
+        }
+
+        // Handle symlinks to e.g. `a//b` by removing leading slashes.
+        while namebuf.first() == Some(&b'/') {
+            namebuf.remove(0);
+        }
+
+        // Split namebuf into a first component and an optional remainder.
+        let slash = namebuf.iter().position(|&byte| byte == b'/');
+        let (component_len, has_remainder) = match slash {
+            Some(index) => (index, true),
+            None => (namebuf.len(), false),
+        };
+
+        // `..` can appear in namebuf when a symlink target contains it.
+        if &namebuf[..component_len] == b".." {
+            if parents.len() == 1 {
+                // `..` at the repository root: the rest of the path (the
+                // `..` included) escapes the repository.
+                return SymlinkedTreePath::OutOfRepo(namebuf);
+            }
+            parents.pop();
+            namebuf.drain(..if has_remainder { 3 } else { 2 });
+            continue;
+        }
+
+        // A symlink to `dir/..` leaves an empty path: the current tree.
+        if component_len == 0 {
+            let Some((tree_oid, _)) = parents.last() else {
+                return fail;
+            };
+            return SymlinkedTreePath::Found(*tree_oid);
+        }
+
+        // Look up the first (or only) path component in the current tree.
+        let mut found = None;
+        if let Some((_, object)) = parents.last() {
+            for entry in TreeEntries::new(format, &object.body) {
+                let Ok(entry) = entry else {
+                    return fail;
+                };
+                if entry.name == &namebuf[..component_len] {
+                    found = Some((entry.mode, entry.oid));
+                    break;
+                }
+            }
+        }
+        let Some((mode, oid)) = found else {
+            return fail;
+        };
+
+        match mode & 0o170000 {
+            0o040000 => {
+                // Directory: done if it is the last component, else descend.
+                if !has_remainder {
+                    return SymlinkedTreePath::Found(oid);
+                }
+                current_oid = oid;
+                need_load = true;
+                namebuf.drain(..component_len + 1);
+            }
+            0o100000 => {
+                // Regular file: done if last component, otherwise the path
+                // tries to descend through a non-directory.
+                if !has_remainder {
+                    return SymlinkedTreePath::Found(oid);
+                }
+                return SymlinkedTreePath::NotDir;
+            }
+            0o120000 => {
+                // Follow a symlink.
+                if follows_remaining == 0 {
+                    return SymlinkedTreePath::Loop;
+                }
+                follows_remaining -= 1;
+                followed_symlink = true;
+                let Ok(link) = reader.read_object(&oid) else {
+                    return SymlinkedTreePath::Dangling;
+                };
+                let target = link.body.clone();
+                if target.first() == Some(&b'/') {
+                    // An absolute link target leaves the repository; any
+                    // remainder is dropped, exactly like upstream.
+                    return SymlinkedTreePath::OutOfRepo(target);
+                }
+                // Splice the target in front of the remainder and re-walk
+                // from the current directory (top of the parent stack).
+                let mut spliced = target;
+                if has_remainder {
+                    spliced.push(b'/');
+                    spliced.extend_from_slice(&namebuf[component_len + 1..]);
+                }
+                namebuf = spliced;
+            }
+            _ => {
+                // Gitlink (or unknown mode): upstream's loop falls through and
+                // re-scans its already-consumed tree descriptor, failing to
+                // find the entry again — the walk ends missing/dangling.
+                return fail;
+            }
+        }
+    }
 }
 
 /// Split `<rev>:<path>` into its revision and path halves.

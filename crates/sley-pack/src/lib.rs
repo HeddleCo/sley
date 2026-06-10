@@ -1094,6 +1094,25 @@ impl PackIndex {
     }
 }
 
+/// The `.rev` table for a pack: index positions (the rank of each object in
+/// the oid-sorted `.idx`) listed in pack order (ascending pack offset), as
+/// upstream `write_rev_file` lays them out. Accepts `entries` in any order;
+/// the result feeds [`PackReverseIndex::write`].
+pub fn pack_order_index_positions(entries: &[PackIndexEntry]) -> Vec<u32> {
+    let mut oid_sorted: Vec<usize> = (0..entries.len()).collect();
+    oid_sorted.sort_by(|&a, &b| entries[a].oid.as_bytes().cmp(entries[b].oid.as_bytes()));
+    let mut index_position = vec![0u32; entries.len()];
+    for (position, &entry) in oid_sorted.iter().enumerate() {
+        index_position[entry] = position as u32;
+    }
+    let mut by_offset: Vec<usize> = (0..entries.len()).collect();
+    by_offset.sort_by_key(|&entry| entries[entry].offset);
+    by_offset
+        .into_iter()
+        .map(|entry| index_position[entry])
+        .collect()
+}
+
 impl PackReverseIndex {
     pub fn write(
         format: ObjectFormat,

@@ -401,10 +401,23 @@ fn splice_includes(
                 loaded.extend_from_slice(&out[before..]);
             }
             Some(IncludeKind::Conditional(condition)) => {
-                if include_condition_matches(condition, base_dir, context, &loaded, parsed) {
+                if hasconfig_remote_url_condition(condition) {
+                    // git's `populate_remote_urls` reads every
+                    // `hasconfig:remote.*.url` include while collecting
+                    // candidate URLs — with remote-URL definitions forbidden —
+                    // even when the condition ends up false. Read the file
+                    // first (dying on a forbidden URL), then splice it only if
+                    // the condition matches.
+                    let mut included = Vec::new();
+                    expand_include_paths(section, base_dir, context, depth, true, &mut included)?;
+                    if include_condition_matches(condition, base_dir, context, &loaded, parsed) {
+                        loaded.extend_from_slice(&included);
+                        out.extend(included);
+                    }
+                } else if include_condition_matches(condition, base_dir, context, &loaded, parsed)
+                {
                     let before = out.len();
-                    let forbid = forbid_remote_url || hasconfig_remote_url_condition(condition);
-                    expand_include_paths(section, base_dir, context, depth, forbid, out)?;
+                    expand_include_paths(section, base_dir, context, depth, forbid_remote_url, out)?;
                     loaded.extend_from_slice(&out[before..]);
                 }
             }
@@ -605,6 +618,462 @@ fn gitdir_condition_matches(
     // so no extra handling is required here.
 
     glob_match(&pattern, &target, case_insensitive)
+}
+
+// ---------------------------------------------------------------------------
+// Layered config stack: git's default config sequence with per-entry metadata
+// ---------------------------------------------------------------------------
+
+/// Which layer of git's configuration sequence an entry came from, mirroring
+/// git's `enum config_scope` (`config_scope_name`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigScope {
+    System,
+    Global,
+    Local,
+    Worktree,
+    Command,
+}
+
+impl ConfigScope {
+    /// The name `--show-scope` prints, exactly as git's `config_scope_name`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfigScope::System => "system",
+            ConfigScope::Global => "global",
+            ConfigScope::Local => "local",
+            ConfigScope::Worktree => "worktree",
+            ConfigScope::Command => "command",
+        }
+    }
+}
+
+/// The kind of source an entry was read from, mirroring git's
+/// `enum config_origin_type` (`config_origin_type_name`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigOriginKind {
+    File,
+    Blob,
+    Stdin,
+    CommandLine,
+}
+
+impl ConfigOriginKind {
+    /// The label `--show-origin` prints before the `:`, exactly as git's
+    /// `config_origin_type_name`.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConfigOriginKind::File => "file",
+            ConfigOriginKind::Blob => "blob",
+            ConfigOriginKind::Stdin => "standard input",
+            ConfigOriginKind::CommandLine => "command line",
+        }
+    }
+}
+
+/// Where a config entry came from: an origin kind plus the source name (the
+/// file path as constructed, the blob spec, or empty for stdin/command line).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOrigin {
+    pub kind: ConfigOriginKind,
+    /// The path/spec exactly as git would report it (`file:.git/config`,
+    /// `file:.git/../include/relative.include`, `blob:<spec>`); empty for
+    /// stdin and command-line origins.
+    pub name: String,
+}
+
+impl ConfigOrigin {
+    pub fn file(name: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigOriginKind::File,
+            name: name.into(),
+        }
+    }
+
+    pub fn blob(spec: impl Into<String>) -> Self {
+        Self {
+            kind: ConfigOriginKind::Blob,
+            name: spec.into(),
+        }
+    }
+
+    pub fn stdin() -> Self {
+        Self {
+            kind: ConfigOriginKind::Stdin,
+            name: String::new(),
+        }
+    }
+
+    pub fn command_line() -> Self {
+        Self {
+            kind: ConfigOriginKind::CommandLine,
+            name: String::new(),
+        }
+    }
+}
+
+/// One flat config event: a key/value plus the scope and origin it was read
+/// from. Section and key names are stored as parsed (callers lower-case them
+/// for display, like git does); subsections are byte-exact.
+#[derive(Debug, Clone)]
+pub struct ConfigStackEntry {
+    pub section: String,
+    pub subsection: Option<String>,
+    pub key: String,
+    pub value: Option<String>,
+    pub scope: ConfigScope,
+    pub origin: ConfigOrigin,
+}
+
+impl ConfigStackEntry {
+    /// Whether this entry is `section[.subsection].key`, using git's matching
+    /// rules: section and key case-insensitive, subsection byte-exact.
+    pub fn matches(&self, section: &str, subsection: Option<&str>, key: &str) -> bool {
+        eq_ignore_ascii_case(&self.section, section)
+            && self.subsection.as_deref() == subsection
+            && eq_ignore_ascii_case(&self.key, key)
+    }
+}
+
+/// The ordered, flattened stream of config events that makes up an effective
+/// configuration, lowest precedence first — git's `do_git_config_sequence`
+/// with per-entry `key_value_info` metadata. "Last one wins" lookups walk the
+/// entries from the back.
+#[derive(Debug, Clone, Default)]
+pub struct ConfigStack {
+    pub entries: Vec<ConfigStackEntry>,
+}
+
+impl ConfigStack {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read one config file into the stack, attributing every entry to
+    /// `scope`. The path is used verbatim as the `file:` origin name (and as
+    /// the base for relative includes), matching git, so callers should pass
+    /// the path in the form git would display (e.g. `.git/config`). A missing
+    /// file contributes nothing.
+    pub fn push_file(
+        &mut self,
+        path: &Path,
+        scope: ConfigScope,
+        respect_includes: bool,
+        context: &ConfigIncludeContext,
+    ) -> Result<()> {
+        emit_config_file(
+            path,
+            scope,
+            context,
+            0,
+            false,
+            respect_includes,
+            &mut self.entries,
+        )
+    }
+
+    /// Append an already-parsed config (stdin, blob, or an explicit file the
+    /// caller read itself) with the given origin and scope.
+    pub fn push_parsed(
+        &mut self,
+        parsed: &GitConfig,
+        origin: ConfigOrigin,
+        scope: ConfigScope,
+        respect_includes: bool,
+        context: &ConfigIncludeContext,
+    ) -> Result<()> {
+        emit_parsed_config(
+            parsed,
+            &origin,
+            scope,
+            context,
+            0,
+            false,
+            respect_includes,
+            &mut self.entries,
+        )
+    }
+
+    /// Append the command-line/environment injection layer (`-c`,
+    /// `GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`): scope `command`, origin
+    /// `command line:`, one event per parameter in order.
+    pub fn push_parameters(&mut self, parameters: &[ConfigParameter]) {
+        for param in parameters {
+            let (section, subsection, key) = param.split_key();
+            self.entries.push(ConfigStackEntry {
+                section: section.to_string(),
+                subsection: subsection.map(str::to_string),
+                key: key.to_string(),
+                value: param.value.clone(),
+                scope: ConfigScope::Command,
+                origin: ConfigOrigin::command_line(),
+            });
+        }
+    }
+
+    /// The last (highest-precedence) entry for the key, including value-less
+    /// boolean-true entries.
+    pub fn get(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Option<&ConfigStackEntry> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|entry| entry.matches(section, subsection, key))
+    }
+
+    /// Every entry for the key, in precedence order (lowest first).
+    pub fn get_all(
+        &self,
+        section: &str,
+        subsection: Option<&str>,
+        key: &str,
+    ) -> Vec<&ConfigStackEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.matches(section, subsection, key))
+            .collect()
+    }
+
+    /// Interpret the last value of the key as a git boolean (bare key = true).
+    /// `None` when unset; an unparsable value also yields `None` (callers that
+    /// need git's "bad boolean config value" die handle it via [`Self::get`]).
+    pub fn get_bool(&self, section: &str, subsection: Option<&str>, key: &str) -> Option<bool> {
+        let entry = self.get(section, subsection, key)?;
+        match &entry.value {
+            None => Some(true),
+            Some(value) => parse_config_bool(value),
+        }
+    }
+}
+
+/// The cross-repository default layers of git's config sequence (the part of
+/// `do_git_config_sequence` before the repository files): the system file
+/// (honouring `GIT_CONFIG_SYSTEM` / `GIT_CONFIG_NOSYSTEM`) followed by the
+/// global file(s) (`GIT_CONFIG_GLOBAL`, or XDG then `~/.gitconfig`), each
+/// paired with the scope it contributes.
+pub fn default_config_layer_paths() -> Vec<(PathBuf, ConfigScope)> {
+    let mut layers = Vec::new();
+    if let Some(system) = system_config_path() {
+        layers.push((system, ConfigScope::System));
+    }
+    for global in global_config_paths() {
+        layers.push((global, ConfigScope::Global));
+    }
+    layers
+}
+
+/// Read + parse a file and emit its entries (resolving includes when asked).
+/// A missing file contributes nothing, matching git.
+fn emit_config_file(
+    path: &Path,
+    scope: ConfigScope,
+    context: &ConfigIncludeContext,
+    depth: usize,
+    forbid_remote_url: bool,
+    respect_includes: bool,
+    out: &mut Vec<ConfigStackEntry>,
+) -> Result<()> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let parsed = GitConfig::parse(&bytes)?;
+    let origin = ConfigOrigin::file(path.to_string_lossy().into_owned());
+    emit_parsed_config(
+        &parsed,
+        &origin,
+        scope,
+        context,
+        depth,
+        forbid_remote_url,
+        respect_includes,
+        out,
+    )
+}
+
+/// Walk a parsed config in order, emitting one [`ConfigStackEntry`] per entry.
+/// Include directives are emitted as ordinary entries first (git's
+/// `git_config_include` calls the callback before splicing) and then, when the
+/// directive applies, the referenced file's entries follow with the *included*
+/// file as their origin and the including layer's scope.
+#[allow(clippy::too_many_arguments)]
+fn emit_parsed_config(
+    parsed: &GitConfig,
+    origin: &ConfigOrigin,
+    scope: ConfigScope,
+    context: &ConfigIncludeContext,
+    depth: usize,
+    forbid_remote_url: bool,
+    respect_includes: bool,
+    out: &mut Vec<ConfigStackEntry>,
+) -> Result<()> {
+    if depth >= CONFIG_MAX_INCLUDE_DEPTH {
+        return Err(GitError::InvalidFormat(format!(
+            "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
+        )));
+    }
+    if forbid_remote_url {
+        reject_remote_urls_in_config(parsed)?;
+    }
+    // Relative includes resolve against the *including file's* directory, by
+    // string concatenation (git's `handle_path_include` never normalises), so
+    // `.git/config` + `../x` yields `.git/../x`. Non-file origins have no base.
+    let base_dir = match origin.kind {
+        ConfigOriginKind::File => Some(match Path::new(&origin.name).parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        }),
+        _ => None,
+    };
+    for section in &parsed.sections {
+        let include_kind = if respect_includes {
+            include_section_kind(section)
+        } else {
+            None
+        };
+        for entry in &section.entries {
+            out.push(ConfigStackEntry {
+                section: section.name.clone(),
+                subsection: section.subsection.clone(),
+                key: entry.key.clone(),
+                value: entry.value.clone(),
+                scope,
+                origin: origin.clone(),
+            });
+            let Some(kind) = &include_kind else { continue };
+            if !eq_ignore_ascii_case(&entry.key, "path") {
+                continue;
+            }
+            let Some(raw) = entry.value.as_deref() else {
+                continue;
+            };
+            if raw.is_empty() {
+                continue;
+            }
+            let resolved = resolve_stack_include_path(raw, base_dir.as_deref())?;
+            match kind {
+                IncludeKind::Unconditional => {
+                    emit_config_file(
+                        &resolved,
+                        scope,
+                        context,
+                        depth + 1,
+                        forbid_remote_url,
+                        true,
+                        out,
+                    )?;
+                }
+                IncludeKind::Conditional(condition)
+                    if hasconfig_remote_url_condition(condition) =>
+                {
+                    // Like git's `populate_remote_urls`, a
+                    // `hasconfig:remote.*.url` include is read (with remote
+                    // URLs forbidden) even when the condition is false; its
+                    // entries only land in the stack when it matches.
+                    let mut included = Vec::new();
+                    emit_config_file(
+                        &resolved,
+                        scope,
+                        context,
+                        depth + 1,
+                        true,
+                        true,
+                        &mut included,
+                    )?;
+                    if stack_include_condition_matches(
+                        condition,
+                        base_dir.as_deref(),
+                        context,
+                        out,
+                        parsed,
+                    ) {
+                        out.extend(included);
+                    }
+                }
+                IncludeKind::Conditional(condition) => {
+                    if stack_include_condition_matches(
+                        condition,
+                        base_dir.as_deref(),
+                        context,
+                        out,
+                        parsed,
+                    ) {
+                        emit_config_file(
+                            &resolved,
+                            scope,
+                            context,
+                            depth + 1,
+                            forbid_remote_url,
+                            true,
+                            out,
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Resolve an include path for the stack walker. Relative paths require a file
+/// base (git: "relative config includes must come from files").
+fn resolve_stack_include_path(raw: &str, base_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(rest) = raw.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return Ok(PathBuf::from(home).join(rest));
+        }
+    }
+    let candidate = Path::new(raw);
+    if candidate.is_absolute() {
+        return Ok(candidate.to_path_buf());
+    }
+    let Some(base_dir) = base_dir else {
+        return Err(GitError::InvalidFormat(
+            "relative config includes must come from files".into(),
+        ));
+    };
+    Ok(base_dir.join(candidate))
+}
+
+/// `includeIf` condition evaluation for the stack walker. `gitdir:` /
+/// `onbranch:` mirror [`include_condition_matches`]; `hasconfig:remote.*.url:`
+/// inspects every `remote.*.url` seen so far in the stack plus the entire
+/// current file (git's `populate_remote_urls`).
+fn stack_include_condition_matches(
+    condition: &str,
+    base_dir: Option<&Path>,
+    context: &ConfigIncludeContext,
+    emitted: &[ConfigStackEntry],
+    current_file: &GitConfig,
+) -> bool {
+    let base_dir = base_dir.unwrap_or_else(|| Path::new("."));
+    if let Some(pattern) = condition.strip_prefix("gitdir:") {
+        return gitdir_condition_matches(pattern, base_dir, context, false);
+    }
+    if let Some(pattern) = condition.strip_prefix("gitdir/i:") {
+        return gitdir_condition_matches(pattern, base_dir, context, true);
+    }
+    if let Some(pattern) = condition.strip_prefix("onbranch:") {
+        return match &context.current_branch {
+            Some(branch) => onbranch_pattern_matches(pattern, branch),
+            None => false,
+        };
+    }
+    if let Some(glob) = condition.strip_prefix("hasconfig:remote.*.url:") {
+        let stack_urls = emitted.iter().filter(|entry| {
+            eq_ignore_ascii_case(&entry.section, "remote") && eq_ignore_ascii_case(&entry.key, "url")
+        });
+        return stack_urls
+            .filter_map(|entry| entry.value.as_deref())
+            .chain(collect_remote_urls(current_file))
+            .any(|url| glob_match(glob, url, false));
+    }
+    false
 }
 
 /// Look up `$HOME`, returning `None` when it is unset or empty.

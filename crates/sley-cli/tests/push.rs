@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -80,12 +79,10 @@ fn run_with_stdin(program: &str, cwd: &Path, args: &[&str], input: &[u8]) -> Out
         .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|err| panic!("failed to run {program} {args:?}: {err}"));
-    child
-        .stdin
-        .as_mut()
-        .expect("child stdin")
-        .write_all(input)
-        .expect("write child stdin");
+    sley_testkit::write_stdin_tolerating_early_exit(
+        child.stdin.as_mut().expect("child stdin"),
+        input,
+    );
     child
         .wait_with_output()
         .unwrap_or_else(|err| panic!("failed to wait for {program} {args:?}: {err}"))

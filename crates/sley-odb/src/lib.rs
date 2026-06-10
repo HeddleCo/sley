@@ -6,7 +6,7 @@ use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
 use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackIndexEntry, PackInput, PackWrite};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -193,6 +193,22 @@ where
     I: IntoIterator<Item = ObjectId>,
 {
     walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
+}
+
+/// [`collect_reachable_object_ids`] with a stop set: objects in `excluded` are
+/// not visited and not expanded, so the walk never sees anything reachable only
+/// through them (used to truncate history at a shallow boundary).
+pub fn collect_reachable_object_ids_excluding<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    walk_reachable_objects(reader, format, starts, excluded, |_, _| {})
 }
 
 pub fn collect_reachable_objects<R, I>(
@@ -454,8 +470,18 @@ pub fn install_repack_result(
     }
     let pack_name = format!("pack-{}", result.pack_checksum.to_hex());
     let new_pack_path = pack_dir.join(format!("{pack_name}.pack"));
+    let new_rev_path = pack_dir.join(format!("{pack_name}.rev"));
     let new_index_path = pack_dir.join(format!("{pack_name}.idx"));
+    // git writes a `.rev` alongside every repacked pack (`pack.writeReverseIndex`
+    // defaults to true). Write it before the `.idx` so the index never becomes
+    // visible ahead of its companions, mirroring upstream's finalize order.
+    let reverse_index = sley_pack::PackReverseIndex::write(
+        format,
+        &sley_pack::pack_order_index_positions(&parsed_index.entries),
+        &result.pack_checksum,
+    )?;
     write_pack_component(&new_pack_path, &result.pack)?;
+    write_pack_component(&new_rev_path, &reverse_index)?;
     write_pack_component(&new_index_path, &result.idx)?;
 
     if !prune {
@@ -2047,6 +2073,15 @@ impl ObjectReader for FileObjectDatabase {
 
 impl ObjectWriter for FileObjectDatabase {
     fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+        // Mirror git's freshen semantics (`write_object_file`:
+        // `freshen_packed_object || freshen_loose_object`): an object already
+        // present anywhere in the database — loose, packed, or through an
+        // alternate — is not written again, so e.g. `git add` after
+        // `git repack -ad` does not resurrect a loose copy of a packed object.
+        let oid = object.object_id(self.format)?;
+        if self.contains(&oid)? {
+            return Ok(oid);
+        }
         self.loose.write_object(object)
     }
 }
@@ -2119,6 +2154,59 @@ fn loose_header_too_long(oid: &ObjectId) -> GitError {
     ))
 }
 
+/// git's `error:`-level diagnostic when the loose framing header cannot be inflated at
+/// all (object-file.c `loose_object_info`, the `ULHR_BAD` arm: `error(_("unable to
+/// unpack %s header"), ...)`).
+fn loose_unpack_header_failed(oid: &ObjectId) -> GitError {
+    GitError::InvalidObject(format!("unable to unpack {oid} header"))
+}
+
+/// git-zlib.c's `error("inflate: %s (%s)", ...)` text for an inflate failure whose
+/// cause is identifiable from the zlib stream header. The checks mirror zlib's own
+/// `inflate()` HEAD-state validation, in order: the FCHECK checksum over CMF+FLG,
+/// the compression method, the window size, and the FDICT preset-dictionary bit
+/// (zlib reports `Z_NEED_DICT` with a NULL `msg`, which git renders as
+/// "(no message)"). Failures past the stream header return `None`: flate2 does not
+/// surface zlib's per-case `msg` strings, so no diagnostic is fabricated for them.
+fn inflate_header_diagnostic(input: &[u8]) -> Option<&'static str> {
+    let [cmf, flg, ..] = *input else { return None };
+    if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
+        return Some("inflate: data stream error (incorrect header check)");
+    }
+    if cmf & 0x0f != 8 {
+        return Some("inflate: data stream error (unknown compression method)");
+    }
+    if cmf >> 4 > 7 {
+        return Some("inflate: data stream error (invalid window size)");
+    }
+    if flg & 0x20 != 0 {
+        return Some("inflate: needs dictionary (no message)");
+    }
+    None
+}
+
+/// Print the `error: inflate: ...` line git's zlib wrapper emits the moment
+/// `inflate()` fails, when the failure is classifiable from the stream header.
+fn emit_inflate_diagnostic(input: &[u8]) {
+    if let Some(diagnostic) = inflate_header_diagnostic(input) {
+        eprintln!("error: {diagnostic}");
+    }
+}
+
+/// Integrity verdict for a single loose object file, as classified by
+/// [`LooseObjectStore::verify_object`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LooseObjectIntegrity {
+    /// Inflated, parsed, and re-hashed to its path-derived oid.
+    Ok,
+    /// Readable and well-formed, but its content hashes to a different oid
+    /// (a loose file stored under the wrong path).
+    HashMismatch { actual: ObjectId },
+    /// Unreadable: corrupt zlib stream, truncated content, or unparseable header.
+    /// The `error:`-level diagnostics were already printed to stderr.
+    Corrupt,
+}
+
 #[derive(Debug, Clone)]
 pub struct LooseObjectStore {
     objects_dir: PathBuf,
@@ -2167,11 +2255,19 @@ impl LooseObjectStore {
     /// Returns `Ok(None)` when the loose object is absent.
     pub fn read_header(&self, oid: &ObjectId) -> Result<Option<(ObjectType, u64)>> {
         let path = self.object_path(oid)?;
-        let file = match fs::File::open(&path) {
+        let mut file = match fs::File::open(&path) {
             Ok(file) => file,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(GitError::Io(err.to_string())),
         };
+        // Capture the zlib stream's 2-byte header before inflating: when the stream
+        // is corrupt, those bytes identify zlib's diagnostic (incorrect header
+        // check, needs dictionary, ...) exactly as zlib's `inflate()` would report
+        // it through git's wrapper.
+        let mut stream_prefix = [0u8; 2];
+        let prefix_len = read_full_prefix(&mut file, &mut stream_prefix)?;
+        file.seek(SeekFrom::Start(0))
+            .map_err(|err| GitError::Io(err.to_string()))?;
         let mut decoder = ZlibDecoder::new(file);
         let mut header = Vec::new();
         let mut byte = [0u8; 1];
@@ -2181,7 +2277,17 @@ impl LooseObjectStore {
             // NUL terminator lands within them — whether the stream simply ends early
             // or overflows the window. Both collapse to the same `error:`-level
             // diagnostic, so a header that ends before its NUL is "too long" too.
-            if decoder.read(&mut byte)? == 0 {
+            // A stream that won't inflate at all is git's ULHR_BAD instead: the
+            // zlib wrapper's `error: inflate: ...` line, then "unable to unpack
+            // <oid> header".
+            let read = match decoder.read(&mut byte) {
+                Ok(read) => read,
+                Err(_) => {
+                    emit_inflate_diagnostic(&stream_prefix[..prefix_len]);
+                    return Err(loose_unpack_header_failed(oid));
+                }
+            };
+            if read == 0 {
                 return Err(loose_header_too_long(oid));
             }
             if byte[0] == 0 {
@@ -2205,6 +2311,87 @@ impl LooseObjectStore {
             .map_err(|_| GitError::InvalidObject("invalid object size".into()))?;
         Ok(Some((object_type, size)))
     }
+
+    /// Loose object ids in this store, sorted by hex.
+    pub fn object_ids(&self) -> Result<Vec<ObjectId>> {
+        loose_object_ids(&self.objects_dir, self.format)
+    }
+
+    /// fsck's loose-object integrity probe, mirroring C git's `read_loose_object`
+    /// (object-file.c) as called from `fsck_loose` (builtin/fsck.c): inflate and
+    /// parse the file at `oid`'s loose path, then re-hash its content against the
+    /// path-derived oid. `display_path` appears verbatim in the `error:`-level
+    /// diagnostics — the path-form messages of `read_loose_object` ("unable to
+    /// unpack header of <path>"), unlike the oid-form messages of the normal read
+    /// path. Returns `Ok(None)` when no loose file exists for `oid`.
+    pub fn verify_object(
+        &self,
+        oid: &ObjectId,
+        display_path: &str,
+    ) -> Result<Option<LooseObjectIntegrity>> {
+        let path = self.object_path(oid)?;
+        let compressed = match fs::read(&path) {
+            Ok(compressed) => compressed,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(GitError::Io(err.to_string())),
+        };
+        let mut decoder = ZlibDecoder::new(compressed.as_slice());
+        let mut framed = Vec::new();
+        if decoder.read_to_end(&mut framed).is_err() {
+            emit_inflate_diagnostic(&compressed);
+            // No NUL inside the header window means inflation died before the
+            // framing header materialized (`unpack_loose_header` != ULHR_OK);
+            // with the header intact it is the body that broke
+            // (`unpack_loose_rest`).
+            if framed_loose_header_terminated(&framed) {
+                eprintln!("error: unable to unpack contents of {display_path}");
+            } else {
+                eprintln!("error: unable to unpack header of {display_path}");
+            }
+            return Ok(Some(LooseObjectIntegrity::Corrupt));
+        }
+        if !framed_loose_header_terminated(&framed) {
+            // ULHR_TOO_LONG collapses into the same path-form message here: C's
+            // `read_loose_object` treats every non-OK `unpack_loose_header` alike.
+            eprintln!("error: unable to unpack header of {display_path}");
+            return Ok(Some(LooseObjectIntegrity::Corrupt));
+        }
+        let Ok(object) = parse_framed_object(&framed) else {
+            eprintln!("error: unable to parse header of {display_path}");
+            return Ok(Some(LooseObjectIntegrity::Corrupt));
+        };
+        let actual = object.object_id(self.format)?;
+        if &actual != oid {
+            return Ok(Some(LooseObjectIntegrity::HashMismatch { actual }));
+        }
+        Ok(Some(LooseObjectIntegrity::Ok))
+    }
+}
+
+/// Whether the inflated framing bytes contain the header's NUL terminator within
+/// git's `MAX_HEADER_LEN` window (object-file.c `unpack_loose_header`'s success
+/// condition).
+fn framed_loose_header_terminated(framed: &[u8]) -> bool {
+    framed
+        .iter()
+        .take(MAX_LOOSE_HEADER_LEN)
+        .any(|byte| *byte == 0)
+}
+
+/// Read up to `prefix.len()` bytes from the start of `file`, returning how many
+/// were available (short only when the file itself is shorter).
+fn read_full_prefix(file: &mut fs::File, prefix: &mut [u8]) -> Result<usize> {
+    let mut len = 0;
+    while len < prefix.len() {
+        let read = file
+            .read(&mut prefix[len..])
+            .map_err(|err| GitError::Io(err.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        len += read;
+    }
+    Ok(len)
 }
 
 impl ObjectReader for LooseObjectStore {
@@ -2219,7 +2406,19 @@ impl ObjectReader for LooseObjectStore {
         };
         let mut decoder = ZlibDecoder::new(compressed.as_slice());
         let mut framed = Vec::new();
-        decoder.read_to_end(&mut framed)?;
+        if decoder.read_to_end(&mut framed).is_err() {
+            emit_inflate_diagnostic(&compressed);
+            // A stream that dies before the framing header materializes is git's
+            // ULHR_BAD ("unable to unpack <oid> header"); with the header intact,
+            // the body is what broke (`unpack_loose_rest`'s "corrupt loose
+            // object").
+            if !framed_loose_header_terminated(&framed) {
+                return Err(loose_unpack_header_failed(oid));
+            }
+            return Err(GitError::InvalidObject(format!(
+                "corrupt loose object '{oid}'"
+            )));
+        }
         // git only inflates the first `MAX_LOOSE_HEADER_LEN` bytes looking for the
         // header's NUL terminator before parsing the type; an over-long header is
         // rejected here (with git's diagnostic) rather than failing later as an

@@ -6164,7 +6164,32 @@ fn run_branch_move_options(
     let old_ref = validate_branch_source_name(&old_branch)?;
     let new_ref = validate_branch_creation_name(&new_branch)?;
     if store.read_ref(&old_ref)?.is_none() {
-        eprintln!("fatal: no branch named '{old_branch}'");
+        // branch.c `copy_or_rename_branch`: renaming the current *unborn*
+        // branch (HEAD points at it but no commit exists) is allowed and only
+        // repoints the HEAD symref; copying it (or touching any other missing
+        // branch) dies.
+        let old_is_head = store.current_branch_ref()?.as_deref() == Some(old_ref.as_str());
+        if matches!(options.kind, BranchMoveKind::Rename) && old_is_head {
+            if !options.force && store.read_ref(&new_ref)?.is_some() {
+                eprintln!("fatal: a branch named '{new_branch}' already exists");
+                return Err(GitError::Exit(128));
+            }
+            let mut tx = store.transaction();
+            tx.update(RefUpdate {
+                name: "HEAD".into(),
+                expected: None,
+                new: RefTarget::Symbolic(new_ref.clone()),
+                reflog: None,
+            });
+            tx.commit()?;
+            rename_branch_config(git_dir, &old_branch, &new_branch)?;
+            return Ok(());
+        }
+        if old_is_head {
+            eprintln!("fatal: no commit on branch '{old_branch}' yet");
+        } else {
+            eprintln!("fatal: no branch named '{old_branch}'");
+        }
         return Err(GitError::Exit(128));
     }
     if !options.force && store.read_ref(&new_ref)?.is_some() {

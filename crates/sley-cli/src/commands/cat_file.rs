@@ -279,6 +279,7 @@ impl CatFileOptions {
                 // Upstream defaults `--buffer` to on when `--batch-all-objects` is in effect,
                 // off otherwise; an explicit `--[no-]buffer` overrides.
                 buffer: self.buffer.unwrap_or(batch_all_objects),
+                follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
             }));
         }
@@ -412,6 +413,10 @@ impl RepositoryObjectView {
 
     fn resolve_path(&self, rev: &str, path: &str) -> Result<sley_rev::ResolvedTreePath> {
         self.repo.resolve_path(rev, path)
+    }
+
+    fn resolve_path_follow_symlinks(&self, rev: &str, path: &str) -> sley_rev::SymlinkedTreePath {
+        self.repo.resolve_path_follow_symlinks(rev, path)
     }
 
     fn all_object_ids(&self) -> Result<Vec<ObjectId>> {
@@ -559,15 +564,24 @@ impl ObjectQuery<'_> {
     fn print_typed_body(&self, object_type: ObjectType) -> Result<()> {
         let oid = self.view.resolve(self.name)?;
         let oid = self.view.replacement_oid(&oid)?;
-        let oid = match object_type {
-            ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid)?,
-            ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid)?,
+        let peeled = match object_type {
+            ObjectType::Blob => sley_rev::peel_tags(self.view.db(), self.view.format(), &oid),
+            ObjectType::Tree => sley_rev::peel_to_tree(self.view.db(), self.view.format(), &oid),
             ObjectType::Commit => {
-                sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)?
+                sley_rev::peel_to_commit(self.view.db(), self.view.format(), &oid)
             }
-            ObjectType::Tag => oid,
+            ObjectType::Tag => Ok(oid),
         };
-        let object = self.view.db().read_object(&oid)?;
+        // The peel itself reads the object, so a corrupt loose object surfaces here
+        // for a direct `<type> <oid>` spelling just as it would from the body read.
+        let oid = match peeled {
+            Ok(oid) => oid,
+            Err(err) => return self.typed_body_read_error(err, &oid),
+        };
+        let object = match self.view.db().read_object(&oid) {
+            Ok(object) => object,
+            Err(err) => return self.typed_body_read_error(err, &oid),
+        };
         if object.object_type != object_type {
             eprintln!("fatal: git cat-file {}: bad file", self.name);
             return Err(GitError::Exit(128));
@@ -575,6 +589,24 @@ impl ObjectQuery<'_> {
         io::stdout().write_all(&object.body)?;
         io::stdout().flush()?;
         Ok(())
+    }
+
+    /// A failed read in `<type> <object>` mode. Upstream reads with
+    /// `OBJECT_INFO_DIE_IF_CORRUPT`, so a corrupt loose object surfaces the odb's
+    /// `error:`-level diagnostic and then dies with `loose object <oid> (stored in
+    /// <path>) is corrupt` (exit 128); every other error propagates unchanged.
+    fn typed_body_read_error<T>(&self, err: GitError, oid: &ObjectId) -> Result<T> {
+        if let GitError::InvalidObject(message) = &err
+            && is_loose_corruption_message(message)
+        {
+            eprintln!("error: {message}");
+            eprintln!(
+                "fatal: loose object {oid} (stored in {}) is corrupt",
+                loose_object_display_path(self.view.db(), oid)
+            );
+            return Err(GitError::Exit(128));
+        }
+        Err(err)
     }
 }
 
@@ -585,6 +617,7 @@ struct CatFileBatchRequest {
     output_nul: bool,
     batch_all_objects: bool,
     buffer: bool,
+    follow_symlinks: bool,
     filter: CatFileObjectsFilter,
 }
 
@@ -723,6 +756,7 @@ impl CatFileBatchRequest {
                     check_only,
                     terminator,
                     apply_replace,
+                    follow_symlinks: self.follow_symlinks,
                     filter: self.filter,
                     all_objects: self.batch_all_objects,
                 },
@@ -847,6 +881,7 @@ impl CatFileBatchRequest {
                 check_only,
                 terminator,
                 apply_replace,
+                follow_symlinks: self.follow_symlinks,
                 filter: self.filter,
                 all_objects: false,
             },
@@ -975,6 +1010,9 @@ struct CatFileBatchRecord<'a> {
     check_only: bool,
     terminator: u8,
     apply_replace: bool,
+    /// `--follow-symlinks`: resolve in-tree symlinks in `<rev>:<path>` specs
+    /// (upstream `GET_OID_FOLLOW_SYMLINKS`).
+    follow_symlinks: bool,
     filter: CatFileObjectsFilter,
     /// True when the record comes from `--batch-all-objects`; upstream silently skips
     /// filter-excluded objects in that mode instead of emitting `<name> excluded`.
@@ -989,8 +1027,61 @@ fn print_cat_file_batch_record(
         view: record.view,
         name: record.object_name,
     };
-    let Ok(oid) = record.view.resolve_object_name(record.object_name) else {
-        return report_object_missing(stdout, &record, &query);
+    // `--follow-symlinks` only alters `<rev>:<path>` resolution (upstream's
+    // `GET_OID_FOLLOW_SYMLINKS` is consulted solely in the `<rev>:<path>`
+    // branch of `get_oid_with_context`); every other spelling resolves as
+    // usual.
+    let resolved_through_symlinks = if record.follow_symlinks
+        && let Some((rev, path)) = sley_rev::split_rev_path_spec(record.object_name)
+    {
+        match record.view.resolve_path_follow_symlinks(rev, path) {
+            sley_rev::SymlinkedTreePath::Found(oid) => Some(oid),
+            sley_rev::SymlinkedTreePath::OutOfRepo(link_path) => {
+                return print_cat_file_symlink_status(stdout, &record, "symlink", &link_path);
+            }
+            sley_rev::SymlinkedTreePath::Missing => {
+                // Upstream's `MISSING_OBJECT` branch in `batch_one_object`
+                // reports the input name directly, with no gitlink/submodule
+                // dispatch (a gitlink reached through the symlink walk reports
+                // `missing`, not `submodule`).
+                write!(stdout, "{} missing", record.object_name)?;
+                stdout.write_all(&[record.terminator])?;
+                return Ok(());
+            }
+            sley_rev::SymlinkedTreePath::Dangling => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "dangling",
+                    record.object_name.as_bytes(),
+                );
+            }
+            sley_rev::SymlinkedTreePath::Loop => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "loop",
+                    record.object_name.as_bytes(),
+                );
+            }
+            sley_rev::SymlinkedTreePath::NotDir => {
+                return print_cat_file_symlink_status(
+                    stdout,
+                    &record,
+                    "notdir",
+                    record.object_name.as_bytes(),
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let oid = match resolved_through_symlinks {
+        Some(oid) => oid,
+        None => match record.view.resolve_object_name(record.object_name) {
+            Ok(oid) => oid,
+            Err(_) => return report_object_missing(stdout, &record, &query),
+        },
     };
     let read_oid = if record.apply_replace {
         record.view.replacement_oid(&oid)?
@@ -1053,9 +1144,10 @@ fn print_cat_file_batch_record(
             eprintln!("fatal: invalid object type");
             return Err(GitError::Exit(128));
         }
-        // An over-long loose header is non-fatal in batch mode: git emits the `error:` line and
-        // reports the oid as `missing`, then continues.
-        Err(GitError::InvalidObject(message)) if is_loose_header_too_long(&message) => {
+        // A corrupt loose object (over-long header, unpackable stream, broken body) is
+        // non-fatal in batch mode: git emits the `error:` line and reports the oid as
+        // `missing`, then continues.
+        Err(GitError::InvalidObject(message)) if is_loose_corruption_message(&message) => {
             eprintln!("error: {message}");
             return report_object_missing(stdout, &record, &query);
         }
@@ -1095,11 +1187,11 @@ fn batch_object_header(
             Err(GitError::Exit(128))
         }
         Err(err) => {
-            // An over-long loose header is not fatal in batch mode: git prints the
+            // A corrupt loose object is not fatal in batch mode: git prints the
             // `error:`-level diagnostic to stderr, reports the oid as `missing`, and keeps
             // going (exit 0). Any other read error is likewise reported as missing.
             if let GitError::InvalidObject(message) = &err
-                && is_loose_header_too_long(message)
+                && is_loose_corruption_message(message)
             {
                 eprintln!("error: {message}");
             }
@@ -1124,6 +1216,26 @@ fn report_object_missing(
         write!(stdout, "{} missing", record.object_name)?;
     }
     stdout.write_all(&[record.terminator])?;
+    Ok(())
+}
+
+/// Emit one of the `--follow-symlinks` notification records (`symlink`/`dangling`/`loop`/
+/// `notdir`): the status word plus the payload's byte length, then the payload itself, each
+/// terminated by the output delimiter — the special-result `printf`s of upstream's
+/// `batch_one_object`. The payload is the original query for `dangling`/`loop`/`notdir` and
+/// the unresolvable link remainder for `symlink`. Upstream flushes after each of these
+/// regardless of `--buffer`; mirror that.
+fn print_cat_file_symlink_status(
+    stdout: &mut io::Stdout,
+    record: &CatFileBatchRecord<'_>,
+    status: &str,
+    payload: &[u8],
+) -> Result<()> {
+    write!(stdout, "{status} {}", payload.len())?;
+    stdout.write_all(&[record.terminator])?;
+    stdout.write_all(payload)?;
+    stdout.write_all(&[record.terminator])?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -1447,11 +1559,11 @@ fn cat_file_object_info_error<T>(
             eprintln!("fatal: invalid object type");
             return Err(GitError::Exit(128));
         }
-        if is_loose_header_too_long(message) {
-            // The odb already formatted git's exact `error:`-level text
-            // (`header for <oid> too long, exceeds 32 bytes`); print it, then fall through to
-            // the per-cmd trailing `fatal:` below (object-file.c emits the `error()`, then the
-            // caller's `die()`).
+        if is_loose_corruption_message(message) {
+            // The odb already formatted git's exact `error:`-level text (too-long header,
+            // unpackable header, corrupt body); print it, then fall through to the per-cmd
+            // trailing `fatal:` below (object-file.c emits the `error()`, then the caller's
+            // `die()`).
             eprintln!("error: {message}");
             return cat_file_object_info_failed(user);
         }
@@ -1469,6 +1581,32 @@ fn cat_file_object_info_error<T>(
 /// <n> bytes`), matched on the stable suffix so it stays independent of the embedded oid.
 fn is_loose_header_too_long(message: &str) -> bool {
     message.starts_with("header for ") && message.contains(" too long, exceeds ")
+}
+
+/// Any `error:`-level loose-object corruption diagnostic the odb pre-formats with git's
+/// exact object-file.c text: the over-long header (ULHR_TOO_LONG), the unpackable header
+/// (`unable to unpack <oid> header`, ULHR_BAD), or the corrupt body (`corrupt loose object
+/// '<oid>'`, `unpack_loose_rest`). Callers print the message as `error: <message>` and then
+/// add their own per-command `fatal:`.
+fn is_loose_corruption_message(message: &str) -> bool {
+    is_loose_header_too_long(message)
+        || (message.starts_with("unable to unpack ") && message.ends_with(" header"))
+        || message.starts_with("corrupt loose object '")
+}
+
+/// The `stored in <path>` spelling of upstream's corrupt-loose die. git prints the loose
+/// path under `$GIT_DIR/objects` using GIT_DIR's textual (often relative) value; sley's
+/// discovery yields an absolute path, so relativize against the cwd when possible.
+fn loose_object_display_path(db: &FileObjectDatabase, oid: &ObjectId) -> String {
+    let Ok(path) = db.loose().object_path(oid) else {
+        return format!("objects/{oid}");
+    };
+    if let Ok(cwd) = std::env::current_dir()
+        && let Ok(relative) = path.strip_prefix(&cwd)
+    {
+        return relative.display().to_string();
+    }
+    path.display().to_string()
 }
 
 /// The trailing `fatal:` git prints after a failed object-info lookup, chosen per `cmd_object`

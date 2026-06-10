@@ -9,19 +9,21 @@
 //! `cmd_receive_pack` stdio wrappers and the `fetch`/`push` orchestration can
 //! call them, and an embedder can drive them directly.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::Path;
 
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
+use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
-    FileObjectDatabase, RawPackInstallOptions, build_and_install_reachable_pack,
+    FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
     build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
-    PKT_LINE_MAX_PAYLOAD_LEN, ReceivePackFeatures, ReceivePackPushRequest, ReceivePackReportStatus,
-    ReceivePackRequest, RefAdvertisement, SideBandChannel, SideBandPacket, UploadPackFeatures,
-    UploadPackNegotiationRequest, UploadPackPackfileResponse, UploadPackRawPackfileResponse,
-    UploadPackRequest, apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
+    PKT_LINE_MAX_PAYLOAD_LEN, ProtocolV2FetchShallowInfo, ReceivePackFeatures,
+    ReceivePackPushRequest, ReceivePackReportStatus, ReceivePackRequest, RefAdvertisement,
+    SideBandChannel, SideBandPacket, UploadPackFeatures, UploadPackNegotiationRequest,
+    UploadPackPackfileResponse, UploadPackRawPackfileResponse, UploadPackRequest,
+    apply_receive_pack_push_request, build_upload_pack_raw_packfile_response,
     encode_receive_pack_features, encode_upload_pack_features,
     read_upload_pack_negotiation_request, read_upload_pack_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
@@ -326,34 +328,191 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
     Ok(haves)
 }
 
+/// The in-process upload-pack's plan for a `deepen` (shallow) local fetch:
+/// which `shallow`/`unshallow` updates to report, which commits the pack walk
+/// must stop at, and which extra tips become packable because the client's
+/// boundary moved.
+///
+/// Mirrors upstream `upload-pack.c::deepen` + `shallow.c::get_shallow_commits`.
+#[derive(Debug, Clone)]
+pub struct LocalDeepenPlan {
+    /// The requested deepen depth (`--depth N`, always >= 1).
+    pub depth: u32,
+    /// The client's existing shallow boundary (`$GIT_DIR/shallow`), replayed as
+    /// `shallow` lines in the upload-pack request.
+    pub client_shallow: Vec<ObjectId>,
+    /// The server's `shallow`/`unshallow` updates the client must fold into
+    /// `$GIT_DIR/shallow` after the pack lands (see [`crate::apply_shallow_info`]).
+    pub shallow_info: Vec<ProtocolV2FetchShallowInfo>,
+    /// Out-of-boundary commits (the parents of boundary commits that are not
+    /// themselves within the boundary): excluding these from the pack walk
+    /// truncates history at the boundary while keeping every tree/blob of the
+    /// boundary commits themselves.
+    pub excluded: HashSet<ObjectId>,
+    /// Parents of client-shallow commits this deepen un-shallowed, added as
+    /// extra pack tips so the newly visible history is sent (upload-pack adds
+    /// them to `want_obj` in `send_unshallow`).
+    pub extra_wants: Vec<ObjectId>,
+}
+
+/// Dereference `oid` through any chain of annotated tags to a commit, or `None`
+/// when it ultimately points at a tree or blob (`deref_tag` in upstream
+/// `shallow.c`'s boundary walk).
+fn peel_to_commit<R: ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let mut oid = *oid;
+    loop {
+        let object = remote_db.read_object(&oid)?;
+        match object.object_type {
+            ObjectType::Commit => return Ok(Some(oid)),
+            ObjectType::Tag => oid = Tag::parse_ref(format, &object.body)?.object,
+            _ => return Ok(None),
+        }
+    }
+}
+
+/// Compute the deepen plan for a shallow local fetch, mirroring upstream
+/// `shallow.c::get_shallow_commits`: a breadth-first minimum-depth walk from the
+/// (tag-dereferenced) `heads` — the primary planned tips, upload-pack's
+/// `want_obj`, NOT auto-followed tags — where tips enter at depth 0 and a commit
+/// processed at depth `d` is a boundary commit when `d + 1 >= depth` (it is
+/// packed, but its parents are not walked).
+///
+/// `client_shallow` is the client's current boundary: boundary commits the
+/// client already has are not re-reported (`send_shallow` skips
+/// `CLIENT_SHALLOW`), and client-shallow commits now within the boundary are
+/// reported as `unshallow` with their parents returned as extra pack tips
+/// (`send_unshallow`).
+pub fn compute_local_deepen<R: ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    heads: &[ObjectId],
+    client_shallow: Vec<ObjectId>,
+    depth: u32,
+) -> Result<LocalDeepenPlan> {
+    let mut min_depth: HashMap<ObjectId, u32> = HashMap::new();
+    let mut queue: VecDeque<ObjectId> = VecDeque::new();
+    for head in heads {
+        let Some(commit) = peel_to_commit(remote_db, format, head)? else {
+            continue;
+        };
+        if !min_depth.contains_key(&commit) {
+            min_depth.insert(commit, 0);
+            queue.push_back(commit);
+        }
+    }
+    // FIFO processing with uniform edge weight makes the first visit the
+    // minimum depth, so each commit is processed exactly once and expands its
+    // parents only when it is within the boundary — the same fixpoint as
+    // upstream's decrease-key re-walks.
+    let mut boundary = Vec::new();
+    let mut boundary_parents = HashSet::new();
+    while let Some(oid) = queue.pop_front() {
+        let commit_depth = min_depth[&oid];
+        let object = remote_db.read_object(&oid)?;
+        let parents = Commit::parse_ref(format, &object.body)?.parents;
+        if commit_depth + 1 >= depth {
+            boundary.push(oid);
+            boundary_parents.extend(parents);
+            continue;
+        }
+        for parent in parents {
+            if !min_depth.contains_key(&parent) {
+                min_depth.insert(parent, commit_depth + 1);
+                queue.push_back(parent);
+            }
+        }
+    }
+    // A boundary commit's parent can itself be within the boundary via a
+    // shorter path (and is then packed); only parents the walk never reached
+    // are excluded.
+    let excluded = boundary_parents
+        .into_iter()
+        .filter(|parent| !min_depth.contains_key(parent))
+        .collect::<HashSet<_>>();
+
+    let client: HashSet<ObjectId> = client_shallow.iter().copied().collect();
+    let mut shallow_info = Vec::new();
+    for oid in &boundary {
+        if !client.contains(oid) {
+            shallow_info.push(ProtocolV2FetchShallowInfo::Shallow(*oid));
+        }
+    }
+    let mut extra_wants = Vec::new();
+    for oid in &client_shallow {
+        let unshallowed = min_depth.get(oid).is_some_and(|d| d + 1 < depth);
+        if !unshallowed {
+            continue;
+        }
+        shallow_info.push(ProtocolV2FetchShallowInfo::Unshallow(*oid));
+        let object = remote_db.read_object(oid)?;
+        extra_wants.extend(Commit::parse_ref(format, &object.body)?.parents);
+    }
+    Ok(LocalDeepenPlan {
+        depth,
+        client_shallow,
+        shallow_info,
+        excluded,
+        extra_wants,
+    })
+}
+
 /// Fetch `wants` from a local repository at `remote_git_dir` into the repository
 /// at `git_dir`, round-tripping the request and response through the protocol
 /// codecs into the in-process upload-pack so the local path exercises the same
 /// wire format as the networked transports. Objects already present locally are
 /// skipped; `promisor` selects promisor-pack installation.
+///
+/// When `deepen` carries a [`LocalDeepenPlan`] (computed by the caller from the
+/// primary planned tips via [`compute_local_deepen`]), the fetch is shallow: the
+/// request replays the client's boundary as `shallow` lines plus a `deepen`
+/// line, the pack walk stops at the plan's boundary, and the returned
+/// shallow-info updates must be folded into `$GIT_DIR/shallow` (see
+/// [`crate::apply_shallow_info`]). Empty for a full fetch.
 pub fn install_fetch_pack_via_local_upload_pack(
     git_dir: &Path,
     remote_git_dir: &Path,
     format: ObjectFormat,
     wants: Vec<ObjectId>,
+    deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
-) -> Result<()> {
+) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let local_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    if wants
-        .iter()
-        .map(|want| local_db.contains(want))
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .all(|contains| contains)
+    // A deepen request must always run: even when every want is already present
+    // the shallow boundary may move (mirrors the SSH path).
+    if deepen.is_none()
+        && wants
+            .iter()
+            .map(|want| local_db.contains(want))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .all(|contains| contains)
     {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let request = UploadPackRequest {
         wants,
+        // The `shallow` capability accompanies a deepen request on the wire
+        // (mirrors the SSH path); a plain fetch keeps its existing wire form.
+        capabilities: deepen
+            .map(|_| {
+                vec![Capability {
+                    name: "shallow".into(),
+                    value: None,
+                }]
+            })
+            .unwrap_or_default(),
+        shallow: deepen
+            .map(|plan| plan.client_shallow.clone())
+            .unwrap_or_default(),
+        deepen: deepen.map(|plan| plan.depth),
         ..UploadPackRequest::default()
     };
     let mut encoded_request = Vec::new();
@@ -385,14 +544,23 @@ pub fn install_fetch_pack_via_local_upload_pack(
             Err(err) => Some(Err(err)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let excluded = collect_reachable_object_ids(&remote_db, format, known_haves)?;
+    let mut excluded = collect_reachable_object_ids(&remote_db, format, known_haves)?;
+    let mut starts = decoded_request.wants;
+    if let Some(plan) = deepen {
+        // Stop the pack walk at the shallow boundary and pack the history a
+        // moved boundary newly exposes.
+        excluded.extend(plan.excluded.iter().copied());
+        starts.extend(plan.extra_wants.iter().copied());
+    }
     build_and_install_reachable_pack(
         &remote_db,
         &local_db,
         format,
-        decoded_request.wants,
+        starts,
         &excluded,
         RawPackInstallOptions { promisor },
     )?;
-    Ok(())
+    Ok(deepen
+        .map(|plan| plan.shallow_info.clone())
+        .unwrap_or_default())
 }

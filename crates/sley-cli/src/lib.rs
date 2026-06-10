@@ -10,9 +10,10 @@ use sley_object::{
     tree_entry_object_type,
 };
 use sley_odb::{
-    FileObjectDatabase, ObjectPrefixResolution, ObjectReader, ObjectWriter, build_reachable_pack,
-    collect_reachable_object_ids, install_bundle_pack, install_reachable_pack,
-    prune_unreachable_loose, repository_object_ids, repository_objects_dir,
+    FileObjectDatabase, LooseObjectIntegrity, ObjectPrefixResolution, ObjectReader, ObjectWriter,
+    build_reachable_pack, collect_reachable_object_ids, install_bundle_pack,
+    install_reachable_pack, prune_unreachable_loose, repository_object_ids,
+    repository_objects_dir,
 };
 use sley_pack::{MultiPackIndex, MultiPackIndexEntry, PackFile, PackIndex};
 use sley_protocol::{
@@ -26,8 +27,8 @@ use sley_protocol::{
 pub(crate) use sley_ref_filter::*;
 use sley_refs::{
     BundleRefUpdate, FileRefStore, PackedRef, Ref, RefPrecondition, RefTarget, RefUpdate,
-    ReflogEntry, branch_ref_name, parse_packed_refs, resolve_ref_peeled, tag_ref_name,
-    validate_ref_name, validate_symref_name, validate_symref_target,
+    ReflogEntry, branch_ref_name, check_refname_format, parse_packed_refs, resolve_ref_peeled,
+    tag_ref_name, validate_ref_name, validate_symref_name, validate_symref_target,
 };
 use sley_remote::FetchOutcome;
 use sley_transport::{RemoteTransport, parse_remote_url};
@@ -148,6 +149,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "bundle" => cmd_bundle(&args[1..]),
         "hash-object" => commands::hash_object::cmd_hash_object(&args[1..]),
         "index-pack" => cmd_index_pack(&args[1..]),
+        "pack-objects" => commands::pack_objects::cmd_pack_objects(&args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(&args[1..]),
@@ -388,6 +390,13 @@ fn var_pager() -> String {
 }
 
 fn var_default_branch() -> String {
+    // git's `repo_default_branch_name`: the test override env var wins over
+    // the `init.defaultBranch` configuration.
+    if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !env.is_empty()
+    {
+        return env;
+    }
     var_effective_config_value("init.defaultBranch").unwrap_or_else(|| "master".into())
 }
 
@@ -1921,6 +1930,7 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     let mut initial_branch_explicit = false;
     let mut quiet = false;
     let mut path = PathBuf::from(".");
+    let mut path_given = false;
     let mut template = None::<Option<String>>;
     let mut template_config = true;
     let mut separate_git_dir = None::<String>;
@@ -2030,7 +2040,10 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
                         .to_string(),
                 ));
             }
-            value => path = PathBuf::from(value),
+            value => {
+                path = PathBuf::from(value);
+                path_given = true;
+            }
         }
     }
 
@@ -2043,14 +2056,47 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         bare = true;
     }
 
+    // Mirror refs.c `repo_default_branch_name`: an explicit `--initial-branch`
+    // wins; otherwise `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME` (when non-empty),
+    // then `init.defaultBranch`, then "master" (which triggers the
+    // `advice.defaultBranchName` hint, emitted after a successful fresh init).
+    // A name sourced from the env/config default dies with git's
+    // `invalid branch name: init.defaultBranch = <name>`; an explicit
+    // `--initial-branch` dies with `invalid initial branch name: '<name>'`
+    // (init-db.c).
+    let mut branch_defaulted = false;
     let initial_branch = match initial_branch {
-        Some(branch) => branch,
-        None => init_config_value("init.defaultBranch", global_config)?
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "master".to_string()),
+        Some(branch) => {
+            if check_refname_format(&format!("refs/heads/{branch}"), false).is_err() {
+                eprintln!("fatal: invalid initial branch name: '{branch}'");
+                return Err(GitError::Exit(128));
+            }
+            branch
+        }
+        None => {
+            let default_name = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map_or_else(
+                    || init_config_value("init.defaultBranch", global_config),
+                    |name| Ok(Some(name)),
+                )?
+                .filter(|value| !value.is_empty());
+            match default_name {
+                Some(name) => {
+                    if check_refname_format(&format!("refs/heads/{name}"), false).is_err() {
+                        eprintln!("fatal: invalid branch name: init.defaultBranch = {name}");
+                        return Err(GitError::Exit(128));
+                    }
+                    name
+                }
+                None => {
+                    branch_defaulted = true;
+                    "master".to_string()
+                }
+            }
+        }
     };
-
-    validate_ref_name(&format!("refs/heads/{initial_branch}"))?;
 
     let cwd = env::current_dir()?;
     let worktree = resolve_cli_path(&cwd, path.to_string_lossy().as_ref());
@@ -2073,6 +2119,98 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         }
     }
 
+    // init-db.c: GIT_WORK_TREE (or --work-tree) only makes sense together with
+    // GIT_DIR and without an explicit `--bare`. After chdir'ing into the target
+    // directory, `--bare` pins GIT_DIR to that directory (overwriting the
+    // environment when a directory argument was given); the effective git dir
+    // then comes from GIT_DIR and its *string* form drives the bare guess.
+    let env_git_dir = explicit_git_dir();
+    let env_work_tree = explicit_work_tree();
+    if env_work_tree.is_some() && (bare_explicit || env_git_dir.is_none()) {
+        eprintln!(
+            "fatal: GIT_WORK_TREE (or --work-tree=<directory>) not allowed without specifying GIT_DIR (or --git-dir=<directory>)"
+        );
+        return Err(GitError::Exit(128));
+    }
+
+    let mut worktree = worktree;
+    let mut git_dir_override = None::<PathBuf>;
+    let mut core_worktree = None::<String>;
+    // Re-initializing from *inside* a linked worktree operates on the shared
+    // repository: git's setup discovers the common git dir and the *main*
+    // worktree, so `init --separate-git-dir` there relocates the common dir and
+    // repoints the main worktree's `.git` (init-db.c works on the discovered
+    // repository, not the linked-worktree admin dir). Redirect `worktree` to the
+    // main worktree root before bootstrap so `.git` resolves to the common dir.
+    if !bare && env_git_dir.is_none() && env_work_tree.is_none() {
+        let dot_git = worktree.join(".git");
+        if dot_git.is_file()
+            && let Some(admin_dir) = read_gitdir_file(&dot_git)?
+            && admin_dir.join("commondir").is_file()
+        {
+            let common = common_git_dir_for_git_dir(&admin_dir)?;
+            if let Some(main_root) = common.parent() {
+                worktree = main_root.to_path_buf();
+            }
+        }
+    }
+    if bare_explicit {
+        // `--bare` without a directory argument leaves an existing GIT_DIR in
+        // charge of where the (bare) repository lives.
+        if !path_given && let Some(raw) = env_git_dir.clone() {
+            git_dir_override = Some(resolve_cli_path(&worktree, raw.to_string_lossy().as_ref()));
+        }
+    } else if let Some(raw) = env_git_dir.clone()
+        && separate_git_dir.is_none()
+        && !bare
+    {
+        let git_dir_abs = resolve_cli_path(&worktree, raw.to_string_lossy().as_ref());
+        if guess_repository_type(&raw, &worktree) {
+            match env_work_tree.clone() {
+                // Guessed-bare git dir + GIT_WORK_TREE: the repository is
+                // *non*-bare after all; record `core.worktree` (init-db.c sets
+                // the work tree, so `create_default_files` writes it).
+                Some(raw_work_tree) => {
+                    let work_tree_abs =
+                        resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
+                    let work_tree_abs =
+                        fs::canonicalize(&work_tree_abs).unwrap_or(work_tree_abs);
+                    if git_dir_abs != work_tree_abs.join(".git") {
+                        core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
+                    }
+                    git_dir_override = Some(git_dir_abs);
+                    worktree = work_tree_abs;
+                }
+                // Plain guessed-bare GIT_DIR (e.g. `GIT_DIR=dir.git git init`):
+                // a bare repository at that directory.
+                None => {
+                    git_dir_override = Some(git_dir_abs);
+                    bare = true;
+                }
+            }
+        } else {
+            // Non-bare guess (".git" or "…/.git"): the work tree is the git
+            // dir's parent (or the target directory), unless GIT_WORK_TREE
+            // overrides it.
+            let work_tree_abs = match env_work_tree.clone() {
+                Some(raw_work_tree) => {
+                    let resolved =
+                        resolve_cli_path(&worktree, raw_work_tree.to_string_lossy().as_ref());
+                    fs::canonicalize(&resolved).unwrap_or(resolved)
+                }
+                None => git_dir_abs
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| worktree.clone()),
+            };
+            if git_dir_abs != work_tree_abs.join(".git") {
+                core_worktree = Some(work_tree_abs.to_string_lossy().into_owned());
+            }
+            git_dir_override = Some(git_dir_abs);
+            worktree = work_tree_abs;
+        }
+    }
+
     let (object_format, object_format_explicit) =
         resolve_init_object_format(object_format, global_config)?;
     let (ref_storage, ref_storage_explicit) =
@@ -2082,6 +2220,8 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
 
     let layout = RepositoryBootstrap::init(InitOptions {
         worktree,
+        git_dir_override,
+        core_worktree,
         object_format,
         object_format_explicit,
         bare,
@@ -2104,6 +2244,9 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
         other => other,
     })?;
 
+    if branch_defaulted && !quiet && !layout.reinitialized {
+        emit_default_branch_advice(&initial_branch, global_config)?;
+    }
     if layout.reinitialized && initial_branch_explicit {
         eprintln!("warning: re-init: ignored --initial-branch={initial_branch}");
     }
@@ -2119,6 +2262,69 @@ fn cmd_init(args: &[String], global_config: &[GlobalConfigOverride]) -> Result<(
     Ok(())
 }
 
+/// git's `default_branch_name_advice` (refs.c, non-WITH_BREAKING_CHANGES build),
+/// emitted through `advise_if_enabled(ADVICE_DEFAULT_BRANCH_NAME, ...)` when an
+/// unconfigured `git init` falls back to "master".
+const DEFAULT_BRANCH_NAME_ADVICE: &str = "Using '{}' as the name for the initial branch. This default branch name\n\
+will change to \"main\" in Git 3.0. To configure the initial branch name\n\
+to use in all of your new repositories, which will suppress this warning,\n\
+call:\n\
+\n\
+\tgit config --global init.defaultBranch <name>\n\
+\n\
+Names commonly chosen instead of 'master' are 'main', 'trunk' and\n\
+'development'. The just-created branch can be renamed via this command:\n\
+\n\
+\tgit branch -m <name>\n\
+\n\
+Disable this message with \"git config set advice.defaultBranchName false\"";
+
+/// Mirror git's `advise_if_enabled` for the unconfigured-default-branch hint:
+/// gated on the `GIT_ADVICE` env bool and `advice.defaultBranchName`, rendered
+/// line-by-line as `hint: <line>` on stderr, coloured per `color.advice`
+/// (advice.c `vadvise`; the hint colour is yellow).
+fn emit_default_branch_advice(
+    branch: &str,
+    global_config: &[GlobalConfigOverride],
+) -> Result<()> {
+    if let Ok(value) = env::var("GIT_ADVICE") {
+        if !parse_config_bool(&value).unwrap_or(!value.is_empty()) {
+            return Ok(());
+        }
+    }
+    if init_config_bool("advice.defaultBranchName", global_config)? == Some(false) {
+        return Ok(());
+    }
+    // `color.advice`: "always" colours unconditionally; "never"/false disables;
+    // "auto"/true/unset colour only when stderr is a terminal (color.c
+    // `git_config_colorbool` + `want_color_stderr`).
+    let colored = match init_config_value("color.advice", global_config)?.as_deref() {
+        Some(value) if value.eq_ignore_ascii_case("always") => true,
+        Some(value) if value.eq_ignore_ascii_case("never") => false,
+        Some(value) if value.eq_ignore_ascii_case("auto") => stderr_is_terminal(),
+        Some(value) => match parse_config_bool(value) {
+            Some(false) => false,
+            _ => stderr_is_terminal(),
+        },
+        None => stderr_is_terminal(),
+    };
+    let (color, reset) = if colored { ("\x1b[33m", "\x1b[m") } else { ("", "") };
+    // The advice body already ends without a trailing newline; the
+    // `Disable this message ...` instruction line was appended above with the
+    // leading blank line git's `turn_off_instructions` carries.
+    let body = DEFAULT_BRANCH_NAME_ADVICE.replacen("{}", branch, 1);
+    for line in body.split('\n') {
+        let sep = if line.is_empty() { "" } else { " " };
+        eprintln!("{color}hint:{sep}{line}{reset}");
+    }
+    Ok(())
+}
+
+fn stderr_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    io::stderr().is_terminal()
+}
+
 /// Resolve the object format for a *fresh* init, returning the chosen format and
 /// whether it was specified explicitly on the command line.
 ///
@@ -2132,6 +2338,19 @@ fn resolve_init_object_format(
     cli_format: Option<String>,
     global_config: &[GlobalConfigOverride],
 ) -> Result<(ObjectFormat, bool)> {
+    // git reads the config defaults FIRST (setup.c `read_default_format_config`),
+    // so an invalid `init.defaultObjectFormat` warns even when the command line
+    // or `GIT_DEFAULT_HASH` ends up choosing the format.
+    let config_format = match init_config_value("init.defaultObjectFormat", global_config)? {
+        Some(value) => match value.parse::<ObjectFormat>() {
+            Ok(format) => Some(format),
+            Err(_) => {
+                eprintln!("warning: unknown hash algorithm '{value}'");
+                None
+            }
+        },
+        None => None,
+    };
     if let Some(value) = cli_format {
         return Ok((parse_init_object_format(&value)?, true));
     }
@@ -2140,13 +2359,8 @@ fn resolve_init_object_format(
             return Ok((parse_init_object_format(&hash)?, false));
         }
     }
-    if let Some(value) = init_config_value("init.defaultObjectFormat", global_config)? {
-        match value.parse::<ObjectFormat>() {
-            Ok(format) => return Ok((format, false)),
-            Err(_) => {
-                eprintln!("warning: unknown hash algorithm '{value}'");
-            }
-        }
+    if let Some(format) = config_format {
+        return Ok((format, false));
     }
     Ok((ObjectFormat::Sha1, false))
 }
@@ -2174,22 +2388,28 @@ fn resolve_init_ref_storage(
     cli_ref_format: Option<Option<String>>,
     global_config: &[GlobalConfigOverride],
 ) -> Result<(RefStorageFormat, bool)> {
+    // git reads the config defaults FIRST (setup.c `read_default_format_config`),
+    // so an invalid `init.defaultRefFormat` warns even when the command line or
+    // `GIT_DEFAULT_REF_FORMAT` ends up choosing the format.
+    let config_format = match init_config_value("init.defaultRefFormat", global_config)? {
+        Some(value) if value.is_empty() => Some(RefStorageFormat::Files),
+        Some(value) => match RefStorageFormat::parse(&value) {
+            Ok(format) => Some(format),
+            Err(_) => {
+                eprintln!("warning: unknown ref storage format '{value}'");
+                None
+            }
+        },
+        None => None,
+    };
     if let Some(value) = cli_ref_format {
         return Ok((parse_init_ref_storage(value.as_deref().unwrap_or(""))?, true));
     }
     if let Ok(value) = env::var("GIT_DEFAULT_REF_FORMAT") {
         return Ok((parse_init_ref_storage(&value)?, false));
     }
-    if let Some(value) = init_config_value("init.defaultRefFormat", global_config)? {
-        if value.is_empty() {
-            return Ok((RefStorageFormat::Files, false));
-        }
-        match RefStorageFormat::parse(&value) {
-            Ok(format) => return Ok((format, false)),
-            Err(_) => {
-                eprintln!("warning: unknown ref storage format '{value}'");
-            }
-        }
+    if let Some(format) = config_format {
+        return Ok((format, false));
     }
     if init_config_bool("feature.experimental", global_config)?.unwrap_or(false) {
         return Ok((RefStorageFormat::Reftable, false));
@@ -2269,6 +2489,21 @@ fn default_init_template_dir() -> Option<PathBuf> {
     let exec_path = String::from_utf8_lossy(&output.stdout);
     let candidate = PathBuf::from(exec_path.trim()).join("../share/git-core/templates");
     candidate.canonicalize().ok().filter(|path| path.is_dir())
+}
+
+/// git's `repo_default_branch_name`: `GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME`
+/// overrides the `init.defaultBranch` configuration (read from the default
+/// config layers: `-c` overrides, then system/global files); the hardcoded
+/// fallback is `master`.
+fn default_initial_branch_name(global_config: &[GlobalConfigOverride]) -> Result<String> {
+    if let Ok(env) = env::var("GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME")
+        && !env.is_empty()
+    {
+        return Ok(env);
+    }
+    Ok(init_config_value("init.defaultBranch", global_config)?
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "master".to_string()))
 }
 
 fn init_config_value(key: &str, global_config: &[GlobalConfigOverride]) -> Result<Option<String>> {
@@ -2887,10 +3122,38 @@ fn cmd_clean(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Expand clustered short boolean options for `git repack` (e.g. `-ad`,
+/// `-adf`) into the per-flag tokens the main parser understands, following
+/// git's getopt semantics. Every short option `git repack` accepts that sley
+/// also implements is a boolean (`-a -A -d -f -F -l -q`; see the
+/// `builtin_repack_options` table in upstream `builtin/repack.c`), so a
+/// cluster is expanded only when *all* of its characters are in that set.
+/// Anything else — long options, positionals, `-`, or a cluster containing a
+/// flag sley does not implement (e.g. `-Adb`) — passes through untouched so
+/// the main parser reports the whole token, mirroring the
+/// no-partial-side-effects rule of `expand_commit_short_clusters`.
+fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        let bytes = arg.as_bytes();
+        if bytes.len() > 2
+            && bytes[0] == b'-'
+            && bytes[1..]
+                .iter()
+                .all(|&ch| matches!(ch, b'a' | b'A' | b'd' | b'f' | b'F' | b'l' | b'q'))
+        {
+            expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
+        } else {
+            expanded.push(arg.clone());
+        }
+    }
+    expanded
+}
+
 fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
-    for arg in args {
+    for arg in &expand_repack_short_clusters(args) {
         match arg.as_str() {
             "-d" => prune = true,
             "-q" | "--quiet" => quiet = true,
@@ -3273,10 +3536,33 @@ fn cmd_fsck(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let roots = fsck_root_oids(&git_dir, format)?;
+    let mut object_ids = repository_object_ids(&git_dir, format)?;
+    // Mirror builtin/fsck.c `fsck_loose`: probe every loose object file before the
+    // connectivity walk, reporting corrupt or mismatched ones at `error:` level on
+    // stderr (with git's path-form spelling) and excluding them from the object set
+    // so they neither parse nor surface as dangling.
+    let objects_dir_display = fsck_objects_dir_display(&git_dir, &cwd);
+    let mut bad_loose = HashSet::new();
+    for oid in db.loose().object_ids()? {
+        let hex = oid.to_hex();
+        let display_path = format!("{objects_dir_display}/{}/{}", &hex[..2], &hex[2..]);
+        match db.loose().verify_object(&oid, &display_path)? {
+            None | Some(LooseObjectIntegrity::Ok) => {}
+            Some(LooseObjectIntegrity::HashMismatch { actual }) => {
+                eprintln!("error: {actual}: hash-path mismatch, found at: {display_path}");
+                bad_loose.insert(oid);
+            }
+            Some(LooseObjectIntegrity::Corrupt) => {
+                eprintln!("error: {oid}: object corrupt or missing: {display_path}");
+                bad_loose.insert(oid);
+            }
+        }
+    }
+    let loose_errors = !bad_loose.is_empty();
+    object_ids.retain(|oid| !bad_loose.contains(oid));
     if roots.is_empty() && progress {
         eprintln!("notice: No default references");
     }
-    let object_ids = repository_object_ids(&git_dir, format)?;
     let report = sley_fsck::fsck_objects_with_options(
         &db,
         format,
@@ -3293,11 +3579,30 @@ fn cmd_fsck(args: &[String]) -> Result<()> {
     for issue in &report.issues {
         println!("{}", issue.message);
     }
-    if report.is_ok() {
-        Ok(())
-    } else {
+    if !report.is_ok() {
         Err(GitError::Exit(10))
+    } else if loose_errors {
+        // builtin/fsck.c exits with its `errors_found` bitmask; a corrupt or
+        // misplaced loose object sets ERROR_OBJECT (= 1).
+        Err(GitError::Exit(1))
+    } else {
+        Ok(())
     }
+}
+
+/// The directory prefix git uses when printing loose-object paths from fsck:
+/// `$GIT_DIR/objects` with GIT_DIR's textual (often relative) value — `./objects`
+/// when the cwd IS the git dir (a bare repository), `.git/objects` at a worktree
+/// root. sley's discovery yields an absolute git dir, so reconstruct the relative
+/// spelling for those shapes and fall back to the absolute path.
+fn fsck_objects_dir_display(git_dir: &Path, cwd: &Path) -> String {
+    if git_dir == cwd {
+        return "./objects".to_string();
+    }
+    if let Ok(relative) = git_dir.strip_prefix(cwd) {
+        return format!("{}/objects", relative.display());
+    }
+    format!("{}/objects", git_dir.display())
 }
 
 fn fsck_root_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<ObjectId>> {
@@ -23317,18 +23622,27 @@ enum RevParsePathFormat {
 }
 
 fn cmd_rev_parse(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        return Err(GitError::Command("rev-parse requires <rev>...".into()));
-    }
     if rev_parse_args_need_no_repository(args)? {
         return Ok(());
     }
     let cwd = env::current_dir()?;
     let git_dir = match discover_git_dir(&cwd) {
         Ok(git_dir) => git_dir,
-        Err(GitError::NotFound(_)) => return rev_parse_not_git_repository(),
+        Err(GitError::NotFound(_)) => {
+            if args.is_empty() {
+                return Err(GitError::Command("rev-parse requires <rev>...".into()));
+            }
+            return rev_parse_not_git_repository();
+        }
         Err(err) => return Err(err),
     };
+    // git's repository setup validates the repository format (version vs
+    // extensions) before rev-parse processes any argument; a bare `rev-parse`
+    // in a malformed repository must still die (t0001 #60/#62/#64).
+    verify_repository_format(&git_dir)?;
+    if args.is_empty() {
+        return Err(GitError::Command("rev-parse requires <rev>...".into()));
+    }
     let format = repository_object_format(&git_dir)?;
     let mut short = None;
     let mut short_revs = 0usize;
@@ -23783,6 +24097,13 @@ fn display_git_common_dir(
 fn display_git_common_dir_default(cwd: &Path, git_dir: &Path) -> Result<String> {
     if let Some(git_dir) = explicit_git_dir() {
         return Ok(git_dir.to_string_lossy().into_owned());
+    }
+    // A linked worktree's git dir (`…/worktrees/<id>`) carries a `commondir`
+    // file pointing at the shared repository. git's `--git-common-dir`
+    // (DEFAULT_RELATIVE_IF_SHARED) prints that common dir, not the per-worktree
+    // git dir, so resolve it before any `.git`-suffix heuristics.
+    if git_dir.join("commondir").is_file() {
+        return Ok(common_git_dir_for_git_dir(git_dir)?.display().to_string());
     }
     if git_dir.file_name().and_then(|name| name.to_str()) != Some(".git") {
         return display_git_dir_default(cwd, git_dir);
@@ -27569,7 +27890,19 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
         return Err(GitError::repository_not_found("not a git repository"));
     }
+    let ceilings = discovery_ceiling_directories();
     for candidate in start.as_ref().ancestors() {
+        // GIT_CEILING_DIRECTORIES: stop the upward walk before *entering* a
+        // listed directory. The starting directory itself is always examined
+        // (a ceiling only limits proper ancestors, like git's
+        // `longest_ancestor_length`).
+        if candidate != start.as_ref()
+            && ceilings
+                .iter()
+                .any(|ceiling| paths_refer_to_same_dir(ceiling, candidate))
+        {
+            break;
+        }
         let dot_git = candidate.join(".git");
         if dot_git.is_dir() {
             return Ok(dot_git);
@@ -27587,6 +27920,32 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
     Err(GitError::repository_not_found("not a git repository"))
 }
 
+/// The `GIT_CEILING_DIRECTORIES` list: colon-separated absolute paths that
+/// repository discovery must not walk up into. Empty entries (including the
+/// `""` no-canonicalization marker) are ignored.
+fn discovery_ceiling_directories() -> Vec<PathBuf> {
+    match env::var("GIT_CEILING_DIRECTORIES") {
+        Ok(value) if !value.is_empty() => value
+            .split(':')
+            .filter(|entry| !entry.is_empty())
+            .map(PathBuf::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Whether two paths name the same directory, tolerating symlink/relative
+/// differences via canonicalization.
+fn paths_refer_to_same_dir(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
     let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
     let config = common_git_dir.join("config");
@@ -27594,6 +27953,71 @@ fn repository_object_format(git_dir: &Path) -> Result<ObjectFormat> {
         return Ok(ObjectFormat::Sha1);
     };
     config.repository_object_format()
+}
+
+/// Mirror git's `verify_repository_format` plus the extension collection in
+/// `check_repo_format` (setup.c): with `core.repositoryformatversion = 0`, any
+/// v1-only extension (`objectformat`, `refstorage`, `compatobjectformat`, ...)
+/// is fatal; with version >= 1, any *unknown* extension is fatal; versions
+/// above 1 are always fatal. Invalid `extensions.refstorage` values die with
+/// git's per-occurrence `invalid value for 'extensions.refstorage'` diagnostic
+/// (delegated to [`repository_ref_storage_format`]). A missing config file or
+/// missing version key is silently OK, exactly like git's
+/// `check_repository_format_gently`.
+fn verify_repository_format(git_dir: &Path) -> Result<()> {
+    repository_ref_storage_format(git_dir)?;
+    let common_git_dir = common_git_dir_for_git_dir(git_dir)?;
+    let config_path = common_git_dir.join("config");
+    let Ok(config) = GitConfig::read(&config_path) else {
+        return Ok(());
+    };
+    let Some(version_value) = config.get("core", None, "repositoryformatversion") else {
+        return Ok(());
+    };
+    let version: i64 = version_value.trim().parse().unwrap_or(0);
+    if version > 1 {
+        eprintln!("fatal: Expected git repo version <= 1, found {version}");
+        return Err(GitError::Exit(128));
+    }
+    let mut v1_only = Vec::new();
+    let mut unknown = Vec::new();
+    for section in config
+        .sections
+        .iter()
+        .filter(|section| {
+            section.name.eq_ignore_ascii_case("extensions") && section.subsection.is_none()
+        })
+    {
+        for entry in &section.entries {
+            let ext = entry.key.to_ascii_lowercase();
+            match ext.as_str() {
+                // Extensions git honours even at repository version 0
+                // (`handle_extension_v0`).
+                "noop" | "preciousobjects" | "partialclone" | "worktreeconfig" => {}
+                // v1-only extensions (`handle_extension`).
+                "noop-v1" | "objectformat" | "compatobjectformat" | "refstorage"
+                | "relativeworktrees" | "submodulepathconfig" => v1_only.push(ext),
+                _ => unknown.push(ext),
+            }
+        }
+    }
+    if version >= 1 && !unknown.is_empty() {
+        let plural = if unknown.len() == 1 { "extension" } else { "extensions" };
+        eprintln!(
+            "fatal: unknown repository {plural} found:\n\t{}",
+            unknown.join("\n\t")
+        );
+        return Err(GitError::Exit(128));
+    }
+    if version == 0 && !v1_only.is_empty() {
+        let plural = if v1_only.len() == 1 { "extension" } else { "extensions" };
+        eprintln!(
+            "fatal: repo version is 0, but v1-only {plural} found:\n\t{}",
+            v1_only.join("\n\t")
+        );
+        return Err(GitError::Exit(128));
+    }
+    Ok(())
 }
 
 fn repository_ref_storage_format(git_dir: &Path) -> Result<&'static str> {
