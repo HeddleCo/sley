@@ -605,10 +605,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     // (even though sley serves it from this same local code path), so it ends
     // without "done.". This is a strictly narrower condition than
     // `local_mechanism` (which also covers `--local` over a `file://`-less path
-    // for the depth warn-and-ignore), so the two are kept distinct.
-    let local_source = parse_remote_url(&repository)
-        .map(|url| url.transport == RemoteTransport::Local)
-        .unwrap_or(false);
+    // for the depth warn-and-ignore), so the two are kept distinct — and
+    // `--no-local` routes a plain local path through the transport machinery,
+    // so "done." additionally requires the local mechanism to have engaged.
+    let local_source = local_mechanism
+        && parse_remote_url(&repository)
+            .map(|url| url.transport == RemoteTransport::Local)
+            .unwrap_or(false);
     if bare {
         clone_bare_or_mirror_local_repository(
             &destination,
