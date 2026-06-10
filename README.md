@@ -1,4 +1,4 @@
-# git-rs
+# sley
 
 Greenfield Rust workspace for a minimal-dependency Git-compatible implementation.
 
