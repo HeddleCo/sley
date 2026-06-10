@@ -1626,9 +1626,10 @@ fn value_canonicalizes_as(value: &str, value_type: ConfigValueType) -> bool {
         ConfigValueType::BoolOrInt => sley_config::parse_config_bool_or_int(value).is_some(),
         ConfigValueType::Color => try_format_config_color_value(value).is_ok(),
         ConfigValueType::ExpiryDate => {
-            // Side-effect-free: accept the literal forms the formatter accepts
-            // without invoking it (the formatter prints on failure).
-            value == "now" || value == "never" || value.bytes().all(|b| b.is_ascii_digit())
+            // Side-effect-free: accept exactly what git's approxidate accepts
+            // (absolute dates, relative dates, the never/now sentinels), without
+            // invoking the formatter (which prints a diagnostic on failure).
+            super::approxidate::parse_expiry_date(value).is_some()
         }
     }
 }
@@ -1702,14 +1703,12 @@ fn config_bad_numeric_value(
 }
 
 fn format_config_expiry_date_value(value: &str) -> Result<String> {
-    match value {
-        "now" => Ok(u64::MAX.to_string()),
-        "never" => Ok("0".into()),
-        value if value.bytes().all(|byte| byte.is_ascii_digit()) => value
-            .parse::<u64>()
-            .map(|value| value.to_string())
-            .map_err(|_| config_bad_expiry_date_value(value)),
-        _ => Err(config_bad_expiry_date_value(value)),
+    // git's `parse_expiry_date` → `approxidate_careful`: canonicalise the value
+    // through approxidate and print the resulting timestamp (`%"PRItime"`). The
+    // `now`/`all` sentinel renders as the unsigned `TIME_MAX` (u64::MAX).
+    match super::approxidate::format_expiry_date(value) {
+        Some(formatted) => Ok(formatted),
+        None => Err(config_bad_expiry_date_value(value)),
     }
 }
 

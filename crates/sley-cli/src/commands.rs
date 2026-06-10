@@ -7,6 +7,7 @@
 
 pub(crate) mod alias;
 pub(crate) mod am;
+pub(crate) mod approxidate;
 pub(crate) mod args;
 pub(crate) mod attrs;
 pub(crate) mod bisect;
