@@ -124,7 +124,7 @@ fn branch_delete_merged_matches_upstream_git() {
     let root = unique_temp_dir("branch-delete-merged");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
             .expect("base oid utf8")
@@ -318,7 +318,7 @@ fn branch_delete_remote_tracking_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo");
     {
         for repo in [&expected, &actual] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             run_with_identity_at(repo, &["commit", "--allow-empty", "-m", "initial", "-q"], 1);
         }
 
@@ -377,7 +377,7 @@ fn branch_force_update_matches_upstream_git() {
     let root = unique_temp_dir("branch-force-update");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
             .expect("base oid utf8")
@@ -568,7 +568,7 @@ fn branch_upstream_config_matches_upstream_git() {
     let root = unique_temp_dir("branch-upstream-config");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         git(&root, &["branch", "topic"]);
         git(&root, &["remote", "add", "origin", "."]);
@@ -668,7 +668,7 @@ fn branch_create_tracking_matches_upstream_git() {
     fs::create_dir_all(&actual).expect("create actual repo");
     {
         for repo in [&expected, &actual] {
-            git(repo, &["init", "-q"]);
+            git(repo, &["init", "-q", "-b", "main"]);
             run_with_identity(repo, &["commit", "--allow-empty", "-m", "initial", "-q"]);
             git(repo, &["remote", "add", "origin", "."]);
             git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -868,7 +868,7 @@ fn branch_rename_and_copy_match_upstream_git() {
     let root = unique_temp_dir("branch-rename-copy");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         git(&root, &["branch", "topic"]);
         git(&root, &["branch", "target"]);
@@ -1026,7 +1026,7 @@ fn branch_verbose_listing_matches_upstream_git() {
     let root = unique_temp_dir("branch-verbose-listing");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity(&root, &["commit", "--allow-empty", "-m", "initial", "-q"]);
         let base_oid = String::from_utf8(git(&root, &["rev-parse", "HEAD"]))
             .expect("base oid utf8")
@@ -1083,7 +1083,7 @@ fn branch_list_patterns_match_upstream_git() {
     let root = unique_temp_dir("branch-list-patterns");
     fs::create_dir_all(&root).expect("create temp repo");
     {
-        git(&root, &["init", "-q"]);
+        git(&root, &["init", "-q", "-b", "main"]);
         run_with_identity_at(
             &root,
             &["commit", "--allow-empty", "-m", "initial", "-q"],
