@@ -148,6 +148,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "bundle" => cmd_bundle(&args[1..]),
         "hash-object" => commands::hash_object::cmd_hash_object(&args[1..]),
         "index-pack" => cmd_index_pack(&args[1..]),
+        "pack-objects" => commands::pack_objects::cmd_pack_objects(&args[1..]),
         "cat-file" => commands::cat_file::cmd_cat_file(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
         "check-attr" => commands::attrs::cmd_check_attr(&args[1..]),
@@ -2809,10 +2810,38 @@ fn cmd_clean(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Expand clustered short boolean options for `git repack` (e.g. `-ad`,
+/// `-adf`) into the per-flag tokens the main parser understands, following
+/// git's getopt semantics. Every short option `git repack` accepts that sley
+/// also implements is a boolean (`-a -A -d -f -F -l -q`; see the
+/// `builtin_repack_options` table in upstream `builtin/repack.c`), so a
+/// cluster is expanded only when *all* of its characters are in that set.
+/// Anything else — long options, positionals, `-`, or a cluster containing a
+/// flag sley does not implement (e.g. `-Adb`) — passes through untouched so
+/// the main parser reports the whole token, mirroring the
+/// no-partial-side-effects rule of `expand_commit_short_clusters`.
+fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
+    let mut expanded = Vec::with_capacity(args.len());
+    for arg in args {
+        let bytes = arg.as_bytes();
+        if bytes.len() > 2
+            && bytes[0] == b'-'
+            && bytes[1..]
+                .iter()
+                .all(|&ch| matches!(ch, b'a' | b'A' | b'd' | b'f' | b'F' | b'l' | b'q'))
+        {
+            expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
+        } else {
+            expanded.push(arg.clone());
+        }
+    }
+    expanded
+}
+
 fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
-    for arg in args {
+    for arg in &expand_repack_short_clusters(args) {
         match arg.as_str() {
             "-d" => prune = true,
             "-q" | "--quiet" => quiet = true,

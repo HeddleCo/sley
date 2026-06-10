@@ -2047,6 +2047,15 @@ impl ObjectReader for FileObjectDatabase {
 
 impl ObjectWriter for FileObjectDatabase {
     fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+        // Mirror git's freshen semantics (`write_object_file`:
+        // `freshen_packed_object || freshen_loose_object`): an object already
+        // present anywhere in the database — loose, packed, or through an
+        // alternate — is not written again, so e.g. `git add` after
+        // `git repack -ad` does not resurrect a loose copy of a packed object.
+        let oid = object.object_id(self.format)?;
+        if self.contains(&oid)? {
+            return Ok(oid);
+        }
         self.loose.write_object(object)
     }
 }

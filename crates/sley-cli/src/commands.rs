@@ -30,6 +30,7 @@ pub(crate) mod merge_tree;
 pub(crate) mod mktag;
 pub(crate) mod name_rev;
 pub(crate) mod notes;
+pub(crate) mod pack_objects;
 pub(crate) mod patch_id;
 pub(crate) mod read_tree;
 pub(crate) mod remote_cmds;
