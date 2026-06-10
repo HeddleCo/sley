@@ -20,7 +20,16 @@ pub(crate) fn cmd_tag(args: &[String]) -> Result<()> {
     let mut list = false;
     let mut explicit_list = false;
     let mut ignore_case = false;
+    // Seed sort keys from `tag.sort` config (in config order). Git reads these
+    // before parsing the command line, so command-line `--sort` keys are
+    // appended after the config keys; the last key parsed is the primary sort
+    // (sort_tag_entries iterates the keys in reverse). `--no-sort` clears all
+    // accumulated keys, config included.
+    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
     let mut sorts = Vec::new();
+    for value in config.get_all("tag", None, "sort").into_iter().flatten() {
+        sorts.push(parse_tag_list_sort(value)?);
+    }
     let mut format_spec = None;
     let mut annotation_lines = None;
     let mut omit_empty = false;
@@ -1298,13 +1307,18 @@ fn parse_tag_list_sort(value: &str) -> Result<TagListSort> {
 }
 
 fn tag_sort_key_error(key: &str) -> Result<TagListSort> {
-    if key.is_empty() {
+    // Mirror git's parse_ref_sorting(): a leading '-' (reverse) and a
+    // "version:"/"v:" prefix are stripped before the atom is parsed, so the
+    // diagnostic names only the unrecognised atom.
+    let atom = key.strip_prefix('-').unwrap_or(key);
+    let atom = atom
+        .strip_prefix("version:")
+        .or_else(|| atom.strip_prefix("v:"))
+        .unwrap_or(atom);
+    if atom.is_empty() {
         eprintln!("fatal: malformed field name: ");
     } else {
-        eprintln!(
-            "fatal: unknown field name: {}",
-            key.strip_prefix('-').unwrap_or(key)
-        );
+        eprintln!("fatal: unknown field name: {atom}");
     }
     Err(GitError::Exit(128))
 }
