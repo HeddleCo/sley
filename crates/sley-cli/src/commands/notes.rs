@@ -71,26 +71,42 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
         Ok(())
     };
 
+    // git's `init_notes` only writes to a notes ref that names a *literal* ref.
+    // A `--ref` carrying rev-parse syntax (`commits^{tree}`, `commits@{N}`) is
+    // refused for every writable subcommand: the expanded name resolves as a
+    // tree-ish/reflog but is not a real ref, so writing through it is rejected.
+    let refuse_non_ref = |verb: &str| -> Result<()> {
+        guard_writable_notes_ref(&git_dir, format, &raw_write_ref, verb)
+    };
+
     match subcommand {
         "list" => notes_list(&git_dir, format, &notes_ref, sub_args),
         "add" => {
             refuse_outside("add")?;
+            refuse_non_ref("add")?;
             notes_add(&git_dir, format, &notes_ref, sub_args)
         }
         "edit" => {
             refuse_outside("edit")?;
+            refuse_non_ref("edit")?;
             notes_edit(&git_dir, format, &notes_ref, sub_args)
         }
         "append" => {
             refuse_outside("append")?;
+            refuse_non_ref("append")?;
             notes_append(&git_dir, format, &notes_ref, sub_args)
         }
         "show" => notes_show(&git_dir, format, &notes_ref, sub_args),
         "remove" => {
             refuse_outside("remove")?;
+            refuse_non_ref("remove")?;
             notes_remove(&git_dir, format, &notes_ref, sub_args)
         }
         "copy" => {
+            // `copy` validates its positional <from>/<to> arguments before
+            // initialising the notes tree (git parses options first), so the
+            // non-ref guard runs *inside* `notes_copy` after that parse to keep
+            // the "too few arguments" usage error taking precedence like git.
             refuse_outside("copy")?;
             notes_copy(&git_dir, format, &notes_ref, sub_args)
         }
@@ -124,6 +140,46 @@ pub(crate) fn raw_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> Strin
         return value.to_string();
     }
     "refs/notes/commits".to_string()
+}
+
+/// Reject a writable notes operation whose (already-expanded) `notes_ref` is not
+/// a literal ref.
+///
+/// Mirrors git's `init_notes` for `NOTES_INIT_WRITABLE`: it first resolves the
+/// ref as a tree-ish (so a reflog selector like `commits@{N}` surfaces its own
+/// "log for ... only has N entries" failure), and if that resolution *succeeds*
+/// it still requires a plain ref read to succeed — a tree-ish such as
+/// `commits^{tree}` peels fine but is not a real ref, so writing through it is
+/// refused with "Cannot use notes ref <ref>". When the tree-ish resolution
+/// fails for a non-existent ref (no reflog selector), git falls through to an
+/// empty tree and the create path is allowed, so this returns `Ok(())`.
+fn guard_writable_notes_ref(
+    git_dir: &Path,
+    format: ObjectFormat,
+    notes_ref: &str,
+    _verb: &str,
+) -> Result<()> {
+    match resolve_revision(git_dir, format, notes_ref) {
+        // The expanded ref resolved as a tree-ish. It is only usable for writing
+        // if it also names a literal ref (git's `refs_read_ref`); a peel like
+        // `^{tree}` or a reflog selector like `@{0}` resolves but is not a ref.
+        Ok(_) => match FileRefStore::new(git_dir.to_path_buf(), format).read_ref(notes_ref) {
+            Ok(Some(_)) => Ok(()),
+            _ => {
+                eprintln!("fatal: Cannot use notes ref {notes_ref}");
+                Err(GitError::Exit(128))
+            }
+        },
+        // A reflog selector that fails to resolve (out of range / absent reflog)
+        // is a hard error in git, carrying its own message; surface it verbatim.
+        Err(GitError::NotFound(kind)) if notes_ref.contains("@{") => {
+            eprintln!("fatal: {kind}");
+            Err(GitError::Exit(128))
+        }
+        // Any other failure to resolve the ref as a tree-ish means it does not
+        // exist yet; git treats this as an empty notes tree and allows creation.
+        Err(_) => Ok(()),
+    }
 }
 
 fn notes_commit_identity() -> Result<NotesCommitIdentity> {
@@ -893,6 +949,11 @@ fn notes_copy(
         }
         _ => return Err(notes_too_many_arguments(NotesUsage::Copy)),
     };
+
+    // After argument validation (matching git's option-parse-then-init order),
+    // refuse a notes ref that resolves to a tree-ish/reflog rather than a real
+    // ref — the same writable-ref guard the other mutating subcommands apply.
+    guard_writable_notes_ref(git_dir, format, notes_ref, "copy")?;
 
     let from = resolve_note_object(git_dir, format, &from_spec)?;
     let to = resolve_note_object(git_dir, format, &to_spec)?;

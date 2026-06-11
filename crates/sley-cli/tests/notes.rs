@@ -247,6 +247,66 @@ fn notes_overwrite_and_errors_match_git() {
     result.expect("notes_overwrite_and_errors_match_git assertions");
 }
 
+/// A `--ref` carrying rev-parse syntax (a tree-ish peel or a reflog selector)
+/// resolves to an object but is not a literal ref, so git refuses to write
+/// notes through it. Mirrors t3301's "cannot edit notes from non-ref" cell and
+/// extends it across every writable subcommand to lock the class shut.
+#[test]
+fn notes_non_ref_write_target_refused_like_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("notes-non-ref");
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let result = std::panic::catch_unwind(|| {
+        let (expected, actual) = make_repo_pair(&root, "nonref", 2);
+
+        // Seed exactly one note so the notes reflog has a single entry, matching
+        // t3301's state when the "non-ref" cell runs.
+        assert_notes_match(&expected, &actual, &["notes", "add", "-m", "seed", "HEAD"]);
+        assert_notes_object_match(&expected, &actual, "refs/notes/commits");
+
+        // The two cases from t3301's cell: a tree-ish peel (resolves but is not a
+        // ref → "Cannot use notes ref ...") and an out-of-range reflog selector
+        // (resolution itself fails → "log for ... only has 1 entries").
+        assert_notes_match(&expected, &actual, &["notes", "--ref", "commits^{tree}", "edit"]);
+        assert_notes_match(&expected, &actual, &["notes", "--ref", "commits@{1}", "edit"]);
+
+        // The refusal is shared by the other no-positional writable subcommands.
+        for verb in ["add", "append", "remove"] {
+            assert_notes_match(
+                &expected,
+                &actual,
+                &["notes", "--ref", "commits^{tree}", verb],
+            );
+            assert_notes_match(
+                &expected,
+                &actual,
+                &["notes", "--ref", "commits@{1}", verb],
+            );
+        }
+
+        // `copy` parses its <from>/<to> positionals before initialising notes,
+        // so it only reaches the guard once those are supplied; with valid args
+        // it refuses the non-ref target just like the others.
+        assert_notes_match(
+            &expected,
+            &actual,
+            &["notes", "--ref", "commits^{tree}", "copy", "HEAD", "HEAD~1"],
+        );
+        assert_notes_match(
+            &expected,
+            &actual,
+            &["notes", "--ref", "commits@{1}", "copy", "HEAD", "HEAD~1"],
+        );
+
+        // The legitimate notes ref is untouched by the refusals above.
+        assert_notes_object_match(&expected, &actual, "refs/notes/commits");
+    });
+    let _ = std::fs::remove_dir_all(&root);
+    result.expect("notes_non_ref_write_target_refused_like_git assertions");
+}
+
 #[test]
 fn notes_append_matches_git() {
     if !git_available() {
