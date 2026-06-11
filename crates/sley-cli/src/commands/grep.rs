@@ -227,24 +227,23 @@ fn parse_grep_bool(value: Option<&str>) -> bool {
 
 pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     let mut opts = GrepOptions::new();
+    // `positionals` is the post-option token stream (pattern, revs, paths). A `--`
+    // among them is preserved as the literal marker `\0DD\0` so the later rev/path
+    // scan can split on it exactly as git does.
     let mut positionals: Vec<String> = Vec::new();
+    const DASHDASH: &str = "\u{0}DD\u{0}";
     let mut saw_double_dash = false;
     // Command-line pattern-type override: `-E/-G/-F/-P` set this (last wins).
     let mut cli_pattern_type: Option<PatternTypeOption> = None;
     let mut no_index = false;
     let mut iter = args.iter().peekable();
 
-    // After the first `--`, args are positionals (pattern / revs / paths) but no
-    // longer options; a *second* `--` forces remaining args to be pathspecs.
-    let mut force_pathspec = false;
     while let Some(arg) = iter.next() {
-        if force_pathspec {
-            opts.pathspecs.push(arg.clone());
-            continue;
-        }
         if saw_double_dash {
+            // Option parsing has stopped; everything is a positional. Preserve a
+            // literal `--` as the marker so the rev/path scan can split on it.
             if arg == "--" {
-                force_pathspec = true;
+                positionals.push(DASHDASH.to_string());
             } else {
                 positionals.push(arg.clone());
             }
@@ -412,9 +411,15 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         }
     }
 
+    let have_pattern = !opts.patterns.is_empty() || !opts.tokens.is_empty();
+    // git: "skip a -- separator; we know it cannot be separating revisions from
+    // pathnames if we haven't even had any patterns yet."
+    if !have_pattern && positionals.first().map(String::as_str) == Some(DASHDASH) {
+        positionals.remove(0);
+    }
     // The very first positional is the pattern unless one was supplied via
     // `-e`/`-f`/boolean tokens.
-    if opts.patterns.is_empty() && opts.tokens.is_empty() {
+    if !have_pattern {
         if positionals.is_empty() {
             eprintln!("fatal: no pattern given");
             return Err(GitError::Exit(128));
@@ -479,14 +484,25 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         }
     }
 
-    // Disambiguate remaining positionals into revs and pathspecs.
-    if !saw_double_dash {
-        let mut in_paths = false;
-        for value in positionals {
-            if in_paths {
-                opts.pathspecs.push(value);
-                continue;
-            }
+    // Disambiguate remaining positionals into revs and pathspecs, mirroring git:
+    // if a `--` is present, everything before it must resolve as a rev and
+    // everything after is a path; otherwise stop at the first non-rev and treat
+    // the rest as paths.
+    let has_dashdash = positionals.iter().any(|p| p == DASHDASH);
+    let mut in_paths = false;
+    for value in positionals {
+        if value == DASHDASH {
+            in_paths = true;
+            continue;
+        }
+        if in_paths {
+            opts.pathspecs.push(value);
+            continue;
+        }
+        if has_dashdash {
+            // Up to the `--`, every token is taken as a rev.
+            opts.revs.push(value);
+        } else {
             match repo.resolve_revision(&value) {
                 Ok(_) => opts.revs.push(value),
                 Err(_) => {
@@ -494,10 +510,6 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                     opts.pathspecs.push(value);
                 }
             }
-        }
-    } else {
-        for value in positionals {
-            opts.revs.push(value);
         }
     }
 
