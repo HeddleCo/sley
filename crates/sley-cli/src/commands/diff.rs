@@ -91,8 +91,15 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut stat = false;
     let mut compact_summary = false;
     let mut stat_count = None;
+    // `git diff` is porcelain: scale --stat to the terminal and honour the
+    // diff.stat*Width config (resolved after the repository is discovered).
+    let mut stat_widths = DiffStatWidths::terminal();
     let mut numstat = false;
     let mut shortstat = false;
+    // `--dirstat` family: None = not requested. Parameters accumulate over the
+    // diff.dirstat config base; bad command-line parameters are fatal.
+    let mut dirstat: Option<DirstatOptions> = None;
+    let mut dirstat_cli_params: Vec<String> = Vec::new();
     let mut patch = false;
     let mut no_patch = false;
     let mut reverse = false;
@@ -115,6 +122,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_submodule_output_control = false;
     let mut diff_word_control = false;
     let mut diff_relative = DiffRelativeMode::Off;
+    // Whether --relative/--no-relative appeared on the command line (an
+    // explicit flag wins over the diff.relative config).
+    let mut diff_relative_explicit = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -126,6 +136,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // git enables rename detection by default (diff.renames defaults to true);
     // --no-renames turns it off. -M/-C select the similarity thresholds.
     let mut inexact_renames = true;
+    // Whether -M/-C/--no-renames appeared explicitly (the diff.renames config
+    // only applies otherwise).
+    let mut renames_explicit = false;
     let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
@@ -162,6 +175,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 }
                 name_only = true;
             }
+            // `git diff` is recursive for tree-to-tree comparisons by default;
+            // accept the explicit flag for upstream compatibility.
+            "-r" => {}
             "--cached" | "--staged" => cached = true,
             "--quiet" => quiet = true,
             "--exit-code" => exit_code = true,
@@ -187,6 +203,39 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
             "--shortstat" => {
                 shortstat = true;
+                no_patch = false;
+            }
+            "--dirstat" | "-X" => {
+                dirstat.get_or_insert_with(DirstatOptions::default);
+                no_patch = false;
+            }
+            value
+                if value.starts_with("--dirstat=")
+                    || (value.starts_with("-X") && value.len() > 2) =>
+            {
+                let params = value
+                    .strip_prefix("--dirstat=")
+                    .or_else(|| value.strip_prefix("-X"))
+                    .unwrap_or("");
+                dirstat.get_or_insert_with(DirstatOptions::default);
+                dirstat_cli_params.push(params.to_string());
+                no_patch = false;
+            }
+            "--cumulative" => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.cumulative = true;
+                no_patch = false;
+            }
+            "--dirstat-by-file" => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.mode = DirstatMode::Files;
+                no_patch = false;
+            }
+            value if value.starts_with("--dirstat-by-file=") => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.mode = DirstatMode::Files;
+                dirstat_cli_params
+                    .push(value["--dirstat-by-file=".len()..].to_string());
                 no_patch = false;
             }
             "-p" | "-u" | "--patch" => {
@@ -419,11 +468,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--ita-invisible-in-index=") => {
                 return log_option_takes_no_value_error("ita-invisible-in-index");
             }
-            "--relative" => diff_relative = DiffRelativeMode::Cwd,
+            "--relative" => {
+                diff_relative = DiffRelativeMode::Cwd;
+                diff_relative_explicit = true;
+            }
             value if let Some(value) = value.strip_prefix("--relative=") => {
+                diff_relative_explicit = true;
                 diff_relative = DiffRelativeMode::Prefix(value.to_string());
             }
-            "--no-relative" => diff_relative = DiffRelativeMode::Off,
+            "--no-relative" => {
+                diff_relative = DiffRelativeMode::Off;
+                diff_relative_explicit = true;
+            }
             value if value.starts_with("--no-relative=") => {
                 return log_option_takes_no_value_error("no-relative");
             }
@@ -483,10 +539,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "-M" | "--find-renames" => {
                 detect_renames = true;
                 inexact_renames = true;
+                renames_explicit = true;
             }
             "-C" | "--find-copies" => {
+                // A repeated -C escalates to --find-copies-harder, like git.
+                if detect_copies {
+                    find_copies_harder = true;
+                }
                 detect_copies = true;
                 inexact_renames = true;
+                renames_explicit = true;
             }
             "--find-copies-harder" => {
                 detect_copies = true;
@@ -496,9 +558,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "--no-find-copies-harder" => {
                 find_copies_harder = false;
             }
+            "--no-rename" => {
+                eprintln!("error: invalid option: --no-rename");
+                return Err(GitError::Exit(129));
+            }
             "--no-renames" => {
                 detect_renames = false;
                 inexact_renames = false;
+                renames_explicit = true;
             }
             "--rename-empty" => rename_empty = true,
             "--no-rename-empty" => rename_empty = false,
@@ -506,6 +573,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 detect_renames = true;
                 inexact_renames = true;
+                renames_explicit = true;
                 rename_threshold = parse_similarity_threshold(&value[2..]);
             }
             value if let Some(value) = value.strip_prefix("--find-renames=") => {
@@ -570,6 +638,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             {
                 stat = true;
                 no_patch = false;
+                diff_stat_parse_width_option(value, &mut stat_widths)?;
                 if let Some(count) = diff_stat_count_option(value)? {
                     stat_count = count;
                 }
@@ -673,11 +742,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff word controls are not supported for this output mode".into(),
         ));
     }
-    if !matches!(diff_relative, DiffRelativeMode::Off) && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff relative output is not supported for this output mode".into(),
-        ));
-    }
     if reverse && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff reverse output is not supported for this output mode".into(),
@@ -705,6 +769,58 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    if !diff_relative_explicit
+        && let Ok(config) = read_repo_config(&git_dir)
+        && config.get_bool("diff", None, "relative").unwrap_or(false)
+    {
+        diff_relative = DiffRelativeMode::Cwd;
+    }
+    if !renames_explicit
+        && let Ok(config) = read_repo_config(&git_dir)
+        && let Some(value) = config.get("diff", None, "renames")
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "no" | "off" | "0" => {
+                detect_renames = false;
+                inexact_renames = false;
+            }
+            "copies" | "copy" => {
+                detect_copies = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(opts) = dirstat.as_mut() {
+        // diff.dirstat config forms the base (bad parameters warn); explicit
+        // --dirstat parameters apply on top (bad parameters are fatal).
+        let mut base = DirstatOptions::default();
+        if let Ok(config) = read_repo_config(&git_dir)
+            && let Some(value) = config.get("diff", None, "dirstat")
+        {
+            let mut errors = String::new();
+            if parse_dirstat_params(value, &mut base, &mut errors) > 0 {
+                eprint!("warning: Found errors in 'diff.dirstat' config variable:\n{errors}");
+            }
+        }
+        // Flags parsed inline (--cumulative / --dirstat-by-file) already
+        // modified `opts`; merge them onto the config base.
+        if opts.cumulative {
+            base.cumulative = true;
+        }
+        if opts.mode == DirstatMode::Files {
+            base.mode = DirstatMode::Files;
+        }
+        let mut errors = String::new();
+        let mut error_count = 0usize;
+        for params in &dirstat_cli_params {
+            error_count += parse_dirstat_params(params, &mut base, &mut errors);
+        }
+        if error_count > 0 {
+            eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}");
+            return Err(GitError::Exit(128));
+        }
+        *opts = base;
+    }
     // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
     // out of the positional arguments; the remainder are pathspecs. Without this,
     // `diff A B` was treated as two paths and silently fell back to an
@@ -723,7 +839,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let repository_abbrev = repository_abbrev(&git_dir, format)?;
     let raw_abbrev = match raw_abbrev {
         Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
-        None => repository_abbrev,
+        // `git diff` is porcelain: raw oids abbreviate by default (unlike the
+        // diff-tree plumbing), to core.abbrev or git's standard 7.
+        None => Some(repository_abbrev.unwrap_or(7).min(format.hex_len())),
     };
     let patch_abbrev = if patch_full_index {
         format.hex_len()
@@ -908,10 +1026,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    // `--relative` rewrites the displayed paths; worktree content reads must
+    // keep resolving against the original location, so the effective worktree
+    // root gains the stripped prefix.
+    let mut worktree_root = worktree_root;
     let entries = if matches!(diff_relative, DiffRelativeMode::Off) {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        if !prefix.is_empty()
+            && let Some(root) = worktree_root.as_mut()
+        {
+            root.push(repo_path_to_path(&prefix));
+        }
         apply_diff_relative(entries, &prefix)
     };
     let entries: Vec<_> = if diff_filter.all_or_none {
@@ -943,20 +1070,36 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             && !numstat
             && !shortstat
             && !summary
+            && dirstat.is_none()
             && !name_status
             && !name_only;
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         if show_raw {
+            // git zeroes the worktree-side oid only when it cannot be trusted:
+            // a stat-clean file keeps its index oid in raw output. The
+            // worktree entries carry the freshly-hashed content oid, so
+            // matching it against the index entry reproduces that rule.
+            let index_oids: HashMap<Vec<u8>, ObjectId> = if zero_worktree_oids {
+                let index_path = sley_worktree::repository_index_path(&git_dir);
+                match fs::read(&index_path) {
+                    Ok(bytes) => Index::parse(&bytes, format)?
+                        .entries
+                        .into_iter()
+                        .map(|entry| (entry.path.to_vec(), entry.oid))
+                        .collect(),
+                    Err(_) => HashMap::new(),
+                }
+            } else {
+                HashMap::new()
+            };
             for entry in &entries {
-                write_diff_raw_entry(
-                    &mut stdout,
-                    entry,
-                    z,
-                    zero_worktree_oids,
-                    raw_abbrev,
-                    format,
-                )?;
+                let zero_entry = zero_worktree_oids
+                    && entry
+                        .new_oid
+                        .as_ref()
+                        .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid));
+                write_diff_raw_entry(&mut stdout, entry, z, zero_entry, raw_abbrev, format)?;
             }
         }
         if show_numstat {
@@ -972,7 +1115,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
         }
         if show_stat {
-            write_diff_stat(
+            let mut stat_widths = stat_widths;
+            if let Ok(config) = read_repo_config(&git_dir) {
+                stat_widths.resolve_config(&config);
+            } else {
+                stat_widths.resolve_config_defaults();
+            }
+            write_diff_stat_with_widths(
                 &mut stdout,
                 &entries,
                 &db,
@@ -983,6 +1132,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     stat_count,
                     color: color_always,
                 },
+                stat_widths,
             )?;
         }
         if show_shortstat {
@@ -992,6 +1142,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 &db,
                 worktree_root.as_deref(),
                 use_worktree_new,
+            )?;
+        }
+        if let Some(dirstat_options) = dirstat
+            && !name_only
+            && !name_status
+        {
+            write_diff_dirstat(
+                &mut stdout,
+                &entries,
+                &db,
+                worktree_root.as_deref(),
+                use_worktree_new,
+                dirstat_options,
             )?;
         }
         if show_summary {
@@ -1019,6 +1182,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             && (summary || (!show_stat && !show_shortstat))
             && !show_numstat
             && !show_raw
+            && dirstat.is_none()
         {
             for entry in &entries {
                 if z && (name_only || name_status) {
@@ -1301,9 +1465,11 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
     if path == prefix {
         return Some(Vec::new());
     }
+    // git matches the prefix as a plain string (`--relative=sub` turns
+    // `subdir/file2` into `dir/file2`), swallowing one separating slash when
+    // the prefix happens to end on a path-component boundary.
     path.strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix(b"/"))
-        .map(|rest| rest.to_vec())
+        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
 }
 
 fn log_validate_word_diff(value: &str) -> Result<()> {

@@ -2164,6 +2164,18 @@ fn span_hash_counts(data: &[u8]) -> BTreeMap<u64, usize> {
 /// Sum, over every hash present in both maps, the smaller of the two byte
 /// counts. This is git's `src_copied`: the number of bytes that appear on both
 /// sides (counting multiplicity via the per-hash byte totals).
+/// git `diffcore_count_changes()`: span-hash byte accounting between two
+/// blobs. Returns `(src_copied, literal_added)` — the bytes of `src` that
+/// survive into `dst`, and the bytes of `dst` not accounted for by `src`.
+/// `--dirstat`'s default "changes" damage is
+/// `(src.len() - src_copied) + literal_added`.
+pub fn count_changes(src: &[u8], dst: &[u8]) -> (usize, usize) {
+    let src_counts = span_hash_counts(src);
+    let dst_counts = span_hash_counts(dst);
+    let copied = common_span_bytes(&src_counts, &dst_counts);
+    (copied, dst.len() - copied)
+}
+
 fn common_span_bytes(src: &BTreeMap<u64, usize>, dst: &BTreeMap<u64, usize>) -> usize {
     let mut common = 0usize;
     // Iterate the smaller map for a few less lookups.
@@ -2181,15 +2193,9 @@ fn common_span_bytes(src: &BTreeMap<u64, usize>, dst: &BTreeMap<u64, usize>) -> 
 }
 
 fn diff_entry_sort_path(entry: &NameStatusEntry) -> &[u8] {
-    if matches!(entry.status, NameStatus::Copied(_)) {
-        entry.path.as_bytes()
-    } else {
-        entry
-            .old_path
-            .as_ref()
-            .map(|p| p.as_bytes())
-            .unwrap_or_else(|| entry.path.as_bytes())
-    }
+    // git's diffcore re-inserts rename/copy pairs at their *destination*'s
+    // position, so the queue (raw, numstat, stat, ...) sorts by the new path.
+    entry.path.as_bytes()
 }
 
 fn mark_unstaged_worktree_oids_unresolved(

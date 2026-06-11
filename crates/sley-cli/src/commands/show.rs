@@ -60,6 +60,11 @@ struct ShowOptions {
     abbrev_len: Option<usize>,
     /// Show stat output before/instead of the patch.
     stat: bool,
+    /// `--stat=<w>[,<n>[,<c>]]` / `--stat-*-width` knobs (terminal-scaled,
+    /// config-respecting defaults, like every porcelain command).
+    stat_widths: DiffStatWidths,
+    /// `--stat=,,<count>` / `--stat-count=<count>` display truncation.
+    stat_count: Option<usize>,
     /// Compact-summary variant of `--stat`.
     compact_summary: bool,
     /// `--numstat` machine-readable stat.
@@ -122,6 +127,8 @@ impl Default for ShowOptions {
             abbrev_commit: false,
             abbrev_len: Some(7),
             stat: false,
+            stat_widths: DiffStatWidths::terminal(),
+            stat_count: None,
             compact_summary: false,
             numstat: false,
             shortstat: false,
@@ -525,7 +532,9 @@ fn write_merge_stat(
         }
     }
     if options.stat || options.compact_summary {
-        write_diff_stat(
+        let mut stat_widths = options.stat_widths;
+        stat_widths.resolve_config(config);
+        write_diff_stat_with_widths(
             stdout,
             entries,
             db,
@@ -533,9 +542,10 @@ fn write_merge_stat(
             false,
             DiffStatOptions {
                 compact_summary: options.compact_summary,
-                stat_count: None,
+                stat_count: options.stat_count,
                 color,
             },
+            stat_widths,
         )?;
     }
     if options.shortstat {
@@ -682,7 +692,9 @@ fn write_commit_diff_patch(
         wrote_prefix = true;
     }
     if show_stat {
-        write_diff_stat(
+        let mut stat_widths = options.stat_widths;
+        stat_widths.resolve_config(config);
+        write_diff_stat_with_widths(
             stdout,
             entries,
             db,
@@ -690,9 +702,10 @@ fn write_commit_diff_patch(
             false,
             DiffStatOptions {
                 compact_summary: options.compact_summary,
-                stat_count: None,
+                stat_count: options.stat_count,
                 color,
             },
+            stat_widths,
         )?;
         wrote_prefix = true;
     }
@@ -839,6 +852,20 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--stat" => {
                 options.stat = true;
                 options.restore_patch();
+            }
+            value
+                if value.starts_with("--stat=")
+                    || value.starts_with("--stat-width=")
+                    || value.starts_with("--stat-name-width=")
+                    || value.starts_with("--stat-graph-width=")
+                    || value.starts_with("--stat-count=") =>
+            {
+                options.stat = true;
+                options.restore_patch();
+                diff_stat_parse_width_option(value, &mut options.stat_widths)?;
+                if let Some(count) = diff_stat_count_option(value)? {
+                    options.stat_count = count;
+                }
             }
             "--compact-summary" => {
                 options.compact_summary = true;

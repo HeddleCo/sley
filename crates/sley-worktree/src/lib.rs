@@ -1241,7 +1241,19 @@ pub fn write_tree_from_index_with_options(
 ) -> Result<ObjectId> {
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
-    let index = Index::parse(&fs::read(&index_path)?, format)?;
+    // A repository with no index file yet (fresh init, nothing staged) is an
+    // empty index: `git write-tree` / `git commit --allow-empty` produce the
+    // empty tree rather than erroring.
+    let index = match fs::read(&index_path) {
+        Ok(bytes) => Index::parse(&bytes, format)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        },
+        Err(err) => return Err(err.into()),
+    };
     let entries = write_tree_entries_for_prefix(&index.entries, options.prefix.as_deref())?;
     let mut root = TreeNode::default();
     let odb = FileObjectDatabase::from_git_dir(git_dir, format);
