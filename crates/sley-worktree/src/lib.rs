@@ -5610,6 +5610,32 @@ pub fn remove_index_and_worktree_paths(
             selected.insert(git_path);
             continue;
         }
+        // A wildcard pathspec (e.g. `git rm "*"` or `git rm "dir/*.c"`) matches
+        // index entries by git's pathspec matcher rather than by literal path or
+        // directory prefix. Try the glob match first when the spec contains
+        // wildcard metacharacters; a glob match removes the entries directly
+        // (no `-r` needed — the pathspec already names the files).
+        if pathspec_is_glob(&git_path) {
+            let glob_matched = index_entries
+                .keys()
+                .filter(|entry| {
+                    pathspec_item_matches(&git_path, entry, PathspecMatchMagic::default())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if !glob_matched.is_empty() {
+                selected.extend(glob_matched);
+                continue;
+            }
+            if options.ignore_unmatch {
+                continue;
+            }
+            eprintln!(
+                "fatal: pathspec '{}' did not match any files",
+                String::from_utf8_lossy(&git_path)
+            );
+            return Err(GitError::Exit(128));
+        }
         let matched = index_entries
             .keys()
             .filter(|entry| index_entry_is_under_path(entry, &git_path))

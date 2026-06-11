@@ -3208,17 +3208,28 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     // git resolves the tree and each `-p` parent as a revision-ish (so a tag,
     // branch, `HEAD^`, abbreviated oid, or `<rev>^{tree}` all work), peeling the
-    // tree argument to a tree and each parent to a commit — not a bare 40-hex
-    // oid. Mirror that: resolve, then peel.
+    // tree argument to a tree and each parent to a commit. A *full-length* hex
+    // oid is taken verbatim without an existence check (matching git, which
+    // accepts e.g. the empty-tree hash `4b825d...` even when it is absent from
+    // the object store); shorter names go through revision resolution + peel.
     let db_resolve = FileObjectDatabase::from_git_dir(&git_dir, format);
-    let tree_rev = sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, &tree)?;
-    let tree = sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?;
+    let tree = match ObjectId::from_hex(format, &tree) {
+        Ok(oid) => oid,
+        Err(_) => {
+            let tree_rev =
+                sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, &tree)?;
+            sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?
+        }
+    };
     let parents = parents
         .iter()
-        .map(|parent| {
-            let oid =
-                sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, parent)?;
-            sley_rev::peel_to_commit(&db_resolve, format, &oid)
+        .map(|parent| match ObjectId::from_hex(format, parent) {
+            Ok(oid) => Ok(oid),
+            Err(_) => {
+                let resolved =
+                    sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, parent)?;
+                sley_rev::peel_to_commit(&db_resolve, format, &resolved)
+            }
         })
         .collect::<Result<Vec<_>>>()?;
     let message = if message_chunks.is_empty() {

@@ -1934,8 +1934,13 @@ fn build_reused_commit_author_identity(
     } else {
         (reused_name, reused_email)
     };
-    let date = date.unwrap_or(&reused_date);
-    sley_sequencer::format_commit_identity(&name, &email, date)
+    // A `--date` override is raw user input; canonicalize it. The reused date
+    // is already in canonical `<seconds> <tz>` form.
+    let date = match date {
+        Some(date) => canonicalize_commit_date(date),
+        None => reused_date,
+    };
+    sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 
 fn parse_commit_identity_parts(identity: &[u8]) -> Result<(String, String, String)> {
@@ -2890,6 +2895,7 @@ fn build_commit_author_identity(author: Option<&str>, date: Option<&str>) -> Res
     let date = date
         .map(str::to_string)
         .unwrap_or_else(|| env::var("GIT_AUTHOR_DATE").unwrap_or_else(|_| "@0 +0000".into()));
+    let date = canonicalize_commit_date(&date);
     sley_sequencer::format_commit_identity(&name, &email, &date)
 }
 

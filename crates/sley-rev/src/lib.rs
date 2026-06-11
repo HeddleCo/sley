@@ -1715,8 +1715,13 @@ pub fn simplify_history(
     pathspec: &Pathspec,
     options: SimplifyOptions,
 ) -> Result<Vec<CommitRecord>> {
-    if pathspec.is_empty() && !options.full_history {
-        // No pathspec and no --full-history: nothing to prune.
+    if pathspec.is_empty() {
+        // Without a pathspec there is nothing to prune: every commit "changes"
+        // the (whole) tree, so TREESAME is never set and no simplification
+        // applies. `--full-history` only differs from the default *in the
+        // presence of a pathspec* (it keeps the merges that join the matching
+        // lines); with no pathspec it is a no-op. git's `prune` flag is off when
+        // `prune_data` is empty, so it never runs `try_to_simplify_commit`.
         return Ok(records);
     }
     let reachable: HashSet<ObjectId> = records.iter().map(|r| r.oid).collect();
