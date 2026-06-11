@@ -28,15 +28,21 @@ impl NotesDisplay {
         self.enabled = true;
         self.given = true;
     }
-    /// `--notes=<ref>` / `--show-notes=<ref>`: enable and add a specific ref.
+    /// `--notes=<ref>`: add a specific ref without forcing the standard refs on
+    /// (only `--show-notes=<ref>` re-enables the defaults).
     fn add_ref(&mut self, reff: &str) {
-        if self.use_default.is_none() {
-            self.use_default = Some(true);
-        }
         self.extra_refs
             .push(NotesRef::expand(reff).as_str().to_string());
         self.enabled = true;
         self.given = true;
+    }
+    /// `--show-notes=<ref>`: like `add_ref`, but additionally turns the standard
+    /// refs back on when they were unset (matches git's `--show-notes=` path).
+    fn add_show_ref(&mut self, reff: &str) {
+        if self.use_default.is_none() {
+            self.use_default = Some(true);
+        }
+        self.add_ref(reff);
     }
     /// `--no-notes`: clear all display state and turn notes off.
     fn disable(&mut self) {
@@ -79,8 +85,15 @@ impl NotesDisplay {
         let load_standard = matches!(self.use_default, Some(true))
             || (self.use_default.is_none() && self.extra_refs.is_empty());
         if load_standard {
-            let default_ref = crate::commands::notes::raw_notes_ref(git_dir, None);
-            push_unique(&mut refs, default_ref);
+            // git's default_notes_ref takes GIT_NOTES_REF verbatim when set —
+            // even when empty, which yields a no-op (no default note shown).
+            let default_ref = match env::var("GIT_NOTES_REF") {
+                Ok(value) => value,
+                Err(_) => crate::commands::notes::raw_notes_ref(git_dir, None),
+            };
+            if !default_ref.is_empty() {
+                push_unique(&mut refs, default_ref);
+            }
             if let Ok(env_value) = env::var("GIT_NOTES_DISPLAY_REF") {
                 for part in env_value.split(':').filter(|s| !s.is_empty()) {
                     for expanded in expand_notes_glob(store, part)? {
@@ -136,6 +149,23 @@ fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
         .collect();
     matched.sort();
     Ok(matched)
+}
+
+/// Resolve the standard notes display refs and render the notes block for
+/// `oid`, for callers (e.g. `git show`) that always use the default display set.
+/// Returns the bytes to append after the commit message (empty when none).
+pub(crate) fn render_standard_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let store = FileRefStore::new(git_dir, format);
+    let display = NotesDisplay {
+        use_default: Some(true),
+        ..NotesDisplay::default()
+    };
+    let refs = display.resolve_refs(git_dir, &store)?;
+    render_notes_block(git_dir, format, &store, &refs, oid)
 }
 
 /// Render the `Notes:` / `Notes (<name>):` block(s) for `oid` across the
@@ -914,7 +944,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 notes_display.add_ref(&value["--notes=".len()..]);
             }
             value if value.starts_with("--show-notes=") => {
-                notes_display.add_ref(&value["--show-notes=".len()..]);
+                notes_display.add_show_ref(&value["--show-notes=".len()..]);
             }
             "--no-notes" => notes_display.disable(),
             "--no-standard-notes" => notes_display.no_standard(),

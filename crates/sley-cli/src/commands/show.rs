@@ -89,6 +89,11 @@ struct ShowOptions {
     /// Ref decoration mode for the `commit` header and `%d`/`%D`. `git show`
     /// defaults to off; `--decorate`/`--decorate=<mode>` enables it.
     decorate: LogDecorationMode,
+    /// Whether notes are displayed after the commit message. git shows notes by
+    /// default for the medium format (no explicit `--pretty`); an explicit
+    /// pretty format or `--no-notes` suppresses them, `--notes`/`--show-notes`
+    /// forces them on.
+    show_notes: bool,
     /// Object/revision arguments to show.
     specs: Vec<String>,
 }
@@ -131,6 +136,8 @@ impl Default for ShowOptions {
             copy_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             date_mode: ForEachRefDateMode::Default,
             decorate: LogDecorationMode::Off,
+            // Default `git show` (medium, no `--pretty`) displays notes.
+            show_notes: true,
             specs: Vec::new(),
         }
     }
@@ -354,6 +361,14 @@ fn show_commit(
             writeln!(stdout)?;
             for line in String::from_utf8_lossy(&commit.message).lines() {
                 writeln!(stdout, "    {line}")?;
+            }
+            if options.show_notes {
+                let notes = crate::commands::log::render_standard_notes(
+                    context.git_dir,
+                    context.format,
+                    oid,
+                )?;
+                stdout.write_all(&notes)?;
             }
         }
         ShowCommitFormat::Oneline => {
@@ -845,14 +860,18 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             "--oneline" => {
                 options.commit_format = ShowCommitFormat::Oneline;
                 options.abbrev_commit = true;
+                // An explicit pretty format suppresses the default notes block.
+                options.show_notes = false;
             }
             // A bare `--pretty`/`--format` (no value) selects the default medium
             // format, exactly like `--pretty=medium`.
             "--pretty" | "--format" => {
                 options.commit_format = ShowCommitFormat::Medium;
+                options.show_notes = false;
             }
             value if let Some(spec) = value.strip_prefix("--pretty=") => {
                 options.commit_format = parse_pretty_value(spec)?;
+                options.show_notes = false;
             }
             value if let Some(spec) = value.strip_prefix("--format=") => {
                 // `--format=<x>` is exactly `--pretty=<x>`: a known name selects a
@@ -860,7 +879,10 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
                 // separator semantics, and a bare user string with `%` behaves as
                 // tformat (trailing newline).
                 options.commit_format = parse_pretty_value(spec)?;
+                options.show_notes = false;
             }
+            "--notes" | "--show-notes" => options.show_notes = true,
+            "--no-notes" => options.show_notes = false,
             // --- oid abbreviation ------------------------------------------------
             "--abbrev-commit" => options.abbrev_commit = true,
             "--no-abbrev-commit" => options.abbrev_commit = false,
