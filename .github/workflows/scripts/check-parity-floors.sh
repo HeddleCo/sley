@@ -11,6 +11,9 @@
 #   check-parity-floors.sh <summary.csv>
 #
 # Floors recorded 2026-06-10 against base b069dbe + git 2.54.0 (GIT_TEST_DEFAULT_HASH=sha1).
+# Round-2 floors (sequencer/graph/bitmaps) measured 2026-06-11 at the
+# integ/round2 tip (epic/sley-sequencer-c + epic/sley-graph-c +
+# epic/sley-bitmaps-a merged onto baac87c).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -31,12 +34,12 @@ declare -A FLOOR=(
     [t1300-config.sh]=445
     [t1401-symbolic-ref.sh]=25
     [t1500-rev-parse.sh]=80
-    [t2400-worktree-add.sh]=158
+    [t2400-worktree-add.sh]=161
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=337
-    [t7004-tag.sh]=150
+    [t7004-tag.sh]=159
     [t3200-branch.sh]=70
-    [t0027-auto-crlf.sh]=2149
+    [t0027-auto-crlf.sh]=2281
     [t2107-update-index-basic.sh]=9
     [t7810-grep.sh]=228
     [t3301-notes.sh]=144
@@ -44,12 +47,22 @@ declare -A FLOOR=(
     [t1462-refs-exists.sh]=11
     [t1510-repo-setup.sh]=109
     [t6423-merge-rename-directories.sh]=14
-    [t3501-revert-cherry-pick.sh]=5
-    [t2020-checkout-detach.sh]=9
+    [t3501-revert-cherry-pick.sh]=21
+    [t3502-cherry-pick-merge.sh]=12
+    [t3505-cherry-pick-empty.sh]=17
+    [t3507-cherry-pick-conflict.sh]=44
+    [t3510-cherry-pick-sequence.sh]=52
+    [t4214-log-graph-octopus.sh]=17
+    [t4215-log-skewed-merges.sh]=9
+    [t6030-bisect-porcelain.sh]=95
+    [t5310-pack-bitmaps.sh]=160
+    [t5326-multi-pack-bitmaps.sh]=312
+    [t6113-rev-list-bitmap-filters.sh]=13
+    [t2020-checkout-detach.sh]=16
     [t6003-rev-list-topo-order.sh]=36
     [t6012-rev-list-simplify.sh]=8
-    [t4205-log-pretty-formats.sh]=107
-    [t4202-log.sh]=34
+    [t4205-log-pretty-formats.sh]=108
+    [t4202-log.sh]=52
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
 )

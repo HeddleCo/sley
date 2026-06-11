@@ -39,7 +39,9 @@ jobs:
   upstream-parity:
     name: Upstream parity (floor-gated subset)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 37 tracked t-files (round-2 added 10, incl. the slow bitmap pair) +
+    # oracle-git build on cache miss; 30 min was sized for the 27-file list.
+    timeout-minutes: 45
 
     steps:
       - uses: actions/checkout@v4
@@ -115,14 +117,28 @@ jobs:
             t3200-branch.sh
             t3301-notes.sh
             t3501-revert-cherry-pick.sh
+            t3502-cherry-pick-merge.sh
+            t3505-cherry-pick-empty.sh
+            t3507-cherry-pick-conflict.sh
+            t3510-cherry-pick-sequence.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
+            t4214-log-graph-octopus.sh
+            t4215-log-skewed-merges.sh
+            t5310-pack-bitmaps.sh
+            t5326-multi-pack-bitmaps.sh
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
+            t6030-bisect-porcelain.sh
+            t6113-rev-list-bitmap-filters.sh
             t6300-for-each-ref.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
             t7810-grep.sh
+          # t5310/t5326 overrun the runner's 120s default per-script timeout
+          # under load (a TIMEOUT row truncates the ok count and would falsely
+          # trip the floor gate). Give every script the same generous ceiling.
+          SLEY_TEST_TIMEOUT: "540"
           SLEY_RUN_LABEL: ${{ github.sha }}
         run: |
           export SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley"
