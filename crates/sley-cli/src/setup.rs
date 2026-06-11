@@ -44,6 +44,10 @@ pub(crate) struct SetupResult {
     /// The relative path from `cwd` to the user's original cwd, with a trailing
     /// `/`, or `None` (git's `(null)`).
     pub prefix: Option<String>,
+    /// Whether `core.bare` and an effective `core.worktree` both apply (git's
+    /// `work_tree_config_is_bogus`): a worktree-requiring command must warn
+    /// "core.bare and core.worktree do not make sense" and then fail.
+    pub worktree_config_bogus: bool,
 }
 
 /// Outcome of the upward `.git` discovery walk (git's `enum discovery_result`,
@@ -52,9 +56,8 @@ enum Discovered {
     /// `GIT_DIR`/`--git-dir` was explicit; `git_dir` is the user-given value.
     Explicit { git_dir: String },
     /// `.git` was found by walking up; `dir` is the directory containing it,
-    /// `git_dir` is the (relative-to-`dir`) value, `is_gitfile` whether `.git`
-    /// was a gitfile.
-    Discovered {
+    /// `git_dir` is the (relative-to-`dir`) value.
+    Found {
         dir: PathBuf,
         git_dir: String,
     },
@@ -70,7 +73,7 @@ pub(crate) fn setup_git_directory() -> Option<SetupResult> {
     let discovered = discover(&cwd)?;
     match discovered {
         Discovered::Explicit { git_dir } => setup_explicit(&git_dir, &cwd),
-        Discovered::Discovered { dir, git_dir } => setup_discovered(&git_dir, &dir, &cwd),
+        Discovered::Found { dir, git_dir } => setup_discovered(&git_dir, &dir, &cwd),
         Discovered::Bare { dir } => setup_bare(&dir, &cwd),
     }
 }
@@ -120,22 +123,21 @@ fn discover(cwd: &Path) -> Option<Discovered> {
         let dot_git = dir.join(".git");
 
         // .git file: "gitdir: <path>".
-        if dot_git.is_file() {
-            if let Ok(Some(target)) = read_gitdir_file(&dot_git) {
-                if is_git_dir_candidate(&target) {
-                    // The user-facing git_dir is the gitfile path itself
-                    // relative to dir (".git"); repo_set_gitdir resolves it.
-                    return Some(Discovered::Discovered {
-                        dir: dir.to_path_buf(),
-                        git_dir: ".git".to_string(),
-                    });
-                }
-            }
+        if dot_git.is_file()
+            && let Ok(Some(target)) = read_gitdir_file(&dot_git)
+            && is_git_dir_candidate(&target)
+        {
+            // The user-facing git_dir is the gitfile path itself relative to
+            // dir (".git"); repo_set_gitdir resolves it.
+            return Some(Discovered::Found {
+                dir: dir.to_path_buf(),
+                git_dir: ".git".to_string(),
+            });
         }
 
         // .git directory.
         if dot_git.is_dir() && is_git_dir_candidate(&dot_git) {
-            return Some(Discovered::Discovered {
+            return Some(Discovered::Found {
                 dir: dir.to_path_buf(),
                 git_dir: ".git".to_string(),
             });
@@ -149,12 +151,11 @@ fn discover(cwd: &Path) -> Option<Discovered> {
         }
 
         // Stop at a filesystem boundary unless GIT_DISCOVERY_ACROSS_FILESYSTEM.
-        if one_filesystem {
-            if let Some(parent) = dir.parent() {
-                if device_of(parent) != start_device {
-                    return None;
-                }
-            }
+        if one_filesystem
+            && let Some(parent) = dir.parent()
+            && device_of(parent) != start_device
+        {
+            return None;
         }
     }
     None
@@ -190,8 +191,17 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
         let wt = resolve_cli_path(cwd, &work_tree_env.to_string_lossy());
         worktree = Some(canonicalize_or(&wt));
     } else if is_bare {
-        // #18, #26: bare, no worktree.
-        return Some(bare_explicit_result(&effective_gitdir_text, &gitdir_dir, cwd));
+        // #18, #26: bare, no worktree. If core.worktree is *also* set this is
+        // the #22.2/#30 conflict ("core.bare and core.worktree do not make
+        // sense"): git warns + marks the work-tree config bogus, then proceeds
+        // here with no worktree.
+        let bogus = core_worktree.is_some();
+        return Some(bare_explicit_result(
+            &effective_gitdir_text,
+            &gitdir_dir,
+            cwd,
+            bogus,
+        ));
     } else if let Some(core_wt) = core_worktree.as_deref() {
         // #6, #14: core.worktree is relative to the git dir.
         let wt = if Path::new(core_wt).is_absolute() {
@@ -202,7 +212,12 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
         worktree = Some(canonicalize_or(&wt));
     } else if !git_env_bool_default("GIT_IMPLICIT_WORK_TREE", true) {
         // #16d: GIT_IMPLICIT_WORK_TREE=0, no worktree.
-        return Some(bare_explicit_result(&effective_gitdir_text, &gitdir_dir, cwd));
+        return Some(bare_explicit_result(
+            &effective_gitdir_text,
+            &gitdir_dir,
+            cwd,
+            false,
+        ));
     } else {
         // #2, #10: worktree defaults to cwd.
         worktree = Some(canonicalize_or(cwd));
@@ -219,6 +234,7 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
             worktree: Some(worktree),
             cwd: cwd.to_path_buf(),
             prefix: None,
+            worktree_config_bogus: false,
         });
     }
 
@@ -233,6 +249,7 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
             worktree: Some(worktree.clone()),
             cwd: worktree,
             prefix: Some(prefix),
+            worktree_config_bogus: false,
         });
     }
 
@@ -243,18 +260,25 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
         worktree: Some(worktree),
         cwd: cwd.to_path_buf(),
         prefix: None,
+        worktree_config_bogus: false,
     })
 }
 
 /// Build the no-worktree result for an explicit GIT_DIR (bare / implicit-wt-off),
 /// matching git's `set_git_dir(gitdirenv, 0)` + return NULL.
-fn bare_explicit_result(gitdir_text: &str, gitdir_dir: &Path, cwd: &Path) -> SetupResult {
+fn bare_explicit_result(
+    gitdir_text: &str,
+    gitdir_dir: &Path,
+    cwd: &Path,
+    worktree_config_bogus: bool,
+) -> SetupResult {
     SetupResult {
         git_dir: gitdir_text.to_string(),
         common_dir: common_dir_for(gitdir_text, gitdir_dir),
         worktree: None,
         cwd: cwd.to_path_buf(),
         prefix: None,
+        worktree_config_bogus,
     }
 }
 
@@ -306,6 +330,7 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
             worktree: None,
             cwd: cwd.to_path_buf(),
             prefix: None,
+            worktree_config_bogus: false,
         });
     }
 
@@ -331,6 +356,7 @@ fn setup_discovered(gitdir: &str, dir: &Path, cwd: &Path) -> Option<SetupResult>
         worktree: Some(worktree.clone()),
         cwd: worktree,
         prefix,
+        worktree_config_bogus: false,
     })
 }
 
@@ -360,12 +386,14 @@ fn setup_explicit_from_discovered(
         let wt = resolve_cli_path(cwd, &work_tree_env.to_string_lossy());
         worktree = Some(canonicalize_or(&wt));
     } else if is_bare {
+        // #20b/c, #28: core.bare + core.worktree conflict — warn + no worktree.
         return Some(SetupResult {
             git_dir: gitdir_text_resolved.clone(),
             common_dir: common_dir_for(&gitdir_text_resolved, gitdir_dir),
             worktree: None,
             cwd: cwd.to_path_buf(),
             prefix: None,
+            worktree_config_bogus: core_worktree.is_some(),
         });
     } else if let Some(core_wt) = core_worktree {
         let wt = if Path::new(core_wt).is_absolute() {
@@ -388,6 +416,7 @@ fn setup_explicit_from_discovered(
             worktree: Some(worktree),
             cwd: cwd.to_path_buf(),
             prefix: None,
+            worktree_config_bogus: false,
         });
     }
 
@@ -399,6 +428,7 @@ fn setup_explicit_from_discovered(
             worktree: Some(worktree.clone()),
             cwd: worktree,
             prefix: Some(prefix),
+            worktree_config_bogus: false,
         });
     }
 
@@ -408,16 +438,20 @@ fn setup_explicit_from_discovered(
         worktree: Some(worktree),
         cwd: cwd.to_path_buf(),
         prefix: None,
+        worktree_config_bogus: false,
     })
 }
 
 /// git's `setup_bare_git_dir`. cwd is inside a git directory; `dir` is the git
 /// directory that was found (could equal cwd or be an ancestor).
 fn setup_bare(dir: &Path, cwd: &Path) -> Option<SetupResult> {
-    // --work-tree / GIT_WORK_TREE re-route through explicit setup with the bare
-    // git dir.
-    if explicit_work_tree().is_some() {
-        let (is_bare, core_worktree) = read_worktree_config(dir);
+    let (is_bare, core_worktree) = read_worktree_config(dir);
+
+    // --work-tree / GIT_WORK_TREE / core.worktree re-route through explicit
+    // setup with the bare git dir (git's setup_bare_git_dir: "if
+    // getenv(GIT_WORK_TREE) || git_work_tree_cfg"). A core.worktree gives the
+    // otherwise-bare repo a real worktree (#20a).
+    if explicit_work_tree().is_some() || core_worktree.is_some() {
         let gitdir_text = if dir == cwd {
             ".".to_string()
         } else {
@@ -432,6 +466,7 @@ fn setup_bare(dir: &Path, cwd: &Path) -> Option<SetupResult> {
             dir,
         );
     }
+    let _ = is_bare;
 
     // inside_git_dir: no worktree. git sets git_dir to the (absolute) dir when
     // dir != cwd, else ".".
@@ -446,6 +481,7 @@ fn setup_bare(dir: &Path, cwd: &Path) -> Option<SetupResult> {
         worktree: None,
         cwd: cwd.to_path_buf(),
         prefix: None,
+        worktree_config_bogus: false,
     })
 }
 
@@ -490,17 +526,17 @@ fn common_dir_path(gitdir: &Path) -> PathBuf {
         return PathBuf::from(env);
     }
     let commondir = gitdir.join("commondir");
-    if commondir.is_file() {
-        if let Ok(value) = fs::read_to_string(&commondir) {
-            let trimmed = value.trim_end_matches(['\n', '\r']);
-            let path = Path::new(trimmed);
-            let resolved = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                gitdir.join(path)
-            };
-            return canonicalize_or(&resolved);
-        }
+    if commondir.is_file()
+        && let Ok(value) = fs::read_to_string(&commondir)
+    {
+        let trimmed = value.trim_end_matches(['\n', '\r']);
+        let path = Path::new(trimmed);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            gitdir.join(path)
+        };
+        return canonicalize_or(&resolved);
     }
     gitdir.to_path_buf()
 }
@@ -513,17 +549,17 @@ fn common_dir_for(git_dir_text: &str, gitdir_dir: &Path) -> String {
         return env.to_string_lossy().into_owned();
     }
     let commondir = gitdir_dir.join("commondir");
-    if commondir.is_file() {
-        if let Ok(value) = fs::read_to_string(&commondir) {
-            let trimmed = value.trim_end_matches(['\n', '\r']);
-            let path = Path::new(trimmed);
-            let resolved = if path.is_absolute() {
-                path.to_path_buf()
-            } else {
-                gitdir_dir.join(path)
-            };
-            return path_to_string(&canonicalize_or(&resolved));
-        }
+    if commondir.is_file()
+        && let Ok(value) = fs::read_to_string(&commondir)
+    {
+        let trimmed = value.trim_end_matches(['\n', '\r']);
+        let path = Path::new(trimmed);
+        let resolved = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            gitdir_dir.join(path)
+        };
+        return path_to_string(&canonicalize_or(&resolved));
     }
     git_dir_text.to_string()
 }

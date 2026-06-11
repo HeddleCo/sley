@@ -2241,7 +2241,9 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
     }
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    // status needs a work tree; emit git's diagnostic (bare / no-worktree, or
+    // the core.bare+core.worktree conflict) when one isn't available.
+    let worktree_root = require_work_tree(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let mut entries = sley_worktree::short_status_with_options(
         &worktree_root,
