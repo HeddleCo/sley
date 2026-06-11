@@ -983,6 +983,19 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 preset_oneline = Some(false);
                 pretty_spec = None;
             }
+            // Built-in `short`/`medium` map to the default-output kinds (short
+            // omits the `Date:` line); other named/custom formats fall through
+            // to the compiled `pretty_spec` path below.
+            "--pretty=short" | "--format=short" => {
+                output = LogOutput::Default(LogDefaultKind::Short);
+                pretty_spec = None;
+                preset_oneline = None;
+            }
+            "--pretty=medium" | "--format=medium" => {
+                output = LogOutput::Default(LogDefaultKind::Medium);
+                pretty_spec = None;
+                preset_oneline = None;
+            }
             "--pretty" | "--format" => {
                 let value = iter
                     .next()
