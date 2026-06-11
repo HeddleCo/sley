@@ -130,7 +130,7 @@ type MergeConflictPaths = Vec<Vec<u8>>;
 /// porcelains consume. It is rename-aware (the merge-ort non-recursive rename
 /// case) because the library merge runs with rename detection enabled.
 pub(crate) fn three_way_merge_trees(
-    db: &mut FileObjectDatabase,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -162,7 +162,7 @@ pub(crate) fn three_way_merge_trees(
 /// state in the virtual tree, which then feeds the outer 3-way merge) — this
 /// matches merge-recursive, which does not stop on virtual-ancestor conflicts.
 fn virtual_ancestor_entry_map(
-    db: &mut FileObjectDatabase,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     bases: &[ObjectId],
     git_dir: &Path,
@@ -176,14 +176,16 @@ fn virtual_ancestor_entry_map(
     // pairwise merge uses the correct sub-base.
     let mut acc_commits = vec![*first];
 
-    let read_db = FileObjectDatabase::from_git_dir(git_dir, format);
     for base in &bases[1..] {
         let other_tree = commit_tree_oid(db, format, base)?;
         let other_map = stash_tree_entry_map(db, format, &other_tree)?;
 
         // Sub-base: the merge base(s) of the accumulated commits and this base.
         // Use the first acc commit as a representative (git folds pairwise).
-        let sub_bases = merge_bases(&read_db, format, &acc_commits[0], base)?;
+        // `db` now serves both the reads here and the writes below — with
+        // `ObjectWriter::write_object` taking `&self`, no second read-only handle
+        // (which re-warmed the pack caches) is needed.
+        let sub_bases = merge_bases(git_dir, db, format, &acc_commits[0], base)?;
         let sub_base_map = match sub_bases.first() {
             Some(sb) => {
                 let sb_tree = commit_tree_oid(db, format, sb)?;
@@ -237,7 +239,7 @@ fn virtual_ancestor_entry_map(
 /// conflict-favouring choice (used by `git merge -X ours|theirs`).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn three_way_merge_trees_with_favor(
-    db: &mut FileObjectDatabase,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
@@ -745,7 +747,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     };
 
     let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let bases = merge_bases(&db, format, &head_oid, &other_oid)?;
+    let bases = merge_bases(&common_git_dir, &db, format, &head_oid, &other_oid)?;
 
     // Already up to date: other is reachable from HEAD.
     if other_oid == head_oid || bases.iter().any(|base| base == &other_oid) {
@@ -1167,7 +1169,7 @@ fn rebase_onto_upstream(
         return Err(GitError::Exit(1));
     }
 
-    let merge_base = merge_bases(&db, format, &head_commit, &upstream_commit)?
+    let merge_base = merge_bases(&common_git_dir, &db, format, &head_commit, &upstream_commit)?
         .into_iter()
         .next();
     let commits_to_replay =
@@ -3125,48 +3127,22 @@ pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Two-commit merge bases. Delegates to the single graph-aware implementation in
+/// [`sley_rev::merge_bases`] (parents/generations come from the commit-graph when
+/// present), so the CLI no longer carries a duplicate, graph-blind copy. The
+/// canonical `merge-base` command already routed through `sley_rev::merge_bases`;
+/// this folds the remaining internal callers (merge / rebase / octopus
+/// virtual-ancestor / log / rev-list / shortlog / format-patch) onto it too, for
+/// one ancestry implementation. `git_dir` is required to locate the
+/// commit-graph.
 pub(crate) fn merge_bases(
+    git_dir: &Path,
     db: &FileObjectDatabase,
     format: ObjectFormat,
     left: &ObjectId,
     right: &ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    let left_depths = ancestor_depths(db, format, left)?;
-    let right_depths = ancestor_depths(db, format, right)?;
-    let mut common = left_depths
-        .keys()
-        .filter(|oid| right_depths.contains_key(*oid))
-        .cloned()
-        .collect::<Vec<_>>();
-    let candidates = common.clone();
-    common = candidates
-        .iter()
-        .filter(|candidate| {
-            !candidates.iter().any(|other| {
-                other != *candidate
-                    && left_depths.get(other).is_some_and(|other_depth| {
-                        left_depths
-                            .get(*candidate)
-                            .is_some_and(|candidate_depth| other_depth < candidate_depth)
-                    })
-                    && right_depths.get(other).is_some_and(|other_depth| {
-                        right_depths
-                            .get(*candidate)
-                            .is_some_and(|candidate_depth| other_depth < candidate_depth)
-                    })
-            })
-        })
-        .cloned()
-        .collect();
-    common.sort_by(|left_oid, right_oid| {
-        let left_score = left_depths[left_oid] + right_depths[left_oid];
-        let right_score = left_depths[right_oid] + right_depths[right_oid];
-        left_score
-            .cmp(&right_score)
-            .then_with(|| left_depths[left_oid].cmp(&left_depths[right_oid]))
-            .then_with(|| left_oid.to_hex().cmp(&right_oid.to_hex()))
-    });
-    Ok(common)
+    sley_rev::merge_bases(git_dir, format, db, left, right)
 }
 
 fn merge_bases_default_many(

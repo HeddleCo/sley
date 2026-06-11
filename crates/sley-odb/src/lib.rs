@@ -19,7 +19,12 @@ pub trait ObjectReader {
 }
 
 pub trait ObjectWriter {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId>;
+    /// Write `object`, returning its id. Takes `&self`: every implementation's
+    /// write state (in-memory map, loose-object cache) is behind interior
+    /// mutability, so a single handle can interleave reads and writes without a
+    /// `&mut` borrow. This lets the merge engine read and write through one `db`
+    /// instead of opening a second read-only handle that re-warms the caches.
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,10 +927,15 @@ where
     Ok(seen)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ObjectDatabase {
     format: ObjectFormat,
-    objects: HashMap<ObjectId, Arc<EncodedObject>>,
+    // Behind a `Mutex` so `write_object` can take `&self` (matching the
+    // `ObjectWriter` trait) and a single handle can interleave reads and writes
+    // without a `&mut` borrow — the same shared-by-`&` shape the file-backed
+    // database uses for its caches. Removes the need for callers to wrap this in
+    // a `RefCell`/`&mut` just to write (see sley-fetch's former `RefCell` dance).
+    objects: Mutex<HashMap<ObjectId, Arc<EncodedObject>>>,
     promisor: bool,
 }
 
@@ -933,7 +943,7 @@ impl ObjectDatabase {
     pub fn new(format: ObjectFormat) -> Self {
         Self {
             format,
-            objects: HashMap::new(),
+            objects: Mutex::new(HashMap::new()),
             promisor: false,
         }
     }
@@ -944,7 +954,10 @@ impl ObjectDatabase {
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
-        self.objects.contains_key(oid)
+        self.objects
+            .lock()
+            .map(|objects| objects.contains_key(oid))
+            .unwrap_or(false)
     }
 
     pub fn validate(&self, oid: &ObjectId) -> Result<()> {
@@ -963,6 +976,8 @@ impl ObjectDatabase {
 impl ObjectReader for ObjectDatabase {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects
+            .lock()
+            .map_err(|_| GitError::object_not_found(*oid))?
             .get(oid)
             .map(Arc::clone)
             .ok_or_else(|| GitError::object_not_found(*oid))
@@ -970,9 +985,13 @@ impl ObjectReader for ObjectDatabase {
 }
 
 impl ObjectWriter for ObjectDatabase {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
-        self.objects.entry(oid).or_insert_with(|| Arc::new(object));
+        self.objects
+            .lock()
+            .map_err(|_| GitError::Io("object cache lock poisoned".into()))?
+            .entry(oid)
+            .or_insert_with(|| Arc::new(object));
         Ok(oid)
     }
 }
@@ -2218,7 +2237,7 @@ impl ObjectReader for FileObjectDatabase {
 }
 
 impl ObjectWriter for FileObjectDatabase {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         // Mirror git's freshen semantics (`write_object_file`:
         // `freshen_packed_object || freshen_loose_object`): an object already
         // present anywhere in the database — loose, packed, or through an
@@ -2667,7 +2686,7 @@ impl ObjectReader for LooseObjectStore {
 }
 
 impl ObjectWriter for LooseObjectStore {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
         let path = self.object_path(&oid)?;
         if path.exists() {
