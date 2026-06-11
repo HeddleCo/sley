@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Default (de)compression backend is zlib-rs (pure Rust, ~zlib-ng speed, no C).
+# See sley-pack for the `pure-rust` miniz_oxide fallback.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-mmap = { path = "../sley-mmap", optional = true }
@@ -14,8 +16,9 @@ sley-object = { path = "../sley-object" }
 sley-pack = { path = "../sley-pack" }
 
 [features]
-# Forward the zlib-ng C backend to flate2 and sley-pack (see sley-pack).
-zlib-ng = ["flate2/zlib-ng", "sley-pack/zlib-ng"]
+# Swap the default zlib-rs backend for flate2's miniz_oxide (`rust_backend`),
+# also forwarded to sley-pack. For no-C/wasm targets where zlib-rs is unavailable.
+pure-rust = ["flate2/rust_backend", "sley-pack/pure-rust"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1", "sley-pack/fast-sha1"]
 # Memory-map pack files instead of reading them into the heap. Pulls in sley-mmap

@@ -7,16 +7,20 @@ license.workspace = true
 
 [dependencies]
 crc32fast = "1"
-flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Default (de)compression backend is zlib-rs: a pure-Rust port of zlib-ng with
+# ~zlib-ng throughput and NO C toolchain / cmake dependency. The `pure-rust`
+# feature swaps in flate2's miniz_oxide (`rust_backend`) for no-C/wasm targets
+# that can't pull in zlib-rs.
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 
 [features]
-# Use flate2's zlib-ng C backend for (de)compression instead of the default
-# pure-Rust miniz_oxide. Faster on large objects but needs a C toolchain, so it
-# is opt-in for downstream consumers that want the perf.
-zlib-ng = ["flate2/zlib-ng"]
+# Swap the default zlib-rs backend for flate2's pure-Rust miniz_oxide backend.
+# Use on targets where zlib-rs is unavailable (e.g. some wasm/no-C builds);
+# slower than zlib-rs but has zero non-Rust deps either way.
+pure-rust = ["flate2/rust_backend"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1"]
 
