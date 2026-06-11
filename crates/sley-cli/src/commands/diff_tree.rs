@@ -29,33 +29,51 @@
 use crate::*;
 use sley_object::TreeEntries;
 
-/// Which family of output git should produce. `diff-tree` defaults to `Raw`
-/// (the `:mode mode oid oid STATUS\tpath` form), which is *not* the default for
-/// `git diff`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiffTreeOutput {
-    Raw,
-    Patch,
-    Stat,
-    Numstat,
-    Shortstat,
-    Summary,
-    NameOnly,
-    NameStatus,
+/// Which output formats to produce, mirroring git's `output_format` bitmask:
+/// the explicit format options accumulate (`--stat --summary` prints both, and
+/// `--patch-with-raw` is raw + patch); `diff-tree` defaults to raw when nothing
+/// was requested, which is *not* the default for `git diff`.
+#[derive(Debug, Clone, Copy, Default)]
+struct DiffTreeOutput {
+    raw: bool,
+    patch: bool,
+    stat: bool,
+    numstat: bool,
+    shortstat: bool,
+    summary: bool,
+    name_only: bool,
+    name_status: bool,
     /// `-s`/`--no-patch`: compute the diff (for the exit code) but print nothing
     /// except, for a single commit, the commit-id header.
-    Silent,
+    silent: bool,
 }
 
 impl DiffTreeOutput {
     /// File-content output modes always operate at blob granularity, so they
     /// descend into changed subtrees regardless of `-r`.
     fn forces_recursion(self) -> bool {
-        matches!(
-            self,
-            Self::Patch | Self::Stat | Self::Numstat | Self::Shortstat | Self::Summary
-        )
+        self.patch || self.stat || self.numstat || self.shortstat || self.summary
     }
+
+    /// Whether any explicit format was selected (otherwise raw is the default).
+    fn any(&self) -> bool {
+        self.raw
+            || self.patch
+            || self.stat
+            || self.numstat
+            || self.shortstat
+            || self.summary
+            || self.name_only
+            || self.name_status
+            || self.silent
+    }
+}
+
+/// `--pretty` commit-header formats diff-tree supports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffTreePretty {
+    Medium,
+    Oneline,
 }
 
 /// Parsed `diff-tree` invocation.
@@ -69,6 +87,12 @@ struct DiffTreeOptions {
     root: bool,
     /// `--no-commit-id`: suppress the per-commit object-id header line.
     no_commit_id: bool,
+    /// `--pretty[=medium|oneline]` / `-v`: print a commit-log header instead of
+    /// the bare commit id.
+    pretty: Option<DiffTreePretty>,
+    /// `-m`: for a merge commit, emit one diff per parent (each preceded by the
+    /// commit header). Without it a merge produces no output at all.
+    merges_separate: bool,
     /// `--stdin`: read tree-ish/commit specs (one diff request per line) from
     /// standard input instead of from the argument list.
     stdin: bool,
@@ -95,11 +119,13 @@ struct DiffTreeOptions {
 impl Default for DiffTreeOptions {
     fn default() -> Self {
         Self {
-            output: DiffTreeOutput::Raw,
+            output: DiffTreeOutput::default(),
             recursive: false,
             show_trees: false,
             root: false,
             no_commit_id: false,
+            pretty: None,
+            merges_separate: false,
             stdin: false,
             z: false,
             detect_renames: false,
@@ -168,14 +194,28 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             "--no-commit-id" => options.no_commit_id = true,
             "--stdin" => options.stdin = true,
             "-z" => options.z = true,
-            "-p" | "-u" | "--patch" => options.output = DiffTreeOutput::Patch,
-            "--stat" => options.output = DiffTreeOutput::Stat,
-            "--numstat" => options.output = DiffTreeOutput::Numstat,
-            "--shortstat" => options.output = DiffTreeOutput::Shortstat,
-            "--summary" => options.output = DiffTreeOutput::Summary,
-            "--name-only" => options.output = DiffTreeOutput::NameOnly,
-            "--name-status" => options.output = DiffTreeOutput::NameStatus,
-            "-s" | "--no-patch" => options.output = DiffTreeOutput::Silent,
+            "-p" | "-u" | "--patch" => options.output.patch = true,
+            "--raw" => options.output.raw = true,
+            "--patch-with-stat" => {
+                options.output.patch = true;
+                options.output.stat = true;
+            }
+            "--patch-with-raw" => {
+                options.output.patch = true;
+                options.output.raw = true;
+            }
+            "--stat" => options.output.stat = true,
+            "--numstat" => options.output.numstat = true,
+            "--shortstat" => options.output.shortstat = true,
+            "--summary" => options.output.summary = true,
+            "--name-only" => options.output.name_only = true,
+            "--name-status" => options.output.name_status = true,
+            "-s" | "--no-patch" => {
+                options.output = DiffTreeOutput {
+                    silent: true,
+                    ..DiffTreeOutput::default()
+                };
+            }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
             // Rename / copy detection. diff-tree leaves these off unless asked.
             "-M" | "--find-renames" => options.detect_renames = true,
@@ -255,18 +295,18 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             value if let Some(rest) = value.strip_prefix("--dst-prefix=") => {
                 options.dst_prefix = rest.to_string();
             }
-            // Combined-merge and pretty-printed log output are out of scope; be
-            // explicit rather than emit something subtly wrong.
-            "-c" | "--cc" | "--combined-all-paths" | "-m" => {
+            // Combined-merge output is out of scope; be explicit rather than
+            // emit something subtly wrong.
+            "-c" | "--cc" | "--combined-all-paths" => {
                 return Err(GitError::Unsupported(
                     "diff-tree combined merge output is not supported".into(),
                 ));
             }
-            "--pretty" | "-v" => {
-                return Err(GitError::Unsupported(
-                    "diff-tree pretty/commit-log output is not supported".into(),
-                ));
+            "-m" => options.merges_separate = true,
+            "--pretty" | "-v" | "--pretty=medium" => {
+                options.pretty = Some(DiffTreePretty::Medium);
             }
+            "--pretty=oneline" => options.pretty = Some(DiffTreePretty::Oneline),
             value if value.starts_with("--pretty=") || value.starts_with("--format=") => {
                 return Err(GitError::Unsupported(
                     "diff-tree pretty/commit-log output is not supported".into(),
@@ -300,6 +340,9 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
         ));
     }
 
+    if !options.output.any() {
+        options.output.raw = true;
+    }
     let repo = RepositoryContext::discover_current()?;
     let git_dir = repo.git_dir();
     let format = repo.format();
@@ -337,9 +380,10 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             if line.is_empty() {
                 continue;
             }
-            let request = parse_stdin_request(format, db, &options, line)?;
-            if run_diff_request(&mut stdout, &request_context, &request)? {
-                has_differences = true;
+            for request in parse_stdin_request(format, db, &options, line)? {
+                if run_diff_request(&mut stdout, &request_context, &request)? {
+                    has_differences = true;
+                }
             }
         }
     } else {
@@ -347,9 +391,10 @@ pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
             print_diff_tree_usage();
             return Err(GitError::Exit(129));
         }
-        let request = resolve_arg_request(&repo, db, &options, &options.revs)?;
-        if run_diff_request(&mut stdout, &request_context, &request)? {
-            has_differences = true;
+        for request in resolve_arg_request(&repo, db, &options, &options.revs)? {
+            if run_diff_request(&mut stdout, &request_context, &request)? {
+                has_differences = true;
+            }
         }
     }
 
@@ -394,7 +439,7 @@ fn resolve_arg_request(
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
     revs: &[String],
-) -> Result<DiffRequest> {
+) -> Result<Vec<DiffRequest>> {
     let format = repo.format();
     if revs.len() == 1 {
         let oid = resolve_tree_ish_arg(repo, &revs[0])?;
@@ -408,12 +453,12 @@ fn resolve_arg_request(
         let right = resolve_tree_ish_arg(repo, &revs[1])?;
         let left_tree = sley_rev::peel_to_tree(db, format, &left)?;
         let right_tree = sley_rev::peel_to_tree(db, format, &right)?;
-        Ok(DiffRequest {
+        Ok(vec![DiffRequest {
             left: Some(left_tree),
             right: Some(right_tree),
             header: None,
             skip: false,
-        })
+        }])
     }
 }
 
@@ -428,7 +473,7 @@ fn single_commit_request(
     options: &DiffTreeOptions,
     oid: &ObjectId,
     header_text: String,
-) -> Result<DiffRequest> {
+) -> Result<Vec<DiffRequest>> {
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
         // diff-tree's single-operand form insists on a commit; a bare tree there
@@ -438,14 +483,40 @@ fn single_commit_request(
             "error: object {oid} is a {}, not a commit",
             object.object_type.as_str()
         );
-        return Ok(DiffRequest {
+        return Ok(vec![DiffRequest {
             left: None,
             right: Some(*oid),
             header: None,
             skip: true,
-        });
+        }]);
     }
-    let commit = Commit::parse_ref(format, &object.body)?;
+    let commit = Commit::parse(format, &object.body)?;
+    let header_text = diff_tree_header_text(options, oid, &commit, header_text);
+    if commit.parents.len() > 1 {
+        // A merge commit: nothing at all without -m/-c/--cc; with -m, one
+        // request per parent, each preceded by the commit header.
+        if !options.merges_separate {
+            return Ok(vec![DiffRequest {
+                left: None,
+                right: Some(commit.tree.clone()),
+                header: None,
+                skip: true,
+            }]);
+        }
+        let mut requests = Vec::with_capacity(commit.parents.len());
+        for parent in &commit.parents {
+            requests.push(DiffRequest {
+                left: Some(sley_rev::peel_to_tree(db, format, parent)?),
+                right: Some(commit.tree.clone()),
+                header: Some(DiffHeader {
+                    text: header_text.clone(),
+                    suppressible: true,
+                }),
+                skip: false,
+            });
+        }
+        return Ok(requests);
+    }
     let left = match commit.parents.first() {
         Some(parent) => Some(sley_rev::peel_to_tree(db, format, parent)?),
         None => None,
@@ -453,14 +524,14 @@ fn single_commit_request(
     // A root commit (no parent) is silently skipped unless --root says to diff it
     // against the empty tree.
     if left.is_none() && !options.root {
-        return Ok(DiffRequest {
+        return Ok(vec![DiffRequest {
             left: None,
             right: Some(commit.tree.clone()),
             header: None,
             skip: true,
-        });
+        }]);
     }
-    Ok(DiffRequest {
+    Ok(vec![DiffRequest {
         left,
         right: Some(commit.tree.clone()),
         header: Some(DiffHeader {
@@ -468,7 +539,49 @@ fn single_commit_request(
             suppressible: true,
         }),
         skip: false,
-    })
+    }])
+}
+
+/// The header block for a single-commit request: the bare id (default), or the
+/// `--pretty` medium/oneline commit-log header. The medium form embeds a
+/// trailing newline so the printed block ends with the blank line that
+/// separates it from the diff.
+fn diff_tree_header_text(
+    options: &DiffTreeOptions,
+    oid: &ObjectId,
+    commit: &Commit,
+    plain_text: String,
+) -> String {
+    match options.pretty {
+        None => plain_text,
+        Some(DiffTreePretty::Oneline) => {
+            format!("{oid} {}", commit_subject(&commit.message))
+        }
+        Some(DiffTreePretty::Medium) => {
+            let mut text = format!("commit {oid}\n");
+            if commit.parents.len() > 1 {
+                let merged: Vec<String> = commit.parents.iter().map(format_log_abbrev_oid).collect();
+                text.push_str(&format!("Merge: {}\n", merged.join(" ")));
+            }
+            text.push_str(&format!(
+                "Author: {}\n",
+                commit_author_identity(&commit.author)
+            ));
+            text.push_str(&format!(
+                "Date:   {}\n",
+                commit_identity_date(&commit.author, ForEachRefDateMode::Default)
+            ));
+            text.push('\n');
+            for line in String::from_utf8_lossy(&commit.message).lines() {
+                if line.is_empty() {
+                    text.push('\n');
+                } else {
+                    text.push_str(&format!("    {line}\n"));
+                }
+            }
+            text
+        }
+    }
 }
 
 /// Parse one `--stdin` line.
@@ -489,11 +602,11 @@ fn parse_stdin_request(
     db: &FileObjectDatabase,
     options: &DiffTreeOptions,
     line: &str,
-) -> Result<DiffRequest> {
+) -> Result<Vec<DiffRequest>> {
     let mut parts = line.split_whitespace();
     let Some(first) = parts.next() else {
         // Blank lines are filtered by the caller; treat anything else as a skip.
-        return Ok(skip_echo(line));
+        return Ok(vec![skip_echo(line)]);
     };
     let second = parts.next();
     if let Some(second) = second {
@@ -501,17 +614,17 @@ fn parse_stdin_request(
             parse_full_oid(format, first),
             parse_full_oid(format, second),
         ) else {
-            return Ok(skip_echo(line));
+            return Ok(vec![skip_echo(line)]);
         };
         let (Ok(left_tree), Ok(right_tree)) = (
             sley_rev::peel_to_tree(db, format, &left),
             sley_rev::peel_to_tree(db, format, &right),
         ) else {
-            return Ok(skip_echo(line));
+            return Ok(vec![skip_echo(line)]);
         };
         // The two-tree stdin header echoes the input verbatim and is *not*
         // suppressed by --no-commit-id.
-        Ok(DiffRequest {
+        Ok(vec![DiffRequest {
             left: Some(left_tree),
             right: Some(right_tree),
             header: Some(DiffHeader {
@@ -519,19 +632,19 @@ fn parse_stdin_request(
                 suppressible: false,
             }),
             skip: false,
-        })
+        }])
     } else {
         let Some(oid) = parse_full_oid(format, first) else {
-            return Ok(skip_echo(line));
+            return Ok(vec![skip_echo(line)]);
         };
         let Ok(object) = db.read_object(&oid) else {
-            return Ok(skip_echo(line));
+            return Ok(vec![skip_echo(line)]);
         };
         if object.object_type != ObjectType::Commit {
             // A lone non-commit object id is not a valid single-token request:
             // git reports the error and prints no header for this line.
             eprintln!("error: Need exactly two trees, separated by a space");
-            return Ok(skip_silent());
+            return Ok(vec![skip_silent()]);
         }
         single_commit_request(format, db, options, &oid, first.to_string())
     }
@@ -636,100 +749,104 @@ fn run_diff_request(
     )?;
     let has_differences = !entries.is_empty();
 
-    match context.options.output {
-        DiffTreeOutput::Silent => {}
-        DiffTreeOutput::Raw => {
-            for entry in &entries {
-                write_diff_raw_entry(
-                    stdout,
-                    entry,
-                    context.options.z,
-                    false,
-                    context.raw_abbrev,
-                    context.format,
-                )?;
+    let output = context.options.output;
+    let mut wrote_block = false;
+    if output.name_only {
+        for entry in &entries {
+            if context.options.z {
+                stdout.write_all(&entry.path)?;
+                stdout.write_all(b"\0")?;
+            } else {
+                let path = status_quote_path(&entry.path, false);
+                writeln!(stdout, "{path}")?;
             }
         }
-        DiffTreeOutput::NameOnly => {
-            for entry in &entries {
-                if context.options.z {
-                    stdout.write_all(&entry.path)?;
+        wrote_block = true;
+    }
+    if output.name_status {
+        for entry in &entries {
+            if context.options.z {
+                stdout.write_all(entry.status.label().as_bytes())?;
+                stdout.write_all(b"\0")?;
+                if let Some(old_path) = &entry.old_path {
+                    stdout.write_all(old_path)?;
                     stdout.write_all(b"\0")?;
-                } else {
-                    let path = status_quote_path(&entry.path, false);
-                    writeln!(stdout, "{path}")?;
                 }
-            }
-        }
-        DiffTreeOutput::NameStatus => {
-            for entry in &entries {
-                if context.options.z {
-                    stdout.write_all(entry.status.label().as_bytes())?;
-                    stdout.write_all(b"\0")?;
-                    if let Some(old_path) = &entry.old_path {
-                        stdout.write_all(old_path)?;
-                        stdout.write_all(b"\0")?;
-                    }
-                    stdout.write_all(&entry.path)?;
-                    stdout.write_all(b"\0")?;
-                } else {
-                    write!(stdout, "{}", entry.status.label())?;
-                    if let Some(old_path) = &entry.old_path {
-                        let old_path = status_quote_path(old_path, false);
-                        write!(stdout, "\t{old_path}")?;
-                    }
-                    let path = status_quote_path(&entry.path, false);
-                    writeln!(stdout, "\t{path}")?;
+                stdout.write_all(&entry.path)?;
+                stdout.write_all(b"\0")?;
+            } else {
+                write!(stdout, "{}", entry.status.label())?;
+                if let Some(old_path) = &entry.old_path {
+                    let old_path = status_quote_path(old_path, false);
+                    write!(stdout, "\t{old_path}")?;
                 }
+                let path = status_quote_path(&entry.path, false);
+                writeln!(stdout, "\t{path}")?;
             }
         }
-        DiffTreeOutput::Numstat => {
-            for entry in &entries {
-                write_diff_numstat_entry(
-                    stdout,
-                    entry,
-                    context.options.z,
-                    context.db,
-                    None,
-                    false,
-                )?;
-            }
-        }
-        DiffTreeOutput::Shortstat => {
-            write_diff_shortstat(stdout, &entries, context.db, None, false)?;
-        }
-        DiffTreeOutput::Stat => {
-            write_diff_stat(
+        wrote_block = true;
+    }
+    if output.raw {
+        for entry in &entries {
+            write_diff_raw_entry(
                 stdout,
-                &entries,
-                context.db,
-                None,
+                entry,
+                context.options.z,
                 false,
-                DiffStatOptions {
-                    compact_summary: false,
-                    stat_count: None,
-                    color: false,
-                },
+                context.raw_abbrev,
+                context.format,
             )?;
         }
-        DiffTreeOutput::Summary => {
-            for entry in &entries {
-                write_diff_summary_entry(stdout, entry)?;
-            }
+        wrote_block = true;
+    }
+    if output.numstat {
+        for entry in &entries {
+            write_diff_numstat_entry(stdout, entry, context.options.z, context.db, None, false)?;
         }
-        DiffTreeOutput::Patch => {
-            for entry in &entries {
-                let patch_options = DiffPatchOptions {
-                    db: context.db,
-                    worktree_root: None,
-                    use_worktree_new: false,
-                    format: context.format,
-                    abbrev: context.patch_abbrev,
-                    src_prefix: &context.options.src_prefix,
-                    dst_prefix: &context.options.dst_prefix,
-                };
-                write_diff_patch_entry(stdout, entry, patch_options)?;
-            }
+        wrote_block = true;
+    }
+    if output.stat {
+        write_diff_stat_with_widths(
+            stdout,
+            &entries,
+            context.db,
+            None,
+            false,
+            DiffStatOptions {
+                compact_summary: false,
+                stat_count: None,
+                color: false,
+            },
+            // diff-tree is plumbing: fixed 80 columns, no config caps.
+            DiffStatWidths::plumbing(),
+        )?;
+        wrote_block = true;
+    }
+    if output.shortstat {
+        write_diff_shortstat(stdout, &entries, context.db, None, false)?;
+        wrote_block = true;
+    }
+    if output.summary {
+        for entry in &entries {
+            write_diff_summary_entry(stdout, entry)?;
+        }
+        wrote_block = true;
+    }
+    if output.patch && !entries.is_empty() {
+        if wrote_block {
+            writeln!(stdout)?;
+        }
+        for entry in &entries {
+            let patch_options = DiffPatchOptions {
+                db: context.db,
+                worktree_root: None,
+                use_worktree_new: false,
+                format: context.format,
+                abbrev: context.patch_abbrev,
+                src_prefix: &context.options.src_prefix,
+                dst_prefix: &context.options.dst_prefix,
+            };
+            write_diff_patch_entry(stdout, entry, patch_options)?;
         }
     }
 

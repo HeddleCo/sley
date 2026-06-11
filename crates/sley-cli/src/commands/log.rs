@@ -677,11 +677,14 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(log_diff_merges_requires_value_error)?;
-                diff_opts.merges = Some(log_parse_diff_merges(value)?);
+                let mode = log_parse_diff_merges(value)?;
+                diff_opts.merges = Some(mode);
+                diff_opts.merges_imply_patch = mode != LogDiffMerges::Off;
             }
             value if value.starts_with("--diff-merges=") => {
-                diff_opts.merges =
-                    Some(log_parse_diff_merges(&value["--diff-merges=".len()..])?);
+                let mode = log_parse_diff_merges(&value["--diff-merges=".len()..])?;
+                diff_opts.merges = Some(mode);
+                diff_opts.merges_imply_patch = mode != LogDiffMerges::Off;
             }
             "--no-walk=sorted" => {
                 walk = false;
@@ -1207,9 +1210,7 @@ fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let output_encoding = log_output_encoding(&config);
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
-    let log_diff = if diff_opts.any()
-        || matches!(diff_opts.merges, Some(LogDiffMerges::FirstParent))
-    {
+    let log_diff = if diff_opts.any() || diff_opts.merges_imply_patch {
         let show_root = show_root_flag.unwrap_or_else(|| {
             config
                 .get_bool("log", None, "showroot")
@@ -2217,6 +2218,9 @@ struct LogDiffOptions {
     stat_widths: DiffStatWidths,
     stat_count: Option<usize>,
     merges: Option<LogDiffMerges>,
+    /// Whether an explicit `--diff-merges=<mode>` was given: unlike `-m`, the
+    /// explicit form enables patch output for merge commits on its own.
+    merges_imply_patch: bool,
 }
 
 impl Default for LogDiffOptions {
@@ -2232,6 +2236,7 @@ impl Default for LogDiffOptions {
             stat_widths: DiffStatWidths::terminal(),
             stat_count: None,
             merges: None,
+            merges_imply_patch: false,
         }
     }
 }
