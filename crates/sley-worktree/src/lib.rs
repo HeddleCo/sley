@@ -103,6 +103,20 @@ pub struct UpdateIndexOptions {
     pub ignore_skip_worktree_entries: bool,
 }
 
+/// A single positional path passed to `update-index`, together with the
+/// `--chmod` state that was active at the point the path was seen on the
+/// command line. git applies `--chmod=(+|-)x` as a stateful flag that affects
+/// every *subsequent* path until overridden, so `--chmod=+x A --chmod=-x B`
+/// flips A executable and B non-executable. Each path also reports its action
+/// (`add '<p>'`, `remove '<p>'`, `chmod (+|-)x '<p>'`) inline under `--verbose`,
+/// interleaved in command-line order — which is why the chmod state must travel
+/// with the path rather than as a single batch-wide flag.
+#[derive(Debug, Clone)]
+pub struct UpdateIndexPath {
+    pub path: PathBuf,
+    pub chmod: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WriteTreeOptions {
     pub missing_ok: bool,
@@ -314,13 +328,50 @@ pub fn update_index_paths(
     paths: &[PathBuf],
     options: UpdateIndexOptions,
 ) -> Result<UpdateIndexResult> {
+    let ordered = ordered_paths_from_plain(paths, options.chmod);
+    update_index_paths_impl(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        &ordered,
+        options,
+        None,
+        false,
+    )
+}
+
+fn ordered_paths_from_plain(paths: &[PathBuf], chmod: Option<bool>) -> Vec<UpdateIndexPath> {
+    paths
+        .iter()
+        .map(|path| UpdateIndexPath {
+            path: path.clone(),
+            chmod,
+        })
+        .collect()
+}
+
+/// Stage an ordered list of paths, each carrying its own `--chmod` state, and
+/// (under `verbose`) print the `add`/`remove`/`chmod` action lines inline in
+/// command-line order. This is the entry point `git update-index <path>...`
+/// uses so that `--chmod=+x A --chmod=-x B --verbose` produces the interleaved
+/// `add 'A'` / `chmod +x 'A'` / `add 'B'` / `chmod -x 'B'` output git emits.
+pub fn update_index_ordered_paths_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[UpdateIndexPath],
+    options: UpdateIndexOptions,
+    config: &GitConfig,
+    verbose: bool,
+) -> Result<UpdateIndexResult> {
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
         paths,
         options,
-        None,
+        Some(config),
+        verbose,
     )
 }
 
@@ -364,13 +415,15 @@ pub fn update_index_paths_filtered(
     options: UpdateIndexOptions,
     config: &GitConfig,
 ) -> Result<UpdateIndexResult> {
+    let ordered = ordered_paths_from_plain(paths, options.chmod);
     update_index_paths_impl(
         worktree_root.as_ref(),
         git_dir.as_ref(),
         format,
-        paths,
+        &ordered,
         options,
         Some(config),
+        false,
     )
 }
 
@@ -378,9 +431,10 @@ fn update_index_paths_impl(
     worktree_root: &Path,
     git_dir: &Path,
     format: ObjectFormat,
-    paths: &[PathBuf],
+    paths: &[UpdateIndexPath],
     options: UpdateIndexOptions,
     clean_config: Option<&GitConfig>,
+    verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let index_path = repository_index_path(git_dir);
     let mut index = if index_path.exists() {
@@ -409,7 +463,10 @@ fn update_index_paths_impl(
     };
     let requested_filter_attrs = filter_attribute_names();
     let mut updated = Vec::new();
-    for path in paths {
+    let mut reports: Vec<String> = Vec::new();
+    for update_path in paths {
+        let path = &update_path.path;
+        let path_chmod = update_path.chmod;
         let absolute = if path.is_absolute() {
             path.clone()
         } else {
@@ -421,6 +478,8 @@ fn update_index_paths_impl(
         let git_path = git_path_bytes(relative)?;
         if options.force_remove {
             index.entries.retain(|existing| existing.path != git_path);
+            // git's update_one() reports `remove` for a --force-remove path.
+            reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
             continue;
         }
         if let Some(existing) = index
@@ -449,6 +508,7 @@ fn update_index_paths_impl(
         let Some(metadata) = symlink_metadata else {
             if options.remove {
                 index.entries.retain(|existing| existing.path != git_path);
+                reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
                 continue;
             }
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
@@ -495,7 +555,10 @@ fn update_index_paths_impl(
         if is_symlink {
             entry.mode = 0o120000;
         }
-        if let Some(executable) = options.chmod {
+        // git's update_one() reports `add` for every staged path (whether the
+        // entry is new or an update), then chmod_path() reports the chmod after.
+        reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
+        if let Some(executable) = path_chmod {
             // git's chmod_path() refuses to flip the executable bit on anything
             // that is not a regular file (a symlink/gitlink has no such bit). It
             // writes the blob first, then errors with this exact message and
@@ -509,6 +572,11 @@ fn update_index_paths_impl(
                 return Err(GitError::Exit(128));
             }
             entry.mode = if executable { 0o100755 } else { 0o100644 };
+            reports.push(format!(
+                "chmod {}x '{}'",
+                if executable { '+' } else { '-' },
+                String::from_utf8_lossy(&git_path)
+            ));
         }
         index.entries.retain(|existing| existing.path != git_path);
         index.entries.push(entry);
@@ -520,6 +588,13 @@ fn update_index_paths_impl(
     normalize_index_version_for_extended_flags(&mut index);
     index.extensions = index_extensions_without_cache_tree(&index.extensions);
     fs::write(index_path, index.write(format)?)?;
+    if verbose {
+        let mut stdout = std::io::stdout().lock();
+        for line in &reports {
+            writeln!(stdout, "{line}")?;
+        }
+        stdout.flush()?;
+    }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
@@ -862,6 +937,7 @@ pub fn set_index_version(
     git_dir: impl AsRef<Path>,
     format: ObjectFormat,
     version: u32,
+    verbose: bool,
 ) -> Result<UpdateIndexResult> {
     if !matches!(version, 2..=4) {
         return Err(GitError::Unsupported(format!(
@@ -880,6 +956,12 @@ pub fn set_index_version(
             checksum: None,
         }
     };
+    // git reports the transition unconditionally under --verbose, even when the
+    // requested version equals the current one ("was 4, set to 4").
+    let previous = index.version;
+    if verbose {
+        println!("index-version: was {previous}, set to {version}");
+    }
     index.version = version;
     normalize_index_version_for_extended_flags(&mut index);
     fs::write(index_path, index.write(format)?)?;
@@ -944,6 +1026,7 @@ pub fn update_index_cacheinfo(
     format: ObjectFormat,
     entries: &[CacheInfoEntry],
     add: bool,
+    verbose: bool,
 ) -> Result<UpdateIndexResult> {
     let git_dir = git_dir.as_ref();
     let index_path = repository_index_path(git_dir);
@@ -958,6 +1041,7 @@ pub fn update_index_cacheinfo(
         }
     };
     let mut updated = Vec::new();
+    let mut reports: Vec<String> = Vec::new();
     for cacheinfo in entries {
         if !add
             && !index
@@ -992,15 +1076,48 @@ pub fn update_index_cacheinfo(
         });
         index.entries.push(entry);
         updated.push(cacheinfo.oid);
+        // git's add_cacheinfo() calls report("add '%s'") *after* the entry is
+        // staged, regardless of whether the subsequent index write succeeds.
+        reports.push(format!(
+            "add '{}'",
+            String::from_utf8_lossy(&cacheinfo.path)
+        ));
     }
     index
         .entries
         .sort_by(|left, right| left.path.cmp(&right.path));
+    // git refuses to write an index entry whose object id is the null oid:
+    // do_write_index() emits `error: cache entry has null sha1: <path>` and
+    // returns nonzero, leaving the on-disk index untouched. The verbose `add`
+    // line has already been printed by then.
+    let null_entry = index.entries.iter().find(|entry| entry.oid.is_null());
+    if let Some(entry) = null_entry {
+        if verbose {
+            flush_update_index_reports(&reports)?;
+        }
+        eprintln!(
+            "error: cache entry has null sha1: {}",
+            String::from_utf8_lossy(&entry.path)
+        );
+        return Err(GitError::Exit(128));
+    }
     fs::write(index_path, index.write(format)?)?;
+    if verbose {
+        flush_update_index_reports(&reports)?;
+    }
     Ok(UpdateIndexResult {
         entries: index.entries.len(),
         updated,
     })
+}
+
+fn flush_update_index_reports(reports: &[String]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    for line in reports {
+        writeln!(stdout, "{line}")?;
+    }
+    stdout.flush()?;
+    Ok(())
 }
 
 pub fn update_index_index_info(

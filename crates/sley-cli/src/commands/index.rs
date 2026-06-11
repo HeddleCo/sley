@@ -1159,6 +1159,10 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut force_remove = false;
     let mut stdin = false;
     let mut nul = false;
+    // `--chmod=(+|-)x` is a stateful flag in git: it sets `set_executable_bit`,
+    // which then applies to every *subsequent* positional path until the next
+    // `--chmod`. We snapshot the current value onto each path as it is parsed so
+    // `--chmod=+x A --chmod=-x B` flips A executable and B non-executable.
     let mut chmod = None;
     let mut cacheinfo = Vec::new();
     let mut index_info = false;
@@ -1191,6 +1195,8 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let mut allow_no_input = false;
     let mut show_index_version = false;
     let mut paths = Vec::new();
+    // chmod state captured per positional path, in lockstep with `paths`.
+    let mut path_chmods: Vec<Option<bool>> = Vec::new();
     let mut idx = 0;
     while idx < args.len() {
         if stdin || index_info {
@@ -1202,6 +1208,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         if positional_only {
             if !ignore_paths_after_unresolve {
                 paths.push(PathBuf::from(arg));
+                path_chmods.push(chmod);
             }
             idx += 1;
             continue;
@@ -1389,9 +1396,23 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
                     .expect("prefix checked by match guard");
                 cacheinfo.push(parse_update_index_cacheinfo_tuple(value)?);
             }
+            "-h" | "--help" => return update_index_usage_help(),
+            // git's parse_options() rejects any unrecognized option with
+            // `error: unknown {option|switch} ...` followed by the usage text on
+            // stderr, exiting 129. A lone `-` is a valid path, not an option.
+            value if value.starts_with('-') && value != "-" => {
+                if let Some(long) = value.strip_prefix("--") {
+                    eprintln!("error: unknown option '{long}'");
+                } else {
+                    let switch = value.chars().nth(1).unwrap_or('-');
+                    eprintln!("error: unknown switch '{switch}'");
+                }
+                return update_index_usage_error();
+            }
             value => {
                 if !ignore_paths_after_unresolve {
                     paths.push(PathBuf::from(value));
+                    path_chmods.push(chmod);
                 }
             }
         }
@@ -1459,14 +1480,22 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let resolved_paths = paths
-        .into_iter()
+        .iter()
         .map(|path| {
             if path.is_absolute() {
-                path
+                path.clone()
             } else {
                 cwd.join(path)
             }
         })
+        .collect::<Vec<_>>();
+    // Pair each resolved path with the `--chmod` state active when it was
+    // parsed, preserving command-line order for the staging branch below.
+    let ordered_paths = resolved_paths
+        .iter()
+        .cloned()
+        .zip(path_chmods.iter().copied())
+        .map(|(path, chmod)| sley_worktree::UpdateIndexPath { path, chmod })
         .collect::<Vec<_>>();
     if refresh {
         sley_worktree::refresh_index_paths(
@@ -1494,7 +1523,7 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             },
         )?;
     } else if let Some(index_version) = index_version {
-        sley_worktree::set_index_version(git_dir.clone(), format, index_version)?;
+        sley_worktree::set_index_version(git_dir.clone(), format, index_version, verbose)?;
     } else if let Some(fsmonitor_valid) = fsmonitor_valid {
         sley_worktree::set_index_fsmonitor_valid_paths(
             &worktree_root,
@@ -1519,33 +1548,33 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             &resolved_paths,
             assume_unchanged,
         )?;
-    } else if !resolved_paths.is_empty() {
+    } else if !ordered_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
-        sley_worktree::update_index_paths_filtered(
+        sley_worktree::update_index_ordered_paths_filtered(
             &worktree_root,
             git_dir.clone(),
             format,
-            &resolved_paths,
+            &ordered_paths,
             sley_worktree::UpdateIndexOptions {
                 add,
                 remove,
                 force_remove,
-                chmod,
+                // chmod is now carried per-path in `ordered_paths`; the batch
+                // option is unused on this branch.
+                chmod: None,
                 info_only,
                 ignore_skip_worktree_entries,
             },
             &config,
+            verbose,
         )?;
-        if verbose {
-            print_update_index_path_actions(&worktree_root, &resolved_paths, force_remove)?;
-        }
     }
     if !cacheinfo.is_empty() {
         let cacheinfo = cacheinfo
             .into_iter()
             .map(|entry| entry.into_worktree_entry(format))
             .collect::<Result<Vec<_>>>()?;
-        sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add)?;
+        sley_worktree::update_index_cacheinfo(&git_dir, format, &cacheinfo, add, verbose)?;
     }
     if show_index_version && !suppress_after_unresolve {
         print_update_index_version(&git_dir)?;
@@ -1562,6 +1591,67 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+const UPDATE_INDEX_USAGE: &str = "\
+usage: git update-index [<options>] [--] [<file>...]
+
+    -q                    continue refresh even when index needs update
+    --[no-]ignore-submodules
+                          refresh: ignore submodules
+    --[no-]add            do not ignore new files
+    --[no-]replace        let files replace directories and vice-versa
+    --[no-]remove         notice files missing from worktree
+    --[no-]unmerged       refresh even if index contains unmerged entries
+    --refresh             refresh stat information
+    --really-refresh      like --refresh, but ignore assume-unchanged setting
+    --cacheinfo <mode>,<object>,<path>
+                          add the specified entry to the index
+    --chmod (+|-)x        override the executable bit of the listed files
+    --assume-unchanged    mark files as \"not changing\"
+    --no-assume-unchanged clear assumed-unchanged bit
+    --skip-worktree       mark files as \"index-only\"
+    --no-skip-worktree    clear skip-worktree bit
+    --[no-]ignore-skip-worktree-entries
+                          do not touch index-only entries
+    --[no-]info-only      add to index only; do not add content to object database
+    --[no-]force-remove   remove named paths even if present in worktree
+    -z                    with --stdin: input lines are terminated by null bytes
+    --stdin               read list of paths to be updated from standard input
+    --index-info          add entries from standard input to the index
+    --unresolve           repopulate stages #2 and #3 for the listed paths
+    -g, --again           only update entries that differ from HEAD
+    --[no-]ignore-missing ignore files missing from worktree
+    --[no-]verbose        report actions to standard output
+    --clear-resolve-undo  (for porcelains) forget saved unresolved conflicts
+    --[no-]index-version <n>
+                          write index in this format
+    --[no-]show-index-version
+                          report on-disk index format version
+    --[no-]split-index    enable or disable split index
+    --[no-]untracked-cache
+                          enable/disable untracked cache
+    --[no-]test-untracked-cache
+                          test if the filesystem supports untracked cache
+    --[no-]force-untracked-cache
+                          enable untracked cache without testing the filesystem
+    --[no-]force-write-index
+                          write out the index even if is not flagged as changed
+    --[no-]fsmonitor      enable or disable file system monitor
+    --fsmonitor-valid     mark files as fsmonitor valid
+    --no-fsmonitor-valid  clear fsmonitor valid bit";
+
+/// Print the `update-index` usage text and exit 129 — the error path git takes
+/// for an unknown option/switch (after the `error: unknown ...` line).
+fn update_index_usage_error<T>() -> Result<T> {
+    eprintln!("{UPDATE_INDEX_USAGE}");
+    Err(GitError::Exit(129))
+}
+
+/// Print the `update-index` usage text and exit 129 — git's `-h`/`--help` path.
+fn update_index_usage_help<T>() -> Result<T> {
+    eprintln!("{UPDATE_INDEX_USAGE}");
+    Err(GitError::Exit(129))
+}
+
 fn print_test_untracked_cache_result(worktree_root: &Path) -> Result<()> {
     let display_path =
         fs::canonicalize(worktree_root).unwrap_or_else(|_| worktree_root.to_path_buf());
@@ -1574,24 +1664,6 @@ fn print_test_untracked_cache_result(worktree_root: &Path) -> Result<()> {
 
 fn print_update_index_fsmonitor_unset_warning() {
     eprintln!("warning: core.fsmonitor is unset; set it if you really want to enable fsmonitor");
-}
-
-fn print_update_index_path_actions(
-    worktree_root: &Path,
-    paths: &[PathBuf],
-    force_remove: bool,
-) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    for path in paths {
-        let verb = if force_remove { "remove" } else { "add" };
-        let display = path.strip_prefix(worktree_root).unwrap_or(path);
-        writeln!(
-            stdout,
-            "{verb} '{}'",
-            display.to_string_lossy().replace('\\', "/")
-        )?;
-    }
-    Ok(())
 }
 
 fn print_update_index_version(git_dir: &Path) -> Result<()> {
