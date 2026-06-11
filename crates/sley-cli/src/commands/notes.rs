@@ -56,14 +56,44 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
         .as_str()
         .to_string();
 
+    // git refuses to write notes outside of refs/notes/. The check uses the
+    // *resolved* ref name: `--ref` is expanded (bare names → refs/notes/<name>),
+    // but GIT_NOTES_REF / core.notesRef are taken verbatim, so a fully-qualified
+    // non-notes ref like `refs/heads/bogus` from the environment is rejected.
+    let raw_write_ref = raw_notes_ref(&git_dir, ref_override.as_deref());
+    let refuse_outside = |verb: &str| -> Result<()> {
+        if !raw_write_ref.starts_with("refs/notes/") {
+            eprintln!(
+                "fatal: refusing to {verb} notes in {raw_write_ref} (outside of refs/notes/)"
+            );
+            return Err(GitError::Exit(128));
+        }
+        Ok(())
+    };
+
     match subcommand {
         "list" => notes_list(&git_dir, format, &notes_ref, sub_args),
-        "add" => notes_add(&git_dir, format, &notes_ref, sub_args),
-        "edit" => notes_edit(&git_dir, format, &notes_ref, sub_args),
-        "append" => notes_append(&git_dir, format, &notes_ref, sub_args),
+        "add" => {
+            refuse_outside("add")?;
+            notes_add(&git_dir, format, &notes_ref, sub_args)
+        }
+        "edit" => {
+            refuse_outside("edit")?;
+            notes_edit(&git_dir, format, &notes_ref, sub_args)
+        }
+        "append" => {
+            refuse_outside("append")?;
+            notes_append(&git_dir, format, &notes_ref, sub_args)
+        }
         "show" => notes_show(&git_dir, format, &notes_ref, sub_args),
-        "remove" => notes_remove(&git_dir, format, &notes_ref, sub_args),
-        "copy" => notes_copy(&git_dir, format, &notes_ref, sub_args),
+        "remove" => {
+            refuse_outside("remove")?;
+            notes_remove(&git_dir, format, &notes_ref, sub_args)
+        }
+        "copy" => {
+            refuse_outside("copy")?;
+            notes_copy(&git_dir, format, &notes_ref, sub_args)
+        }
         "get-ref" => notes_get_ref(&notes_ref, sub_args),
         other => notes_unknown_subcommand_error(other),
     }
@@ -71,6 +101,29 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
 
 fn notes_ref_handle(notes_ref: &str) -> NotesRef {
     NotesRef::expand(notes_ref)
+}
+
+/// The notes ref name as git's `init_notes_check` sees it for the
+/// outside-refs/notes refusal. `--ref` is run through `expand_notes_ref` (bare
+/// names gain a `refs/notes/` prefix), but `GIT_NOTES_REF` / `core.notesRef` are
+/// taken verbatim — a fully-qualified non-notes ref from the environment must
+/// be rejected rather than silently re-homed under `refs/notes/`.
+fn raw_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> String {
+    if let Some(value) = ref_override {
+        return NotesRef::expand(value).as_str().to_string();
+    }
+    if let Ok(value) = env::var("GIT_NOTES_REF")
+        && !value.is_empty()
+    {
+        return value;
+    }
+    if let Ok(config) = read_repo_config(git_dir)
+        && let Some(value) = config.get("core", None, "notesRef")
+        && !value.is_empty()
+    {
+        return value.to_string();
+    }
+    "refs/notes/commits".to_string()
 }
 
 fn notes_commit_identity() -> Result<NotesCommitIdentity> {
