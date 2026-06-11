@@ -118,6 +118,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_submodule_output_control = false;
     let mut diff_word_control = false;
     let mut diff_relative = DiffRelativeMode::Off;
+    // Whether --relative/--no-relative appeared on the command line (an
+    // explicit flag wins over the diff.relative config).
+    let mut diff_relative_explicit = false;
     let mut src_prefix = "a/".to_string();
     let mut dst_prefix = "b/".to_string();
     let mut head = false;
@@ -422,11 +425,18 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--ita-invisible-in-index=") => {
                 return log_option_takes_no_value_error("ita-invisible-in-index");
             }
-            "--relative" => diff_relative = DiffRelativeMode::Cwd,
+            "--relative" => {
+                diff_relative = DiffRelativeMode::Cwd;
+                diff_relative_explicit = true;
+            }
             value if let Some(value) = value.strip_prefix("--relative=") => {
+                diff_relative_explicit = true;
                 diff_relative = DiffRelativeMode::Prefix(value.to_string());
             }
-            "--no-relative" => diff_relative = DiffRelativeMode::Off,
+            "--no-relative" => {
+                diff_relative = DiffRelativeMode::Off;
+                diff_relative_explicit = true;
+            }
             value if value.starts_with("--no-relative=") => {
                 return log_option_takes_no_value_error("no-relative");
             }
@@ -677,11 +687,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff word controls are not supported for this output mode".into(),
         ));
     }
-    if !matches!(diff_relative, DiffRelativeMode::Off) && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff relative output is not supported for this output mode".into(),
-        ));
-    }
     if reverse && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff reverse output is not supported for this output mode".into(),
@@ -709,6 +714,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    if !diff_relative_explicit
+        && let Ok(config) = read_repo_config(&git_dir)
+        && config.get_bool("diff", None, "relative").unwrap_or(false)
+    {
+        diff_relative = DiffRelativeMode::Cwd;
+    }
     // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
     // out of the positional arguments; the remainder are pathspecs. Without this,
     // `diff A B` was treated as two paths and silently fell back to an
@@ -727,7 +738,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let repository_abbrev = repository_abbrev(&git_dir, format)?;
     let raw_abbrev = match raw_abbrev {
         Some(abbrev) => abbrev.map(|width| width.min(format.hex_len())),
-        None => repository_abbrev,
+        // `git diff` is porcelain: raw oids abbreviate by default (unlike the
+        // diff-tree plumbing), to core.abbrev or git's standard 7.
+        None => Some(repository_abbrev.unwrap_or(7).min(format.hex_len())),
     };
     let patch_abbrev = if patch_full_index {
         format.hex_len()
@@ -912,10 +925,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     } else {
         entries
     };
+    // `--relative` rewrites the displayed paths; worktree content reads must
+    // keep resolving against the original location, so the effective worktree
+    // root gains the stripped prefix.
+    let mut worktree_root = worktree_root;
     let entries = if matches!(diff_relative, DiffRelativeMode::Off) {
         entries
     } else {
         let prefix = diff_relative_prefix(&diff_relative, &cwd, &git_dir)?;
+        if !prefix.is_empty()
+            && let Some(root) = worktree_root.as_mut()
+        {
+            root.push(repo_path_to_path(&prefix));
+        }
         apply_diff_relative(entries, &prefix)
     };
     let entries: Vec<_> = if diff_filter.all_or_none {
@@ -952,15 +974,30 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
         let show_summary = summary && !name_only && !name_status;
         if show_raw {
+            // git zeroes the worktree-side oid only when it cannot be trusted:
+            // a stat-clean file keeps its index oid in raw output. The
+            // worktree entries carry the freshly-hashed content oid, so
+            // matching it against the index entry reproduces that rule.
+            let index_oids: HashMap<Vec<u8>, ObjectId> = if zero_worktree_oids {
+                let index_path = sley_worktree::repository_index_path(&git_dir);
+                match fs::read(&index_path) {
+                    Ok(bytes) => Index::parse(&bytes, format)?
+                        .entries
+                        .into_iter()
+                        .map(|entry| (entry.path.to_vec(), entry.oid))
+                        .collect(),
+                    Err(_) => HashMap::new(),
+                }
+            } else {
+                HashMap::new()
+            };
             for entry in &entries {
-                write_diff_raw_entry(
-                    &mut stdout,
-                    entry,
-                    z,
-                    zero_worktree_oids,
-                    raw_abbrev,
-                    format,
-                )?;
+                let zero_entry = zero_worktree_oids
+                    && entry
+                        .new_oid
+                        .as_ref()
+                        .is_none_or(|oid| index_oids.get(&entry.path[..]) != Some(oid));
+                write_diff_raw_entry(&mut stdout, entry, z, zero_entry, raw_abbrev, format)?;
             }
         }
         if show_numstat {
@@ -1312,9 +1349,11 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
     if path == prefix {
         return Some(Vec::new());
     }
+    // git matches the prefix as a plain string (`--relative=sub` turns
+    // `subdir/file2` into `dir/file2`), swallowing one separating slash when
+    // the prefix happens to end on a path-component boundary.
     path.strip_prefix(prefix)
-        .and_then(|rest| rest.strip_prefix(b"/"))
-        .map(|rest| rest.to_vec())
+        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
 }
 
 fn log_validate_word_diff(value: &str) -> Result<()> {
