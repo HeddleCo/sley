@@ -1,7 +1,6 @@
 use sley_config::GitConfig;
 use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result};
 use sley_index::{CacheTree, Index, IndexEntry, Stage};
-use sley_object::TreeEntries;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget, RefUpdate, ReflogEntry, branch_ref_name};
@@ -6469,49 +6468,21 @@ fn tree_entries(
     Ok(entries)
 }
 
+/// Flatten a tree's blob leaves into `entries`, keyed by full path.
+///
+/// Delegates to the canonical [`sley_diff_merge::flatten_tree`] (the local
+/// recursive flattener was a byte-identical copy) and adapts its
+/// `(mode, oid)` tuples into this module's [`TrackedEntry`]. Entries already
+/// present in `entries` are overwritten, matching the previous insert-based
+/// behaviour.
 fn collect_tree_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
-    let mut path = Vec::new();
-    collect_tree_entries_into(db, format, tree_oid, &mut path, entries)
-}
-
-fn collect_tree_entries_into(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    path: &mut Vec<u8>,
-    entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
-) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let original_len = path.len();
-        if original_len != 0 {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.name);
-        if entry.mode == 0o040000 {
-            collect_tree_entries_into(db, format, &entry.oid, path, entries)?;
-        } else {
-            entries.insert(
-                path.clone(),
-                TrackedEntry {
-                    mode: entry.mode,
-                    oid: entry.oid,
-                },
-            );
-        }
-        path.truncate(original_len);
+    for (path, (mode, oid)) in sley_diff_merge::flatten_tree(db, format, tree_oid)? {
+        entries.insert(path, TrackedEntry { mode, oid });
     }
     Ok(())
 }

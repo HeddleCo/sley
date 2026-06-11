@@ -2277,6 +2277,14 @@ fn head_tree_entries(
     Ok(entries)
 }
 
+/// Flatten `tree_oid` into `entries` (keyed by `prefix`-rooted full paths),
+/// adapting the canonical [`flatten_tree`] tuples into [`TrackedEntry`].
+///
+/// `flatten_tree` flattens from an empty prefix; each of its paths is rejoined
+/// under `prefix` with [`join_tree_path`], reproducing the recursive
+/// prefix-building this helper previously did inline. Used by the full
+/// (non-pruned) flatten paths: `--find-copies-harder` and the changed-subtree
+/// add/delete sides of the simultaneous diff walk.
 fn collect_tree_entries(
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -2284,31 +2292,9 @@ fn collect_tree_entries(
     prefix: Vec<u8>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let mut path = prefix.clone();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.name);
-        if entry.mode == 0o040000 {
-            collect_tree_entries(db, format, &entry.oid, path, entries)?;
-        } else {
-            entries.insert(
-                path,
-                TrackedEntry {
-                    mode: entry.mode,
-                    oid: entry.oid,
-                },
-            );
-        }
+    for (rel_path, (mode, oid)) in flatten_tree(db, format, tree_oid)? {
+        let path = join_tree_path(&prefix, &rel_path);
+        entries.insert(path, TrackedEntry { mode, oid });
     }
     Ok(())
 }

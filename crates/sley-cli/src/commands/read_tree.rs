@@ -27,7 +27,6 @@
 //! pattern.
 
 use crate::*;
-use sley_object::TreeEntries;
 
 /// A flat map from a repository-relative path to a tree leaf's `(mode, oid)`.
 type LeafMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
@@ -315,51 +314,17 @@ fn resolve_tree_ish(repo: &RepositoryContext, spec: &str) -> Result<ObjectId> {
     }
 }
 
-/// Recursively collect a tree's blob/symlink/gitlink leaves into `out`,
-/// keyed by full path. Subtrees are descended; the path separator is `/`.
-fn collect_tree_leaves(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    prefix: &[u8],
-    out: &mut LeafMap,
-) -> Result<()> {
-    // The empty tree contributes no leaves and need not be stored.
-    if tree_oid == &empty_tree_oid(format)? {
-        return Ok(());
-    }
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let mut path = prefix.to_vec();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.name);
-        if entry.mode == 0o040000 {
-            collect_tree_leaves(db, format, &entry.oid, &path, out)?;
-        } else {
-            out.insert(path, (entry.mode, entry.oid));
-        }
-    }
-    Ok(())
-}
-
 /// Read one tree into a flat path -> (mode, oid) map.
+///
+/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`], which
+/// already short-circuits the (possibly unstored) empty tree and descends
+/// subtrees identically to the local flattener it replaced.
 fn tree_leaf_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<LeafMap> {
-    let mut out = BTreeMap::new();
-    collect_tree_leaves(db, format, tree_oid, &[], &mut out)?;
-    Ok(out)
+    sley_diff_merge::flatten_tree(db, format, tree_oid)
 }
 
 /// Convert a leaf map to sorted stage-0 `(path, entry)` pairs.

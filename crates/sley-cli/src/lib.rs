@@ -1043,45 +1043,15 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
 
 /// Recursively map a tree's blob entries to `(mode, oid)` keyed by full path.
 /// Shared by the stash and merge/cherry-pick/revert replay machinery.
+///
+/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`]; the local
+/// recursive flattener was a byte-identical copy.
 fn stash_tree_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
-    let mut entries = BTreeMap::new();
-    collect_stash_tree_entry_map(db, format, tree_oid, Vec::new(), &mut entries)?;
-    Ok(entries)
-}
-
-fn collect_stash_tree_entry_map(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    prefix: Vec<u8>,
-    entries: &mut BTreeMap<Vec<u8>, (u32, ObjectId)>,
-) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {}, found {}",
-            tree_oid,
-            object.object_type.as_str()
-        )));
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let mut path = prefix.clone();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.name);
-        if entry.mode == 0o040000 {
-            collect_stash_tree_entry_map(db, format, &entry.oid, path, entries)?;
-        } else {
-            entries.insert(path, (entry.mode, entry.oid));
-        }
-    }
-    Ok(())
+    sley_diff_merge::flatten_tree(db, format, tree_oid)
 }
 
 fn ancestor_depths(
@@ -2687,11 +2657,25 @@ fn is_binary_content(bytes: &[u8]) -> bool {
     bytes.contains(&0)
 }
 
+/// `--stat` insertion/deletion line counts, computed by the shared diff-merge
+/// Myers engine rather than a CLI-local LCS.
+///
+/// Myers produces a shortest edit script, so the count of `Insert` lines is
+/// `new_len - lcs` and the count of `Delete` lines is `old_len - lcs` — exactly
+/// the values the removed local LCS counter returned.
 fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
-    let old_lines = diff_lines(old);
-    let new_lines = diff_lines(new);
-    let common = lcs_len(&old_lines, &new_lines);
-    (new_lines.len() - common, old_lines.len() - common)
+    let old_lines = sley_diff_merge::split_lines(old);
+    let new_lines = sley_diff_merge::split_lines(new);
+    let mut inserted = 0usize;
+    let mut deleted = 0usize;
+    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
+        match op {
+            sley_diff_merge::DiffOp::Insert(n) => inserted += n,
+            sley_diff_merge::DiffOp::Delete(n) => deleted += n,
+            sley_diff_merge::DiffOp::Equal(_) => {}
+        }
+    }
+    (inserted, deleted)
 }
 
 fn count_diff_lines(bytes: &[u8]) -> usize {
@@ -2714,23 +2698,6 @@ fn diff_lines(bytes: &[u8]) -> Vec<&[u8]> {
         lines.push(&bytes[start..]);
     }
     lines
-}
-
-fn lcs_len(left: &[&[u8]], right: &[&[u8]]) -> usize {
-    let mut previous = vec![0; right.len() + 1];
-    let mut current = vec![0; right.len() + 1];
-    for left_line in left {
-        for (idx, right_line) in right.iter().enumerate() {
-            current[idx + 1] = if left_line == right_line {
-                previous[idx] + 1
-            } else {
-                previous[idx + 1].max(current[idx])
-            };
-        }
-        std::mem::swap(&mut previous, &mut current);
-        current.fill(0);
-    }
-    previous[right.len()]
 }
 
 fn apply_diff_pathspec(
