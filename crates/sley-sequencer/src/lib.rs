@@ -1,3 +1,5 @@
+pub mod replay;
+
 use sley_core::{GitError, ObjectId, Result};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag};
 use sley_odb::FileObjectDatabase;
