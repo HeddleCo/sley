@@ -221,6 +221,32 @@ fn render_notes_block(
 }
 
 pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
+    cmd_log_impl(args, false)
+}
+
+/// `git whatchanged --i-still-use-this`: log with raw diff output by default
+/// and `always_show_header = 0` semantics (commits whose diff comes out empty
+/// — e.g. merges — are omitted entirely).
+pub(crate) fn cmd_whatchanged(args: &[String]) -> Result<()> {
+    let mut acknowledged = false;
+    let mut filtered = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg == "--i-still-use-this" {
+            acknowledged = true;
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+    if !acknowledged {
+        eprintln!(
+            "fatal: git whatchanged is nominated for removal.\nIf you still use this command, add an extra option, '--i-still-use-this',\non the command line and let us know you still use it by sending an e-mail\nto <git@vger.kernel.org>.  Thanks."
+        );
+        return Err(GitError::Exit(128));
+    }
+    cmd_log_impl(&filtered, true)
+}
+
+fn cmd_log_impl(args: &[String], whatchanged: bool) -> Result<()> {
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
     let mut linear_ranges = Vec::new();
@@ -578,8 +604,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             | "--clear-decorations"
             | "--no-decorate-refs"
             | "--no-decorate-refs-exclude"
-            | "--no-patch"
-            | "--no-diff-merges"
             | "--full-diff"
             | "--relative"
             | "--no-relative"
@@ -620,8 +644,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             | "-C"
             | "-B"
             | "-D"
-            | "-m"
-            | "-s"
             | "-b"
             | "-w"
             | "-bw"
@@ -655,10 +677,11 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 let value = iter
                     .next()
                     .ok_or_else(log_diff_merges_requires_value_error)?;
-                log_validate_diff_merges(value)?;
+                diff_opts.merges = Some(log_parse_diff_merges(value)?);
             }
             value if value.starts_with("--diff-merges=") => {
-                log_validate_diff_merges(&value["--diff-merges=".len()..])?;
+                diff_opts.merges =
+                    Some(log_parse_diff_merges(&value["--diff-merges=".len()..])?);
             }
             "--no-walk=sorted" => {
                 walk = false;
@@ -1125,15 +1148,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             }
             "--raw" => diff_opts.raw = true,
             "-m" => diff_opts.merges = Some(LogDiffMerges::FirstParent),
-            "--no-diff-merges" | "--diff-merges=off" | "--diff-merges=none" => {
-                diff_opts.merges = Some(LogDiffMerges::Off);
-            }
-            "--diff-merges=first-parent" | "--diff-merges=1" => {
-                diff_opts.merges = Some(LogDiffMerges::FirstParent);
-            }
-            "--diff-merges=m" | "--diff-merges=on" | "--diff-merges=separate" => {
-                diff_opts.merges = Some(LogDiffMerges::FirstParent);
-            }
+            "--no-diff-merges" => diff_opts.merges = Some(LogDiffMerges::Off),
             "--root" => show_root_flag = Some(true),
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!("unsupported log option {value}")));
@@ -1181,6 +1196,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         eprintln!("fatal: cannot combine --no-walk with --graph");
         return Err(GitError::Exit(128));
     }
+    if whatchanged && !diff_opts.any() {
+        diff_opts.raw = true;
+    }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
@@ -1189,7 +1207,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let output_encoding = log_output_encoding(&config);
     // Per-commit diff rendering context (only consulted when a diff-output
     // option was given).
-    let log_diff = if diff_opts.any() {
+    let log_diff = if diff_opts.any()
+        || matches!(diff_opts.merges, Some(LogDiffMerges::FirstParent))
+    {
         let show_root = show_root_flag.unwrap_or_else(|| {
             config
                 .get_bool("log", None, "showroot")
@@ -1806,7 +1826,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                             + log_prefix_display_width(prefix);
                         let block = log_diff.render(record, prefix_width)?;
                         if !block.is_empty() {
-                            msg.push(b'\n');
+                            msg.extend_from_slice(diff_opts.block_separator());
                             msg.extend_from_slice(&block);
                         }
                     }
@@ -1819,12 +1839,28 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    let mut printed_entries = 0usize;
     for (index, record) in selected.iter().enumerate() {
         match output {
             LogOutput::Default(kind) => {
-                if index > 0 {
+                // The diff block is rendered up front: whatchanged
+                // (always_show_header = 0) omits the whole entry when the
+                // commit's diff comes out empty.
+                let diff_block = match &log_diff {
+                    Some(log_diff) => {
+                        let prefix_width =
+                            log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
+                        log_diff.render(record, prefix_width)?
+                    }
+                    None => Vec::new(),
+                };
+                if whatchanged && log_diff.is_some() && diff_block.is_empty() {
+                    continue;
+                }
+                if printed_entries > 0 {
                     println!();
                 }
+                printed_entries += 1;
                 print!(
                     "commit {}",
                     format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
@@ -1862,15 +1898,10 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                     )?;
                     io::stdout().write_all(&notes)?;
                 }
-                if let Some(log_diff) = &log_diff {
-                    let prefix_width =
-                        log_prefix_display_width(line_prefix.as_deref().unwrap_or(""));
-                    let block = log_diff.render(record, prefix_width)?;
-                    if !block.is_empty() {
-                        let mut stdout = io::stdout();
-                        stdout.write_all(b"\n")?;
-                        stdout.write_all(&block)?;
-                    }
+                if !diff_block.is_empty() {
+                    let mut stdout = io::stdout();
+                    stdout.write_all(diff_opts.block_separator())?;
+                    stdout.write_all(&diff_block)?;
                 }
             }
             LogOutput::Compiled {
@@ -1879,6 +1910,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 show_children: compiled_children,
                 inline_children,
             } => {
+                printed_entries += 1;
                 let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
                 if index > 0 && !final_newline {
                     io::stdout().write_all(term)?;
@@ -2151,6 +2183,27 @@ enum LogDiffMerges {
     FirstParent,
 }
 
+/// Parse a `--diff-merges=<value>` into the supported modes.
+fn log_parse_diff_merges(value: &str) -> Result<LogDiffMerges> {
+    match value {
+        "off" | "none" => Ok(LogDiffMerges::Off),
+        // "on"/"m" follow the diff-merges default (separate); sley renders the
+        // first-parent diff for these until separate/combined modes land.
+        "first-parent" | "1" | "on" | "separate" | "m" => Ok(LogDiffMerges::FirstParent),
+        "" => {
+            eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
+            Err(GitError::Exit(128))
+        }
+        "combined" | "c" | "dense-combined" | "cc" | "remerge" | "r" => Err(GitError::Command(
+            format!("unsupported log option --diff-merges={value}"),
+        )),
+        _ => {
+            eprintln!("fatal: invalid value for '--diff-merges': '{value}'");
+            Err(GitError::Exit(128))
+        }
+    }
+}
+
 /// Diff-output options accepted by `git log` (`-p`, `--stat`, `--raw`, ...).
 #[derive(Debug, Clone)]
 struct LogDiffOptions {
@@ -2184,6 +2237,17 @@ impl Default for LogDiffOptions {
 }
 
 impl LogDiffOptions {
+    /// The bytes separating a commit's message from its diff block in the
+    /// default output: `---` when a diffstat accompanies the patch
+    /// (`--patch-with-stat`), a blank line otherwise.
+    fn block_separator(&self) -> &'static [u8] {
+        if self.patch && (self.stat || self.compact_summary) {
+            b"---\n"
+        } else {
+            b"\n"
+        }
+    }
+
     /// Whether any diff output was requested at all.
     fn any(&self) -> bool {
         self.patch
@@ -2218,20 +2282,26 @@ impl LogDiffContext<'_> {
     /// lines WITHOUT a leading blank line (the caller owns separators, which
     /// differ between the default and oneline/format outputs).
     fn render(&self, record: &sley_rev::CommitRecord, line_prefix_width: i64) -> Result<Vec<u8>> {
-        if !self.opts.any() {
+        // An explicit non-off --diff-merges without any diff-output option
+        // shows patches for merge commits only.
+        let merges_only = !self.opts.any();
+        if merges_only
+            && (record.commit.parents.len() <= 1 || self.merges == LogDiffMerges::Off)
+        {
             return Ok(Vec::new());
         }
-        let parent_tree = match record.parents.len() {
+        let parents = &record.commit.parents;
+        let parent_tree = match parents.len() {
             0 => {
                 if !self.show_root {
                     return Ok(Vec::new());
                 }
                 None
             }
-            1 => Some(self.parent_tree(&record.parents[0])?),
+            1 => Some(self.parent_tree(&parents[0])?),
             _ => match self.merges {
                 LogDiffMerges::Off => return Ok(Vec::new()),
-                LogDiffMerges::FirstParent => Some(self.parent_tree(&record.parents[0])?),
+                LogDiffMerges::FirstParent => Some(self.parent_tree(&parents[0])?),
             },
         };
         let base = sley_diff_merge::DiffNameStatusOptions {
@@ -2278,6 +2348,7 @@ impl LogDiffContext<'_> {
 
         let mut out: Vec<u8> = Vec::new();
         let opts = self.opts;
+        let patch = opts.patch || merges_only;
         if opts.raw {
             for entry in &entries {
                 write_diff_raw_entry(&mut out, entry, false, false, self.raw_abbrev, self.format)?;
@@ -2314,7 +2385,7 @@ impl LogDiffContext<'_> {
                 write_diff_summary_entry(&mut out, entry)?;
             }
         }
-        if opts.patch {
+        if patch {
             if opts.raw
                 || opts.numstat
                 || opts.stat

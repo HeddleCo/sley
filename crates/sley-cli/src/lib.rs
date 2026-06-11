@@ -210,6 +210,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "ls-files" => commands::index::cmd_ls_files(&args[1..]),
         "ls-tree" => commands::index::cmd_ls_tree(&args[1..]),
         "log" => commands::log::cmd_log(&args[1..]),
+        "whatchanged" => commands::log::cmd_whatchanged(&args[1..]),
         "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(&args[1..]),
         "pull" => {
@@ -1909,7 +1910,7 @@ fn diff_raw_oid(
     format: ObjectFormat,
 ) -> String {
     let zero_width = abbrev.unwrap_or_else(|| format.hex_len());
-    if zero {
+    let mut hex = if zero {
         "0".repeat(zero_width)
     } else {
         oid.map(|oid| {
@@ -1918,7 +1919,16 @@ fn diff_raw_oid(
             hex[..width].to_string()
         })
         .unwrap_or_else(|| "0".repeat(zero_width))
+    };
+    // git's diff_aligned_abbrev: under GIT_PRINT_SHA1_ELLIPSIS=yes an
+    // abbreviated raw oid carries a "..." tail (the old-style aligned form
+    // t4013's default cells still exercise).
+    if hex.len() < format.hex_len()
+        && std::env::var("GIT_PRINT_SHA1_ELLIPSIS").is_ok_and(|value| value == "yes")
+    {
+        hex.push_str("...");
     }
+    hex
 }
 
 #[derive(Clone, Copy)]
