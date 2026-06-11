@@ -55,6 +55,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut regexp_mode = SimpleLogRegexMode::Basic;
     let mut date_mode = ForEachRefDateMode::Default;
     let mut date_explicit = false;
+    // `-z` / `--null`: separate/terminate compiled-format entries with NUL
+    // instead of newline.
+    let mut null_terminate = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -752,6 +755,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-show-signature=") => {
                 return log_fatal_unrecognized_argument(value);
             }
+            "-z" | "--null" => null_terminate = true,
+            "--no-null" => null_terminate = false,
             "--oneline" => {
                 preset_oneline = Some(false);
                 pretty_spec = None;
@@ -1114,11 +1119,12 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             _ => unreachable!("metadata fast path requires compiled output"),
         };
         let mut stdout = io::stdout();
+        let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
         for (index, record) in selected.iter().enumerate() {
             // `--pretty=format:` separates entries with a newline (none trailing);
             // `--format=`/`tformat:`/oneline terminate each entry with one.
             if index > 0 && !final_newline {
-                stdout.write_all(b"\n")?;
+                stdout.write_all(term)?;
             }
             let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
             emit_compiled_log_format_metadata(
@@ -1140,7 +1146,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             )?;
             stdout.write_all(&line)?;
             if final_newline {
-                stdout.write_all(b"\n")?;
+                stdout.write_all(term)?;
             }
         }
         stdout.flush()?;
@@ -1266,8 +1272,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 show_children: compiled_children,
                 inline_children,
             } => {
+                let term: &[u8] = if null_terminate { b"\0" } else { b"\n" };
                 if index > 0 && !final_newline {
-                    println!();
+                    io::stdout().write_all(term)?;
                 }
                 let format_context = LogFormatContext {
                     abbrev_len,
@@ -1293,7 +1300,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                     print_log_format(record, compiled, format_context)?;
                 }
                 if final_newline {
-                    println!();
+                    io::stdout().write_all(term)?;
                 }
             }
         }
