@@ -37,10 +37,14 @@ sley-transport = { path = "../sley-transport", features = ["http-client", "tls-r
 sley-worktree = { path = "../sley-worktree" }
 
 [features]
-# Build the sley binary with flate2's miniz_oxide backend instead of the default
-# zlib-rs (forwarded to sley-odb / sley-pack). For no-C/wasm targets; both are
-# pure-Rust, decompression is byte-identical, zlib-rs is the faster default.
-pure-rust = ["sley-odb/pure-rust", "sley-pack/pure-rust"]
+# The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
+# speed, no C). The `pure-rust` miniz_oxide fallback is a leaf-crate feature on
+# sley-odb / sley-pack: a no-C/wasm consumer that needs it depends on those
+# crates directly with `default-features = false, features = ["pure-rust"]`. It
+# is NOT exposed here because the binary's many transitive sley-odb consumers
+# re-enable the default zlib-rs under Cargo feature unification, so a top-level
+# forward could not actually swap the backend.
+#
 # Build the sley binary with the hardware-accelerated SHA-1 backend (forwarded to
 # sley-core). Default builds stay pure-Rust; OIDs are byte-identical either way.
 fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1", "sley-pack/fast-sha1"]

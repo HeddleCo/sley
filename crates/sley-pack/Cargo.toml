@@ -7,19 +7,25 @@ license.workspace = true
 
 [dependencies]
 crc32fast = "1"
-# Default (de)compression backend is zlib-rs: a pure-Rust port of zlib-ng with
-# ~zlib-ng throughput and NO C toolchain / cmake dependency. The `pure-rust`
-# feature swaps in flate2's miniz_oxide (`rust_backend`) for no-C/wasm targets
-# that can't pull in zlib-rs.
-flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+# No backend baked into the dep line: the backend is picked by exactly one of
+# the mutually-exclusive `zlib-rs`/`pure-rust` crate features below. flate2's
+# backend cfg cascade ranks zlib-rs above miniz_oxide, so an additive feature
+# can't *unselect* zlib-rs once it's on — hence default-on zlib-rs + a
+# `--no-default-features` swap to `pure-rust`, which is the only way Cargo's
+# additive features express mutual exclusion.
+flate2 = { version = "1", default-features = false }
 sley-core = { path = "../sley-core" }
 sley-formats = { path = "../sley-formats" }
 sley-object = { path = "../sley-object" }
 
 [features]
-# Swap the default zlib-rs backend for flate2's pure-Rust miniz_oxide backend.
-# Use on targets where zlib-rs is unavailable (e.g. some wasm/no-C builds);
-# slower than zlib-rs but has zero non-Rust deps either way.
+default = ["zlib-rs"]
+# Default backend: zlib-rs, a pure-Rust port of zlib-ng — ~zlib-ng throughput,
+# NO C toolchain / cmake. Cargo.lock gains zlib-rs, not libz-ng-sys.
+zlib-rs = ["flate2/zlib-rs"]
+# Fallback backend: flate2's miniz_oxide (`rust_backend`). Slower than zlib-rs
+# but available on no-C/wasm targets where zlib-rs is unavailable. Select with
+# `--no-default-features --features pure-rust`; decompression is byte-identical.
 pure-rust = ["flate2/rust_backend"]
 # Forward the hardware-accelerated SHA-1 backend (see sley-core).
 fast-sha1 = ["sley-core/fast-sha1"]

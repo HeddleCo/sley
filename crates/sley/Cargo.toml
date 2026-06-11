@@ -25,10 +25,11 @@ default = ["remote"]
 # Callable fetch/push/clone/ls-remote orchestration (heddle transport surface).
 # Enabled by default; disable with `default-features = false` for a smaller dep tree.
 remote = ["dep:sley-remote", "sley-remote/http"]
-# Swap the default zlib-rs backend for flate2's miniz_oxide (forwarded to
-# sley-odb). For no-C/wasm targets; both are pure-Rust, decompression is
-# byte-identical, zlib-rs is the faster default.
-pure-rust = ["sley-odb/pure-rust"]
+# The (de)compression backend is the default-on zlib-rs (pure Rust, ~zlib-ng
+# speed, no C). The `pure-rust` miniz_oxide fallback lives on sley-odb / sley-pack
+# as a leaf-crate feature (`--no-default-features --features pure-rust`); it is
+# not re-exported here because feature unification across this crate's other
+# sley-odb consumers re-enables the default zlib-rs, so a forward could not swap it.
 # Opt into the hardware-accelerated SHA-1 backend (forwarded to sley-core via
 # sley-odb). Default builds stay pure-Rust. OIDs are byte-identical either way.
 fast-sha1 = ["sley-core/fast-sha1", "sley-odb/fast-sha1"]
