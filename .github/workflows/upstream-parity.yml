@@ -39,9 +39,10 @@ jobs:
   upstream-parity:
     name: Upstream parity (floor-gated subset)
     runs-on: ubuntu-latest
-    # 37 tracked t-files (round-2 added 10, incl. the slow bitmap pair) +
-    # oracle-git build on cache miss; 30 min was sized for the 27-file list.
-    timeout-minutes: 45
+    # 48 tracked t-files (round-3 added 11: rebase-i, bitmaps-b, diff-formats,
+    # incl. the slow t5327 multi-pack rev suite) + oracle-git build on cache
+    # miss; 45 min was sized for the 37-file list.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -116,17 +117,28 @@ jobs:
             t3103-ls-tree-misc.sh
             t3200-branch.sh
             t3301-notes.sh
+            t3403-rebase-skip.sh
+            t3404-rebase-interactive.sh
+            t3406-rebase-message.sh
+            t3418-rebase-continue.sh
+            t3420-rebase-autostash.sh
             t3501-revert-cherry-pick.sh
             t3502-cherry-pick-merge.sh
             t3505-cherry-pick-empty.sh
             t3507-cherry-pick-conflict.sh
             t3510-cherry-pick-sequence.sh
+            t4013-diff-various.sh
+            t4045-diff-relative.sh
+            t4047-diff-dirstat.sh
+            t4052-stat-output.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
             t4214-log-graph-octopus.sh
             t4215-log-skewed-merges.sh
             t5310-pack-bitmaps.sh
             t5326-multi-pack-bitmaps.sh
+            t5327-multi-pack-bitmaps-rev.sh
+            t5332-multi-pack-reuse.sh
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh

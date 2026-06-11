@@ -14,6 +14,9 @@
 # Round-2 floors (sequencer/graph/bitmaps) measured 2026-06-11 at the
 # integ/round2 tip (epic/sley-sequencer-c + epic/sley-graph-c +
 # epic/sley-bitmaps-a merged onto baac87c).
+# Round-3 floors (rebase-i/bitmaps-b/diff-formats) measured 2026-06-11 at the
+# integ/round3 tip (epic/sley-rebase-i + epic/sley-bitmaps-b +
+# epic/sley-diff-formats merged onto 04f10f8).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -28,23 +31,23 @@ fi
 
 # script -> floor (minimum acceptable ok-assertion count).
 declare -A FLOOR=(
-    [t0001-init.sh]=99
-    [t1006-cat-file.sh]=285
+    [t0001-init.sh]=100
+    [t1006-cat-file.sh]=289
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=445
     [t1401-symbolic-ref.sh]=25
     [t1500-rev-parse.sh]=80
-    [t2400-worktree-add.sh]=161
+    [t2400-worktree-add.sh]=162
     [t3070-wildmatch.sh]=1861
-    [t6300-for-each-ref.sh]=337
+    [t6300-for-each-ref.sh]=358
     [t7004-tag.sh]=159
-    [t3200-branch.sh]=70
+    [t3200-branch.sh]=116
     [t0027-auto-crlf.sh]=2281
     [t2107-update-index-basic.sh]=9
     [t7810-grep.sh]=228
     [t3301-notes.sh]=144
-    [t1461-refs-list.sh]=337
-    [t1462-refs-exists.sh]=11
+    [t1461-refs-list.sh]=358
+    [t1462-refs-exists.sh]=12
     [t1510-repo-setup.sh]=109
     [t6423-merge-rename-directories.sh]=14
     [t3501-revert-cherry-pick.sh]=21
@@ -55,16 +58,27 @@ declare -A FLOOR=(
     [t4214-log-graph-octopus.sh]=17
     [t4215-log-skewed-merges.sh]=9
     [t6030-bisect-porcelain.sh]=95
-    [t5310-pack-bitmaps.sh]=160
-    [t5326-multi-pack-bitmaps.sh]=312
+    [t5310-pack-bitmaps.sh]=218
+    [t5326-multi-pack-bitmaps.sh]=336
     [t6113-rev-list-bitmap-filters.sh]=13
     [t2020-checkout-detach.sh]=16
     [t6003-rev-list-topo-order.sh]=36
-    [t6012-rev-list-simplify.sh]=8
+    [t6012-rev-list-simplify.sh]=9
     [t4205-log-pretty-formats.sh]=108
-    [t4202-log.sh]=52
+    [t4202-log.sh]=54
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
+    [t3403-rebase-skip.sh]=16
+    [t3404-rebase-interactive.sh]=36
+    [t3406-rebase-message.sh]=9
+    [t3418-rebase-continue.sh]=11
+    [t3420-rebase-autostash.sh]=28
+    [t5327-multi-pack-bitmaps-rev.sh]=308
+    [t5332-multi-pack-reuse.sh]=9
+    [t4013-diff-various.sh]=124
+    [t4052-stat-output.sh]=71
+    [t4045-diff-relative.sh]=29
+    [t4047-diff-dirstat.sh]=41
 )
 
 fail=0
