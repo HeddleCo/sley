@@ -973,7 +973,6 @@ fn parse_show_args(args: &[String]) -> Result<ShowOptions> {
             | "--ext-diff"
             | "--no-textconv"
             | "--textconv"
-            | "--no-notes"
             | "--no-show-signature"
             | "--root" => {}
             value if value.starts_with("--color=") => {}
