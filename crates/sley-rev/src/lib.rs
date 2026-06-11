@@ -1490,8 +1490,13 @@ fn tree_same_for_pathspec(
         find_copies_harder: false,
         rename_empty: false,
     };
-    let changes =
-        sley_diff_merge::diff_name_status_trees_with_options(db, format, parent_tree, commit_tree, options)?;
+    let changes = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        parent_tree,
+        commit_tree,
+        options,
+    )?;
     for entry in &changes {
         if pathspec.is_empty() || pathspec.matches(entry.path.as_bytes()) {
             return Ok(false);
@@ -1515,8 +1520,12 @@ fn tree_same_as_empty_for_pathspec(
         find_copies_harder: false,
         rename_empty: false,
     };
-    let changes =
-        sley_diff_merge::diff_name_status_empty_tree_with_options(db, format, commit_tree, options)?;
+    let changes = sley_diff_merge::diff_name_status_empty_tree_with_options(
+        db,
+        format,
+        commit_tree,
+        options,
+    )?;
     for entry in &changes {
         if pathspec.is_empty() || pathspec.matches(entry.path.as_bytes()) {
             return Ok(false);
@@ -1560,7 +1569,8 @@ fn compute_treesame(
         let commit_tree = commit_tree_oid(record);
         let mut simplify = CommitSimplify::default();
         if record.parents.is_empty() {
-            simplify.treesame = tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
+            simplify.treesame =
+                tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
             out.insert(record.oid, simplify);
             continue;
         }
@@ -1740,7 +1750,10 @@ pub fn simplify_history(
     // default-mode simplification truncated a merge, else the real parents
     // (first-parent-limited when requested).
     let effective_parents = |oid: &ObjectId, real: &[ObjectId]| -> Vec<ObjectId> {
-        if let Some(div) = simplify.get(oid).and_then(|s| s.simplified_parents.as_ref()) {
+        if let Some(div) = simplify
+            .get(oid)
+            .and_then(|s| s.simplified_parents.as_ref())
+        {
             return div.clone();
         }
         if options.first_parent {
