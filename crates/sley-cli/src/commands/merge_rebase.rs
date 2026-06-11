@@ -501,7 +501,7 @@ fn current_branch_short_name(refs: &FileRefStore) -> Result<Option<String>> {
 /// `GIT_CONFIG_*` overrides layered on top (highest precedence), mirroring how
 /// git applies `-c` to every config read — not just `git config`. Returns `None`
 /// outside a repository.
-fn effective_config_with_overrides() -> Option<GitConfig> {
+pub(crate) fn effective_config_with_overrides() -> Option<GitConfig> {
     let mut config = identity_effective_config()?;
     if let Ok(parameters) = crate::injected_config_parameters() {
         config

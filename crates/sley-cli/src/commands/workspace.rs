@@ -393,6 +393,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     orphan: false,
                 };
             }
+            "--detach" => branch_mode = CheckoutBranchMode::Detach,
             "--orphan" => {
                 let branch = iter.next().ok_or_else(|| {
                     GitError::Command("checkout --orphan requires a branch".into())
@@ -552,6 +553,47 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     }
 
     let checkout_message = match branch_mode {
+        CheckoutBranchMode::Detach => {
+            if positional.len() > 1 {
+                return Err(GitError::Command(
+                    "checkout --detach accepts at most one commit".into(),
+                ));
+            }
+            let target = positional.first().map(String::as_str).unwrap_or("HEAD");
+            let target_oid = resolve_revision(&git_dir, format, target)?;
+            let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+            let target_oid = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+            let store = FileRefStore::new(&git_dir, format);
+            let from = checkout_reflog_from_name(&store);
+            let config = read_repo_config(&git_dir)?;
+            let subject = detached_checkout_subject(&git_dir, format, &target_oid);
+            let message = format!("checkout: moving from {from} to {target}").into_bytes();
+            match sley_worktree::checkout_detached_filtered(
+                &worktree_root,
+                &git_dir,
+                format,
+                &target_oid,
+                commit_identity_from_env("COMMITTER")?,
+                message.clone(),
+                &config,
+            ) {
+                Ok(_) => {}
+                Err(err) if checkout_is_dirty_tree_error(&err) => {
+                    checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid))?;
+                    detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                }
+                Err(err) => return Err(err),
+            }
+            sley_sequencer::replay::remove_branch_state(&git_dir);
+            if !quiet {
+                eprintln!(
+                    "HEAD is now at {} {}",
+                    format_log_abbrev_oid(&target_oid),
+                    subject
+                );
+            }
+            return Ok(());
+        }
         CheckoutBranchMode::Existing => {
             let [branch] = positional.as_slice() else {
                 return Err(GitError::Command(
@@ -572,15 +614,25 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             {
                 let config = read_repo_config(&git_dir)?;
                 let subject = detached_checkout_subject(&git_dir, format, &target_oid);
-                sley_worktree::checkout_detached_filtered(
+                let from = checkout_reflog_from_name(&store);
+                let message =
+                    format!("checkout: moving from {from} to {branch}").into_bytes();
+                match sley_worktree::checkout_detached_filtered(
                     &worktree_root,
                     &git_dir,
                     format,
                     &target_oid,
                     commit_identity_from_env("COMMITTER")?,
-                    format!("checkout: moving to {branch}").into_bytes(),
+                    message.clone(),
                     &config,
-                )?;
+                ) {
+                    Ok(_) => {}
+                    Err(err) if checkout_is_dirty_tree_error(&err) => {
+                        checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target_oid))?;
+                        detach_head_with_reflog(&git_dir, format, &target_oid, message)?;
+                    }
+                    Err(err) => return Err(err),
+                }
                 sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!(
@@ -637,14 +689,25 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let branch = checkout_message.branch();
 
     let config = read_repo_config(&git_dir)?;
-    sley_worktree::checkout_branch_filtered(
-        worktree_root,
+    match sley_worktree::checkout_branch_filtered(
+        &worktree_root,
         git_dir.clone(),
         format,
         branch,
         commit_identity_from_env("COMMITTER")?,
         &config,
-    )?;
+    ) {
+        Ok(_) => {}
+        Err(err) if checkout_is_dirty_tree_error(&err) => {
+            let store = FileRefStore::new(&git_dir, format);
+            let from = checkout_reflog_from_name(&store);
+            let target = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)?
+                .ok_or_else(|| GitError::reference_not_found("branch"))?;
+            checkout_twoway_dirty(&git_dir, &worktree_root, format, Some(&target))?;
+            switch_head_symbolic_with_reflog(&git_dir, format, branch, &target, &from)?;
+        }
+        Err(err) => return Err(err),
+    }
     sley_sequencer::replay::remove_branch_state(&git_dir);
     if !quiet {
         checkout_message.print();
@@ -653,6 +716,25 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
+    // `switch --orphan <name>` clears the index and worktree of files carried
+    // from the old HEAD (a twoway checkout to the empty tree), unlike
+    // `checkout --orphan` which keeps them staged.
+    if let Some(pos) = args.iter().position(|arg| arg == "--orphan") {
+        let Some(branch) = args.get(pos + 1) else {
+            return Err(GitError::Command("switch --orphan requires a branch".into()));
+        };
+        let cwd = env::current_dir()?;
+        let git_dir = discover_git_dir(&cwd)?;
+        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        let format = repository_object_format(&git_dir)?;
+        checkout_twoway_dirty(&git_dir, &worktree_root, format, None)?;
+        checkout_switch_to_unborn_branch(&git_dir, branch)?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+        if !args.iter().any(|arg| arg == "-q" || arg == "--quiet") {
+            eprintln!("Switched to a new branch '{branch}'");
+        }
+        return Ok(());
+    }
     let mut checkout_args = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -675,6 +757,7 @@ pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
                         .to_string(),
                 );
             }
+            "-d" => checkout_args.push("--detach".to_string()),
             "-C" | "--force-create" => {
                 checkout_args.push("-B".to_string());
                 let branch = iter
@@ -894,8 +977,238 @@ pub(crate) fn cmd_restore(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Dirty-tolerant two-way checkout fallback: paths whose content is the same
+/// in the current HEAD and the target carry their index/worktree state across
+/// the switch (git's twoway_merge); paths that must change are updated only
+/// when clean, and staged changes that conflict with the target refuse the
+/// switch. `target` of `None` switches to the empty tree (`switch --orphan`).
+fn checkout_twoway_dirty(
+    git_dir: &Path,
+    worktree_root: &Path,
+    format: ObjectFormat,
+    target: Option<&ObjectId>,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let target_map = match target {
+        Some(target) => {
+            let tree = commands::merge_rebase::commit_tree_oid(&db, format, target)?;
+            stash_tree_entry_map(&db, format, &tree)?
+        }
+        None => BTreeMap::new(),
+    };
+    let refs = FileRefStore::new(git_dir, format);
+    let head_map = match commands::merge_rebase::head_commit_oid(&refs)? {
+        Some(head) => {
+            let tree = commands::merge_rebase::commit_tree_oid(&db, format, &head)?;
+            stash_tree_entry_map(&db, format, &tree)?
+        }
+        None => BTreeMap::new(),
+    };
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let old_index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let mut stage0: BTreeMap<Vec<u8>, IndexEntry> = BTreeMap::new();
+    for entry in &old_index.entries {
+        if index_entry_stage(entry) > 0 {
+            eprintln!("error: you need to resolve your current index first");
+            return Err(GitError::Exit(1));
+        }
+        stage0.insert(entry.path.clone().into_bytes(), entry.clone());
+    }
+    let all_paths: BTreeSet<Vec<u8>> = stage0
+        .keys()
+        .cloned()
+        .chain(target_map.keys().cloned())
+        .chain(head_map.keys().cloned())
+        .collect();
+    let mut blocked: Vec<Vec<u8>> = Vec::new();
+    let mut updates: Vec<(Vec<u8>, (u32, ObjectId))> = Vec::new();
+    let mut deletions: Vec<Vec<u8>> = Vec::new();
+    // Paths the new index keeps from the old index even though the target
+    // tree disagrees (the twoway "carry" rule: HEAD and target agree).
+    let mut carried: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for path in &all_paths {
+        let current = stage0.get(path).map(|entry| (entry.mode, entry.oid));
+        let wanted = target_map.get(path).copied();
+        let in_head = head_map.get(path).copied();
+        if in_head == wanted {
+            // Same on both sides of the switch: carry local state verbatim.
+            if current.is_some() && wanted != current {
+                carried.insert(path.clone());
+            }
+            continue;
+        }
+        if current == wanted {
+            continue;
+        }
+        if current != in_head {
+            // Staged (or missing) state conflicts with the switch.
+            blocked.push(path.clone());
+            continue;
+        }
+        let rel = String::from_utf8_lossy(path).into_owned();
+        let full = worktree_root.join(&rel);
+        if let Some(entry) = stage0.get(path) {
+            if let Ok(bytes) = fs::read(&full) {
+                let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+                if on_disk != entry.oid {
+                    blocked.push(path.clone());
+                    continue;
+                }
+            }
+        } else if let Some((_, oid)) = &wanted
+            && let Ok(bytes) = fs::read(&full)
+        {
+            // Untracked file in the way: only identical content may be adopted.
+            let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+            if &on_disk != oid {
+                eprintln!(
+                    "error: The following untracked working tree files would be overwritten by checkout:"
+                );
+                eprintln!("\t{rel}");
+                eprintln!("Please move or remove them before you switch branches.");
+                eprintln!("Aborting");
+                return Err(GitError::Exit(1));
+            }
+        }
+        match wanted {
+            Some(entry) => updates.push((path.clone(), entry)),
+            None => deletions.push(path.clone()),
+        }
+    }
+    if !blocked.is_empty() {
+        eprintln!(
+            "error: Your local changes to the following files would be overwritten by checkout:"
+        );
+        for path in &blocked {
+            eprintln!("\t{}", String::from_utf8_lossy(path));
+        }
+        eprintln!("Please commit your changes or stash them before you switch branches.");
+        eprintln!("Aborting");
+        return Err(GitError::Exit(1));
+    }
+    for (path, (mode, oid)) in &updates {
+        let content = commands::merge_rebase::merge_read_blob(&db, oid)?;
+        commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &content, *mode)?;
+    }
+    for path in &deletions {
+        commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+    }
+    let mut entries: Vec<IndexEntry> = Vec::new();
+    for (path, (mode, oid)) in &target_map {
+        if carried.contains(path) {
+            continue;
+        }
+        if let Some(old) = stage0.get(path)
+            && old.mode == *mode
+            && old.oid == *oid
+        {
+            entries.push(old.clone());
+        } else {
+            entries.push(commands::merge_rebase::merge_index_entry(
+                path, *mode, *oid, 0,
+            ));
+        }
+    }
+    for path in &carried {
+        if let Some(old) = stage0.get(path) {
+            entries.push(old.clone());
+        }
+    }
+    // Staged adds whose path is in neither tree are carried too.
+    for (path, entry) in &stage0 {
+        if !target_map.contains_key(path)
+            && !head_map.contains_key(path)
+            && !carried.contains(path)
+        {
+            entries.push(entry.clone());
+        }
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(
+        &index_path,
+        Index {
+            version: 2,
+            entries,
+            extensions: Vec::new(),
+            checksum: None,
+        }
+        .write(format)?,
+    )?;
+    Ok(())
+}
+
+fn checkout_is_dirty_tree_error(err: &GitError) -> bool {
+    matches!(err, GitError::Transaction(msg) if msg.contains("clean working tree"))
+}
+
+fn detach_head_with_reflog(
+    git_dir: &Path,
+    format: ObjectFormat,
+    target: &ObjectId,
+    message: Vec<u8>,
+) -> Result<()> {
+    let refs = FileRefStore::new(git_dir, format);
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Direct(*target),
+        reflog: Some(ReflogEntry {
+            old_oid: ObjectId::null(format),
+            new_oid: *target,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message,
+        }),
+    });
+    tx.commit()
+}
+
+fn switch_head_symbolic_with_reflog(
+    git_dir: &Path,
+    format: ObjectFormat,
+    branch: &str,
+    target: &ObjectId,
+    from: &str,
+) -> Result<()> {
+    let refs = FileRefStore::new(git_dir, format);
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: "HEAD".into(),
+        expected: None,
+        new: RefTarget::Symbolic(branch_ref_name(branch)?),
+        reflog: Some(ReflogEntry {
+            old_oid: *target,
+            new_oid: *target,
+            committer: commit_identity_from_env("COMMITTER")?,
+            message: format!("checkout: moving from {from} to {branch}").into_bytes(),
+        }),
+    });
+    tx.commit()
+}
+
+fn checkout_reflog_from_name(store: &FileRefStore) -> String {
+    match store.read_ref("HEAD") {
+        Ok(Some(RefTarget::Symbolic(name))) => name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&name)
+            .to_string(),
+        Ok(Some(RefTarget::Direct(oid))) => oid.to_hex(),
+        _ => "HEAD".to_string(),
+    }
+}
+
 enum CheckoutBranchMode {
     Existing,
+    Detach,
     Create {
         branch: String,
         force: bool,

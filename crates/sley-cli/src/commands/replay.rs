@@ -409,8 +409,7 @@ fn run_replay(action: ReplayAction, args: &[String]) -> Result<()> {
 }
 
 fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
-    let config = read_repo_config(git_dir).ok()?;
-    let value = config.get(section, None, key)?;
+    let value = config_value(git_dir, section, key)?;
     match value.to_ascii_lowercase().as_str() {
         "true" | "yes" | "on" | "1" | "" => Some(true),
         "false" | "no" | "off" | "0" => Some(false),
@@ -418,7 +417,13 @@ fn config_bool(git_dir: &Path, section: &str, key: &str) -> Option<bool> {
     }
 }
 
+/// Effective-config lookup (repo + global/system + `-c`/env injection).
 fn config_value(git_dir: &Path, section: &str, key: &str) -> Option<String> {
+    if let Some(config) = crate::commands::merge_rebase::effective_config_with_overrides()
+        && let Some(value) = config.get(section, None, key)
+    {
+        return Some(value.to_string());
+    }
     let config = read_repo_config(git_dir).ok()?;
     config.get(section, None, key).map(str::to_string)
 }
@@ -1071,10 +1076,24 @@ fn should_edit(action: ReplayAction, opts: &ReplayOpts) -> bool {
 /// `message`; the edited result is cleaned of comment lines.
 fn edit_message(ctx: &ReplayCtx, message: &[u8]) -> Result<Vec<u8>> {
     let path = ctx.git_dir.join("COMMIT_EDITMSG");
-    fs::write(&path, message)?;
+    let comment = comment_char(&ctx.git_dir);
+    let mut template = message.to_vec();
+    if !template.ends_with(b"\n") {
+        template.push(b'\n');
+    }
+    // The editor template carries the commented help block git appends.
+    template.push(b'\n');
+    let c = comment as char;
+    template.extend_from_slice(
+        format!(
+            "{c} Please enter the commit message for your changes. Lines starting\n{c} with '{c}' will be ignored, and an empty message aborts the commit.\n"
+        )
+        .as_bytes(),
+    );
+    fs::write(&path, template)?;
     launch_editor(&ctx.git_dir, &path)?;
     let edited = fs::read(&path)?;
-    Ok(strip_comment_lines(&edited, comment_char(&ctx.git_dir)))
+    Ok(strip_comment_lines(&edited, comment))
 }
 
 pub(crate) fn launch_editor(git_dir: &Path, path: &Path) -> Result<()> {
@@ -1159,9 +1178,9 @@ fn has_conforming_footer(message: &[u8]) -> bool {
 /// Append a `Signed-off-by:` trailer ahead of any trailing comment block
 /// (`append_signoff` + `ignored_log_message_bytes`).
 pub(crate) fn append_signoff_before_comments(message: Vec<u8>, signoff: &[u8]) -> Vec<u8> {
+    // `signoff` is the full "Signed-off-by: name <email>" line (no newline).
     let signoff_line = {
-        let mut line = b"Signed-off-by: ".to_vec();
-        line.extend_from_slice(signoff);
+        let mut line = signoff.to_vec();
         line.push(b'\n');
         line
     };

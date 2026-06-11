@@ -6337,13 +6337,24 @@ fn checkout_switch_head_symbolic(
     old_oid: Option<ObjectId>,
     new_oid: Option<ObjectId>,
 ) -> Result<()> {
+    // Reflog "from" side: the previous branch's short name, or the commit id
+    // when HEAD was detached (git's `checkout: moving from X to Y` shape,
+    // which `@{-N}` resolution parses).
+    let from = match refs.read_ref("HEAD") {
+        Ok(Some(RefTarget::Symbolic(name))) => name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&name)
+            .to_string(),
+        Ok(Some(RefTarget::Direct(oid))) => oid.to_hex(),
+        _ => "HEAD".to_string(),
+    };
     let mut tx = refs.transaction();
     let reflog = match (old_oid, new_oid) {
         (Some(old_oid), Some(new_oid)) => Some(ReflogEntry {
             old_oid,
             new_oid,
             committer,
-            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
+            message: format!("checkout: moving from {from} to {branch}").into_bytes(),
         }),
         _ => None,
     };

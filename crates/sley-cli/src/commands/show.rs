@@ -1015,9 +1015,14 @@ fn parse_pretty_value(value: &str) -> Result<ShowCommitFormat> {
     match value {
         "" | "medium" | "default" => Ok(ShowCommitFormat::Medium),
         "oneline" => Ok(ShowCommitFormat::FullOneline),
+        // `reference`: `<abbrev-hash> (<subject>, <short-author-date>)`.
+        "reference" => Ok(ShowCommitFormat::Custom {
+            compiled: CompiledLogFormat::compile("%h (%s, %as)", LogFormatDialect::Log)?,
+            final_newline: true,
+        }),
         // Built-in named layouts sley does not yet render. Reject explicitly
         // rather than mis-formatting them as literal text.
-        "short" | "full" | "fuller" | "reference" | "email" | "mboxrd" | "raw" => Err(
+        "short" | "full" | "fuller" | "email" | "mboxrd" | "raw" => Err(
             GitError::Unsupported(format!("show does not support --pretty={value}")),
         ),
         other if other.contains('%') => Ok(ShowCommitFormat::Custom {
