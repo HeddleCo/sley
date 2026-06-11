@@ -1477,6 +1477,18 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
+    // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
+    // `git log` can re-encode the message to the log output encoding (UTF-8 by
+    // default). git omits the header for UTF-8.
+    let commit_encoding_header = read_repo_config(&git_dir)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("i18n", None, "commitEncoding")
+                .map(str::to_string)
+        })
+        .filter(|enc| !encoding_is_utf8(enc))
+        .map(String::into_bytes);
     let committer = commit_identity_from_env("COMMITTER")?;
     let amended_commit = amend
         .then(|| read_amended_commit(&git_dir, format))
@@ -1600,6 +1612,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         committer,
         reflog_message: commit_reflog_message(&message, amend),
         message,
+        encoding: commit_encoding_header,
     };
     let result = if amend {
         sley_sequencer::amend_index(&git_dir, format, options)

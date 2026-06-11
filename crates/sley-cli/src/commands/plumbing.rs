@@ -3229,6 +3229,7 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
             author,
             committer,
             message,
+            encoding: None,
         },
     )?;
     println!("{oid}");

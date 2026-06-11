@@ -21,6 +21,69 @@ const DEFAULT_CANDIDATES: usize = 10;
 /// The smallest abbreviation length git will ever emit for an object name.
 const MINIMUM_ABBREV: usize = 4;
 
+/// Compute the `%(describe[:opts])` string for a commit, mirroring git's
+/// `format_commit_one`/`describe` integration: failures (no names, no candidate)
+/// yield `Ok(None)` so the placeholder expands to an empty string instead of
+/// erroring. `tags`/`abbrev`/`matches`/`excludes` come from the `%(describe:...)`
+/// option parse.
+pub(crate) fn describe_for_format(
+    git_dir: &Path,
+    format: ObjectFormat,
+    db: &FileObjectDatabase,
+    target: &ObjectId,
+    use_tags: bool,
+    abbrev_opt: Option<usize>,
+    matches: &[String],
+    excludes: &[String],
+) -> Result<Option<String>> {
+    let mut options = DescribeOptions {
+        tags: use_tags,
+        ..DescribeOptions::default()
+    };
+    options.patterns.extend(matches.iter().cloned());
+    options.exclude_patterns.extend(excludes.iter().cloned());
+    if let Some(abbrev) = abbrev_opt {
+        options.abbrev = Some(abbrev);
+    }
+
+    let abbrev = resolve_describe_abbrev(git_dir, format, options.abbrev)?;
+    let tags = collect_describe_tags(git_dir, format, db, &options)?;
+    if tags.by_commit.is_empty() {
+        return Ok(None);
+    }
+
+    // Exact match.
+    if let Some(best) = tags
+        .by_commit
+        .get(target)
+        .filter(|tag| describe_eligible(tag, &options))
+    {
+        if options.long {
+            return Ok(Some(format!(
+                "{}-0-g{}",
+                best.name,
+                describe_abbrev_oid(db, target, abbrev)?
+            )));
+        }
+        return Ok(Some(best.name.clone()));
+    }
+
+    let search = describe_search(format, db, &options, &tags.by_commit, target)?;
+    let Some((best, _traversed)) = search.found else {
+        return Ok(None);
+    };
+    let short = describe_abbrev_oid(db, target, abbrev)?;
+    if options.long || best.depth != 0 {
+        if abbrev == 0 {
+            Ok(Some(best.tag.name.clone()))
+        } else {
+            Ok(Some(format!("{}-{}-g{short}", best.tag.name, best.depth)))
+        }
+    } else {
+        Ok(Some(best.tag.name.clone()))
+    }
+}
+
 pub(crate) fn cmd_describe(args: &[String]) -> Result<()> {
     let mut options = DescribeOptions::default();
     let mut commits: Vec<String> = Vec::new();

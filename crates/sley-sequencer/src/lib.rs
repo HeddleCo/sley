@@ -40,6 +40,8 @@ pub struct CommitCreate {
     pub author: Vec<u8>,
     pub committer: Vec<u8>,
     pub message: Vec<u8>,
+    /// `encoding` header value (`i18n.commitEncoding`); `None`/UTF-8 omits it.
+    pub encoding: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,6 +50,8 @@ pub struct CommitIndexOptions {
     pub committer: Vec<u8>,
     pub message: Vec<u8>,
     pub reflog_message: Vec<u8>,
+    /// `encoding` header value (`i18n.commitEncoding`); `None`/UTF-8 omits it.
+    pub encoding: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,7 +87,7 @@ pub fn create_commit(writer: &mut impl ObjectWriter, commit: CommitCreate) -> Re
         parents: commit.parents,
         author: commit.author,
         committer: commit.committer,
-        encoding: None,
+        encoding: commit.encoding,
         message: commit.message,
     };
     writer.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
@@ -175,6 +179,7 @@ fn commit_tree_with_amend(
             author: options.author,
             committer: options.committer.clone(),
             message: options.message,
+            encoding: options.encoding,
         },
     )?;
     let expected = parent.map(RefTarget::Direct);
@@ -313,6 +318,7 @@ mod tests {
                 author: identity.clone(),
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
+                encoding: None,
             },
         )
         .expect("test operation should succeed");

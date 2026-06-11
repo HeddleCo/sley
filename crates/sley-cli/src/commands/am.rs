@@ -1131,6 +1131,7 @@ fn create_am_commit(
             author,
             committer: committer.clone(),
             message,
+            encoding: None,
         },
     )?;
 

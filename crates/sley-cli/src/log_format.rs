@@ -158,6 +158,98 @@ pub(crate) enum FormatToken {
     ReflogGe,
     /// `stash list` — `%gs` (reflog subject).
     ReflogGs,
+    /// `%<(N[,trunc])` style alignment/padding directive.
+    Padding(PaddingSpec),
+    /// `%w(width[,indent1[,indent2]])` wrapping directive.
+    Wrap(WrapSpec),
+    /// `%(trailers[:opts])`.
+    Trailers(String),
+    /// `%(decorate[:opts])`.
+    Decorate(DecorateSpec),
+    /// `%(describe[:opts])`.
+    Describe(DescribeSpec),
+    /// `%C(...)` color directive that should still flush pending padding even
+    /// though it produces no visible width (matches git's modifier handling).
+    ColorAuto,
+    /// A `%-`/`%+`/`% ` magic prefix applied to the following placeholder.
+    Magic(MagicPrefix),
+}
+
+/// git's per-placeholder magic prefix (`%-`/`%+`/`% `).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MagicPrefix {
+    /// `%-`: delete preceding newline(s) when the placeholder is empty.
+    DelLfBeforeEmpty,
+    /// `%+`: insert a newline before a non-empty placeholder.
+    AddLfBeforeNonEmpty,
+    /// `% `: insert a space before a non-empty placeholder.
+    AddSpBeforeNonEmpty,
+}
+
+/// Flush direction for a `%<`/`%>`/`%><`/`%>>` padding directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaddingFlush {
+    Left,
+    Right,
+    Both,
+    LeftAndSteal,
+}
+
+/// Truncation mode for a padding directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaddingTrunc {
+    None,
+    Left,
+    Middle,
+    Right,
+}
+
+/// A parsed `%<`/`%>`/... padding placeholder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PaddingSpec {
+    pub flush: PaddingFlush,
+    pub trunc: PaddingTrunc,
+    /// Positive = fixed width; negative = "pad to that column" (`%<|`).
+    pub padding: i64,
+}
+
+/// A parsed `%w(width,indent1,indent2)` wrap directive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WrapSpec {
+    pub width: usize,
+    pub indent1: usize,
+    pub indent2: usize,
+}
+
+/// A parsed `%(decorate[:opts])` placeholder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DecorateSpec {
+    pub prefix: String,
+    pub suffix: String,
+    pub separator: String,
+    pub pointer: String,
+    pub tag: String,
+}
+
+impl Default for DecorateSpec {
+    fn default() -> Self {
+        Self {
+            prefix: " (".into(),
+            suffix: ")".into(),
+            separator: ", ".into(),
+            pointer: " -> ".into(),
+            tag: "tag: ".into(),
+        }
+    }
+}
+
+/// A parsed `%(describe[:opts])` placeholder.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct DescribeSpec {
+    pub tags: bool,
+    pub abbrev: Option<usize>,
+    pub matches: Vec<String>,
+    pub excludes: Vec<String>,
 }
 
 impl FormatToken {
@@ -197,6 +289,46 @@ impl CompiledLogFormat {
             if ch != '%' {
                 push_literal(&mut tokens, ch);
                 continue;
+            }
+            // A magic prefix (`%-`/`%+`/`% `) applies to the *following*
+            // placeholder. `%+w()`/`% w()`/`%-w()` are refused by git (the magic
+            // cannot reorder wrap output), so a following `w(` falls back to a
+            // verbatim `%`.
+            if let Some(&magic_ch) = chars.peek()
+                && matches!(magic_ch, '-' | '+' | ' ')
+            {
+                let mut after = chars.clone();
+                after.next(); // skip the magic char
+                if after.peek() == Some(&'w') {
+                    // `%±w(...)` — git refuses; emit a verbatim '%'.
+                    push_literal(&mut tokens, '%');
+                    continue;
+                }
+                let prefix = match magic_ch {
+                    '-' => MagicPrefix::DelLfBeforeEmpty,
+                    '+' => MagicPrefix::AddLfBeforeNonEmpty,
+                    _ => MagicPrefix::AddSpBeforeNonEmpty,
+                };
+                tokens.push(FormatToken::Magic(prefix));
+                chars.next(); // consume the magic char; placeholder follows
+            }
+            // Complex directives (`%<`, `%>`, `%w(`, `%(...)`) need byte-accurate
+            // slicing of the remainder, so peek the rest of the format and parse
+            // it directly; on success advance the char iterator past it.
+            {
+                let rest: String = chars.clone().collect();
+                if let Some((token, consumed_bytes)) =
+                    parse_complex_directive(&rest, dialect, &mut fields)?
+                {
+                    let consumed_chars = rest[..consumed_bytes].chars().count();
+                    for _ in 0..consumed_chars {
+                        chars.next();
+                    }
+                    if let Some(token) = token {
+                        tokens.push(token);
+                    }
+                    continue;
+                }
             }
             match chars.next() {
                 Some('%') => tokens.push(FormatToken::Percent),
@@ -327,6 +459,10 @@ impl CompiledLogFormat {
         self.fields.contains(FormatFields::OID)
     }
 
+    pub(crate) fn uses_source(&self) -> bool {
+        self.fields.contains(FormatFields::REV_SOURCE)
+    }
+
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
     #[allow(dead_code)]
     pub(crate) fn is_oid_only(&self) -> bool {
@@ -397,6 +533,372 @@ impl CompiledLogFormat {
             }
         })
     }
+}
+
+/// Limit padding/wrap widths the way git's FORMATTING_LIMIT does, so an
+/// overflowing directive is rejected (emitted verbatim) instead of allocating.
+const FORMATTING_LIMIT: i64 = 1 << 30;
+
+/// Try to parse a complex directive (`%<`/`%>`/`%w(`/`%(...)`) from `rest`,
+/// which is the format string *after* the leading `%`. Returns:
+/// - `Ok(None)` if `rest` doesn't start a complex directive — fall through.
+/// - `Ok(Some((Some(token), n)))` to push `token` and consume `n` chars.
+/// - `Ok(Some((Some(Literal("%")), 0)))` to emit a verbatim `%` (git's
+///   "unknown/invalid placeholder" fallback) without consuming the rest.
+#[allow(clippy::type_complexity)]
+fn parse_complex_directive(
+    rest: &str,
+    dialect: LogFormatDialect,
+    fields: &mut FormatFields,
+) -> Result<Option<(Option<FormatToken>, usize)>> {
+    let first = match rest.chars().next() {
+        Some(ch) => ch,
+        None => return Ok(None),
+    };
+    match first {
+        '<' | '>' => {
+            // A padding directive — or a verbatim `%`/`%>` if it doesn't parse.
+            if let Some((spec, consumed)) = parse_padding_placeholder(rest) {
+                Ok(Some((Some(FormatToken::Padding(spec)), consumed)))
+            } else {
+                // git emits a verbatim '%' and rescans from the flush char.
+                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
+            }
+        }
+        'w' => {
+            // `%w(...)`; a bare `%w` (no paren) is not ours.
+            if rest.as_bytes().get(1) != Some(&b'(') {
+                return Ok(None);
+            }
+            if let Some((spec, consumed)) = parse_wrap_placeholder(rest) {
+                Ok(Some((Some(FormatToken::Wrap(spec)), consumed)))
+            } else {
+                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
+            }
+        }
+        '(' => {
+            // `%(trailers...)`, `%(decorate...)`, `%(describe...)`.
+            let Some(end) = rest.find(')') else {
+                return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
+            };
+            let inner = &rest[1..end];
+            let consumed = end + 1; // include '(' .. ')'
+            if let Some(opts) = inner.strip_prefix("trailers") {
+                let opts = opts.strip_prefix(':').unwrap_or("");
+                // Validate the option string; a bad option means git emits the
+                // placeholder verbatim (return 0).
+                if !inner.starts_with("trailers")
+                    || (!opts.is_empty()
+                        && crate::commands::for_each_ref::parse_for_each_ref_trailer_options(opts)
+                            .is_err())
+                {
+                    // `%(trailers:key)` (no value) etc. — verbatim.
+                    return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
+                }
+                // Accept `trailers` and `trailers:<opts>` only (not `trailersX`).
+                if !(inner == "trailers" || inner.starts_with("trailers:")) {
+                    return Ok(Some((Some(FormatToken::Literal("%".into())), 0)));
+                }
+                *fields |= FormatFields::BODY;
+                Ok(Some((Some(FormatToken::Trailers(opts.to_string())), consumed)))
+            } else if inner == "decorate" || inner.starts_with("decorate:") {
+                let opts = inner.strip_prefix("decorate").unwrap_or("");
+                let opts = opts.strip_prefix(':').unwrap_or("");
+                match parse_decorate_spec(opts) {
+                    Some(spec) => {
+                        *fields |= FormatFields::DECORATIONS;
+                        Ok(Some((Some(FormatToken::Decorate(spec)), consumed)))
+                    }
+                    None => Ok(Some((Some(FormatToken::Literal("%".into())), 0))),
+                }
+            } else if inner == "describe" || inner.starts_with("describe:") {
+                let opts = inner.strip_prefix("describe").unwrap_or("");
+                let opts = opts.strip_prefix(':').unwrap_or("");
+                match parse_describe_spec(opts) {
+                    Some(spec) => {
+                        *fields |= FormatFields::BODY;
+                        Ok(Some((Some(FormatToken::Describe(spec)), consumed)))
+                    }
+                    None => Ok(Some((Some(FormatToken::Literal("%".into())), 0))),
+                }
+            } else {
+                let _ = dialect;
+                // Unknown `%(...)` — verbatim.
+                Ok(Some((Some(FormatToken::Literal("%".into())), 0)))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Port of pretty.c `parse_padding_placeholder`. `rest` begins at the flush
+/// char (`<`/`>`). Returns the spec and the number of chars consumed.
+fn parse_padding_placeholder(rest: &str) -> Option<(PaddingSpec, usize)> {
+    let bytes = rest.as_bytes();
+    let mut idx = 0usize;
+    let flush = match bytes.first()? {
+        b'<' => {
+            idx += 1;
+            PaddingFlush::Right
+        }
+        b'>' => {
+            idx += 1;
+            match bytes.get(1) {
+                Some(b'<') => {
+                    idx += 1;
+                    PaddingFlush::Both
+                }
+                Some(b'>') => {
+                    idx += 1;
+                    PaddingFlush::LeftAndSteal
+                }
+                _ => PaddingFlush::Left,
+            }
+        }
+        _ => return None,
+    };
+    let mut to_column = false;
+    if bytes.get(idx) == Some(&b'|') {
+        to_column = true;
+        idx += 1;
+    }
+    if bytes.get(idx) != Some(&b'(') {
+        return None;
+    }
+    idx += 1;
+    let start = idx;
+    // strcspn(start, ",)")
+    let num_end = rest[start..]
+        .find([',', ')'])
+        .map(|off| start + off)
+        .unwrap_or(rest.len());
+    if num_end >= rest.len() || num_end == start {
+        // !*end || end == start
+        return None;
+    }
+    // strtol
+    let (width, num_consumed) = parse_leading_i64(&rest[start..]);
+    if num_consumed == 0 {
+        return None;
+    }
+    if !(-FORMATTING_LIMIT..=FORMATTING_LIMIT).contains(&width) {
+        return None;
+    }
+    if width == 0 {
+        return None;
+    }
+    let mut width = width;
+    if width < 0 {
+        if to_column {
+            width += term_columns();
+        }
+        if width < 0 {
+            return None;
+        }
+    }
+    let padding = if to_column { -width } else { width };
+    let mut trunc = PaddingTrunc::None;
+    let end_byte = bytes[num_end];
+    let consumed_end;
+    if end_byte == b',' {
+        let tstart = num_end + 1;
+        let close = rest[tstart..].find(')').map(|off| tstart + off)?;
+        if close == tstart {
+            return None;
+        }
+        let modifier = &rest[tstart..];
+        trunc = if modifier.starts_with("trunc)") {
+            PaddingTrunc::Right
+        } else if modifier.starts_with("ltrunc)") {
+            PaddingTrunc::Left
+        } else if modifier.starts_with("mtrunc)") {
+            PaddingTrunc::Middle
+        } else {
+            return None;
+        };
+        consumed_end = close;
+    } else {
+        consumed_end = num_end;
+    }
+    // git returns `end - placeholder + 1`; here that's consumed_end + 1 chars
+    // measured from the flush char. Since the directive is all ASCII, char
+    // count == byte count.
+    Some((
+        PaddingSpec {
+            flush,
+            trunc,
+            padding,
+        },
+        consumed_end + 1,
+    ))
+}
+
+/// Port of pretty.c `parse_wrap_args`/`%w(...)`. `rest` begins at `w`.
+fn parse_wrap_placeholder(rest: &str) -> Option<(WrapSpec, usize)> {
+    // rest[0] == 'w', rest[1] == '('
+    let close = rest.find(')')?;
+    let inner = &rest[2..close];
+    let mut nums = [0i64; 3];
+    let mut count = 0usize;
+    if !inner.is_empty() {
+        for part in inner.split(',') {
+            if count >= 3 {
+                return None;
+            }
+            let (val, consumed) = parse_leading_i64(part);
+            // git uses strtoul; a trailing garbage or empty part is tolerated as
+            // 0 only when the field is empty. Require the whole part be numeric.
+            if consumed != part.len() {
+                return None;
+            }
+            // Overflow guard like git's check against maximum_signed_value_of_type.
+            if !(0..=FORMATTING_LIMIT).contains(&val) {
+                return None;
+            }
+            nums[count] = val;
+            count += 1;
+        }
+    }
+    Some((
+        WrapSpec {
+            width: nums[0] as usize,
+            indent1: nums[1] as usize,
+            indent2: nums[2] as usize,
+        },
+        close + 1,
+    ))
+}
+
+fn parse_decorate_spec(opts: &str) -> Option<DecorateSpec> {
+    let mut spec = DecorateSpec::default();
+    if opts.is_empty() {
+        return Some(spec);
+    }
+    let mut rest = opts;
+    loop {
+        if rest.is_empty() {
+            break;
+        }
+        if let Some((value, tail)) = decorate_match_value(rest, "prefix") {
+            spec.prefix = expand_decorate_value(value);
+            rest = tail;
+        } else if let Some((value, tail)) = decorate_match_value(rest, "suffix") {
+            spec.suffix = expand_decorate_value(value);
+            rest = tail;
+        } else if let Some((value, tail)) = decorate_match_value(rest, "separator") {
+            spec.separator = expand_decorate_value(value);
+            rest = tail;
+        } else if let Some((value, tail)) = decorate_match_value(rest, "pointer") {
+            spec.pointer = expand_decorate_value(value);
+            rest = tail;
+        } else if let Some((value, tail)) = decorate_match_value(rest, "tag") {
+            spec.tag = expand_decorate_value(value);
+            rest = tail;
+        } else {
+            return None;
+        }
+    }
+    Some(spec)
+}
+
+/// Match `name=value` (value runs to the next unescaped `,` or end).
+fn decorate_match_value<'a>(rest: &'a str, name: &str) -> Option<(&'a str, &'a str)> {
+    let after = rest.strip_prefix(name)?;
+    let after = after.strip_prefix('=')?;
+    // value ends at the next ',' (commas are not escapable here; git uses
+    // %x2C inside the value to encode literal commas).
+    let end = after.find(',').unwrap_or(after.len());
+    let value = &after[..end];
+    let tail = &after[end..];
+    let tail = tail.strip_prefix(',').unwrap_or(tail);
+    Some((value, tail))
+}
+
+fn parse_describe_spec(opts: &str) -> Option<DescribeSpec> {
+    let mut spec = DescribeSpec::default();
+    if opts.is_empty() {
+        return Some(spec);
+    }
+    for part in opts.split(',') {
+        if part == "tags" {
+            spec.tags = true;
+        } else if let Some(v) = part.strip_prefix("abbrev=") {
+            spec.abbrev = Some(v.parse::<usize>().ok()?);
+        } else if let Some(v) = part.strip_prefix("match=") {
+            spec.matches.push(v.to_string());
+        } else if let Some(v) = part.strip_prefix("exclude=") {
+            spec.excludes.push(v.to_string());
+        } else {
+            return None;
+        }
+    }
+    Some(spec)
+}
+
+/// Parse a leading optionally-signed integer like C strtol; returns
+/// (value, bytes_consumed). `bytes_consumed == 0` if no digits.
+fn parse_leading_i64(s: &str) -> (i64, usize) {
+    let bytes = s.as_bytes();
+    let mut idx = 0usize;
+    let mut neg = false;
+    if matches!(bytes.first(), Some(b'+') | Some(b'-')) {
+        neg = bytes[0] == b'-';
+        idx += 1;
+    }
+    let digit_start = idx;
+    let mut value: i64 = 0;
+    while idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        value = value.saturating_mul(10).saturating_add((bytes[idx] - b'0') as i64);
+        idx += 1;
+    }
+    if idx == digit_start {
+        return (0, 0);
+    }
+    if neg {
+        value = -value;
+    }
+    (value, idx)
+}
+
+/// git's `expand_string_arg` for decorate values: only `%%` and `%x##`.
+fn expand_decorate_value(arg: &str) -> String {
+    let bytes = arg.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] != b'%' {
+            out.push(bytes[idx]);
+            idx += 1;
+            continue;
+        }
+        if bytes.get(idx + 1) == Some(&b'%') {
+            out.push(b'%');
+            idx += 2;
+        } else if bytes.get(idx + 1) == Some(&b'x')
+            && let (Some(h), Some(l)) = (
+                bytes.get(idx + 2).and_then(|b| (*b as char).to_digit(16)),
+                bytes.get(idx + 3).and_then(|b| (*b as char).to_digit(16)),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            idx += 4;
+        } else {
+            out.push(b'%');
+            idx += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// git `term_columns()`: respects COLUMNS env, defaults to 80.
+fn term_columns() -> i64 {
+    if let Ok(cols) = std::env::var("COLUMNS")
+        && let Ok(n) = cols.trim().parse::<i64>()
+        && n > 0
+    {
+        return n;
+    }
+    80
 }
 
 fn push_literal(tokens: &mut Vec<FormatToken>, ch: char) {
