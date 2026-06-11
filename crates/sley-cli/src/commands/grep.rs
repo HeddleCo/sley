@@ -126,6 +126,19 @@ impl GrepOptions {
     }
 
     fn push_pattern(&mut self, text: String) {
+        // git splits a pattern containing newlines into several OR'd patterns
+        // (`append_grep_pattern` is called per line of a multi-line `-e`/positional).
+        if text.contains('\n') {
+            for line in text.split('\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                let idx = self.patterns.len();
+                self.patterns.push(line.to_string());
+                self.tokens.push(ExprToken::Pattern(idx));
+            }
+            return;
+        }
         let idx = self.patterns.len();
         self.patterns.push(text);
         self.tokens.push(ExprToken::Pattern(idx));
@@ -221,9 +234,20 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     let mut no_index = false;
     let mut iter = args.iter().peekable();
 
+    // After the first `--`, args are positionals (pattern / revs / paths) but no
+    // longer options; a *second* `--` forces remaining args to be pathspecs.
+    let mut force_pathspec = false;
     while let Some(arg) = iter.next() {
-        if saw_double_dash {
+        if force_pathspec {
             opts.pathspecs.push(arg.clone());
+            continue;
+        }
+        if saw_double_dash {
+            if arg == "--" {
+                force_pathspec = true;
+            } else {
+                positionals.push(arg.clone());
+            }
             continue;
         }
         match arg.as_str() {
@@ -921,10 +945,11 @@ fn grep_buffer(
         if max == 0 {
             break;
         }
-        let (matched, column) = eval_line(plan, line);
+        let (matched, col, icol) = eval_line(plan, line);
         if matched != opts.invert {
-            // Inverted matches always report column 1 (no positive leaf).
-            let column = if opts.invert { 0 } else { column };
+            // git: cno = invert ? icol : col; a missing match (None) prints as 1.
+            let chosen = if opts.invert { icol } else { col };
+            let column = chosen.map(|c| c + 1).unwrap_or(1);
             hits.push(LineHit {
                 line_no: i + 1,
                 column,
@@ -946,8 +971,14 @@ fn grep_buffer(
 
     if opts.count {
         if any {
-            write_path_prefix(out, rev, display_path, show_filename, opts.null_data)?;
+            // `-h` suppresses the whole path prefix (including the rev), printing
+            // just the count.
             if show_filename {
+                if let Some(rev) = rev {
+                    out.write_all(rev.as_bytes())?;
+                    out.write_all(b":")?;
+                }
+                write_quoted_path(out, display_path, opts.null_data)?;
                 out.write_all(field_sep)?;
             }
             out.write_all(hits.len().to_string().as_bytes())?;
@@ -988,10 +1019,27 @@ fn grep_buffer(
     if opts.only_matching {
         for hit in &hits {
             let line = lines[hit.line_no - 1];
-            for span in plan.matcher.match_spans_expr(plan.expr, line) {
+            let spans = plan.matcher.match_spans_expr(plan.expr, line);
+            // git advances `cno` cumulatively: it starts at the 1-based offset of
+            // the first match, then after each match adds that match's end offset
+            // measured from the running `bol` (`cno += rm_eo; bol += rm_eo`). We
+            // mirror that with an explicit moving `bol`.
+            let mut cno = spans.first().map(|s| s.0 + 1).unwrap_or(0);
+            let mut bol = 0usize;
+            for (i, span) in spans.iter().enumerate() {
+                if i > 0 {
+                    // Add the previous match's rm_eo (relative to the prior bol).
+                    let prev = spans[i - 1];
+                    cno += prev.1 - bol;
+                    bol = prev.1;
+                }
                 write_match_prefix(out, rev, display_path, show_filename, field_sep)?;
                 if opts.line_number {
                     out.write_all(hit.line_no.to_string().as_bytes())?;
+                    out.write_all(field_sep)?;
+                }
+                if opts.column {
+                    out.write_all(cno.to_string().as_bytes())?;
                     out.write_all(field_sep)?;
                 }
                 out.write_all(&line[span.0..span.1])?;
@@ -1018,16 +1066,21 @@ fn grep_buffer(
     Ok(true)
 }
 
-/// Evaluate whether a line matches; return (matched, leftmost-1-based-column).
-fn eval_line(plan: &GrepPlan<'_>, line: &[u8]) -> (bool, usize) {
+/// Evaluate whether a line matches. Returns `(matched, col, icol)` where `col` is
+/// the leftmost positive-leaf match offset and `icol` the leftmost negated-leaf
+/// offset (both 0-based, `None` when absent). git prints `(invert ? icol : col)`
+/// + 1, defaulting to 1 when absent.
+fn eval_line(plan: &GrepPlan<'_>, line: &[u8]) -> (bool, Option<usize>, Option<usize>) {
     match plan.expr {
         Some(expr) => {
             let mut col: Option<usize> = None;
-            let matched = eval_expr(plan.matcher, expr, line, false, &mut col);
-            (matched, col.map(|c| c + 1).unwrap_or(0))
+            let mut icol: Option<usize> = None;
+            let matched = eval_expr(plan.matcher, expr, line, &mut col, &mut icol);
+            (matched, col, icol)
         }
         None => {
-            // Plain OR-list: matched if any pattern matches; column = leftmost.
+            // Plain OR-list: matched if any pattern matches; col = leftmost. No
+            // negated leaves, so icol stays None.
             let mut col: Option<usize> = None;
             let mut matched = false;
             for idx in 0..plan.matcher.patterns.len() {
@@ -1039,43 +1092,43 @@ fn eval_line(plan: &GrepPlan<'_>, line: &[u8]) -> (bool, usize) {
                     }
                 }
             }
-            (matched, col.map(|c| c + 1).unwrap_or(0))
+            (matched, col, None)
         }
     }
 }
 
-/// Evaluate a boolean expression; track the leftmost positive-leaf match column
-/// in `col`. `negated` flips leaf truth (a NOT toggles it on the way down); a
-/// negated leaf does not contribute to `col` (git swaps col/icol under NOT).
+/// Evaluate a boolean expression, threading `col` (positive-leaf leftmost match)
+/// and `icol` (negated-leaf leftmost match). A `--not` swaps the two on the way
+/// down, mirroring git's `match_expr_eval`.
 fn eval_expr(
     matcher: &GrepMatcher,
     expr: &Expr,
     line: &[u8],
-    negated: bool,
     col: &mut Option<usize>,
+    icol: &mut Option<usize>,
 ) -> bool {
     match expr {
         Expr::Atom(idx) => {
             let found = matcher.find_idx(*idx, line, 0);
-            let hit = found.is_some();
-            if !negated {
-                if let Some((s, _)) = found {
-                    *col = Some(col.map_or(s, |c| c.min(s)));
-                }
+            if let Some((s, _)) = found {
+                *col = Some(col.map_or(s, |c| c.min(s)));
             }
-            if negated { !hit } else { hit }
+            found.is_some()
         }
-        Expr::Not(inner) => eval_expr(matcher, inner, line, !negated, col),
+        Expr::Not(inner) => {
+            // Swap col/icol for the negated subtree.
+            !eval_expr(matcher, inner, line, icol, col)
+        }
         Expr::And(l, r) => {
             // git does not short-circuit AND under --column. Evaluate both.
-            let lh = eval_expr(matcher, l, line, negated, col);
-            let rh = eval_expr(matcher, r, line, negated, col);
-            if negated { lh || rh } else { lh && rh }
+            let lh = eval_expr(matcher, l, line, col, icol);
+            let rh = eval_expr(matcher, r, line, col, icol);
+            lh && rh
         }
         Expr::Or(l, r) => {
-            let lh = eval_expr(matcher, l, line, negated, col);
-            let rh = eval_expr(matcher, r, line, negated, col);
-            if negated { lh && rh } else { lh || rh }
+            let lh = eval_expr(matcher, l, line, col, icol);
+            let rh = eval_expr(matcher, r, line, col, icol);
+            lh || rh
         }
     }
 }
@@ -1116,13 +1169,15 @@ fn compute_output_lines(
     if opts.function_context {
         for hit in hits {
             let center = hit.line_no - 1;
-            let (header, end) = function_bounds(lines, center);
+            let (header, end, header_is_func) = function_bounds(lines, center);
             for (i, line) in flags.iter_mut().enumerate().take(end + 1) {
                 if i >= header && i <= end && !line.selected {
                     line.context = true;
                 }
             }
-            if header < center && !flags[header].selected {
+            // Only mark the header with `=` when it is a real funcname line
+            // (a bare include/preamble block above the match shows as `-`).
+            if header_is_func && header < center && !flags[header].selected {
                 flags[header].context = false;
                 flags[header].function = true;
             }
@@ -1141,12 +1196,12 @@ fn compute_output_lines(
     flags
 }
 
-/// A line is a "function" header if it starts at column 0 with a non-space,
-/// non-comment, non-closing-brace character (git's default `match_funcname`).
+/// A line is a "function" header under git's default `match_funcname`: a
+/// non-empty line whose first byte is a letter, `_`, or `$`.
 fn is_funcline(line: &[u8]) -> bool {
     match line.first() {
         None => false,
-        Some(&b) => !(b == b' ' || b == b'\t' || b == b'}' || b == b'\n' || b == b'\r'),
+        Some(&b) => b.is_ascii_alphabetic() || b == b'_' || b == b'$',
     }
 }
 
@@ -1155,11 +1210,15 @@ fn enclosing_function(lines: &[&[u8]], from: usize) -> Option<usize> {
     (0..=from).rev().find(|&i| is_funcline(lines[i]))
 }
 
-/// For -W: return (function_header_line, last_line_of_function) bracketing `from`.
-fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize) {
-    let header = enclosing_function(lines, from).unwrap_or(from);
-    // The function ends just before the next function header, trimming trailing
-    // blank lines.
+/// For -W: return `(function_header_line, last_line_of_function, header_is_func)`
+/// bracketing `from`. When no funcname line precedes the match, the body extends
+/// to the top of the file and `header_is_func` is false.
+fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize, bool) {
+    let (header, header_is_func) = match enclosing_function(lines, from) {
+        Some(h) => (h, true),
+        None => (0, false),
+    };
+    // The function ends just before the next function header.
     let mut end = lines.len() - 1;
     for i in (header + 1)..lines.len() {
         if is_funcline(lines[i]) {
@@ -1167,15 +1226,11 @@ fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize) {
             break;
         }
     }
-    while end > header && lines[end].iter().all(|&b| b == b' ' || b == b'\t') && lines[end].is_empty()
-    {
-        end -= 1;
-    }
-    // Trim trailing empty lines.
+    // Trim trailing empty lines (git: "Trailing empty lines are not interesting").
     while end > from && lines[end].is_empty() {
         end -= 1;
     }
-    (header, end)
+    (header, end, header_is_func)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1244,24 +1299,6 @@ fn emit_lines(
         last_printed = Some(i);
     }
     *printed_file = true;
-    Ok(())
-}
-
-/// Writes the `<rev>:<path>` (quoted) prefix without a trailing field separator.
-fn write_path_prefix(
-    out: &mut impl Write,
-    rev: Option<&str>,
-    display_path: &[u8],
-    show_filename: bool,
-    raw: bool,
-) -> Result<()> {
-    if let Some(rev) = rev {
-        out.write_all(rev.as_bytes())?;
-        out.write_all(b":")?;
-    }
-    if show_filename || rev.is_some() {
-        write_quoted_path(out, display_path, raw)?;
-    }
     Ok(())
 }
 
