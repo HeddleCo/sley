@@ -5,6 +5,58 @@
 use crate::*;
 
 pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
+    for_each_ref_core(args, "git for-each-ref")
+}
+
+/// The `-h` usage banner, matching git's parse_options output byte-for-byte.
+/// Only the program name on the first line differs between `for-each-ref` and
+/// `refs list`; continuation lines are indented to a fixed column (25 literal
+/// spaces in COMMON_USAGE_FOR_EACH_REF + 7 for the stripped `usage: ` prefix).
+fn print_for_each_ref_usage(usage_cmd: &str) {
+    eprint!(
+        "usage: {usage_cmd} [--count=<count>] [--shell|--perl|--python|--tcl]
+                                [(--sort=<key>)...] [--format=<format>]
+                                [--include-root-refs] [--points-at=<object>]
+                                [--merged[=<object>]] [--no-merged[=<object>]]
+                                [--contains[=<object>]] [--no-contains[=<object>]]
+                                [(--exclude=<pattern>)...] [--start-after=<marker>]
+                                [ --stdin | (<pattern>...)]
+
+    -s, --[no-]shell      quote placeholders suitably for shells
+    -p, --[no-]perl       quote placeholders suitably for perl
+    --[no-]python         quote placeholders suitably for python
+    --[no-]tcl            quote placeholders suitably for Tcl
+    --[no-]omit-empty     do not output a newline after empty formatted refs
+
+    --[no-]count <n>      show only <n> matched refs
+    --[no-]format <format>
+                          format to use for the output
+    --[no-]start-after <marker>
+                          start iteration after the provided marker
+    --[no-]color[=<when>] respect format colors
+    --[no-]exclude <pattern>
+                          exclude refs which match pattern
+    --[no-]sort <key>     field name to sort on
+    --[no-]points-at <object>
+                          print only refs which points at the given object
+    --merged <commit>     print only refs that are merged
+    --no-merged <commit>  print only refs that are not merged
+    --contains <commit>   print only refs which contain the commit
+    --no-contains <commit>
+                          print only refs which don't contain the commit
+    --[no-]ignore-case    sorting and filtering are case insensitive
+    --[no-]stdin          read reference patterns from stdin
+    --[no-]include-root-refs
+                          also include HEAD ref and pseudorefs
+
+"
+    );
+}
+
+/// The shared core of `git for-each-ref` and its clone `git refs list` (see
+/// builtin/refs.c::cmd_refs_list, which calls for_each_ref_core). The only
+/// per-command difference is the program name printed in the `-h` usage banner.
+pub(crate) fn for_each_ref_core(args: &[String], usage_cmd: &str) -> Result<()> {
     let mut format_spec = "%(objectname) %(objecttype)\t%(refname)".to_string();
     let mut count = None;
     let mut omit_empty = false;
@@ -24,6 +76,14 @@ pub(crate) fn cmd_for_each_ref(args: &[String]) -> Result<()> {
     let mut merged_filter = None;
     let mut excludes = Vec::new();
     let mut patterns = Vec::new();
+    // git's parse_options only *records* --sort strings (validation is deferred to
+    // ref_sorting_options), so a `-h` anywhere on the line is reached and prints the
+    // usage banner even alongside an invalid --sort=bogus. Mirror that by handling
+    // -h before eager sort validation can error.
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_for_each_ref_usage(usage_cmd);
+        return Err(GitError::Exit(129));
+    }
     let mut idx = 0;
     while idx < args.len() {
         match args[idx].as_str() {

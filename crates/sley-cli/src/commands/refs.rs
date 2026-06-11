@@ -2792,3 +2792,68 @@ fn symbolic_ref_usage() -> Result<()> {
     eprintln!();
     Err(GitError::Exit(129))
 }
+
+/// `git refs` command group (builtin/refs.c, git 2.54). Dispatches to the ref
+/// plumbing subcommands. `list` is an exact clone of `for-each-ref` (it calls
+/// the same for_each_ref_core in git); `exists` is a raw ref-existence probe.
+/// migrate/verify/optimize are out of scope for the parity quick-win.
+pub(crate) fn cmd_refs(args: &[String]) -> Result<()> {
+    let Some(subcommand) = args.first().map(String::as_str) else {
+        eprintln!("error: need a subcommand");
+        print_refs_usage();
+        return Err(GitError::Exit(129));
+    };
+    match subcommand {
+        "list" => commands::for_each_ref::for_each_ref_core(&args[1..], "git refs list"),
+        "exists" => cmd_refs_exists(&args[1..]),
+        "-h" | "--help" => {
+            print_refs_usage();
+            Err(GitError::Exit(129))
+        }
+        other => {
+            eprintln!("error: unknown subcommand: `{other}'");
+            print_refs_usage();
+            Err(GitError::Exit(129))
+        }
+    }
+}
+
+/// `git refs exists <ref>` — exit 0 if the raw ref exists, 2 if it does not
+/// (ENOENT/EISDIR), matching builtin/refs.c::cmd_refs_exists. Does not DWIM and
+/// does not read the pointed-at object.
+fn cmd_refs_exists(args: &[String]) -> Result<()> {
+    // git: `argc != 1` after option parsing -> die. There are no options other
+    // than -h, which parse_options would have consumed in cmd_refs already.
+    let refs: Vec<&String> = args.iter().filter(|arg| arg.as_str() != "--").collect();
+    if refs.len() != 1 {
+        eprintln!("fatal: 'git refs exists' requires a reference");
+        return Err(GitError::Exit(128));
+    }
+    let name = refs[0];
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let store = FileRefStore::new(&git_dir, format);
+    if store.raw_ref_exists(name)? {
+        Ok(())
+    } else {
+        eprintln!("error: reference does not exist");
+        Err(GitError::Exit(2))
+    }
+}
+
+fn print_refs_usage() {
+    eprintln!("usage: git refs migrate --ref-format=<format> [--no-reflog] [--dry-run]");
+    eprintln!("   or: git refs verify [--strict] [--verbose]");
+    eprintln!("   or: git refs list [--count=<count>] [--shell|--perl|--python|--tcl]");
+    eprintln!("                                [(--sort=<key>)...] [--format=<format>]");
+    eprintln!("                                [--include-root-refs] [--points-at=<object>]");
+    eprintln!("                                [--merged[=<object>]] [--no-merged[=<object>]]");
+    eprintln!("                                [--contains[=<object>]] [--no-contains[=<object>]]");
+    eprintln!("                                [(--exclude=<pattern>)...] [--start-after=<marker>]");
+    eprintln!("                                [ --stdin | (<pattern>...)]");
+    eprintln!("   or: git refs exists <ref>");
+    eprintln!(
+        "   or: git refs optimize [--all] [--no-prune] [--auto] [--include <pattern>] [--exclude <pattern>]"
+    );
+    eprintln!();
+}
