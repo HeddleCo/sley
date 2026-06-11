@@ -8411,10 +8411,19 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         if git_dir.as_os_str().is_empty() {
             return Err(GitError::repository_not_found("not a git repository"));
         }
-        return Ok(resolve_cli_path(
-            start.as_ref(),
-            git_dir.to_string_lossy().as_ref(),
-        ));
+        let resolved = resolve_cli_path(start.as_ref(), git_dir.to_string_lossy().as_ref());
+        // An explicit GIT_DIR / --git-dir that points at a `.git` *file*
+        // ("gitdir: <path>") is resolved to its target, exactly as git's
+        // `setup_explicit_git_dir` does via `read_gitfile`. Without this the
+        // ref store would be pointed at the gitfile itself (a regular file),
+        // so reads of HEAD/refs fail.
+        if resolved.is_file()
+            && let Some(target) = read_gitdir_file(&resolved)?
+            && is_git_dir_candidate(&target)
+        {
+            return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
+        }
+        return Ok(resolved);
     }
     if global_bare() {
         let cwd = env::current_dir()?;
