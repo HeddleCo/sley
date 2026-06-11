@@ -473,7 +473,15 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         cwd.join(destination)
     };
-    let template = template.as_deref().map(|path| resolve_cli_path(&cwd, path));
+    // An empty `--template=` (or `--template ""`) disables templating entirely,
+    // matching upstream git's `copy_templates()`, which returns immediately when
+    // the template directory is the empty string. Resolving "" against the cwd
+    // would otherwise yield the cwd itself, and copying it into the destination's
+    // gitdir recurses without bound (the destination lives inside the cwd).
+    let template = template
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .map(|path| resolve_cli_path(&cwd, path));
     let bundle_uri = bundle_uri
         .as_ref()
         .map(|uri| CloneBundleUri::new(&cwd, uri));

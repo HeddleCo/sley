@@ -1267,6 +1267,13 @@ fn clone_local_repository_template_options_match_upstream_git() {
                 false,
                 false,
             ),
+            // An empty `--template=` disables templating; upstream git treats it
+            // as "no template". A regression in resolving "" against the cwd made
+            // sley copy the cwd into the destination gitdir, recursing until the
+            // path overflowed — this case guards that the clone simply completes
+            // with no template applied, matching git.
+            ("empty-equals", vec!["--template="], false, false),
+            ("empty-space", vec!["--template", ""], false, false),
             (
                 "bare-template",
                 vec!["--bare", "--template", template_arg],
