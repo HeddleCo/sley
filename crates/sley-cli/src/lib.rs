@@ -2657,11 +2657,25 @@ fn is_binary_content(bytes: &[u8]) -> bool {
     bytes.contains(&0)
 }
 
+/// `--stat` insertion/deletion line counts, computed by the shared diff-merge
+/// Myers engine rather than a CLI-local LCS.
+///
+/// Myers produces a shortest edit script, so the count of `Insert` lines is
+/// `new_len - lcs` and the count of `Delete` lines is `old_len - lcs` — exactly
+/// the values the removed local LCS counter returned.
 fn count_line_diff(old: &[u8], new: &[u8]) -> (usize, usize) {
-    let old_lines = diff_lines(old);
-    let new_lines = diff_lines(new);
-    let common = lcs_len(&old_lines, &new_lines);
-    (new_lines.len() - common, old_lines.len() - common)
+    let old_lines = sley_diff_merge::split_lines(old);
+    let new_lines = sley_diff_merge::split_lines(new);
+    let mut inserted = 0usize;
+    let mut deleted = 0usize;
+    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
+        match op {
+            sley_diff_merge::DiffOp::Insert(n) => inserted += n,
+            sley_diff_merge::DiffOp::Delete(n) => deleted += n,
+            sley_diff_merge::DiffOp::Equal(_) => {}
+        }
+    }
+    (inserted, deleted)
 }
 
 fn count_diff_lines(bytes: &[u8]) -> usize {
@@ -2684,23 +2698,6 @@ fn diff_lines(bytes: &[u8]) -> Vec<&[u8]> {
         lines.push(&bytes[start..]);
     }
     lines
-}
-
-fn lcs_len(left: &[&[u8]], right: &[&[u8]]) -> usize {
-    let mut previous = vec![0; right.len() + 1];
-    let mut current = vec![0; right.len() + 1];
-    for left_line in left {
-        for (idx, right_line) in right.iter().enumerate() {
-            current[idx + 1] = if left_line == right_line {
-                previous[idx] + 1
-            } else {
-                previous[idx + 1].max(current[idx])
-            };
-        }
-        std::mem::swap(&mut previous, &mut current);
-        current.fill(0);
-    }
-    previous[right.len()]
 }
 
 fn apply_diff_pathspec(
