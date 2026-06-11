@@ -1,28 +1,46 @@
 //! `git bisect` and its subcommands
 //! (start/good/bad/skip/reset/log/replay/terms/next/visualize/run).
 //!
-//! `git bisect` performs a binary search across a range of commits to find the
-//! one that introduced a change. The state lives entirely on disk under the
-//! repository's git dir:
+//! A faithful port of upstream `builtin/bisect.c` + `bisect.c`: the same state
+//! files, the same messages, and the same weighted-midpoint selection
+//! (`find_bisection` with the `approx_halfway` early exit, `filter_skipped`,
+//! and the PRN-driven `skip_away`). The state lives on disk under the git dir:
 //!
 //! * `BISECT_START` -- the symbolic name (branch) or detached oid HEAD pointed
 //!   at when the bisection began; `bisect reset` restores it.
-//! * `BISECT_TERMS` -- two lines, `<term-bad>` then `<term-good>` (the "new" and
-//!   "old" terms, defaulting to `bad`/`good`).
-//! * `BISECT_NAMES` -- the rev-list arguments restricting the search (pathspecs
-//!   etc.); written empty when unrestricted.
-//! * `BISECT_LOG` -- a human-readable transcript replayed by `bisect replay`.
-//! * `BISECT_EXPECTED_REV` / `BISECT_ANCESTORS_OK` -- caches written when a
-//!   midpoint is checked out.
+//! * `BISECT_TERMS` -- two lines, `<term-bad>` then `<term-good>`.
+//! * `BISECT_NAMES` -- sq-quoted rev-list arguments restricting the search.
+//! * `BISECT_LOG` -- a transcript replayed by `bisect replay`.
+//! * `BISECT_EXPECTED_REV` / `BISECT_ANCESTORS_OK` / `BISECT_HEAD` /
+//!   `BISECT_FIRST_PARENT` / `BISECT_RUN` -- caches and mode markers.
 //! * `refs/bisect/<term-bad>` -- the single known-bad commit.
 //! * `refs/bisect/<term-good>-<oid>` -- one ref per known-good commit.
 //! * `refs/bisect/skip-<oid>` -- one ref per skipped commit.
-//!
-//! Command modules pull their shared plumbing from the crate root. A glob import
-//! works because a submodule can access its ancestor module's items (including
-//! private ones), so every helper, type, and re-export visible at the crate root
-//! is in scope here without re-listing it.
 use crate::*;
+
+// Upstream `enum bisect_error` values; the process exit code is the negation.
+const BISECT_OK: i32 = 0;
+const BISECT_FAILED: i32 = -1;
+const BISECT_ONLY_SKIPPED_LEFT: i32 = -2;
+const BISECT_MERGE_BASE_CHECK: i32 = -3;
+const BISECT_NO_TESTABLE_COMMIT: i32 = -4;
+const BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND: i32 = -10;
+const BISECT_INTERNAL_SUCCESS_MERGE_BASE: i32 = -11;
+
+fn is_bisect_success(res: i32) -> bool {
+    res == BISECT_OK
+        || res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND
+        || res == BISECT_INTERNAL_SUCCESS_MERGE_BASE
+}
+
+/// Map an internal bisect code to the command result (exit code = -code).
+fn bisect_exit(code: i32) -> Result<()> {
+    if is_bisect_success(code) {
+        Ok(())
+    } else {
+        Err(GitError::Exit(-code))
+    }
+}
 
 /// The resolved terms for a bisection (`bad`/`good` by default, or whatever the
 /// user picked via `--term-old`/`--term-new`). `bad` is the "new" state, `good`
@@ -42,11 +60,15 @@ impl Default for BisectTerms {
     }
 }
 
+const VOCAB_BAD: &str = "bad|new";
+const VOCAB_GOOD: &str = "good|old";
+
 /// Everything a subcommand needs to manipulate bisection state, resolved once at
 /// the top of each command.
 struct BisectRepo {
     git_dir: PathBuf,
-    worktree_root: PathBuf,
+    /// `None` in a bare repository (which implies `--no-checkout`).
+    worktree_root: Option<PathBuf>,
     format: ObjectFormat,
 }
 
@@ -54,7 +76,7 @@ impl BisectRepo {
     fn open() -> Result<Self> {
         let cwd = env::current_dir()?;
         let git_dir = discover_git_dir(&cwd)?;
-        let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+        let worktree_root = sley_worktree::worktree_root_for_git_dir(&git_dir)?;
         let format = repository_object_format(&git_dir)?;
         Ok(Self {
             git_dir,
@@ -67,12 +89,21 @@ impl BisectRepo {
         FileObjectDatabase::from_git_dir(&self.git_dir, self.format)
     }
 
+    fn store(&self) -> FileRefStore {
+        FileRefStore::new(&self.git_dir, self.format)
+    }
+
     fn state_path(&self, name: &str) -> PathBuf {
         self.git_dir.join(name)
     }
 
+    /// git's `is_empty_or_missing_file(git_path_bisect_start())`, negated.
     fn is_bisecting(&self) -> bool {
-        self.state_path("BISECT_START").exists()
+        fs::metadata(self.state_path("BISECT_START")).is_ok_and(|meta| meta.len() > 0)
+    }
+
+    fn no_checkout(&self) -> bool {
+        self.state_path("BISECT_HEAD").exists()
     }
 }
 
@@ -86,8 +117,6 @@ pub(crate) fn cmd_bisect(args: &[String]) -> Result<()> {
     let rest = &args[1..];
     match subcommand {
         "start" => cmd_bisect_start(rest),
-        "bad" | "new" => cmd_bisect_state(rest, BisectMark::Bad),
-        "good" | "old" => cmd_bisect_state(rest, BisectMark::Good),
         "skip" => cmd_bisect_skip(rest),
         "next" => cmd_bisect_next(rest),
         "reset" => cmd_bisect_reset(rest),
@@ -100,25 +129,31 @@ pub(crate) fn cmd_bisect(args: &[String]) -> Result<()> {
             print_bisect_usage();
             Ok(())
         }
-        other => {
-            // `bad`/`good` may also be reached through user-defined terms. If a
-            // bisection is in progress and the word matches the configured term,
-            // dispatch accordingly.
-            if let Ok(repo) = BisectRepo::open()
-                && repo.is_bisecting()
-                && let Ok(terms) = read_bisect_terms(&repo)
-            {
-                if other == terms.bad {
-                    return cmd_bisect_state(rest, BisectMark::Bad);
-                }
-                if other == terms.good {
-                    return cmd_bisect_state(rest, BisectMark::Good);
-                }
-            }
-            eprintln!("fatal: unknown command: '{other}'");
+        other if other.starts_with('-') => {
+            eprintln!("error: unknown option `{}'", other.trim_start_matches('-'));
             eprintln!();
             print_bisect_usage();
             Err(GitError::Exit(129))
+        }
+        other => {
+            // `bad`/`good`/`new`/`old` and user-defined terms dispatch to the
+            // state handler; `check_and_set_terms` may initialize BISECT_TERMS
+            // or reject a term that mismatches the session's vocabulary.
+            let repo = BisectRepo::open()?;
+            let mut terms = BisectTerms::default();
+            get_terms(&repo, &mut terms);
+            if check_and_set_terms(&repo, &mut terms, other).is_err()
+                || (other != terms.good && other != terms.bad)
+            {
+                eprintln!("fatal: unknown command: '{other}'");
+                eprintln!();
+                print_bisect_usage();
+                return Err(GitError::Exit(129));
+            }
+            let mut out = io::stdout();
+            let code = bisect_state(&repo, &mut terms, args, &mut out)?;
+            out.flush()?;
+            bisect_exit(code)
         }
     }
 }
@@ -142,497 +177,940 @@ fn print_bisect_usage() {
 }
 
 // ---------------------------------------------------------------------------
+// terms plumbing
+// ---------------------------------------------------------------------------
+
+/// Load BISECT_TERMS into `terms` (leaves them untouched when missing),
+/// mirroring upstream `get_terms` (returns Err when the file is absent).
+fn get_terms(repo: &BisectRepo, terms: &mut BisectTerms) -> bool {
+    match fs::read_to_string(repo.state_path("BISECT_TERMS")) {
+        Ok(contents) => {
+            let mut lines = contents.lines();
+            terms.bad = lines.next().unwrap_or("").to_string();
+            terms.good = lines.next().unwrap_or("").to_string();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn check_term_format(term: &str, orig_term: &str) -> Result<i32> {
+    // Upstream validates "refs/bisect/<term>" as a refname.
+    if term.is_empty()
+        || term.contains('/')
+        || term.contains(' ')
+        || term.contains("..")
+        || term.starts_with('-')
+        || term.starts_with('.')
+        || term.ends_with('.')
+        || term.ends_with(".lock")
+        || term
+            .bytes()
+            .any(|byte| byte < 0x20 || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+    {
+        eprintln!("error: '{term}' is not a valid term");
+        return Ok(-1);
+    }
+    const BUILTINS: &[&str] = &[
+        "help",
+        "start",
+        "skip",
+        "next",
+        "reset",
+        "visualize",
+        "view",
+        "replay",
+        "log",
+        "run",
+        "terms",
+    ];
+    if BUILTINS.contains(&term) {
+        eprintln!("error: can't use the builtin command '{term}' as a term");
+        return Ok(-1);
+    }
+    if (orig_term != "bad" && (term == "bad" || term == "new"))
+        || (orig_term != "good" && (term == "good" || term == "old"))
+    {
+        eprintln!("error: can't change the meaning of the term '{term}'");
+        return Ok(-1);
+    }
+    Ok(0)
+}
+
+fn write_terms(repo: &BisectRepo, bad: &str, good: &str) -> Result<i32> {
+    if bad == good {
+        eprintln!("error: please use two different terms");
+        return Ok(-1);
+    }
+    if check_term_format(bad, "bad")? != 0 || check_term_format(good, "good")? != 0 {
+        return Ok(-1);
+    }
+    fs::write(repo.state_path("BISECT_TERMS"), format!("{bad}\n{good}\n"))?;
+    Ok(0)
+}
+
+/// Upstream `check_and_set_terms`: validates a state word against the session's
+/// terms, initializing BISECT_TERMS on the first `bad`/`good` or `new`/`old`.
+fn check_and_set_terms(repo: &BisectRepo, terms: &mut BisectTerms, cmd: &str) -> Result<()> {
+    let has_term_file = fs::metadata(repo.state_path("BISECT_TERMS")).is_ok_and(|m| m.len() > 0);
+    if cmd == "skip" || cmd == "start" || cmd == "terms" {
+        return Ok(());
+    }
+    if has_term_file && cmd != terms.bad && cmd != terms.good {
+        eprintln!(
+            "error: Invalid command: you're currently in a {}/{} bisect",
+            terms.bad, terms.good
+        );
+        return Err(GitError::Exit(1));
+    }
+    if !has_term_file {
+        if cmd == "bad" || cmd == "good" {
+            terms.bad = "bad".into();
+            terms.good = "good".into();
+            if write_terms(repo, "bad", "good")? != 0 {
+                return Err(GitError::Exit(1));
+            }
+        } else if cmd == "new" || cmd == "old" {
+            terms.bad = "new".into();
+            terms.good = "old".into();
+            if write_terms(repo, "new", "old")? != 0 {
+                return Err(GitError::Exit(1));
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// refs/bisect/* helpers (read via the ref store so packed refs are seen)
+// ---------------------------------------------------------------------------
+
+fn bisect_refs(repo: &BisectRepo) -> Result<Vec<(String, ObjectId)>> {
+    let store = repo.store();
+    let mut out = Vec::new();
+    for reference in store.list_refs()? {
+        if let Some(rest) = reference.name.strip_prefix("refs/bisect/")
+            && let RefTarget::Direct(oid) = reference.target
+        {
+            out.push((rest.to_string(), oid));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(out)
+}
+
+fn bisect_bad_oid(repo: &BisectRepo, terms: &BisectTerms) -> Result<Option<ObjectId>> {
+    Ok(bisect_refs(repo)?
+        .into_iter()
+        .find(|(name, _)| *name == terms.bad)
+        .map(|(_, oid)| oid))
+}
+
+fn bisect_good_oids(repo: &BisectRepo, terms: &BisectTerms) -> Result<Vec<ObjectId>> {
+    let prefix = format!("{}-", terms.good);
+    Ok(bisect_refs(repo)?
+        .into_iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .map(|(_, oid)| oid)
+        .collect())
+}
+
+fn bisect_skip_oids(repo: &BisectRepo) -> Result<Vec<ObjectId>> {
+    Ok(bisect_refs(repo)?
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("skip-"))
+        .map(|(_, oid)| oid)
+        .collect())
+}
+
+fn write_loose_bisect_ref(repo: &BisectRepo, name: &str, oid: &ObjectId) -> Result<()> {
+    let dir = repo.git_dir.join("refs").join("bisect");
+    fs::create_dir_all(&dir)?;
+    fs::write(dir.join(name), format!("{}\n", oid.to_hex()))?;
+    Ok(())
+}
+
+/// Upstream `bisect_clean_state`: delete every refs/bisect/* ref (loose or
+/// packed), the BISECT_HEAD / BISECT_EXPECTED_REV pseudorefs, and the state
+/// files, removing BISECT_START last.
+fn bisect_clean_state(repo: &BisectRepo) -> Result<()> {
+    let store = repo.store();
+    for (name, _) in bisect_refs(repo)? {
+        let _ = store.delete_ref(&format!("refs/bisect/{name}"));
+        // Loose writes here bypass the store; clear any remaining file too.
+        let _ = fs::remove_file(repo.git_dir.join("refs").join("bisect").join(&name));
+    }
+    for name in ["BISECT_HEAD", "BISECT_EXPECTED_REV"] {
+        let _ = fs::remove_file(repo.state_path(name));
+    }
+    for name in [
+        "BISECT_ANCESTORS_OK",
+        "BISECT_LOG",
+        "BISECT_NAMES",
+        "BISECT_RUN",
+        "BISECT_TERMS",
+        "BISECT_FIRST_PARENT",
+        "BISECT_START",
+    ] {
+        let _ = fs::remove_file(repo.state_path(name));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// log helpers
+// ---------------------------------------------------------------------------
+
+fn append_to_bisect_log(repo: &BisectRepo, text: &str) -> Result<()> {
+    let mut log = match fs::read_to_string(repo.state_path("BISECT_LOG")) {
+        Ok(contents) => contents,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(err) => return Err(err.into()),
+    };
+    log.push_str(text);
+    fs::write(repo.state_path("BISECT_LOG"), log)?;
+    Ok(())
+}
+
+fn commit_subject_of(repo: &BisectRepo, oid: &ObjectId) -> Result<String> {
+    let db = repo.db();
+    let peeled = sley_rev::peel_to_commit(&db, repo.format, oid)?;
+    let object = db.read_object(&peeled)?;
+    let commit = Commit::parse(repo.format, &object.body)?;
+    Ok(commit_subject(&commit.message))
+}
+
+/// `# <state>: [<oid>] <subject>` line (upstream `log_commit`).
+fn bisect_log_state_line(repo: &BisectRepo, state: &str, oid: &ObjectId) -> Result<String> {
+    let subject = commit_subject_of(repo, oid)?;
+    Ok(format!("# {state}: [{}] {subject}\n", oid.to_hex()))
+}
+
+/// Upstream `bisect_write`: update the state ref and append the log lines.
+fn bisect_write(
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    state: &str,
+    rev: &str,
+    nolog: bool,
+) -> Result<i32> {
+    let ref_name = if state == terms.bad {
+        terms.bad.clone()
+    } else if state == terms.good || state == "skip" {
+        format!("{state}-{rev}")
+    } else {
+        eprintln!("error: Bad bisect_write argument: {state}");
+        return Ok(-1);
+    };
+    let oid = match resolve_revision(&repo.git_dir, repo.format, rev) {
+        Ok(oid) => oid,
+        Err(_) => {
+            eprintln!("error: couldn't get the oid of the rev '{rev}'");
+            return Ok(-1);
+        }
+    };
+    write_loose_bisect_ref(repo, &ref_name, &oid)?;
+    append_to_bisect_log(repo, &bisect_log_state_line(repo, state, &oid)?)?;
+    if !nolog {
+        append_to_bisect_log(repo, &format!("git bisect {state} {rev}\n"))?;
+    }
+    Ok(0)
+}
+
+/// Render args the way git records them: each sq-quoted, space-prefixed.
+fn sq_quote_args<I: IntoIterator<Item = S>, S: AsRef<str>>(args: I) -> String {
+    let mut out = String::new();
+    for arg in args {
+        out.push(' ');
+        out.push('\'');
+        for ch in arg.as_ref().chars() {
+            if ch == '\'' {
+                out.push_str("'\\''");
+            } else {
+                out.push(ch);
+            }
+        }
+        out.push('\'');
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// status / next-check
+// ---------------------------------------------------------------------------
+
+struct BisectState {
+    nr_good: usize,
+    nr_bad: usize,
+}
+
+fn bisect_status(repo: &BisectRepo, terms: &BisectTerms) -> Result<BisectState> {
+    Ok(BisectState {
+        nr_good: bisect_good_oids(repo, terms)?.len(),
+        nr_bad: usize::from(bisect_bad_oid(repo, terms)?.is_some()),
+    })
+}
+
+/// Print to stdout AND append `# <text>` to BISECT_LOG (upstream
+/// `bisect_log_printf`).
+fn bisect_log_printf(repo: &BisectRepo, out: &mut dyn Write, text: &str) -> Result<()> {
+    write!(out, "{text}")?;
+    append_to_bisect_log(repo, &format!("# {text}"))?;
+    Ok(())
+}
+
+fn bisect_print_status(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) -> Result<()> {
+    let state = bisect_status(repo, terms)?;
+    if state.nr_good > 0 && state.nr_bad > 0 {
+        return Ok(());
+    }
+    if state.nr_good == 0 && state.nr_bad == 0 {
+        bisect_log_printf(repo, out, "status: waiting for both good and bad commits\n")?;
+    } else if state.nr_good > 0 {
+        let plural = if state.nr_good == 1 {
+            "commit"
+        } else {
+            "commits"
+        };
+        bisect_log_printf(
+            repo,
+            out,
+            &format!(
+                "status: waiting for bad commit, {} good {plural} known\n",
+                state.nr_good
+            ),
+        )?;
+    } else {
+        bisect_log_printf(
+            repo,
+            out,
+            "status: waiting for good commit(s), bad commit known\n",
+        )?;
+    }
+    Ok(())
+}
+
+/// Upstream `decide_next`: 0 = proceed, -1 = cannot.
+fn decide_next(
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    current_term: Option<&str>,
+    missing_good: bool,
+    missing_bad: bool,
+) -> i32 {
+    if !missing_good && !missing_bad {
+        return 0;
+    }
+    let Some(current_term) = current_term else {
+        return -1;
+    };
+    if missing_good && !missing_bad && current_term == terms.good {
+        // Have bad (or new) but not good (or old): warn, and proceed when
+        // stdin is not a terminal (the test environment).
+        eprintln!("warning: bisecting only with a {} commit", terms.bad);
+        return 0;
+    }
+    if repo.is_bisecting() {
+        eprintln!(
+            "error: You need to give me at least one {VOCAB_BAD} and {VOCAB_GOOD} revision.\nYou can use \"git bisect {VOCAB_BAD}\" and \"git bisect {VOCAB_GOOD}\" for that."
+        );
+    } else {
+        eprintln!(
+            "error: You need to start by \"git bisect start\".\nYou then need to give me at least one {VOCAB_GOOD} and {VOCAB_BAD} revision.\nYou can use \"git bisect {VOCAB_GOOD}\" and \"git bisect {VOCAB_BAD}\" for that."
+        );
+    }
+    -1
+}
+
+fn bisect_next_check(repo: &BisectRepo, terms: &BisectTerms, current_term: Option<&str>) -> i32 {
+    let state = match bisect_status(repo, terms) {
+        Ok(state) => state,
+        Err(_) => return -1,
+    };
+    decide_next(repo, terms, current_term, state.nr_good == 0, state.nr_bad == 0)
+}
+
+fn bisect_autostart(repo: &BisectRepo, terms: &mut BisectTerms) -> i32 {
+    if repo.is_bisecting() {
+        return 0;
+    }
+    eprintln!("You need to start by \"git bisect start\"\n");
+    // Non-interactive stdin: do not autostart, fail like upstream.
+    let _ = terms;
+    -1
+}
+
+// ---------------------------------------------------------------------------
+// state (good/bad/new/old/<term>) and skip
+// ---------------------------------------------------------------------------
+
+/// The commit currently under test: BISECT_HEAD when present, else HEAD.
+fn current_bisect_oid(repo: &BisectRepo) -> Result<ObjectId> {
+    if let Ok(contents) = fs::read_to_string(repo.state_path("BISECT_HEAD")) {
+        let trimmed = contents.trim();
+        if !trimmed.is_empty() {
+            return ObjectId::from_hex(repo.format, trimmed);
+        }
+    }
+    resolve_revision(&repo.git_dir, repo.format, "HEAD")
+}
+
+/// Upstream `bisect_state`: argv[0] is the state word, the rest are revs.
+fn bisect_state(
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    argv: &[String],
+    out: &mut dyn Write,
+) -> Result<i32> {
+    if argv.is_empty() {
+        eprintln!("error: Please call `--bisect-state` with at least one argument");
+        return Ok(BISECT_FAILED);
+    }
+    if bisect_autostart(repo, terms) != 0 {
+        return Ok(BISECT_FAILED);
+    }
+    let state = argv[0].clone();
+    if check_and_set_terms(repo, terms, &state).is_err()
+        || !(state == terms.good || state == terms.bad || state == "skip")
+    {
+        return Ok(BISECT_FAILED);
+    }
+    let rev_args = &argv[1..];
+    if rev_args.len() > 1 && state == terms.bad {
+        eprintln!(
+            "error: 'git bisect {}' can take only one argument.",
+            terms.bad
+        );
+        return Ok(BISECT_FAILED);
+    }
+
+    let db = repo.db();
+    let mut revs: Vec<ObjectId> = Vec::new();
+    if rev_args.is_empty() {
+        let oid = match current_bisect_oid(repo) {
+            Ok(oid) => oid,
+            Err(_) => {
+                eprintln!("error: Bad rev input: HEAD");
+                return Ok(BISECT_FAILED);
+            }
+        };
+        revs.push(oid);
+    }
+    // All input revs are checked before any write so junk revs leave no state.
+    for arg in rev_args {
+        let oid = match resolve_revision(&repo.git_dir, repo.format, arg) {
+            Ok(oid) => oid,
+            Err(_) => {
+                eprintln!("error: Bad rev input: {arg}");
+                return Ok(BISECT_FAILED);
+            }
+        };
+        let commit = match sley_rev::peel_to_commit(&db, repo.format, &oid) {
+            Ok(commit) => commit,
+            Err(_) => {
+                eprintln!("fatal: Bad rev input (not a commit): {arg}");
+                return Err(GitError::Exit(128));
+            }
+        };
+        revs.push(commit);
+    }
+
+    let mut verify_expected = true;
+    let expected: Option<ObjectId> = fs::read_to_string(repo.state_path("BISECT_EXPECTED_REV"))
+        .ok()
+        .and_then(|contents| ObjectId::from_hex(repo.format, contents.trim()).ok());
+    if expected.is_none() {
+        verify_expected = false;
+    }
+    for oid in &revs {
+        if bisect_write(repo, terms, &state, &oid.to_hex(), false)? != 0 {
+            return Ok(BISECT_FAILED);
+        }
+        if verify_expected && Some(*oid) != expected {
+            let _ = fs::remove_file(repo.state_path("BISECT_ANCESTORS_OK"));
+            let _ = fs::remove_file(repo.state_path("BISECT_EXPECTED_REV"));
+            verify_expected = false;
+        }
+    }
+    bisect_auto_next(repo, terms, out)
+}
+
+fn cmd_bisect_skip(args: &[String]) -> Result<()> {
+    let repo = BisectRepo::open()?;
+    let mut terms = BisectTerms::default();
+    get_terms(&repo, &mut terms);
+
+    let mut argv_state: Vec<String> = vec!["skip".to_string()];
+    for arg in args {
+        if arg.contains("..") {
+            // A range skips every commit the range expression selects.
+            let db = repo.db();
+            let (left, right) = arg.split_once("..").unwrap_or(("", ""));
+            let left = if left.is_empty() { "HEAD" } else { left };
+            let right = if right.is_empty() { "HEAD" } else { right };
+            let left_oid = resolve_revision(&repo.git_dir, repo.format, left)
+                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
+            let right_oid = resolve_revision(&repo.git_dir, repo.format, right)
+                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid));
+            let (Ok(left_oid), Ok(right_oid)) = (left_oid, right_oid) else {
+                eprintln!("fatal: Bad rev input: {arg}");
+                return Err(GitError::Exit(128));
+            };
+            let mut excluded: HashSet<ObjectId> = HashSet::new();
+            for record in sley_rev::walk_commits(&db, repo.format, [left_oid])? {
+                excluded.insert(record.oid);
+            }
+            for record in sley_rev::walk_commits(&db, repo.format, [right_oid])? {
+                if !excluded.contains(&record.oid) {
+                    argv_state.push(record.oid.to_hex());
+                }
+            }
+        } else {
+            argv_state.push(arg.clone());
+        }
+    }
+    let mut out = io::stdout();
+    let code = bisect_state(&repo, &mut terms, &argv_state, &mut out)?;
+    out.flush()?;
+    bisect_exit(code)
+}
+
+// ---------------------------------------------------------------------------
+// next / auto-next
+// ---------------------------------------------------------------------------
+
+fn cmd_bisect_next(args: &[String]) -> Result<()> {
+    if !args.is_empty() {
+        eprintln!("error: 'git bisect next' requires 0 arguments");
+        return Err(GitError::Exit(1));
+    }
+    let repo = BisectRepo::open()?;
+    let mut terms = BisectTerms::default();
+    get_terms(&repo, &mut terms);
+    let mut out = io::stdout();
+    let code = bisect_next(&repo, &mut terms, &mut out)?;
+    out.flush()?;
+    bisect_exit(code)
+}
+
+fn bisect_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) -> Result<i32> {
+    if bisect_autostart(repo, terms) != 0 {
+        return Ok(BISECT_FAILED);
+    }
+    let good_term = terms.good.clone();
+    if bisect_next_check(repo, terms, Some(&good_term)) != 0 {
+        return Ok(BISECT_FAILED);
+    }
+    let res = bisect_next_all(repo, terms, out)?;
+    if res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND {
+        // Record the conclusion in BISECT_LOG.
+        if let Some(bad) = bisect_bad_oid(repo, terms)? {
+            let subject = commit_subject_of(repo, &bad)?;
+            append_to_bisect_log(
+                repo,
+                &format!(
+                    "# first {} commit: [{}] {subject}\n",
+                    terms.bad,
+                    bad.to_hex()
+                ),
+            )?;
+        }
+        return Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND);
+    }
+    if res == BISECT_ONLY_SKIPPED_LEFT {
+        bisect_log_skipped_commits(repo, terms)?;
+        return Ok(BISECT_ONLY_SKIPPED_LEFT);
+    }
+    Ok(res)
+}
+
+fn bisect_auto_next(repo: &BisectRepo, terms: &mut BisectTerms, out: &mut dyn Write) -> Result<i32> {
+    if bisect_next_check(repo, terms, None) != 0 {
+        bisect_print_status(repo, terms, out)?;
+        return Ok(BISECT_OK);
+    }
+    bisect_next(repo, terms, out)
+}
+
+/// Append the `# only skipped commits left to test` block to BISECT_LOG
+/// (upstream `bisect_skipped_commits`), listing `bad ^goods` newest-first.
+fn bisect_log_skipped_commits(repo: &BisectRepo, terms: &BisectTerms) -> Result<()> {
+    let Some(bad) = bisect_bad_oid(repo, terms)? else {
+        return Ok(());
+    };
+    let goods = bisect_good_oids(repo, terms)?;
+    let candidates = bisect_candidate_records(repo, &bad, &goods, repo.first_parent_mode())?;
+    let mut text = String::from("# only skipped commits left to test\n");
+    for record in &candidates {
+        text.push_str(&format!(
+            "# possible first {} commit: [{}] {}\n",
+            terms.bad,
+            record.oid.to_hex(),
+            commit_subject(&record.commit.message)
+        ));
+    }
+    append_to_bisect_log(repo, &text)?;
+    Ok(())
+}
+
+impl BisectRepo {
+    fn first_parent_mode(&self) -> bool {
+        self.state_path("BISECT_FIRST_PARENT").exists()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // start
 // ---------------------------------------------------------------------------
 
 fn cmd_bisect_start(args: &[String]) -> Result<()> {
     let repo = BisectRepo::open()?;
-    let mut term_good: Option<String> = None;
-    let mut term_bad: Option<String> = None;
-    let mut no_checkout = false;
-    let mut first_parent = false;
-    let mut revs: Vec<String> = Vec::new();
-    let mut pathspecs: Vec<String> = Vec::new();
-    let mut saw_double_dash = false;
+    let mut terms = BisectTerms::default();
+    let mut out = io::stdout();
+    let code = bisect_start(&repo, &mut terms, args, &mut out)?;
+    out.flush()?;
+    bisect_exit(code)
+}
+
+fn bisect_start(
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    args: &[String],
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let mut no_checkout = repo.worktree_root.is_none();
+    let mut first_parent_only = false;
+    let mut must_write_terms = false;
+    let mut revs: Vec<ObjectId> = Vec::new();
+
+    let has_double_dash = args.iter().any(|arg| arg == "--");
+    let db = repo.db();
 
     let mut index = 0;
     while index < args.len() {
-        let arg = &args[index];
-        if saw_double_dash {
-            pathspecs.push(arg.clone());
+        let arg = args[index].as_str();
+        if arg == "--" {
+            break;
+        } else if arg == "--no-checkout" {
+            no_checkout = true;
+        } else if arg == "--first-parent" {
+            first_parent_only = true;
+        } else if arg == "--term-good" || arg == "--term-old" {
             index += 1;
-            continue;
-        }
-        match arg.as_str() {
-            "--" => saw_double_dash = true,
-            "--no-checkout" => no_checkout = true,
-            "--first-parent" => first_parent = true,
-            "--term-good" | "--term-old" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return bisect_option_requires_value("--term-good");
-                };
-                term_good = Some(value.clone());
-            }
-            value if let Some(value) = bisect_strip_long_value(value, "--term-good") => {
-                term_good = Some(value.to_string());
-            }
-            value if let Some(value) = bisect_strip_long_value(value, "--term-old") => {
-                term_good = Some(value.to_string());
-            }
-            "--term-bad" | "--term-new" => {
-                index += 1;
-                let Some(value) = args.get(index) else {
-                    return bisect_option_requires_value("--term-bad");
-                };
-                term_bad = Some(value.clone());
-            }
-            value if let Some(value) = bisect_strip_long_value(value, "--term-bad") => {
-                term_bad = Some(value.to_string());
-            }
-            value if let Some(value) = bisect_strip_long_value(value, "--term-new") => {
-                term_bad = Some(value.to_string());
-            }
-            value if value.starts_with('-') => {
-                eprintln!("error: unknown option `{}'", value.trim_start_matches('-'));
-                eprintln!();
-                print_bisect_usage();
-                return Err(GitError::Exit(129));
-            }
-            value => revs.push(value.to_string()),
+            let Some(value) = args.get(index) else {
+                eprintln!("error: '' is not a valid term");
+                return Ok(BISECT_FAILED);
+            };
+            must_write_terms = true;
+            terms.good = value.clone();
+        } else if let Some(value) = arg
+            .strip_prefix("--term-good=")
+            .or_else(|| arg.strip_prefix("--term-old="))
+        {
+            must_write_terms = true;
+            terms.good = value.to_string();
+        } else if arg == "--term-bad" || arg == "--term-new" {
+            index += 1;
+            let Some(value) = args.get(index) else {
+                eprintln!("error: '' is not a valid term");
+                return Ok(BISECT_FAILED);
+            };
+            must_write_terms = true;
+            terms.bad = value.clone();
+        } else if let Some(value) = arg
+            .strip_prefix("--term-bad=")
+            .or_else(|| arg.strip_prefix("--term-new="))
+        {
+            must_write_terms = true;
+            terms.bad = value.to_string();
+        } else if arg.starts_with("--") {
+            eprintln!("error: unrecognized option: '{arg}'");
+            return Ok(BISECT_FAILED);
+        } else if let Ok(oid) = resolve_revision(&repo.git_dir, repo.format, arg)
+            .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
+        {
+            revs.push(oid);
+        } else if has_double_dash {
+            eprintln!("fatal: '{arg}' does not appear to be a valid revision");
+            return Err(GitError::Exit(128));
+        } else {
+            break;
         }
         index += 1;
     }
+    let pathspec_pos = index;
 
-    let terms = resolve_start_terms(term_good, term_bad)?;
+    if !revs.is_empty() {
+        must_write_terms = true;
+    }
+    // First rev is bad, the rest are good.
+    let states: Vec<String> = revs
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| {
+            if idx == 0 {
+                terms.bad.clone()
+            } else {
+                terms.good.clone()
+            }
+        })
+        .collect();
 
-    // git resolves the positional arguments to commits up front; the first
-    // (if any) is the bad commit and the rest are good. An argument that does
-    // not name a commit is treated as a pathspec, matching git's lenient
-    // `start` parsing, so a leading non-rev simply restricts the search.
-    let mut resolved: Vec<ObjectId> = Vec::with_capacity(revs.len());
-    for rev in &revs {
-        match resolve_revision(&repo.git_dir, repo.format, rev) {
-            Ok(oid) => resolved.push(oid),
-            Err(_) => pathspecs.push(rev.clone()),
-        }
+    // Verify HEAD and figure out where the bisection starts from.
+    let store = repo.store();
+    let head_target = store.read_ref("HEAD")?;
+    if head_target.is_none() {
+        eprintln!("error: bad HEAD - I need a HEAD");
+        return Ok(BISECT_FAILED);
     }
 
-    // Record the current HEAD so `bisect reset` can return here. A branch is
-    // stored by name; a detached HEAD by its full object id.
-    let store = FileRefStore::new(&repo.git_dir, repo.format);
-    let start_name = match store.read_ref("HEAD")? {
-        Some(RefTarget::Symbolic(name)) => name
-            .strip_prefix("refs/heads/")
-            .map(str::to_string)
-            .unwrap_or(name),
-        Some(RefTarget::Direct(oid)) => oid.to_hex(),
-        None => {
-            eprintln!("fatal: bad HEAD - I need a HEAD");
-            return Err(GitError::Exit(128));
+    let start_head: String = if repo.is_bisecting() {
+        // Already bisecting: move back to where the previous session started.
+        let recorded = fs::read_to_string(repo.state_path("BISECT_START"))?;
+        let recorded = recorded.trim().to_string();
+        if !no_checkout
+            && cmd_checkout(&[
+                "--ignore-other-worktrees".to_string(),
+                recorded.clone(),
+                "--".to_string(),
+            ])
+            .is_err()
+        {
+            eprintln!(
+                "error: checking out '{recorded}' failed. Try 'git bisect start <valid-branch>'."
+            );
+            return Ok(BISECT_FAILED);
+        }
+        recorded
+    } else {
+        match head_target {
+            Some(RefTarget::Symbolic(name)) => match name.strip_prefix("refs/heads/") {
+                Some(branch) => branch.to_string(),
+                None => {
+                    eprintln!("error: bad HEAD - strange symbolic ref");
+                    return Ok(BISECT_FAILED);
+                }
+            },
+            Some(RefTarget::Direct(oid)) => oid.to_hex(),
+            None => unreachable!("checked above"),
         }
     };
 
-    // Clean out any stale bisection refs/state before starting fresh.
-    remove_bisect_refs(&repo)?;
-    remove_bisect_state_files(&repo)?;
+    // Get rid of any old bisect state.
+    bisect_clean_state(repo)?;
 
-    fs::write(repo.state_path("BISECT_START"), format!("{start_name}\n"))?;
-    fs::write(
-        repo.state_path("BISECT_NAMES"),
-        names_file_contents(&pathspecs),
-    )?;
-    write_bisect_terms(&repo, &terms)?;
-    if no_checkout {
-        // Record that we should not move the working tree; we still keep BISECT
-        // bookkeeping. The presence of the file mirrors git.
-        fs::write(
-            repo.state_path("BISECT_HEAD"),
-            format!("{}\n", current_head_oid(&repo)?.to_hex()),
-        )?;
-    }
-    let _ = first_parent; // accepted; the linear midpoint search already follows history.
-
-    // Build the BISECT_LOG header. When revs are supplied inline, git emits the
-    // `# bad:`/`# good:` lines *before* the command line.
-    let mut log = String::new();
-    for (idx, oid) in resolved.iter().enumerate() {
-        let mark = if idx == 0 { &terms.bad } else { &terms.good };
-        log.push_str(&bisect_log_state_line(&repo, mark, oid)?);
-    }
-    log.push_str(&format!("git bisect start{}\n", format_log_args(args)));
-    fs::write(repo.state_path("BISECT_LOG"), &log)?;
-
-    // Apply the resolved revs as good/bad marks.
-    let mut bad: Option<ObjectId> = None;
-    let mut goods: Vec<ObjectId> = Vec::new();
-    for (idx, oid) in resolved.into_iter().enumerate() {
-        if idx == 0 {
-            write_bad_ref(&repo, &terms, &oid)?;
-            bad = Some(oid);
-        } else {
-            write_good_ref(&repo, &terms, &oid)?;
-            goods.push(oid);
+    let res = (|| -> Result<i32> {
+        fs::write(repo.state_path("BISECT_START"), format!("{start_head}\n"))?;
+        if first_parent_only {
+            fs::write(repo.state_path("BISECT_FIRST_PARENT"), "\n")?;
         }
-    }
-
-    // Drive to the next step if we already have enough information.
-    bisect_auto_next(&repo, &terms, bad.is_some(), goods.len(), no_checkout)
-}
-
-/// Resolve the term pair for `start`, validating any user overrides.
-fn resolve_start_terms(term_good: Option<String>, term_bad: Option<String>) -> Result<BisectTerms> {
-    let mut terms = BisectTerms::default();
-    if let Some(good) = term_good {
-        validate_term(&good)?;
-        terms.good = good;
-    }
-    if let Some(bad) = term_bad {
-        validate_term(&bad)?;
-        terms.bad = bad;
-    }
-    if terms.good == terms.bad {
-        eprintln!("fatal: please use two different terms",);
-        return Err(GitError::Exit(128));
-    }
-    Ok(terms)
-}
-
-fn validate_term(term: &str) -> Result<()> {
-    // git rejects terms that collide with subcommands or are not valid ref
-    // components.
-    const RESERVED: &[&str] = &[
-        "bad",
-        "new",
-        "good",
-        "old",
-        "skip",
-        "start",
-        "terms",
-        "reset",
-        "log",
-        "replay",
-        "next",
-        "visualize",
-        "view",
-        "run",
-        "help",
-    ];
-    if term.is_empty()
-        || RESERVED.contains(&term)
-        || term.contains('/')
-        || term.contains(' ')
-        || term.starts_with('-')
-    {
-        eprintln!("fatal: '{term}' is not a valid term");
-        return Err(GitError::Exit(128));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// good / bad / new / old
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BisectMark {
-    Good,
-    Bad,
-}
-
-fn cmd_bisect_state(args: &[String], mark: BisectMark) -> Result<()> {
-    let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
-        eprintln!("You need to start by \"git bisect start\"");
-        eprintln!();
-        return Err(GitError::Exit(1));
-    }
-    let terms = read_bisect_terms(&repo)?;
-
-    // Collect rev arguments (default to HEAD when none are given). `bad`/`new`
-    // accept at most one rev; `good`/`old` accept several.
-    let revs: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
-    if mark == BisectMark::Bad && revs.len() > 1 {
-        eprintln!(
-            "error: 'git bisect {}' can take only one argument.",
-            terms.bad
-        );
-        return Err(GitError::Exit(1));
-    }
-
-    let no_checkout = repo.state_path("BISECT_HEAD").exists();
-    let targets: Vec<ObjectId> = if revs.is_empty() {
-        // With no rev, mark the commit currently under test: the detached HEAD,
-        // or BISECT_HEAD when running with --no-checkout.
-        vec![current_bisect_oid(&repo, no_checkout)?]
-    } else {
-        let mut out = Vec::with_capacity(revs.len());
-        for rev in revs {
-            let oid = match resolve_revision(&repo.git_dir, repo.format, rev) {
+        if no_checkout {
+            let oid = match resolve_revision(&repo.git_dir, repo.format, &start_head) {
                 Ok(oid) => oid,
                 Err(_) => {
-                    eprintln!("error: Bad rev input: {rev}");
-                    return Err(GitError::Exit(1));
+                    eprintln!("error: invalid ref: '{start_head}'");
+                    return Ok(BISECT_FAILED);
                 }
             };
-            out.push(oid);
+            fs::write(
+                repo.state_path("BISECT_HEAD"),
+                format!("{}\n", oid.to_hex()),
+            )?;
         }
-        out
-    };
 
-    let mark_term = match mark {
-        BisectMark::Bad => terms.bad.clone(),
-        BisectMark::Good => terms.good.clone(),
-    };
+        // Record the rev-list restriction (the args from the first non-rev on),
+        // replicating upstream's `pathspec_pos < argc - 1` quirk.
+        let names = if pathspec_pos + 1 < args.len() {
+            format!("{}\n", sq_quote_args(args[pathspec_pos..].iter()))
+        } else {
+            "\n".to_string()
+        };
+        fs::write(repo.state_path("BISECT_NAMES"), names)?;
 
-    let mut log = read_bisect_log(&repo)?;
-
-    for oid in &targets {
-        match mark {
-            BisectMark::Bad => write_bad_ref(&repo, &terms, oid)?,
-            BisectMark::Good => write_good_ref(&repo, &terms, oid)?,
-        }
-        log.push_str(&bisect_log_state_line(&repo, &mark_term, oid)?);
-    }
-    // Append the actual command line that produced these marks.
-    log.push_str(&format!(
-        "git bisect {}{}\n",
-        mark_term,
-        format_args_with_oids(&targets)
-    ));
-    fs::write(repo.state_path("BISECT_LOG"), &log)?;
-
-    let have_bad = bisect_bad_ref(&repo, &terms)?.is_some();
-    let good_count = bisect_good_oids(&repo, &terms)?.len();
-    bisect_auto_next(&repo, &terms, have_bad, good_count, no_checkout)
-}
-
-// ---------------------------------------------------------------------------
-// skip
-// ---------------------------------------------------------------------------
-
-fn cmd_bisect_skip(args: &[String]) -> Result<()> {
-    let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
-        eprintln!("You need to start by \"git bisect start\"");
-        eprintln!();
-        return Err(GitError::Exit(1));
-    }
-    let terms = read_bisect_terms(&repo)?;
-
-    let no_checkout = repo.state_path("BISECT_HEAD").exists();
-    let mut targets: Vec<ObjectId> = Vec::new();
-    let specs: Vec<&String> = args.iter().filter(|arg| !arg.starts_with('-')).collect();
-    if specs.is_empty() {
-        targets.push(current_bisect_oid(&repo, no_checkout)?);
-    } else {
-        for spec in specs {
-            // A `a..b` range skips every commit reachable from `b` but not `a`.
-            if spec.contains("..") {
-                for oid in resolve_skip_range(&repo, spec)? {
-                    targets.push(oid);
-                }
-            } else {
-                let oid = match resolve_revision(&repo.git_dir, repo.format, spec) {
-                    Ok(oid) => oid,
-                    Err(_) => {
-                        eprintln!("fatal: Bad rev input: {spec}");
-                        return Err(GitError::Exit(128));
-                    }
-                };
-                targets.push(oid);
+        for (state, oid) in states.iter().zip(&revs) {
+            if bisect_write(repo, terms, state, &oid.to_hex(), true)? != 0 {
+                return Ok(BISECT_FAILED);
             }
         }
-    }
 
-    let mut log = read_bisect_log(&repo)?;
-    for oid in &targets {
-        write_skip_ref(&repo, oid)?;
-        log.push_str(&bisect_log_state_line(&repo, "skip", oid)?);
-    }
-    log.push_str(&format!(
-        "git bisect skip{}\n",
-        format_args_with_oids(&targets)
-    ));
-    fs::write(repo.state_path("BISECT_LOG"), &log)?;
-
-    let have_bad = bisect_bad_ref(&repo, &terms)?.is_some();
-    let good_count = bisect_good_oids(&repo, &terms)?.len();
-    bisect_auto_next(&repo, &terms, have_bad, good_count, no_checkout)
-}
-
-/// Resolve a `a..b` range to the list of commit ids reachable from `b` but not
-/// from `a` (the commits `git bisect skip <a>..<b>` would skip).
-fn resolve_skip_range(repo: &BisectRepo, spec: &str) -> Result<Vec<ObjectId>> {
-    let Some((left, right)) = spec.split_once("..") else {
-        return Ok(Vec::new());
-    };
-    let db = repo.db();
-    let right_oid = resolve_revision(&repo.git_dir, repo.format, right)?;
-    let mut excluded: HashSet<ObjectId> = HashSet::new();
-    if !left.is_empty() {
-        let left_oid = resolve_revision(&repo.git_dir, repo.format, left)?;
-        for record in sley_rev::walk_commits(&db, repo.format, [left_oid])? {
-            excluded.insert(record.oid);
+        if must_write_terms && write_terms(repo, &terms.bad, &terms.good)? != 0 {
+            return Ok(BISECT_FAILED);
         }
+
+        append_to_bisect_log(
+            repo,
+            &format!("git bisect start{}\n", sq_quote_args(args.iter())),
+        )?;
+        Ok(BISECT_OK)
+    })()?;
+    if res != BISECT_OK {
+        return Ok(res);
     }
-    let mut out = Vec::new();
-    for record in sley_rev::walk_commits(&db, repo.format, [right_oid])? {
-        if !excluded.contains(&record.oid) {
-            out.push(record.oid);
-        }
+
+    let res = bisect_auto_next(repo, terms, out)?;
+    if !is_bisect_success(res) {
+        bisect_clean_state(repo)?;
     }
-    Ok(out)
+    Ok(res)
 }
 
 // ---------------------------------------------------------------------------
-// next
-// ---------------------------------------------------------------------------
-
-fn cmd_bisect_next(args: &[String]) -> Result<()> {
-    if let Some(arg) = args.iter().find(|arg| arg.starts_with('-')) {
-        eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
-        eprintln!();
-        print_bisect_usage();
-        return Err(GitError::Exit(129));
-    }
-    let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
-        eprintln!("You need to start by \"git bisect start\"");
-        eprintln!();
-        return Err(GitError::Exit(1));
-    }
-    let terms = read_bisect_terms(&repo)?;
-    let have_bad = bisect_bad_ref(&repo, &terms)?.is_some();
-    let good_count = bisect_good_oids(&repo, &terms)?.len();
-    let no_checkout = repo.state_path("BISECT_HEAD").exists();
-    bisect_auto_next(&repo, &terms, have_bad, good_count, no_checkout)
-}
-
-// ---------------------------------------------------------------------------
-// reset
+// reset / log / replay / terms / visualize
 // ---------------------------------------------------------------------------
 
 fn cmd_bisect_reset(args: &[String]) -> Result<()> {
-    let repo = BisectRepo::open()?;
-    let commit = args.iter().find(|arg| !arg.starts_with('-')).cloned();
-    if let Some(arg) = args.iter().find(|arg| arg.starts_with('-')) {
-        eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
-        eprintln!();
-        print_bisect_usage();
-        return Err(GitError::Exit(129));
-    }
-
-    if !repo.is_bisecting() {
-        // git treats `reset` when not bisecting as a successful no-op unless an
-        // explicit commit was requested.
-        if commit.is_none() {
-            return Ok(());
-        }
-        eprintln!("We are not bisecting.");
+    if args.len() > 1 {
+        eprintln!("error: 'git bisect reset' requires either no argument or a commit");
         return Err(GitError::Exit(1));
     }
-
-    // Determine where to return: the explicit commit, or the recorded
-    // BISECT_START (branch name or detached oid).
-    let target = match commit {
-        Some(commit) => commit,
-        None => read_bisect_start(&repo)?,
-    };
-
-    // Clear bisection state before checking out so a failed checkout does not
-    // leave half-torn-down state lying around in the common case.
-    remove_bisect_refs(&repo)?;
-    remove_bisect_state_files(&repo)?;
-
-    // Reuse the regular checkout machinery so the "Switched to branch" /
-    // "HEAD is now at" messaging matches git. A branch name checks out the
-    // branch; anything else detaches.
-    let store = FileRefStore::new(&repo.git_dir, repo.format);
-    let is_branch = store.read_ref(&format!("refs/heads/{target}"))?.is_some();
-    if is_branch {
-        cmd_checkout(&[target])
-    } else {
-        cmd_checkout(&["--detach".to_string(), target])
-    }
+    let repo = BisectRepo::open()?;
+    bisect_exit(bisect_reset(&repo, args.first().map(String::as_str))?)
 }
 
-// ---------------------------------------------------------------------------
-// log
-// ---------------------------------------------------------------------------
+fn bisect_reset(repo: &BisectRepo, commit: Option<&str>) -> Result<i32> {
+    let branch: String = match commit {
+        None => {
+            match fs::read_to_string(repo.state_path("BISECT_START")) {
+                Ok(contents) => contents.trim().to_string(),
+                Err(_) => {
+                    println!("We are not bisecting.");
+                    String::new()
+                }
+            }
+        }
+        Some(commit) => {
+            let db = repo.db();
+            if resolve_revision(&repo.git_dir, repo.format, commit)
+                .and_then(|oid| sley_rev::peel_to_commit(&db, repo.format, &oid))
+                .is_err()
+            {
+                eprintln!("error: '{commit}' is not a valid commit");
+                return Ok(BISECT_FAILED);
+            }
+            commit.to_string()
+        }
+    };
+
+    if !branch.is_empty() && !repo.state_path("BISECT_HEAD").exists() {
+        if cmd_checkout(&[
+            "--ignore-other-worktrees".to_string(),
+            branch.clone(),
+            "--".to_string(),
+        ])
+        .is_err()
+        {
+            eprintln!(
+                "error: could not check out original HEAD '{branch}'. Try 'git bisect reset <commit>'."
+            );
+            return Ok(BISECT_FAILED);
+        }
+    }
+    bisect_clean_state(repo)?;
+    Ok(BISECT_OK)
+}
 
 fn cmd_bisect_log(args: &[String]) -> Result<()> {
-    if let Some(arg) = args.first() {
-        eprintln!("error: unknown option `{}'", arg.trim_start_matches('-'));
-        eprintln!();
-        print_bisect_usage();
-        return Err(GitError::Exit(129));
-    }
+    let _ = args; // upstream ignores extra arguments
     let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
+    let log_path = repo.state_path("BISECT_LOG");
+    let empty_or_missing = fs::metadata(&log_path).map(|m| m.len() == 0).unwrap_or(true);
+    if empty_or_missing {
         eprintln!("error: We are not bisecting.");
         return Err(GitError::Exit(1));
     }
-    let log = read_bisect_log(&repo)?;
+    let log = fs::read(&log_path)?;
     let mut stdout = io::stdout();
-    stdout.write_all(log.as_bytes())?;
+    stdout.write_all(&log)?;
     stdout.flush()?;
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// replay
-// ---------------------------------------------------------------------------
-
 fn cmd_bisect_replay(args: &[String]) -> Result<()> {
-    let path = args.iter().find(|arg| !arg.starts_with('-'));
-    let Some(path) = path else {
-        eprintln!("usage: git bisect replay <logfile>");
-        return Err(GitError::Exit(129));
-    };
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(_) => {
-            eprintln!("cannot read {path} for replaying");
-            return Err(GitError::Exit(1));
-        }
-    };
-
-    // A replay starts a fresh bisection, then applies each recorded command.
-    // Comment lines (`# ...`) are ignored; `git bisect <cmd> <args>` lines are
-    // re-executed.
-    cmd_bisect_reset(&[])?;
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let tokens = tokenize_log_line(line);
-        let tokens: Vec<String> = match tokens {
-            Some(tokens) => tokens,
-            None => continue,
-        };
-        // Expect `git bisect <subcommand> ...`.
-        let mut iter = tokens.into_iter();
-        match (iter.next().as_deref(), iter.next().as_deref()) {
-            (Some("git"), Some("bisect")) => {
-                let sub: Vec<String> = iter.collect();
-                cmd_bisect(&sub)?;
-            }
-            _ => continue,
-        }
+    if args.len() != 1 {
+        eprintln!("error: no logfile given");
+        return Err(GitError::Exit(1));
     }
-    Ok(())
+    let filename = &args[0];
+    let repo = BisectRepo::open()?;
+    let mut terms = BisectTerms::default();
+    bisect_exit(bisect_replay(&repo, &mut terms, filename)?)
 }
 
-/// Split a `git bisect ...` log line into tokens, honouring the single-quote
-/// quoting git uses when it records arguments. Returns `None` on malformed
-/// quoting.
-fn tokenize_log_line(line: &str) -> Option<Vec<String>> {
+fn bisect_replay(repo: &BisectRepo, terms: &mut BisectTerms, filename: &str) -> Result<i32> {
+    let empty_or_missing = fs::metadata(filename).map(|m| m.len() == 0).unwrap_or(true);
+    if empty_or_missing {
+        eprintln!("error: cannot read file '{filename}' for replaying");
+        return Ok(BISECT_FAILED);
+    }
+    if bisect_reset(repo, None)? != 0 {
+        return Ok(BISECT_FAILED);
+    }
+    let contents = fs::read_to_string(filename)?;
+    let mut out = io::stdout();
+    let mut res = BISECT_OK;
+    for line in contents.lines() {
+        if res != BISECT_OK {
+            break;
+        }
+        res = process_replay_line(repo, terms, line.trim_end_matches('\r'), &mut out)?;
+    }
+    out.flush()?;
+    if res != BISECT_OK {
+        return Ok(BISECT_FAILED);
+    }
+    bisect_auto_next(repo, terms, &mut io::stdout())
+}
+
+fn process_replay_line(
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    line: &str,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let p = line.trim_start();
+    let rest = if let Some(rest) = p.strip_prefix("git bisect") {
+        rest
+    } else if let Some(rest) = p.strip_prefix("git-bisect") {
+        rest
+    } else {
+        return Ok(BISECT_OK);
+    };
+    if !rest.starts_with([' ', '\t']) {
+        return Ok(BISECT_OK);
+    }
+    let rest = rest.trim_start();
+    let (word, rev) = match rest.find([' ', '\t']) {
+        Some(pos) => (&rest[..pos], rest[pos..].trim_start()),
+        None => (rest, ""),
+    };
+
+    get_terms(repo, terms);
+    if check_and_set_terms(repo, terms, word).is_err() {
+        return Ok(BISECT_FAILED);
+    }
+
+    if word == "start" {
+        let argv = sq_dequote_args(rev);
+        return bisect_start(repo, terms, &argv, out);
+    }
+    if word == terms.good || word == terms.bad || word == "skip" {
+        return bisect_write(repo, terms, word, rev, false);
+    }
+    if word == "terms" {
+        let argv = sq_dequote_args(rev);
+        return bisect_terms_print(repo, terms, argv.first().map(String::as_str));
+    }
+    eprintln!("error: '{word}'?? what are you talking about?");
+    Ok(BISECT_FAILED)
+}
+
+/// Split an sq-quoted argument string back into tokens (upstream
+/// `sq_dequote_to_strvec`, lenient about unquoted words).
+fn sq_dequote_args(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let mut chars = line.chars().peekable();
     let mut in_token = false;
+    let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
         match ch {
             ' ' | '\t' => {
@@ -643,22 +1121,24 @@ fn tokenize_log_line(line: &str) -> Option<Vec<String>> {
             }
             '\'' => {
                 in_token = true;
-                // Read until the closing quote. git escapes embedded quotes as
-                // `'\''`.
                 loop {
                     match chars.next() {
-                        Some('\'') => break,
-                        Some('\\') => {
-                            // `'\''` sequence: backslash then quote then quote.
-                            if chars.peek() == Some(&'\'') {
-                                chars.next();
-                                current.push('\'');
-                            } else {
-                                current.push('\\');
+                        Some('\'') => {
+                            // `'\''` escape: backslash-quote-quote
+                            if chars.peek() == Some(&'\\') {
+                                let mut lookahead = chars.clone();
+                                lookahead.next();
+                                if lookahead.peek() == Some(&'\'') {
+                                    chars.next();
+                                    chars.next();
+                                    current.push('\'');
+                                    continue;
+                                }
                             }
+                            break;
                         }
                         Some(other) => current.push(other),
-                        None => return None,
+                        None => break,
                     }
                 }
             }
@@ -671,57 +1151,60 @@ fn tokenize_log_line(line: &str) -> Option<Vec<String>> {
     if in_token {
         tokens.push(current);
     }
-    Some(tokens)
+    tokens
 }
 
-// ---------------------------------------------------------------------------
-// terms
-// ---------------------------------------------------------------------------
-
 fn cmd_bisect_terms(args: &[String]) -> Result<()> {
-    let repo = BisectRepo::open()?;
-    let terms = if repo.is_bisecting() {
-        read_bisect_terms(&repo)?
-    } else if args.is_empty() {
-        eprintln!("error: no terms defined");
+    if args.len() > 1 {
+        eprintln!("error: 'git bisect terms' requires 0 or 1 argument");
         return Err(GitError::Exit(1));
-    } else {
-        BisectTerms::default()
-    };
+    }
+    let repo = BisectRepo::open()?;
+    let mut terms = BisectTerms::default();
+    bisect_exit(bisect_terms_print(
+        &repo,
+        &mut terms,
+        args.first().map(String::as_str),
+    )?)
+}
 
-    match args.first().map(String::as_str) {
+fn bisect_terms_print(
+    repo: &BisectRepo,
+    terms: &mut BisectTerms,
+    option: Option<&str>,
+) -> Result<i32> {
+    if !get_terms(repo, terms) {
+        eprintln!("error: no terms defined");
+        return Ok(BISECT_FAILED);
+    }
+    match option {
         None => {
             println!("Your current terms are {} for the old state", terms.good);
             println!("and {} for the new state.", terms.bad);
-            Ok(())
+            Ok(BISECT_OK)
         }
         Some("--term-good") | Some("--term-old") => {
             println!("{}", terms.good);
-            Ok(())
+            Ok(BISECT_OK)
         }
         Some("--term-bad") | Some("--term-new") => {
             println!("{}", terms.bad);
-            Ok(())
+            Ok(BISECT_OK)
         }
         Some(other) => {
             eprintln!(
-                "error: unrecognized option: '{}'",
-                other.trim_start_matches('-')
+                "error: invalid argument {other} for 'git bisect terms'.\nSupported options are: --term-good|--term-old and --term-bad|--term-new."
             );
-            Err(GitError::Exit(129))
+            Ok(BISECT_FAILED)
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// visualize / run (best-effort; not the focus of the state machine)
-// ---------------------------------------------------------------------------
-
 fn cmd_bisect_visualize(_args: &[String]) -> Result<()> {
     let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
-        eprintln!("You need to start by \"git bisect start\"");
-        eprintln!();
+    let mut terms = BisectTerms::default();
+    get_terms(&repo, &mut terms);
+    if bisect_next_check(&repo, &terms, None) != 0 {
         return Err(GitError::Exit(1));
     }
     Err(GitError::Unsupported(
@@ -729,300 +1212,757 @@ fn cmd_bisect_visualize(_args: &[String]) -> Result<()> {
     ))
 }
 
-fn cmd_bisect_run(_args: &[String]) -> Result<()> {
-    let repo = BisectRepo::open()?;
-    if !repo.is_bisecting() {
-        eprintln!("You need to start by \"git bisect start\"");
-        eprintln!();
+// ---------------------------------------------------------------------------
+// run
+// ---------------------------------------------------------------------------
+
+fn cmd_bisect_run(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        eprintln!("error: 'git bisect run' failed: no command provided.");
         return Err(GitError::Exit(1));
     }
-    Err(GitError::Unsupported(
-        "git bisect run is not implemented".into(),
-    ))
+    let repo = BisectRepo::open()?;
+    let mut terms = BisectTerms::default();
+    get_terms(&repo, &mut terms);
+    bisect_exit(bisect_run(&repo, &mut terms, args)?)
 }
 
-// ---------------------------------------------------------------------------
-// Core: decide whether we can compute a midpoint, and either step or finish.
-// ---------------------------------------------------------------------------
-
-fn bisect_auto_next(
-    repo: &BisectRepo,
-    terms: &BisectTerms,
-    have_bad: bool,
-    good_count: usize,
-    no_checkout: bool,
-) -> Result<()> {
-    // The waiting-status messages always use the literal words "good"/"bad",
-    // even when custom terms are in effect, matching git.
-    if !have_bad && good_count == 0 {
-        let status = "waiting for both good and bad commits";
-        println!("status: {status}");
-        write_log_status(repo, status)?;
-        return Ok(());
+/// Run `command` through the shell, returning the child's exit code (negative
+/// when killed by a signal, mirroring run_command).
+fn do_bisect_run(command: &str) -> Result<i32> {
+    println!("running {command}");
+    io::stdout().flush()?;
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .status()?;
+    match status.code() {
+        Some(code) => Ok(code),
+        None => Ok(-1),
     }
-    if have_bad && good_count == 0 {
-        let status = "waiting for good commit(s), bad commit known";
-        println!("status: {status}");
-        write_log_status(repo, status)?;
-        return Ok(());
-    }
-    if !have_bad && good_count > 0 {
-        let status = format!("waiting for bad commit, {good_count} good commit known");
-        println!("status: {status}");
-        write_log_status(repo, &status)?;
-        return Ok(());
-    }
-
-    bisect_step(repo, terms, no_checkout)
 }
 
-/// Compute the next commit to test and check it out, or announce the first bad
-/// commit when the search has converged.
-fn bisect_step(repo: &BisectRepo, terms: &BisectTerms, no_checkout: bool) -> Result<()> {
-    let db = repo.db();
-    let bad = bisect_bad_ref(repo, terms)?
-        .ok_or_else(|| GitError::InvalidFormat("bisect bad ref missing".into()))?;
+fn verify_good(repo: &BisectRepo, terms: &BisectTerms, command: &str) -> Result<i32> {
     let goods = bisect_good_oids(repo, terms)?;
-    let skips = bisect_skip_oids(repo)?;
+    let Some(good_rev) = goods.first().copied() else {
+        return Ok(-1);
+    };
+    let no_checkout = repo.no_checkout();
+    let current = match current_bisect_oid(repo) {
+        Ok(oid) => oid,
+        Err(_) => return Ok(-1),
+    };
+    let mut sink = Vec::new();
+    if bisect_checkout(repo, &good_rev, no_checkout, &mut sink)? != BISECT_OK {
+        return Ok(-1);
+    }
+    let rc = do_bisect_run(command)?;
+    let mut sink = Vec::new();
+    if bisect_checkout(repo, &current, no_checkout, &mut sink)? != BISECT_OK {
+        return Ok(-1);
+    }
+    Ok(rc)
+}
 
-    // Validate that every good commit is an ancestor of the bad commit, and that
-    // no good commit equals the bad commit.
-    for good in &goods {
-        if good == &bad {
-            // git prints this particular diagnostic to stdout.
-            println!("{} was both good and bad", bad.to_hex());
-            return Err(GitError::Exit(1));
+fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Result<i32> {
+    if bisect_next_check(repo, terms, None) != 0 {
+        return Ok(BISECT_FAILED);
+    }
+    if args.is_empty() {
+        eprintln!("error: bisect run failed: no command provided.");
+        return Ok(BISECT_FAILED);
+    }
+    let command = sq_quote_args(args.iter()).trim_start().to_string();
+    let mut is_first_run = true;
+    loop {
+        let mut res = do_bisect_run(&command)?;
+
+        // Exit code 126 and 127 can come from the shell when the script is
+        // missing or not executable; verify with a known-good revision.
+        if is_first_run && (res == 126 || res == 127) {
+            let rc = verify_good(repo, terms, &command)?;
+            is_first_run = false;
+            if rc < 0 || rc >= 128 {
+                eprintln!("error: unable to verify {command} on good revision");
+                return Ok(BISECT_FAILED);
+            }
+            if rc == res {
+                eprintln!("error: bogus exit code {rc} for good revision");
+                return Ok(BISECT_FAILED);
+            }
+        }
+
+        if res < 0 || res >= 128 {
+            eprintln!("error: bisect run failed: exit code {res} from {command} is < 0 or >= 128");
+            return Ok(res);
+        }
+
+        let new_state = if res == 125 {
+            "skip".to_string()
+        } else if res == 0 {
+            terms.good.clone()
+        } else {
+            terms.bad.clone()
+        };
+
+        // Upstream redirects the state step's stdout into BISECT_RUN, then
+        // prints the file.
+        let mut buffer: Vec<u8> = Vec::new();
+        let state_res = bisect_state(repo, terms, &[new_state.clone()], &mut buffer)?;
+        fs::write(repo.state_path("BISECT_RUN"), &buffer)?;
+        io::stdout().write_all(&buffer)?;
+        io::stdout().flush()?;
+
+        if state_res == BISECT_ONLY_SKIPPED_LEFT {
+            eprintln!("error: bisect run cannot continue any more");
+            return Ok(state_res);
+        } else if state_res == BISECT_INTERNAL_SUCCESS_MERGE_BASE {
+            println!("bisect run success");
+            return Ok(BISECT_OK);
+        } else if state_res == BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND {
+            println!("bisect found first bad commit");
+            return Ok(BISECT_OK);
+        } else if state_res != BISECT_OK {
+            eprintln!(
+                "error: bisect run failed: 'git bisect {new_state}' exited with error code {state_res}"
+            );
+            return Ok(state_res);
         }
     }
+}
 
-    // The candidate set is everything reachable from `bad` but not from any
-    // `good` commit (i.e. `good..bad`), including `bad` itself.
+// ---------------------------------------------------------------------------
+// The bisection core: candidates, weights, midpoint (upstream bisect.c)
+// ---------------------------------------------------------------------------
+
+/// `bad ^goods` in rev-list order (newest-first date order), first-parent
+/// limited on the bad side when requested.
+fn bisect_candidate_records(
+    repo: &BisectRepo,
+    bad: &ObjectId,
+    goods: &[ObjectId],
+    first_parent: bool,
+) -> Result<Vec<sley_rev::CommitRecord>> {
+    let db = repo.db();
     let mut excluded: HashSet<ObjectId> = HashSet::new();
-    for good in &goods {
-        if !sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, good, &bad)? {
-            eprintln!("Some good revs are not ancestors of the bad rev.");
-            eprintln!("git bisect cannot work properly in this case.");
-            eprintln!("Maybe you mistook good and bad revs?");
-            return Err(GitError::Exit(1));
-        }
-        for record in sley_rev::walk_commits(&db, repo.format, [good.clone()])? {
+    for good in goods {
+        for record in sley_rev::walk_commits(&db, repo.format, [*good])? {
             excluded.insert(record.oid);
         }
     }
+    let records = rev_list_walk_commits(&db, repo.format, [*bad], first_parent)?;
+    let kept: Vec<sley_rev::CommitRecord> = records
+        .into_iter()
+        .filter(|record| !excluded.contains(&record.oid))
+        .collect();
+    let refs: Vec<&sley_rev::CommitRecord> = kept.iter().collect();
+    let ordered = rev_list_date_order(refs)?;
+    Ok(ordered.into_iter().cloned().collect())
+}
 
-    // Walk `bad`'s history, collecting candidates (skip the excluded set).
-    let mut candidates: Vec<sley_rev::CommitRecord> = Vec::new();
-    let mut candidate_ids: HashSet<ObjectId> = HashSet::new();
-    for record in sley_rev::walk_commits(&db, repo.format, [bad.clone()])? {
-        if excluded.contains(&record.oid) {
-            continue;
-        }
-        candidate_ids.insert(record.oid);
-        candidates.push(record);
-    }
-
-    let nr = candidates.len();
-    if nr == 0 {
-        // Nothing reachable that is not already known good: `bad` is the first
-        // bad commit.
-        return announce_first_bad(repo, terms, &bad);
-    }
-
-    // Compute, for each candidate, the number of candidates reachable from it
-    // (its "weight"), restricted to the candidate set. The midpoint is the
-    // candidate whose weight is the "reaches" target below.
-    let weights = compute_candidate_weights(&candidates, &candidate_ids);
-
-    // git's bisection targets the commit whose reachable-candidate count
-    // ("reaches") best halves the set, and announces `nr - reaches - 1`
-    // revisions left. Empirically (matching git's commit-traversal-order tie
-    // breaking) `reaches == nr / 2` for every `nr` except `nr == 3`, where git
-    // lands on the upper side and uses `reaches == 2`.
-    let reaches = bisect_reaches(nr);
-
-    // The commit actually checked out is the one whose weight is `reaches`,
-    // preferring an unskipped commit. When that exact commit is skipped, fall
-    // back to the unskipped candidate with weight nearest `reaches` (ties broken
-    // by object id for determinism), but keep the announced count tied to
-    // `reaches` as git does.
-    let skip_set: HashSet<&ObjectId> = skips.iter().collect();
-    let mut best_unskipped: Option<BisectChoice> = None;
-    for record in &candidates {
-        if skip_set.contains(&record.oid) {
-            continue;
-        }
-        let weight = *weights.get(&record.oid).unwrap_or(&0);
-        let choice = BisectChoice {
-            oid: record.oid,
-            key: bisect_reaches_key(weight, reaches),
-        };
-        if bisect_choice_better(&choice, &best_unskipped) {
-            best_unskipped = Some(choice);
-        }
-    }
-    let optimal_weight = reaches;
-
-    let Some(choice) = best_unskipped else {
-        // Every candidate is skipped; git reports it cannot conclude.
-        eprintln!("There are only 'skip'ped commits left to test.");
-        eprintln!("The first {} commit could be any of:", terms.bad);
-        for record in &candidates {
-            println!("{}", record.oid.to_hex());
-        }
-        eprintln!("We cannot bisect more!");
-        return Err(GitError::Exit(2));
+/// Read the BISECT_NAMES pathspec restriction (sq-quoted; `--` tokens dropped).
+fn bisect_pathspec(repo: &BisectRepo) -> Result<Option<sley_rev::Pathspec>> {
+    let contents = match fs::read_to_string(repo.state_path("BISECT_NAMES")) {
+        Ok(contents) => contents,
+        Err(_) => return Ok(None),
     };
-    let midpoint = choice.oid;
+    let mut specs: Vec<String> = Vec::new();
+    for line in contents.lines() {
+        for token in sq_dequote_args(line.trim()) {
+            if token != "--" && !token.is_empty() {
+                specs.push(token);
+            }
+        }
+    }
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let pathspec = sley_rev::Pathspec::parse(
+        specs.iter().map(|spec| spec.as_bytes()),
+        sley_rev::PathspecMatchMagic::default(),
+    )
+    .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+    Ok(Some(pathspec))
+}
 
-    // If the only remaining candidate is `bad` itself, the search is done.
-    if nr == 1 && midpoint == bad {
-        return announce_first_bad(repo, terms, &bad);
+/// Weighted-midpoint selection, ported from upstream `do_find_bisection` /
+/// `find_bisection`. `list` is oldest-first; `parents[i]` are the indices of
+/// each commit's interesting parents. When `find_all` is false, returns the
+/// first commit found approximately halfway; otherwise computes every weight
+/// and returns all candidates sorted by distance (descending, ties by oid).
+struct Bisection {
+    /// Indices (into the kept list) of the chosen commits, best first.
+    picks: Vec<usize>,
+    /// Weight (reachable interesting commits) of the best pick.
+    reaches: usize,
+}
+
+fn approx_halfway(weight: i64, nr: usize) -> bool {
+    let diff = 2 * weight - nr as i64;
+    match diff {
+        -1..=1 => true,
+        _ => diff.unsigned_abs() < (nr / 1024) as u64,
+    }
+}
+
+fn count_distance(start: usize, parents: &[Vec<usize>]) -> i64 {
+    // Reachable-set count over the interesting graph (upstream count_distance
+    // with COUNTED marks).
+    let mut visited = vec![false; parents.len()];
+    let mut stack = vec![start];
+    let mut nr = 0i64;
+    while let Some(idx) = stack.pop() {
+        if visited[idx] {
+            continue;
+        }
+        visited[idx] = true;
+        nr += 1;
+        for &parent in &parents[idx] {
+            if !visited[parent] {
+                stack.push(parent);
+            }
+        }
+    }
+    nr
+}
+
+fn do_find_bisection(
+    oids: &[ObjectId],
+    parents: &[Vec<usize>],
+    find_all: bool,
+) -> Bisection {
+    let nr = oids.len();
+    let mut weights: Vec<i64> = vec![0; nr];
+    let mut counted = 0usize;
+
+    for idx in 0..nr {
+        match parents[idx].len() {
+            0 => {
+                weights[idx] = 1;
+                counted += 1;
+            }
+            1 => weights[idx] = -1,
+            _ => weights[idx] = -2,
+        }
     }
 
-    let revisions_left = nr.saturating_sub(optimal_weight + 1);
-    let steps = estimate_bisect_steps(nr);
-    println!(
-        "Bisecting: {revisions_left} {} left to test after this (roughly {steps} {})",
-        plural(revisions_left, "revision", "revisions"),
-        plural(steps, "step", "steps"),
-    );
-    let subject = commit_subject_of(repo, &midpoint)?;
-    println!("[{}] {subject}", midpoint.to_hex());
+    // Count merges the expensive way first, with the halfway early exit.
+    for idx in 0..nr {
+        if weights[idx] != -2 {
+            continue;
+        }
+        weights[idx] = count_distance(idx, parents);
+        if !find_all && approx_halfway(weights[idx], nr) {
+            return Bisection {
+                picks: vec![idx],
+                reaches: weights[idx] as usize,
+            };
+        }
+        counted += 1;
+    }
 
-    // Cache the expected midpoint and check it out (unless --no-checkout).
+    // Fill in single-strand-of-pearls weights from known parents.
+    while counted < nr {
+        for idx in 0..nr {
+            if weights[idx] >= 0 {
+                continue;
+            }
+            let Some(&known) = parents[idx].iter().find(|&&p| weights[p] >= 0) else {
+                continue;
+            };
+            weights[idx] = weights[known] + 1;
+            counted += 1;
+            if !find_all && approx_halfway(weights[idx], nr) {
+                return Bisection {
+                    picks: vec![idx],
+                    reaches: weights[idx] as usize,
+                };
+            }
+        }
+    }
+
+    if !find_all {
+        // best_bisection: maximize min(weight, nr - weight); first wins ties.
+        let mut best = 0usize;
+        let mut best_distance: i64 = -1;
+        for idx in 0..nr {
+            let weight = weights[idx];
+            let distance = weight.min(nr as i64 - weight);
+            if distance > best_distance {
+                best = idx;
+                best_distance = distance;
+            }
+        }
+        Bisection {
+            picks: vec![best],
+            reaches: weights[best] as usize,
+        }
+    } else {
+        // best_bisection_sorted: distance descending, ties by ascending oid.
+        let mut order: Vec<usize> = (0..nr).collect();
+        let distance =
+            |idx: usize| -> i64 { weights[idx].min(nr as i64 - weights[idx]) };
+        order.sort_by(|&a, &b| {
+            distance(b)
+                .cmp(&distance(a))
+                .then_with(|| oids[a].cmp(&oids[b]))
+        });
+        let reaches = order.first().map(|&idx| weights[idx] as usize).unwrap_or(0);
+        Bisection {
+            picks: order,
+            reaches,
+        }
+    }
+}
+
+/// Pseudo random number generator from upstream bisect.c (used by skip_away).
+fn get_prn(count: usize) -> usize {
+    let count = (count as u32).wrapping_mul(1_103_515_245).wrapping_add(12_345);
+    ((count / 65_536) % 32_768) as usize
+}
+
+/// Integer square root with the same float iteration as upstream.
+fn sqrti(val: i32) -> i32 {
+    if val == 0 {
+        return 0;
+    }
+    let mut x = val as f32;
+    loop {
+        let y = (x + (val as f32) / x) / 2.0;
+        let d = if y > x { y - x } else { x - y };
+        x = y;
+        if d < 0.5 {
+            break;
+        }
+    }
+    x as i32
+}
+
+/// Pick a commit "away" from the (skipped) head of the list.
+fn skip_away(list: &[usize], count: usize, oids: &[ObjectId], bad: &ObjectId) -> usize {
+    let prn = get_prn(count);
+    let index = (count * prn / 32_768) * sqrti(prn as i32) as usize / sqrti(32_768) as usize;
+    let mut previous: Option<usize> = None;
+    for (i, &idx) in list.iter().enumerate() {
+        if i == index {
+            if oids[idx] != *bad {
+                return idx;
+            }
+            return previous.unwrap_or(list[0]);
+        }
+        previous = Some(idx);
+    }
+    list[0]
+}
+
+enum SkipFilter {
+    /// The best pick was not skipped: use it as-is.
+    Clean(usize),
+    /// Skips interfered: the picked index plus the skipped ("tried") indices.
+    Skipped {
+        pick: Option<usize>,
+        tried: Vec<usize>,
+    },
+}
+
+/// filter_skipped + skip_away (upstream `managed_skipped`). `picks` is the
+/// sorted candidate order; returns which commit to test and which skipped
+/// commits were "tried".
+fn managed_skipped(
+    picks: &[usize],
+    oids: &[ObjectId],
+    skipped: &HashSet<ObjectId>,
+    bad: &ObjectId,
+) -> SkipFilter {
+    if skipped.is_empty() || picks.is_empty() {
+        return match picks.first() {
+            Some(&idx) => SkipFilter::Clean(idx),
+            None => SkipFilter::Skipped {
+                pick: None,
+                tried: Vec::new(),
+            },
+        };
+    }
+    if !skipped.contains(&oids[picks[0]]) {
+        return SkipFilter::Clean(picks[0]);
+    }
+    // First pick is skipped: fully filter, then skip away.
+    let mut tried = Vec::new();
+    let mut filtered = Vec::new();
+    for &idx in picks {
+        if skipped.contains(&oids[idx]) {
+            tried.push(idx);
+        } else {
+            filtered.push(idx);
+        }
+    }
+    if filtered.is_empty() {
+        return SkipFilter::Skipped { pick: None, tried };
+    }
+    let pick = skip_away(&filtered, filtered.len(), oids, bad);
+    SkipFilter::Skipped {
+        pick: Some(pick),
+        tried,
+    }
+}
+
+fn error_if_skipped_commits(
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    tried: &[ObjectId],
+    bad: Option<&ObjectId>,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    if tried.is_empty() {
+        return Ok(BISECT_OK);
+    }
+    writeln!(
+        out,
+        "There are only 'skip'ped commits left to test.\nThe first {} commit could be any of:",
+        terms.bad
+    )?;
+    for oid in tried {
+        writeln!(out, "{}", oid.to_hex())?;
+    }
+    if let Some(bad) = bad {
+        writeln!(out, "{}", bad.to_hex())?;
+    }
+    writeln!(out, "We cannot bisect more!")?;
+    let _ = repo;
+    Ok(BISECT_ONLY_SKIPPED_LEFT)
+}
+
+/// Check out (or record, with --no-checkout) the next rev and print
+/// `[<oid>] <subject>` (upstream `bisect_checkout`).
+fn bisect_checkout(
+    repo: &BisectRepo,
+    rev: &ObjectId,
+    no_checkout: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
     fs::write(
         repo.state_path("BISECT_EXPECTED_REV"),
-        format!("{}\n", midpoint.to_hex()),
+        format!("{}\n", rev.to_hex()),
     )?;
-    let _ = fs::write(repo.state_path("BISECT_ANCESTORS_OK"), b"");
     if no_checkout {
-        fs::write(
-            repo.state_path("BISECT_HEAD"),
-            format!("{}\n", midpoint.to_hex()),
-        )?;
+        fs::write(repo.state_path("BISECT_HEAD"), format!("{}\n", rev.to_hex()))?;
     } else {
-        checkout_bisect_midpoint(repo, &midpoint)?;
-    }
-    Ok(())
-}
-
-/// A scored candidate for the midpoint. `key` orders candidates: the largest
-/// `key` is the best midpoint.
-#[derive(Clone)]
-struct BisectChoice {
-    oid: ObjectId,
-    key: (usize, usize),
-}
-
-/// The "reaches" target git aims for: the reachable-candidate count of the
-/// commit it checks out, which determines the announced "N revisions left"
-/// (`nr - reaches - 1`). This is `nr / 2` for every `nr` except `nr == 3`,
-/// where git's traversal-order tie-breaking lands on the upper side.
-fn bisect_reaches(nr: usize) -> usize {
-    if nr == 3 { 2 } else { nr / 2 }
-}
-
-/// Rank a candidate by how close its `weight` is to the `reaches` target.
-/// The primary key prefers the smallest distance to `reaches` (so the value is
-/// larger when nearer); the secondary key prefers the larger weight, matching
-/// git's preference for the commit nearer the bad end when a skip forces it off
-/// the exact midpoint.
-fn bisect_reaches_key(weight: usize, reaches: usize) -> (usize, usize) {
-    (usize::MAX - weight.abs_diff(reaches), weight)
-}
-
-/// Is `choice` a strictly better midpoint than the current best? Remaining ties
-/// (identical distance and weight) are broken by the lexicographically smaller
-/// object id so the result is deterministic regardless of traversal order.
-fn bisect_choice_better(choice: &BisectChoice, current: &Option<BisectChoice>) -> bool {
-    match current {
-        None => true,
-        Some(best) => {
-            choice.key > best.key
-                || (choice.key == best.key && choice.oid.to_hex() < best.oid.to_hex())
-        }
-    }
-}
-
-/// Check out `target` in detached-HEAD mode for the bisection step, mirroring
-/// git's silent checkout (no "Note: switching to" advice).
-fn checkout_bisect_midpoint(repo: &BisectRepo, target: &ObjectId) -> Result<()> {
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let old = current_head_oid(repo)
-        .map(|oid| oid.to_hex())
-        .unwrap_or_else(|_| "HEAD".to_string());
-    let message = format!("checkout: moving from {old} to {}", target.to_hex());
-    sley_worktree::checkout_detached(
-        &repo.worktree_root,
-        &repo.git_dir,
-        repo.format,
-        target,
-        committer,
-        message.into_bytes(),
-    )?;
-    Ok(())
-}
-
-/// For each candidate, compute how many candidates are reachable from it
-/// (including itself), restricted to the candidate set. This mirrors git's
-/// per-commit weight: the count of still-interesting commits an ancestor sweep
-/// from that commit reaches.
-///
-/// Implemented as an explicit reachability sweep over the parent adjacency
-/// restricted to candidates. This is O(V*E) in the worst case, but bisect runs
-/// on candidate sets that are small relative to the repository, and being
-/// obviously correct matters more than micro-optimising the walk: `walk_commits`
-/// is a breadth-first sweep that does not guarantee topological order, so an
-/// accumulation pass keyed on traversal order would miscount.
-fn compute_candidate_weights(
-    candidates: &[sley_rev::CommitRecord],
-    candidate_ids: &HashSet<ObjectId>,
-) -> HashMap<ObjectId, usize> {
-    let index_of: HashMap<&ObjectId, usize> = candidates
-        .iter()
-        .enumerate()
-        .map(|(idx, record)| (&record.oid, idx))
-        .collect();
-    let n = candidates.len();
-
-    // Adjacency: for each candidate, the indices of its candidate-parents.
-    let mut parent_indices: Vec<Vec<usize>> = vec![Vec::new(); n];
-    for (idx, record) in candidates.iter().enumerate() {
-        for parent in &record.parents {
-            if candidate_ids.contains(parent)
-                && let Some(&pidx) = index_of.get(parent)
-            {
-                parent_indices[idx].push(pidx);
-            }
-        }
-    }
-
-    let mut weights = HashMap::with_capacity(n);
-    let mut visited = vec![false; n];
-    // Indices marked during the current sweep, cleared between starts so we do
-    // not pay to re-zero the whole `visited` vector each time.
-    let mut touched: Vec<usize> = Vec::new();
-    for (start, record) in candidates.iter().enumerate() {
-        for &idx in &touched {
-            visited[idx] = false;
-        }
-        touched.clear();
-
-        visited[start] = true;
-        touched.push(start);
-        let mut frontier = vec![start];
-        while let Some(idx) = frontier.pop() {
-            for &pidx in &parent_indices[idx] {
-                if !visited[pidx] {
-                    visited[pidx] = true;
-                    touched.push(pidx);
-                    frontier.push(pidx);
+        let Some(worktree_root) = &repo.worktree_root else {
+            return Ok(BISECT_FAILED);
+        };
+        let committer = commit_identity_from_env("COMMITTER")?;
+        let old = resolve_revision(&repo.git_dir, repo.format, "HEAD")
+            .map(|oid| oid.to_hex())
+            .unwrap_or_else(|_| "HEAD".to_string());
+        let message = format!("checkout: moving from {old} to {}", rev.to_hex());
+        if let Err(err) = sley_worktree::checkout_detached(
+            worktree_root,
+            &repo.git_dir,
+            repo.format,
+            rev,
+            committer,
+            message.into_bytes(),
+        ) {
+            // A missing tree/object dies the way `git checkout` does.
+            if let GitError::NotFound(kind) = &err {
+                let text = kind.to_string();
+                if let Some(hex) = text
+                    .split(|ch: char| !ch.is_ascii_hexdigit())
+                    .find(|token| token.len() >= 40)
+                {
+                    eprintln!("fatal: unable to read tree ({hex})");
                 }
             }
+            return Ok(BISECT_FAILED);
         }
-        weights.insert(record.oid, touched.len());
     }
-    weights
+    let subject = commit_subject_of(repo, rev)?;
+    writeln!(out, "[{}] {subject}", rev.to_hex())?;
+    Ok(BISECT_OK)
+}
+
+/// Independent merge bases of `bad` against all `goods` (upstream
+/// `repo_get_merge_bases_many`, approximated by the deduped union of pairwise
+/// bases with dominated entries removed).
+fn bisect_merge_bases(
+    repo: &BisectRepo,
+    bad: &ObjectId,
+    goods: &[ObjectId],
+) -> Result<Vec<ObjectId>> {
+    let db = repo.db();
+    let mut bases: Vec<ObjectId> = Vec::new();
+    for good in goods {
+        for base in merge_bases(&repo.git_dir, &db, repo.format, bad, good)? {
+            if !bases.contains(&base) {
+                bases.push(base);
+            }
+        }
+    }
+    if bases.len() > 1 {
+        // Drop bases that are ancestors of another base.
+        let mut independent = Vec::new();
+        for (idx, base) in bases.iter().enumerate() {
+            let mut dominated = false;
+            for (other_idx, other) in bases.iter().enumerate() {
+                if idx != other_idx
+                    && sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, base, other)?
+                {
+                    dominated = true;
+                    break;
+                }
+            }
+            if !dominated {
+                independent.push(*base);
+            }
+        }
+        bases = independent;
+    }
+    Ok(bases)
+}
+
+fn is_expected_rev(repo: &BisectRepo, oid: &ObjectId) -> bool {
+    fs::read_to_string(repo.state_path("BISECT_EXPECTED_REV"))
+        .ok()
+        .and_then(|contents| ObjectId::from_hex(repo.format, contents.trim()).ok())
+        .is_some_and(|expected| expected == *oid)
+}
+
+fn join_oids_hex(oids: &[ObjectId]) -> String {
+    oids.iter()
+        .map(ObjectId::to_hex)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Upstream `check_merge_bases`.
+fn check_merge_bases(
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    bad: &ObjectId,
+    goods: &[ObjectId],
+    skipped: &HashSet<ObjectId>,
+    no_checkout: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let bases = bisect_merge_bases(repo, bad, goods)?;
+    for base in &bases {
+        if base == bad {
+            // handle_bad_merge_base
+            if is_expected_rev(repo, bad) {
+                let bad_hex = bad.to_hex();
+                let good_hex = join_oids_hex(goods);
+                if terms.bad == "bad" && terms.good == "good" {
+                    eprintln!(
+                        "The merge base {bad_hex} is bad.\nThis means the bug has been fixed between {bad_hex} and [{good_hex}]."
+                    );
+                } else if terms.bad == "new" && terms.good == "old" {
+                    eprintln!(
+                        "The merge base {bad_hex} is new.\nThe property has changed between {bad_hex} and [{good_hex}]."
+                    );
+                } else {
+                    eprintln!(
+                        "The merge base {bad_hex} is {}.\nThis means the first '{}' commit is between {bad_hex} and [{good_hex}].",
+                        terms.bad, terms.good
+                    );
+                }
+                return Ok(BISECT_MERGE_BASE_CHECK);
+            }
+            eprintln!(
+                "Some {} revs are not ancestors of the {} rev.\ngit bisect cannot work properly in this case.\nMaybe you mistook {} and {} revs?",
+                terms.good, terms.bad, terms.good, terms.bad
+            );
+            return Ok(BISECT_FAILED);
+        } else if goods.contains(base) {
+            continue;
+        } else if skipped.contains(base) {
+            let good_hex = join_oids_hex(goods);
+            eprintln!(
+                "warning: the merge base between {} and [{good_hex}] must be skipped.\nSo we cannot be sure the first {} commit is between {} and {}.\nWe continue anyway.",
+                bad.to_hex(),
+                terms.bad,
+                base.to_hex(),
+                bad.to_hex()
+            );
+        } else {
+            writeln!(out, "Bisecting: a merge base must be tested")?;
+            let res = bisect_checkout(repo, base, no_checkout, out)?;
+            if res == BISECT_OK {
+                return Ok(BISECT_INTERNAL_SUCCESS_MERGE_BASE);
+            }
+            return Ok(res);
+        }
+    }
+    Ok(BISECT_OK)
+}
+
+/// Upstream `check_good_are_ancestors_of_bad`.
+fn check_good_are_ancestors_of_bad(
+    repo: &BisectRepo,
+    terms: &BisectTerms,
+    bad: Option<&ObjectId>,
+    goods: &[ObjectId],
+    skipped: &HashSet<ObjectId>,
+    no_checkout: bool,
+    out: &mut dyn Write,
+) -> Result<i32> {
+    let Some(bad) = bad else {
+        eprintln!("error: a {} revision is needed", terms.bad);
+        return Ok(BISECT_FAILED);
+    };
+    if repo.state_path("BISECT_ANCESTORS_OK").is_file() {
+        return Ok(BISECT_OK);
+    }
+    if goods.is_empty() {
+        return Ok(BISECT_OK);
+    }
+    let db = repo.db();
+    let mut all_ancestors = true;
+    for good in goods {
+        if !sley_rev::is_ancestor(&repo.git_dir, repo.format, &db, good, bad)? {
+            all_ancestors = false;
+            break;
+        }
+    }
+    let res = if !all_ancestors {
+        check_merge_bases(repo, terms, bad, goods, skipped, no_checkout, out)?
+    } else {
+        BISECT_OK
+    };
+    if res == BISECT_OK {
+        let _ = fs::write(repo.state_path("BISECT_ANCESTORS_OK"), b"");
+    }
+    Ok(res)
+}
+
+/// The core next-step computation (upstream `bisect_next_all`).
+fn bisect_next_all(repo: &BisectRepo, terms: &BisectTerms, out: &mut dyn Write) -> Result<i32> {
+    let no_checkout = repo.no_checkout();
+    let first_parent = repo.first_parent_mode();
+    let bad = bisect_bad_oid(repo, terms)?;
+    let goods = bisect_good_oids(repo, terms)?;
+    let skipped: HashSet<ObjectId> = bisect_skip_oids(repo)?.into_iter().collect();
+    let find_all = !skipped.is_empty();
+
+    let res = check_good_are_ancestors_of_bad(
+        repo,
+        terms,
+        bad.as_ref(),
+        &goods,
+        &skipped,
+        no_checkout,
+        out,
+    )?;
+    if res != BISECT_OK {
+        return Ok(res);
+    }
+    let bad = bad.expect("checked by check_good_are_ancestors_of_bad");
+
+    // Candidate list: `bad ^goods` (newest-first), restricted by BISECT_NAMES.
+    let candidates = bisect_candidate_records(repo, &bad, &goods, first_parent)?;
+    let db = repo.db();
+    let kept: Vec<sley_rev::CommitRecord> = match bisect_pathspec(repo)? {
+        Some(pathspec) => sley_rev::simplify_history(
+            &db,
+            repo.format,
+            candidates.clone(),
+            &pathspec,
+            sley_rev::SimplifyOptions {
+                full_history: false,
+                first_parent,
+            },
+        )?,
+        None => candidates.clone(),
+    };
+
+    if kept.is_empty() && candidates.is_empty() {
+        // Nothing reachable at all: bad was also good.
+        writeln!(
+            out,
+            "{} was both {} and {}",
+            bad.to_hex(),
+            terms.good,
+            terms.bad
+        )?;
+        return Ok(BISECT_FAILED);
+    }
+    if kept.is_empty() {
+        eprintln!("No testable commit found.\nMaybe you started with bad path arguments?");
+        return Ok(BISECT_NO_TESTABLE_COMMIT);
+    }
+
+    // Oldest-first list with intra-set parent adjacency.
+    let mut list: Vec<&sley_rev::CommitRecord> = kept.iter().collect();
+    list.reverse();
+    let oids: Vec<ObjectId> = list.iter().map(|record| record.oid).collect();
+    let index_by_oid: HashMap<ObjectId, usize> = oids
+        .iter()
+        .enumerate()
+        .map(|(idx, oid)| (*oid, idx))
+        .collect();
+    let parents: Vec<Vec<usize>> = list
+        .iter()
+        .map(|record| {
+            let mut adjacent = Vec::new();
+            for parent in &record.parents {
+                if let Some(&pidx) = index_by_oid.get(parent) {
+                    adjacent.push(pidx);
+                }
+                if first_parent {
+                    break;
+                }
+            }
+            adjacent
+        })
+        .collect();
+
+    let all = oids.len();
+    let bisection = do_find_bisection(&oids, &parents, find_all);
+    let reaches = bisection.reaches;
+
+    let (bisect_rev, tried): (Option<ObjectId>, Vec<ObjectId>) =
+        match managed_skipped(&bisection.picks, &oids, &skipped, &bad) {
+            SkipFilter::Clean(idx) => (Some(oids[idx]), Vec::new()),
+            SkipFilter::Skipped { pick, tried } => (
+                pick.map(|idx| oids[idx]),
+                tried.into_iter().map(|idx| oids[idx]).collect(),
+            ),
+        };
+
+    let Some(bisect_rev) = bisect_rev else {
+        let res = error_if_skipped_commits(repo, terms, &tried, None, out)?;
+        if res != BISECT_OK {
+            return Ok(res);
+        }
+        writeln!(
+            out,
+            "{} was both {} and {}",
+            bad.to_hex(),
+            terms.good,
+            terms.bad
+        )?;
+        return Ok(BISECT_FAILED);
+    };
+
+    if bisect_rev == bad {
+        let res = error_if_skipped_commits(repo, terms, &tried, Some(&bad), out)?;
+        if res != BISECT_OK {
+            return Ok(res);
+        }
+        writeln!(out, "{} is the first {} commit", bisect_rev.to_hex(), terms.bad)?;
+        bisect_show_commit(repo, &bisect_rev, out)?;
+        return Ok(BISECT_INTERNAL_SUCCESS_1ST_BAD_FOUND);
+    }
+
+    let nr = all - reaches - 1;
+    let steps = estimate_bisect_steps(all);
+    writeln!(
+        out,
+        "Bisecting: {nr} {} left to test after this (roughly {steps} {})",
+        plural(nr, "revision", "revisions"),
+        plural(steps, "step", "steps"),
+    )?;
+
+    bisect_checkout(repo, &bisect_rev, no_checkout, out)
 }
 
 /// git's `estimate_bisect_steps`: roughly `log2(all)`, nudged for how far `all`
@@ -1037,29 +1977,9 @@ fn estimate_bisect_steps(all: usize) -> usize {
     if e < 3 * x { n } else { n - 1 }
 }
 
-/// Print the convergence message: `<oid> is the first bad commit`, followed by a
-/// `git show`-style rendering of the commit (header + diffstat), matching the
-/// project's default log formatting.
-fn announce_first_bad(repo: &BisectRepo, terms: &BisectTerms, bad: &ObjectId) -> Result<()> {
-    // Record the conclusion in BISECT_LOG (using the configured term), then
-    // print it and a `git show`-style summary of the commit.
-    let subject = commit_subject_of(repo, bad)?;
-    let mut log = read_bisect_log(repo)?;
-    log.push_str(&format!(
-        "# first {} commit: [{}] {subject}\n",
-        terms.bad,
-        bad.to_hex()
-    ));
-    fs::write(repo.state_path("BISECT_LOG"), &log)?;
-
-    println!("{} is the first {} commit", bad.to_hex(), terms.bad);
-    write_commit_show(repo, bad)?;
-    Ok(())
-}
-
-/// Render a commit in `git show` (medium) form: the commit header, the indented
-/// message, then a blank line and a name-stat diffstat against its first parent.
-fn write_commit_show(repo: &BisectRepo, oid: &ObjectId) -> Result<()> {
+/// Render the first-bad commit like `git show --stat --summary
+/// --no-abbrev-commit --diff-merges=first-parent`.
+fn bisect_show_commit(repo: &BisectRepo, oid: &ObjectId, out: &mut dyn Write) -> Result<()> {
     let db = repo.db();
     let object = db.read_object(oid)?;
     if object.object_type != ObjectType::Commit {
@@ -1069,27 +1989,33 @@ fn write_commit_show(repo: &BisectRepo, oid: &ObjectId) -> Result<()> {
         )));
     }
     let commit = Commit::parse(repo.format, &object.body)?;
-    let mut stdout = io::stdout();
-    writeln!(stdout, "commit {}", oid.to_hex())?;
-    writeln!(stdout, "Author: {}", commit_author_identity(&commit.author))?;
+    writeln!(out, "commit {}", oid.to_hex())?;
+    if commit.parents.len() > 1 {
+        let short: Vec<String> = commit
+            .parents
+            .iter()
+            .map(|parent| parent.to_hex()[..7].to_string())
+            .collect();
+        writeln!(out, "Merge: {}", short.join(" "))?;
+    }
+    writeln!(out, "Author: {}", commit_author_identity(&commit.author))?;
     writeln!(
-        stdout,
+        out,
         "Date:   {}",
         commit_identity_date(&commit.author, ForEachRefDateMode::Default)
     )?;
-    writeln!(stdout)?;
+    writeln!(out)?;
     for line in String::from_utf8_lossy(&commit.message).lines() {
         if line.is_empty() {
-            writeln!(stdout)?;
+            writeln!(out)?;
         } else {
-            writeln!(stdout, "    {line}")?;
+            writeln!(out, "    {line}")?;
         }
     }
-    writeln!(stdout)?;
-    stdout.flush()?;
+    writeln!(out)?;
 
     // Diffstat against the first parent (or the empty tree for a root commit).
-    let new_tree = commit.tree.clone();
+    let new_tree = commit.tree;
     let entries = match commit.parents.first() {
         Some(parent) => {
             let parent_object = db.read_object(parent)?;
@@ -1110,7 +2036,7 @@ fn write_commit_show(repo: &BisectRepo, oid: &ObjectId) -> Result<()> {
         )?,
     };
     write_diff_stat(
-        &mut stdout,
+        out,
         &entries,
         &db,
         None,
@@ -1121,288 +2047,27 @@ fn write_commit_show(repo: &BisectRepo, oid: &ObjectId) -> Result<()> {
             color: false,
         },
     )?;
-    stdout.flush()?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Ref helpers (refs/bisect/*)
-// ---------------------------------------------------------------------------
-
-fn bisect_refs_dir(repo: &BisectRepo) -> PathBuf {
-    repo.git_dir.join("refs").join("bisect")
-}
-
-fn write_loose_bisect_ref(repo: &BisectRepo, name: &str, oid: &ObjectId) -> Result<()> {
-    let dir = bisect_refs_dir(repo);
-    fs::create_dir_all(&dir)?;
-    fs::write(dir.join(name), format!("{}\n", oid.to_hex()))?;
-    Ok(())
-}
-
-fn write_bad_ref(repo: &BisectRepo, terms: &BisectTerms, oid: &ObjectId) -> Result<()> {
-    write_loose_bisect_ref(repo, &terms.bad, oid)
-}
-
-fn write_good_ref(repo: &BisectRepo, terms: &BisectTerms, oid: &ObjectId) -> Result<()> {
-    write_loose_bisect_ref(repo, &format!("{}-{}", terms.good, oid.to_hex()), oid)
-}
-
-fn write_skip_ref(repo: &BisectRepo, oid: &ObjectId) -> Result<()> {
-    write_loose_bisect_ref(repo, &format!("skip-{}", oid.to_hex()), oid)
-}
-
-fn read_loose_bisect_oid(repo: &BisectRepo, name: &str) -> Result<Option<ObjectId>> {
-    let path = bisect_refs_dir(repo).join(name);
-    match fs::read_to_string(&path) {
-        Ok(contents) => {
-            let trimmed = contents.trim();
-            if trimmed.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(ObjectId::from_hex(repo.format, trimmed)?))
-            }
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn bisect_bad_ref(repo: &BisectRepo, terms: &BisectTerms) -> Result<Option<ObjectId>> {
-    read_loose_bisect_oid(repo, &terms.bad)
-}
-
-fn bisect_good_oids(repo: &BisectRepo, terms: &BisectTerms) -> Result<Vec<ObjectId>> {
-    bisect_prefixed_oids(repo, &format!("{}-", terms.good))
-}
-
-fn bisect_skip_oids(repo: &BisectRepo) -> Result<Vec<ObjectId>> {
-    bisect_prefixed_oids(repo, "skip-")
-}
-
-fn bisect_prefixed_oids(repo: &BisectRepo, prefix: &str) -> Result<Vec<ObjectId>> {
-    let dir = bisect_refs_dir(repo);
-    let mut out = Vec::new();
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(out),
-        Err(err) => return Err(err.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            continue;
-        };
-        if let Some(rest) = name.strip_prefix(prefix) {
-            let oid = ObjectId::from_hex(repo.format, rest)?;
-            out.push(oid);
-        }
-    }
-    out.sort_by_key(ObjectId::to_hex);
-    Ok(out)
-}
-
-fn remove_bisect_refs(repo: &BisectRepo) -> Result<()> {
-    // Remove every ref file under refs/bisect/ but leave the (now empty)
-    // directory in place, matching git's `bisect_clean_state`.
-    let dir = bisect_refs_dir(repo);
-    let entries = match fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-        Err(err) => return Err(err.into()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        match fs::remove_file(entry.path()) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+    // `--summary`: creation/deletion/mode lines after the stat.
+    for entry in &entries {
+        match entry.status {
+            sley_diff_merge::NameStatus::Added => writeln!(
+                out,
+                " create mode {:o} {}",
+                entry.new_mode.unwrap_or(0o100644),
+                String::from_utf8_lossy(&entry.path)
+            )?,
+            sley_diff_merge::NameStatus::Deleted => writeln!(
+                out,
+                " delete mode {:o} {}",
+                entry.old_mode.unwrap_or(0o100644),
+                String::from_utf8_lossy(&entry.path)
+            )?,
+            _ => {}
         }
     }
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// State-file helpers
-// ---------------------------------------------------------------------------
-
-const BISECT_STATE_FILES: &[&str] = &[
-    "BISECT_START",
-    "BISECT_TERMS",
-    "BISECT_NAMES",
-    "BISECT_LOG",
-    "BISECT_EXPECTED_REV",
-    "BISECT_ANCESTORS_OK",
-    "BISECT_HEAD",
-];
-
-fn remove_bisect_state_files(repo: &BisectRepo) -> Result<()> {
-    for name in BISECT_STATE_FILES {
-        match fs::remove_file(repo.state_path(name)) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
-    }
-    Ok(())
-}
-
-fn write_bisect_terms(repo: &BisectRepo, terms: &BisectTerms) -> Result<()> {
-    // git writes the "new" (bad) term first, then the "old" (good) term.
-    fs::write(
-        repo.state_path("BISECT_TERMS"),
-        format!("{}\n{}\n", terms.bad, terms.good),
-    )?;
-    Ok(())
-}
-
-fn read_bisect_terms(repo: &BisectRepo) -> Result<BisectTerms> {
-    let path = repo.state_path("BISECT_TERMS");
-    match fs::read_to_string(&path) {
-        Ok(contents) => {
-            let mut lines = contents.lines();
-            let bad = lines.next().unwrap_or("bad").trim().to_string();
-            let good = lines.next().unwrap_or("good").trim().to_string();
-            Ok(BisectTerms {
-                bad: if bad.is_empty() { "bad".into() } else { bad },
-                good: if good.is_empty() { "good".into() } else { good },
-            })
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(BisectTerms::default()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn read_bisect_start(repo: &BisectRepo) -> Result<String> {
-    let contents = fs::read_to_string(repo.state_path("BISECT_START"))?;
-    let trimmed = contents.trim();
-    if trimmed.is_empty() {
-        // Fall back to the default branch name git uses.
-        Ok("HEAD".to_string())
-    } else {
-        Ok(trimmed.to_string())
-    }
-}
-
-fn read_bisect_log(repo: &BisectRepo) -> Result<String> {
-    match fs::read_to_string(repo.state_path("BISECT_LOG")) {
-        Ok(contents) => Ok(contents),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(String::new()),
-        Err(err) => Err(err.into()),
-    }
-}
-
-fn write_log_status(repo: &BisectRepo, status: &str) -> Result<()> {
-    let mut log = read_bisect_log(repo)?;
-    log.push_str(&format!("# status: {status}\n"));
-    fs::write(repo.state_path("BISECT_LOG"), &log)?;
-    Ok(())
-}
-
-/// Build a `# <mark>: [<oid>] <subject>` BISECT_LOG line.
-fn bisect_log_state_line(repo: &BisectRepo, mark: &str, oid: &ObjectId) -> Result<String> {
-    let subject = commit_subject_of(repo, oid)?;
-    Ok(format!("# {mark}: [{}] {subject}\n", oid.to_hex()))
-}
-
-fn names_file_contents(pathspecs: &[String]) -> String {
-    if pathspecs.is_empty() {
-        "\n".to_string()
-    } else {
-        let mut out = String::new();
-        for spec in pathspecs {
-            out.push_str(spec);
-            out.push('\n');
-        }
-        out
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Small shared utilities
-// ---------------------------------------------------------------------------
-
-fn current_head_oid(repo: &BisectRepo) -> Result<ObjectId> {
-    resolve_revision(&repo.git_dir, repo.format, "HEAD")
-}
-
-/// The commit currently under test: the detached HEAD in normal mode, or the
-/// commit recorded in BISECT_HEAD when bisecting with `--no-checkout`.
-fn current_bisect_oid(repo: &BisectRepo, no_checkout: bool) -> Result<ObjectId> {
-    if no_checkout {
-        let contents = fs::read_to_string(repo.state_path("BISECT_HEAD"))?;
-        let trimmed = contents.trim();
-        if !trimmed.is_empty() {
-            return ObjectId::from_hex(repo.format, trimmed);
-        }
-    }
-    current_head_oid(repo)
-}
-
-fn commit_subject_of(repo: &BisectRepo, oid: &ObjectId) -> Result<String> {
-    let db = repo.db();
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Commit {
-        // Peel tags to their commit if necessary.
-        let peeled = sley_rev::peel_to_commit(&db, repo.format, oid)?;
-        let object = db.read_object(&peeled)?;
-        let commit = Commit::parse(repo.format, &object.body)?;
-        return Ok(commit_subject(&commit.message));
-    }
-    let commit = Commit::parse(repo.format, &object.body)?;
-    Ok(commit_subject(&commit.message))
-}
-
-fn bisect_option_requires_value(option: &str) -> Result<()> {
-    eprintln!(
-        "error: option `{}' requires a value",
-        option.trim_start_matches('-')
-    );
-    eprintln!();
-    print_bisect_usage();
-    Err(GitError::Exit(129))
-}
-
-/// Strip a `--name=value` long option, returning the value if `arg` matches.
-fn bisect_strip_long_value<'a>(arg: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}=");
-    arg.strip_prefix(&prefix)
-}
-
-/// Render command-line arguments the way git records them in BISECT_LOG: each
-/// argument single-quoted and space-separated, preceded by a leading space.
-fn format_log_args(args: &[String]) -> String {
-    let mut out = String::new();
-    for arg in args {
-        out.push(' ');
-        out.push_str(&shell_single_quote(arg));
-    }
-    out
-}
-
-/// Render a list of object ids as space-separated full hex, preceded by a
-/// leading space (used for the `git bisect good <oid> <oid>` log lines, where
-/// git records the resolved oids rather than the user's shorthand).
-fn format_args_with_oids(oids: &[ObjectId]) -> String {
-    let mut out = String::new();
-    for oid in oids {
-        out.push(' ');
-        out.push_str(&oid.to_hex());
-    }
-    out
-}
-
-fn shell_single_quote(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('\'');
-    for ch in value.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }

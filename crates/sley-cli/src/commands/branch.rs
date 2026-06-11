@@ -8669,6 +8669,39 @@ fn branch_ref_push_sort_key(config: &GitConfig, reference: &sley_refs::Ref) -> S
         .unwrap_or_default()
 }
 
+/// The `* (no branch, ...)` / `* (HEAD detached at ...)` first line `git
+/// branch` prints when HEAD is detached, with the in-progress-operation
+/// variants (bisect / rebase) taking precedence -- mirroring upstream
+/// `wt_status_get_state` + `get_head_description`.
+fn detached_head_branch_line() -> Option<String> {
+    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
+    let format = repository_object_format(&git_dir).ok()?;
+    let store = FileRefStore::new(&git_dir, format);
+    let RefTarget::Direct(oid) = store.read_ref("HEAD").ok()?? else {
+        return None;
+    };
+    if let Ok(start) = fs::read_to_string(git_dir.join("BISECT_START")) {
+        let start = start.trim();
+        if !start.is_empty() {
+            return Some(format!("(no branch, bisect started on {start})"));
+        }
+    }
+    for dir in ["rebase-merge", "rebase-apply"] {
+        if let Ok(head_name) = fs::read_to_string(git_dir.join(dir).join("head-name")) {
+            let branch = head_name
+                .trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(head_name.trim())
+                .to_string();
+            return Some(format!("(no branch, rebasing {branch})"));
+        }
+    }
+    Some(format!(
+        "(HEAD detached at {})",
+        format_log_abbrev_oid(&oid)
+    ))
+}
+
 fn print_branch_refs(
     refs: Vec<sley_refs::Ref>,
     current: Option<&str>,
@@ -8676,6 +8709,16 @@ fn print_branch_refs(
     color: bool,
     mut include: impl FnMut(&sley_refs::Ref, &str) -> bool,
 ) -> Result<()> {
+    if matches!(mode, BranchListMode::Local | BranchListMode::All)
+        && current.is_none()
+        && let Some(line) = detached_head_branch_line()
+    {
+        if color {
+            println!("* \x1b[32m{line}\x1b[m");
+        } else {
+            println!("* {line}");
+        }
+    }
     for reference in refs {
         if matches!(mode, BranchListMode::Local | BranchListMode::All)
             && let Some(name) = reference.name.strip_prefix("refs/heads/")

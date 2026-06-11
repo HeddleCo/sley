@@ -232,6 +232,13 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
         format!("refs/heads/{rev}")
     } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
         format!("refs/tags/{rev}")
+    } else if rev.contains('/') && refs.read_ref(&format!("refs/{rev}"))?.is_some() {
+        // git's lookup rule #2 ("refs/%s") — e.g. `bisect/bad`, `notes/commits`.
+        format!("refs/{rev}")
+    } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
+        format!("refs/remotes/{rev}")
+    } else if refs.read_ref(&format!("refs/remotes/{rev}/HEAD"))?.is_some() {
+        format!("refs/remotes/{rev}/HEAD")
     } else if validate_symref_name(rev).is_ok() {
         rev.to_string()
     } else {

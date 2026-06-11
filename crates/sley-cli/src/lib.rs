@@ -2268,7 +2268,7 @@ fn write_diff_numstat_counts(stdout: &mut io::Stdout, stats: DiffLineStats) -> R
 }
 
 fn write_diff_shortstat(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,
@@ -2318,7 +2318,7 @@ fn write_diff_shortstat(
 }
 
 fn write_diff_stat(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
     worktree_root: Option<&Path>,

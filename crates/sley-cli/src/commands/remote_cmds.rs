@@ -473,6 +473,17 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         cwd.join(destination)
     };
+    // Upstream absolutizes a local source path (`absolute_pathdup` in
+    // builtin/clone.c) so later chdirs — the bare/mirror path fetches from
+    // inside the destination — cannot re-anchor a relative source like ".".
+    let repository = if Path::new(&repository).is_dir() {
+        cwd.join(&repository)
+            .canonicalize()
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or(repository)
+    } else {
+        repository
+    };
     // An empty `--template=` (or `--template ""`) disables templating entirely,
     // matching upstream git's `copy_templates()`, which returns immediately when
     // the template directory is the empty string. Resolving "" against the cwd

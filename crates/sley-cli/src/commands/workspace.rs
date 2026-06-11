@@ -290,6 +290,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut positional = Vec::new();
+    let mut pathspec_args: Vec<String> = Vec::new();
+    let mut saw_dashdash = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -335,7 +337,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 };
             }
             "--" => {
-                positional.extend(iter.map(|value| value.to_string()));
+                saw_dashdash = true;
+                pathspec_args.extend(iter.map(|value| value.to_string()));
                 break;
             }
             value => positional.push(value.to_string()),
@@ -346,6 +349,76 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+
+    // Path-checkout forms: `checkout [<tree-ish>] -- <paths>` and
+    // `checkout <tree-ish> <paths>...` / `checkout <path>` (when the sole
+    // positional names a tracked path rather than a rev). Restores the named
+    // paths from the tree-ish into index+worktree, or from the index into the
+    // worktree when no tree-ish is given.
+    if matches!(branch_mode, CheckoutBranchMode::Existing) {
+        let mut sources = positional.clone();
+        let mut paths = pathspec_args.clone();
+        if !saw_dashdash && sources.len() > 1 {
+            // `checkout <rev> <paths>...` — first arg must be a revision.
+            if sley_rev::resolve_revision(&git_dir, format, &sources[0]).is_ok() {
+                paths = sources.split_off(1);
+            } else {
+                paths = mem::take(&mut sources);
+            }
+        } else if !saw_dashdash && sources.len() == 1 && !force {
+            // A single positional that is not a branch or rev but names a
+            // tracked path is a worktree restore (git's disambiguation).
+            let store = FileRefStore::new(&git_dir, format);
+            let is_branch = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(&sources[0])?)
+                .ok()
+                .flatten()
+                .is_some();
+            if !is_branch
+                && sley_rev::resolve_revision(&git_dir, format, &sources[0]).is_err()
+                && cwd.join(&sources[0]).exists()
+            {
+                paths = mem::take(&mut sources);
+            }
+        }
+        if !paths.is_empty() {
+            let paths: Vec<PathBuf> = paths
+                .iter()
+                .map(|path| {
+                    let buf = PathBuf::from(path);
+                    if buf.is_absolute() { buf } else { cwd.join(buf) }
+                })
+                .collect();
+            match sources.as_slice() {
+                [] => {
+                    sley_worktree::restore_worktree_paths(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &paths,
+                    )?;
+                    return Ok(());
+                }
+                [rev] => {
+                    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+                    let oid = sley_rev::resolve_revision(&git_dir, format, rev)?;
+                    let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
+                    sley_worktree::restore_index_and_worktree_paths_from_tree(
+                        &worktree_root,
+                        &git_dir,
+                        format,
+                        &tree,
+                        &paths,
+                    )?;
+                    return Ok(());
+                }
+                _ => {
+                    return Err(GitError::Command(
+                        "checkout with paths takes at most one tree-ish".into(),
+                    ));
+                }
+            }
+        }
+    }
 
     // `git checkout -f <commit-ish>` where the target is the commit HEAD already
     // points at (the common `git checkout -f HEAD` form, e.g. the trailing step
