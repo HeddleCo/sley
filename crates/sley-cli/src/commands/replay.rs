@@ -1184,20 +1184,35 @@ pub(crate) fn append_signoff_before_comments(message: Vec<u8>, signoff: &[u8]) -
         line.push(b'\n');
         line
     };
-    // Find the earliest suffix made only of comment / blank lines; the
-    // trailer is inserted ahead of it.
+    // Find the earliest suffix made only of ignorable lines (comments,
+    // blanks, and the old-style "Conflicts:" block — git's
+    // `ignore_non_trailer`); the trailer is inserted ahead of it.
     let mut body_end = message.len();
     {
         let mut candidate = None;
         let mut offset = 0;
+        let mut in_conflicts = false;
         for line in message.split_inclusive(|&b| b == b'\n') {
-            let is_commentish = line.first() == Some(&b'#') || line == b"\n";
-            if is_commentish {
+            let stripped: &[u8] = if line.ends_with(b"\n") {
+                &line[..line.len() - 1]
+            } else {
+                line
+            };
+            let is_commentish = line.first() == Some(&b'#') || stripped.is_empty();
+            let is_conflicts_head = stripped == b"Conflicts:";
+            let is_conflicts_entry = in_conflicts && line.first() == Some(&b'\t');
+            if is_commentish || is_conflicts_head || is_conflicts_entry {
                 if candidate.is_none() {
                     candidate = Some(offset);
                 }
+                if is_conflicts_head {
+                    in_conflicts = true;
+                } else if !is_conflicts_entry {
+                    in_conflicts = false;
+                }
             } else {
                 candidate = None;
+                in_conflicts = false;
             }
             offset += line.len();
         }

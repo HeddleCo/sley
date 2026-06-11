@@ -2102,7 +2102,14 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                 && fixup_commit.is_none()
                 && squash_commit.is_none()
             {
-                read_merge_message_from_file(&git_dir).ok()
+                if in_merge {
+                    read_merge_message_from_file(&git_dir).ok()
+                } else {
+                    // Keep the commented "# Conflicts:" block intact: the
+                    // editor template shows it and the post-editor cleanup
+                    // strips it.
+                    fs::read(git_dir.join("MERGE_MSG")).ok()
+                }
             } else {
                 None
             }
@@ -2114,14 +2121,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         commit_stage_tracked_changes(&git_dir, format)?;
     }
     let mut message = if signoff {
-        if in_cherry_pick || in_revert {
-            commands::replay::append_signoff_before_comments(
-                message,
-                &commit_signoff_from_env()?,
-            )
-        } else {
-            commit_message_with_signoff(message, &commit_signoff_from_env()?)
-        }
+        commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
     } else {
         message
     };
@@ -2132,8 +2132,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         || !message_chunks.is_empty()
         || reuse_message.is_some()
         || fixup_commit.is_some()
-        || squash_commit.is_some()
-        || amend;
+        || squash_commit.is_some();
     let in_rebase = rebase_in_progress(&git_dir);
     let use_editor = !in_rebase
         && !in_merge
