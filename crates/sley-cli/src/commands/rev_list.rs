@@ -2069,7 +2069,7 @@ fn rev_list_bitmap_apply_filter(
         }
     }
 
-    let mut exclude_type = |result: &mut sley_odb::BitmapWalkResult, object_type: ObjectType| {
+    let exclude_type = |result: &mut sley_odb::BitmapWalkResult, object_type: ObjectType| {
         for (word, (type_word, tip_word)) in result
             .words
             .iter_mut()

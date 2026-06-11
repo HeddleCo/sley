@@ -1033,7 +1033,7 @@ fn bitmap_next_commit_index(idx: u32) -> u32 {
         return offset.min(MIN_COMMITS);
     }
     let offset = idx - MIN_REGION;
-    offset.min(MAX_COMMITS).max(MIN_COMMITS)
+    offset.clamp(MIN_COMMITS, MAX_COMMITS)
 }
 
 /// Builds a serialised `.bitmap` for the pack described by `index_entries` /
@@ -1160,7 +1160,7 @@ fn build_reachability_bitmap(
     }
 
     // Selection: date-descending, then the spacing schedule.
-    indexed_commits.sort_by(|left, right| right.date.cmp(&left.date));
+    indexed_commits.sort_by_key(|commit| std::cmp::Reverse(commit.date));
     let mut selected: Vec<&IndexedCommit> = Vec::new();
     let commit_count = indexed_commits.len() as u32;
     if commit_count < 100 {

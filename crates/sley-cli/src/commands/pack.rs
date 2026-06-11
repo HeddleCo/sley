@@ -1301,12 +1301,51 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         write_bitmap.then(|| preferred_pack.unwrap_or(0)),
     )?;
     let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
+    let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
+
+    // Build the bitmap BEFORE the midx lands on disk: a closure failure must
+    // abort the whole write (upstream dies and leaves no midx behind),
+    // unlike repack's warn-and-continue.
+    let bitmap = if write_bitmap {
+        let db = FileObjectDatabase::new(object_dir.clone(), format);
+        let mut tips = repack_preferred_bitmap_tips(&git_dir, &db, format)?;
+        if let Some(snapshot) = &refs_snapshot {
+            // Snapshot lines are "<oid>" (plain tip) or "+<oid>" (preferred
+            // tip, upstream's NEEDS_BITMAP). Only the preferred ones
+            // influence selection here.
+            for line in fs::read_to_string(snapshot)?.lines() {
+                if let Some(hex) = line.strip_prefix('+')
+                    && let Ok(oid) = ObjectId::from_hex(format, hex)
+                    && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+                {
+                    tips.insert(commit);
+                }
+            }
+        }
+        let preferred_pack = preferred_pack.unwrap_or(0);
+        match sley_odb::build_midx_bitmap(
+            &db,
+            format,
+            &objects,
+            &midx_checksum,
+            preferred_pack,
+            &tips,
+        )? {
+            Some(bitmap) => Some(bitmap),
+            None => {
+                eprintln!("fatal: could not write multi-pack bitmap");
+                return Err(GitError::Exit(1));
+            }
+        }
+    } else {
+        None
+    };
+
     fs::write(pack_dir.join("multi-pack-index"), &midx)?;
 
     // Clear midx bitmap/rev sidecars that don't belong to this write: stale
     // checksums always; the current checksum's too when no bitmap was asked
     // for (upstream clear_midx_files_ext keeps only what it just wrote).
-    let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
     for entry in fs::read_dir(&pack_dir)? {
         let path = entry?.path();
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
@@ -1320,34 +1359,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         }
     }
 
-    if !write_bitmap {
-        return Ok(());
-    }
-    let preferred_pack = preferred_pack.unwrap_or(0);
-
-    let db = FileObjectDatabase::new(object_dir.clone(), format);
-    let mut tips = repack_preferred_bitmap_tips(&git_dir, &db, format)?;
-    if let Some(snapshot) = &refs_snapshot {
-        // Snapshot lines are "<oid>" (plain tip) or "+<oid>" (preferred tip,
-        // upstream's NEEDS_BITMAP). Only the preferred ones influence
-        // selection here.
-        for line in fs::read_to_string(snapshot)?.lines() {
-            if let Some(hex) = line.strip_prefix('+')
-                && let Ok(oid) = ObjectId::from_hex(format, hex)
-                && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
-            {
-                tips.insert(commit);
-            }
-        }
-    }
-    if let Some(bitmap) = sley_odb::build_midx_bitmap(
-        &db,
-        format,
-        &objects,
-        &midx_checksum,
-        preferred_pack,
-        &tips,
-    )? {
+    if let Some(bitmap) = bitmap {
         let bitmap_path = pack_dir.join(&bitmap_name);
         let temp_path = bitmap_path.with_extension("bitmap.tmp");
         fs::write(&temp_path, &bitmap)?;
