@@ -18,10 +18,12 @@ use crate::*;
 
 pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
     let mut base_name = None::<String>;
+    let mut stdout_mode = false;
     let mut saw_dashdash = false;
     for arg in args {
         match arg.as_str() {
             "--" if !saw_dashdash => saw_dashdash = true,
+            "--stdout" if !saw_dashdash => stdout_mode = true,
             // Progress-meter toggles: sley never draws a progress meter, so
             // these are accepted as no-ops (they have no on-disk effect).
             "-q" | "--quiet" | "--no-quiet" | "--progress" | "--no-progress" | "--all-progress"
@@ -40,9 +42,12 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
             }
         }
     }
-    let Some(base_name) = base_name else {
+    if base_name.is_none() && !stdout_mode {
         return pack_objects_usage();
-    };
+    }
+    if base_name.is_some() && stdout_mode {
+        return pack_objects_usage();
+    }
 
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
@@ -71,6 +76,14 @@ pub(crate) fn cmd_pack_objects(args: &[String]) -> Result<()> {
         })
         .collect();
     let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    if stdout_mode {
+        // `--stdout`: emit the pack stream itself; no idx/rev companions.
+        let mut stdout = io::stdout();
+        stdout.write_all(&written.pack)?;
+        stdout.flush()?;
+        return Ok(());
+    }
+    let base_name = base_name.expect("checked above");
     let positions = pack_order_index_positions(&written.entries);
     let reverse_index = PackReverseIndex::write(format, &positions, &written.checksum)?;
 

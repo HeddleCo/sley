@@ -434,7 +434,16 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     }
                 }
             }
-            None if positional.len() > 1 => (Some(positional[0].as_str()), &positional[1..]),
+            None if positional.len() > 1 => {
+                // `checkout <rev> <paths>...` — but if the first arg is not a
+                // revision, every positional is a pathspec (git's
+                // disambiguation for `checkout <path> <path>...`).
+                if sley_rev::resolve_revision(&git_dir, format, &positional[0]).is_ok() {
+                    (Some(positional[0].as_str()), &positional[1..])
+                } else {
+                    (None, positional.as_slice())
+                }
+            }
             None if positional.len() == 1 => {
                 // A single arg that is neither a branch nor a revision but
                 // names an existing file is a path checkout.
@@ -1964,6 +1973,20 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
                     .into_iter()
                     .map(|path| path.to_string_lossy().into_owned()),
             );
+        }
+    }
+    if !pathspec_args.is_empty() {
+        if all {
+            eprintln!(
+                "fatal: paths '{} ...' with -a does not make sense",
+                pathspec_args[0]
+            );
+            return Err(GitError::Exit(128));
+        }
+        if amend {
+            return Err(GitError::Unsupported(
+                "commit pathspecs with --amend are not implemented".into(),
+            ));
         }
     }
     if unified_context && !interactive && !patch {

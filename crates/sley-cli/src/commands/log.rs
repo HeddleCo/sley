@@ -277,6 +277,12 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut null_terminate = false;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut full_history = false;
+    let mut graph = false;
+    let mut line_prefix: Option<String> = None;
+    let mut color_always = false;
+    // `--no-walk[=sorted]` sorts the given commits by commit time;
+    // `--no-walk=unsorted` keeps the command-line order.
+    let mut no_walk_unsorted = true;
     let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -493,7 +499,10 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             }
             "-P" | "--perl-regexp" => regexp_mode = SimpleLogRegexMode::Perl,
             "--do-walk" => walk = true,
-            "--no-walk" => walk = false,
+            "--no-walk" => {
+                walk = false;
+                no_walk_unsorted = false;
+            }
             "-g" | "--walk-reflogs" => walk_reflogs = true,
             "--no-walk-reflogs" => walk_reflogs = false,
             "--max-age" => {
@@ -554,8 +563,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             | "--no-mailmap"
             | "--show-signature"
             | "--no-show-signature"
-            | "--no-color"
-            | "--color"
             | "--no-decorate"
             | "--decorate=no"
             | "--decorate=auto"
@@ -648,7 +655,14 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             value if value.starts_with("--diff-merges=") => {
                 log_validate_diff_merges(&value["--diff-merges=".len()..])?;
             }
-            "--no-walk=sorted" | "--no-walk=unsorted" => walk = false,
+            "--no-walk=sorted" => {
+                walk = false;
+                no_walk_unsorted = false;
+            }
+            "--no-walk=unsorted" => {
+                walk = false;
+                no_walk_unsorted = true;
+            }
             value if value.starts_with("--no-walk=") => {
                 return log_no_walk_invalid_argument(value);
             }
@@ -793,8 +807,22 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             value if value.starts_with("--color-moved=") => {
                 log_validate_color_moved(&value["--color-moved=".len()..])?;
             }
+            "--graph" => graph = true,
+            "--no-graph" => graph = false,
+            "--color" => color_always = true,
+            "--no-color" => color_always = false,
+            "--line-prefix" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| log_option_requires_value_error("line-prefix"))?;
+                line_prefix = Some(value.to_string());
+            }
+            value if value.starts_with("--line-prefix=") => {
+                line_prefix = Some(value["--line-prefix=".len()..].to_string());
+            }
             value if value.starts_with("--color=") => {
                 log_validate_color(&value["--color=".len()..])?;
+                color_always = value["--color=".len()..].eq_ignore_ascii_case("always");
             }
             "--color-moved-ws" => {
                 let value = iter
@@ -1104,6 +1132,10 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    if graph && !walk {
+        eprintln!("fatal: cannot combine --no-walk with --graph");
+        return Err(GitError::Exit(128));
+    }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let config = read_repo_config(&git_dir)?;
@@ -1314,6 +1346,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         }
     }
     if walk
+        && !graph
+        && line_prefix.is_none()
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
         && pathspecs.is_empty()
         && !full_history
@@ -1437,7 +1471,24 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         selected.push(record);
     }
     selected = match ordering {
+        // `--graph` implies topological ordering (upstream sets
+        // `revs->topo_order = 1`); `--date-order`/`--author-date-order` pick
+        // the date-keyed topo variants, which the helpers below already are.
+        RevListOrdering::Default if graph => rev_list_topo_order(selected)?,
         RevListOrdering::Default if walk => rev_list_date_order(selected)?,
+        RevListOrdering::Default if !no_walk_unsorted => {
+            // `--no-walk[=sorted]`: a plain stable commit-time sort (upstream
+            // `commit_list_sort_by_date`), newest first.
+            let mut keyed = selected
+                .iter()
+                .map(|record| {
+                    commit_identity_timestamp_i64(&record.commit.committer)
+                        .map(|timestamp| (timestamp, *record))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            keyed.sort_by_key(|(timestamp, _)| std::cmp::Reverse(*timestamp));
+            keyed.into_iter().map(|(_, record)| record).collect()
+        }
         RevListOrdering::Default => selected,
         RevListOrdering::Topo => rev_list_topo_order(selected)?,
         RevListOrdering::Date => rev_list_date_order(selected)?,
@@ -1466,6 +1517,11 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         )?;
         selected = simplified_storage.iter().collect();
     }
+    // For `--graph`, a parent is "interesting" iff it will be shown — judged
+    // against the full selection BEFORE `--skip`/`-n` truncation (matching
+    // upstream `get_commit_action`, which is truncation-blind).
+    let graph_shown: Option<HashSet<ObjectId>> =
+        graph.then(|| selected.iter().map(|record| record.oid).collect());
     if skip > 0 {
         selected = selected.into_iter().skip(skip).collect();
     }
@@ -1528,6 +1584,121 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
+
+    if let Some(shown) = &graph_shown {
+        let palette = log_graph_color_palette(&config);
+        let mut graph_state = sley_rev::graph::Graph::new(palette, color_always);
+        let prefix: &str = line_prefix.as_deref().unwrap_or("");
+        let mut out = io::stdout();
+        // Whether the previous entry's message ended without a newline
+        // (upstream `opt->missing_newline`), for the separator decision.
+        let mut prev_missing_newline = false;
+        for (index, record) in selected.iter().enumerate() {
+            let mut interesting: Vec<ObjectId> = record
+                .parents
+                .iter()
+                .filter(|parent| shown.contains(*parent))
+                .copied()
+                .collect();
+            if first_parent {
+                interesting.truncate(1);
+            }
+            graph_state.update(record.oid, &interesting);
+            match &output {
+                LogOutput::Compiled {
+                    compiled,
+                    final_newline,
+                    ..
+                } => {
+                    if index > 0 && !*final_newline {
+                        // `--pretty=format:` separator semantics.
+                        if !prev_missing_newline {
+                            graph_show_padding(&mut graph_state, prefix, &mut out)?;
+                        }
+                        out.write_all(b"\n")?;
+                    }
+                    graph_show_commit(&mut graph_state, prefix, &mut out)?;
+                    let format_context = LogFormatContext {
+                        abbrev_len,
+                        decorations: &decorations,
+                        marker: '>',
+                        dialect: LogFormatDialect::Log,
+                        source: log_format_source.as_deref(),
+                        date_mode,
+                        source_oid: source_labels.as_ref(),
+                        describe: Some(&describe_ctx),
+                        color: color_always,
+                        output_encoding: &output_encoding,
+                    };
+                    let mut msg = Vec::with_capacity(compiled.estimated_line_capacity());
+                    emit_compiled_log_format(
+                        record,
+                        compiled,
+                        &format_context,
+                        &mut msg,
+                        0..compiled.tokens.len(),
+                    )?;
+                    graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
+                    let newline_terminated = msg.last() == Some(&b'\n');
+                    prev_missing_newline = !newline_terminated;
+                    if *final_newline {
+                        if newline_terminated {
+                            graph_show_padding(&mut graph_state, prefix, &mut out)?;
+                        }
+                        out.write_all(b"\n")?;
+                        prev_missing_newline = false;
+                    }
+                }
+                LogOutput::Default(kind) => {
+                    if index > 0 {
+                        graph_show_padding(&mut graph_state, prefix, &mut out)?;
+                        out.write_all(b"\n")?;
+                    }
+                    graph_show_commit(&mut graph_state, prefix, &mut out)?;
+                    write!(
+                        out,
+                        "commit {}",
+                        format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
+                    )?;
+                    if let Some(labels) = decorations.get(&record.oid)
+                        && !labels.is_empty()
+                    {
+                        write!(out, " ({})", labels.join(", "))?;
+                    }
+                    out.write_all(b"\n")?;
+                    graph_show_oneline(&mut graph_state, prefix, &mut out)?;
+                    let mut msg: Vec<u8> = Vec::new();
+                    if record.parents.len() > 1 {
+                        let merged: Vec<String> =
+                            record.parents.iter().map(format_log_abbrev_oid).collect();
+                        writeln!(msg, "Merge: {}", merged.join(" ")).map_err(io::Error::from)?;
+                    }
+                    writeln!(msg, "Author: {}", commit_author_identity(&record.commit.author))
+                        .map_err(io::Error::from)?;
+                    if *kind == LogDefaultKind::Medium {
+                        writeln!(
+                            msg,
+                            "Date:   {}",
+                            commit_identity_date(&record.commit.author, date_mode)
+                        )
+                        .map_err(io::Error::from)?;
+                    }
+                    msg.push(b'\n');
+                    for line in String::from_utf8_lossy(&record.commit.message).lines() {
+                        if line.is_empty() {
+                            msg.push(b'\n');
+                        } else {
+                            writeln!(msg, "    {line}").map_err(io::Error::from)?;
+                        }
+                    }
+                    graph_show_commit_msg(&mut graph_state, prefix, &msg, &mut out)?;
+                    prev_missing_newline = false;
+                }
+            }
+        }
+        out.flush()?;
+        return Ok(());
+    }
 
     for (index, record) in selected.iter().enumerate() {
         match output {
@@ -1598,6 +1769,31 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                         &child_oids,
                         abbrev_len,
                     )?;
+                } else if let Some(prefix) = &line_prefix {
+                    // `--line-prefix=<p>` prefixes every output line.
+                    let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
+                    emit_compiled_log_format(
+                        record,
+                        compiled,
+                        &format_context,
+                        &mut line,
+                        0..compiled.tokens.len(),
+                    )?;
+                    let mut stdout = io::stdout();
+                    let mut start = 0usize;
+                    while start < line.len() {
+                        let end = line[start..]
+                            .iter()
+                            .position(|&byte| byte == b'\n')
+                            .map(|pos| start + pos + 1)
+                            .unwrap_or(line.len());
+                        stdout.write_all(prefix.as_bytes())?;
+                        stdout.write_all(&line[start..end])?;
+                        start = end;
+                    }
+                    if line.is_empty() {
+                        stdout.write_all(prefix.as_bytes())?;
+                    }
                 } else {
                     print_log_format(record, compiled, format_context)?;
                 }
@@ -1753,6 +1949,152 @@ fn resolve_pretty_spec(
     Err(GitError::Exit(128))
 }
 
+// ---------------------------------------------------------------------------
+// `--graph` rendering helpers (upstream graph.c's `graph_show_*` family)
+// ---------------------------------------------------------------------------
+
+/// The `log.graphColors` palette (empty -> the renderer's ANSI default).
+/// Invalid entries are warned about and skipped, like upstream
+/// `parse_graph_colors_config`.
+fn log_graph_color_palette(config: &GitConfig) -> Vec<String> {
+    let Some(value) = config.get("log", None, "graphColors") else {
+        return Vec::new();
+    };
+    let mut palette = Vec::new();
+    for token in value.split(',') {
+        if token.trim().is_empty() {
+            eprintln!("warning: ignored invalid color '{token}' in log.graphColors");
+            continue;
+        }
+        match crate::commands::config_cmd::try_format_config_color_value(token) {
+            Ok(code) => palette.push(code),
+            Err(()) => {
+                eprintln!("warning: ignored invalid color '{token}' in log.graphColors");
+            }
+        }
+    }
+    palette
+}
+
+/// Emit graph rows up to and including the current commit's row (no trailing
+/// newline), prefixing each physical line with `prefix`.
+fn graph_show_commit(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    write!(out, "{prefix}")?;
+    let mut shown = false;
+    while !shown && !graph.is_commit_finished() {
+        let mut row = String::new();
+        shown = graph.next_line(&mut row);
+        out.write_all(row.as_bytes())?;
+        if !shown {
+            out.write_all(b"\n")?;
+            write!(out, "{prefix}")?;
+        }
+    }
+    Ok(())
+}
+
+/// Emit a single graph row (no trailing newline).
+fn graph_show_oneline(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    write!(out, "{prefix}")?;
+    let mut row = String::new();
+    graph.next_line(&mut row);
+    out.write_all(row.as_bytes())?;
+    Ok(())
+}
+
+/// Emit a padding row (no trailing newline).
+fn graph_show_padding(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    write!(out, "{prefix}")?;
+    let mut row = String::new();
+    graph.padding_line(&mut row);
+    out.write_all(row.as_bytes())?;
+    Ok(())
+}
+
+/// Emit the remaining graph rows for the current commit; ends WITHOUT a
+/// trailing newline (upstream `graph_show_remainder`).
+fn graph_show_remainder(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    write!(out, "{prefix}")?;
+    if graph.is_commit_finished() {
+        return Ok(());
+    }
+    loop {
+        let mut row = String::new();
+        graph.next_line(&mut row);
+        out.write_all(row.as_bytes())?;
+        if !graph.is_commit_finished() {
+            out.write_all(b"\n")?;
+            write!(out, "{prefix}")?;
+        } else {
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Print `msg` line by line, with a graph row before every line but the first
+/// (upstream `graph_show_strbuf`).
+fn graph_show_strbuf(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    msg: &[u8],
+    out: &mut dyn Write,
+) -> Result<()> {
+    let mut start = 0usize;
+    while start < msg.len() {
+        let end = msg[start..]
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map(|pos| start + pos + 1)
+            .unwrap_or(msg.len());
+        out.write_all(&msg[start..end])?;
+        let ended_with_newline = msg[end - 1] == b'\n';
+        if ended_with_newline && end < msg.len() {
+            graph_show_oneline(graph, prefix, out)?;
+        }
+        start = end;
+    }
+    Ok(())
+}
+
+/// Print the commit message followed by any remaining graph rows (upstream
+/// `graph_show_commit_msg`).
+fn graph_show_commit_msg(
+    graph: &mut sley_rev::graph::Graph,
+    prefix: &str,
+    msg: &[u8],
+    out: &mut dyn Write,
+) -> Result<()> {
+    graph_show_strbuf(graph, prefix, msg, out)?;
+    let newline_terminated = msg.last() == Some(&b'\n');
+    if !graph.is_commit_finished() {
+        if !newline_terminated {
+            out.write_all(b"\n")?;
+        }
+        graph_show_remainder(graph, prefix, out)?;
+        if newline_terminated {
+            out.write_all(b"\n")?;
+        }
+    }
+    Ok(())
+}
+
 fn log_fatal_unrecognized_argument(value: &str) -> Result<()> {
     eprintln!("fatal: unrecognized argument: {value}");
     Err(GitError::Exit(128))
@@ -1851,11 +2193,7 @@ fn print_log_format_with_children(
         .tokens
         .iter()
         .position(|token| matches!(token, FormatToken::Subject | FormatToken::SanitizedSubject));
-    let child_abbrev_len = if compiled
-        .tokens
-        .iter()
-        .any(|token| *token == FormatToken::OidFull)
-    {
+    let child_abbrev_len = if compiled.tokens.contains(&FormatToken::OidFull) {
         None
     } else {
         abbrev_len

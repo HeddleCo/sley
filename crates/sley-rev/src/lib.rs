@@ -1,3 +1,5 @@
+pub mod graph;
+
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 
@@ -232,6 +234,13 @@ fn resolve_revision_ref(refs: &FileRefStore, rev: &str) -> Result<Option<ObjectI
         format!("refs/heads/{rev}")
     } else if refs.read_ref(&format!("refs/tags/{rev}"))?.is_some() {
         format!("refs/tags/{rev}")
+    } else if rev.contains('/') && refs.read_ref(&format!("refs/{rev}"))?.is_some() {
+        // git's lookup rule #2 ("refs/%s") — e.g. `bisect/bad`, `notes/commits`.
+        format!("refs/{rev}")
+    } else if refs.read_ref(&format!("refs/remotes/{rev}"))?.is_some() {
+        format!("refs/remotes/{rev}")
+    } else if refs.read_ref(&format!("refs/remotes/{rev}/HEAD"))?.is_some() {
+        format!("refs/remotes/{rev}/HEAD")
     } else if validate_symref_name(rev).is_ok() {
         rev.to_string()
     } else {
@@ -2985,7 +2994,7 @@ mod tests {
     #[test]
     fn resolve_revision_supports_abbreviated_loose_object_ids() {
         let git_dir = temp_git_dir();
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"abbrev\n".to_vec()))
             .expect("test operation should succeed");
@@ -3001,7 +3010,7 @@ mod tests {
     #[test]
     fn resolve_revision_prefers_ref_over_abbreviated_object_id() {
         let git_dir = temp_git_dir();
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let object = db
             .write_object(EncodedObject::new(
                 ObjectType::Blob,
@@ -3192,7 +3201,7 @@ mod tests {
     #[test]
     fn pack_refs_with_auto_peel_writes_peeled_tag() {
         let git_dir = temp_git_dir();
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let tree = db
             .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
             .expect("test operation should succeed");
