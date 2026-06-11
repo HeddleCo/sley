@@ -26,7 +26,7 @@ fi
 # script -> floor (minimum acceptable ok-assertion count).
 declare -A FLOOR=(
     [t0001-init.sh]=99
-    [t1006-cat-file.sh]=284
+    [t1006-cat-file.sh]=285
     [t1007-hash-object.sh]=40
     [t1300-config.sh]=445
     [t1401-symbolic-ref.sh]=25
@@ -46,8 +46,10 @@ declare -A FLOOR=(
     [t6423-merge-rename-directories.sh]=14
     [t3501-revert-cherry-pick.sh]=5
     [t2020-checkout-detach.sh]=9
-    [t4205-log-pretty-formats.sh]=106
-    [t4202-log.sh]=33
+    [t6003-rev-list-topo-order.sh]=36
+    [t6012-rev-list-simplify.sh]=8
+    [t4205-log-pretty-formats.sh]=107
+    [t4202-log.sh]=34
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
 )
