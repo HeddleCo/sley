@@ -422,6 +422,258 @@ fn merge_commit_and_advance(
     Ok(oid)
 }
 
+/// `git merge <a> <b> [...]` — the octopus strategy. Mirrors upstream's
+/// `git-merge-octopus`: iteratively three-way-merge each head onto the running
+/// merged tree (MRT), fast-forwarding where possible, and refuse (exit 2) the
+/// moment any pairwise step conflicts — an octopus merge must be trivially
+/// clean. The final commit records HEAD plus every non-redundant head as
+/// parents, in command-line order.
+#[allow(clippy::too_many_arguments)]
+fn merge_octopus(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+    worktree_root: &Path,
+    refs: &FileRefStore,
+    targets: &[String],
+    options: &MergeOptions,
+) -> Result<()> {
+    if options.no_commit || options.ff_only {
+        return Err(GitError::Unsupported(
+            "octopus merges with --no-commit or --ff-only are not supported yet".into(),
+        ));
+    }
+    let head_oid = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => match refs.read_ref(&branch)? {
+            Some(RefTarget::Direct(oid)) => oid,
+            _ => {
+                return Err(GitError::Unsupported(
+                    "octopus merge into an unborn branch is not supported".into(),
+                ));
+            }
+        },
+        Some(RefTarget::Direct(oid)) => oid,
+        None => {
+            return Err(GitError::Command("HEAD is not a valid revision".into()));
+        }
+    };
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+
+    let mut heads = Vec::with_capacity(targets.len());
+    for target in targets {
+        let oid = resolve_revision(git_dir, format, target)?;
+        let commit = sley_rev::peel_to_commit(&db, format, &oid)?;
+        heads.push((target.clone(), commit));
+    }
+
+    // git's `reduce_heads`: drop heads already reachable from HEAD or from
+    // another head (a duplicate keeps only its first occurrence).
+    let is_ancestor = |db: &FileObjectDatabase, ancestor: &ObjectId, of: &ObjectId| -> Result<bool> {
+        if ancestor == of {
+            return Ok(true);
+        }
+        Ok(merge_bases(git_dir, db, format, ancestor, of)?
+            .iter()
+            .any(|base| base == ancestor))
+    };
+    let mut reduced: Vec<(String, ObjectId)> = Vec::new();
+    'heads: for (index, (name, oid)) in heads.iter().enumerate() {
+        if is_ancestor(&db, oid, &head_oid)? {
+            continue;
+        }
+        for (other_index, (_, other)) in heads.iter().enumerate() {
+            if other_index == index {
+                continue;
+            }
+            if oid == other {
+                if other_index < index {
+                    continue 'heads;
+                }
+                continue;
+            }
+            if is_ancestor(&db, oid, other)? {
+                continue 'heads;
+            }
+        }
+        reduced.push((name.clone(), *oid));
+    }
+    if reduced.is_empty() {
+        if !options.quiet {
+            println!("Already up to date.");
+        }
+        return Ok(());
+    }
+
+    // Iterative octopus: MRC tracks the commits the running tree stands for.
+    let head_tree = commit_tree_oid(&db, format, &head_oid)?;
+    let mut merged_map = stash_tree_entry_map(&db, format, &head_tree)?;
+    let mut merged_commits = vec![head_oid];
+    let mut non_ff = false;
+    for (name, oid) in &reduced {
+        let mut base_args = vec![*oid];
+        base_args.extend(merged_commits.iter().copied());
+        let common = merge_bases_default_many(&db, format, &base_args)?;
+        if common.len() == 1 && common[0] == *oid {
+            // Already covered by the merges performed so far.
+            continue;
+        }
+        if !non_ff && merged_commits.len() == 1 && common.len() == 1 && common[0] == merged_commits[0]
+        {
+            // Fast-forward the running state to this head.
+            let tree = commit_tree_oid(&db, format, oid)?;
+            merged_map = stash_tree_entry_map(&db, format, &tree)?;
+            merged_commits = vec![*oid];
+            continue;
+        }
+        if common.is_empty() {
+            eprintln!("Unable to find common commit with {name}");
+            return Err(GitError::Exit(2));
+        }
+        non_ff = true;
+        let base_map = virtual_ancestor_entry_map(&db, format, &common, common_git_dir)?;
+        let theirs_tree = commit_tree_oid(&db, format, oid)?;
+        let theirs_map = stash_tree_entry_map(&db, format, &theirs_tree)?;
+        let (results, conflicts) = three_way_merge_trees_with_favor(
+            &db,
+            format,
+            &base_map,
+            &merged_map,
+            &theirs_map,
+            "HEAD",
+            name,
+            options.favor,
+        )?;
+        if !conflicts.is_empty() {
+            // Octopus refuses to leave conflicts for manual resolution.
+            eprintln!("Simple merge did not work, octopus merge is not possible.");
+            eprintln!("Merge with strategy octopus failed.");
+            return Err(GitError::Exit(2));
+        }
+        let mut next: MergeTreeMap = BTreeMap::new();
+        for (path, result) in results {
+            if let MergePathResult::Resolved(Some(entry)) = result {
+                next.insert(path, entry);
+            }
+        }
+        merged_map = next;
+        merged_commits.push(*oid);
+    }
+
+    if !non_ff && merged_commits.len() == 1 && reduced.len() == 1 {
+        // Degenerated to a plain fast-forward.
+        let new_oid = merged_commits[0];
+        let target_ref = match refs.read_ref("HEAD")? {
+            Some(RefTarget::Symbolic(branch)) => branch,
+            _ => "HEAD".to_string(),
+        };
+        let mut tx = refs.transaction();
+        tx.update(RefUpdate {
+            name: target_ref,
+            expected: Some(RefTarget::Direct(head_oid)),
+            new: RefTarget::Direct(new_oid),
+            reflog: Some(ReflogEntry {
+                old_oid: head_oid,
+                new_oid,
+                committer: commit_identity_from_env("COMMITTER")?,
+                message: format!("merge {}: Fast-forward", reduced[0].0).into_bytes(),
+            }),
+        });
+        tx.commit()?;
+        sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+        if !options.quiet {
+            let mut stdout = io::stdout();
+            writeln!(
+                stdout,
+                "Updating {}..{}",
+                format_log_abbrev_oid(&head_oid),
+                format_log_abbrev_oid(&new_oid)
+            )?;
+            writeln!(stdout, "Fast-forward")?;
+            let new_tree = commit_tree_oid(&db, format, &new_oid)?;
+            write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &new_tree)?;
+            stdout.flush()?;
+        }
+        return Ok(());
+    }
+
+    // Build the merged tree via a temporary stage-0 index, mirroring the
+    // two-parent clean path above.
+    let mut entries = Vec::new();
+    for (path, (mode, oid)) in &merged_map {
+        entries.push(merge_index_entry(path, *mode, *oid, 0));
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let index = Index {
+        version: 2,
+        entries,
+        extensions: Vec::new(),
+        checksum: None,
+    };
+    fs::write(
+        sley_worktree::repository_index_path(git_dir),
+        index.write(format)?,
+    )?;
+    let merged_tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+
+    let message = options.message.clone().unwrap_or_else(|| {
+        let names = reduced
+            .iter()
+            .map(|(name, _)| format!("'{name}'"))
+            .collect::<Vec<_>>();
+        let list = match names.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => names.join(", "),
+        };
+        format!("Merge branches {list}")
+    });
+
+    if !options.quiet {
+        let mut stdout = io::stdout();
+        writeln!(stdout, "Merge made by the 'octopus' strategy.")?;
+        write_merge_result_diffstat(&mut stdout, &db, format, &head_tree, &merged_tree)?;
+        stdout.flush()?;
+    }
+
+    let author = commit_identity_from_env("AUTHOR")?;
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let mut parents = vec![head_oid];
+    parents.extend(reduced.iter().map(|(_, oid)| *oid));
+    let merged_oid = sley_sequencer::create_commit(
+        &mut write_db,
+        sley_sequencer::CommitCreate {
+            tree: merged_tree,
+            parents,
+            author,
+            committer: committer.clone(),
+            message: commit_cleanup_message(
+                message.into_bytes(),
+                CommitCleanupMode::Whitespace,
+            ),
+            encoding: None,
+        },
+    )?;
+    let target_ref = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => branch,
+        _ => "HEAD".to_string(),
+    };
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: target_ref,
+        expected: Some(RefTarget::Direct(head_oid)),
+        new: RefTarget::Direct(merged_oid),
+        reflog: Some(ReflogEntry {
+            old_oid: head_oid,
+            new_oid: merged_oid,
+            committer,
+            message: "merge: Merge made by the 'octopus' strategy.".into(),
+        }),
+    });
+    tx.commit()?;
+    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &merged_oid)?;
+    Ok(())
+}
+
 struct MergeOptions {
     message: Option<String>,
     no_ff: bool,
@@ -755,9 +1007,15 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             return Err(GitError::Command("merge requires a commit argument".into()));
         }
         _ => {
-            return Err(GitError::Unsupported(
-                "octopus merges (multiple commits) are not supported yet".into(),
-            ));
+            return merge_octopus(
+                &git_dir,
+                &common_git_dir,
+                format,
+                &worktree_root,
+                &refs,
+                &positional,
+                &options,
+            );
         }
     };
 

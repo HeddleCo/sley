@@ -8,7 +8,10 @@ use flate2::write::ZlibEncoder;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
-use sley_pack::{MultiPackIndex, PackFile, PackIndex, PackIndexEntry, PackInput, PackWrite};
+use sley_pack::{
+    MultiPackIndex, PackBitmapIndex, PackBitmapWriter, PackFile, PackIndex, PackIndexEntry,
+    PackInput, PackWrite,
+};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -455,6 +458,21 @@ pub fn install_repack_result(
     result: &RepackResult,
     prune: bool,
 ) -> Result<()> {
+    install_repack_result_with_bitmap(git_dir, format, result, prune, None)
+}
+
+/// [`install_repack_result`] that additionally writes a `pack-<checksum>.bitmap`
+/// reachability bitmap alongside the new pack when `bitmap_tips` is `Some`.
+/// `bitmap_tips` carries the repository's ref tips (peeled to commits): they
+/// receive selection preference, mirroring upstream's `NEEDS_BITMAP` flagging of
+/// ref tips in `git repack -b` / `pack-objects --write-bitmap-index`.
+pub fn install_repack_result_with_bitmap(
+    git_dir: &Path,
+    format: ObjectFormat,
+    result: &RepackResult,
+    prune: bool,
+    bitmap_tips: Option<&HashSet<ObjectId>>,
+) -> Result<()> {
     let objects_dir = repository_objects_dir(git_dir);
     let pack_dir = objects_dir.join("pack");
     fs::create_dir_all(&pack_dir)?;
@@ -490,6 +508,27 @@ pub fn install_repack_result(
     write_pack_component(&new_pack_path, &result.pack)?;
     write_pack_component(&new_rev_path, &reverse_index)?;
     write_pack_component(&new_index_path, &result.idx)?;
+
+    if let Some(tips) = bitmap_tips {
+        // Build before pruning: the closure walk reads objects through the
+        // pre-existing packs/loose store (the new pack holds the same bytes).
+        let database = FileObjectDatabase::new(objects_dir.clone(), format);
+        if let Some(bitmap) = build_pack_bitmap(
+            &database,
+            format,
+            &result.index_entries,
+            &result.pack_checksum,
+            tips,
+        )? {
+            // Unlike the pack/idx/rev (content-addressed by the pack
+            // checksum), the bitmap depends on selection inputs (e.g.
+            // pack.preferBitmapTips), so an existing file must be replaced —
+            // write_pack_component's exists-skip would keep a stale selection.
+            let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
+            remove_file_if_exists(&bitmap_path)?;
+            write_pack_component(&bitmap_path, &bitmap)?;
+        }
+    }
 
     if !prune {
         return Ok(());
@@ -927,6 +966,706 @@ where
         }
     }
     Ok(seen)
+}
+
+// ===== reachability bitmaps (.bitmap write + consult) =====
+
+/// Bit accessors over a `Vec<u64>` bitset using git's bitmap convention:
+/// bit `i` lives in word `i / 64` at bit `i % 64` (LSB-first within a word).
+fn bitset_get(words: &[u64], position: u32) -> bool {
+    let word = (position / 64) as usize;
+    word < words.len() && words[word] & (1u64 << (position % 64)) != 0
+}
+
+fn bitset_set(words: &mut [u64], position: u32) {
+    let word = (position / 64) as usize;
+    if word < words.len() {
+        words[word] |= 1u64 << (position % 64);
+    }
+}
+
+fn bitset_or(acc: &mut [u64], other: &[u64]) {
+    for (dst, src) in acc.iter_mut().zip(other) {
+        *dst |= *src;
+    }
+}
+
+/// Sorted set-bit positions of a bitset (the inverse of repeated [`bitset_set`]).
+fn bitset_positions(words: &[u64]) -> Vec<u32> {
+    let mut positions = Vec::new();
+    for (word_index, word) in words.iter().enumerate() {
+        let mut remaining = *word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            positions.push(word_index as u32 * 64 + bit);
+            remaining &= remaining - 1;
+        }
+    }
+    positions
+}
+
+/// Committer timestamp (epoch seconds) of a commit identity line
+/// (`Name <email> <timestamp> <tz>`); 0 when unparseable, matching git's
+/// tolerance for bogus dates during bitmap commit selection.
+fn commit_identity_timestamp(identity: &[u8]) -> i64 {
+    let mut fields = identity.rsplitn(3, |byte| *byte == b' ');
+    let _tz = fields.next();
+    fields
+        .next()
+        .and_then(|raw| std::str::from_utf8(raw).ok())
+        .and_then(|raw| raw.parse::<i64>().ok())
+        .unwrap_or(0)
+}
+
+/// Upstream `next_commit_index` (pack-bitmap-write.c): the spacing schedule for
+/// bitmap commit selection over the date-descending commit list.
+fn bitmap_next_commit_index(idx: u32) -> u32 {
+    const MIN_COMMITS: u32 = 100;
+    const MAX_COMMITS: u32 = 5000;
+    const MUST_REGION: u32 = 100;
+    const MIN_REGION: u32 = 20000;
+
+    if idx <= MUST_REGION {
+        return 0;
+    }
+    if idx <= MIN_REGION {
+        let offset = idx - MUST_REGION;
+        return offset.min(MIN_COMMITS);
+    }
+    let offset = idx - MIN_REGION;
+    offset.clamp(MIN_COMMITS, MAX_COMMITS)
+}
+
+/// Builds a serialised `.bitmap` for the pack described by `index_entries` /
+/// `pack_checksum`, mirroring upstream pack-bitmap-write.c:
+///
+/// * commit selection walks the pack's commits in committer-date-descending
+///   order through [`bitmap_next_commit_index`]'s spacing schedule, preferring
+///   `preferred_tips` (ref tips — upstream's `NEEDS_BITMAP`) and merge commits
+///   inside each window;
+/// * each selected commit stores its full reachability closure (commits, trees,
+///   blobs) as pack-order bit positions (no XOR compression — `xor_offset` 0 is
+///   valid on disk and what readers see after resolution anyway).
+///
+/// Returns `Ok(None)` — mirroring upstream's warn-and-skip — when the pack
+/// lacks full closure (a reachable object is missing from it).
+pub fn build_pack_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    index_entries: &[PackIndexEntry],
+    pack_checksum: &ObjectId,
+    preferred_tips: &HashSet<ObjectId>,
+) -> Result<Option<Vec<u8>>> {
+    // `index_entries` carries no ordering guarantee (writer provenance is in
+    // pack-write order); bit numbering follows pack (offset) order.
+    let mut by_offset: Vec<usize> = (0..index_entries.len()).collect();
+    by_offset.sort_by_key(|&slot| index_entries[slot].offset);
+    let bit_order: Vec<ObjectId> = by_offset
+        .into_iter()
+        .map(|slot| index_entries[slot].oid)
+        .collect();
+    build_reachability_bitmap(db, format, pack_checksum, &bit_order, preferred_tips)
+}
+
+/// [`build_pack_bitmap`]'s multi-pack sibling: builds the serialised
+/// `multi-pack-index-<checksum>.bitmap` for `midx_entries`, with bits in
+/// pseudo-pack order (preferred pack first, then pack id, then offset — the
+/// same order [`MultiPackIndex::write_with_reverse_index`] records in `RIDX`)
+/// and the midx checksum in the BITM checksum field.
+pub fn build_midx_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    midx_entries: &[sley_pack::MultiPackIndexEntry],
+    midx_checksum: &ObjectId,
+    preferred_pack: u32,
+    preferred_tips: &HashSet<ObjectId>,
+) -> Result<Option<Vec<u8>>> {
+    let mut pseudo: Vec<usize> = (0..midx_entries.len()).collect();
+    pseudo.sort_by_key(|&slot| {
+        let entry = &midx_entries[slot];
+        (
+            entry.pack_int_id != preferred_pack,
+            entry.pack_int_id,
+            entry.offset,
+        )
+    });
+    let bit_order: Vec<ObjectId> = pseudo
+        .into_iter()
+        .map(|slot| midx_entries[slot].oid)
+        .collect();
+    build_reachability_bitmap(db, format, midx_checksum, &bit_order, preferred_tips)
+}
+
+/// Shared write half: `bit_order` lists every covered object's oid in bit
+/// order (pack order for a single pack, pseudo-pack order for a midx);
+/// `checksum` fills the BITM checksum field (pack checksum / midx checksum).
+fn build_reachability_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    checksum: &ObjectId,
+    bit_order: &[ObjectId],
+    preferred_tips: &HashSet<ObjectId>,
+) -> Result<Option<Vec<u8>>> {
+    if bit_order.is_empty() || bit_order.len() > u32::MAX as usize {
+        return Ok(None);
+    }
+    let object_count = bit_order.len();
+
+    // The on-disk entry position space is the oid-sorted lookup order (.idx /
+    // midx OIDL); derive each bit-order slot's rank there.
+    let mut oid_sorted: Vec<u32> = (0..object_count as u32).collect();
+    oid_sorted.sort_by(|&left, &right| {
+        bit_order[left as usize]
+            .as_bytes()
+            .cmp(bit_order[right as usize].as_bytes())
+    });
+    let mut index_position = vec![0u32; object_count];
+    for (position, &slot) in oid_sorted.iter().enumerate() {
+        index_position[slot as usize] = position as u32;
+    }
+    let mut oid_to_pack = HashMap::with_capacity(object_count);
+    for (pack_pos, oid) in bit_order.iter().enumerate() {
+        oid_to_pack.insert(*oid, pack_pos as u32);
+    }
+
+    // Object types in bit order; commits also collect (date, parent count).
+    let mut object_types = Vec::with_capacity(object_count);
+    struct IndexedCommit {
+        oid: ObjectId,
+        pack_pos: u32,
+        index_pos: u32,
+        date: i64,
+        parent_count: usize,
+    }
+    let mut indexed_commits = Vec::new();
+    for (pack_pos, oid) in bit_order.iter().enumerate() {
+        // Type via the header fast path: blobs (the bulk of most packs) never
+        // need their bodies inflated here.
+        let object_type = match db.read_object_header(oid)? {
+            Some((object_type, _)) => object_type,
+            None => db.read_object(oid)?.object_type,
+        };
+        object_types.push(object_type);
+        if object_type == ObjectType::Commit {
+            let object = db.read_object(oid)?;
+            let commit = Commit::parse_ref(format, &object.body)?;
+            indexed_commits.push(IndexedCommit {
+                oid: *oid,
+                pack_pos: pack_pos as u32,
+                index_pos: index_position[pack_pos],
+                date: commit_identity_timestamp(commit.committer),
+                parent_count: commit.parents.len(),
+            });
+        }
+    }
+
+    // Selection: date-descending, then the spacing schedule.
+    indexed_commits.sort_by_key(|commit| std::cmp::Reverse(commit.date));
+    let mut selected: Vec<&IndexedCommit> = Vec::new();
+    let commit_count = indexed_commits.len() as u32;
+    if commit_count < 100 {
+        selected.extend(indexed_commits.iter());
+    } else {
+        let mut i = 0u32;
+        loop {
+            let next = bitmap_next_commit_index(i);
+            if i + next >= commit_count {
+                break;
+            }
+            let mut chosen = &indexed_commits[(i + next) as usize];
+            if next > 0 {
+                for j in 0..=next {
+                    let candidate = &indexed_commits[(i + j) as usize];
+                    if preferred_tips.contains(&candidate.oid) {
+                        chosen = candidate;
+                        break;
+                    }
+                    if candidate.parent_count >= 2 {
+                        chosen = candidate;
+                    }
+                }
+            }
+            selected.push(chosen);
+            i += next + 1;
+        }
+    }
+
+    // Reachability closures, oldest-first so newer walks stop at memoised
+    // older selected commits.
+    let word_count = object_count.div_ceil(64);
+    let mut memo: HashMap<ObjectId, Arc<Vec<u64>>> = HashMap::new();
+    for commit in selected.iter().rev() {
+        let mut acc = vec![0u64; word_count];
+        let mut pending = vec![commit.oid];
+        while let Some(oid) = pending.pop() {
+            let Some(&pack_pos) = oid_to_pack.get(&oid) else {
+                // Mirrors upstream's "Packfile doesn't have full closure".
+                eprintln!(
+                    "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {oid} is missing)"
+                );
+                return Ok(None);
+            };
+            if bitset_get(&acc, pack_pos) {
+                continue;
+            }
+            if let Some(stored) = memo.get(&oid) {
+                bitset_or(&mut acc, stored);
+                continue;
+            }
+            bitset_set(&mut acc, pack_pos);
+            let object = db.read_object(&oid)?;
+            let tree = {
+                let parsed = Commit::parse_ref(format, &object.body)?;
+                pending.extend(parsed.parents);
+                parsed.tree
+            };
+            if !bitmap_mark_tree(db, format, &tree, &oid_to_pack, &mut acc)? {
+                return Ok(None);
+            }
+        }
+        memo.insert(commit.oid, Arc::new(acc));
+    }
+
+    let mut writer = PackBitmapWriter::new(format, *checksum, &object_types)?;
+    for commit in &selected {
+        let words = match memo.get(&commit.oid) {
+            Some(words) => words,
+            None => continue,
+        };
+        writer.add_commit(commit.pack_pos, commit.index_pos, &bitset_positions(words))?;
+    }
+    writer.write().map(Some)
+}
+
+/// Marks `tree` and everything below it (sub-trees, blobs) in `acc`, skipping
+/// already-set bits (their closure is already covered). Returns `false` when an
+/// object is missing from the pack (no full closure), after warning.
+fn bitmap_mark_tree(
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    tree: &ObjectId,
+    oid_to_pack: &HashMap<ObjectId, u32>,
+    acc: &mut [u64],
+) -> Result<bool> {
+    let Some(&pack_pos) = oid_to_pack.get(tree) else {
+        eprintln!(
+            "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {tree} is missing)"
+        );
+        return Ok(false);
+    };
+    if bitset_get(acc, pack_pos) {
+        return Ok(true);
+    }
+    bitset_set(acc, pack_pos);
+    let object = db.read_object(tree)?;
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        if entry.is_gitlink() {
+            continue;
+        }
+        if entry.is_tree() {
+            if !bitmap_mark_tree(db, format, &entry.oid, oid_to_pack, acc)? {
+                return Ok(false);
+            }
+        } else {
+            let Some(&blob_pos) = oid_to_pack.get(&entry.oid) else {
+                eprintln!(
+                    "warning: Failed to write bitmap index. Packfile doesn't have full closure (object {} is missing)",
+                    entry.oid
+                );
+                return Ok(false);
+            };
+            bitset_set(acc, blob_pos);
+        }
+    }
+    Ok(true)
+}
+
+/// A pack's `.bitmap` loaded for consultation: oid <-> pack-position mappings,
+/// resolved (XOR-expanded) per-commit reachability bitsets, and the four object
+/// type bitmaps. Bit numbering follows pack order throughout.
+pub struct LoadedPackBitmap {
+    object_count: u32,
+    oid_to_pack: HashMap<ObjectId, u32>,
+    pack_to_oid: Vec<ObjectId>,
+    commit_words: HashMap<ObjectId, Arc<Vec<u64>>>,
+    commits: Vec<u64>,
+    trees: Vec<u64>,
+    blobs: Vec<u64>,
+    tags: Vec<u64>,
+}
+
+impl LoadedPackBitmap {
+    pub fn object_count(&self) -> u32 {
+        self.object_count
+    }
+
+    /// Pack-order position of `oid`, when the object is in the bitmapped pack.
+    pub fn pack_position(&self, oid: &ObjectId) -> Option<u32> {
+        self.oid_to_pack.get(oid).copied()
+    }
+
+    pub fn oid_at(&self, position: u32) -> Option<&ObjectId> {
+        self.pack_to_oid.get(position as usize)
+    }
+
+    /// The resolved reachability bitset stored for `oid`, when it was one of
+    /// the writer's selected commits.
+    pub fn bitmap_for_commit(&self, oid: &ObjectId) -> Option<&Arc<Vec<u64>>> {
+        self.commit_words.get(oid)
+    }
+
+    /// Oids of every commit with a stored bitmap entry (unordered).
+    pub fn bitmapped_commits(&self) -> impl Iterator<Item = &ObjectId> {
+        self.commit_words.keys()
+    }
+
+    /// The type bitmap for `object_type` (bit per pack position).
+    pub fn type_words(&self, object_type: ObjectType) -> &[u64] {
+        match object_type {
+            ObjectType::Commit => &self.commits,
+            ObjectType::Tree => &self.trees,
+            ObjectType::Blob => &self.blobs,
+            ObjectType::Tag => &self.tags,
+        }
+    }
+
+    fn word_count(&self) -> usize {
+        (self.object_count as usize).div_ceil(64)
+    }
+}
+
+/// Loads the single-pack `.bitmap` of `objects_dir/pack`, if a valid one
+/// exists. Scans `pack-*.bitmap` files (sorted, first valid wins, like
+/// upstream's "first bitmap" behaviour), requires the sibling `.idx`, and
+/// verifies the recorded pack checksum. Any unreadable/corrupt bitmap yields
+/// `Ok(None)` — consumers fall back to a regular object walk, mirroring
+/// upstream's warn-and-ignore on bitmap load failure.
+pub fn load_pack_bitmap(
+    objects_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Option<LoadedPackBitmap>> {
+    let pack_dir = objects_dir.join("pack");
+    if !pack_dir.exists() {
+        return Ok(None);
+    }
+    // A multi-pack bitmap wins over single-pack bitmaps, like upstream's
+    // open_bitmap trying the midx first.
+    if let Some(bitmap) = load_midx_bitmap(&pack_dir, format)? {
+        return Ok(Some(bitmap));
+    }
+    let mut bitmap_paths = Vec::new();
+    for entry in fs::read_dir(&pack_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("bitmap")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("pack-"))
+        {
+            bitmap_paths.push(path);
+        }
+    }
+    bitmap_paths.sort();
+    for bitmap_path in bitmap_paths {
+        match load_pack_bitmap_file(&bitmap_path, format) {
+            Ok(Some(bitmap)) => return Ok(Some(bitmap)),
+            Ok(None) | Err(_) => continue,
+        }
+    }
+    Ok(None)
+}
+
+/// Loads `multi-pack-index-<checksum>.bitmap` when the pack directory has a
+/// multi-pack-index with a `RIDX` chunk (the bit-order permutation) and a
+/// matching bitmap file. Returns `Ok(None)` — never an error — on any missing
+/// or unusable piece, so callers fall through to single-pack bitmaps.
+fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<LoadedPackBitmap>> {
+    let midx_path = pack_dir.join("multi-pack-index");
+    if !midx_path.exists() {
+        return Ok(None);
+    }
+    let Ok(midx_bytes) = fs::read(&midx_path) else {
+        return Ok(None);
+    };
+    let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
+        return Ok(None);
+    };
+    let bitmap_path = pack_dir.join(format!("multi-pack-index-{}.bitmap", midx.checksum.to_hex()));
+    if !bitmap_path.exists() {
+        return Ok(None);
+    }
+    let Some(reverse_index) = &midx.reverse_index else {
+        // Without the RIDX permutation the bit numbering is unknown.
+        return Ok(None);
+    };
+    let object_count = midx.objects.len();
+    let Ok(bitmap_bytes) = fs::read(&bitmap_path) else {
+        return Ok(None);
+    };
+    let parsed = match PackBitmapIndex::parse(&bitmap_bytes, format, object_count) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    if parsed.pack_checksum != midx.checksum {
+        return Ok(None);
+    }
+
+    // midx.objects is in lookup (oid-sorted) order; RIDX maps bit positions
+    // to lookup positions.
+    let mut pack_to_oid = Vec::with_capacity(object_count);
+    for &midx_pos in reverse_index {
+        let Some(entry) = midx.objects.get(midx_pos as usize) else {
+            return Ok(None);
+        };
+        pack_to_oid.push(entry.oid);
+    }
+    let mut oid_to_pack = HashMap::with_capacity(object_count);
+    for (pack_pos, oid) in pack_to_oid.iter().enumerate() {
+        oid_to_pack.insert(*oid, pack_pos as u32);
+    }
+    match assemble_loaded_bitmap(parsed, object_count, pack_to_oid, oid_to_pack, |position| {
+        midx.objects.get(position).map(|entry| entry.oid)
+    }) {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn load_pack_bitmap_file(
+    bitmap_path: &Path,
+    format: ObjectFormat,
+) -> Result<Option<LoadedPackBitmap>> {
+    let index_path = bitmap_path.with_extension("idx");
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
+    let object_count = index.entries.len();
+    let parsed = PackBitmapIndex::parse(&fs::read(bitmap_path)?, format, object_count)?;
+    if parsed.pack_checksum != index.pack_checksum {
+        return Ok(None);
+    }
+
+    let mut pack_order: Vec<u32> = (0..object_count as u32).collect();
+    pack_order.sort_by_key(|index_pos| index.entries[*index_pos as usize].offset);
+    let mut pack_to_oid = Vec::with_capacity(object_count);
+    for index_pos in &pack_order {
+        pack_to_oid.push(index.entries[*index_pos as usize].oid);
+    }
+    let mut oid_to_pack = HashMap::with_capacity(object_count);
+    for (pack_pos, oid) in pack_to_oid.iter().enumerate() {
+        oid_to_pack.insert(*oid, pack_pos as u32);
+    }
+
+    assemble_loaded_bitmap(parsed, object_count, pack_to_oid, oid_to_pack, |position| {
+        index.entries.get(position).map(|entry| entry.oid)
+    })
+    .map(Some)
+}
+
+/// Shared tail of the bitmap loaders: expands the type bitmaps, resolves the
+/// per-commit entries (XOR offsets reference earlier entries in file order),
+/// and maps each entry's lookup-order position back to a commit oid via
+/// `lookup_oid`.
+fn assemble_loaded_bitmap(
+    parsed: PackBitmapIndex,
+    object_count: usize,
+    pack_to_oid: Vec<ObjectId>,
+    oid_to_pack: HashMap<ObjectId, u32>,
+    lookup_oid: impl Fn(usize) -> Option<ObjectId>,
+) -> Result<LoadedPackBitmap> {
+    let word_count = object_count.div_ceil(64);
+    let expand = |bitmap: &sley_pack::EwahBitmap| -> Result<Vec<u64>> {
+        let mut words = bitmap.to_words()?;
+        words.resize(word_count, 0);
+        Ok(words)
+    };
+
+    let mut resolved: Vec<Arc<Vec<u64>>> = Vec::with_capacity(parsed.entries.len());
+    let mut commit_words = HashMap::with_capacity(parsed.entries.len());
+    for (entry_index, entry) in parsed.entries.iter().enumerate() {
+        let mut words = expand(&entry.bitmap)?;
+        if entry.xor_offset > 0 {
+            let base_index = entry_index - entry.xor_offset as usize;
+            let base = &resolved[base_index];
+            for (dst, src) in words.iter_mut().zip(base.iter()) {
+                *dst ^= *src;
+            }
+        }
+        let words = Arc::new(words);
+        resolved.push(Arc::clone(&words));
+        let commit_oid = lookup_oid(entry.object_position as usize).ok_or_else(|| {
+            GitError::InvalidFormat("bitmap entry position out of range".into())
+        })?;
+        commit_words.insert(commit_oid, words);
+    }
+
+    Ok(LoadedPackBitmap {
+        object_count: object_count as u32,
+        oid_to_pack,
+        pack_to_oid,
+        commit_words,
+        commits: expand(&parsed.type_bitmaps.commits)?,
+        trees: expand(&parsed.type_bitmaps.trees)?,
+        blobs: expand(&parsed.type_bitmaps.blobs)?,
+        tags: expand(&parsed.type_bitmaps.tags)?,
+    })
+}
+
+/// Result of a bitmap-assisted reachability walk: pack-position bits for
+/// in-pack objects plus the "extended" objects encountered outside the
+/// bitmapped pack (in first-seen order, like upstream's extended index).
+pub struct BitmapWalkResult {
+    pub words: Vec<u64>,
+    pub extended: Vec<(ObjectId, ObjectType)>,
+}
+
+impl BitmapWalkResult {
+    /// Removes everything reachable in `haves` from this result.
+    pub fn subtract(&mut self, haves: &BitmapWalkResult) {
+        for (dst, src) in self.words.iter_mut().zip(haves.words.iter()) {
+            *dst &= !*src;
+        }
+        let have_ext: HashSet<ObjectId> = haves.extended.iter().map(|(oid, _)| *oid).collect();
+        self.extended.retain(|(oid, _)| !have_ext.contains(oid));
+    }
+}
+
+/// Computes the set of objects reachable from `roots` using stored bitmaps
+/// where available and a fill-in object walk where not — the consult half of
+/// the bitmap engine (upstream `find_objects` + `fill_in_bitmap`).
+///
+/// Roots may be any object type; tag chains are peeled with every tag object
+/// itself included, like the pending-object handling in
+/// `prepare_bitmap_walk`. When `include_objects` is false only commits are
+/// walked (tree contents of fill-in commits are not marked) — callers that
+/// only count/enumerate commits mask with the commit type bitmap, so the
+/// extra non-commit bits OR-ed in from stored (closed) bitmaps are harmless.
+pub fn bitmap_reachable(
+    bitmap: &LoadedPackBitmap,
+    db: &impl ObjectReader,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+    include_objects: bool,
+) -> Result<BitmapWalkResult> {
+    let mut walk = BitmapFillWalk {
+        bitmap,
+        words: vec![0u64; bitmap.word_count()],
+        extended: Vec::new(),
+        extended_seen: HashSet::new(),
+    };
+    let mut commit_stack: Vec<ObjectId> = Vec::new();
+
+    for root in roots {
+        let mut oid = *root;
+        // Peel tag chains, marking each tag object on the way.
+        loop {
+            let object = db.read_object(&oid)?;
+            match object.object_type {
+                ObjectType::Tag => {
+                    walk.mark(&oid, ObjectType::Tag);
+                    let tag = Tag::parse_ref(format, &object.body)?;
+                    oid = tag.object;
+                }
+                ObjectType::Commit => {
+                    commit_stack.push(oid);
+                    break;
+                }
+                ObjectType::Tree => {
+                    walk.mark_tree_closure(db, format, &oid)?;
+                    break;
+                }
+                ObjectType::Blob => {
+                    walk.mark(&oid, ObjectType::Blob);
+                    break;
+                }
+            }
+        }
+    }
+
+    while let Some(oid) = commit_stack.pop() {
+        if let Some(position) = bitmap.pack_position(&oid) {
+            if bitset_get(&walk.words, position) {
+                continue;
+            }
+            if let Some(stored) = bitmap.bitmap_for_commit(&oid) {
+                bitset_or(&mut walk.words, stored);
+                continue;
+            }
+            bitset_set(&mut walk.words, position);
+        } else {
+            if walk.extended_seen.contains(&oid) {
+                continue;
+            }
+            walk.extended_seen.insert(oid);
+            walk.extended.push((oid, ObjectType::Commit));
+        }
+        let object = db.read_object(&oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        commit_stack.extend(commit.parents);
+        if include_objects {
+            walk.mark_tree_closure(db, format, &commit.tree)?;
+        }
+    }
+
+    Ok(BitmapWalkResult {
+        words: walk.words,
+        extended: walk.extended,
+    })
+}
+
+struct BitmapFillWalk<'a> {
+    bitmap: &'a LoadedPackBitmap,
+    words: Vec<u64>,
+    extended: Vec<(ObjectId, ObjectType)>,
+    extended_seen: HashSet<ObjectId>,
+}
+
+impl BitmapFillWalk<'_> {
+    /// Marks one object; returns false when it was already marked.
+    fn mark(&mut self, oid: &ObjectId, object_type: ObjectType) -> bool {
+        if let Some(position) = self.bitmap.pack_position(oid) {
+            if bitset_get(&self.words, position) {
+                return false;
+            }
+            bitset_set(&mut self.words, position);
+            true
+        } else {
+            if !self.extended_seen.insert(*oid) {
+                return false;
+            }
+            self.extended.push((*oid, object_type));
+            true
+        }
+    }
+
+    /// Marks `tree` and everything below it, skipping subtrees already marked
+    /// (a set in-pack bit means its closure is covered: either it came from a
+    /// stored — closed — bitmap, or this walk already expanded it).
+    fn mark_tree_closure(
+        &mut self,
+        db: &impl ObjectReader,
+        format: ObjectFormat,
+        tree: &ObjectId,
+    ) -> Result<()> {
+        if !self.mark(tree, ObjectType::Tree) {
+            return Ok(());
+        }
+        let object = db.read_object(tree)?;
+        for entry in TreeEntries::new(format, &object.body) {
+            let entry = entry?;
+            if entry.is_gitlink() {
+                continue;
+            }
+            if entry.is_tree() {
+                self.mark_tree_closure(db, format, &entry.oid)?;
+            } else {
+                self.mark(&entry.oid, ObjectType::Blob);
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -1400,6 +2139,19 @@ fn collect_loose_object_ids(
         }
     }
     Ok(())
+}
+
+/// Every object id resolvable through a pack (any `.idx` or the
+/// multi-pack-index) under `objects_dir/pack`. Used by `--unpacked`
+/// filtering: an object is "unpacked" when absent from this set, regardless
+/// of a loose copy also existing.
+pub fn packed_object_ids(
+    objects_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let mut oids = HashSet::new();
+    collect_packed_object_ids(&objects_dir.as_ref().join("pack"), format, &mut oids)?;
+    Ok(oids)
 }
 
 fn collect_packed_object_ids(
