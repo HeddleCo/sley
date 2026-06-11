@@ -1423,6 +1423,12 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
         io::stdin().read_to_end(&mut input)?;
         if stdin {
             let stdin_paths = update_index_stdin_paths(&input, nul);
+            // Keep `path_chmods` in lockstep with `paths`: stdin paths inherit
+            // the chmod state in effect at the `--stdin` flag (git applies
+            // set_executable_bit to stdin paths too). Without this the later
+            // `paths`/`path_chmods` zip would truncate and silently drop the
+            // stdin paths.
+            path_chmods.extend(std::iter::repeat_n(chmod, stdin_paths.len()));
             paths.extend(stdin_paths);
         } else {
             let cwd = env::current_dir()?;

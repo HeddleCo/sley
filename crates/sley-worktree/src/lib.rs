@@ -508,7 +508,10 @@ fn update_index_paths_impl(
         let Some(metadata) = symlink_metadata else {
             if options.remove {
                 index.entries.retain(|existing| existing.path != git_path);
-                reports.push(format!("remove '{}'", String::from_utf8_lossy(&git_path)));
+                // git's update_one() unconditionally reports `add '<path>'`
+                // after process_path(), even when the missing file was removed
+                // from the index via the `--remove` (not --force-remove) path.
+                reports.push(format!("add '{}'", String::from_utf8_lossy(&git_path)));
                 continue;
             }
             print_update_index_path_error(&git_path, "does not exist and --remove not passed");
