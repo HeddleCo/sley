@@ -1,3 +1,5 @@
+pub mod graph;
+
 use sley_config::GitConfig;
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 

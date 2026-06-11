@@ -1783,7 +1783,7 @@ fn format_config_color_value(value: &str) -> Result<String> {
 /// The side-effect-free core of [`format_config_color_value`]: returns `Err(())`
 /// (no diagnostic) when the value is not a valid color, so callers like
 /// `--list --type=color` can silently skip it.
-fn try_format_config_color_value(value: &str) -> std::result::Result<String, ()> {
+pub(crate) fn try_format_config_color_value(value: &str) -> std::result::Result<String, ()> {
     let mut codes = Vec::new();
     let mut color_slot = 0usize;
     for token in value.split_whitespace() {
