@@ -96,6 +96,10 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut stat_widths = DiffStatWidths::terminal();
     let mut numstat = false;
     let mut shortstat = false;
+    // `--dirstat` family: None = not requested. Parameters accumulate over the
+    // diff.dirstat config base; bad command-line parameters are fatal.
+    let mut dirstat: Option<DirstatOptions> = None;
+    let mut dirstat_cli_params: Vec<String> = Vec::new();
     let mut patch = false;
     let mut no_patch = false;
     let mut reverse = false;
@@ -132,6 +136,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     // git enables rename detection by default (diff.renames defaults to true);
     // --no-renames turns it off. -M/-C select the similarity thresholds.
     let mut inexact_renames = true;
+    // Whether -M/-C/--no-renames appeared explicitly (the diff.renames config
+    // only applies otherwise).
+    let mut renames_explicit = false;
     let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
@@ -168,6 +175,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 }
                 name_only = true;
             }
+            // `git diff` is recursive for tree-to-tree comparisons by default;
+            // accept the explicit flag for upstream compatibility.
+            "-r" => {}
             "--cached" | "--staged" => cached = true,
             "--quiet" => quiet = true,
             "--exit-code" => exit_code = true,
@@ -193,6 +203,39 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
             "--shortstat" => {
                 shortstat = true;
+                no_patch = false;
+            }
+            "--dirstat" | "-X" => {
+                dirstat.get_or_insert_with(DirstatOptions::default);
+                no_patch = false;
+            }
+            value
+                if value.starts_with("--dirstat=")
+                    || (value.starts_with("-X") && value.len() > 2) =>
+            {
+                let params = value
+                    .strip_prefix("--dirstat=")
+                    .or_else(|| value.strip_prefix("-X"))
+                    .unwrap_or("");
+                dirstat.get_or_insert_with(DirstatOptions::default);
+                dirstat_cli_params.push(params.to_string());
+                no_patch = false;
+            }
+            "--cumulative" => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.cumulative = true;
+                no_patch = false;
+            }
+            "--dirstat-by-file" => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.mode = DirstatMode::Files;
+                no_patch = false;
+            }
+            value if value.starts_with("--dirstat-by-file=") => {
+                let opts = dirstat.get_or_insert_with(DirstatOptions::default);
+                opts.mode = DirstatMode::Files;
+                dirstat_cli_params
+                    .push(value["--dirstat-by-file=".len()..].to_string());
                 no_patch = false;
             }
             "-p" | "-u" | "--patch" => {
@@ -496,10 +539,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "-M" | "--find-renames" => {
                 detect_renames = true;
                 inexact_renames = true;
+                renames_explicit = true;
             }
             "-C" | "--find-copies" => {
+                // A repeated -C escalates to --find-copies-harder, like git.
+                if detect_copies {
+                    find_copies_harder = true;
+                }
                 detect_copies = true;
                 inexact_renames = true;
+                renames_explicit = true;
             }
             "--find-copies-harder" => {
                 detect_copies = true;
@@ -509,9 +558,14 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "--no-find-copies-harder" => {
                 find_copies_harder = false;
             }
+            "--no-rename" => {
+                eprintln!("error: invalid option: --no-rename");
+                return Err(GitError::Exit(129));
+            }
             "--no-renames" => {
                 detect_renames = false;
                 inexact_renames = false;
+                renames_explicit = true;
             }
             "--rename-empty" => rename_empty = true,
             "--no-rename-empty" => rename_empty = false,
@@ -519,6 +573,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_similarity_option(&value[2..], "find-renames")?;
                 detect_renames = true;
                 inexact_renames = true;
+                renames_explicit = true;
                 rename_threshold = parse_similarity_threshold(&value[2..]);
             }
             value if let Some(value) = value.strip_prefix("--find-renames=") => {
@@ -719,6 +774,52 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         && config.get_bool("diff", None, "relative").unwrap_or(false)
     {
         diff_relative = DiffRelativeMode::Cwd;
+    }
+    if !renames_explicit
+        && let Ok(config) = read_repo_config(&git_dir)
+        && let Some(value) = config.get("diff", None, "renames")
+    {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "no" | "off" | "0" => {
+                detect_renames = false;
+                inexact_renames = false;
+            }
+            "copies" | "copy" => {
+                detect_copies = true;
+            }
+            _ => {}
+        }
+    }
+    if let Some(opts) = dirstat.as_mut() {
+        // diff.dirstat config forms the base (bad parameters warn); explicit
+        // --dirstat parameters apply on top (bad parameters are fatal).
+        let mut base = DirstatOptions::default();
+        if let Ok(config) = read_repo_config(&git_dir)
+            && let Some(value) = config.get("diff", None, "dirstat")
+        {
+            let mut errors = String::new();
+            if parse_dirstat_params(value, &mut base, &mut errors) > 0 {
+                eprint!("warning: Found errors in 'diff.dirstat' config variable:\n{errors}");
+            }
+        }
+        // Flags parsed inline (--cumulative / --dirstat-by-file) already
+        // modified `opts`; merge them onto the config base.
+        if opts.cumulative {
+            base.cumulative = true;
+        }
+        if opts.mode == DirstatMode::Files {
+            base.mode = DirstatMode::Files;
+        }
+        let mut errors = String::new();
+        let mut error_count = 0usize;
+        for params in &dirstat_cli_params {
+            error_count += parse_dirstat_params(params, &mut base, &mut errors);
+        }
+        if error_count > 0 {
+            eprint!("fatal: Failed to parse --dirstat/-X option parameter:\n{errors}");
+            return Err(GitError::Exit(128));
+        }
+        *opts = base;
     }
     // Pull any leading `<rev>` / `<rev> <rev>` / `<rev>..<rev>` / `<rev>...<rev>`
     // out of the positional arguments; the remainder are pathspecs. Without this,
@@ -969,6 +1070,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             && !numstat
             && !shortstat
             && !summary
+            && dirstat.is_none()
             && !name_status
             && !name_only;
         let show_patch = !name_only && !name_status && (patch || no_output_mode);
@@ -1042,6 +1144,19 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 use_worktree_new,
             )?;
         }
+        if let Some(dirstat_options) = dirstat
+            && !name_only
+            && !name_status
+        {
+            write_diff_dirstat(
+                &mut stdout,
+                &entries,
+                &db,
+                worktree_root.as_deref(),
+                use_worktree_new,
+                dirstat_options,
+            )?;
+        }
         if show_summary {
             for entry in &entries {
                 write_diff_summary_entry(&mut stdout, entry)?;
@@ -1067,6 +1182,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             && (summary || (!show_stat && !show_shortstat))
             && !show_numstat
             && !show_raw
+            && dirstat.is_none()
         {
             for entry in &entries {
                 if z && (name_only || name_status) {

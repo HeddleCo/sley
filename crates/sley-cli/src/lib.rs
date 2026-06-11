@@ -2202,9 +2202,8 @@ fn write_diff_numstat_entry(
     } else {
         write_diff_numstat_counts(stdout, stats)?;
         if let Some(old_path) = &entry.old_path {
-            let old_path = status_quote_path(old_path, false);
-            let path = status_quote_path(&entry.path, false);
-            writeln!(stdout, "{old_path} => {path}")?;
+            // Renames/copies print the brace-collapsed form, like the stat rows.
+            writeln!(stdout, "{}", diff_stat_pprint_rename(old_path, &entry.path))?;
         } else {
             let path = status_quote_path(&entry.path, false);
             writeln!(stdout, "{path}")?;
@@ -2579,6 +2578,210 @@ fn write_diff_stat_with_widths(
         }
     }
     write_diff_stat_summary_line(stdout, rows.len(), adds, dels)
+}
+
+/// `--dirstat` damage accounting mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirstatMode {
+    /// Default: span-hash "damage" — bytes removed from the old blob plus
+    /// bytes literally added to the new one.
+    Changes,
+    /// `lines`: line-based diffstat damage (binary blobs count bytes/64).
+    Lines,
+    /// `files`: every changed file contributes equal damage 1.
+    Files,
+}
+
+/// Parsed `--dirstat`/`-X`/diff.dirstat parameters.
+#[derive(Debug, Clone, Copy)]
+struct DirstatOptions {
+    mode: DirstatMode,
+    cumulative: bool,
+    /// Cut-off in permille (default 30 = 3%).
+    permille: i64,
+}
+
+impl Default for DirstatOptions {
+    fn default() -> Self {
+        DirstatOptions {
+            mode: DirstatMode::Changes,
+            cumulative: false,
+            permille: 30,
+        }
+    }
+}
+
+/// git `parse_dirstat_params()`: comma-separated `changes|lines|files|
+/// cumulative|noncumulative|<limit>` parameters. Unknown parameters append to
+/// `errors` (one line each) and are counted in the returned error total.
+fn parse_dirstat_params(params: &str, options: &mut DirstatOptions, errors: &mut String) -> usize {
+    let mut error_count = 0usize;
+    if params.is_empty() {
+        return 0;
+    }
+    for param in params.split(',') {
+        match param {
+            "changes" => options.mode = DirstatMode::Changes,
+            "lines" => options.mode = DirstatMode::Lines,
+            "files" => options.mode = DirstatMode::Files,
+            "noncumulative" => options.cumulative = false,
+            "cumulative" => options.cumulative = true,
+            _ if param.starts_with(|c: char| c.is_ascii_digit()) => {
+                let digits_end = param
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(param.len());
+                let mut permille: i64 =
+                    param[..digits_end].parse::<i64>().unwrap_or(0) * 10;
+                let rest = &param[digits_end..];
+                let mut ok = rest.is_empty();
+                if let Some(frac) = rest.strip_prefix('.')
+                    && frac.starts_with(|c: char| c.is_ascii_digit())
+                {
+                    // Only the first fractional digit counts; the rest must
+                    // also be digits.
+                    permille += i64::from(frac.as_bytes()[0] - b'0');
+                    ok = frac.bytes().all(|byte| byte.is_ascii_digit());
+                }
+                if ok {
+                    options.permille = permille;
+                } else {
+                    errors.push_str(&format!(
+                        "  Failed to parse dirstat cut-off percentage '{param}'\n"
+                    ));
+                    error_count += 1;
+                }
+            }
+            _ => {
+                errors.push_str(&format!("  Unknown dirstat parameter '{param}'\n"));
+                error_count += 1;
+            }
+        }
+    }
+    error_count
+}
+
+/// One file's contribution to the dirstat tree.
+struct DirstatFile {
+    name: Vec<u8>,
+    changed: u64,
+}
+
+/// Faithful port of git diff.c `show_dirstat()` / `show_dirstat_by_line()` +
+/// `gather_dirstat()`.
+fn write_diff_dirstat(
+    stdout: &mut dyn Write,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    options: DirstatOptions,
+) -> Result<()> {
+    let mut files = Vec::with_capacity(entries.len());
+    let mut changed_total: u64 = 0;
+    for entry in entries {
+        let name = entry.path.to_vec();
+        let damage: u64 = if entry.old_oid.is_some() && entry.old_oid == entry.new_oid {
+            // Identical pre-/post-content (e.g. a pure mode change or an
+            // exact rename): zero damage, but the file still participates in
+            // the directory "sources" accounting.
+            0
+        } else {
+            match options.mode {
+                DirstatMode::Files => 1,
+                DirstatMode::Lines => {
+                    let old_content = diff_entry_old_content(entry, db)?;
+                    let new_content =
+                        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+                    match diff_line_stats(old_content.as_deref(), new_content.as_deref()) {
+                        DiffLineStats::Binary => {
+                            let bytes = old_content.as_ref().map_or(0, Vec::len)
+                                + new_content.as_ref().map_or(0, Vec::len);
+                            (bytes as u64).div_ceil(64)
+                        }
+                        DiffLineStats::Text { inserted, deleted } => (inserted + deleted) as u64,
+                    }
+                }
+                DirstatMode::Changes => {
+                    let old_content = diff_entry_old_content(entry, db)?;
+                    let new_content =
+                        diff_entry_new_content(entry, db, worktree_root, use_worktree_new)?;
+                    let damage = match (old_content.as_deref(), new_content.as_deref()) {
+                        (Some(old), Some(new)) => {
+                            let (copied, added) = sley_diff_merge::count_changes(old, new);
+                            ((old.len() - copied) + added) as u64
+                        }
+                        (Some(old), None) => old.len() as u64,
+                        (None, Some(new)) => new.len() as u64,
+                        (None, None) => 0,
+                    };
+                    // The oid changed, so force nonzero damage even when the
+                    // span hashes consider the blobs identical.
+                    damage.max(1)
+                }
+            }
+        };
+        changed_total += damage;
+        files.push(DirstatFile { name, changed: damage });
+    }
+    if changed_total == 0 {
+        return Ok(());
+    }
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut idx = 0usize;
+    gather_dirstat(stdout, &files, &mut idx, changed_total, b"", &options)?;
+    Ok(())
+}
+
+/// Recursive directory aggregation with the permille cut-off; returns the
+/// directory's summed damage (0 once reported, unless cumulative).
+fn gather_dirstat(
+    stdout: &mut dyn Write,
+    files: &[DirstatFile],
+    idx: &mut usize,
+    changed_total: u64,
+    base: &[u8],
+    options: &DirstatOptions,
+) -> Result<u64> {
+    let mut sum_changes: u64 = 0;
+    let mut sources: u32 = 0;
+    while *idx < files.len() {
+        let file = &files[*idx];
+        if file.name.len() < base.len() || !file.name.starts_with(base) {
+            break;
+        }
+        let changes = match file.name[base.len()..].iter().position(|&b| b == b'/') {
+            Some(slash) => {
+                let new_base = file.name[..base.len() + slash + 1].to_vec();
+                sources += 1;
+                gather_dirstat(stdout, files, idx, changed_total, &new_base, options)?
+            }
+            None => {
+                let changes = file.changed;
+                *idx += 1;
+                sources += 2;
+                changes
+            }
+        };
+        sum_changes += changes;
+    }
+    // No report for the top level, nor when everything in this directory came
+    // from a single subdirectory.
+    if !base.is_empty() && sources != 1 && sum_changes > 0 {
+        let permille = (sum_changes * 1000 / changed_total) as i64;
+        if permille >= options.permille {
+            writeln!(
+                stdout,
+                "{:4}.{}% {}",
+                permille / 10,
+                permille % 10,
+                String::from_utf8_lossy(base)
+            )?;
+            if !options.cumulative {
+                return Ok(0);
+            }
+        }
+    }
+    Ok(sum_changes)
 }
 
 /// git `print_stat_summary_inserts_deletes()`: the
