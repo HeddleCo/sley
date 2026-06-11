@@ -320,6 +320,7 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
             // merge path; merge-tree parity is preserved byte-for-byte).
             detect_renames: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            directory_renames: sley_diff_merge::DirectoryRenames::False,
         },
     )?;
     let outcome = render_merge_outcome(&merge, branch1, branch2);
