@@ -79,6 +79,7 @@ mod log_format;
 mod remote;
 mod repo_path;
 mod repository;
+mod setup;
 
 pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
 
@@ -110,6 +111,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
     set_global_pathspec_flags(global.pathspec_flags);
+    // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
+    // before dispatching. This is the CLI-side repository setup that
+    // `sley::Repository::discover` deliberately leaves to this layer.
+    if env::var_os("GIT_TRACE_SETUP").is_some()
+        && let Some(setup_result) = setup::setup_git_directory()
+    {
+        setup::trace_repo_setup(&setup_result);
+    }
     dispatch_with_aliases(global.args, &global.config, 0)
 }
 
