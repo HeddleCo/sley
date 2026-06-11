@@ -3,7 +3,7 @@ use sley_core::{GitError, ObjectFormat, ObjectId, RepoPath, Result, object_id_fo
 pub use sley_core::BString;
 use sley_index::Index;
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntries, TreeEntry};
-use sley_odb::{FileObjectDatabase, ObjectReader};
+use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -3421,6 +3421,728 @@ fn trim_ascii_end(bytes: &[u8]) -> &[u8] {
 
 fn lossy(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+// ===========================================================================
+// Library tree-merge seam (`merge_trees`).
+//
+// This is the single 3-way tree-merge engine that every merge porcelain calls.
+// Before it existed the logic was duplicated across the CLI: `merge-tree
+// --write-tree` had its own copy and `git merge` / `cherry-pick` / `revert`
+// had a second copy. Both copies implemented the identical per-path diff3
+// resolution; the only differences were *rendering* (write-tree emits a tree +
+// stage list + messages; the porcelains stage an index + materialize a
+// worktree). This seam computes the merge once and returns a per-path result
+// rich enough for both renderings, so the resolution lives in exactly one
+// place.
+//
+// The result is byte-identical to the old per-command copies on every cell
+// they already handled (clean merges, content / add-add / modify-delete
+// conflicts, mode merges). On top of that it adds rename-aware resolution: a
+// file renamed on one side and modified on the other follows the rename,
+// gated by [`MergeTreesOptions::detect_renames`] (the classic merge-ort
+// non-recursive rename case).
+// ===========================================================================
+
+/// Flattened tree: repository-relative path -> (mode, blob/symlink/gitlink oid).
+pub type MergeEntryMap = BTreeMap<Vec<u8>, (u32, ObjectId)>;
+
+/// Whether to favour one side wholesale for textual conflicts (`-Xours` /
+/// `-Xtheirs`), or to leave conflict markers in place.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MergeFavor {
+    /// Leave conflict markers in place (the default).
+    None,
+    /// On a textual conflict, take ours' content wholesale.
+    Ours,
+    /// On a textual conflict, take theirs' content wholesale.
+    Theirs,
+}
+
+/// Options controlling a [`merge_trees`] run.
+pub struct MergeTreesOptions<'a> {
+    /// Conflict-marker label for ours (e.g. a branch name or `HEAD`).
+    pub ours_label: &'a str,
+    /// Conflict-marker label for theirs.
+    pub theirs_label: &'a str,
+    /// Diff3 ancestor label (the `|||||||` side); merge porcelains use
+    /// `"merged common ancestors"`.
+    pub ancestor_label: &'a str,
+    /// `-Xours` / `-Xtheirs` favouring for textual conflicts.
+    pub favor: MergeFavor,
+    /// Enable rename-aware merging: a file renamed on one side and modified on
+    /// the other follows the rename. When `false`, the merge is purely
+    /// path-keyed (the historical behaviour).
+    pub detect_renames: bool,
+    /// Minimum similarity (`0..=100`) for inexact rename detection.
+    pub rename_threshold: u8,
+}
+
+impl Default for MergeTreesOptions<'_> {
+    fn default() -> Self {
+        Self {
+            ours_label: "ours",
+            theirs_label: "theirs",
+            ancestor_label: "merged common ancestors",
+            favor: MergeFavor::None,
+            detect_renames: false,
+            rename_threshold: DEFAULT_RENAME_THRESHOLD,
+        }
+    }
+}
+
+/// The kind of conflict recorded for a path, used to render the stable
+/// conflict-type token and human message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeConflictKind {
+    /// Both sides changed the file content differently (or both added it with
+    /// differing content — an add/add).
+    Content { add_add: bool },
+    /// The file was deleted on one side and modified on the other.
+    ModifyDelete {
+        /// The side label that deleted the path.
+        deleted_in: String,
+        /// The side label that modified (and thus kept) the path.
+        modified_in: String,
+    },
+    /// A file renamed on one side, with a content conflict against the other
+    /// side's change at the destination.
+    RenameContent {
+        /// The original (pre-rename) path.
+        old_path: Vec<u8>,
+    },
+}
+
+/// One resolved/conflicted path in the merged tree.
+#[derive(Debug, Clone)]
+pub struct MergedPath {
+    /// Destination path in the merged tree.
+    pub path: Vec<u8>,
+    /// The per-stage (1=base, 2=ours, 3=theirs) entries when conflicted; all
+    /// `None` for a clean resolution.
+    pub stages: MergeStages,
+    /// `Some((mode, oid))` is the final leaf written to the merged tree; `None`
+    /// means the path is absent in the result (a clean delete).
+    pub result: Option<(u32, ObjectId)>,
+    /// When conflicted, the worktree bytes + mode to materialize (content with
+    /// conflict markers, or the surviving side's bytes). `None` for a clean
+    /// path.
+    pub worktree: Option<(u32, Vec<u8>)>,
+    /// `Some(..)` exactly when this path conflicted.
+    pub conflict: Option<MergeConflictKind>,
+    /// True when this path went through a textual 3-way content merge (both
+    /// sides diverged and both were mergeable files). Drives the "Auto-merging
+    /// <path>" informational message, which `git merge-tree` emits for every
+    /// such path — clean or conflicted.
+    pub auto_merged: bool,
+}
+
+impl MergedPath {
+    /// True when this path resolved cleanly (no conflict recorded).
+    pub fn is_clean(&self) -> bool {
+        self.conflict.is_none()
+    }
+}
+
+/// Per-stage higher-order index entries for a conflicted path.
+#[derive(Debug, Clone, Default)]
+pub struct MergeStages {
+    pub base: Option<(u32, ObjectId)>,
+    pub ours: Option<(u32, ObjectId)>,
+    pub theirs: Option<(u32, ObjectId)>,
+}
+
+/// The outcome of a 3-way tree merge: the merged top-level tree plus per-path
+/// detail and a clean/conflicted flag.
+#[derive(Debug, Clone)]
+pub struct MergeTreesResult {
+    /// Object id of the merged top-level tree (always written, even on
+    /// conflict — conflicted blobs go in with their marker content).
+    pub tree: ObjectId,
+    /// Per-path results, sorted by path.
+    pub paths: Vec<MergedPath>,
+    /// False if any path conflicted.
+    pub clean: bool,
+}
+
+impl MergeTreesResult {
+    /// Iterate over the paths that conflicted, in path order.
+    pub fn conflicts(&self) -> impl Iterator<Item = &MergedPath> {
+        self.paths.iter().filter(|entry| entry.conflict.is_some())
+    }
+}
+
+/// Read a tree object (by oid) into a flattened path -> (mode, oid) map,
+/// descending into subtrees. The canonical empty tree yields an empty map.
+pub fn flatten_tree(
+    reader: &impl ObjectReader,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+) -> Result<MergeEntryMap> {
+    let mut entries = BTreeMap::new();
+    if *tree_oid == empty_tree_oid(format)? {
+        return Ok(entries);
+    }
+    collect_flat_tree(reader, format, tree_oid, Vec::new(), &mut entries)?;
+    Ok(entries)
+}
+
+fn collect_flat_tree(
+    reader: &impl ObjectReader,
+    format: ObjectFormat,
+    tree_oid: &ObjectId,
+    prefix: Vec<u8>,
+    entries: &mut MergeEntryMap,
+) -> Result<()> {
+    let object = reader.read_object(tree_oid)?;
+    if object.object_type != ObjectType::Tree {
+        return Err(GitError::InvalidObject(format!(
+            "expected tree {}, found {}",
+            tree_oid,
+            object.object_type.as_str()
+        )));
+    }
+    for entry in TreeEntries::new(format, &object.body) {
+        let entry = entry?;
+        let mut path = prefix.clone();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(entry.name);
+        if entry.mode == 0o040000 {
+            collect_flat_tree(reader, format, &entry.oid, path, entries)?;
+        } else {
+            entries.insert(path, (entry.mode, entry.oid));
+        }
+    }
+    Ok(())
+}
+
+/// True for a plain file blob (regular or executable) — i.e. a mode whose
+/// content can be textually 3-way merged. Symlinks and gitlinks are excluded.
+pub fn is_mergeable_file_mode(mode: u32) -> bool {
+    mode == 0o100644 || mode == 0o100755
+}
+
+/// 3-way merge of three trees into a single merged tree.
+///
+/// `base` is the common-ancestor tree (`None` for unrelated histories — every
+/// path is then treated as added on both sides). `ours`/`theirs` are the two
+/// sides. Cleanly-merged blob content and the resulting (sub)trees are written
+/// to `db`; the returned [`MergeTreesResult`] carries the merged top-level tree
+/// oid plus per-path detail.
+///
+/// This is the shared engine behind `git merge-tree --write-tree`, `git merge`,
+/// `git cherry-pick`, and `git revert`. It is behaviour-preserving relative to
+/// the per-command copies it replaced, and additionally resolves renames when
+/// [`MergeTreesOptions::detect_renames`] is set.
+pub fn merge_trees(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    base: Option<&ObjectId>,
+    ours: &ObjectId,
+    theirs: &ObjectId,
+    options: &MergeTreesOptions<'_>,
+) -> Result<MergeTreesResult> {
+    let base_map = match base {
+        Some(tree) => flatten_tree(db, format, tree)?,
+        None => MergeEntryMap::new(),
+    };
+    let ours_map = flatten_tree(db, format, ours)?;
+    let theirs_map = flatten_tree(db, format, theirs)?;
+    merge_entry_maps(db, format, &base_map, &ours_map, &theirs_map, options)
+}
+
+/// [`merge_trees`] operating on already-flattened entry maps. The merge
+/// porcelains often hold the flattened maps already (e.g. cherry-pick builds
+/// `theirs` from a picked commit's tree), so this avoids re-reading them.
+pub fn merge_entry_maps(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    base_map: &MergeEntryMap,
+    ours_map: &MergeEntryMap,
+    theirs_map: &MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) -> Result<MergeTreesResult> {
+    // Rename-aware step: detect files renamed on exactly one side relative to
+    // base, so a modification on the other side follows the rename. This is the
+    // non-recursive merge-ort rename case. We compute a rewrite map that, for a
+    // one-sided rename old->new, presents the *other* side's `old` content at
+    // `new` (and drops `old`), letting the path-keyed core below do the 3-way
+    // content merge at the destination.
+    let renames = if options.detect_renames {
+        detect_merge_renames(db, format, base_map, ours_map, theirs_map, options)?
+    } else {
+        MergeRenames::default()
+    };
+
+    // Build the effective per-side maps with renames applied.
+    let (eff_base, eff_ours, eff_theirs) =
+        apply_merge_renames(base_map, ours_map, theirs_map, &renames);
+
+    let mut all_paths = BTreeSet::new();
+    all_paths.extend(eff_base.keys().cloned());
+    all_paths.extend(eff_ours.keys().cloned());
+    all_paths.extend(eff_theirs.keys().cloned());
+
+    let mut paths: Vec<MergedPath> = Vec::new();
+    let mut leaves: MergeEntryMap = BTreeMap::new();
+    let mut clean = true;
+
+    for path in all_paths {
+        let base = eff_base.get(&path).cloned();
+        let ours = eff_ours.get(&path).cloned();
+        let theirs = eff_theirs.get(&path).cloned();
+        let old_path = renames.dest_to_source.get(&path).cloned();
+
+        // Trivial resolutions (identical to the historical per-command logic).
+        if ours == theirs {
+            if let Some(entry) = ours {
+                leaves.insert(path.clone(), entry);
+            }
+            paths.push(clean_path(path, ours));
+            continue;
+        }
+        if ours == base {
+            if let Some(entry) = &theirs {
+                leaves.insert(path.clone(), *entry);
+            }
+            paths.push(clean_path(path, theirs));
+            continue;
+        }
+        if theirs == base {
+            if let Some(entry) = &ours {
+                leaves.insert(path.clone(), *entry);
+            }
+            paths.push(clean_path(path, ours));
+            continue;
+        }
+
+        // Both sides diverged. Decide how to combine.
+        let content_mergeable = matches!(&ours, Some((mode, _)) if is_mergeable_file_mode(*mode))
+            && matches!(&theirs, Some((mode, _)) if is_mergeable_file_mode(*mode))
+            && match &base {
+                Some((mode, _)) => is_mergeable_file_mode(*mode),
+                None => true,
+            };
+
+        if let (true, Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) =
+            (content_mergeable, &ours, &theirs)
+        {
+            let add_add = base.is_none();
+            let base_bytes = match &base {
+                Some((_, oid)) => merge_blob_bytes(db, oid)?,
+                None => Vec::new(),
+            };
+            let ours_bytes = merge_blob_bytes(db, ours_oid)?;
+            let theirs_bytes = merge_blob_bytes(db, theirs_oid)?;
+            let result = merge_blobs(
+                &base_bytes,
+                &ours_bytes,
+                &theirs_bytes,
+                &MergeBlobOptions {
+                    ours_label: options.ours_label,
+                    theirs_label: options.theirs_label,
+                    base_label: options.ancestor_label,
+                    style: ConflictStyle::Merge,
+                },
+            );
+
+            let base_mode = base.as_ref().map(|(mode, _)| *mode);
+            let (resolved_mode, mode_conflict) =
+                merge_file_modes(base_mode, *ours_mode, *theirs_mode);
+
+            if !result.conflicted && !mode_conflict {
+                let oid = db.write_object(EncodedObject::new(ObjectType::Blob, result.content))?;
+                leaves.insert(path.clone(), (resolved_mode, oid));
+                paths.push(clean_path_auto(path, Some((resolved_mode, oid)), true));
+            } else if options.favor != MergeFavor::None && !mode_conflict {
+                let chosen = if options.favor == MergeFavor::Ours {
+                    ours
+                } else {
+                    theirs
+                };
+                if let Some(entry) = chosen {
+                    leaves.insert(path.clone(), entry);
+                }
+                paths.push(clean_path_auto(path, chosen, true));
+            } else {
+                clean = false;
+                let oid = db.write_object(EncodedObject::new(
+                    ObjectType::Blob,
+                    result.content.clone(),
+                ))?;
+                leaves.insert(path.clone(), (resolved_mode, oid));
+                let worktree_mode = if *ours_mode == *theirs_mode {
+                    *ours_mode
+                } else {
+                    0o100644
+                };
+                let conflict = match &old_path {
+                    Some(old) => MergeConflictKind::RenameContent {
+                        old_path: old.clone(),
+                    },
+                    None => MergeConflictKind::Content { add_add },
+                };
+                paths.push(MergedPath {
+                    path: path.clone(),
+                    stages: stages_for(&base, &ours, &theirs),
+                    result: Some((resolved_mode, oid)),
+                    worktree: Some((worktree_mode, result.content)),
+                    conflict: Some(conflict),
+                    auto_merged: true,
+                });
+            }
+        } else if base.is_some() && (ours.is_none() || theirs.is_none()) {
+            // modify/delete.
+            clean = false;
+            let (deleted_in, modified_in, surviving) = if ours.is_none() {
+                (
+                    options.ours_label.to_string(),
+                    options.theirs_label.to_string(),
+                    theirs,
+                )
+            } else {
+                (
+                    options.theirs_label.to_string(),
+                    options.ours_label.to_string(),
+                    ours,
+                )
+            };
+            let worktree = match &surviving {
+                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                None => None,
+            };
+            if let Some(entry) = surviving {
+                leaves.insert(path.clone(), entry);
+            }
+            paths.push(MergedPath {
+                path: path.clone(),
+                stages: stages_for(&base, &ours, &theirs),
+                result: surviving,
+                worktree,
+                conflict: Some(MergeConflictKind::ModifyDelete {
+                    deleted_in,
+                    modified_in,
+                }),
+                auto_merged: false,
+            });
+        } else {
+            // add/add of non-files, type changes, mode changes, etc. Keep the
+            // surviving side's content and record a generic content conflict.
+            clean = false;
+            let add_add = base.is_none();
+            let surviving = ours.or(theirs);
+            let worktree = match &surviving {
+                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                None => None,
+            };
+            if let Some(entry) = surviving {
+                leaves.insert(path.clone(), entry);
+            }
+            paths.push(MergedPath {
+                path: path.clone(),
+                stages: stages_for(&base, &ours, &theirs),
+                result: surviving,
+                worktree,
+                conflict: Some(MergeConflictKind::Content { add_add }),
+                auto_merged: false,
+            });
+        }
+    }
+
+    let tree = write_merged_tree(db, &leaves)?;
+
+    Ok(MergeTreesResult { tree, paths, clean })
+}
+
+/// Construct a clean (non-conflicted) [`MergedPath`].
+fn clean_path(path: Vec<u8>, result: Option<(u32, ObjectId)>) -> MergedPath {
+    clean_path_auto(path, result, false)
+}
+
+/// Like [`clean_path`] but records whether the path went through a textual
+/// 3-way content merge (for the "Auto-merging" message).
+fn clean_path_auto(path: Vec<u8>, result: Option<(u32, ObjectId)>, auto_merged: bool) -> MergedPath {
+    MergedPath {
+        path,
+        stages: MergeStages::default(),
+        result,
+        worktree: None,
+        conflict: None,
+        auto_merged,
+    }
+}
+
+/// Snapshot the present stages for a conflicted path.
+fn stages_for(
+    base: &Option<(u32, ObjectId)>,
+    ours: &Option<(u32, ObjectId)>,
+    theirs: &Option<(u32, ObjectId)>,
+) -> MergeStages {
+    MergeStages {
+        base: *base,
+        ours: *ours,
+        theirs: *theirs,
+    }
+}
+
+/// Read a blob's raw bytes, requiring it to be a blob object.
+fn merge_blob_bytes(reader: &impl ObjectReader, oid: &ObjectId) -> Result<Vec<u8>> {
+    let object = reader.read_object(oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            oid,
+            object.object_type.as_str()
+        )));
+    }
+    Ok(object.body.clone())
+}
+
+/// 3-way merge of a file mode. Returns the resolved mode and whether the modes
+/// conflict (both sides changed it to different non-base values).
+fn merge_file_modes(base: Option<u32>, ours: u32, theirs: u32) -> (u32, bool) {
+    if ours == theirs {
+        return (ours, false);
+    }
+    match base {
+        Some(base) if ours == base => (theirs, false),
+        Some(base) if theirs == base => (ours, false),
+        _ => (ours, true),
+    }
+}
+
+/// Build a top-level tree object from a flat map of `path -> (mode, oid)`
+/// leaves, writing every (sub)tree object to `db`.
+fn write_merged_tree(db: &mut FileObjectDatabase, leaves: &MergeEntryMap) -> Result<ObjectId> {
+    let mut root = MergeTreeNode::default();
+    for (path, (mode, oid)) in leaves {
+        root.insert(path, *mode, *oid);
+    }
+    root.write(db)
+}
+
+#[derive(Default)]
+struct MergeTreeNode {
+    blobs: BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    subtrees: BTreeMap<Vec<u8>, MergeTreeNode>,
+}
+
+impl MergeTreeNode {
+    fn insert(&mut self, path: &[u8], mode: u32, oid: ObjectId) {
+        match path.iter().position(|byte| *byte == b'/') {
+            Some(slash) => {
+                let component = path[..slash].to_vec();
+                let rest = &path[slash + 1..];
+                self.subtrees
+                    .entry(component)
+                    .or_default()
+                    .insert(rest, mode, oid);
+            }
+            None => {
+                self.blobs.insert(path.to_vec(), (mode, oid));
+            }
+        }
+    }
+
+    fn write(&self, db: &mut FileObjectDatabase) -> Result<ObjectId> {
+        let mut entries: Vec<TreeEntry> = Vec::new();
+        for (name, (mode, oid)) in &self.blobs {
+            entries.push(TreeEntry {
+                mode: *mode,
+                name: BString::from(name.clone()),
+                oid: *oid,
+            });
+        }
+        for (name, subtree) in &self.subtrees {
+            let oid = subtree.write(db)?;
+            entries.push(TreeEntry {
+                mode: 0o040000,
+                name: BString::from(name.clone()),
+                oid,
+            });
+        }
+        entries.sort_by_key(merge_tree_sort_key);
+        let tree = Tree { entries };
+        db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
+    }
+}
+
+fn merge_tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
+    let mut key = entry.name.as_bytes().to_vec();
+    if entry.mode == 0o040000 {
+        key.push(b'/');
+    }
+    key
+}
+
+// --- Rename-aware non-recursive merge -------------------------------------
+
+/// The rename pairings discovered for one merge: which destination paths came
+/// from which source path, and which source paths were renamed away on each
+/// side (so they are not also treated as deletes).
+#[derive(Default)]
+struct MergeRenames {
+    /// One-sided renames keyed by *destination* path -> source path. Only
+    /// renames where the OTHER side kept/modified the source in place are
+    /// recorded (the case where the modification must follow the rename).
+    dest_to_source: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+/// Detect one-sided renames usable for a non-recursive merge: a path present in
+/// `base`, deleted on one side and present (renamed) at a new path on that same
+/// side, while the OTHER side still has the original path (modified or
+/// unchanged). Such a rename lets the other side's change move to the
+/// destination.
+fn detect_merge_renames(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base_map: &MergeEntryMap,
+    ours_map: &MergeEntryMap,
+    theirs_map: &MergeEntryMap,
+    options: &MergeTreesOptions<'_>,
+) -> Result<MergeRenames> {
+    let mut renames = MergeRenames::default();
+
+    // Renames on ours: the other side that must carry its change is theirs.
+    collect_side_renames(
+        db,
+        format,
+        base_map,
+        ours_map,
+        theirs_map,
+        options.rename_threshold,
+        &mut renames,
+    )?;
+    // Renames on theirs: the other side that carries its change is ours.
+    collect_side_renames(
+        db,
+        format,
+        base_map,
+        theirs_map,
+        ours_map,
+        options.rename_threshold,
+        &mut renames,
+    )?;
+
+    Ok(renames)
+}
+
+/// Collect renames that occurred on `side` (relative to `base`) for which the
+/// `other` side still references the original path. `db`/`format` resolve blob
+/// bytes for similarity scoring.
+fn collect_side_renames(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base_map: &MergeEntryMap,
+    side_map: &MergeEntryMap,
+    other_map: &MergeEntryMap,
+    threshold: u8,
+    renames: &mut MergeRenames,
+) -> Result<()> {
+    // Diff base->side with inexact rename detection; the resulting `Renamed`
+    // entries name (old_path -> new_path) pairs on this side.
+    let base_tree = entry_map_as_tracked(base_map);
+    let side_tree = entry_map_as_tracked(side_map);
+    let options = RenameDetectionOptions {
+        base: DiffNameStatusOptions {
+            detect_renames: true,
+            detect_copies: false,
+            find_copies_harder: false,
+            rename_empty: false,
+        },
+        detect_inexact: true,
+        rename_threshold: threshold,
+        copy_threshold: threshold,
+    };
+    let changes = diff_name_status_maps_with_renames(
+        &base_tree,
+        &side_tree,
+        base_tree.keys().chain(side_tree.keys()),
+        options,
+        |oid| merge_blob_bytes(db, oid).ok(),
+    )?;
+
+    for change in changes {
+        let NameStatus::Renamed(_) = change.status else {
+            continue;
+        };
+        let Some(old_path) = change.old_path.as_ref() else {
+            continue;
+        };
+        let old = old_path.as_bytes().to_vec();
+        let new = change.path.as_bytes().to_vec();
+
+        // Only act when the destination is genuinely new (not already present
+        // in either side from a different origin) and the OTHER side still
+        // references the source path — i.e. the other side modified/kept `old`,
+        // and its change should follow the rename to `new`.
+        if !other_map.contains_key(&old) {
+            continue;
+        }
+        // If the other side ALSO renamed/created `new`, that is a rename/rename
+        // or rename/add corner case we leave to the path-keyed core (stage-b).
+        if other_map.contains_key(&new) {
+            continue;
+        }
+        // Skip if both sides renamed the same source to the same dest (already
+        // recorded) or to anything (first writer wins; the path-keyed core then
+        // sees identical dest entries and resolves trivially).
+        renames.dest_to_source.entry(new).or_insert(old);
+    }
+
+    let _ = format;
+    Ok(())
+}
+
+/// Rewrite the three side maps so that each detected one-sided rename old->new
+/// presents the OTHER side's `old` entry at `new`, and removes `old` from
+/// every side. The path-keyed merge core then performs the 3-way content merge
+/// at `new` with base=base[old], one side = the renaming side's new content,
+/// the other side = the modifying side's old content.
+fn apply_merge_renames(
+    base_map: &MergeEntryMap,
+    ours_map: &MergeEntryMap,
+    theirs_map: &MergeEntryMap,
+    renames: &MergeRenames,
+) -> (MergeEntryMap, MergeEntryMap, MergeEntryMap) {
+    if renames.dest_to_source.is_empty() {
+        return (base_map.clone(), ours_map.clone(), theirs_map.clone());
+    }
+    let mut base = base_map.clone();
+    let mut ours = ours_map.clone();
+    let mut theirs = theirs_map.clone();
+
+    for (new, old) in &renames.dest_to_source {
+        // Move base[old] to base[new] so the destination has a proper ancestor.
+        if let Some(entry) = base.remove(old) {
+            base.entry(new.clone()).or_insert(entry);
+        }
+        // For each side, if it still has `old`, move that entry to `new`.
+        for side in [&mut ours, &mut theirs] {
+            if let Some(entry) = side.remove(old) {
+                side.entry(new.clone()).or_insert(entry);
+            }
+        }
+    }
+    (base, ours, theirs)
+}
+
+/// Adapt a flat `path -> (mode, oid)` map into the `TrackedEntry` map the
+/// name-status diff core consumes.
+fn entry_map_as_tracked(map: &MergeEntryMap) -> BTreeMap<Vec<u8>, TrackedEntry> {
+    map.iter()
+        .map(|(path, (mode, oid))| {
+            (
+                path.clone(),
+                TrackedEntry {
+                    mode: *mode,
+                    oid: *oid,
+                },
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

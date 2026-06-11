@@ -1258,6 +1258,7 @@ fn apply_three_way(
     println!("Falling back to patching base and 3-way merge...");
     let (results, conflicts) = three_way_merge_trees(
         &mut db,
+        format,
         &base_map,
         &ours_map,
         &theirs_map,

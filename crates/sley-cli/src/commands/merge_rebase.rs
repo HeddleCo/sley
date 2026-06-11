@@ -21,10 +21,6 @@ pub(crate) fn merge_read_blob(db: &FileObjectDatabase, oid: &ObjectId) -> Result
     Ok(object.body.clone())
 }
 
-pub(crate) fn merge_is_regular_file(mode: u32) -> bool {
-    mode == 0o100644 || mode == 0o100755
-}
-
 pub(crate) fn merge_index_entry(path: &[u8], mode: u32, oid: ObjectId, stage: u16) -> IndexEntry {
     let flags = ((stage & 0x3) << 12) | (path.len().min(0x0fff) as u16);
     IndexEntry {
@@ -96,106 +92,59 @@ type MergePathResults = BTreeMap<Vec<u8>, MergePathResult>;
 type MergeConflictPaths = Vec<Vec<u8>>;
 
 /// 3-way merge of three flattened trees. Writes any cleanly-merged blob content
-/// to the ODB and returns per-path results plus the sorted list of conflicted paths.
+/// to the ODB and returns per-path results plus the sorted list of conflicted
+/// paths.
+///
+/// This is a thin adapter over the library seam
+/// [`sley_diff_merge::merge_entry_maps`]: the resolution logic lives there, and
+/// this function only re-shapes the per-path library result into the
+/// index/worktree-oriented [`MergePathResult`] the merge / cherry-pick / revert
+/// porcelains consume. It is rename-aware (the merge-ort non-recursive rename
+/// case) because the library merge runs with rename detection enabled.
 pub(crate) fn three_way_merge_trees(
     db: &mut FileObjectDatabase,
+    format: ObjectFormat,
     base: &MergeTreeMap,
     ours: &MergeTreeMap,
     theirs: &MergeTreeMap,
     ours_label: &str,
     theirs_label: &str,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
-    let mut all_paths = BTreeSet::new();
-    all_paths.extend(base.keys().cloned());
-    all_paths.extend(ours.keys().cloned());
-    all_paths.extend(theirs.keys().cloned());
+    let merge = sley_diff_merge::merge_entry_maps(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        &sley_diff_merge::MergeTreesOptions {
+            ours_label,
+            theirs_label,
+            ancestor_label: "merged common ancestors",
+            favor: sley_diff_merge::MergeFavor::None,
+            // Seam-lift commit: behaviour-preserving, so rename detection is
+            // off (matches the historical path-keyed merge). Stage-a's second
+            // commit flips this on to add rename-aware merging.
+            detect_renames: false,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+        },
+    )?;
 
     let mut results = BTreeMap::new();
     let mut conflicts = Vec::new();
-    for path in all_paths {
-        let b = base.get(&path).cloned();
-        let o = ours.get(&path).cloned();
-        let t = theirs.get(&path).cloned();
-
-        if o == t {
-            results.insert(path, MergePathResult::Resolved(o));
-            continue;
-        }
-        if o == b {
-            results.insert(path, MergePathResult::Resolved(t));
-            continue;
-        }
-        if t == b {
-            results.insert(path, MergePathResult::Resolved(o));
-            continue;
-        }
-
-        // Both sides changed differently relative to the base.
-        let content_mergeable = matches!(&o, Some((mode, _)) if merge_is_regular_file(*mode))
-            && matches!(&t, Some((mode, _)) if merge_is_regular_file(*mode))
-            && match &b {
-                Some((mode, _)) => merge_is_regular_file(*mode),
-                None => true,
-            };
-
-        if let (true, Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) =
-            (content_mergeable, &o, &t)
-        {
-            let base_bytes = match &b {
-                Some((_, oid)) => merge_read_blob(db, oid)?,
-                None => Vec::new(),
-            };
-            let ours_bytes = merge_read_blob(db, ours_oid)?;
-            let theirs_bytes = merge_read_blob(db, theirs_oid)?;
-            let merged = sley_diff_merge::merge_blobs(
-                &base_bytes,
-                &ours_bytes,
-                &theirs_bytes,
-                &sley_diff_merge::MergeBlobOptions {
-                    ours_label,
-                    theirs_label,
-                    base_label: "merged common ancestors",
-                    style: sley_diff_merge::ConflictStyle::Merge,
-                },
-            );
-            if !merged.conflicted && ours_mode == theirs_mode {
-                let oid = db.write_object(EncodedObject::new(ObjectType::Blob, merged.content))?;
-                results.insert(path, MergePathResult::Resolved(Some((*ours_mode, oid))));
-            } else {
-                conflicts.push(path.clone());
-                let worktree_mode = if *ours_mode == *theirs_mode {
-                    *ours_mode
-                } else {
-                    0o100644
-                };
-                results.insert(
-                    path,
-                    MergePathResult::Conflict {
-                        base: b,
-                        ours: o.clone(),
-                        theirs: t.clone(),
-                        worktree: Some((worktree_mode, merged.content)),
-                    },
-                );
-            }
-        } else {
-            // Non-content-mergeable: modify/delete, add/add of non-files, type or
-            // mode changes. Keep the surviving side's bytes in the worktree.
-            conflicts.push(path.clone());
-            let worktree = if let Some((mode, oid)) = o.as_ref().or(t.as_ref()) {
-                Some((*mode, merge_read_blob(db, oid)?))
-            } else {
-                None
-            };
+    for entry in merge.paths {
+        if entry.conflict.is_some() {
+            conflicts.push(entry.path.clone());
             results.insert(
-                path,
+                entry.path,
                 MergePathResult::Conflict {
-                    base: b,
-                    ours: o,
-                    theirs: t,
-                    worktree,
+                    base: entry.stages.base,
+                    ours: entry.stages.ours,
+                    theirs: entry.stages.theirs,
+                    worktree: entry.worktree,
                 },
             );
+        } else {
+            results.insert(entry.path, MergePathResult::Resolved(entry.result));
         }
     }
     Ok((results, conflicts))
@@ -626,6 +575,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     let mut write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
     let (results, conflicts) = three_way_merge_trees(
         &mut write_db,
+        format,
         &base_map,
         &ours_map,
         &theirs_map,
@@ -1720,6 +1670,7 @@ fn rebase_replay_commits(
         let mut write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let (results, conflicts) = three_way_merge_trees(
             &mut write_db,
+            format,
             &base_map,
             &ours_map,
             &theirs_map,
@@ -2473,6 +2424,7 @@ fn finalize_replay(
     let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let (results, conflicts) = three_way_merge_trees(
         &mut write_db,
+        format,
         &plan.base,
         &ours_map,
         &plan.theirs,
