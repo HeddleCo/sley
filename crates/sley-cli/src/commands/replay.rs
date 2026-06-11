@@ -576,7 +576,6 @@ fn regexish_contains(haystack: &str, pattern: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[String]) -> Result<()> {
-    read_and_refresh_cache(ctx)?;
     let selection = select_revisions(ctx, ctx.action, rev_args)?;
     if selection.commits.is_empty() {
         eprintln!("error: empty commit set passed");
@@ -627,13 +626,14 @@ fn sequencer_pick_revisions(ctx: &ReplayCtx, opts: &ReplayOpts, rev_args: &[Stri
     pick_commits(ctx, opts, &items)
 }
 
-/// `read_and_refresh_cache`: refuse to start with unmerged index entries.
-fn read_and_refresh_cache(ctx: &ReplayCtx) -> Result<()> {
+/// The unmerged-index guard inside `do_pick_commit`'s dirty-index check
+/// (`error_resolve_conflict`).
+fn check_no_unmerged(ctx: &ReplayCtx) -> std::result::Result<(), ReplayHalt> {
     let index_path = sley_worktree::repository_index_path(&ctx.git_dir);
     let Ok(bytes) = fs::read(&index_path) else {
         return Ok(());
     };
-    let index = Index::parse(&bytes, ctx.format)?;
+    let index = Index::parse(&bytes, ctx.format).map_err(print_fatal_error)?;
     if index
         .entries
         .iter()
@@ -646,7 +646,7 @@ fn read_and_refresh_cache(ctx: &ReplayCtx) -> Result<()> {
         eprintln!("error: {verb} is not possible because you have unmerged files.");
         eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
         eprintln!("hint: as appropriate to mark resolution and make a commit.");
-        return Err(fatal_failed(ctx.action));
+        return Err(ReplayHalt::Fatal);
     }
     Ok(())
 }
@@ -727,6 +727,7 @@ fn do_pick_commit(
     })?;
 
     // HEAD / index-dirtiness checks.
+    check_no_unmerged(ctx)?;
     let head = ctx.head_oid();
     let unborn = head.is_none();
     let head_tree = match &head {
@@ -1785,13 +1786,9 @@ fn sequencer_skip(ctx: &ReplayCtx) -> Result<()> {
             return Err(fatal_failed(ctx.action));
         }
     }
-    // `git reset --merge HEAD`.
+    // `git reset --merge HEAD` (an unborn HEAD resets to the empty tree).
     let head = ctx.head_oid();
-    let Some(head) = head else {
-        eprintln!("error: cannot resolve HEAD");
-        return Err(fatal_failed(ctx.action));
-    };
-    reset_merge(ctx, &head).map_err(|_| {
+    reset_merge_target(ctx, head.as_ref()).map_err(|_| {
         eprintln!("error: failed to skip the commit");
         fatal_failed(ctx.action)
     })?;
@@ -1865,23 +1862,27 @@ fn sequencer_rollback(ctx: &ReplayCtx) -> Result<()> {
 /// on-disk content diverges from the (stage-0) index. Conflicted paths are
 /// reset outright. Clears the in-progress branch state on success.
 fn reset_merge(ctx: &ReplayCtx, target: &ObjectId) -> Result<()> {
-    reset_merge_in(
-        &ctx.git_dir,
-        &ctx.worktree_root,
-        ctx.format,
-        target,
-    )
+    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, Some(target))
+}
+
+fn reset_merge_target(ctx: &ReplayCtx, target: Option<&ObjectId>) -> Result<()> {
+    reset_merge_in(&ctx.git_dir, &ctx.worktree_root, ctx.format, target)
 }
 
 pub(crate) fn reset_merge_in(
     git_dir: &Path,
     worktree_root: &Path,
     format: ObjectFormat,
-    target: &ObjectId,
+    target: Option<&ObjectId>,
 ) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let target_tree = commit_tree_oid(&db, format, target)?;
-    let target_map = stash_tree_entry_map(&db, format, &target_tree)?;
+    let target_map = match target {
+        Some(target) => {
+            let target_tree = commit_tree_oid(&db, format, target)?;
+            stash_tree_entry_map(&db, format, &target_tree)?
+        }
+        None => MergeTreeMap::new(),
+    };
     let index_path = sley_worktree::repository_index_path(git_dir);
     let old_index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
@@ -1954,8 +1955,11 @@ pub(crate) fn reset_merge_in(
                 String::from_utf8_lossy(path)
             );
         }
+        let target_text = target
+            .map(|oid| oid.to_hex())
+            .unwrap_or_else(|| "HEAD".to_string());
         return Err(GitError::Command(format!(
-            "Could not reset index file to revision '{target}'."
+            "Could not reset index file to revision '{target_text}'."
         )));
     }
 
@@ -2001,7 +2005,9 @@ pub(crate) fn reset_merge_in(
     // Move HEAD (branch tip or detached) when the target differs.
     let refs = FileRefStore::new(git_dir, format);
     let current_head = head_commit_oid(&refs)?;
-    if current_head.as_ref() != Some(target) {
+    if let Some(target) = target
+        && current_head.as_ref() != Some(target)
+    {
         let target_ref = match refs.read_ref("HEAD")? {
             Some(RefTarget::Symbolic(branch)) => branch,
             _ => "HEAD".to_string(),

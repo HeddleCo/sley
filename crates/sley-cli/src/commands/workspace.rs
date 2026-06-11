@@ -37,6 +37,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             "--mixed" => mode = ResetMode::Mixed,
             "--soft" => mode = ResetMode::Soft,
             "--hard" => mode = ResetMode::Hard,
+            "--merge" => mode = ResetMode::Merge,
             "--pathspec-file-nul" => pathspec_file_nul = true,
             "--no-pathspec-file-nul" => pathspec_file_nul = false,
             "--pathspec-from-file" => {
@@ -78,6 +79,36 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
     let pathspec_from_file_provided = pathspec_from_file.is_some();
+    if mode == ResetMode::Merge {
+        if pathspec_from_file_provided || (saw_separator && !positionals.is_empty()) {
+            eprintln!("fatal: Cannot do merge reset with paths.");
+            return Err(GitError::Exit(128));
+        }
+        let target = match positionals.as_slice() {
+            [] => "HEAD",
+            [target] => target.as_str(),
+            _ => {
+                eprintln!("fatal: Cannot do merge reset with paths.");
+                return Err(GitError::Exit(128));
+            }
+        };
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let target_oid = resolve_revision(&git_dir, format, target)?;
+        let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
+        return commands::replay::reset_merge_in(
+            &git_dir,
+            &worktree_root,
+            format,
+            Some(&target_commit),
+        )
+            .map_err(|err| match err {
+                GitError::Command(message) => {
+                    eprintln!("fatal: {message}");
+                    GitError::Exit(128)
+                }
+                other => other,
+            });
+    }
     if matches!(mode, ResetMode::Soft | ResetMode::Hard) {
         if pathspec_from_file_provided {
             eprintln!("fatal: Cannot do {} reset with paths.", mode.as_str());
@@ -100,6 +131,35 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             Ok(oid) => oid,
             Err(_) => zero_oid(format)?,
         };
+        if mode == ResetMode::Hard
+            && target == "HEAD"
+            && resolve_revision(&git_dir, format, "HEAD").is_err()
+        {
+            // `git reset --hard` on an unborn branch: empty the index and
+            // remove the (previously tracked) worktree files.
+            let index_path = sley_worktree::repository_index_path(&git_dir);
+            if index_path.exists() {
+                let index = Index::parse(&fs::read(&index_path)?, format)?;
+                for entry in &index.entries {
+                    let full = worktree_root.join(entry.path.to_string());
+                    if full.is_file() {
+                        let _ = fs::remove_file(&full);
+                    }
+                }
+                fs::write(
+                    &index_path,
+                    Index {
+                        version: 2,
+                        entries: Vec::new(),
+                        extensions: Vec::new(),
+                        checksum: None,
+                    }
+                    .write(format)?,
+                )?;
+            }
+            sley_sequencer::replay::remove_branch_state(&git_dir);
+            return Ok(());
+        }
         let target_oid = resolve_revision(&git_dir, format, target)?;
         let target_commit = sley_rev::peel_to_commit(&db, format, &target_oid)?;
         if mode == ResetMode::Hard {
@@ -121,6 +181,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
         if mode == ResetMode::Hard && !quiet {
             print_reset_hard_head(&git_dir, format, &target_commit)?;
         }
+        sley_sequencer::replay::remove_branch_state(&git_dir);
         return Ok(());
     }
 
@@ -148,6 +209,7 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             &positionals[0],
             commit_identity_from_env("COMMITTER")?,
         )?;
+        sley_sequencer::replay::remove_branch_state(&git_dir);
         if !quiet {
             print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
         }
@@ -191,7 +253,8 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
     if let Some(pathspec_file) = pathspec_from_file {
         paths.extend(read_pathspecs_from_file(&pathspec_file, pathspec_file_nul)?);
     }
-    if paths.is_empty() && !pathspec_from_file_provided {
+    let no_explicit_paths = paths.is_empty() && !pathspec_from_file_provided;
+    if no_explicit_paths {
         paths.push(worktree_root.clone());
     }
     if !saw_separator && source_tree.is_none() {
@@ -239,6 +302,9 @@ pub(crate) fn cmd_reset(args: &[String]) -> Result<()> {
             &resolved_paths,
         )?;
     }
+    if no_explicit_paths {
+        sley_sequencer::replay::remove_branch_state(&git_dir);
+    }
     if !quiet {
         print_reset_unstaged_changes(&worktree_root, &git_dir, format)?;
     }
@@ -250,6 +316,7 @@ enum ResetMode {
     Mixed,
     Soft,
     Hard,
+    Merge,
 }
 
 impl ResetMode {
@@ -258,6 +325,7 @@ impl ResetMode {
             Self::Mixed => "mixed",
             Self::Soft => "soft",
             Self::Hard => "hard",
+            Self::Merge => "merge",
         }
     }
 }
@@ -290,6 +358,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut force = false;
     let mut branch_mode = CheckoutBranchMode::Existing;
     let mut positional = Vec::new();
+    let mut dashdash_index = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -335,6 +404,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 };
             }
             "--" => {
+                dashdash_index = Some(positional.len());
                 positional.extend(iter.map(|value| value.to_string()));
                 break;
             }
@@ -346,6 +416,77 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+
+    // Pathspec checkout: `checkout [<tree-ish>] [--] <pathspec>...` restores
+    // paths (and, with a tree-ish, index entries) instead of switching HEAD.
+    if matches!(branch_mode, CheckoutBranchMode::Existing) {
+        let (source, paths): (Option<&str>, &[String]) = match dashdash_index {
+            Some(index) => {
+                let (before, after) = positional.split_at(index);
+                match before {
+                    [] => (None, after),
+                    [rev] => (Some(rev.as_str()), after),
+                    _ => {
+                        return Err(GitError::Command(
+                            "checkout with multiple tree-ish arguments is not supported".into(),
+                        ));
+                    }
+                }
+            }
+            None if positional.len() > 1 => (Some(positional[0].as_str()), &positional[1..]),
+            None if positional.len() == 1 => {
+                // A single arg that is neither a branch nor a revision but
+                // names an existing file is a path checkout.
+                let value = &positional[0];
+                let store = FileRefStore::new(&git_dir, format);
+                let is_branch = branch_ref_name(value)
+                    .ok()
+                    .and_then(|name| sley_refs::resolve_ref_peeled(&store, &name).ok().flatten())
+                    .is_some();
+                if !is_branch
+                    && sley_rev::resolve_revision(&git_dir, format, value).is_err()
+                    && cwd.join(value).exists()
+                {
+                    (None, positional.as_slice())
+                } else {
+                    (None, &[])
+                }
+            }
+            None => (None, &[]),
+        };
+        if !paths.is_empty() {
+            let resolved_paths: Vec<PathBuf> = paths
+                .iter()
+                .map(|path| {
+                    let path = PathBuf::from(path);
+                    if path.is_absolute() { path } else { cwd.join(path) }
+                })
+                .collect();
+            match source {
+                Some(rev) => {
+                    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+                    let oid = resolve_revision(&git_dir, format, rev)?;
+                    let tree = sley_rev::peel_to_tree(&db, format, &oid)?;
+                    sley_worktree::restore_index_and_worktree_paths_from_tree(
+                        worktree_root,
+                        git_dir,
+                        format,
+                        &tree,
+                        &resolved_paths,
+                    )?;
+                }
+                None => {
+                    sley_worktree::restore_worktree_paths(
+                        worktree_root,
+                        git_dir,
+                        format,
+                        &resolved_paths,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+    }
 
     // `git checkout -f <commit-ish>` where the target is the commit HEAD already
     // points at (the common `git checkout -f HEAD` form, e.g. the trailing step
@@ -368,7 +509,45 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 format,
                 &target_oid,
             )?;
+            sley_sequencer::replay::remove_branch_state(&git_dir);
             return Ok(());
+        }
+    }
+
+    // `-f`: discard local index/worktree changes (including conflict stages)
+    // before switching, so the clean-tree checkout below succeeds — git's
+    // force semantics. Untracked files are preserved.
+    if force {
+        let store = FileRefStore::new(&git_dir, format);
+        if let Ok(Some(head_oid)) = resolve_ref_peeled(&store, "HEAD") {
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &worktree_root,
+                &git_dir,
+                format,
+                &head_oid,
+            )?;
+        } else {
+            // Unborn HEAD: discard the staged state entirely.
+            let index_path = sley_worktree::repository_index_path(&git_dir);
+            if index_path.exists() {
+                let index = Index::parse(&fs::read(&index_path)?, format)?;
+                for entry in &index.entries {
+                    let full = worktree_root.join(entry.path.to_string());
+                    if full.is_file() {
+                        let _ = fs::remove_file(&full);
+                    }
+                }
+                fs::write(
+                    &index_path,
+                    Index {
+                        version: 2,
+                        entries: Vec::new(),
+                        extensions: Vec::new(),
+                        checksum: None,
+                    }
+                    .write(format)?,
+                )?;
+            }
         }
     }
 
@@ -402,6 +581,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     format!("checkout: moving to {branch}").into_bytes(),
                     &config,
                 )?;
+                sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!(
                         "HEAD is now at {} {}",
@@ -427,6 +607,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     ));
                 }
                 checkout_switch_to_unborn_branch(&git_dir, &branch)?;
+                sley_sequencer::replay::remove_branch_state(&git_dir);
                 if !quiet {
                     eprintln!("Switched to a new branch '{branch}'");
                 }
@@ -458,12 +639,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let config = read_repo_config(&git_dir)?;
     sley_worktree::checkout_branch_filtered(
         worktree_root,
-        git_dir,
+        git_dir.clone(),
         format,
         branch,
         commit_identity_from_env("COMMITTER")?,
         &config,
     )?;
+    sley_sequencer::replay::remove_branch_state(&git_dir);
     if !quiet {
         checkout_message.print();
     }
@@ -879,6 +1061,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut pathspec_from_file_active = false;
     let mut pathspec_file_nul = false;
     let mut pathspec_args = Vec::new();
+    let mut edit_flag: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1340,7 +1523,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--no-only=") => {
                 return commit_option_takes_no_value_error("no-only");
             }
-            "-e" | "--edit" | "--no-edit" => {}
+            "-e" | "--edit" => edit_flag = Some(true),
+            "--no-edit" => edit_flag = Some(false),
             value if value.starts_with("--edit=") => {
                 return commit_option_takes_no_value_error("edit");
             }
@@ -1467,11 +1651,6 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             );
         }
     }
-    if !pathspec_args.is_empty() {
-        return Err(GitError::Unsupported(
-            "commit pathspecs are not implemented".into(),
-        ));
-    }
     if unified_context && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
@@ -1496,19 +1675,31 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             "commit interactive patch selection is not implemented".into(),
         ));
     }
-    if file_message.is_none()
-        && message_chunks.is_empty()
-        && reuse_message.is_none()
-        && fixup_commit.is_none()
-        && squash_commit.is_none()
-        && trailers.is_empty()
-        && !amend
-    {
-        return Err(GitError::Command("commit requires -m <message>".into()));
-    }
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
     let in_merge = git_dir.join("MERGE_HEAD").is_file();
+    let in_cherry_pick = git_dir.join("CHERRY_PICK_HEAD").is_file();
+    let in_revert = git_dir.join("REVERT_HEAD").is_file();
+    if !pathspec_args.is_empty() {
+        if in_merge {
+            eprintln!("fatal: cannot do a partial commit during a merge.");
+            return Err(GitError::Exit(128));
+        }
+        if in_cherry_pick || in_revert {
+            eprintln!("fatal: cannot do a partial commit during a cherry-pick.");
+            return Err(GitError::Exit(128));
+        }
+    }
+    if amend {
+        if in_merge {
+            eprintln!("fatal: You are in the middle of a merge -- cannot amend.");
+            return Err(GitError::Exit(128));
+        }
+        if in_cherry_pick || in_revert {
+            eprintln!("fatal: You are in the middle of a cherry-pick -- cannot amend.");
+            return Err(GitError::Exit(128));
+        }
+    }
     // `i18n.commitEncoding` is recorded as the commit's `encoding` header so that
     // `git log` can re-encode the message to the log output encoding (UTF-8 by
     // default). git omits the header for UTF-8.
@@ -1563,7 +1754,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         build_commit_author_identity(author_override.as_deref(), author_date.as_deref())?
     };
-    let mut message = reused_commit
+    let had_file_message = file_message.is_some();
+    let message = reused_commit
         .as_ref()
         .map(|commit| {
             if let Some(squash_message) = &squash_message {
@@ -1590,7 +1782,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             }
         })
         .or_else(|| {
-            if in_merge
+            if (in_merge || in_cherry_pick || in_revert)
                 && file_message.is_none()
                 && message_chunks.is_empty()
                 && reuse_message.is_none()
@@ -1605,31 +1797,98 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .unwrap_or_else(|| {
             file_message.unwrap_or_else(|| commit_message_from_prepared_chunks(&message_chunks))
         });
+    if all {
+        commit_stage_tracked_changes(&git_dir, format)?;
+    }
+    let mut message = if signoff {
+        if in_cherry_pick || in_revert {
+            commands::replay::append_signoff_before_comments(
+                message,
+                &commit_signoff_from_env()?,
+            )
+        } else {
+            commit_message_with_signoff(message, &commit_signoff_from_env()?)
+        }
+    } else {
+        message
+    };
+    // Editor flow: a commit without an explicit message source launches the
+    // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
+    // their historical no-editor behavior).
+    let had_message_source = had_file_message
+        || !message_chunks.is_empty()
+        || reuse_message.is_some()
+        || fixup_commit.is_some()
+        || squash_commit.is_some()
+        || amend;
+    let in_rebase = rebase_in_progress(&git_dir);
+    let use_editor = !in_rebase
+        && !in_merge
+        && (edit_flag == Some(true) || (edit_flag != Some(false) && !had_message_source));
+    if use_editor {
+        let editmsg = git_dir.join("COMMIT_EDITMSG");
+        fs::write(&editmsg, &message)?;
+        if let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg) {
+            eprintln!("error: {err}");
+            eprintln!("Please supply the message using either -m or -F option.");
+            return Err(GitError::Exit(1));
+        }
+        message = fs::read(&editmsg)?;
+        if cleanup_mode.is_none() {
+            message = commands::replay::strip_comment_lines(
+                &message,
+                commands::replay::comment_char(&git_dir),
+            );
+        }
+    }
     if let Some(cleanup_mode) = cleanup_mode {
         message = commit_cleanup_message(message, cleanup_mode);
     }
     let message_with_trailers =
         commands::tag::tag_message_with_trailers(message.clone(), &trailers);
-    if !allow_empty_message && commit_message_is_empty(&message_with_trailers) {
+    if (in_cherry_pick || in_revert)
+        && !allow_empty_message
+        && commit_message_is_empty(&message_with_trailers)
+    {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
-    if all {
-        commit_stage_tracked_changes(&git_dir, format)?;
-    }
-    let message = if signoff {
-        commit_message_with_signoff(message, &commit_signoff_from_env()?)
-    } else {
-        message
-    };
+    let message = message;
     let message = tag_message_with_trailers(message, &trailers);
-    if rebase_in_progress(&git_dir) {
+    if in_rebase {
         return conclude_rebase_step_via_commit(
             &git_dir, format, author, committer, message, quiet,
         );
     }
     if in_merge {
         return conclude_in_progress_merge(&git_dir, format, message, quiet);
+    }
+    if in_cherry_pick || in_revert {
+        return conclude_replay_via_commit(
+            &git_dir,
+            format,
+            message,
+            allow_empty,
+            allow_empty_message,
+            author,
+            author_override.is_none() && !reset_author,
+            quiet,
+        );
+    }
+    if !allow_empty_message && commit_message_is_empty(&message) {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
+    if !pathspec_args.is_empty() {
+        return commit_partial_paths(
+            &git_dir,
+            format,
+            &pathspec_args,
+            author,
+            committer,
+            message,
+            quiet,
+        );
     }
     if !allow_empty
         && !amend
@@ -1657,6 +1916,322 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         println!("{}", result.oid);
     }
     Ok(())
+}
+
+/// Conclude an in-progress cherry-pick / revert via `git commit`: commit the
+/// staged resolution with the picked commit's authorship, then run the
+/// sequencer post-commit cleanup (CHERRY_PICK_HEAD / REVERT_HEAD removal and
+/// the last-pick sequencer-state teardown).
+#[allow(clippy::too_many_arguments)]
+fn conclude_replay_via_commit(
+    git_dir: &Path,
+    format: ObjectFormat,
+    message: Vec<u8>,
+    allow_empty: bool,
+    allow_empty_message: bool,
+    env_author: Vec<u8>,
+    use_pick_author: bool,
+    quiet: bool,
+) -> Result<()> {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let refs = FileRefStore::new(git_dir, format);
+    let head = commands::merge_rebase::head_commit_oid(&refs)?;
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    if let Ok(bytes) = fs::read(&index_path) {
+        let index = Index::parse(&bytes, format)?;
+        let unmerged: BTreeSet<String> = index
+            .entries
+            .iter()
+            .filter(|entry| index_entry_stage(entry) > 0)
+            .map(|entry| entry.path.to_string())
+            .collect();
+        if !unmerged.is_empty() {
+            for path in &unmerged {
+                println!("U\t{path}");
+            }
+            eprintln!("error: Committing is not possible because you have unmerged files.");
+            eprintln!("hint: Fix them up in the work tree, and then use 'git add/rm <file>'");
+            eprintln!("hint: as appropriate to mark resolution and make a commit.");
+            eprintln!("fatal: Exiting because of an unresolved conflict.");
+            return Err(GitError::Exit(128));
+        }
+    }
+    let head_tree = match &head {
+        Some(oid) => commands::merge_rebase::commit_tree_oid(&db, format, oid)?,
+        None => ObjectId::empty_tree(format),
+    };
+    let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    let cherry_pick_head = git_dir.join("CHERRY_PICK_HEAD");
+    if !allow_empty && tree == head_tree {
+        let action = if cherry_pick_head.is_file() {
+            "cherry-pick"
+        } else {
+            "revert"
+        };
+        eprintln!(
+            "The previous cherry-pick is now empty, possibly due to conflict resolution."
+        );
+        eprintln!("If you wish to commit it anyway, use:");
+        eprintln!();
+        eprintln!("    git commit --allow-empty");
+        eprintln!();
+        eprintln!("Otherwise, please use 'git {action} --skip'");
+        return Err(GitError::Exit(1));
+    }
+    if !allow_empty_message && commit_message_is_empty(&message) {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
+    let author = if use_pick_author && cherry_pick_head.is_file() {
+        let text = fs::read_to_string(&cherry_pick_head)?;
+        let oid = ObjectId::from_hex(format, text.trim())?;
+        let object = db.read_object(&oid)?;
+        Commit::parse(format, &object.body)?.author
+    } else {
+        env_author
+    };
+    let committer = commit_identity_from_env("COMMITTER")?;
+    let new_oid = sley_sequencer::create_commit(
+        &mut FileObjectDatabase::from_git_dir(git_dir, format),
+        sley_sequencer::CommitCreate {
+            tree,
+            parents: head.iter().copied().collect(),
+            author,
+            committer: committer.clone(),
+            message: message.clone(),
+            encoding: None,
+        },
+    )?;
+    let target_ref = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => branch,
+        _ => "HEAD".to_string(),
+    };
+    let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: target_ref,
+        expected: head.map(RefTarget::Direct),
+        new: RefTarget::Direct(new_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: commit_reflog_message(&message, false),
+        }),
+    });
+    tx.commit()?;
+    sley_sequencer::replay::post_commit_cleanup(git_dir);
+    for name in ["MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "SQUASH_MSG"] {
+        let _ = fs::remove_file(git_dir.join(name));
+    }
+    if !quiet {
+        println!("{new_oid}");
+    }
+    Ok(())
+}
+
+/// Minimal partial commit (`git commit [-m ...] -- <paths>`): record HEAD's
+/// tree with the named paths' current working-tree contents, then refresh
+/// those index entries. Mirrors git's --only default for the upstream
+/// suite's tracked-file usage.
+fn commit_partial_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[String],
+    author: Vec<u8>,
+    committer: Vec<u8>,
+    message: Vec<u8>,
+    quiet: bool,
+) -> Result<()> {
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let cwd = env::current_dir()?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let refs = FileRefStore::new(git_dir, format);
+    let head = commands::merge_rebase::head_commit_oid(&refs)?;
+    let mut tree_map = match &head {
+        Some(oid) => {
+            let tree = commands::merge_rebase::commit_tree_oid(&db, format, oid)?;
+            stash_tree_entry_map(&db, format, &tree)?
+        }
+        None => BTreeMap::new(),
+    };
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let mut index = if index_path.exists() {
+        Index::parse(&fs::read(&index_path)?, format)?
+    } else {
+        Index {
+            version: 2,
+            entries: Vec::new(),
+            extensions: Vec::new(),
+            checksum: None,
+        }
+    };
+    let known: BTreeSet<Vec<u8>> = index
+        .entries
+        .iter()
+        .map(|entry| entry.path.clone().into_bytes())
+        .collect();
+    let mut rel_paths: Vec<Vec<u8>> = Vec::new();
+    for path in paths {
+        let absolute = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            cwd.join(path)
+        };
+        let rel = absolute
+            .strip_prefix(&worktree_root)
+            .map_err(|_| GitError::InvalidPath(format!("pathspec outside repository: {path}")))?
+            .to_string_lossy()
+            .into_owned()
+            .into_bytes();
+        if !known.contains(&rel) && !tree_map.contains_key(&rel) {
+            eprintln!(
+                "error: pathspec '{path}' did not match any file(s) known to git"
+            );
+            return Err(GitError::Exit(128));
+        }
+        rel_paths.push(rel);
+    }
+    for rel in &rel_paths {
+        let full = worktree_root.join(String::from_utf8_lossy(rel).as_ref());
+        match fs::read(&full) {
+            Ok(bytes) => {
+                let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
+                let mode = file_mode_for_commit(&full);
+                tree_map.insert(rel.clone(), (mode, oid));
+            }
+            Err(_) => {
+                tree_map.remove(rel);
+            }
+        }
+    }
+    let tree = write_tree_from_entry_map(&db, format, &tree_map)?;
+    let new_oid = sley_sequencer::create_commit(
+        &mut FileObjectDatabase::from_git_dir(git_dir, format),
+        sley_sequencer::CommitCreate {
+            tree,
+            parents: head.iter().copied().collect(),
+            author,
+            committer: committer.clone(),
+            message: message.clone(),
+            encoding: None,
+        },
+    )?;
+    let target_ref = match refs.read_ref("HEAD")? {
+        Some(RefTarget::Symbolic(branch)) => branch,
+        _ => "HEAD".to_string(),
+    };
+    let old_oid = head.unwrap_or_else(|| ObjectId::null(format));
+    let mut tx = refs.transaction();
+    tx.update(RefUpdate {
+        name: target_ref,
+        expected: head.map(RefTarget::Direct),
+        new: RefTarget::Direct(new_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid,
+            committer,
+            message: commit_reflog_message(&message, false),
+        }),
+    });
+    tx.commit()?;
+    // Refresh the touched index entries to the committed blobs.
+    for rel in &rel_paths {
+        index
+            .entries
+            .retain(|entry| entry.path.as_bytes() != rel.as_slice());
+        if let Some((mode, oid)) = tree_map.get(rel) {
+            index.entries.push(commands::merge_rebase::merge_index_entry(
+                rel, *mode, *oid, 0,
+            ));
+        }
+    }
+    index.entries.sort_by(|left, right| left.path.cmp(&right.path));
+    fs::write(&index_path, index.write(format)?)?;
+    sley_sequencer::replay::post_commit_cleanup(git_dir);
+    if !quiet {
+        println!("{new_oid}");
+    }
+    Ok(())
+}
+
+fn file_mode_for_commit(path: &Path) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = fs::metadata(path)
+            && metadata.permissions().mode() & 0o111 != 0
+        {
+            return 0o100755;
+        }
+    }
+    0o100644
+}
+
+/// Write a tree object hierarchy from a flat `path -> (mode, oid)` map
+/// (grouping by leading path component, mirroring fast-import's writer).
+fn write_tree_from_entry_map(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+) -> Result<ObjectId> {
+    let _ = format;
+    write_entry_map_level(db, entries, &[])
+}
+
+fn write_entry_map_level(
+    db: &FileObjectDatabase,
+    entries: &BTreeMap<Vec<u8>, (u32, ObjectId)>,
+    prefix: &[u8],
+) -> Result<ObjectId> {
+    let mut tree_entries: Vec<sley_object::TreeEntry> = Vec::new();
+    let mut subdirs: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let prefix_len = if prefix.is_empty() { 0 } else { prefix.len() + 1 };
+    for (path, (mode, oid)) in entries {
+        if !prefix.is_empty()
+            && (!path.starts_with(prefix) || path.get(prefix.len()) != Some(&b'/'))
+        {
+            continue;
+        }
+        let rel = &path[prefix_len..];
+        if let Some(slash) = rel.iter().position(|b| *b == b'/') {
+            subdirs.insert(rel[..slash].to_vec());
+        } else {
+            tree_entries.push(sley_object::TreeEntry {
+                mode: *mode,
+                name: BString::from(rel.to_vec()),
+                oid: *oid,
+            });
+        }
+    }
+    for dir in subdirs {
+        let mut sub_prefix = prefix.to_vec();
+        if !sub_prefix.is_empty() {
+            sub_prefix.push(b'/');
+        }
+        sub_prefix.extend_from_slice(&dir);
+        let sub_oid = write_entry_map_level(db, entries, &sub_prefix)?;
+        tree_entries.push(sley_object::TreeEntry {
+            mode: 0o040000,
+            name: BString::from(dir),
+            oid: sub_oid,
+        });
+    }
+    // Tree entries collate with subtrees as though their name ends in `/`.
+    tree_entries.sort_by_key(|entry| {
+        let mut key = entry.name.clone().into_bytes();
+        if entry.mode == 0o040000 {
+            key.push(b'/');
+        }
+        key
+    });
+    db.write_object(EncodedObject::new(
+        ObjectType::Tree,
+        sley_object::Tree {
+            entries: tree_entries,
+        }
+        .write(),
+    ))
 }
 
 enum CommitFixup {
