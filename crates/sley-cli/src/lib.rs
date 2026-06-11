@@ -212,7 +212,15 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "log" => commands::log::cmd_log(&args[1..]),
         "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(&args[1..]),
-        "pull" => commands::merge_rebase::cmd_pull(&args[1..]),
+        "pull" => {
+            // `-s`/`--strategy` pulls take a narrow dedicated path; the general
+            // pull implementation rejects the option.
+            if commands::pull_strategy::pull_has_strategy_option(&args[1..]) {
+                commands::pull_strategy::cmd_pull_with_strategy(&args[1..])
+            } else {
+                commands::merge_rebase::cmd_pull(&args[1..])
+            }
+        }
         "rebase" => commands::merge_rebase::cmd_rebase(&args[1..]),
         "cherry-pick" => commands::replay::cmd_cherry_pick(&args[1..]),
         "revert" => commands::replay::cmd_revert(&args[1..]),
