@@ -4726,8 +4726,34 @@ pub fn restore_worktree_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
+    restore_worktree_paths_inner(worktree_root.as_ref(), git_dir.as_ref(), format, paths, None)
+}
+
+/// Like [`restore_worktree_paths`], applying the smudge-side content filters
+/// (CRLF / ident / filter drivers) the way a checkout writes blobs.
+pub fn restore_worktree_paths_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    config: &GitConfig,
+) -> Result<RestoreResult> {
+    restore_worktree_paths_inner(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        paths,
+        Some(config),
+    )
+}
+
+fn restore_worktree_paths_inner(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    smudge_config: Option<&GitConfig>,
+) -> Result<RestoreResult> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Err(GitError::Exit(1));
@@ -4754,7 +4780,7 @@ pub fn restore_worktree_paths(
             if entry.path.as_bytes() == git_path.as_slice()
                 || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path))
             {
-                restore_index_entry(worktree_root, &db, entry)?;
+                restore_index_entry(worktree_root, git_dir, format, &db, entry, smudge_config)?;
                 restored.insert(entry.path.clone());
                 matched = true;
             }
@@ -6015,8 +6041,11 @@ pub fn move_index_and_worktree_path(
 
 fn restore_index_entry(
     worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
 ) -> Result<()> {
     let object = db.read_object(&entry.oid)?;
     if object.object_type != ObjectType::Blob {
@@ -6026,11 +6055,28 @@ fn restore_index_entry(
             object.object_type.as_str()
         )));
     }
+    let body: Cow<'_, [u8]> = match smudge_config {
+        Some(config) => {
+            let checks = smudge_attribute_checks_from_index(
+                worktree_root,
+                git_dir,
+                format,
+                entry.path.as_bytes(),
+            )?;
+            apply_smudge_filter_with_attributes_cow(
+                config,
+                &checks,
+                entry.path.as_bytes(),
+                &object.body,
+            )?
+        }
+        None => Cow::Borrowed(&object.body),
+    };
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, &object.body)?;
+    fs::write(file_path, &body)?;
     Ok(())
 }
 

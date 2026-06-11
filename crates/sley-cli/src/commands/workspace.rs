@@ -477,11 +477,13 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     )?;
                 }
                 None => {
-                    sley_worktree::restore_worktree_paths(
+                    let config = read_repo_config(&git_dir)?;
+                    sley_worktree::restore_worktree_paths_filtered(
                         worktree_root,
-                        git_dir,
+                        &git_dir,
                         format,
                         &resolved_paths,
+                        &config,
                     )?;
                 }
             }
@@ -2342,10 +2344,10 @@ fn conclude_replay_via_commit(
     Ok(())
 }
 
-/// Minimal partial commit (`git commit [-m ...] -- <paths>`): record HEAD's
-/// tree with the named paths' current working-tree contents, then refresh
-/// those index entries. Mirrors git's --only default for the upstream
-/// suite's tracked-file usage.
+/// Partial commit (`git commit [-m ...] -- <paths>`): stage the named paths'
+/// working-tree contents (clean filters applied, directories expanded over
+/// the tracked entries beneath them), then record HEAD's tree with just those
+/// paths replaced. Mirrors git's `--only` default for tracked-file usage.
 fn commit_partial_paths(
     git_dir: &Path,
     format: ObjectFormat,
@@ -2368,7 +2370,7 @@ fn commit_partial_paths(
         None => BTreeMap::new(),
     };
     let index_path = sley_worktree::repository_index_path(git_dir);
-    let mut index = if index_path.exists() {
+    let index = if index_path.exists() {
         Index::parse(&fs::read(&index_path)?, format)?
     } else {
         Index {
@@ -2382,37 +2384,100 @@ fn commit_partial_paths(
         .entries
         .iter()
         .map(|entry| entry.path.clone().into_bytes())
+        .chain(tree_map.keys().cloned())
         .collect();
+
+    // Expand the pathspecs over the tracked entries (directories and `.`
+    // cover everything beneath them).
     let mut rel_paths: Vec<Vec<u8>> = Vec::new();
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     for path in paths {
         let absolute = if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
             cwd.join(path)
         };
-        let rel = absolute
-            .strip_prefix(&worktree_root)
-            .map_err(|_| GitError::InvalidPath(format!("pathspec outside repository: {path}")))?
-            .to_string_lossy()
-            .into_owned()
-            .into_bytes();
-        if !known.contains(&rel) && !tree_map.contains_key(&rel) {
-            eprintln!(
-                "error: pathspec '{path}' did not match any file(s) known to git"
-            );
+        let rel: Vec<u8> = match absolute.strip_prefix(&worktree_root) {
+            Ok(stripped) => stripped.to_string_lossy().into_owned().into_bytes(),
+            Err(_) => {
+                return Err(GitError::InvalidPath(format!(
+                    "pathspec outside repository: {path}"
+                )));
+            }
+        };
+        let mut matched = false;
+        if rel.is_empty() {
+            // `.` at the worktree root: every tracked entry.
+            for tracked in &known {
+                if seen.insert(tracked.clone()) {
+                    rel_paths.push(tracked.clone());
+                }
+                matched = true;
+            }
+        } else if known.contains(&rel) {
+            if seen.insert(rel.clone()) {
+                rel_paths.push(rel.clone());
+            }
+            matched = true;
+        } else {
+            let mut prefix = rel.clone();
+            prefix.push(b'/');
+            for tracked in &known {
+                if tracked.starts_with(&prefix) {
+                    if seen.insert(tracked.clone()) {
+                        rel_paths.push(tracked.clone());
+                    }
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            eprintln!("error: pathspec '{path}' did not match any file(s) known to git");
             return Err(GitError::Exit(128));
         }
-        rel_paths.push(rel);
     }
+
+    // Stage the matched paths with the regular add machinery (clean filters,
+    // mode bits) — partial commits update those index entries too.
+    let config = read_repo_config(git_dir)?;
+    let ordered: Vec<sley_worktree::UpdateIndexPath> = rel_paths
+        .iter()
+        .map(|rel| sley_worktree::UpdateIndexPath {
+            path: worktree_root.join(String::from_utf8_lossy(rel).as_ref()),
+            chmod: None,
+        })
+        .collect();
+    sley_worktree::update_index_ordered_paths_filtered(
+        &worktree_root,
+        git_dir,
+        format,
+        &ordered,
+        sley_worktree::UpdateIndexOptions {
+            add: true,
+            remove: true,
+            force_remove: false,
+            chmod: None,
+            info_only: false,
+            ignore_skip_worktree_entries: false,
+        },
+        &config,
+        false,
+    )?;
+
+    // Overlay the staged state of the matched paths onto HEAD's tree.
+    let updated_index = Index::parse(&fs::read(&index_path)?, format)?;
+    let staged: BTreeMap<Vec<u8>, (u32, ObjectId)> = updated_index
+        .entries
+        .iter()
+        .filter(|entry| index_entry_stage(entry) == 0)
+        .map(|entry| (entry.path.clone().into_bytes(), (entry.mode, entry.oid)))
+        .collect();
     for rel in &rel_paths {
-        let full = worktree_root.join(String::from_utf8_lossy(rel).as_ref());
-        match fs::read(&full) {
-            Ok(bytes) => {
-                let oid = db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
-                let mode = file_mode_for_commit(&full);
-                tree_map.insert(rel.clone(), (mode, oid));
+        match staged.get(rel) {
+            Some(entry) => {
+                tree_map.insert(rel.clone(), *entry);
             }
-            Err(_) => {
+            None => {
                 tree_map.remove(rel);
             }
         }
@@ -2447,37 +2512,11 @@ fn commit_partial_paths(
         }),
     });
     tx.commit()?;
-    // Refresh the touched index entries to the committed blobs.
-    for rel in &rel_paths {
-        index
-            .entries
-            .retain(|entry| entry.path.as_bytes() != rel.as_slice());
-        if let Some((mode, oid)) = tree_map.get(rel) {
-            index.entries.push(commands::merge_rebase::merge_index_entry(
-                rel, *mode, *oid, 0,
-            ));
-        }
-    }
-    index.entries.sort_by(|left, right| left.path.cmp(&right.path));
-    fs::write(&index_path, index.write(format)?)?;
     sley_sequencer::replay::post_commit_cleanup(git_dir);
     if !quiet {
         println!("{new_oid}");
     }
     Ok(())
-}
-
-fn file_mode_for_commit(path: &Path) -> u32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Ok(metadata) = fs::metadata(path)
-            && metadata.permissions().mode() & 0o111 != 0
-        {
-            return 0o100755;
-        }
-    }
-    0o100644
 }
 
 /// Write a tree object hierarchy from a flat `path -> (mode, oid)` map
