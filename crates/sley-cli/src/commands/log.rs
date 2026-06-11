@@ -2192,11 +2192,7 @@ fn print_log_format_with_children(
         .tokens
         .iter()
         .position(|token| matches!(token, FormatToken::Subject | FormatToken::SanitizedSubject));
-    let child_abbrev_len = if compiled
-        .tokens
-        .iter()
-        .any(|token| *token == FormatToken::OidFull)
-    {
+    let child_abbrev_len = if compiled.tokens.contains(&FormatToken::OidFull) {
         None
     } else {
         abbrev_len

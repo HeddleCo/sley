@@ -970,12 +970,16 @@ fn cmd_bisect_reset(args: &[String]) -> Result<()> {
 fn bisect_reset(repo: &BisectRepo, commit: Option<&str>) -> Result<i32> {
     let branch: String = match commit {
         None => {
+            // Upstream prints "We are not bisecting." only when BISECT_START
+            // exists but is empty (strbuf_read_file(...) == 0); a missing file
+            // resets silently.
             match fs::read_to_string(repo.state_path("BISECT_START")) {
-                Ok(contents) => contents.trim().to_string(),
-                Err(_) => {
+                Ok(contents) if contents.is_empty() => {
                     println!("We are not bisecting.");
                     String::new()
                 }
+                Ok(contents) => contents.trim_end().to_string(),
+                Err(_) => String::new(),
             }
         }
         Some(commit) => {
@@ -991,19 +995,19 @@ fn bisect_reset(repo: &BisectRepo, commit: Option<&str>) -> Result<i32> {
         }
     };
 
-    if !branch.is_empty() && !repo.state_path("BISECT_HEAD").exists() {
-        if cmd_checkout(&[
+    if !branch.is_empty()
+        && !repo.state_path("BISECT_HEAD").exists()
+        && cmd_checkout(&[
             "--ignore-other-worktrees".to_string(),
             branch.clone(),
             "--".to_string(),
         ])
         .is_err()
-        {
-            eprintln!(
-                "error: could not check out original HEAD '{branch}'. Try 'git bisect reset <commit>'."
-            );
-            return Ok(BISECT_FAILED);
-        }
+    {
+        eprintln!(
+            "error: could not check out original HEAD '{branch}'. Try 'git bisect reset <commit>'."
+        );
+        return Ok(BISECT_FAILED);
     }
     bisect_clean_state(repo)?;
     Ok(BISECT_OK)
@@ -1275,14 +1279,14 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
     let command = sq_quote_args(args.iter()).trim_start().to_string();
     let mut is_first_run = true;
     loop {
-        let mut res = do_bisect_run(&command)?;
+        let res = do_bisect_run(&command)?;
 
         // Exit code 126 and 127 can come from the shell when the script is
         // missing or not executable; verify with a known-good revision.
         if is_first_run && (res == 126 || res == 127) {
             let rc = verify_good(repo, terms, &command)?;
             is_first_run = false;
-            if rc < 0 || rc >= 128 {
+            if !(0..128).contains(&rc) {
                 eprintln!("error: unable to verify {command} on good revision");
                 return Ok(BISECT_FAILED);
             }
@@ -1292,7 +1296,7 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
             }
         }
 
-        if res < 0 || res >= 128 {
+        if !(0..128).contains(&res) {
             eprintln!("error: bisect run failed: exit code {res} from {command} is < 0 or >= 128");
             return Ok(res);
         }
@@ -1308,7 +1312,7 @@ fn bisect_run(repo: &BisectRepo, terms: &mut BisectTerms, args: &[String]) -> Re
         // Upstream redirects the state step's stdout into BISECT_RUN, then
         // prints the file.
         let mut buffer: Vec<u8> = Vec::new();
-        let state_res = bisect_state(repo, terms, &[new_state.clone()], &mut buffer)?;
+        let state_res = bisect_state(repo, terms, std::slice::from_ref(&new_state), &mut buffer)?;
         fs::write(repo.state_path("BISECT_RUN"), &buffer)?;
         io::stdout().write_all(&buffer)?;
         io::stdout().flush()?;
@@ -1447,15 +1451,15 @@ fn do_find_bisection(
     }
 
     // Count merges the expensive way first, with the halfway early exit.
-    for idx in 0..nr {
-        if weights[idx] != -2 {
+    for (idx, weight) in weights.iter_mut().enumerate() {
+        if *weight != -2 {
             continue;
         }
-        weights[idx] = count_distance(idx, parents);
-        if !find_all && approx_halfway(weights[idx], nr) {
+        *weight = count_distance(idx, parents);
+        if !find_all && approx_halfway(*weight, nr) {
             return Bisection {
                 picks: vec![idx],
-                reaches: weights[idx] as usize,
+                reaches: *weight as usize,
             };
         }
         counted += 1;
@@ -1485,8 +1489,7 @@ fn do_find_bisection(
         // best_bisection: maximize min(weight, nr - weight); first wins ties.
         let mut best = 0usize;
         let mut best_distance: i64 = -1;
-        for idx in 0..nr {
-            let weight = weights[idx];
+        for (idx, &weight) in weights.iter().enumerate() {
             let distance = weight.min(nr as i64 - weight);
             if distance > best_distance {
                 best = idx;

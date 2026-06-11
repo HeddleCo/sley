@@ -189,10 +189,13 @@ impl Graph {
         };
 
         let mapping_idx: usize;
-        if self.num_parents > 1 && idx.is_some() && self.merge_layout == -1 {
+        if self.num_parents > 1
+            && self.merge_layout == -1
+            && let Some(idx) = idx
+        {
             // First parent of a merge: pick the layout based on whether the
             // parent's column sits left of the merge.
-            let idx = idx.unwrap() as i64;
+            let idx = idx as i64;
             let dist = idx - i as i64;
             let shift = if dist > 1 { 2 * dist - 3 } else { 1 };
             self.merge_layout = if dist > 0 { 0 } else { 1 };
@@ -511,10 +514,8 @@ impl Graph {
                 }
             }
 
-            if Some(col_commit) == first_parent {
-                if i < num_columns {
-                    parent_col = Some(self.columns[i].clone());
-                }
+            if Some(col_commit) == first_parent && i < num_columns {
+                parent_col = Some(self.columns[i].clone());
             }
         }
 
