@@ -153,15 +153,22 @@ impl GrepOptions {
     }
 }
 
+/// Effective `grep.*` config decisions resolved from the layered config stream.
+struct GrepConfig {
+    pattern_type: PatternTypeOption,
+    extended: bool,
+    linenumber: Option<bool>,
+    column: Option<bool>,
+    fullname: Option<bool>,
+}
+
 /// Resolve the effective pattern type from config (`grep.patternType`,
 /// `grep.extendedRegexp`) plus the command-line override accumulated during argv
 /// parsing. Config order is file entries first, then `-c` injected parameters;
 /// `grep.patternType=default` resets to unspecified so a later
 /// `grep.extendedRegexp` can take effect. The command-line flags (`-E/-G/-F/-P`)
 /// override config entirely.
-fn resolve_pattern_config(
-    config: &GitConfig,
-) -> Result<(PatternTypeOption, bool, Option<bool>, Option<bool>, Option<bool>)> {
+fn resolve_pattern_config(config: &GitConfig) -> Result<GrepConfig> {
     let mut pattern_type = PatternTypeOption::Unspecified;
     let mut extended = false;
     let mut linenumber: Option<bool> = None;
@@ -201,7 +208,13 @@ fn resolve_pattern_config(
         apply(&param.canonical_key.to_ascii_lowercase(), param.value.as_deref())?;
     }
 
-    Ok((pattern_type, extended, linenumber, column, fullname))
+    Ok(GrepConfig {
+        pattern_type,
+        extended,
+        linenumber,
+        column,
+        fullname,
+    })
 }
 
 fn parse_pattern_type_arg(arg: &str) -> Result<PatternTypeOption> {
@@ -470,13 +483,16 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
 
     // Resolve config-driven pattern type + display defaults, then the CLI
     // override (`-E/-G/-F/-P` win over config).
-    let (mut pattern_type, extended, cfg_linenumber, cfg_column, cfg_fullname) =
-        resolve_pattern_config(repo.config())?;
+    let cfg = resolve_pattern_config(repo.config())?;
+    let cfg_linenumber = cfg.linenumber;
+    let cfg_column = cfg.column;
+    let cfg_fullname = cfg.fullname;
+    let mut pattern_type = cfg.pattern_type;
     if let Some(cli) = cli_pattern_type {
         pattern_type = cli;
     }
     if pattern_type == PatternTypeOption::Unspecified {
-        pattern_type = if extended {
+        pattern_type = if cfg.extended {
             PatternTypeOption::Ere
         } else {
             PatternTypeOption::Bre
@@ -495,20 +511,20 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     };
     // `grep.*` config sets the default; an explicit CLI flag (tracked by the
     // `_set` markers) overrides it. git applies config first, then CLI overrides.
-    if let Some(v) = cfg_linenumber {
-        if !opts.line_number_set {
-            opts.line_number = v;
-        }
+    if let Some(v) = cfg_linenumber
+        && !opts.line_number_set
+    {
+        opts.line_number = v;
     }
-    if let Some(v) = cfg_column {
-        if !opts.column_set {
-            opts.column = v;
-        }
+    if let Some(v) = cfg_column
+        && !opts.column_set
+    {
+        opts.column = v;
     }
-    if let Some(v) = cfg_fullname {
-        if !opts.full_name_set {
-            opts.full_name = v;
-        }
+    if let Some(v) = cfg_fullname
+        && !opts.full_name_set
+    {
+        opts.full_name = v;
     }
 
     // Disambiguate remaining positionals into revs and pathspecs, mirroring git:
@@ -1234,10 +1250,10 @@ fn compute_output_lines(
         // -p: prepend the enclosing function header (a `=` line) per hunk.
         for hit in hits {
             let center = hit.line_no - 1;
-            if let Some(header) = enclosing_function(lines, center) {
-                if !flags[header].selected {
-                    flags[header].function = true;
-                }
+            if let Some(header) = enclosing_function(lines, center)
+                && !flags[header].selected
+            {
+                flags[header].function = true;
             }
         }
     }
