@@ -1,0 +1,878 @@
+//! Shared pathspec primitive for sley.
+//!
+//! This crate owns the byte-faithful port of git's wildmatch engine
+//! (`wildmatch.c::dowild`) and the single-item pathspec matcher
+//! (`match_pathspec_item`), plus a [`Pathspec`] type that parses git's
+//! pathspec *magic* prefixes (`:(exclude)`, `:(icase)`, `:(literal)`,
+//! `:(glob)`, `:(top)`, `:(attr:...)`, and the shorthand `:!`/`:^`/`:/`).
+//!
+//! Four clusters consume this primitive: the rev-walk (`sley-rev`), diff,
+//! the worktree walker (`sley-worktree`, which re-exports the engine for its
+//! `ls-files` path), and the CLI. Keeping the wildmatch port and the magic
+//! parser in one low-level crate (depending only on `sley-core`) means there
+//! is exactly one implementation of git's matching semantics to keep in sync
+//! with the 2.54 oracle.
+//!
+//! STAGE-A scope: parsing + per-path `matches`. The TREESAME / history
+//! simplification that *consumes* a `Pathspec` to prune the rev-walk is
+//! STAGE-B; this crate only provides the matching primitive that stage will
+//! drive.
+
+/// A parsed pathspec element: a single pattern plus its magic flags.
+///
+/// Mirrors git's `struct pathspec_item` for the subset sley needs today.
+/// Construct with [`PathspecElement::parse`]; query with
+/// [`PathspecElement::matches`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathspecElement {
+    /// The match pattern with any magic prefix stripped (git's `item.match`).
+    pattern: Vec<u8>,
+    /// `:(exclude)` / `:!` / `:^` — this element subtracts from the set.
+    exclude: bool,
+    /// `:(icase)` — case-insensitive matching.
+    icase: bool,
+    /// `:(literal)` — wildcards are matched literally (no globbing).
+    literal: bool,
+    /// `:(glob)` — pathname-aware globbing (`**` required to cross `/`).
+    glob: bool,
+    /// `:(top)` / `:/` — match from the repository root (sley already matches
+    /// repo-relative paths from the root, so this is parsed and surfaced but
+    /// does not change single-path matching; it affects prefix handling that
+    /// the consuming cluster applies).
+    top: bool,
+    /// `:(attr:...)` attribute requirements, stored verbatim. Attribute-based
+    /// selection is not yet evaluated (STAGE-B+); the labels are retained so a
+    /// pathspec carrying them round-trips and the consumer can reject/honor
+    /// them explicitly rather than silently dropping them.
+    attrs: Vec<Vec<u8>>,
+}
+
+impl PathspecElement {
+    /// Parse one pathspec argument, honoring git's magic prefixes.
+    ///
+    /// Recognizes both the long form `:(magic1,magic2,...)pattern` and the
+    /// shorthand sigils `:!`/`:^` (exclude), `:/` (top). Defaults
+    /// (`literal`/`glob`/`icase` from the global `--*-pathspecs` flags) are
+    /// supplied via `defaults` and overridden per-element by any explicit
+    /// magic. Unknown long-form magic words are an error, matching git.
+    pub fn parse(arg: &[u8], defaults: PathspecMatchMagic) -> Result<Self, PathspecParseError> {
+        let mut exclude = false;
+        let mut icase = defaults.icase;
+        let mut literal = defaults.literal;
+        let mut glob = defaults.glob;
+        let mut top = false;
+        let mut attrs: Vec<Vec<u8>> = Vec::new();
+
+        let rest = if let Some(after) = arg.strip_prefix(b":(") {
+            // Long form: :(magic[,magic...])pattern
+            let close = after
+                .iter()
+                .position(|&c| c == b')')
+                .ok_or(PathspecParseError::UnterminatedMagic)?;
+            let magic = &after[..close];
+            for word in split_magic(magic) {
+                match word.as_slice() {
+                    b"exclude" => exclude = true,
+                    b"icase" => icase = true,
+                    b"literal" => literal = true,
+                    b"glob" => glob = true,
+                    b"top" => top = true,
+                    other => {
+                        if let Some(attr) = other.strip_prefix(b"attr:") {
+                            attrs.push(attr.to_vec());
+                        } else if other.is_empty() {
+                            // Empty magic word (e.g. trailing comma) — ignore,
+                            // matching git's lenient split.
+                        } else {
+                            return Err(PathspecParseError::UnknownMagic(other.to_vec()));
+                        }
+                    }
+                }
+            }
+            &after[close + 1..]
+        } else if let Some(after) = arg.strip_prefix(b":") {
+            // Shorthand sigils. git consumes a run of leading sigils.
+            let mut idx = 0;
+            while idx < after.len() {
+                match after[idx] {
+                    b'!' | b'^' => exclude = true,
+                    b'/' => top = true,
+                    _ => break,
+                }
+                idx += 1;
+            }
+            &after[idx..]
+        } else {
+            arg
+        };
+
+        // `:(glob)` and `:(literal)` are mutually exclusive in git.
+        if glob && literal {
+            return Err(PathspecParseError::GlobLiteralConflict);
+        }
+
+        Ok(PathspecElement {
+            pattern: rest.to_vec(),
+            exclude,
+            icase,
+            literal,
+            glob,
+            top,
+            attrs,
+        })
+    }
+
+    /// Whether this element is an `:(exclude)` element.
+    pub fn is_exclude(&self) -> bool {
+        self.exclude
+    }
+
+    /// Whether this element carries `:(top)` / `:/` magic.
+    pub fn is_top(&self) -> bool {
+        self.top
+    }
+
+    /// The attribute requirements carried by `:(attr:...)`, if any.
+    pub fn attrs(&self) -> &[Vec<u8>] {
+        &self.attrs
+    }
+
+    /// The bare match pattern (magic prefix stripped).
+    pub fn pattern(&self) -> &[u8] {
+        &self.pattern
+    }
+
+    /// The [`PathspecMatchMagic`] this element matches under.
+    fn magic(&self) -> PathspecMatchMagic {
+        PathspecMatchMagic {
+            literal: self.literal,
+            glob: self.glob,
+            icase: self.icase,
+        }
+    }
+
+    /// Whether `name` (a repo-relative path, no leading slash) is selected by
+    /// this single element, ignoring its exclude polarity. Use
+    /// [`Pathspec::matches`] for the combined include/exclude semantics.
+    pub fn matches_path(&self, name: &[u8]) -> bool {
+        pathspec_item_matches(&self.pattern, name, self.magic())
+    }
+}
+
+/// A full pathspec: an ordered list of [`PathspecElement`]s combining positive
+/// (include) and `:(exclude)` patterns.
+///
+/// Semantics (git `match_pathspec`): a path matches when at least one
+/// non-exclude element selects it AND no exclude element selects it. An
+/// all-exclude (or empty) pathspec matches everything not excluded — matching
+/// git, where `git log -- ':(exclude)foo'` keeps every path but `foo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pathspec {
+    elements: Vec<PathspecElement>,
+}
+
+impl Pathspec {
+    /// Parse a list of raw pathspec arguments under the given global magic
+    /// defaults (from `--{glob,noglob,literal,icase}-pathspecs`).
+    pub fn parse<I, S>(args: I, defaults: PathspecMatchMagic) -> Result<Self, PathspecParseError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<[u8]>,
+    {
+        let mut elements = Vec::new();
+        for arg in args {
+            elements.push(PathspecElement::parse(arg.as_ref(), defaults)?);
+        }
+        Ok(Pathspec { elements })
+    }
+
+    /// An empty pathspec matches every path.
+    pub fn is_empty(&self) -> bool {
+        self.elements.is_empty()
+    }
+
+    /// The parsed elements, in order.
+    pub fn elements(&self) -> &[PathspecElement] {
+        &self.elements
+    }
+
+    /// Whether `path` (repo-relative, no leading slash) is selected.
+    ///
+    /// An empty pathspec, or one with only excludes, matches any path the
+    /// excludes don't subtract — exactly git's `match_pathspec` behavior.
+    pub fn matches(&self, path: &[u8]) -> bool {
+        if self.elements.is_empty() {
+            return true;
+        }
+        let mut have_include = false;
+        let mut included = false;
+        for element in &self.elements {
+            if element.exclude {
+                if element.matches_path(path) {
+                    return false;
+                }
+            } else {
+                have_include = true;
+                if element.matches_path(path) {
+                    included = true;
+                }
+            }
+        }
+        // With at least one include, the path must hit one of them. With only
+        // excludes, anything not excluded is kept.
+        if have_include { included } else { true }
+    }
+}
+
+/// Split a `:(...)` magic body on commas (git's `parse_long_magic` separator).
+fn split_magic(body: &[u8]) -> Vec<Vec<u8>> {
+    body.split(|&c| c == b',').map(|w| w.to_vec()).collect()
+}
+
+/// Error parsing a pathspec magic prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathspecParseError {
+    /// A `:(` was not closed by a `)`.
+    UnterminatedMagic,
+    /// A long-form magic word git does not recognize.
+    UnknownMagic(Vec<u8>),
+    /// `:(glob)` and `:(literal)` were both requested.
+    GlobLiteralConflict,
+}
+
+impl core::fmt::Display for PathspecParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            PathspecParseError::UnterminatedMagic => {
+                write!(f, "Missing ')' at end of pathspec magic")
+            }
+            PathspecParseError::UnknownMagic(word) => {
+                write!(f, "Invalid pathspec magic '{}'", String::from_utf8_lossy(word))
+            }
+            PathspecParseError::GlobLiteralConflict => {
+                write!(f, "'literal' and 'glob' are incompatible")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PathspecParseError {}
+
+/// Pathspec match magic, mirroring git's `PATHSPEC_LITERAL`/`PATHSPEC_GLOB`/
+/// `PATHSPEC_ICASE`. Constructed from the global `--{glob,noglob,icase,literal}-pathspecs`
+/// options. Drives [`pathspec_item_matches`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PathspecMatchMagic {
+    pub literal: bool,
+    pub glob: bool,
+    pub icase: bool,
+}
+
+/// git `is_glob_special`: characters that make a pathspec a wildcard.
+fn is_glob_special(c: u8) -> bool {
+    matches!(c, b'*' | b'?' | b'[' | b'\\')
+}
+
+/// git `simple_length`: length of the literal prefix before the first glob-special
+/// character (or end of string).
+fn simple_length(s: &[u8]) -> usize {
+    for (i, &c) in s.iter().enumerate() {
+        if is_glob_special(c) {
+            return i;
+        }
+    }
+    s.len()
+}
+
+/// Case-aware byte comparison up to `n` bytes, honoring `icase` (git `ps_strncmp`).
+fn ps_strncmp(icase: bool, a: &[u8], b: &[u8], n: usize) -> bool {
+    // Returns true when the first `n` bytes are EQUAL (mirrors `!strncmp`).
+    let a = &a[..a.len().min(n)];
+    let b = &b[..b.len().min(n)];
+    if a.len() < n && b.len() < n && a.len() != b.len() {
+        return false;
+    }
+    let len = n.min(a.len()).min(b.len());
+    for i in 0..len {
+        let (mut ca, mut cb) = (a[i], b[i]);
+        if icase {
+            ca = ca.to_ascii_lowercase();
+            cb = cb.to_ascii_lowercase();
+        }
+        if ca != cb {
+            return false;
+        }
+    }
+    true
+}
+
+/// True if `path` contains a glob-special character.
+pub fn pathspec_is_glob(path: &[u8]) -> bool {
+    path.iter().any(|byte| matches!(byte, b'*' | b'?' | b'['))
+}
+
+/// Port of git's `match_pathspec_item` for the single-pathspec / single-name case
+/// (no prefix, no attr magic). `match_` is the pathspec, `name` is the candidate
+/// path. Returns whether the pathspec selects `name` (exactly, as a directory
+/// prefix, or via wildmatch). Byte-for-byte faithful to git 2.54 for the
+/// `ls-files -- <pathspec>` path that t3070 exercises.
+pub fn pathspec_item_matches(match_: &[u8], name: &[u8], magic: PathspecMatchMagic) -> bool {
+    let icase = magic.icase;
+    let matchlen = match_.len();
+    let namelen = name.len();
+
+    // nowildcard_len: with LITERAL magic the whole pattern is literal.
+    let nowildcard_len = if magic.literal {
+        matchlen
+    } else {
+        simple_length(match_)
+    };
+
+    // Empty pathspec matches everything (git: `if (!*match) return MATCHED_RECURSIVELY`).
+    if matchlen == 0 {
+        return true;
+    }
+
+    // Literal-prefix comparison.
+    if matchlen <= namelen && ps_strncmp(icase, match_, name, matchlen) {
+        if matchlen == namelen {
+            return true; // MATCHED_EXACTLY
+        }
+        if match_[matchlen - 1] == b'/' || name[matchlen] == b'/' {
+            return true; // MATCHED_RECURSIVELY
+        }
+    } else if match_[matchlen - 1] == b'/'
+        && namelen == matchlen - 1
+        && ps_strncmp(icase, match_, name, namelen)
+    {
+        // DO_MATCH_DIRECTORY case: pathspec `foo/` vs name `foo`.
+        return true;
+    }
+
+    // Wildcard match — git `git_fnmatch(item, match, name, nowildcard_len)`.
+    if nowildcard_len < matchlen {
+        // git strips the literal prefix off BOTH pattern and name before running
+        // wildmatch (so `foo**` vs `foo/bba/arr` becomes `**` vs `/bba/arr`).
+        if nowildcard_len > 0 && !ps_strncmp(icase, match_, name, nowildcard_len) {
+            return false;
+        }
+        let pat = &match_[nowildcard_len..];
+        if name.len() < nowildcard_len {
+            return false;
+        }
+        let str_ = &name[nowildcard_len..];
+
+        let flags = if magic.glob && !magic.literal {
+            WM_PATHNAME | if icase { WM_CASEFOLD } else { 0 }
+        } else {
+            // Default pathspec (no glob magic): pathmatch semantics.
+            if icase { WM_CASEFOLD } else { 0 }
+        };
+        if wildmatch(pat, str_, flags) {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Case-insensitive match flag (git `WM_CASEFOLD`).
+pub const WM_CASEFOLD: u32 = 1;
+/// Pathname-aware match flag (git `WM_PATHNAME`): `*`/`?` do not cross `/`,
+/// `**` is required to span directory separators.
+pub const WM_PATHNAME: u32 = 2;
+
+const WM_MATCH: i32 = 0;
+const WM_NOMATCH: i32 = 1;
+const WM_ABORT_ALL: i32 = -1;
+const WM_ABORT_TO_STARSTAR: i32 = -2;
+
+#[inline]
+fn wm_isascii(c: u8) -> bool {
+    c < 0x80
+}
+#[inline]
+fn wm_isupper(c: u8) -> bool {
+    wm_isascii(c) && c.is_ascii_uppercase()
+}
+#[inline]
+fn wm_islower(c: u8) -> bool {
+    wm_isascii(c) && c.is_ascii_lowercase()
+}
+#[inline]
+fn wm_tolower(c: u8) -> u8 {
+    c.to_ascii_lowercase()
+}
+#[inline]
+fn wm_toupper(c: u8) -> u8 {
+    c.to_ascii_uppercase()
+}
+#[inline]
+fn wm_is_glob_special(c: u8) -> bool {
+    matches!(c, b'*' | b'?' | b'[' | b'\\')
+}
+
+fn wm_cc_eq(class: &[u8], lit: &[u8]) -> bool {
+    class == lit
+}
+
+fn wm_class_matches(class: &[u8], t_ch: u8, flags: u32) -> Option<bool> {
+    // Returns Some(matched) for a recognized class, or None for a malformed
+    // class name (caller maps to WM_ABORT_ALL).
+    let m = if wm_cc_eq(class, b"alnum") {
+        wm_isascii(t_ch) && t_ch.is_ascii_alphanumeric()
+    } else if wm_cc_eq(class, b"alpha") {
+        wm_isascii(t_ch) && t_ch.is_ascii_alphabetic()
+    } else if wm_cc_eq(class, b"blank") {
+        wm_isascii(t_ch) && (t_ch == b' ' || t_ch == b'\t')
+    } else if wm_cc_eq(class, b"cntrl") {
+        wm_isascii(t_ch) && t_ch.is_ascii_control()
+    } else if wm_cc_eq(class, b"digit") {
+        wm_isascii(t_ch) && t_ch.is_ascii_digit()
+    } else if wm_cc_eq(class, b"graph") {
+        wm_isascii(t_ch) && t_ch.is_ascii_graphic()
+    } else if wm_cc_eq(class, b"lower") {
+        wm_islower(t_ch)
+    } else if wm_cc_eq(class, b"print") {
+        // ISPRINT: printable including space (0x20..=0x7e).
+        wm_isascii(t_ch) && (0x20..=0x7e).contains(&t_ch)
+    } else if wm_cc_eq(class, b"punct") {
+        wm_isascii(t_ch) && t_ch.is_ascii_punctuation()
+    } else if wm_cc_eq(class, b"space") {
+        wm_isascii(t_ch) && t_ch.is_ascii_whitespace()
+    } else if wm_cc_eq(class, b"upper") {
+        wm_isupper(t_ch) || ((flags & WM_CASEFOLD) != 0 && wm_islower(t_ch))
+    } else if wm_cc_eq(class, b"xdigit") {
+        wm_isascii(t_ch) && t_ch.is_ascii_hexdigit()
+    } else {
+        return None;
+    };
+    Some(m)
+}
+
+/// Faithful port of git's `wildmatch.c::dowild`. Returns one of the internal
+/// `WM_*` codes (`WM_MATCH`, `WM_NOMATCH`, `WM_ABORT_ALL`, `WM_ABORT_TO_STARSTAR`).
+fn dowild(pattern: &[u8], text: &[u8], flags: u32) -> i32 {
+    let p = pattern;
+    let mut pi = 0usize;
+    let mut ti = 0usize;
+
+    while pi < p.len() {
+        let mut p_ch = p[pi];
+        let t_ch_raw = if ti < text.len() { text[ti] } else { 0 };
+        let mut t_ch = t_ch_raw;
+
+        if t_ch == 0 && p_ch != b'*' {
+            return WM_ABORT_ALL;
+        }
+        if (flags & WM_CASEFOLD) != 0 && wm_isupper(t_ch) {
+            t_ch = wm_tolower(t_ch);
+        }
+        if (flags & WM_CASEFOLD) != 0 && wm_isupper(p_ch) {
+            p_ch = wm_tolower(p_ch);
+        }
+
+        match p_ch {
+            b'?' => {
+                if (flags & WM_PATHNAME) != 0 && t_ch == b'/' {
+                    return WM_NOMATCH;
+                }
+                // fallthrough: advance both
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+            b'*' => {
+                pi += 1;
+                let match_slash: bool;
+                if pi < p.len() && p[pi] == b'*' {
+                    let prev_p = pi; // index of the second '*'
+                    while pi < p.len() && p[pi] == b'*' {
+                        pi += 1;
+                    }
+                    if (flags & WM_PATHNAME) == 0 {
+                        match_slash = true;
+                    } else if (prev_p < 2 || p[prev_p - 2] == b'/')
+                        && (pi == p.len()
+                            || p[pi] == b'/'
+                            || (p[pi] == b'\\' && pi + 1 < p.len() && p[pi + 1] == b'/'))
+                    {
+                        if pi < p.len()
+                            && p[pi] == b'/'
+                            && dowild(&p[pi + 1..], &text[ti..], flags) == WM_MATCH
+                        {
+                            return WM_MATCH;
+                        }
+                        match_slash = true;
+                    } else {
+                        match_slash = false;
+                    }
+                } else {
+                    match_slash = (flags & WM_PATHNAME) == 0;
+                }
+
+                if pi == p.len() {
+                    // Trailing "**" matches everything; trailing "*" matches only
+                    // if there are no more slashes.
+                    if !match_slash && text[ti..].contains(&b'/') {
+                        return WM_ABORT_TO_STARSTAR;
+                    }
+                    return WM_MATCH;
+                } else if !match_slash && p[pi] == b'/' {
+                    // _one_ asterisk followed by a slash with WM_PATHNAME matches
+                    // the next directory.
+                    match text[ti..].iter().position(|&c| c == b'/') {
+                        None => return WM_ABORT_ALL,
+                        Some(off) => {
+                            ti += off; // point at the slash; consumed by loop end
+                        }
+                    }
+                    // emulate `break` then the for-loop's `text++; p++` increment:
+                    pi += 1;
+                    ti += 1;
+                    continue;
+                }
+
+                // The matching loop.
+                let mut cur_t = ti;
+                loop {
+                    let mut tc = if cur_t < text.len() { text[cur_t] } else { 0 };
+                    if tc == 0 {
+                        break;
+                    }
+                    if !wm_is_glob_special(p[pi]) {
+                        let mut pc = p[pi];
+                        if (flags & WM_CASEFOLD) != 0 && wm_isupper(pc) {
+                            pc = wm_tolower(pc);
+                        }
+                        loop {
+                            tc = if cur_t < text.len() { text[cur_t] } else { 0 };
+                            if tc == 0 {
+                                break;
+                            }
+                            if !(match_slash || tc != b'/') {
+                                break;
+                            }
+                            let mut tcf = tc;
+                            if (flags & WM_CASEFOLD) != 0 && wm_isupper(tcf) {
+                                tcf = wm_tolower(tcf);
+                            }
+                            if tcf == pc {
+                                break;
+                            }
+                            cur_t += 1;
+                        }
+                        // Recompute the casefolded tc for the comparison below.
+                        let tc_cmp = {
+                            let raw = if cur_t < text.len() { text[cur_t] } else { 0 };
+                            if (flags & WM_CASEFOLD) != 0 && wm_isupper(raw) {
+                                wm_tolower(raw)
+                            } else {
+                                raw
+                            }
+                        };
+                        if tc_cmp != pc {
+                            if match_slash {
+                                return WM_ABORT_ALL;
+                            } else {
+                                return WM_ABORT_TO_STARSTAR;
+                            }
+                        }
+                    }
+                    let matched = dowild(&p[pi..], &text[cur_t..], flags);
+                    if matched != WM_NOMATCH {
+                        if !match_slash || matched != WM_ABORT_TO_STARSTAR {
+                            return matched;
+                        }
+                    } else {
+                        let cur_raw = if cur_t < text.len() { text[cur_t] } else { 0 };
+                        if !match_slash && cur_raw == b'/' {
+                            return WM_ABORT_TO_STARSTAR;
+                        }
+                    }
+                    cur_t += 1;
+                }
+                return WM_ABORT_ALL;
+            }
+            b'[' => {
+                pi += 1;
+                let mut p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                if p_ch2 == b'^' {
+                    p_ch2 = b'!';
+                }
+                let negated = p_ch2 == b'!';
+                if negated {
+                    pi += 1;
+                    p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                }
+                let mut prev_ch: u8 = 0;
+                let mut matched = false;
+                loop {
+                    if p_ch2 == 0 {
+                        return WM_ABORT_ALL;
+                    }
+                    let mut next_prev: u8 = p_ch2;
+                    let mut skip_class = false;
+                    if p_ch2 == b'\\' {
+                        pi += 1;
+                        p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                        if p_ch2 == 0 {
+                            return WM_ABORT_ALL;
+                        }
+                        if t_ch == p_ch2 {
+                            matched = true;
+                        }
+                        next_prev = p_ch2;
+                    } else if p_ch2 == b'-'
+                        && prev_ch != 0
+                        && pi + 1 < p.len()
+                        && p[pi + 1] != b']'
+                    {
+                        pi += 1;
+                        p_ch2 = p[pi];
+                        if p_ch2 == b'\\' {
+                            pi += 1;
+                            p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                            if p_ch2 == 0 {
+                                return WM_ABORT_ALL;
+                            }
+                        }
+                        if t_ch <= p_ch2 && t_ch >= prev_ch {
+                            matched = true;
+                        } else if (flags & WM_CASEFOLD) != 0 && wm_islower(t_ch) {
+                            let t_up = wm_toupper(t_ch);
+                            if t_up <= p_ch2 && t_up >= prev_ch {
+                                matched = true;
+                            }
+                        }
+                        next_prev = 0;
+                    } else if p_ch2 == b'[' && pi + 1 < p.len() && p[pi + 1] == b':' {
+                        // [:class:]
+                        let s = pi + 2;
+                        let mut scan = s;
+                        loop {
+                            if scan >= p.len() {
+                                break;
+                            }
+                            if p[scan] == b']' {
+                                break;
+                            }
+                            scan += 1;
+                        }
+                        pi = scan;
+                        p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                        if p_ch2 == 0 {
+                            return WM_ABORT_ALL;
+                        }
+                        // i = p - s - 1 (length of class name); require trailing ':'
+                        let class_end = pi; // index of ']'
+                        if class_end < s + 1 || p[class_end - 1] != b':' {
+                            // Not a real [:class:]; treat '[' as a literal set member.
+                            pi = s.wrapping_sub(2);
+                            p_ch2 = b'[';
+                            if t_ch == p_ch2 {
+                                matched = true;
+                            }
+                            skip_class = true;
+                            next_prev = p_ch2;
+                        } else {
+                            let class = &p[s..class_end - 1];
+                            match wm_class_matches(class, t_ch, flags) {
+                                Some(true) => matched = true,
+                                Some(false) => {}
+                                None => return WM_ABORT_ALL,
+                            }
+                            next_prev = 0;
+                        }
+                    } else if t_ch == p_ch2 {
+                        matched = true;
+                    }
+
+                    let _ = skip_class;
+                    // next: advance to the next class char
+                    prev_ch = next_prev;
+                    pi += 1;
+                    p_ch2 = if pi < p.len() { p[pi] } else { 0 };
+                    if p_ch2 == b']' {
+                        break;
+                    }
+                }
+                if matched == negated || ((flags & WM_PATHNAME) != 0 && t_ch == b'/') {
+                    return WM_NOMATCH;
+                }
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+            b'\\' => {
+                // Literal match with the following character. p[pi+1]=='\0'
+                // failure is handled by the default arm below.
+                pi += 1;
+                let lit = if pi < p.len() { p[pi] } else { 0 };
+                let lit = if (flags & WM_CASEFOLD) != 0 && wm_isupper(lit) {
+                    wm_tolower(lit)
+                } else {
+                    lit
+                };
+                if t_ch != lit {
+                    return WM_NOMATCH;
+                }
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+            _ => {
+                if t_ch != p_ch {
+                    return WM_NOMATCH;
+                }
+                pi += 1;
+                ti += 1;
+                continue;
+            }
+        }
+    }
+
+    if ti < text.len() && text[ti] != 0 {
+        WM_NOMATCH
+    } else {
+        WM_MATCH
+    }
+}
+
+/// Match `pattern` against `text` with git's `wildmatch` semantics.
+/// `flags` is a bitwise-OR of [`WM_CASEFOLD`] and [`WM_PATHNAME`].
+pub fn wildmatch(pattern: &[u8], text: &[u8], flags: u32) -> bool {
+    dowild(pattern, text, flags) == WM_MATCH
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ps(args: &[&str]) -> Pathspec {
+        Pathspec::parse(args.iter().map(|s| s.as_bytes()), PathspecMatchMagic::default())
+            .expect("valid pathspec")
+    }
+
+    #[test]
+    fn empty_pathspec_matches_everything() {
+        let p = Pathspec::default();
+        assert!(p.is_empty());
+        assert!(p.matches(b"any/path"));
+    }
+
+    #[test]
+    fn literal_prefix_matches_directory_recursively() {
+        let p = ps(&["src"]);
+        assert!(p.matches(b"src"));
+        assert!(p.matches(b"src/lib.rs"));
+        assert!(!p.matches(b"srcs/lib.rs"));
+        assert!(!p.matches(b"other"));
+    }
+
+    #[test]
+    fn exclude_subtracts_from_includes() {
+        let p = ps(&["src", ":(exclude)src/gen"]);
+        assert!(p.matches(b"src/lib.rs"));
+        assert!(!p.matches(b"src/gen/x.rs"));
+    }
+
+    #[test]
+    fn exclude_shorthand_sigils() {
+        for spec in [":!foo", ":^foo"] {
+            let p = ps(&[spec]);
+            assert!(p.elements()[0].is_exclude());
+            // exclude-only pathspec keeps everything but the excluded path.
+            assert!(p.matches(b"bar"));
+            assert!(!p.matches(b"foo"));
+        }
+    }
+
+    #[test]
+    fn icase_magic_folds_case() {
+        let p = ps(&[":(icase)readme"]);
+        assert!(p.matches(b"README"));
+        assert!(p.matches(b"readme"));
+        let plain = ps(&["readme"]);
+        assert!(!plain.matches(b"README"));
+    }
+
+    #[test]
+    fn glob_magic_is_pathname_aware() {
+        // :(glob)*.rs uses WM_PATHNAME so `*` does not cross `/`.
+        let p = ps(&[":(glob)*.rs"]);
+        assert!(p.matches(b"lib.rs"));
+        assert!(!p.matches(b"src/lib.rs"));
+        // ** spans directories under glob magic.
+        let pp = ps(&[":(glob)**/*.rs"]);
+        assert!(pp.matches(b"src/lib.rs"));
+    }
+
+    #[test]
+    fn literal_magic_disables_wildcards() {
+        let p = ps(&[":(literal)a*b"]);
+        assert!(p.matches(b"a*b"));
+        assert!(!p.matches(b"axxb"));
+    }
+
+    #[test]
+    fn top_magic_is_parsed() {
+        let p = ps(&[":(top)src", ":/other"]);
+        assert!(p.elements()[0].is_top());
+        assert!(p.elements()[1].is_top());
+    }
+
+    #[test]
+    fn attr_magic_is_retained() {
+        let p = ps(&[":(attr:binary)data"]);
+        assert_eq!(p.elements()[0].attrs(), &[b"binary".to_vec()]);
+        assert_eq!(p.elements()[0].pattern(), b"data");
+    }
+
+    #[test]
+    fn combined_magic_words() {
+        let p = ps(&[":(exclude,icase)Cargo.lock"]);
+        let el = &p.elements()[0];
+        assert!(el.is_exclude());
+        // exclude is case-insensitive: CARGO.LOCK is subtracted too.
+        assert!(!p.matches(b"CARGO.LOCK"));
+    }
+
+    fn parse_err(arg: &[u8]) -> PathspecParseError {
+        match Pathspec::parse([arg], PathspecMatchMagic::default()) {
+            Ok(_) => panic!("expected parse error for {:?}", String::from_utf8_lossy(arg)),
+            Err(e) => e,
+        }
+    }
+
+    #[test]
+    fn glob_literal_conflict_is_error() {
+        assert_eq!(
+            parse_err(b":(glob,literal)x"),
+            PathspecParseError::GlobLiteralConflict
+        );
+    }
+
+    #[test]
+    fn unknown_magic_is_error() {
+        assert!(matches!(
+            parse_err(b":(bogus)x"),
+            PathspecParseError::UnknownMagic(_)
+        ));
+    }
+
+    #[test]
+    fn unterminated_magic_is_error() {
+        assert_eq!(
+            parse_err(b":(exclude"),
+            PathspecParseError::UnterminatedMagic
+        );
+    }
+
+    #[test]
+    fn exclude_only_keeps_unmatched() {
+        let p = ps(&[":(exclude)target"]);
+        assert!(p.matches(b"src/lib.rs"));
+        assert!(!p.matches(b"target/debug"));
+    }
+}

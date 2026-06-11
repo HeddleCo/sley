@@ -1277,6 +1277,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sley-pathspec"
+version = "0.1.0"
+dependencies = [
+ "sley-core",
+]
+
+[[package]]
 name = "sley-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1379,6 +1386,7 @@ dependencies = [
  "sley-index",
  "sley-object",
  "sley-odb",
+ "sley-pathspec",
  "sley-refs",
 ]
 

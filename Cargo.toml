@@ -9,6 +9,7 @@ members = [
     "crates/sley-protocol",
     "crates/sley-odb",
     "crates/sley-refs",
+    "crates/sley-pathspec",
     "crates/sley-rev",
     "crates/sley-worktree",
     "crates/sley-diff-merge",
