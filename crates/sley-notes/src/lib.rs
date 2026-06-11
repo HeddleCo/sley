@@ -564,7 +564,9 @@ fn commit_notes_update(
             old_oid,
             new_oid: commit_oid,
             committer: identity.committer.clone(),
-            message: message.as_bytes().to_vec(),
+            // git prefixes the notes reflog message with "notes: " (the commit
+            // message itself is left unprefixed).
+            message: format!("notes: {message}").into_bytes(),
         }),
     });
     tx.commit()?;
