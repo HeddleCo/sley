@@ -294,6 +294,7 @@ pub fn notes_ref_expected(store: &FileRefStore, notes_ref: &NotesRef) -> Result<
 /// `ref_expected` is the compare-and-swap precondition on the notes ref:
 /// `None` means the ref must not exist; [`Some`](RefTarget::Direct) means it must
 /// point at that oid. Use [`notes_ref_expected`] for legacy auto-detection.
+#[allow(clippy::too_many_arguments)]
 pub fn write_notes(
     git_dir: &Path,
     format: ObjectFormat,
@@ -320,6 +321,7 @@ pub fn write_notes(
 /// Incrementally upsert a single note, reading any fanout layout and writing a
 /// flat sorted tree. Returns [`UpsertNoteOutcome::Unchanged`] when `annotated`
 /// already maps to `blob`.
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_note_for(
     git_dir: &Path,
     format: ObjectFormat,
@@ -352,6 +354,7 @@ pub fn upsert_note_for(
 }
 
 /// Write `body` as a blob, then call [`upsert_note_for`].
+#[allow(clippy::too_many_arguments)]
 pub fn upsert_note_bytes_for(
     git_dir: &Path,
     format: ObjectFormat,
@@ -363,7 +366,7 @@ pub fn upsert_note_bytes_for(
     identity: &NotesCommitIdentity,
     ref_expected: Option<RefTarget>,
 ) -> Result<UpsertNoteOutcome> {
-    let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let blob = db.write_object(EncodedObject::new(ObjectType::Blob, body.to_vec()))?;
     upsert_note_for(
         git_dir,
@@ -379,6 +382,7 @@ pub fn upsert_note_bytes_for(
 }
 
 /// Remove the note for a single annotated object, if present.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_note_for(
     git_dir: &Path,
     format: ObjectFormat,
@@ -404,6 +408,7 @@ pub fn remove_note_for(
 /// Remove notes for `annotated` in a single fast-forward commit when any are
 /// present. Returns [`RemoveNoteOutcome::Unchanged`] when the ref is absent or
 /// none of the oids have notes.
+#[allow(clippy::too_many_arguments)]
 pub fn remove_notes_for(
     git_dir: &Path,
     format: ObjectFormat,
@@ -560,6 +565,7 @@ fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<O
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit_notes_update(
     git_dir: &Path,
     format: ObjectFormat,

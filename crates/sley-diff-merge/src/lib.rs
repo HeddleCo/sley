@@ -4595,7 +4595,7 @@ mod tests {
         let root = temp_root();
         let layout = RepositoryLayout::init_at(&root, ObjectFormat::Sha1, false)
             .expect("test operation should succeed");
-        let mut db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&layout.git_dir, ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
             .expect("test operation should succeed");

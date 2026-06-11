@@ -446,7 +446,7 @@ fn update_index_paths_impl(
             checksum: None,
         }
     };
-    let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     // Build the `.gitattributes` matcher ONCE for the whole batch when clean
     // filters are in play. `apply_clean_filter` rebuilds it from scratch on every
     // call — and `AttributeMatcher::from_worktree_root` walks the entire worktree
@@ -7385,7 +7385,7 @@ mod tests {
         body.extend_from_slice(b"committer Test <test@example.com> 0 +0000\n");
         body.extend_from_slice(b"\n");
         body.extend_from_slice(b"sparse fixture\n");
-        let mut odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+        let odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
             .expect("test operation should succeed");
@@ -7809,7 +7809,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(format!("tree {tree}\n").as_bytes());
         body.extend_from_slice(b"author T <t@e> 0 +0000\ncommitter T <t@e> 0 +0000\n\nm\n");
-        let mut odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
             .expect("test operation should succeed");

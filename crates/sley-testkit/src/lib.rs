@@ -1814,7 +1814,7 @@ pub fn sha256_loose_object_interop_parity() -> Result<LooseObjectInteropParity> 
         run_git(&root, ["init", "-q", "--object-format=sha256"], &[])?;
         let body = b"hello from sha256 loose object\n";
         let object = EncodedObject::new(ObjectType::Blob, body.to_vec());
-        let mut store = LooseObjectStore::from_git_dir(root.join(".git"), ObjectFormat::Sha256);
+        let store = LooseObjectStore::from_git_dir(root.join(".git"), ObjectFormat::Sha256);
         let oid = store.write_object(object)?;
         let upstream_type = String::from_utf8_lossy(&run_git_owned(
             &root,

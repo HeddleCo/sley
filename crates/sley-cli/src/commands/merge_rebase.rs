@@ -874,17 +874,16 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
 
     let ours_label = "HEAD".to_string();
     let theirs_label = target.clone();
-    let mut write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
 
     // Recursive merge of the merge bases into a single virtual ancestor tree
     // (the merge-recursive "virtual ancestor" — git's behaviour for a
     // criss-cross history with >1 merge base). With a single base this is just
     // that base's tree, so the common case is unchanged.
-    let base_map =
-        virtual_ancestor_entry_map(&mut write_db, format, &bases, &common_git_dir)?;
+    let base_map = virtual_ancestor_entry_map(&write_db, format, &bases, &common_git_dir)?;
 
     let (results, conflicts) = three_way_merge_trees_with_favor(
-        &mut write_db,
+        &write_db,
         format,
         &base_map,
         &ours_map,
@@ -1991,9 +1990,9 @@ fn rebase_replay_commits(
         let base_map = stash_tree_entry_map(db, format, &parent_tree)?;
         let ours_map = stash_tree_entry_map(db, format, &ours_tree)?;
         let theirs_map = stash_tree_entry_map(db, format, &theirs_tree)?;
-        let mut write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+        let write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
         let (results, conflicts) = three_way_merge_trees(
-            &mut write_db,
+            &write_db,
             format,
             &base_map,
             &ours_map,

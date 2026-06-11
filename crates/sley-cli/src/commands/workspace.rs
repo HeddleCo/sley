@@ -2122,6 +2122,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if all {
         commit_stage_tracked_changes(&git_dir, format)?;
     }
+    // Emptiness is judged before the signoff trailer is added (git aborts
+    // `commit -m "" -s`).
+    let empty_before_signoff = commit_message_is_empty(
+        &commands::tag::tag_message_with_trailers(message.clone(), &trailers),
+    );
     let mut message = if signoff {
         commands::replay::append_signoff_before_comments(message, &commit_signoff_from_env()?)
     } else {
@@ -2188,6 +2193,10 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             author_override.is_none() && !reset_author,
             quiet,
         );
+    }
+    if !allow_empty_message && empty_before_signoff && !use_editor {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
     }
     if !allow_empty_message && commit_message_is_empty(&message) {
         eprintln!("Aborting commit due to empty commit message.");
