@@ -226,7 +226,7 @@ fn setup_explicit(gitdirenv: &str, cwd: &Path) -> Option<SetupResult> {
     // returns the prefix.
     if let Some(prefix) = relative_inside(&worktree, &cwd_canon) {
         // set_git_dir(gitdirenv, 1): realpath the gitdir.
-        let abs_gitdir = path_to_string(&gitdir_dir);
+        let abs_gitdir = path_to_string(&canonicalize_or(&gitdir_dir));
         return Some(SetupResult {
             git_dir: abs_gitdir.clone(),
             common_dir: common_dir_for(&abs_gitdir, &gitdir_dir),
@@ -392,7 +392,7 @@ fn setup_explicit_from_discovered(
     }
 
     if let Some(prefix) = relative_inside(&worktree, &cwd_canon) {
-        let abs_gitdir = path_to_string(gitdir_dir);
+        let abs_gitdir = path_to_string(&canonicalize_or(gitdir_dir));
         return Some(SetupResult {
             git_dir: abs_gitdir.clone(),
             common_dir: common_dir_for(&abs_gitdir, gitdir_dir),
