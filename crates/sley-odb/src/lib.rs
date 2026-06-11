@@ -1149,6 +1149,106 @@ pub fn build_midx_bitmap(
     build_reachability_bitmap(db, format, midx_checksum, &bit_order, preferred_tips)
 }
 
+/// Upstream `bitmap_builder_init`'s `num_maximal` counter (pack-bitmap-write.c):
+/// walk the first-parent ancestry of the selected commits, children before
+/// parents, propagating per-commit "which selected commits reach me" masks.
+/// A commit counts as maximal when it is selected, or when distinct selected
+/// lineages converge on it (its mask gains bits its last contributing child
+/// did not carry). Only the count is needed (for the trace2 data event), so no
+/// reverse-edge bookkeeping is kept.
+fn bitmap_num_maximal_commits(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    selected: &[ObjectId],
+) -> Result<usize> {
+    // First-parent subgraph reachable from the selected commits.
+    let mut first_parent: HashMap<ObjectId, Option<ObjectId>> = HashMap::new();
+    let mut stack: Vec<ObjectId> = selected.to_vec();
+    while let Some(oid) = stack.pop() {
+        if first_parent.contains_key(&oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        let parent = commit.parents.first().copied();
+        first_parent.insert(oid, parent);
+        if let Some(parent) = parent {
+            stack.push(parent);
+        }
+    }
+    // Children-before-parents order (Kahn over the single first-parent edge).
+    let mut pending_children: HashMap<ObjectId, usize> = HashMap::new();
+    for parent in first_parent.values().flatten() {
+        *pending_children.entry(*parent).or_default() += 1;
+    }
+    let word_count = selected.len().div_ceil(64);
+    struct MaximalEnt {
+        mask: Vec<u64>,
+        maximal: bool,
+    }
+    let mut ents: HashMap<ObjectId, MaximalEnt> = HashMap::new();
+    for (bit, oid) in selected.iter().enumerate() {
+        let ent = ents.entry(*oid).or_insert_with(|| MaximalEnt {
+            mask: vec![0u64; word_count],
+            maximal: true,
+        });
+        ent.mask[bit / 64] |= 1u64 << (bit % 64);
+        ent.maximal = true;
+    }
+    let mut queue: Vec<ObjectId> = first_parent
+        .keys()
+        .filter(|oid| pending_children.get(*oid).copied().unwrap_or(0) == 0)
+        .copied()
+        .collect();
+    let mut num_maximal = 0usize;
+    while let Some(oid) = queue.pop() {
+        if let Some(ent) = ents.remove(&oid) {
+            if ent.maximal {
+                num_maximal += 1;
+            }
+            if let Some(Some(parent)) = first_parent.get(&oid) {
+                match ents.entry(*parent) {
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        // Fresh parent mask: c_not_p, !p_not_c -> not maximal.
+                        vacant.insert(MaximalEnt {
+                            mask: ent.mask.clone(),
+                            maximal: false,
+                        });
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                        let parent_ent = occupied.get_mut();
+                        let c_not_p = ent
+                            .mask
+                            .iter()
+                            .zip(&parent_ent.mask)
+                            .any(|(child, parent)| child & !parent != 0);
+                        if c_not_p {
+                            let p_not_c = parent_ent
+                                .mask
+                                .iter()
+                                .zip(&ent.mask)
+                                .any(|(parent, child)| parent & !child != 0);
+                            for (parent, child) in parent_ent.mask.iter_mut().zip(&ent.mask) {
+                                *parent |= child;
+                            }
+                            parent_ent.maximal = p_not_c;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(Some(parent)) = first_parent.get(&oid)
+            && let Some(remaining) = pending_children.get_mut(parent)
+        {
+            *remaining -= 1;
+            if *remaining == 0 {
+                queue.push(*parent);
+            }
+        }
+    }
+    Ok(num_maximal)
+}
+
 /// Shared write half: `bit_order` lists every covered object's oid in bit
 /// order (pack order for a single pack, pseudo-pack order for a midx);
 /// `checksum` fills the BITM checksum field (pack checksum / midx checksum).
@@ -1241,6 +1341,17 @@ fn build_reachability_bitmap(
             selected.push(chosen);
             i += next + 1;
         }
+    }
+
+    // Trace2 selection counters (upstream bitmap_builder_init): emitted before
+    // the closure walk, like upstream emits them before building the ewah
+    // bitmaps. Computing num_maximal_commits needs its own first-parent walk,
+    // so it only runs when the trace2 event target is active.
+    if std::env::var_os("GIT_TRACE2_EVENT").is_some() {
+        let selected_oids: Vec<ObjectId> = selected.iter().map(|commit| commit.oid).collect();
+        let num_maximal = bitmap_num_maximal_commits(db, format, &selected_oids)?;
+        sley_core::trace2::data("pack-bitmap-write", "num_selected_commits", selected.len());
+        sley_core::trace2::data("pack-bitmap-write", "num_maximal_commits", num_maximal);
     }
 
     // Reachability closures, oldest-first so newer walks stop at memoised
@@ -1448,11 +1559,33 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     if !bitmap_path.exists() {
         return Ok(None);
     }
-    let Some(reverse_index) = &midx.reverse_index else {
-        // Without the RIDX permutation the bit numbering is unknown.
-        return Ok(None);
-    };
     let object_count = midx.objects.len();
+    // Upstream `load_midx_revindex`: prefer the midx's own RIDX chunk unless
+    // GIT_TEST_MIDX_READ_RIDX=0 disables it, else fall back to the separate
+    // `multi-pack-index-<checksum>.rev` file; a trace2 data event records
+    // which source supplied the permutation.
+    let read_ridx_chunk = env::var("GIT_TEST_MIDX_READ_RIDX")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let reverse_index: Vec<u32> = match (&midx.reverse_index, read_ridx_chunk) {
+        (Some(chunk), true) => {
+            sley_core::trace2::data("load_midx_revindex", "source", "midx");
+            chunk.clone()
+        }
+        _ => {
+            let rev_path =
+                pack_dir.join(format!("multi-pack-index-{}.rev", midx.checksum.to_hex()));
+            let Ok(rev_bytes) = fs::read(&rev_path) else {
+                // Without the RIDX permutation the bit numbering is unknown.
+                return Ok(None);
+            };
+            let Ok(parsed_rev) = sley_pack::PackReverseIndex::parse(&rev_bytes, format, object_count) else {
+                return Ok(None);
+            };
+            sley_core::trace2::data("load_midx_revindex", "source", "rev");
+            parsed_rev.positions
+        }
+    };
     let Ok(bitmap_bytes) = fs::read(&bitmap_path) else {
         return Ok(None);
     };
@@ -1467,7 +1600,7 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     // midx.objects is in lookup (oid-sorted) order; RIDX maps bit positions
     // to lookup positions.
     let mut pack_to_oid = Vec::with_capacity(object_count);
-    for &midx_pos in reverse_index {
+    for &midx_pos in &reverse_index {
         let Some(entry) = midx.objects.get(midx_pos as usize) else {
             return Ok(None);
         };

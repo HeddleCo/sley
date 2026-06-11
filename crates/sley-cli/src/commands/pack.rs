@@ -3,6 +3,7 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_pack::PackReverseIndex;
 
 #[derive(Debug)]
 struct IndexPackOptions {
@@ -1354,6 +1355,27 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
 
     fs::write(pack_dir.join("multi-pack-index"), &midx)?;
 
+    // GIT_TEST_MIDX_WRITE_REV=1 (t5327): additionally write the bit-order
+    // permutation as a separate `multi-pack-index-<checksum>.rev` file, the
+    // way upstream's write_midx_reverse_index does alongside the RIDX chunk.
+    let rev_name = format!("multi-pack-index-{}.rev", midx_checksum.to_hex());
+    let write_rev_file = write_bitmap
+        && env::var("GIT_TEST_MIDX_WRITE_REV").is_ok_and(|value| value == "1" || value == "true");
+    if write_rev_file {
+        let mut pseudo: Vec<u32> = (0..objects.len() as u32).collect();
+        let preferred = preferred_pack.unwrap_or(0);
+        pseudo.sort_by_key(|&midx_pos| {
+            let object = &objects[midx_pos as usize];
+            (
+                object.pack_int_id != preferred,
+                object.pack_int_id,
+                object.offset,
+            )
+        });
+        let rev_bytes = PackReverseIndex::write(format, &pseudo, &midx_checksum)?;
+        fs::write(pack_dir.join(&rev_name), &rev_bytes)?;
+    }
+
     // Clear midx bitmap/rev sidecars that don't belong to this write: stale
     // checksums always; the current checksum's too when no bitmap was asked
     // for (upstream clear_midx_files_ext keeps only what it just wrote).
@@ -1365,6 +1387,7 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
         if name.starts_with("multi-pack-index-")
             && (name.ends_with(".bitmap") || name.ends_with(".rev"))
             && (!write_bitmap || name != bitmap_name)
+            && (!write_rev_file || name != rev_name)
         {
             let _ = fs::remove_file(&path);
         }
