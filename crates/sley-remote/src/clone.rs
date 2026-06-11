@@ -97,6 +97,9 @@ pub struct CloneOptions<'a> {
     /// the fetch the destination checks out this commit detached instead of
     /// creating `checkout_branch`; `refs/remotes/<origin>/HEAD` is not written.
     pub detached_head: Option<ObjectId>,
+    /// Partial-clone object filter (`--filter=blob:none`) to apply to the
+    /// clone fetch. Only honored by the in-process local server.
+    pub filter: Option<sley_odb::PackObjectFilter>,
 }
 
 /// The structured result of a [`clone`].
@@ -187,7 +190,7 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             common_git_dir: remote_common_git_dir.clone(),
         },
     };
-    let fetch_options = clone_fetch_options(request.options.depth);
+    let fetch_options = clone_fetch_options(request.options.depth, request.options.filter);
     fetch(
         crate::fetch::FetchRequest {
             git_dir: &git_dir,
@@ -288,7 +291,10 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 /// `FETCH_HEAD`, the requested shallow `depth`, and otherwise neutral (no prune, no
 /// `--tags`, not a dry run, not appending). Mirrors the options the CLI's clone
 /// paths passed.
-fn clone_fetch_options(depth: Option<u32>) -> FetchOptions {
+fn clone_fetch_options(
+    depth: Option<u32>,
+    filter: Option<sley_odb::PackObjectFilter>,
+) -> FetchOptions {
     FetchOptions {
         quiet: true,
         auto_follow_tags: true,
@@ -301,5 +307,6 @@ fn clone_fetch_options(depth: Option<u32>) -> FetchOptions {
         prune_option_explicit: false,
         depth,
         merge_src: None,
+        filter,
     }
 }

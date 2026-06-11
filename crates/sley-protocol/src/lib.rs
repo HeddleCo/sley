@@ -579,6 +579,58 @@ pub fn write_fetch_head(writer: &mut impl Write, records: &[FetchHeadRecord]) ->
     Ok(())
 }
 
+/// Match an abbreviated refspec source against the advertised refs the way
+/// upstream's `find_ref_by_name_abbrev` (remote.c) does: score each
+/// advertisement with `refname_match`'s `ref_rev_parse_rules` (exact name
+/// first, then `refs/<name>`, `refs/tags/<name>`, `refs/heads/<name>`,
+/// `refs/remotes/<name>`, `refs/remotes/<name>/HEAD`) and keep the best.
+fn find_advertised_ref_by_name_abbrev<'a>(
+    refs: &'a [RefAdvertisement],
+    name: &str,
+) -> Option<&'a RefAdvertisement> {
+    let mut best: Option<(&RefAdvertisement, usize)> = None;
+    for reference in refs {
+        let score = fetch_refname_match_score(name, &reference.name);
+        if score > best.map(|(_, score)| score).unwrap_or(0) {
+            best = Some((reference, score));
+        }
+    }
+    best.map(|(reference, _)| reference)
+}
+
+/// `refname_match` (refs.c): non-zero when `abbrev` can mean `full`, with the
+/// magnitude giving disambiguation precedence (earlier rules win).
+fn fetch_refname_match_score(abbrev: &str, full: &str) -> usize {
+    let expansions = [
+        abbrev.to_string(),
+        format!("refs/{abbrev}"),
+        format!("refs/tags/{abbrev}"),
+        format!("refs/heads/{abbrev}"),
+        format!("refs/remotes/{abbrev}"),
+        format!("refs/remotes/{abbrev}/HEAD"),
+    ];
+    for (index, candidate) in expansions.iter().enumerate() {
+        if candidate == full {
+            return expansions.len() - index;
+        }
+    }
+    0
+}
+
+/// Qualify a fetch refspec destination the way upstream's `get_local_ref`
+/// (remote.c) does: `refs/...` stays as-is, `heads/`, `tags/` and `remotes/`
+/// gain a `refs/` prefix, and anything else lands under `refs/heads/`.
+fn fetch_local_ref_name(name: &str) -> String {
+    if name.starts_with("refs/") {
+        name.to_string()
+    } else if name.starts_with("heads/") || name.starts_with("tags/") || name.starts_with("remotes/")
+    {
+        format!("refs/{name}")
+    } else {
+        format!("refs/heads/{name}")
+    }
+}
+
 pub fn plan_fetch_ref_updates(
     refs: &[RefAdvertisement],
     refspecs: &[RefSpec],
@@ -615,12 +667,12 @@ pub fn plan_fetch_ref_updates(
         if refspec_is_excluded(&negative, src)? {
             continue;
         }
-        let Some(reference) = refs.iter().find(|reference| reference.name == src) else {
+        let Some(reference) = find_advertised_ref_by_name_abbrev(refs, src) else {
             return Err(GitError::reference_not_found(format!("remote ref {src}")));
         };
         updates.push(FetchRefUpdate {
             src: reference.name.clone(),
-            dst: refspec.dst.clone(),
+            dst: refspec.dst.as_deref().map(fetch_local_ref_name),
             oid: reference.oid,
             not_for_merge: false,
         });

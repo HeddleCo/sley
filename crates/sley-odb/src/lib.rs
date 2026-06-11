@@ -337,12 +337,193 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let Some(pack) = build_reachable_pack(source, format, starts, excluded)? else {
+    build_and_install_reachable_pack_filtered(
+        source,
+        destination,
+        format,
+        starts,
+        excluded,
+        options,
+        None,
+    )
+}
+
+/// A partial-clone object filter applied while building a transfer pack.
+///
+/// Mirrors the subset of upstream's `list-objects-filter` the in-process local
+/// server supports: directly-wanted tips are always packed; the filter only
+/// prunes objects reached *through* the traversal (upstream's
+/// `filter_blobs_none` runs on traversed blobs, never on wanted tips).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackObjectFilter {
+    /// `blob:none`: omit every blob reached through tree traversal.
+    BlobNone,
+}
+
+/// [`build_and_install_reachable_pack`] with an optional partial-clone
+/// `filter`. With `Some(BlobNone)`, blobs are dropped from the pack unless
+/// they are directly wanted (named in `starts`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_install_reachable_pack_filtered<R, I>(
+    source: &R,
+    destination: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: RawPackInstallOptions,
+    filter: Option<PackObjectFilter>,
+) -> Result<Option<PackInstallResult>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let starts: Vec<ObjectId> = starts.into_iter().collect();
+    let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
+    let mut objects = collect_reachable_pack_objects(source, format, starts, excluded)?;
+    match filter {
+        Some(PackObjectFilter::BlobNone) => {
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
+            });
+        }
+        None => {}
+    }
+    if objects.is_empty() {
         return Ok(None);
-    };
+    }
+    let inputs = pack_inputs(&objects);
+    let pack = PackFile::write_packed_with_known_ids(&inputs, format)?;
     destination
         .install_generated_pack_unchecked(&pack, options)
         .map(Some)
+}
+
+/// Assemble a pack stream that reuses an existing pack's object data verbatim
+/// (upstream pack-objects' "pack reuse" fast path, full-pack case) and appends
+/// `appended` as freshly encoded undeltified entries.
+///
+/// The reused pack's entry bytes are copied as-is between our own header and
+/// trailer: a full-pack copy preserves every relative distance, so internal
+/// `OFS_DELTA` bases stay valid. The header object count covers both the
+/// reused and appended entries, and the trailing pack checksum is recomputed
+/// over the assembled stream.
+pub fn assemble_pack_with_verbatim_reuse(
+    format: ObjectFormat,
+    reused_pack_bytes: &[u8],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    assemble_pack_with_verbatim_reuses(format, &[reused_pack_bytes], appended)
+}
+
+/// Like [`assemble_pack_with_verbatim_reuse`], but concatenates multiple whole
+/// packs before appending fresh entries.
+pub fn assemble_pack_with_verbatim_reuses(
+    format: ObjectFormat,
+    reused_packs: &[&[u8]],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    let hash_len = format.raw_len();
+    let mut reused_count = 0u32;
+    let mut capacity = 12 + hash_len + 64 * appended.len();
+    for reused_pack_bytes in reused_packs {
+        if reused_pack_bytes.len() < 12 + hash_len {
+            return Err(GitError::InvalidFormat("reused pack too short".into()));
+        }
+        if &reused_pack_bytes[..4] != b"PACK" {
+            return Err(GitError::InvalidFormat("reused pack has no signature".into()));
+        }
+        let version = u32::from_be_bytes([
+            reused_pack_bytes[4],
+            reused_pack_bytes[5],
+            reused_pack_bytes[6],
+            reused_pack_bytes[7],
+        ]);
+        if version != 2 {
+            return Err(GitError::Unsupported(format!("reused pack version {version}")));
+        }
+        let count = u32::from_be_bytes([
+            reused_pack_bytes[8],
+            reused_pack_bytes[9],
+            reused_pack_bytes[10],
+            reused_pack_bytes[11],
+        ]);
+        reused_count = reused_count
+            .checked_add(count)
+            .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+        capacity = capacity.saturating_add(reused_pack_bytes.len().saturating_sub(12 + hash_len));
+    }
+    let total = reused_count
+        .checked_add(appended.len() as u32)
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    for reused_pack_bytes in reused_packs {
+        out.extend_from_slice(&reused_pack_bytes[12..reused_pack_bytes.len() - hash_len]);
+    }
+    for input in appended {
+        write_undeltified_pack_entry(&mut out, input.object)?;
+    }
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    Ok((out, reused_count))
+}
+
+/// Assemble a pack stream by copying already-encoded pack entries verbatim and
+/// appending freshly encoded undeltified entries.
+pub fn assemble_pack_with_verbatim_entries(
+    format: ObjectFormat,
+    reused_entries: &[&[u8]],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    let reused_count = u32::try_from(reused_entries.len())
+        .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+    let total = reused_count
+        .checked_add(appended.len() as u32)
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+
+    let mut capacity = 12 + format.raw_len() + 64 * appended.len();
+    for entry in reused_entries {
+        capacity = capacity.saturating_add(entry.len());
+    }
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    for entry in reused_entries {
+        out.extend_from_slice(entry);
+    }
+    for input in appended {
+        write_undeltified_pack_entry(&mut out, input.object)?;
+    }
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    Ok((out, reused_count))
+}
+
+/// Append one undeltified pack entry (type/size varint header + zlib body).
+fn write_undeltified_pack_entry(out: &mut Vec<u8>, object: &EncodedObject) -> Result<()> {
+    let type_bits: u8 = match object.object_type {
+        ObjectType::Commit => 1,
+        ObjectType::Tree => 2,
+        ObjectType::Blob => 3,
+        ObjectType::Tag => 4,
+    };
+    let mut size = object.body.len() as u64;
+    let mut byte = (type_bits << 4) | (size & 0x0f) as u8;
+    size >>= 4;
+    while size > 0 {
+        out.push(byte | 0x80);
+        byte = (size & 0x7f) as u8;
+        size >>= 7;
+    }
+    out.push(byte);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&object.body)?;
+    out.extend_from_slice(&encoder.finish()?);
+    Ok(())
 }
 
 /// Outcome of consolidating every object in a repository into a single pack.
@@ -380,6 +561,93 @@ pub struct RepackResult {
 /// [`install_repack_result`].
 ///
 /// Returns `Ok(None)` when the repository contains no objects at all.
+/// `git repack -a`'s gathering rule: pack the reachability closure of `roots`
+/// (ref tips, `HEAD`, reflog entries, indexed objects) instead of everything
+/// on disk. Borrowed objects (alternates) reachable from the roots are packed
+/// into the new local pack like upstream `pack-objects --all` without
+/// `--local`; previously-packed objects that are no longer reachable are NOT
+/// carried forward (that is how `repack -a -d` drops them). Missing objects
+/// are tolerated (stale reflog entries may reference pruned history).
+///
+/// Returns `Ok(None)` when no roots resolve to any object.
+pub fn repack_reachable_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut objects: Vec<ReachablePackObject> = Vec::new();
+    let mut pending: Vec<ObjectId> = roots.to_vec();
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                pending.extend(commit.parents);
+                pending.push(commit.tree);
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body) {
+                    let entry = entry?;
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+        objects.push(ReachablePackObject { oid, object });
+    }
+    if objects.is_empty() {
+        return Ok(None);
+    }
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+
+    // Every pre-existing local pack is superseded under `-a` (their reachable
+    // objects are in the new pack; their unreachable ones are being dropped).
+    let new_pack_file_name = format!("pack-{}.pack", written.checksum.to_hex());
+    let obsolete_packs = existing_pack_files(&objects_dir.join("pack"))?
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some(&new_pack_file_name))
+        .collect();
+
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs,
+        packed_loose,
+        pack_checksum,
+        index_entries,
+    }))
+}
+
 pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
@@ -435,6 +703,50 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         packed_loose,
         pack_checksum: written.checksum,
         index_entries: written.entries,
+    }))
+}
+
+/// Gather only loose objects in `git_dir` and write them into a new pack.
+///
+/// This is the engine for plain `git repack -d` (without `-a`): existing packs
+/// remain in place, and pruning removes only the loose copies that the new pack
+/// now serves.
+pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let loose_oids = loose_object_ids(&objects_dir, format)?;
+    if loose_oids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut objects = Vec::with_capacity(loose_oids.len());
+    for oid in &loose_oids {
+        objects.push(ReachablePackObject {
+            oid: *oid,
+            object: database.read_object(oid)?,
+        });
+    }
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_oids
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs: Vec::new(),
+        packed_loose,
+        pack_checksum,
+        index_entries,
     }))
 }
 
@@ -1096,6 +1408,106 @@ pub fn build_midx_bitmap(
     build_reachability_bitmap(db, format, midx_checksum, &bit_order, preferred_tips)
 }
 
+/// Upstream `bitmap_builder_init`'s `num_maximal` counter (pack-bitmap-write.c):
+/// walk the first-parent ancestry of the selected commits, children before
+/// parents, propagating per-commit "which selected commits reach me" masks.
+/// A commit counts as maximal when it is selected, or when distinct selected
+/// lineages converge on it (its mask gains bits its last contributing child
+/// did not carry). Only the count is needed (for the trace2 data event), so no
+/// reverse-edge bookkeeping is kept.
+fn bitmap_num_maximal_commits(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    selected: &[ObjectId],
+) -> Result<usize> {
+    // First-parent subgraph reachable from the selected commits.
+    let mut first_parent: HashMap<ObjectId, Option<ObjectId>> = HashMap::new();
+    let mut stack: Vec<ObjectId> = selected.to_vec();
+    while let Some(oid) = stack.pop() {
+        if first_parent.contains_key(&oid) {
+            continue;
+        }
+        let object = db.read_object(&oid)?;
+        let commit = Commit::parse_ref(format, &object.body)?;
+        let parent = commit.parents.first().copied();
+        first_parent.insert(oid, parent);
+        if let Some(parent) = parent {
+            stack.push(parent);
+        }
+    }
+    // Children-before-parents order (Kahn over the single first-parent edge).
+    let mut pending_children: HashMap<ObjectId, usize> = HashMap::new();
+    for parent in first_parent.values().flatten() {
+        *pending_children.entry(*parent).or_default() += 1;
+    }
+    let word_count = selected.len().div_ceil(64);
+    struct MaximalEnt {
+        mask: Vec<u64>,
+        maximal: bool,
+    }
+    let mut ents: HashMap<ObjectId, MaximalEnt> = HashMap::new();
+    for (bit, oid) in selected.iter().enumerate() {
+        let ent = ents.entry(*oid).or_insert_with(|| MaximalEnt {
+            mask: vec![0u64; word_count],
+            maximal: true,
+        });
+        ent.mask[bit / 64] |= 1u64 << (bit % 64);
+        ent.maximal = true;
+    }
+    let mut queue: Vec<ObjectId> = first_parent
+        .keys()
+        .filter(|oid| pending_children.get(*oid).copied().unwrap_or(0) == 0)
+        .copied()
+        .collect();
+    let mut num_maximal = 0usize;
+    while let Some(oid) = queue.pop() {
+        if let Some(ent) = ents.remove(&oid) {
+            if ent.maximal {
+                num_maximal += 1;
+            }
+            if let Some(Some(parent)) = first_parent.get(&oid) {
+                match ents.entry(*parent) {
+                    std::collections::hash_map::Entry::Vacant(vacant) => {
+                        // Fresh parent mask: c_not_p, !p_not_c -> not maximal.
+                        vacant.insert(MaximalEnt {
+                            mask: ent.mask.clone(),
+                            maximal: false,
+                        });
+                    }
+                    std::collections::hash_map::Entry::Occupied(mut occupied) => {
+                        let parent_ent = occupied.get_mut();
+                        let c_not_p = ent
+                            .mask
+                            .iter()
+                            .zip(&parent_ent.mask)
+                            .any(|(child, parent)| child & !parent != 0);
+                        if c_not_p {
+                            let p_not_c = parent_ent
+                                .mask
+                                .iter()
+                                .zip(&ent.mask)
+                                .any(|(parent, child)| parent & !child != 0);
+                            for (parent, child) in parent_ent.mask.iter_mut().zip(&ent.mask) {
+                                *parent |= child;
+                            }
+                            parent_ent.maximal = p_not_c;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(Some(parent)) = first_parent.get(&oid)
+            && let Some(remaining) = pending_children.get_mut(parent)
+        {
+            *remaining -= 1;
+            if *remaining == 0 {
+                queue.push(*parent);
+            }
+        }
+    }
+    Ok(num_maximal)
+}
+
 /// Shared write half: `bit_order` lists every covered object's oid in bit
 /// order (pack order for a single pack, pseudo-pack order for a midx);
 /// `checksum` fills the BITM checksum field (pack checksum / midx checksum).
@@ -1188,6 +1600,17 @@ fn build_reachability_bitmap(
             selected.push(chosen);
             i += next + 1;
         }
+    }
+
+    // Trace2 selection counters (upstream bitmap_builder_init): emitted before
+    // the closure walk, like upstream emits them before building the ewah
+    // bitmaps. Computing num_maximal_commits needs its own first-parent walk,
+    // so it only runs when the trace2 event target is active.
+    if std::env::var_os("GIT_TRACE2_EVENT").is_some() {
+        let selected_oids: Vec<ObjectId> = selected.iter().map(|commit| commit.oid).collect();
+        let num_maximal = bitmap_num_maximal_commits(db, format, &selected_oids)?;
+        sley_core::trace2::data("pack-bitmap-write", "num_selected_commits", selected.len());
+        sley_core::trace2::data("pack-bitmap-write", "num_maximal_commits", num_maximal);
     }
 
     // Reachability closures, oldest-first so newer walks stop at memoised
@@ -1395,11 +1818,33 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     if !bitmap_path.exists() {
         return Ok(None);
     }
-    let Some(reverse_index) = &midx.reverse_index else {
-        // Without the RIDX permutation the bit numbering is unknown.
-        return Ok(None);
-    };
     let object_count = midx.objects.len();
+    // Upstream `load_midx_revindex`: prefer the midx's own RIDX chunk unless
+    // GIT_TEST_MIDX_READ_RIDX=0 disables it, else fall back to the separate
+    // `multi-pack-index-<checksum>.rev` file; a trace2 data event records
+    // which source supplied the permutation.
+    let read_ridx_chunk = env::var("GIT_TEST_MIDX_READ_RIDX")
+        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    let reverse_index: Vec<u32> = match (&midx.reverse_index, read_ridx_chunk) {
+        (Some(chunk), true) => {
+            sley_core::trace2::data("load_midx_revindex", "source", "midx");
+            chunk.clone()
+        }
+        _ => {
+            let rev_path =
+                pack_dir.join(format!("multi-pack-index-{}.rev", midx.checksum.to_hex()));
+            let Ok(rev_bytes) = fs::read(&rev_path) else {
+                // Without the RIDX permutation the bit numbering is unknown.
+                return Ok(None);
+            };
+            let Ok(parsed_rev) = sley_pack::PackReverseIndex::parse(&rev_bytes, format, object_count) else {
+                return Ok(None);
+            };
+            sley_core::trace2::data("load_midx_revindex", "source", "rev");
+            parsed_rev.positions
+        }
+    };
     let Ok(bitmap_bytes) = fs::read(&bitmap_path) else {
         return Ok(None);
     };
@@ -1414,7 +1859,7 @@ fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<Load
     // midx.objects is in lookup (oid-sorted) order; RIDX maps bit positions
     // to lookup positions.
     let mut pack_to_oid = Vec::with_capacity(object_count);
-    for &midx_pos in reverse_index {
+    for &midx_pos in &reverse_index {
         let Some(entry) = midx.objects.get(midx_pos as usize) else {
             return Ok(None);
         };

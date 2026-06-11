@@ -2898,6 +2898,7 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         prune_option_explicit: false,
         depth: None,
         merge_src,
+        filter: None,
     };
     pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;

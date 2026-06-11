@@ -7,6 +7,65 @@ use std::str::FromStr;
 
 pub const UPSTREAM_GIT_COMPAT_VERSION: &str = "2.54.0";
 
+/// Minimal trace2 event-target support (`GIT_TRACE2_EVENT`).
+///
+/// Upstream's trace2 event target writes one JSON object per line to the file
+/// named by `GIT_TRACE2_EVENT`. sley emits only the `data` events the test
+/// suite asserts on (`test_trace2_data` greps for the contiguous
+/// `"category":"...","key":"...","value":"..."` triple), with the same field
+/// order trace2's `fn_data_fl` produces. Unset/unwritable targets are
+/// silently ignored, like upstream's best-effort tracing.
+pub mod trace2 {
+    use std::fmt::Display;
+    use std::fmt::Write as _;
+    use std::io::Write;
+
+    fn escape_json(raw: &str) -> String {
+        let mut out = String::with_capacity(raw.len());
+        for ch in raw.chars() {
+            match ch {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                ch if (ch as u32) < 0x20 => {
+                    let _ = write!(out, "\\u{:04x}", ch as u32);
+                }
+                ch => out.push(ch),
+            }
+        }
+        out
+    }
+
+    /// Emit a trace2 `data` event (upstream `trace2_data_string` /
+    /// `trace2_data_intmax`): a JSON line appended to the `GIT_TRACE2_EVENT`
+    /// file when that target is enabled.
+    pub fn data(category: &str, key: &str, value: impl Display) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_EVENT") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        // Upstream accepts absolute paths (and fd/unix-socket forms sley does
+        // not support); only path-like targets are honored here.
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "{{\"event\":\"data\",\"sid\":\"sley\",\"thread\":\"main\",\"nesting\":1,\"category\":\"{}\",\"key\":\"{}\",\"value\":\"{}\"}}\n",
+            escape_json(category),
+            escape_json(key),
+            escape_json(&value.to_string()),
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ObjectFormat {
     Sha1,
