@@ -90,19 +90,39 @@ jobs:
         env:
           GIT_SRC_DIR: /tmp/git-src
           GIT_TEST_DEFAULT_HASH: sha1
-          # The floor-gated subset: the 9 foundational t-files sley tracks.
-          # t2400 has no command-name alias in the runner, so we pass exact
-          # filenames via SLEY_TESTS (overrides the runner's default subset).
+          # The floor-gated subset. MUST stay in sync with the floors table in
+          # .github/workflows/scripts/check-parity-floors.sh: every tracked
+          # floor file has to be listed here or the gate fails with "tracked
+          # file absent from summary". Exact filenames via SLEY_TESTS
+          # (overrides the runner's default subset).
           SLEY_TESTS: >-
             t0001-init.sh
+            t0027-auto-crlf.sh
             t1006-cat-file.sh
             t1007-hash-object.sh
             t1300-config.sh
             t1401-symbolic-ref.sh
+            t1461-refs-list.sh
+            t1462-refs-exists.sh
             t1500-rev-parse.sh
+            t1510-repo-setup.sh
+            t2020-checkout-detach.sh
+            t2107-update-index-basic.sh
             t2400-worktree-add.sh
             t3000-ls-files-others.sh
+            t3070-wildmatch.sh
             t3103-ls-tree-misc.sh
+            t3200-branch.sh
+            t3301-notes.sh
+            t3501-revert-cherry-pick.sh
+            t4202-log.sh
+            t4205-log-pretty-formats.sh
+            t6003-rev-list-topo-order.sh
+            t6012-rev-list-simplify.sh
+            t6300-for-each-ref.sh
+            t6423-merge-rename-directories.sh
+            t7004-tag.sh
+            t7810-grep.sh
           SLEY_RUN_LABEL: ${{ github.sha }}
         run: |
           export SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley"
