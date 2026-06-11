@@ -6741,6 +6741,46 @@ fn emit_compiled_log_format(
             idx += 1;
             continue;
         }
+        // A magic prefix (`%-`/`%+`/`% `) wraps the *next* placeholder: it adds a
+        // leading newline/space when the placeholder is non-empty, or deletes a
+        // preceding newline when it is empty (git's `format_commit_item`).
+        if let FormatToken::Magic(magic) = token {
+            idx += 1;
+            if idx >= tokens.len() {
+                continue;
+            }
+            let mut captured = Vec::new();
+            emit_log_one_token(
+                &tokens[idx],
+                record,
+                context,
+                &mut captured,
+                &author_name,
+                &author_email,
+                &committer_name,
+                &committer_email,
+                &author_timestamp,
+                &committer_timestamp,
+            )?;
+            idx += 1;
+            match magic {
+                log_format::MagicPrefix::DelLfBeforeEmpty if captured.is_empty() => {
+                    while out.last() == Some(&b'\n') {
+                        out.pop();
+                    }
+                }
+                log_format::MagicPrefix::AddLfBeforeNonEmpty if !captured.is_empty() => {
+                    out.push(b'\n');
+                    out.extend_from_slice(&captured);
+                }
+                log_format::MagicPrefix::AddSpBeforeNonEmpty if !captured.is_empty() => {
+                    out.push(b' ');
+                    out.extend_from_slice(&captured);
+                }
+                _ => out.extend_from_slice(&captured),
+            }
+            continue;
+        }
         // A padding directive captures the *next* token group (any leading
         // color modifiers plus one content placeholder), pads it, and appends.
         if let FormatToken::Padding(spec) = token {
@@ -7038,7 +7078,7 @@ fn emit_log_one_token(
                 // git's reference coloring at emission sites that need it.
                 let _ = color;
             }
-            FormatToken::Padding(_) | FormatToken::Wrap(_) => {
+            FormatToken::Padding(_) | FormatToken::Wrap(_) | FormatToken::Magic(_) => {
                 // Handled by the outer state machine in emit_compiled_log_format.
             }
             FormatToken::StashDecoParen
@@ -7577,7 +7617,8 @@ fn emit_compiled_log_format_metadata(
             | FormatToken::Trailers(_)
             | FormatToken::Decorate(_)
             | FormatToken::Describe(_)
-            | FormatToken::ColorAuto => {}
+            | FormatToken::ColorAuto
+            | FormatToken::Magic(_) => {}
         }
     }
     Ok(())
@@ -7801,7 +7842,8 @@ pub(crate) fn emit_compiled_stash_format(
             | FormatToken::Trailers(_)
             | FormatToken::Decorate(_)
             | FormatToken::Describe(_)
-            | FormatToken::ColorAuto => {}
+            | FormatToken::ColorAuto
+            | FormatToken::Magic(_) => {}
         }
     }
     Ok(())

@@ -171,6 +171,19 @@ pub(crate) enum FormatToken {
     /// `%C(...)` color directive that should still flush pending padding even
     /// though it produces no visible width (matches git's modifier handling).
     ColorAuto,
+    /// A `%-`/`%+`/`% ` magic prefix applied to the following placeholder.
+    Magic(MagicPrefix),
+}
+
+/// git's per-placeholder magic prefix (`%-`/`%+`/`% `).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MagicPrefix {
+    /// `%-`: delete preceding newline(s) when the placeholder is empty.
+    DelLfBeforeEmpty,
+    /// `%+`: insert a newline before a non-empty placeholder.
+    AddLfBeforeNonEmpty,
+    /// `% `: insert a space before a non-empty placeholder.
+    AddSpBeforeNonEmpty,
 }
 
 /// Flush direction for a `%<`/`%>`/`%><`/`%>>` padding directive.
@@ -276,6 +289,28 @@ impl CompiledLogFormat {
             if ch != '%' {
                 push_literal(&mut tokens, ch);
                 continue;
+            }
+            // A magic prefix (`%-`/`%+`/`% `) applies to the *following*
+            // placeholder. `%+w()`/`% w()`/`%-w()` are refused by git (the magic
+            // cannot reorder wrap output), so a following `w(` falls back to a
+            // verbatim `%`.
+            if let Some(&magic_ch) = chars.peek()
+                && matches!(magic_ch, '-' | '+' | ' ')
+            {
+                let mut after = chars.clone();
+                after.next(); // skip the magic char
+                if after.peek() == Some(&'w') {
+                    // `%±w(...)` — git refuses; emit a verbatim '%'.
+                    push_literal(&mut tokens, '%');
+                    continue;
+                }
+                let prefix = match magic_ch {
+                    '-' => MagicPrefix::DelLfBeforeEmpty,
+                    '+' => MagicPrefix::AddLfBeforeNonEmpty,
+                    _ => MagicPrefix::AddSpBeforeNonEmpty,
+                };
+                tokens.push(FormatToken::Magic(prefix));
+                chars.next(); // consume the magic char; placeholder follows
             }
             // Complex directives (`%<`, `%>`, `%w(`, `%(...)`) need byte-accurate
             // slicing of the remainder, so peek the rest of the format and parse
