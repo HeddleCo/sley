@@ -56,21 +56,19 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut date_mode = ForEachRefDateMode::Default;
     let mut positional_only = false;
     let mut not = false;
+    let mut pathspecs: Vec<String> = Vec::new();
+    let mut full_history = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
-            add_rev_list_revision_arg(
-                arg,
-                not,
-                &mut includes,
-                &mut excludes,
-                &mut linear_ranges,
-                &mut symmetric_ranges,
-            )?;
+            // After `--`, every remaining argument is a pathspec, never a
+            // revision (git: `setup_revisions` switches to prune_data here).
+            pathspecs.push(arg.to_string());
             continue;
         }
         match arg.as_str() {
             "--" => positional_only = true,
+            "--full-history" => full_history = true,
             "--not" => not = !not,
             "--default" => {
                 default_revision = Some(
@@ -85,12 +83,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--count" => count = true,
             "--no-count" => count = false,
             "--topo-order" => ordering = RevListOrdering::Topo,
-            "--date-order" | "--author-date-order" => ordering = RevListOrdering::Date,
+            "--date-order" => ordering = RevListOrdering::Date,
+            "--author-date-order" => ordering = RevListOrdering::AuthorDate,
             "--sparse"
             | "--dense"
             | "--remove-empty"
             | "--unpacked"
-            | "--full-history"
             | "--simplify-merges"
             | "--show-pulls"
             | "--exclude-promisor-objects" => {}
@@ -684,6 +682,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
         && (matches!(pretty, RevListPretty::Default) || metadata_format.is_some())
         && matches!(object_filter, RevListObjectFilter::None)
+        && pathspecs.is_empty()
+        && !full_history
         && !objects
         && !objects_edge
         && disk_usage.is_none()
@@ -833,9 +833,34 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         (RevListWalkMode::NoWalkSorted, RevListOrdering::Default) => rev_list_date_order(selected)?,
         (RevListWalkMode::NoWalkUnsorted, RevListOrdering::Default) => selected,
         (RevListWalkMode::Walk, RevListOrdering::Default) => rev_list_date_order(selected)?,
-        (_, RevListOrdering::Topo) => rev_list_topo_order(selected),
+        (_, RevListOrdering::Topo) => rev_list_topo_order(selected)?,
         (_, RevListOrdering::Date) => rev_list_date_order(selected)?,
+        (_, RevListOrdering::AuthorDate) => rev_list_author_date_order(selected)?,
     };
+    // Pathspec-limited / --full-history simplification: TREESAME-prune the
+    // ordered set and rewrite parents past the dropped commits. Held in an
+    // owned binding so `selected` (a Vec of references) can borrow from it.
+    let simplified_storage;
+    if !pathspecs.is_empty() || full_history {
+        let pathspec = sley_rev::Pathspec::parse(
+            pathspecs.iter().map(|p| p.as_bytes()),
+            sley_rev::PathspecMatchMagic::default(),
+        )
+        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+        let ordered_owned: Vec<sley_rev::CommitRecord> =
+            selected.iter().map(|r| (*r).clone()).collect();
+        simplified_storage = sley_rev::simplify_history(
+            &db,
+            format,
+            ordered_owned,
+            &pathspec,
+            sley_rev::SimplifyOptions {
+                full_history,
+                first_parent,
+            },
+        )?;
+        selected = simplified_storage.iter().collect();
+    }
     if skip_count > 0 {
         selected = selected.into_iter().skip(skip_count).collect();
     }

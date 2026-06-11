@@ -1424,6 +1424,438 @@ pub fn walk_commits<R: ObjectReader>(
 }
 
 // ---------------------------------------------------------------------------
+// TREESAME / pathspec-limited history simplification (STAGE-B)
+//
+// Faithful port of the subset of git's revision.c history-simplification needed
+// for pathspec-limited `log`/`rev-list`: per-commit TREESAME classification
+// (`try_to_simplify_commit`/`rev_compare_tree`), the default simplification that
+// follows only the TREESAME parent and drops unchanged commits, `--full-history`
+// (keep every commit that touches the paths plus the merges that join them), and
+// parent rewriting (`rewrite_parents`/`rewrite_one`).
+// ---------------------------------------------------------------------------
+
+/// Flags controlling history simplification, mirroring the relevant `rev_info`
+/// fields. `--simplify-merges`, `--show-pulls`, and `--ancestry-path` are
+/// STAGE-C; this struct carries the STAGE-B subset.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimplifyOptions {
+    /// `--full-history`: keep every commit whose limited tree-diff is non-empty
+    /// against *any* parent (and the merges that join those lines), rather than
+    /// the default which follows a single TREESAME parent.
+    pub full_history: bool,
+    /// `--first-parent`: TREESAME is computed only against the first parent, and
+    /// rewriting follows only the first parent.
+    pub first_parent: bool,
+}
+
+/// Per-commit simplification flags computed during the TREESAME pass.
+#[derive(Debug, Clone, Default)]
+struct CommitSimplify {
+    /// git's `TREESAME` object flag: the commit does not change any pathspec-
+    /// matched path relative to its relevant parent(s).
+    treesame: bool,
+    /// The parent list after default-mode diversion. In `try_to_simplify_commit`,
+    /// when a merge is REV_TREE_SAME to one of its parents (and we are doing
+    /// dense, non-`--full-history` simplification), git truncates the parent list
+    /// to *just that parent* and diverts the whole walk down it — the other merge
+    /// sides are discarded. `None` means "use the commit's real parents" (no
+    /// diversion happened); `Some(list)` is the diverted (single-parent) list.
+    simplified_parents: Option<Vec<ObjectId>>,
+}
+
+/// Resolve a commit's tree oid, preferring the already-parsed record.
+fn commit_tree_oid(record: &CommitRecord) -> ObjectId {
+    record.commit.tree
+}
+
+/// git's `rev_compare_tree` reduced to the SAME/!SAME decision the default and
+/// `--full-history` simplifications need: are `parent_tree` and `commit_tree`
+/// identical across every path the pathspec matches?
+///
+/// Mirrors `diff_tree_oid` limited by the pathspec: we diff the two trees
+/// (rename-blind, exactly as git's pruning diff is) and report SAME iff no
+/// changed path is matched by the pathspec. An empty pathspec matches every
+/// path, so it reduces to "are the trees equal".
+fn tree_same_for_pathspec(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    parent_tree: &ObjectId,
+    commit_tree: &ObjectId,
+    pathspec: &Pathspec,
+) -> Result<bool> {
+    if parent_tree == commit_tree {
+        return Ok(true);
+    }
+    // Rename-blind name-status diff — git's pruning diff never detects renames.
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: false,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: false,
+    };
+    let changes = sley_diff_merge::diff_name_status_trees_with_options(
+        db,
+        format,
+        parent_tree,
+        commit_tree,
+        options,
+    )?;
+    for entry in &changes {
+        if pathspec.is_empty() || pathspec.matches(entry.path.as_bytes()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// git's `rev_same_tree_as_empty` for the pathspec subset: is `commit_tree`
+/// empty of every pathspec-matched path (i.e. a root commit adds nothing the
+/// pathspec cares about)?
+fn tree_same_as_empty_for_pathspec(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    commit_tree: &ObjectId,
+    pathspec: &Pathspec,
+) -> Result<bool> {
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: false,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: false,
+    };
+    let changes = sley_diff_merge::diff_name_status_empty_tree_with_options(
+        db,
+        format,
+        commit_tree,
+        options,
+    )?;
+    for entry in &changes {
+        if pathspec.is_empty() || pathspec.matches(entry.path.as_bytes()) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Compute the `TREESAME` flag for every commit in `records`, limited by
+/// `pathspec`. `reachable` is the set of oids in `records` so we can tell a
+/// "relevant" (on-graph) parent from a boundary one — git's `relevant_commit`.
+///
+/// Faithful to `try_to_simplify_commit`'s dense-mode logic: a root commit is
+/// TREESAME iff it adds no pathspec-matched path; a single-parent commit is
+/// TREESAME iff its tree-diff against the parent is empty for the pathspec; a
+/// merge is TREESAME iff it is SAME to its relevant parent(s) (irrelevant —
+/// off-graph — parents cannot make it !TREESAME when any relevant parent
+/// exists).
+fn compute_treesame(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    records: &[CommitRecord],
+    reachable: &HashSet<ObjectId>,
+    pathspec: &Pathspec,
+    first_parent: bool,
+    full_history: bool,
+) -> Result<HashMap<ObjectId, CommitSimplify>> {
+    // O(1) tree lookup for on-graph commits.
+    let tree_by_oid: HashMap<ObjectId, ObjectId> =
+        records.iter().map(|r| (r.oid, r.commit.tree)).collect();
+    let parent_tree = |oid: &ObjectId| -> Option<ObjectId> {
+        if let Some(tree) = tree_by_oid.get(oid) {
+            Some(*tree)
+        } else {
+            read_commit_tree(db, format, oid).ok()
+        }
+    };
+
+    let mut out = HashMap::with_capacity(records.len());
+    for record in records {
+        let commit_tree = commit_tree_oid(record);
+        let mut simplify = CommitSimplify::default();
+        if record.parents.is_empty() {
+            simplify.treesame =
+                tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
+            out.insert(record.oid, simplify);
+            continue;
+        }
+        // Non-merge in default (non-dense) mode is always a change. We always run
+        // dense here (the pathspec / --full-history path), so fall through.
+        let mut relevant_parents = 0usize;
+        let mut relevant_change = false;
+        let mut irrelevant_change = false;
+        let mut diverted = false;
+        for (nth, parent) in record.parents.iter().enumerate() {
+            // `--first-parent`: do not compare against later parents (git breaks
+            // out of the loop at nth_parent == 1).
+            if first_parent && nth >= 1 {
+                break;
+            }
+            let relevant = reachable.contains(parent);
+            if relevant {
+                relevant_parents += 1;
+            }
+            let Some(pt) = parent_tree(parent) else {
+                // Missing parent tree → REV_TREE_NEW (a difference).
+                if relevant {
+                    relevant_change = true;
+                } else {
+                    irrelevant_change = true;
+                }
+                continue;
+            };
+            let same = tree_same_for_pathspec(db, format, &pt, &commit_tree, pathspec)?;
+            if same {
+                // try_to_simplify_commit: REV_TREE_SAME. In dense, non-full-
+                // history mode, if this parent is relevant (or we keep
+                // simplify_history on), git truncates the parent list to this
+                // single parent, marks TREESAME, and diverts. We only divert in
+                // the default (non-full-history) mode.
+                if !full_history && relevant {
+                    simplify.simplified_parents = Some(vec![*parent]);
+                    simplify.treesame = true;
+                    diverted = true;
+                    break;
+                }
+                // full-history (or irrelevant): keep going, do not divert.
+                continue;
+            }
+            if relevant {
+                relevant_change = true;
+            } else {
+                irrelevant_change = true;
+            }
+        }
+        if !diverted {
+            // git: if we have any relevant parents, TREESAME considers only them;
+            // otherwise it falls back to the irrelevant ones.
+            simplify.treesame = if relevant_parents > 0 {
+                !relevant_change
+            } else {
+                !irrelevant_change
+            };
+        }
+        out.insert(record.oid, simplify);
+    }
+    Ok(out)
+}
+
+/// Read a commit's tree oid directly from the object store (for off-graph
+/// parents not present as a `CommitRecord`).
+fn read_commit_tree(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Commit::parse_ref(format, &object.body)?.tree)
+}
+
+/// git's `one_relevant_parent`: pick the single parent a TREESAME commit can be
+/// simplified onto, or `None` if there is no unique relevant parent.
+fn one_relevant_parent<'a>(
+    parents: &'a [ObjectId],
+    reachable: &HashSet<ObjectId>,
+    record_oids: &HashSet<ObjectId>,
+    first_parent: bool,
+) -> Option<&'a ObjectId> {
+    if parents.is_empty() {
+        return None;
+    }
+    if first_parent || parents.len() == 1 {
+        return parents.first();
+    }
+    let mut relevant: Option<&ObjectId> = None;
+    for parent in parents {
+        let is_relevant = reachable.contains(parent) || record_oids.contains(parent);
+        if is_relevant {
+            if relevant.is_some() {
+                return None;
+            }
+            relevant = Some(parent);
+        }
+    }
+    relevant
+}
+
+/// git's `rewrite_one`: follow a chain of TREESAME commits to the first ancestor
+/// that is either !TREESAME (a real change), a root with no parents, or a commit
+/// without a unique relevant parent. Returns that rewritten parent oid, or
+/// `None` when the chain dead-ends at a root (the parent edge is dropped).
+fn rewrite_one(
+    start: &ObjectId,
+    simplify: &HashMap<ObjectId, CommitSimplify>,
+    parents_of: &HashMap<ObjectId, Vec<ObjectId>>,
+    reachable: &HashSet<ObjectId>,
+    record_oids: &HashSet<ObjectId>,
+    first_parent: bool,
+) -> Option<ObjectId> {
+    let mut current = *start;
+    loop {
+        let ts = simplify.get(&current).map(|s| s.treesame).unwrap_or(false);
+        if !ts {
+            return Some(current);
+        }
+        let Some(parents) = parents_of.get(&current) else {
+            // Off-graph; treat as a real boundary (keep it).
+            return Some(current);
+        };
+        if parents.is_empty() {
+            // rewrite_one_noparents: the edge is dropped.
+            return None;
+        }
+        match one_relevant_parent(parents, reachable, record_oids, first_parent) {
+            Some(parent) => current = *parent,
+            None => return Some(current),
+        }
+    }
+}
+
+/// Apply pathspec-limited default / `--full-history` simplification to an ordered
+/// reachable commit set, returning the records to display with their parents
+/// rewritten past simplified-away commits.
+///
+/// `records` must already be in the desired output order (date or topo). The
+/// returned records preserve that order, filtered and parent-rewritten.
+pub fn simplify_history(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    records: Vec<CommitRecord>,
+    pathspec: &Pathspec,
+    options: SimplifyOptions,
+) -> Result<Vec<CommitRecord>> {
+    if pathspec.is_empty() {
+        // Without a pathspec there is nothing to prune: every commit "changes"
+        // the (whole) tree, so TREESAME is never set and no simplification
+        // applies. `--full-history` only differs from the default *in the
+        // presence of a pathspec* (it keeps the merges that join the matching
+        // lines); with no pathspec it is a no-op. git's `prune` flag is off when
+        // `prune_data` is empty, so it never runs `try_to_simplify_commit`.
+        return Ok(records);
+    }
+    let reachable: HashSet<ObjectId> = records.iter().map(|r| r.oid).collect();
+    let record_oids = reachable.clone();
+    let simplify = compute_treesame(
+        db,
+        format,
+        &records,
+        &reachable,
+        pathspec,
+        options.first_parent,
+        options.full_history,
+    )?;
+
+    // Effective parent list for each commit: the diverted single parent when
+    // default-mode simplification truncated a merge, else the real parents
+    // (first-parent-limited when requested).
+    let effective_parents = |oid: &ObjectId, real: &[ObjectId]| -> Vec<ObjectId> {
+        if let Some(div) = simplify
+            .get(oid)
+            .and_then(|s| s.simplified_parents.as_ref())
+        {
+            return div.clone();
+        }
+        if options.first_parent {
+            real.iter().take(1).cloned().collect()
+        } else {
+            real.to_vec()
+        }
+    };
+    let parents_of: HashMap<ObjectId, Vec<ObjectId>> = records
+        .iter()
+        .map(|r| (r.oid, effective_parents(&r.oid, &r.parents)))
+        .collect();
+
+    // Re-derive reachability following the *effective* (diverted) parent edges,
+    // starting from the tips — commits in the set that are not an effective
+    // parent of any other commit. In default mode this is what drops the
+    // pruned-away merge sides: a side branch only reachable through a diverted
+    // merge edge is never visited.
+    let is_effective_parent: HashSet<ObjectId> = parents_of
+        .values()
+        .flat_map(|ps| ps.iter().copied())
+        .collect();
+    let tips: Vec<ObjectId> = records
+        .iter()
+        .map(|r| r.oid)
+        .filter(|oid| !is_effective_parent.contains(oid))
+        .collect();
+    let mut live: HashSet<ObjectId> = HashSet::new();
+    let mut stack = tips;
+    while let Some(oid) = stack.pop() {
+        if !live.insert(oid) {
+            continue;
+        }
+        if let Some(ps) = parents_of.get(&oid) {
+            for p in ps {
+                if record_oids.contains(p) && !live.contains(p) {
+                    stack.push(*p);
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(records.len());
+    for record in records {
+        // Only commits still reachable after diversion are candidates.
+        if !live.contains(&record.oid) {
+            continue;
+        }
+        let ts = simplify
+            .get(&record.oid)
+            .map(|s| s.treesame)
+            .unwrap_or(false);
+        let effective = parents_of
+            .get(&record.oid)
+            .cloned()
+            .unwrap_or_else(|| record.parents.clone());
+        let is_merge = effective.len() > 1;
+
+        // Default simplification: show a commit iff it is !TREESAME. With
+        // --full-history every non-TREESAME commit is shown AND merges are kept
+        // even when TREESAME (so the joined lines stay connected).
+        let show = if options.full_history {
+            !ts || is_merge
+        } else {
+            !ts
+        };
+        if !show {
+            continue;
+        }
+
+        // Rewrite parents past simplified-away (TREESAME) commits.
+        let mut new_parents: Vec<ObjectId> = Vec::with_capacity(effective.len());
+        let mut seen_parent: HashSet<ObjectId> = HashSet::new();
+        for parent in &effective {
+            if let Some(rewritten) = rewrite_one(
+                parent,
+                &simplify,
+                &parents_of,
+                &reachable,
+                &record_oids,
+                options.first_parent,
+            ) {
+                // Drop duplicate parents introduced by rewriting (git's
+                // remove_duplicate_parents collapses these).
+                if seen_parent.insert(rewritten) {
+                    new_parents.push(rewritten);
+                }
+            }
+        }
+        out.push(CommitRecord {
+            oid: record.oid,
+            parents: new_parents,
+            commit: record.commit,
+        });
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
 // `<rev>:<path>` resolution
 // ---------------------------------------------------------------------------
 

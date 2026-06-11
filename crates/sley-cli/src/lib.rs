@@ -5582,12 +5582,35 @@ fn parse_rev_list_object_type_filter(value: &str) -> Result<ObjectType> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RevListOrdering {
     Default,
+    /// `--topo-order` — git's `REV_SORT_IN_GRAPH_ORDER`: a strict topological
+    /// linearization whose tie-break preserves the traversal (commit-date) order
+    /// via a LIFO emission queue with reversed initial tips.
     Topo,
+    /// `--date-order` — git's `REV_SORT_BY_COMMIT_DATE`: topological with a
+    /// committer-time priority queue tie-break.
     Date,
+    /// `--author-date-order` — git's `REV_SORT_BY_AUTHOR_DATE`: topological with
+    /// an author-time priority queue tie-break.
+    AuthorDate,
 }
 
-fn rev_list_topo_order(records: Vec<&sley_rev::CommitRecord>) -> Vec<&sley_rev::CommitRecord> {
-    rev_list_ready_order(records, |idx| idx)
+/// `--topo-order` (git's `REV_SORT_IN_GRAPH_ORDER`).
+///
+/// Reproduces `sort_in_topological_order` byte-for-byte for the graph-order
+/// sort: indegrees are computed from a committer-date-ordered pass, the initial
+/// tips (indegree 1) are collected in that order and then *reversed*, and
+/// emission is LIFO — parents are pushed onto the tail of the work queue when
+/// their last child is emitted, and the next commit is popped from the tail.
+/// This preserves the traversal order at the tips while guaranteeing no parent
+/// precedes any of its children.
+fn rev_list_topo_order(
+    records: Vec<&sley_rev::CommitRecord>,
+) -> Result<Vec<&sley_rev::CommitRecord>> {
+    // git's `revs->commits` reaches `sort_in_topological_order` already in
+    // committer-date order; reproduce that input ordering first so the tip /
+    // LIFO sequence matches.
+    let records = rev_list_commit_date_input_order(records)?;
+    Ok(rev_list_topo_emit(records, None))
 }
 
 fn rev_list_date_order(
@@ -5600,6 +5623,94 @@ fn rev_list_date_order(
     Ok(rev_list_ready_order(records, |idx| {
         (timestamps[idx], Reverse(idx))
     }))
+}
+
+/// `--author-date-order` (git's `REV_SORT_BY_AUTHOR_DATE`).
+///
+/// Identical topological readiness to [`rev_list_date_order`], but the priority
+/// queue is keyed on the *author* timestamp rather than the committer one.
+fn rev_list_author_date_order(
+    records: Vec<&sley_rev::CommitRecord>,
+) -> Result<Vec<&sley_rev::CommitRecord>> {
+    let timestamps = records
+        .iter()
+        .map(|record| commit_identity_timestamp_i64(&record.commit.author))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(rev_list_ready_order(records, |idx| {
+        (timestamps[idx], Reverse(idx))
+    }))
+}
+
+/// Order a reachable commit set into the committer-date order git's traversal
+/// produces before it hands the list to `sort_in_topological_order`. Newest
+/// committer time first, ties broken by the SMALLER oid (matching git's
+/// `(commit_time, Reverse(oid))` priority during the limiting walk).
+fn rev_list_commit_date_input_order(
+    records: Vec<&sley_rev::CommitRecord>,
+) -> Result<Vec<&sley_rev::CommitRecord>> {
+    let mut keyed = records
+        .into_iter()
+        .map(|record| {
+            commit_identity_timestamp_i64(&record.commit.committer).map(|ts| (ts, record))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // Newest first; for equal times the smaller oid first.
+    keyed.sort_by(|(ta, a), (tb, b)| tb.cmp(ta).then_with(|| a.oid.cmp(&b.oid)));
+    Ok(keyed.into_iter().map(|(_, record)| record).collect())
+}
+
+/// Linearize `records` (already in git's input order) topologically using a
+/// LIFO emission queue with reversed initial tips — git's graph-order sort.
+///
+/// `priority` is unused for graph order (`None`); the parameter is reserved so a
+/// future date-keyed prio-queue variant can share this readiness machinery, but
+/// the date orders currently route through [`rev_list_ready_order`] which is
+/// already byte-identical to git for them.
+fn rev_list_topo_emit<'a>(
+    records: Vec<&'a sley_rev::CommitRecord>,
+    priority: Option<&[i64]>,
+) -> Vec<&'a sley_rev::CommitRecord> {
+    let _ = priority;
+    let index_by_oid = records
+        .iter()
+        .enumerate()
+        .map(|(idx, record)| (record.oid, idx))
+        .collect::<HashMap<_, _>>();
+    // Indegree: mark every listed commit 1, then for each listed parent that is
+    // itself in the set, increment. A commit whose indegree stays 1 is a tip.
+    let mut indegree = vec![1usize; records.len()];
+    for record in &records {
+        for parent in &record.parents {
+            if let Some(&pi) = index_by_oid.get(parent) {
+                indegree[pi] += 1;
+            }
+        }
+    }
+    // Tips in input order, then reversed for LIFO emission.
+    let mut queue: Vec<usize> = indegree
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, deg)| (*deg == 1).then_some(idx))
+        .collect();
+    queue.reverse();
+    let mut out = Vec::with_capacity(records.len());
+    while let Some(idx) = queue.pop() {
+        let record = records[idx];
+        for parent in &record.parents {
+            if let Some(&pi) = index_by_oid.get(parent) {
+                if indegree[pi] == 0 {
+                    continue;
+                }
+                indegree[pi] -= 1;
+                if indegree[pi] == 1 {
+                    queue.push(pi);
+                }
+            }
+        }
+        indegree[idx] = 0;
+        out.push(record);
+    }
+    out
 }
 
 fn rev_list_ready_order<K: Ord>(
@@ -8573,7 +8684,25 @@ fn commit_identity_from_env(role: &str) -> Result<Vec<u8>> {
         .or_else(|| identity_config_value("user.email", &mut config))
         .unwrap_or_else(|| "sley@example.invalid".into());
     let date = env::var(format!("GIT_{role}_DATE")).unwrap_or_else(|_| "@0 +0000".into());
+    let date = canonicalize_commit_date(&date);
     sley_sequencer::format_commit_identity(&name, &email, &date)
+}
+
+/// Canonicalise a `GIT_*_DATE`/`--date=` value to git's raw `<seconds> +HHMM`
+/// form so the sequencer's identity builder (which only accepts the raw form)
+/// stores the same bytes git would.
+///
+/// git's `commit-tree` / `commit` run author and committer dates through
+/// `parse_date`, accepting ISO-8601 (`2005-04-07T22:13:13`), `<date> <time> <tz>`
+/// (`2005-01-01 00:00:00 +0000`), RFC-2822, and the raw form. The full date.c
+/// port lives in [`commands::approxidate`]; route the value through it and emit
+/// the canonical raw form. Values that do not parse are passed through verbatim
+/// so the sequencer still reports the original "invalid date" error.
+fn canonicalize_commit_date(date: &str) -> String {
+    match commands::approxidate::parse_commit_date(date) {
+        Some((seconds, tz)) => format!("{seconds} {tz}"),
+        None => date.to_string(),
+    }
 }
 
 /// Lazily-loaded effective config used as the identity fallback. `Skip` means
@@ -8635,6 +8764,7 @@ fn commit_signoff_from_env() -> Result<Vec<u8>> {
         .or_else(|| identity_config_value("user.email", &mut config))
         .unwrap_or_else(|| "sley@example.invalid".into());
     let date = env::var("GIT_COMMITTER_DATE").unwrap_or_else(|_| "@0 +0000".into());
+    let date = canonicalize_commit_date(&date);
     sley_sequencer::format_commit_identity(&name, &email, &date)?;
     Ok(format!("Signed-off-by: {name} <{email}>").into_bytes())
 }
