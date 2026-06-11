@@ -1,3 +1,7 @@
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use flate2::{Compress, Compression, FlushCompress, Status};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use sley_formats::Bundle;

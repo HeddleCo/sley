@@ -5,6 +5,10 @@
 //! here now have dedicated crates: [`sley_object`], [`sley_config`], and
 //! [`sley_index`].
 
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use sley_config::{ConfigEntry, ConfigSection, GitConfig};
 use sley_core::{GitError, ObjectFormat, ObjectId, Result};
 use std::fs;
@@ -167,7 +171,7 @@ impl Reftable {
         };
         let mut refs = refs.to_vec();
         refs.sort_by(|left, right| left.name.cmp(&right.name));
-        let mut out = write_reftable_header(header);
+        let mut out = write_reftable_header(header)?;
         if !refs.is_empty() {
             let block_start = out.len();
             out.push(b'r');
@@ -264,11 +268,11 @@ fn parse_reftable_header(bytes: &[u8]) -> Result<ReftableHeader> {
     })
 }
 
-fn write_reftable_header(header: ReftableHeader) -> Vec<u8> {
+fn write_reftable_header(header: ReftableHeader) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(header.version.header_len());
     out.extend_from_slice(REFTABLE_MAGIC);
     out.push(header.version.number());
-    write_u24(&mut out, header.block_size).expect("header block size fits u24");
+    write_u24(&mut out, header.block_size)?;
     out.extend_from_slice(&header.min_update_index.to_be_bytes());
     out.extend_from_slice(&header.max_update_index.to_be_bytes());
     if header.version == ReftableVersion::V2 {
@@ -277,7 +281,7 @@ fn write_reftable_header(header: ReftableHeader) -> Vec<u8> {
             ObjectFormat::Sha256 => b"s256",
         });
     }
-    out
+    Ok(out)
 }
 
 fn parse_reftable_footer(bytes: &[u8], version: ReftableVersion) -> Result<ReftableFooter> {
@@ -333,7 +337,7 @@ fn write_reftable_footer(
             "reftable object id abbreviation length exceeds 31".into(),
         ));
     }
-    let mut out = write_reftable_header(header);
+    let mut out = write_reftable_header(header)?;
     out.extend_from_slice(&ref_index_position.to_be_bytes());
     out.extend_from_slice(&((obj_position << 5) | u64::from(obj_id_len)).to_be_bytes());
     out.extend_from_slice(&obj_index_position.to_be_bytes());

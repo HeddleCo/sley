@@ -1,3 +1,7 @@
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use sley_core::Result;
 use sley_odb::{FileObjectDatabase, RawPackInstallOptions, RawPackInstallResult, RawPackInstaller};
 use sley_protocol::{
