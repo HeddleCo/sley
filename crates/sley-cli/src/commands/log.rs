@@ -54,6 +54,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut regexp_ignore_case = false;
     let mut regexp_mode = SimpleLogRegexMode::Basic;
     let mut date_mode = ForEachRefDateMode::Default;
+    let mut date_explicit = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -510,9 +511,11 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             "--date" => {
                 let value = iter.next().ok_or_else(log_date_requires_value_error)?;
                 date_mode = log_date_mode(value)?;
+                date_explicit = true;
             }
             value if value.starts_with("--date=") => {
                 date_mode = log_date_mode(&value["--date=".len()..])?;
+                date_explicit = true;
             }
             "--diff-algorithm" => {
                 let value = iter
@@ -862,6 +865,21 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
             ResolvedPretty::Default => output = LogOutput::Default,
+            ResolvedPretty::Reference => {
+                // reference defaults the date to short; an explicit --date wins.
+                if !date_explicit {
+                    date_mode = ForEachRefDateMode::Short;
+                }
+                output = LogOutput::Compiled {
+                    compiled: CompiledLogFormat::compile(
+                        "%C(auto)%h (%s, %ad)",
+                        LogFormatDialect::Log,
+                    )?,
+                    final_newline: true,
+                    show_children: false,
+                    inline_children: false,
+                };
+            }
             ResolvedPretty::Compiled {
                 compiled,
                 final_newline,
@@ -1080,12 +1098,21 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         if reverse {
             selected.reverse();
         }
-        let compiled = match &output {
-            LogOutput::Compiled { compiled, .. } => compiled,
+        let (compiled, final_newline) = match &output {
+            LogOutput::Compiled {
+                compiled,
+                final_newline,
+                ..
+            } => (compiled, *final_newline),
             _ => unreachable!("metadata fast path requires compiled output"),
         };
         let mut stdout = io::stdout();
-        for record in &selected {
+        for (index, record) in selected.iter().enumerate() {
+            // `--pretty=format:` separates entries with a newline (none trailing);
+            // `--format=`/`tformat:`/oneline terminate each entry with one.
+            if index > 0 && !final_newline {
+                stdout.write_all(b"\n")?;
+            }
             let mut line = Vec::with_capacity(compiled.estimated_line_capacity());
             emit_compiled_log_format_metadata(
                 record,
@@ -1105,7 +1132,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 &mut line,
             )?;
             stdout.write_all(&line)?;
-            stdout.write_all(b"\n")?;
+            if final_newline {
+                stdout.write_all(b"\n")?;
+            }
         }
         stdout.flush()?;
         return Ok(());
@@ -1326,6 +1355,9 @@ fn emit_compiled_reflog_walk_format(
 enum ResolvedPretty {
     Oneline,
     Default,
+    /// `--pretty=reference`: `%C(auto)%h (%s, %ad)` with a default short date
+    /// that an explicit `--date=` overrides (but `log.date` config does not).
+    Reference,
     Compiled {
         compiled: CompiledLogFormat,
         final_newline: bool,
@@ -1363,13 +1395,7 @@ fn resolve_pretty_spec(
             "oneline" => return Ok(ResolvedPretty::Oneline),
             "short" | "medium" => return Ok(ResolvedPretty::Default),
             "reference" => {
-                return Ok(ResolvedPretty::Compiled {
-                    compiled: CompiledLogFormat::compile(
-                        "%C(auto)%h (%s, %as)",
-                        LogFormatDialect::Log,
-                    )?,
-                    final_newline: true,
-                });
+                return Ok(ResolvedPretty::Reference);
             }
             _ => {}
         }
