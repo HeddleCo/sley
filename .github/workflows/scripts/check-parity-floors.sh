@@ -37,6 +37,9 @@ declare -A FLOOR=(
     [t7004-tag.sh]=150
     [t3200-branch.sh]=70
     [t0027-auto-crlf.sh]=2149
+    [t2107-update-index-basic.sh]=9
+    [t4205-log-pretty-formats.sh]=106
+    [t4202-log.sh]=33
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
 )
