@@ -121,10 +121,11 @@ pub(crate) fn three_way_merge_trees(
             theirs_label,
             ancestor_label: "merged common ancestors",
             favor: sley_diff_merge::MergeFavor::None,
-            // Seam-lift commit: behaviour-preserving, so rename detection is
-            // off (matches the historical path-keyed merge). Stage-a's second
-            // commit flips this on to add rename-aware merging.
-            detect_renames: false,
+            // Rename-aware non-recursive merge: a file renamed on one side and
+            // modified on the other follows the rename (the merge-ort
+            // single-base rename case). Recursive/criss-cross bases remain a
+            // later stage.
+            detect_renames: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         },
     )?;

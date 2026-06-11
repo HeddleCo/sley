@@ -3693,7 +3693,8 @@ pub fn merge_entry_maps(
         let base = eff_base.get(&path).cloned();
         let ours = eff_ours.get(&path).cloned();
         let theirs = eff_theirs.get(&path).cloned();
-        let old_path = renames.dest_to_source.get(&path).cloned();
+        let rename = renames.dest_to_source.get(&path);
+        let old_path = rename.map(|r| r.source.clone());
 
         // Trivial resolutions (identical to the historical per-command logic).
         if ours == theirs {
@@ -3736,13 +3737,32 @@ pub fn merge_entry_maps(
             };
             let ours_bytes = merge_blob_bytes(db, ours_oid)?;
             let theirs_bytes = merge_blob_bytes(db, theirs_oid)?;
+            // When this destination came from a one-sided rename, git qualifies
+            // the conflict-marker labels with the per-side path (the renaming
+            // side shows the new path, the other side the old path), e.g.
+            // `<<<<<<< HEAD:old.txt` / `>>>>>>> feature:new.txt`.
+            let (ours_label, theirs_label) = match rename {
+                Some(MergeRename { source, side }) => {
+                    let (ours_path, theirs_path) = match side {
+                        // theirs renamed -> ours kept the source path.
+                        RenameSide::Theirs => (source.as_slice(), path.as_slice()),
+                        // ours renamed -> theirs kept the source path.
+                        RenameSide::Ours => (path.as_slice(), source.as_slice()),
+                    };
+                    (
+                        qualify_label(options.ours_label, ours_path),
+                        qualify_label(options.theirs_label, theirs_path),
+                    )
+                }
+                None => (options.ours_label.to_string(), options.theirs_label.to_string()),
+            };
             let result = merge_blobs(
                 &base_bytes,
                 &ours_bytes,
                 &theirs_bytes,
                 &MergeBlobOptions {
-                    ours_label: options.ours_label,
-                    theirs_label: options.theirs_label,
+                    ours_label: &ours_label,
+                    theirs_label: &theirs_label,
                     base_label: options.ancestor_label,
                     style: ConflictStyle::Merge,
                 },
@@ -3979,15 +3999,29 @@ fn merge_tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
 
 // --- Rename-aware non-recursive merge -------------------------------------
 
+/// Which side of the merge performed a rename.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RenameSide {
+    Ours,
+    Theirs,
+}
+
+/// One detected one-sided rename: its source path and which side renamed it.
+#[derive(Clone)]
+struct MergeRename {
+    source: Vec<u8>,
+    side: RenameSide,
+}
+
 /// The rename pairings discovered for one merge: which destination paths came
-/// from which source path, and which source paths were renamed away on each
-/// side (so they are not also treated as deletes).
+/// from which source path, and which side renamed (so the other side's change
+/// can follow the rename and conflict labels can be path-qualified like git).
 #[derive(Default)]
 struct MergeRenames {
-    /// One-sided renames keyed by *destination* path -> source path. Only
-    /// renames where the OTHER side kept/modified the source in place are
-    /// recorded (the case where the modification must follow the rename).
-    dest_to_source: BTreeMap<Vec<u8>, Vec<u8>>,
+    /// One-sided renames keyed by *destination* path. Only renames where the
+    /// OTHER side kept/modified the source in place are recorded (the case
+    /// where the modification must follow the rename).
+    dest_to_source: BTreeMap<Vec<u8>, MergeRename>,
 }
 
 /// Detect one-sided renames usable for a non-recursive merge: a path present in
@@ -4012,6 +4046,7 @@ fn detect_merge_renames(
         base_map,
         ours_map,
         theirs_map,
+        RenameSide::Ours,
         options.rename_threshold,
         &mut renames,
     )?;
@@ -4022,6 +4057,7 @@ fn detect_merge_renames(
         base_map,
         theirs_map,
         ours_map,
+        RenameSide::Theirs,
         options.rename_threshold,
         &mut renames,
     )?;
@@ -4032,12 +4068,14 @@ fn detect_merge_renames(
 /// Collect renames that occurred on `side` (relative to `base`) for which the
 /// `other` side still references the original path. `db`/`format` resolve blob
 /// bytes for similarity scoring.
+#[allow(clippy::too_many_arguments)]
 fn collect_side_renames(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     base_map: &MergeEntryMap,
     side_map: &MergeEntryMap,
     other_map: &MergeEntryMap,
+    side: RenameSide,
     threshold: u8,
     renames: &mut MergeRenames,
 ) -> Result<()> {
@@ -4089,7 +4127,10 @@ fn collect_side_renames(
         // Skip if both sides renamed the same source to the same dest (already
         // recorded) or to anything (first writer wins; the path-keyed core then
         // sees identical dest entries and resolves trivially).
-        renames.dest_to_source.entry(new).or_insert(old);
+        renames
+            .dest_to_source
+            .entry(new)
+            .or_insert(MergeRename { source: old, side });
     }
 
     let _ = format;
@@ -4114,7 +4155,8 @@ fn apply_merge_renames(
     let mut ours = ours_map.clone();
     let mut theirs = theirs_map.clone();
 
-    for (new, old) in &renames.dest_to_source {
+    for (new, rename) in &renames.dest_to_source {
+        let old = &rename.source;
         // Move base[old] to base[new] so the destination has a proper ancestor.
         if let Some(entry) = base.remove(old) {
             base.entry(new.clone()).or_insert(entry);
@@ -4127,6 +4169,12 @@ fn apply_merge_renames(
         }
     }
     (base, ours, theirs)
+}
+
+/// Build a path-qualified conflict-marker label `"<label>:<path>"`, as git does
+/// for renamed files (so the two sides of a conflict name their distinct paths).
+fn qualify_label(label: &str, path: &[u8]) -> String {
+    format!("{label}:{}", String::from_utf8_lossy(path))
 }
 
 /// Adapt a flat `path -> (mode, oid)` map into the `TrackedEntry` map the
