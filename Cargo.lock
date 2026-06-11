@@ -1334,6 +1334,7 @@ dependencies = [
  "sley-index",
  "sley-object",
  "sley-odb",
+ "sley-pathspec",
  "sley-refs",
 ]
 

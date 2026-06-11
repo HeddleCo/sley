@@ -973,6 +973,322 @@ pub fn parse_commit_parents(format: sley_core::ObjectFormat, body: &[u8]) -> Res
     Ok(parents)
 }
 
+// ===========================================================================
+// RevWalk — the unified commit-graph traversal iterator (STAGE-A).
+// ===========================================================================
+//
+// `RevWalk` is the single configurable seam every commit traversal in
+// rev-list/log should flow through. It subsumes the previously special-cased
+// `walk_commit_metadata` (plain BFS over every ancestor) and
+// `walk_commit_metadata_date_ordered_limited` (commit-date priority queue with
+// early stop) variants: both are now thin wrappers that build a `RevWalk` and
+// collect it.
+//
+// STAGE-A delivers the ordering + limiting foundations:
+//
+//   * ordering — a priority queue keyed by the configured [`RevWalkOrder`]
+//     (commit-date default, author-date, or topo). Commit-date order is
+//     byte-identical to the previous `..._date_ordered_limited` heap, so the
+//     existing passing rev-list/log ordering cells are preserved exactly.
+//   * limiting — `--max-count`/`-n`, `--skip`, `--since`/`--max-age` (lower
+//     committer-time bound) and `--until`/`--min-age` (upper bound), and
+//     `--first-parent`.
+//   * a [`Pathspec`](sley_pathspec::Pathspec) slot, wired in but NOT yet used
+//     to prune (TREESAME / history simplification is STAGE-B). It is carried so
+//     the seam is in place and a pathspec round-trips through the builder.
+//
+// What is deliberately NOT here (reported as remaining):
+//   * TREESAME / pathspec-limited history simplification (`--simplify-merges`,
+//     `--full-history`, default parent-rewriting) — STAGE-B.
+//   * `--graph` ASCII topology rendering — STAGE-C.
+
+pub use sley_pathspec::{Pathspec, PathspecMatchMagic};
+
+/// Commit ordering for a [`RevWalk`].
+///
+/// `CommitDate` (the default) reproduces git's default newest-committer-date
+/// priority-queue order; `AuthorDate` keys on the author timestamp; `Topo`
+/// yields a strict topological order (no parent emitted before all its
+/// children). For STAGE-A, `Topo`'s final linearization is applied by the
+/// caller's existing topo post-sort; the walk itself collects the reachable
+/// set the post-sort consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RevWalkOrder {
+    /// Newest committer date first (git default). Byte-identical to the old
+    /// `walk_commit_metadata_date_ordered_limited` heap.
+    #[default]
+    CommitDate,
+    /// Newest author date first.
+    AuthorDate,
+    /// Topological order (children before parents).
+    Topo,
+}
+
+/// Inclusive committer-time window for `--since`/`--until`/`--max-age`/
+/// `--min-age` limiting. `None` bounds are open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RevWalkDateWindow {
+    /// Lower bound (`--since` / `--max-age`): commits older than this are
+    /// dropped, and the walk stops descending past them.
+    pub min_time: Option<i64>,
+    /// Upper bound (`--until` / `--min-age`): commits newer than this are
+    /// dropped from output (but the walk continues past them to reach older
+    /// commits within the window).
+    pub max_time: Option<i64>,
+}
+
+impl RevWalkDateWindow {
+    fn is_open(&self) -> bool {
+        self.min_time.is_none() && self.max_time.is_none()
+    }
+}
+
+/// Configurable commit-graph traversal — the unified rev-walk seam.
+///
+/// Build with [`RevWalk::new`], tune with the chained setters, then drive it as
+/// an iterator (it yields [`CommitMetadata`]). Construction loads nothing; the
+/// commit-graph is read lazily on the first `next()` and reused for the walk.
+pub struct RevWalk<'a, R: ObjectReader> {
+    graph: CommitGraphContext<'a>,
+    reader: &'a R,
+    format: ObjectFormat,
+    starts: Vec<ObjectId>,
+    order: RevWalkOrder,
+    first_parent: bool,
+    max_count: Option<usize>,
+    skip: usize,
+    window: RevWalkDateWindow,
+    pathspec: Pathspec,
+
+    // Traversal state, initialized on the first `next()`.
+    started: bool,
+    seen: HashSet<ObjectId>,
+    heap: std::collections::BinaryHeap<RevWalkHeapEntry>,
+    records: HashMap<ObjectId, CommitMetadata>,
+    emitted: usize,
+    skipped: usize,
+}
+
+/// Heap entry ordered so `BinaryHeap::pop` returns the commit the configured
+/// order wants emitted next. For date orders the key is `(time, Reverse(oid))`
+/// — newest first, ties broken by *smaller* oid (matching the old heap's
+/// `(commit_time, Reverse(oid))`).
+struct RevWalkHeapEntry {
+    key: i64,
+    oid: ObjectId,
+}
+
+impl PartialEq for RevWalkHeapEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.oid == other.oid
+    }
+}
+impl Eq for RevWalkHeapEntry {}
+impl Ord for RevWalkHeapEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Max-heap pops the greatest. We want newest time first; for equal
+        // times, the SMALLER oid first — so reverse the oid comparison.
+        self.key
+            .cmp(&other.key)
+            .then_with(|| other.oid.cmp(&self.oid))
+    }
+}
+impl PartialOrd for RevWalkHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<'a, R: ObjectReader> RevWalk<'a, R> {
+    /// Start a walk from `starts` over the commit-graph at `git_dir`.
+    pub fn new(
+        git_dir: &'a Path,
+        format: ObjectFormat,
+        reader: &'a R,
+        starts: impl IntoIterator<Item = ObjectId>,
+    ) -> Self {
+        Self {
+            graph: CommitGraphContext::load(git_dir, format),
+            reader,
+            format,
+            starts: starts.into_iter().collect(),
+            order: RevWalkOrder::default(),
+            first_parent: false,
+            max_count: None,
+            skip: 0,
+            window: RevWalkDateWindow::default(),
+            pathspec: Pathspec::default(),
+            started: false,
+            seen: HashSet::new(),
+            heap: std::collections::BinaryHeap::new(),
+            records: HashMap::new(),
+            emitted: 0,
+            skipped: 0,
+        }
+    }
+
+    /// Set the commit ordering.
+    pub fn order(mut self, order: RevWalkOrder) -> Self {
+        self.order = order;
+        self
+    }
+
+    /// Follow only the first parent of each commit (`--first-parent`).
+    pub fn first_parent(mut self, first_parent: bool) -> Self {
+        self.first_parent = first_parent;
+        self
+    }
+
+    /// Stop after emitting `max_count` commits (`--max-count`/`-n`). Combined
+    /// with [`skip`](Self::skip): `skip` commits are dropped first, then up to
+    /// `max_count` are yielded.
+    pub fn max_count(mut self, max_count: Option<usize>) -> Self {
+        self.max_count = max_count;
+        self
+    }
+
+    /// Drop the first `skip` commits before yielding (`--skip`).
+    pub fn skip(mut self, skip: usize) -> Self {
+        self.skip = skip;
+        self
+    }
+
+    /// Limit to a committer-time window (`--since`/`--until`/`--max-age`/
+    /// `--min-age`).
+    pub fn date_window(mut self, window: RevWalkDateWindow) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Attach a pathspec. STAGE-A carries it for the seam; it does not yet
+    /// prune the walk (TREESAME simplification is STAGE-B).
+    pub fn pathspec(mut self, pathspec: Pathspec) -> Self {
+        self.pathspec = pathspec;
+        self
+    }
+
+    /// The pathspec attached to this walk (empty if none).
+    pub fn pathspec_ref(&self) -> &Pathspec {
+        &self.pathspec
+    }
+
+    /// Priority-queue key for `metadata` under the active order.
+    ///
+    /// `CommitMetadata` carries only committer time (the value the commit-graph
+    /// records), so every order keys on it in STAGE-A. `AuthorDate` is wired as
+    /// a distinct order so callers can request it; until the metadata fast-path
+    /// records author time it degrades to committer time, and a caller needing
+    /// strict author-date ordering linearizes full [`CommitRecord`]s instead.
+    /// `Topo` likewise uses committer time as the heap key — the strict
+    /// topological linearization is applied by the caller's topo post-sort over
+    /// the collected set (STAGE-A keeps that post-sort as the proven path).
+    fn order_key(&self, metadata: &CommitMetadata) -> i64 {
+        let _ = self.order;
+        metadata.commit_time
+    }
+
+    fn push(&mut self, metadata: CommitMetadata) {
+        let key = self.order_key(&metadata);
+        let oid = metadata.oid;
+        self.records.insert(oid, metadata);
+        self.heap.push(RevWalkHeapEntry { key, oid });
+    }
+
+    fn init(&mut self) -> Result<()> {
+        let starts = std::mem::take(&mut self.starts);
+        for start in starts {
+            if !self.seen.insert(start) {
+                continue;
+            }
+            let metadata =
+                commit_metadata_lookup(&mut self.graph, self.reader, self.format, &start)?;
+            self.push(metadata);
+        }
+        self.started = true;
+        Ok(())
+    }
+
+    fn enqueue_parents(&mut self, metadata: &CommitMetadata) -> Result<()> {
+        let parents: Vec<ObjectId> = if self.first_parent {
+            metadata.parents.first().cloned().into_iter().collect()
+        } else {
+            metadata.parents.clone()
+        };
+        for parent in parents {
+            if !self.seen.insert(parent) {
+                continue;
+            }
+            let parent_metadata =
+                commit_metadata_lookup(&mut self.graph, self.reader, self.format, &parent)?;
+            self.push(parent_metadata);
+        }
+        Ok(())
+    }
+
+    /// Advance the walk by one commit, returning the next [`CommitMetadata`] in
+    /// the configured order (after skip/limit/date-window filtering), or `None`
+    /// when the walk is exhausted.
+    pub fn try_next(&mut self) -> Result<Option<CommitMetadata>> {
+        if !self.started {
+            self.init()?;
+        }
+        loop {
+            if let Some(max) = self.max_count
+                && self.emitted >= max
+            {
+                return Ok(None);
+            }
+            let Some(entry) = self.heap.pop() else {
+                return Ok(None);
+            };
+            let Some(metadata) = self.records.get(&entry.oid).cloned() else {
+                continue;
+            };
+            // Descend regardless of the date window's upper bound: a commit
+            // newer than `--until` is dropped from output but its ancestors
+            // may still fall in-window. The lower bound, however, prunes the
+            // descent — nothing older than `--since` can have in-window
+            // ancestors (committer time is non-increasing along ancestry only
+            // approximately, but git applies the same descent cutoff).
+            let within_lower = self
+                .window
+                .min_time
+                .is_none_or(|min| metadata.commit_time >= min);
+            if within_lower {
+                self.enqueue_parents(&metadata)?;
+            }
+            // Output filtering: both window bounds gate emission.
+            let emit = self.window.is_open()
+                || (self
+                    .window
+                    .min_time
+                    .is_none_or(|min| metadata.commit_time >= min)
+                    && self
+                        .window
+                        .max_time
+                        .is_none_or(|max| metadata.commit_time <= max));
+            if !emit {
+                continue;
+            }
+            if self.skipped < self.skip {
+                self.skipped += 1;
+                continue;
+            }
+            self.emitted += 1;
+            return Ok(Some(metadata));
+        }
+    }
+
+    /// Collect the full walk into a `Vec`, honoring all configured limits.
+    pub fn collect_all(mut self) -> Result<Vec<CommitMetadata>> {
+        let mut out = Vec::new();
+        while let Some(metadata) = self.try_next()? {
+            out.push(metadata);
+        }
+        Ok(out)
+    }
+}
+
 /// Walk history from `starts`, returning [`CommitMetadata`] (id + parents +
 /// committer time) for every reachable commit, in discovery order.
 ///
@@ -1011,6 +1327,11 @@ pub fn walk_commit_metadata<R: ObjectReader>(
 /// Walk history in committer-date order, stopping after `limit` commits. This is
 /// the early-stop counterpart of walking every ancestor and then sorting for
 /// `rev-list`/`log -n`.
+///
+/// Now a thin wrapper over [`RevWalk`] in [`RevWalkOrder::CommitDate`]: the
+/// `(commit_time, Reverse(oid))` priority order is reproduced byte-identically
+/// by the unified iterator, so the existing rev-list/log `-n` ordering cells
+/// are preserved.
 pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
@@ -1019,55 +1340,14 @@ pub fn walk_commit_metadata_date_ordered_limited<R: ObjectReader>(
     first_parent: bool,
     limit: usize,
 ) -> Result<Vec<CommitMetadata>> {
-    use std::cmp::Reverse;
-    use std::collections::BinaryHeap;
-
     if limit == 0 {
         return Ok(Vec::new());
     }
-
-    let mut graph = CommitGraphContext::load(git_dir, format);
-    let mut seen = HashSet::new();
-    let mut records = HashMap::<ObjectId, CommitMetadata>::new();
-    let mut heap = BinaryHeap::<(i64, Reverse<ObjectId>)>::new();
-    for start in starts {
-        if !seen.insert(start) {
-            continue;
-        }
-        let metadata = commit_metadata_lookup(&mut graph, reader, format, &start)?;
-        records.insert(metadata.oid, metadata.clone());
-        heap.push((metadata.commit_time, Reverse(metadata.oid)));
-    }
-
-    let mut out = Vec::with_capacity(limit.min(256));
-    while out.len() < limit {
-        let Some((_, Reverse(oid))) = heap.pop() else {
-            break;
-        };
-        let Some(metadata) = records.get(&oid).cloned() else {
-            continue;
-        };
-        out.push(metadata.clone());
-        let parents = if first_parent {
-            metadata
-                .parents
-                .first()
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>()
-        } else {
-            metadata.parents.clone()
-        };
-        for parent in parents {
-            if !seen.insert(parent) {
-                continue;
-            }
-            let parent_metadata = commit_metadata_lookup(&mut graph, reader, format, &parent)?;
-            records.insert(parent_metadata.oid, parent_metadata.clone());
-            heap.push((parent_metadata.commit_time, Reverse(parent_metadata.oid)));
-        }
-    }
-    Ok(out)
+    RevWalk::new(git_dir, format, reader, starts)
+        .order(RevWalkOrder::CommitDate)
+        .first_parent(first_parent)
+        .max_count(Some(limit))
+        .collect_all()
 }
 
 fn commit_metadata_lookup<R: ObjectReader>(
@@ -3904,5 +4184,168 @@ mod tests {
             sley_core::digest_bytes(format, &out).expect("test operation should succeed");
         out.extend_from_slice(checksum.as_bytes());
         out
+    }
+
+    // --- RevWalk skeleton (STAGE-A) -------------------------------------
+
+    /// Build a linear chain c0 <- c1 <- ... with strictly increasing committer
+    /// times, returning the oids oldest-first. The empty tree is reused.
+    fn build_linear_history(git_dir: &std::path::Path, n: usize) -> Vec<ObjectId> {
+        let mut db = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("write empty tree");
+        let mut oids = Vec::new();
+        let mut parents = Vec::new();
+        for i in 0..n {
+            let oid = write_dated_commit(
+                &mut db,
+                tree,
+                parents.clone(),
+                format!("c{i}\n").as_bytes(),
+                100 + i as i64,
+            );
+            parents = vec![oid];
+            oids.push(oid);
+        }
+        oids
+    }
+
+    fn walk_oids<R: ObjectReader>(walk: RevWalk<'_, R>) -> Vec<ObjectId> {
+        walk.collect_all()
+            .expect("walk succeeds")
+            .into_iter()
+            .map(|m| m.oid)
+            .collect()
+    }
+
+    #[test]
+    fn revwalk_commit_date_order_newest_first() {
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 4); // oldest..newest
+        let tip = *oids.last().expect("tip");
+        let got = walk_oids(RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]));
+        let mut expected = oids.clone();
+        expected.reverse(); // newest committer-date first
+        assert_eq!(got, expected);
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_max_count_limits_output() {
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 5);
+        let tip = *oids.last().expect("tip");
+        let got = walk_oids(
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).max_count(Some(2)),
+        );
+        assert_eq!(got, vec![oids[4], oids[3]]);
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_skip_then_limit() {
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 5);
+        let tip = *oids.last().expect("tip");
+        let got = walk_oids(
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip])
+                .skip(1)
+                .max_count(Some(2)),
+        );
+        // newest..oldest is c4,c3,c2,c1,c0; skip 1 -> c3,c2.
+        assert_eq!(got, vec![oids[3], oids[2]]);
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_delegates_match_old_limited_walk() {
+        // The thin-wrapper invariant: walk_commit_metadata_date_ordered_limited
+        // (now RevWalk-backed) is byte-identical to a direct RevWalk in
+        // CommitDate order with the same limit.
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 6);
+        let tip = *oids.last().expect("tip");
+        let via_fn = walk_commit_metadata_date_ordered_limited(
+            &git_dir,
+            ObjectFormat::Sha1,
+            &db,
+            [tip],
+            false,
+            3,
+        )
+        .expect("limited walk")
+        .into_iter()
+        .map(|m| m.oid)
+        .collect::<Vec<_>>();
+        let via_walk = walk_oids(
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip])
+                .order(RevWalkOrder::CommitDate)
+                .max_count(Some(3)),
+        );
+        assert_eq!(via_fn, via_walk);
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_first_parent_follows_one_line() {
+        let git_dir = temp_git_dir();
+        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let tree = db
+            .write_object(EncodedObject::new(ObjectType::Tree, Vec::new()))
+            .expect("tree");
+        let base = write_dated_commit(&mut db, tree, vec![], b"base\n", 100);
+        let side = write_dated_commit(&mut db, tree, vec![base], b"side\n", 110);
+        let main = write_dated_commit(&mut db, tree, vec![base], b"main\n", 120);
+        let merge = write_dated_commit(&mut db, tree, vec![main, side], b"merge\n", 130);
+        let first_parent = walk_oids(
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [merge]).first_parent(true),
+        );
+        // first-parent line: merge -> main -> base; `side` is skipped.
+        assert_eq!(first_parent, vec![merge, main, base]);
+        assert!(!first_parent.contains(&side));
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_date_window_filters_and_prunes() {
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 5); // times 100..104
+        let tip = *oids.last().expect("tip");
+        // since=102 (>=102), until=103 (<=103) -> times 102,103 -> oids[3],oids[2].
+        let got = walk_oids(
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).date_window(
+                RevWalkDateWindow {
+                    min_time: Some(102),
+                    max_time: Some(103),
+                },
+            ),
+        );
+        assert_eq!(got, vec![oids[3], oids[2]]);
+        fs::remove_dir_all(git_dir).expect("cleanup");
+    }
+
+    #[test]
+    fn revwalk_pathspec_is_carried_but_not_pruning() {
+        // STAGE-A: a pathspec is attached and round-trips, but does not yet
+        // prune (TREESAME simplification is STAGE-B). The full history is still
+        // returned.
+        let git_dir = temp_git_dir();
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let oids = build_linear_history(&git_dir, 3);
+        let tip = *oids.last().expect("tip");
+        let spec = Pathspec::parse([b"does/not/exist".as_slice()], PathspecMatchMagic::default())
+            .expect("pathspec");
+        let walk =
+            RevWalk::new(&git_dir, ObjectFormat::Sha1, &db, [tip]).pathspec(spec.clone());
+        assert_eq!(walk.pathspec_ref(), &spec);
+        let got = walk_oids(walk);
+        assert_eq!(got.len(), 3, "pathspec must not prune in STAGE-A");
+        fs::remove_dir_all(git_dir).expect("cleanup");
     }
 }

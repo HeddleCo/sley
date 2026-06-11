@@ -12,6 +12,7 @@ sley-formats = { path = "../sley-formats" }
 sley-index = { path = "../sley-index" }
 sley-object = { path = "../sley-object" }
 sley-odb = { path = "../sley-odb" }
+sley-pathspec = { path = "../sley-pathspec" }
 sley-refs = { path = "../sley-refs" }
 
 [lints]
