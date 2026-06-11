@@ -93,6 +93,10 @@ pub struct CloneOptions<'a> {
     pub depth: Option<u32>,
     /// The committer identity for the branch-creation and checkout reflog entries.
     pub committer: Vec<u8>,
+    /// The remote `HEAD` is detached at this commit (no default branch). After
+    /// the fetch the destination checks out this commit detached instead of
+    /// creating `checkout_branch`; `refs/remotes/<origin>/HEAD` is not written.
+    pub detached_head: Option<ObjectId>,
 }
 
 /// The structured result of a [`clone`].
@@ -201,6 +205,21 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
     )?;
 
     let store = FileRefStore::new(&git_dir, request.format);
+    if let Some(detached) = &request.options.detached_head {
+        sley_worktree::checkout_detached_filtered(
+            request.destination,
+            &git_dir,
+            request.format,
+            detached,
+            request.options.committer.clone(),
+            b"clone: checkout".to_vec(),
+            &config,
+        )?;
+        return Ok(CloneOutcome {
+            git_dir,
+            branch_oid: *detached,
+        });
+    }
     let remote_branch_ref = format!(
         "refs/remotes/{}/{}",
         request.options.origin, request.options.checkout_branch
