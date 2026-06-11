@@ -3532,6 +3532,15 @@ pub enum MergeConflictKind {
         /// The original (pre-rename) path.
         old_path: Vec<u8>,
     },
+    /// A file renamed on one side whose source was deleted on the other side.
+    RenameDelete {
+        /// The pre-rename source path.
+        old_path: Vec<u8>,
+        /// The side label that performed the rename.
+        renamed_in: String,
+        /// The side label that deleted the source.
+        deleted_in: String,
+    },
 }
 
 /// One resolved/conflicted path in the merged tree.
@@ -3915,6 +3924,54 @@ pub fn merge_entry_maps(
         }
     }
 
+    // Rename/delete conflicts: a file renamed on one side whose source the other
+    // side deleted. The merge core resolved the destination cleanly (only the
+    // renaming side has it), but git flags this as a conflict — keep the renamed
+    // content in the tree, record higher-order stages, and mark the merge dirty.
+    if !renames.rename_deletes.is_empty() {
+        for (dest, rd) in &renames.rename_deletes {
+            // Skip if another conflict already claimed this destination.
+            let Some(slot) = paths.iter_mut().find(|p| &p.path == dest) else {
+                continue;
+            };
+            if slot.conflict.is_some() {
+                continue;
+            }
+            let base_entry = base_map.get(&rd.source).copied();
+            let renamed_entry = slot.result;
+            // The renamed content sits on the renaming side; the deleting side
+            // contributes no stage at the destination.
+            let (ours_stage, theirs_stage) = match rd.side {
+                RenameSide::Ours => (renamed_entry, None),
+                RenameSide::Theirs => (None, renamed_entry),
+            };
+            let (renamed_in, deleted_in) = match rd.side {
+                RenameSide::Ours => {
+                    (options.ours_label.to_string(), options.theirs_label.to_string())
+                }
+                RenameSide::Theirs => {
+                    (options.theirs_label.to_string(), options.ours_label.to_string())
+                }
+            };
+            let worktree = match &renamed_entry {
+                Some((mode, oid)) => Some((*mode, merge_blob_bytes(db, oid)?)),
+                None => None,
+            };
+            slot.stages = MergeStages {
+                base: base_entry,
+                ours: ours_stage,
+                theirs: theirs_stage,
+            };
+            slot.worktree = worktree;
+            slot.conflict = Some(MergeConflictKind::RenameDelete {
+                old_path: rd.source.clone(),
+                renamed_in,
+                deleted_in,
+            });
+            clean = false;
+        }
+    }
+
     let tree = write_merged_tree(db, &leaves)?;
 
     Ok(MergeTreesResult { tree, paths, clean })
@@ -4057,6 +4114,19 @@ struct MergeRename {
     side: RenameSide,
 }
 
+/// A file renamed on one side whose source was *deleted* on the other side — a
+/// rename/delete conflict. git keeps the renamed content at the destination but
+/// flags the merge as conflicted.
+#[derive(Clone)]
+struct RenameDelete {
+    /// The pre-rename source path (deleted on the other side).
+    source: Vec<u8>,
+    /// The post-rename destination path (the surviving renamed content).
+    dest: Vec<u8>,
+    /// Which side performed the rename (the other side deleted the source).
+    side: RenameSide,
+}
+
 /// The rename pairings discovered for one merge: which destination paths came
 /// from which source path, and which side renamed (so the other side's change
 /// can follow the rename and conflict labels can be path-qualified like git).
@@ -4066,6 +4136,9 @@ struct MergeRenames {
     /// OTHER side kept/modified the source in place are recorded (the case
     /// where the modification must follow the rename).
     dest_to_source: BTreeMap<Vec<u8>, MergeRename>,
+    /// Rename/delete conflicts: a file renamed on one side whose source the
+    /// other side deleted. Keyed by destination path.
+    rename_deletes: BTreeMap<Vec<u8>, RenameDelete>,
 }
 
 /// Every file rename observed on one side (base->side), as `(old, new)` pairs.
@@ -4177,6 +4250,20 @@ fn collect_side_renames(
         // references the source path — i.e. the other side modified/kept `old`,
         // and its change should follow the rename to `new`.
         if !other_map.contains_key(&old) {
+            // The source path is gone on the other side. If it existed in base
+            // (so the other side *deleted* it) and the other side did not also
+            // produce `new`, this is a rename/delete conflict: this side renamed
+            // the file, the other side deleted its source.
+            if base_map.contains_key(&old) && !other_map.contains_key(&new) {
+                renames
+                    .rename_deletes
+                    .entry(new.clone())
+                    .or_insert(RenameDelete {
+                        source: old.clone(),
+                        dest: new.clone(),
+                        side,
+                    });
+            }
             continue;
         }
         // If the other side ALSO renamed/created `new`, that is a rename/rename

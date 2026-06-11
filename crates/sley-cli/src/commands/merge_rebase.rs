@@ -64,6 +64,34 @@ pub(crate) fn merge_write_worktree_file(
     Ok(())
 }
 
+/// True when it is safe to delete the worktree file at `path` during a merge:
+/// either the file is already gone, or its on-disk content hashes to the blob
+/// `ours` (HEAD) had at that path. An untracked file (ours = `None`) or a file
+/// whose content diverges from ours' version is preserved, matching git's refusal
+/// to clobber untracked/dirty data (the rename/delete "Gollum's ring" case).
+fn worktree_file_matches_ours(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    ours: Option<&(u32, ObjectId)>,
+) -> Result<bool> {
+    let _ = db;
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let full = worktree_root.join(rel);
+    let Ok(bytes) = fs::read(&full) else {
+        // Missing/unreadable: nothing to clobber, removal is a no-op anyway.
+        return Ok(true);
+    };
+    let Some((_, ours_oid)) = ours else {
+        // The path was not tracked on ours' side; on-disk content is untracked.
+        return Ok(false);
+    };
+    let format = ours_oid.format();
+    let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+    Ok(&on_disk == ours_oid)
+}
+
 pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<()> {
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
@@ -935,12 +963,25 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(&worktree_root, path)?,
+            MergePathResult::Resolved(None) => {
+                // git only removes a worktree file when its content is the tracked
+                // (ours/HEAD) version; an untracked file or one with divergent
+                // content at this path is left alone (the rename/delete "Gollum's
+                // ring" safety case). When the path was not in ours, or the file
+                // on disk differs from ours' blob, preserve it.
+                if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
+                    merge_remove_worktree_file(&worktree_root, path)?;
+                }
+            }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
                     merge_write_worktree_file(&worktree_root, path, content, *mode)?
                 }
-                None => merge_remove_worktree_file(&worktree_root, path)?,
+                None => {
+                    if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
+                        merge_remove_worktree_file(&worktree_root, path)?;
+                    }
+                }
             },
         }
     }

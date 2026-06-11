@@ -498,6 +498,21 @@ fn render_merge_outcome(
                     ),
                 });
             }
+            sley_diff_merge::MergeConflictKind::RenameDelete {
+                old_path,
+                renamed_in,
+                deleted_in,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![old_path.clone(), path.clone()],
+                    stable_type: "CONFLICT (rename/delete)".to_string(),
+                    message: format!(
+                        "CONFLICT (rename/delete): {old} renamed to {new} in {renamed_in}, but deleted in {deleted_in}.",
+                        old = String::from_utf8_lossy(old_path),
+                        new = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
         }
         push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
