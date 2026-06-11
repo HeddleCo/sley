@@ -275,9 +275,19 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     // `-z` / `--null`: separate/terminate compiled-format entries with NUL
     // instead of newline.
     let mut null_terminate = false;
+    let mut pathspecs: Vec<String> = Vec::new();
+    let mut full_history = false;
+    let mut positional_only = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
+        if positional_only {
+            // After `--`, every remaining argument is a pathspec.
+            pathspecs.push(arg.to_string());
+            continue;
+        }
         match arg.as_str() {
+            "--" => positional_only = true,
+            "--full-history" => full_history = true,
             "--not" => not = !not,
             "--stdin" => read_stdin = true,
             "--default" => {
@@ -534,7 +544,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             | "--dense"
             | "--remove-empty"
             | "--unpacked"
-            | "--full-history"
             | "--simplify-merges"
             | "--show-pulls"
             | "--no-source"
@@ -1305,6 +1314,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     }
     if walk
         && matches!(ordering, RevListOrdering::Default | RevListOrdering::Date)
+        && pathspecs.is_empty()
+        && !full_history
         && matches!(&output, LogOutput::Compiled { compiled, show_children: false, .. }
             if compiled.is_metadata_emitable() && compiled.uses_oid() && !compiled.uses_decorations())
         && decoration == LogDecorationMode::Off
@@ -1431,6 +1442,29 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         RevListOrdering::Date => rev_list_date_order(selected)?,
         RevListOrdering::AuthorDate => rev_list_author_date_order(selected)?,
     };
+    // Pathspec-limited / --full-history simplification (TREESAME prune + parent
+    // rewriting). Owned binding outlives `selected` (a Vec of references).
+    let simplified_storage;
+    if !pathspecs.is_empty() || full_history {
+        let pathspec = sley_rev::Pathspec::parse(
+            pathspecs.iter().map(|p| p.as_bytes()),
+            sley_rev::PathspecMatchMagic::default(),
+        )
+        .map_err(|err| GitError::Command(format!("bad pathspec: {err:?}")))?;
+        let ordered_owned: Vec<sley_rev::CommitRecord> =
+            selected.iter().map(|r| (*r).clone()).collect();
+        simplified_storage = sley_rev::simplify_history(
+            &db,
+            format,
+            ordered_owned,
+            &pathspec,
+            sley_rev::SimplifyOptions {
+                full_history,
+                first_parent,
+            },
+        )?;
+        selected = simplified_storage.iter().collect();
+    }
     if skip > 0 {
         selected = selected.into_iter().skip(skip).collect();
     }
