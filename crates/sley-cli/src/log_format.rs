@@ -567,7 +567,7 @@ fn parse_complex_directive(
                 *fields |= FormatFields::BODY;
                 Ok(Some((Some(FormatToken::Trailers(opts.to_string())), consumed)))
             } else if inner == "decorate" || inner.starts_with("decorate:") {
-                let opts = inner.strip_prefix("decorate").unwrap();
+                let opts = inner.strip_prefix("decorate").unwrap_or("");
                 let opts = opts.strip_prefix(':').unwrap_or("");
                 match parse_decorate_spec(opts) {
                     Some(spec) => {
@@ -577,7 +577,7 @@ fn parse_complex_directive(
                     None => Ok(Some((Some(FormatToken::Literal("%".into())), 0))),
                 }
             } else if inner == "describe" || inner.starts_with("describe:") {
-                let opts = inner.strip_prefix("describe").unwrap();
+                let opts = inner.strip_prefix("describe").unwrap_or("");
                 let opts = opts.strip_prefix(':').unwrap_or("");
                 match parse_describe_spec(opts) {
                     Some(spec) => {

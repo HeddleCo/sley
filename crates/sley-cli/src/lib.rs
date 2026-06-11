@@ -7102,29 +7102,30 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
             w = -indent;
             space = Some(0);
         }
-        let restart;
+        let mut restart = false;
         loop {
             // (skip ANSI escapes — not present in the corpus; omitted.)
             let c = text.get(pos).copied().unwrap_or(0);
             if c == 0 || (c as char).is_ascii_whitespace() {
                 if w <= width || space.is_none() {
-                    let start = if c == 0 && pos == bol {
-                        restart = false;
-                        return; // matched git's early return
-                    } else if let Some(sp) = space {
-                        sp
-                    } else {
-                        if indent > 0 {
-                            out.extend(std::iter::repeat_n(b' ', indent as usize));
+                    // git's `new_line` is reachable here only when `space` is set
+                    // and width is exceeded; in this branch we emit the segment.
+                    let start = match space {
+                        _ if c == 0 && pos == bol => return, // git early return
+                        Some(sp) => sp,
+                        None => {
+                            if indent > 0 {
+                                out.extend(std::iter::repeat_n(b' ', indent as usize));
+                            }
+                            bol
                         }
-                        bol
                     };
                     out.extend_from_slice(&text[start..pos]);
                     if c == 0 {
-                        restart = false;
                         return;
                     }
                     let mut sp = pos;
+                    let mut go_new_line = false;
                     if c == b'\t' {
                         w |= 0x07;
                     } else if c == b'\n' {
@@ -7132,43 +7133,37 @@ fn log_wrap_text(out: &mut Vec<u8>, text: &[u8], indent1: i32, indent2: i32, wid
                         let next = text.get(sp).copied().unwrap_or(0);
                         if next == b'\n' {
                             out.push(b'\n');
-                            // goto new_line
-                            out.push(b'\n');
-                            // git's new_line resets after adding '\n'; but it
-                            // already added one above for the blank-line case, so
-                            // emulate the double via the new_line block below.
-                            // Simpler: fall through to new_line handling.
-                            // We replicate new_line inline:
-                            bol = sp + 1;
-                            // space char at `sp` is '\n' -> isspace true
-                            // text = bol = space + isspace(*space)
-                            // Here we set pos to bol and reset.
-                            pos = bol;
-                            space = None;
-                            w = indent2;
-                            indent = indent2;
-                            continue;
+                            go_new_line = true;
                         } else if !(next as char).is_ascii_alphanumeric() {
-                            // goto new_line
-                            out.push(b'\n');
-                            bol = sp + if (next as char).is_ascii_whitespace() { 1 } else { 0 };
-                            pos = bol;
-                            space = None;
-                            w = indent2;
-                            indent = indent2;
-                            continue;
+                            go_new_line = true;
                         } else {
                             out.push(b' ');
                         }
+                    }
+                    if go_new_line {
+                        out.push(b'\n');
+                        let advance = if (text.get(sp).copied().unwrap_or(0) as char)
+                            .is_ascii_whitespace()
+                        {
+                            1
+                        } else {
+                            0
+                        };
+                        bol = sp + advance;
+                        pos = bol;
+                        space = None;
+                        w = indent2;
+                        indent = indent2;
+                        continue;
                     }
                     space = Some(sp);
                     w += 1;
                     pos += 1;
                     continue;
                 } else {
-                    // new_line
+                    // new_line (width exceeded, break at the last space)
                     out.push(b'\n');
-                    let sp = space.unwrap();
+                    let sp = space.unwrap_or(pos);
                     let advance = if (text.get(sp).copied().unwrap_or(0) as char)
                         .is_ascii_whitespace()
                     {
