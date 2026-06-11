@@ -1513,6 +1513,26 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
             refresh_ignore_missing,
             really_refresh,
         )?;
+        // Unmerged entries make the refresh fail (`<path>: needs merge`).
+        let index_path = sley_worktree::repository_index_path(&git_dir);
+        if index_path.exists() {
+            let index = Index::parse(&fs::read(&index_path)?, format)?;
+            let mut unmerged: Vec<String> = index
+                .entries
+                .iter()
+                .filter(|entry| index_entry_stage(entry) > 0)
+                .map(|entry| entry.path.to_string())
+                .collect();
+            unmerged.dedup();
+            if !unmerged.is_empty() {
+                if !refresh_quiet {
+                    for path in &unmerged {
+                        println!("{path}: needs merge");
+                    }
+                }
+                return Err(GitError::Exit(1));
+            }
+        }
     } else if again {
         sley_worktree::update_index_again(
             &worktree_root,

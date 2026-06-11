@@ -43,6 +43,7 @@ pub(crate) mod plumbing;
 pub(crate) mod read_tree;
 pub(crate) mod refs;
 pub(crate) mod remote_cmds;
+pub(crate) mod replay;
 pub(crate) mod rev_list;
 pub(crate) mod rev_parse;
 pub(crate) mod shortlog;

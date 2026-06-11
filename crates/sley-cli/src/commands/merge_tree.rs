@@ -321,6 +321,7 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
             detect_renames: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
             directory_renames: sley_diff_merge::DirectoryRenames::False,
+            style: sley_diff_merge::ConflictStyle::Merge,
         },
     )?;
     let outcome = render_merge_outcome(&merge, branch1, branch2);

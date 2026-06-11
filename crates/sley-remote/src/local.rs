@@ -399,8 +399,8 @@ pub fn compute_local_deepen<R: ObjectReader>(
         let Some(commit) = peel_to_commit(remote_db, format, head)? else {
             continue;
         };
-        if !min_depth.contains_key(&commit) {
-            min_depth.insert(commit, 0);
+        if let std::collections::hash_map::Entry::Vacant(entry) = min_depth.entry(commit) {
+            entry.insert(0);
             queue.push_back(commit);
         }
     }
@@ -420,8 +420,8 @@ pub fn compute_local_deepen<R: ObjectReader>(
             continue;
         }
         for parent in parents {
-            if !min_depth.contains_key(&parent) {
-                min_depth.insert(parent, commit_depth + 1);
+            if let std::collections::hash_map::Entry::Vacant(entry) = min_depth.entry(parent) {
+                entry.insert(commit_depth + 1);
                 queue.push_back(parent);
             }
         }

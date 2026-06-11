@@ -119,6 +119,33 @@ impl Default for DiffTreeOptions {
 }
 
 pub(crate) fn cmd_diff_tree(args: &[String]) -> Result<()> {
+    // `diff-tree -s --pretty=tformat:%s <commit>` — the no-diff subject-only
+    // form the sequencer suite uses; print the subject and stop.
+    {
+        let silent = args.iter().any(|arg| arg == "-s" || arg == "--no-patch");
+        let pretty = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--pretty="))
+            .filter(|fmt| *fmt == "tformat:%s" || *fmt == "format:%s");
+        if silent && let Some(_fmt) = pretty {
+            let revs: Vec<&String> = args
+                .iter()
+                .filter(|arg| !arg.starts_with('-') || arg.as_str() == "-")
+                .collect();
+            if let [rev] = revs.as_slice() {
+                let cwd = env::current_dir()?;
+                let git_dir = discover_git_dir(&cwd)?;
+                let format = repository_object_format(&git_dir)?;
+                let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+                let oid = resolve_revision(&git_dir, format, rev)?;
+                let commit_oid = sley_rev::peel_to_commit(&db, format, &oid)?;
+                let object = db.read_object(&commit_oid)?;
+                let commit = Commit::parse(format, &object.body)?;
+                println!("{}", commit_subject(&commit.message));
+                return Ok(());
+            }
+        }
+    }
     let mut options = DiffTreeOptions::default();
     let mut pathspecs: Vec<String> = Vec::new();
     let mut positional_only = false;

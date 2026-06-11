@@ -552,7 +552,13 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let remote_git_dir = ls_remote_git_dir(&repository)?;
     let remote_common_git_dir = common_git_dir_for_git_dir(&remote_git_dir)?;
     let format = repository_object_format(&remote_common_git_dir)?;
-    let remote_head_branch = remote_head_branch(&remote_common_git_dir, format)?;
+    let detached_remote_head = remote_head_detached(&remote_common_git_dir, format);
+    let remote_head_branch = match (&detached_remote_head, &branch) {
+        // A detached source HEAD has no default branch; the clone checks the
+        // commit out detached (unless --branch named one).
+        (Some(_), None) => String::new(),
+        _ => remote_head_branch(&remote_common_git_dir, format)?,
+    };
     let alternates = clone_alternates(&remote_git_dir, shared, &reference_alternates)?;
     let revision_oid = revision
         .as_deref()
@@ -717,6 +723,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
+    let remote_common_git_dir_for_head = remote_common_git_dir.clone();
     let remote_source = sley_remote::CloneSource::Local {
         git_dir: remote_git_dir,
         common_git_dir: remote_common_git_dir,
@@ -731,6 +738,11 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // warned-and-ignored above, leaving `None` (a full clone).
         depth,
         committer: commit_identity_from_env("COMMITTER")?,
+        detached_head: if branch_explicit {
+            None
+        } else {
+            detached_remote_head
+        },
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -750,6 +762,16 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 } else {
                     Some(format!("+refs/heads/*:refs/remotes/{origin}/*"))
                 };
+                // A detached source HEAD may sit on commits unreachable from
+                // any ref; copy its closure so the detached checkout works.
+                if let Some(detached) = clone_options.detached_head.as_ref() {
+                    copy_local_revision_objects(
+                        &remote_common_git_dir_for_head,
+                        git_dir,
+                        format,
+                        detached,
+                    )?;
+                }
                 configure_local_clone(git_dir, fetch_refspec)
             },
             configure_branch: &mut |git_dir, branch| {
@@ -905,6 +927,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         single_branch,
         depth: options.depth,
         committer: commit_identity_from_env("COMMITTER")?,
+        detached_head: None,
     };
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
@@ -1021,6 +1044,7 @@ fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         single_branch,
         depth: options.depth,
         committer: commit_identity_from_env("COMMITTER")?,
+        detached_head: None,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1698,6 +1722,15 @@ fn remote_head_branch(remote_git_dir: &Path, format: ObjectFormat) -> Result<Str
         Some(RefTarget::Direct(_)) | None => {
             Err(GitError::reference_not_found("remote HEAD branch"))
         }
+    }
+}
+
+/// The remote `HEAD` commit when it is detached (no default branch).
+fn remote_head_detached(remote_git_dir: &Path, format: ObjectFormat) -> Option<ObjectId> {
+    let remote_store = FileRefStore::new(remote_git_dir, format);
+    match remote_store.read_ref("HEAD").ok()? {
+        Some(RefTarget::Direct(oid)) => Some(oid),
+        _ => None,
     }
 }
 

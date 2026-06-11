@@ -1441,7 +1441,7 @@ impl FileRefStore {
                 if err.kind() == std::io::ErrorKind::NotADirectory {
                     return Err(ref_directory_conflict_error(
                         &update.name,
-                        &parent_to_ref_name(&self.ref_base_dir(&update.name), parent),
+                        &parent_to_ref_name(self.ref_base_dir(&update.name), parent),
                     ));
                 }
                 return Err(GitError::Io(err.to_string()));

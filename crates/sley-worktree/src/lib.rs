@@ -446,7 +446,7 @@ fn update_index_paths_impl(
             checksum: None,
         }
     };
-    let mut odb = FileObjectDatabase::from_git_dir(git_dir, format);
+    let odb = FileObjectDatabase::from_git_dir(git_dir, format);
     // Build the `.gitattributes` matcher ONCE for the whole batch when clean
     // filters are in play. `apply_clean_filter` rebuilds it from scratch on every
     // call — and `AttributeMatcher::from_worktree_root` walks the entire worktree
@@ -4726,8 +4726,34 @@ pub fn restore_worktree_paths(
     format: ObjectFormat,
     paths: &[PathBuf],
 ) -> Result<RestoreResult> {
-    let worktree_root = worktree_root.as_ref();
-    let git_dir = git_dir.as_ref();
+    restore_worktree_paths_inner(worktree_root.as_ref(), git_dir.as_ref(), format, paths, None)
+}
+
+/// Like [`restore_worktree_paths`], applying the smudge-side content filters
+/// (CRLF / ident / filter drivers) the way a checkout writes blobs.
+pub fn restore_worktree_paths_filtered(
+    worktree_root: impl AsRef<Path>,
+    git_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    config: &GitConfig,
+) -> Result<RestoreResult> {
+    restore_worktree_paths_inner(
+        worktree_root.as_ref(),
+        git_dir.as_ref(),
+        format,
+        paths,
+        Some(config),
+    )
+}
+
+fn restore_worktree_paths_inner(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+    smudge_config: Option<&GitConfig>,
+) -> Result<RestoreResult> {
     let index_path = repository_index_path(git_dir);
     if !index_path.exists() {
         return Err(GitError::Exit(1));
@@ -4754,7 +4780,7 @@ pub fn restore_worktree_paths(
             if entry.path.as_bytes() == git_path.as_slice()
                 || (recursive && index_entry_is_under_path(entry.path.as_bytes(), &git_path))
             {
-                restore_index_entry(worktree_root, &db, entry)?;
+                restore_index_entry(worktree_root, git_dir, format, &db, entry, smudge_config)?;
                 restored.insert(entry.path.clone());
                 matched = true;
             }
@@ -6015,8 +6041,11 @@ pub fn move_index_and_worktree_path(
 
 fn restore_index_entry(
     worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
     db: &FileObjectDatabase,
     entry: &IndexEntry,
+    smudge_config: Option<&GitConfig>,
 ) -> Result<()> {
     let object = db.read_object(&entry.oid)?;
     if object.object_type != ObjectType::Blob {
@@ -6026,11 +6055,28 @@ fn restore_index_entry(
             object.object_type.as_str()
         )));
     }
+    let body: Cow<'_, [u8]> = match smudge_config {
+        Some(config) => {
+            let checks = smudge_attribute_checks_from_index(
+                worktree_root,
+                git_dir,
+                format,
+                entry.path.as_bytes(),
+            )?;
+            apply_smudge_filter_with_attributes_cow(
+                config,
+                &checks,
+                entry.path.as_bytes(),
+                &object.body,
+            )?
+        }
+        None => Cow::Borrowed(&object.body),
+    };
     let file_path = worktree_path(worktree_root, entry.path.as_bytes())?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(file_path, &object.body)?;
+    fs::write(file_path, &body)?;
     Ok(())
 }
 
@@ -6337,13 +6383,24 @@ fn checkout_switch_head_symbolic(
     old_oid: Option<ObjectId>,
     new_oid: Option<ObjectId>,
 ) -> Result<()> {
+    // Reflog "from" side: the previous branch's short name, or the commit id
+    // when HEAD was detached (git's `checkout: moving from X to Y` shape,
+    // which `@{-N}` resolution parses).
+    let from = match refs.read_ref("HEAD") {
+        Ok(Some(RefTarget::Symbolic(name))) => name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(&name)
+            .to_string(),
+        Ok(Some(RefTarget::Direct(oid))) => oid.to_hex(),
+        _ => "HEAD".to_string(),
+    };
     let mut tx = refs.transaction();
     let reflog = match (old_oid, new_oid) {
         (Some(old_oid), Some(new_oid)) => Some(ReflogEntry {
             old_oid,
             new_oid,
             committer,
-            message: format!("checkout: moving from HEAD to {branch}").into_bytes(),
+            message: format!("checkout: moving from {from} to {branch}").into_bytes(),
         }),
         _ => None,
     };
@@ -7328,7 +7385,7 @@ mod tests {
         body.extend_from_slice(b"committer Test <test@example.com> 0 +0000\n");
         body.extend_from_slice(b"\n");
         body.extend_from_slice(b"sparse fixture\n");
-        let mut odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
+        let odb = FileObjectDatabase::from_git_dir(git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
             .expect("test operation should succeed");
@@ -7752,7 +7809,7 @@ mod tests {
         let mut body = Vec::new();
         body.extend_from_slice(format!("tree {tree}\n").as_bytes());
         body.extend_from_slice(b"author T <t@e> 0 +0000\ncommitter T <t@e> 0 +0000\n\nm\n");
-        let mut odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let odb = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let commit = odb
             .write_object(EncodedObject::new(ObjectType::Commit, body))
             .expect("test operation should succeed");

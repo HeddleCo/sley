@@ -13,5 +13,8 @@ sley-odb = { path = "../sley-odb" }
 sley-refs = { path = "../sley-refs" }
 sley-worktree = { path = "../sley-worktree" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
