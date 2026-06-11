@@ -302,7 +302,7 @@ fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
             && bytes[0] == b'-'
             && bytes[1..]
                 .iter()
-                .all(|&ch| matches!(ch, b'a' | b'A' | b'd' | b'f' | b'F' | b'l' | b'q'))
+                .all(|&ch| matches!(ch, b'a' | b'A' | b'b' | b'd' | b'f' | b'F' | b'l' | b'q'))
         {
             expanded.extend(bytes[1..].iter().map(|&ch| format!("-{}", ch as char)));
         } else {
@@ -312,13 +312,57 @@ fn expand_repack_short_clusters(args: &[String]) -> Vec<String> {
     expanded
 }
 
+/// The commit oids that get bitmap selection preference, mirroring upstream's
+/// `NEEDS_BITMAP` marking: tips of refs under the `pack.preferBitmapTips`
+/// hierarchies (each config value names a ref prefix, normalised to end with
+/// `/`), peeled to commits. Empty when the config is unset.
+fn repack_preferred_bitmap_tips(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let config = read_repo_config(git_dir)?;
+    let prefixes: Vec<String> = config
+        .get_all("pack", None, "preferBitmapTips")
+        .into_iter()
+        .flatten()
+        .map(|prefix| {
+            if prefix.ends_with('/') {
+                prefix.to_string()
+            } else {
+                format!("{prefix}/")
+            }
+        })
+        .collect();
+    let mut tips = HashSet::new();
+    if prefixes.is_empty() {
+        return Ok(tips);
+    }
+    let store = FileRefStore::new(git_dir, format);
+    for reference in store.list_refs()? {
+        if !prefixes.iter().any(|prefix| reference.name.starts_with(prefix)) {
+            continue;
+        }
+        let RefTarget::Direct(oid) = reference.target else {
+            continue;
+        };
+        if let Ok(commit) = sley_rev::peel_to_commit(db, format, &oid) {
+            tips.insert(commit);
+        }
+    }
+    Ok(tips)
+}
+
 pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
+    let mut write_bitmaps: Option<bool> = None;
     for arg in &expand_repack_short_clusters(args) {
         match arg.as_str() {
             "-d" => prune = true,
             "-q" | "--quiet" => quiet = true,
+            "-b" | "--write-bitmap-index" => write_bitmaps = Some(true),
+            "--no-write-bitmap-index" => write_bitmaps = Some(false),
             // Accepted no-ops: we always rewrite every object into one pack.
             "-a" | "-A" | "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
             value if value.starts_with("--window") || value.starts_with("--depth") => {}
@@ -337,8 +381,26 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
     let format = repository_object_format(&common_git_dir)?;
+    let write_bitmaps = match write_bitmaps {
+        Some(explicit) => explicit,
+        None => read_repo_config(&common_git_dir)?
+            .get_bool("repack", None, "writeBitmaps")
+            .unwrap_or(false),
+    };
     if let Some(result) = sley_odb::repack_all_objects(&common_git_dir, format)? {
-        sley_odb::install_repack_result(&common_git_dir, format, &result, prune)?;
+        let bitmap_tips = if write_bitmaps {
+            let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+            Some(repack_preferred_bitmap_tips(&common_git_dir, &db, format)?)
+        } else {
+            None
+        };
+        sley_odb::install_repack_result_with_bitmap(
+            &common_git_dir,
+            format,
+            &result,
+            prune,
+            bitmap_tips.as_ref(),
+        )?;
     }
     let _ = quiet;
     Ok(())

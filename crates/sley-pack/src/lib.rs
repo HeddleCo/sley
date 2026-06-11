@@ -222,9 +222,15 @@ pub struct PackBitmapTypeBitmaps {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackBitmapEntry {
+    /// The commit's position in the *oid-sorted* pack index (`.idx` order),
+    /// NOT the pack-order position used for the bitmap's bit numbering.
+    /// Upstream writes `oid_pos(...)` here (pack-bitmap-write.c) and reads it
+    /// back via `nth_packed_object_id` (pack-bitmap.c).
     pub object_position: u32,
     pub xor_offset: u8,
     pub flags: u8,
+    /// Reachability bitmap; bit `i` refers to the `i`-th object in *pack
+    /// order* (offset order), as mapped by the pack's reverse index.
     pub bitmap: EwahBitmap,
 }
 
@@ -1426,7 +1432,9 @@ impl PackBitmapIndex {
         })
     }
 
-    pub fn entry_for_pack_position(&self, position: u32) -> Option<&PackBitmapEntry> {
+    /// Looks up the stored entry whose commit sits at `position` in the
+    /// oid-sorted pack index (`.idx` order; see [`PackBitmapEntry::object_position`]).
+    pub fn entry_for_index_position(&self, position: u32) -> Option<&PackBitmapEntry> {
         self.entries
             .iter()
             .find(|entry| entry.object_position == position)
@@ -3891,7 +3899,10 @@ pub struct PackBitmapWriter {
 
 #[derive(Debug, Clone)]
 struct SelectedCommit {
-    commit_position: u32,
+    /// Oid-sorted `.idx` position (what the on-disk entry records). The
+    /// commit's pack-order position lives in `reachable` with the rest of the
+    /// bits.
+    commit_index_position: u32,
     flags: u8,
     reachable: Vec<u32>,
 }
@@ -3969,16 +3980,30 @@ impl PackBitmapWriter {
 
     /// Registers a selected commit and the pack positions reachable from it.
     ///
-    /// `commit_position` is the pack position of the commit itself; it must
-    /// reference a commit object and is implicitly part of the reachable set.
-    /// `reachable` lists the pack positions of every object reachable from the
-    /// commit (it may include or omit `commit_position`; duplicates are fine).
-    /// All positions must be in range. The commit's full (non-XORed) bitmap is
-    /// stored.
-    pub fn add_commit(&mut self, commit_position: u32, reachable: &[u32]) -> Result<()> {
+    /// `commit_position` is the *pack-order* position of the commit itself (the
+    /// bit-number space); it must reference a commit object and is implicitly
+    /// part of the reachable set. `commit_index_position` is the commit's
+    /// position in the *oid-sorted* pack index — this is what the on-disk entry
+    /// records (upstream `oid_pos`); bits and entry positions live in different
+    /// spaces. `reachable` lists the pack-order positions of every object
+    /// reachable from the commit (it may include or omit `commit_position`;
+    /// duplicates are fine). All positions must be in range. The commit's full
+    /// (non-XORed) bitmap is stored.
+    pub fn add_commit(
+        &mut self,
+        commit_position: u32,
+        commit_index_position: u32,
+        reachable: &[u32],
+    ) -> Result<()> {
         if commit_position >= self.object_count {
             return Err(GitError::InvalidFormat(format!(
                 "commit position {commit_position} out of range for {} objects",
+                self.object_count
+            )));
+        }
+        if commit_index_position >= self.object_count {
+            return Err(GitError::InvalidFormat(format!(
+                "commit index position {commit_index_position} out of range for {} objects",
                 self.object_count
             )));
         }
@@ -3998,7 +4023,7 @@ impl PackBitmapWriter {
         let mut reachable = reachable.to_vec();
         reachable.push(commit_position);
         self.selected.push(SelectedCommit {
-            commit_position,
+            commit_index_position,
             flags: Self::FLAG_NONE,
             reachable,
         });
@@ -4021,7 +4046,7 @@ impl PackBitmapWriter {
         for selected in &self.selected {
             let bitmap = EwahBitmap::from_positions(self.object_count, &selected.reachable)?;
             entries.push(PackBitmapEntry {
-                object_position: selected.commit_position,
+                object_position: selected.commit_index_position,
                 xor_offset: 0,
                 flags: selected.flags,
                 bitmap,
@@ -4154,23 +4179,24 @@ impl PackBitmapIndex {
 /// Convenience wrapper that builds a `.bitmap` file in one call.
 ///
 /// `object_types` lists the [`ObjectType`] of every pack object in pack order,
-/// `pack_checksum` is the pack's trailing checksum, and `commits` pairs each
-/// selected commit's pack position with the pack positions reachable from it.
-/// An optional `name_hash_cache` (one entry per object) may be supplied to emit
+/// `pack_checksum` is the pack's trailing checksum, and `commits` carries, per
+/// selected commit, `(pack_position, index_position, reachable_pack_positions)`
+/// (see [`PackBitmapWriter::add_commit`] for the two position spaces). An
+/// optional `name_hash_cache` (one entry per object) may be supplied to emit
 /// the hash-cache extension.
 pub fn write_bitmap(
     format: ObjectFormat,
     pack_checksum: ObjectId,
     object_types: &[ObjectType],
-    commits: &[(u32, Vec<u32>)],
+    commits: &[(u32, u32, Vec<u32>)],
     name_hash_cache: Option<Vec<u32>>,
 ) -> Result<Vec<u8>> {
     let mut writer = PackBitmapWriter::new(format, pack_checksum, object_types)?;
     if let Some(cache) = name_hash_cache {
         writer = writer.with_name_hash_cache(cache)?;
     }
-    for (commit_position, reachable) in commits {
-        writer.add_commit(*commit_position, reachable)?;
+    for (commit_position, commit_index_position, reachable) in commits {
+        writer.add_commit(*commit_position, *commit_index_position, reachable)?;
     }
     writer.write()
 }
@@ -5525,7 +5551,7 @@ mod tests {
         assert_eq!(parsed.type_bitmaps.trees.bit_size, 3);
         assert_eq!(parsed.entries.len(), 1);
         let entry = parsed
-            .entry_for_pack_position(2)
+            .entry_for_index_position(2)
             .expect("test operation should succeed");
         assert_eq!(entry.xor_offset, 0);
         assert_eq!(entry.flags, 1);
@@ -6757,7 +6783,7 @@ mod tests {
             ObjectFormat::Sha1,
             pack_checksum_sha1(),
             &object_types,
-            &[(0u32, vec![1u32, 2u32])],
+            &[(0u32, 0u32, vec![1u32, 2u32])],
             None,
         )
         .expect("test operation should succeed");
@@ -6802,7 +6828,7 @@ mod tests {
         );
         assert_eq!(parsed.entries.len(), 1);
         let entry = parsed
-            .entry_for_pack_position(0)
+            .entry_for_index_position(0)
             .expect("test operation should succeed");
         assert_eq!(entry.xor_offset, 0);
         assert_eq!(entry.flags, 0);
@@ -6825,7 +6851,7 @@ mod tests {
             ObjectFormat::Sha256,
             pack_checksum.clone(),
             &object_types,
-            &[(0u32, vec![1u32])],
+            &[(0u32, 0u32, vec![1u32])],
             None,
         )
         .expect("test operation should succeed");
@@ -6851,7 +6877,7 @@ mod tests {
             ObjectFormat::Sha1,
             pack_checksum_sha1(),
             &object_types,
-            &[(0u32, vec![1u32, 2u32])],
+            &[(0u32, 0u32, vec![1u32, 2u32])],
             Some(cache.clone()),
         )
         .expect("test operation should succeed");
@@ -6876,10 +6902,10 @@ mod tests {
             PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
                 .expect("test operation should succeed");
         writer
-            .add_commit(0, &[2, 3])
+            .add_commit(0, 0, &[2, 3])
             .expect("test operation should succeed");
         writer
-            .add_commit(1, &[2])
+            .add_commit(1, 1, &[2])
             .expect("test operation should succeed");
         let bytes = writer.write().expect("test operation should succeed");
         let parsed = PackBitmapIndex::parse(&bytes, ObjectFormat::Sha1, 4)
@@ -6894,7 +6920,7 @@ mod tests {
             vec![0, 1]
         );
         let first = parsed
-            .entry_for_pack_position(0)
+            .entry_for_index_position(0)
             .expect("test operation should succeed");
         assert_eq!(
             first
@@ -6904,7 +6930,7 @@ mod tests {
             vec![0, 2, 3]
         );
         let second = parsed
-            .entry_for_pack_position(1)
+            .entry_for_index_position(1)
             .expect("test operation should succeed");
         assert_eq!(
             second
@@ -6946,11 +6972,13 @@ mod tests {
             PackBitmapWriter::new(ObjectFormat::Sha1, pack_checksum_sha1(), &object_types)
                 .expect("test operation should succeed");
         // Position 1 is a blob, not a commit.
-        assert!(writer.add_commit(1, &[]).is_err());
+        assert!(writer.add_commit(1, 1, &[]).is_err());
         // Position 5 is out of range entirely.
-        assert!(writer.add_commit(5, &[]).is_err());
+        assert!(writer.add_commit(5, 5, &[]).is_err());
+        // Index position out of range.
+        assert!(writer.add_commit(0, 5, &[]).is_err());
         // Reachable position out of range.
-        assert!(writer.add_commit(0, &[9]).is_err());
+        assert!(writer.add_commit(0, 0, &[9]).is_err());
     }
 
     #[test]
@@ -7056,12 +7084,18 @@ mod tests {
                 .iter()
                 .position(|ty| *ty == ObjectType::Commit)
                 .expect("test operation should succeed") as u32;
+            // The entry records the commit's position in the oid-sorted index.
+            let commit_index_position = index
+                .entries
+                .iter()
+                .position(|entry| position_of(entry.offset) == commit_position)
+                .expect("test operation should succeed") as u32;
             let reachable: Vec<u32> = (0..index.entries.len() as u32).collect();
             let bytes = write_bitmap(
                 ObjectFormat::Sha1,
                 index.pack_checksum.clone(),
                 &object_types,
-                &[(commit_position, reachable)],
+                &[(commit_position, commit_index_position, reachable)],
                 None,
             )
             .expect("test operation should succeed");
