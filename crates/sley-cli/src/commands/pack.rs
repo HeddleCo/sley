@@ -1129,6 +1129,9 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut stdin_packs = false;
+    let mut write_bitmap = false;
+    let mut preferred_pack_name: Option<String> = None;
+    let mut refs_snapshot: Option<PathBuf> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1147,6 +1150,29 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             }
             "--stdin-packs" => stdin_packs = true,
             "--no-stdin-packs" => stdin_packs = false,
+            "--bitmap" => write_bitmap = true,
+            "--no-bitmap" => write_bitmap = false,
+            "--preferred-pack" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--preferred-pack requires a value".into())
+                })?;
+                preferred_pack_name = Some(value.clone());
+            }
+            value if value.starts_with("--preferred-pack=") => {
+                preferred_pack_name = Some(value["--preferred-pack=".len()..].to_string());
+            }
+            "--refs-snapshot" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("--refs-snapshot requires a value".into())
+                })?;
+                refs_snapshot = Some(resolve_cli_path(&cwd, value));
+            }
+            value if value.starts_with("--refs-snapshot=") => {
+                refs_snapshot = Some(resolve_cli_path(
+                    &cwd,
+                    &value["--refs-snapshot=".len()..],
+                ));
+            }
             other => {
                 return Err(GitError::Unsupported(format!(
                     "multi-pack-index write option {other}"
@@ -1182,6 +1208,24 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
     };
     pack_names.sort();
 
+    // Per-pack mtimes drive both duplicate resolution and the default
+    // preferred pack (upstream uses the .pack mtime for both). Captured once —
+    // the duplicate-resolution sort consults them O(n log n) times.
+    let pack_mtimes: Vec<std::time::SystemTime> = pack_names
+        .iter()
+        .map(|name| {
+            fs::metadata(pack_dir.join(name).with_extension("pack"))
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::UNIX_EPOCH)
+        })
+        .collect();
+    let pack_mtime = |pack_int_id: u32| -> std::time::SystemTime {
+        pack_mtimes
+            .get(pack_int_id as usize)
+            .copied()
+            .unwrap_or(std::time::UNIX_EPOCH)
+    };
+
     let mut objects = Vec::new();
     for (pack_int_id, pack_name) in pack_names.iter().enumerate() {
         let index = PackIndex::parse(&fs::read(pack_dir.join(pack_name))?, format)?;
@@ -1193,8 +1237,122 @@ fn cmd_multi_pack_index_write(args: &[String]) -> Result<()> {
             });
         }
     }
-    let midx = MultiPackIndex::write(format, 1, &pack_names, &objects)?;
-    fs::write(pack_dir.join("multi-pack-index"), midx)?;
+
+    if write_bitmap && objects.is_empty() {
+        // Upstream refuses a multi-pack .bitmap over zero objects but still
+        // writes the midx itself.
+        eprintln!("warning: refusing to write multi-pack .bitmap without any objects");
+        write_bitmap = false;
+    }
+
+    // Preferred pack: explicit name, else (when writing a bitmap) the pack
+    // with the oldest mtime — it gets pseudo-pack priority so its objects
+    // lead the bit order.
+    let preferred_pack: Option<u32> = match &preferred_pack_name {
+        Some(name) => {
+            let normalized = name.strip_suffix(".pack").map(|stem| format!("{stem}.idx"));
+            match pack_names.iter().position(|pack_name| {
+                pack_name == name || Some(pack_name.as_str()) == normalized.as_deref()
+            }) {
+                Some(position) => Some(position as u32),
+                None => {
+                    eprintln!("warning: unknown preferred pack: '{name}'");
+                    write_bitmap.then_some(0)
+                }
+            }
+        }
+        None if write_bitmap => {
+            let mut preferred = 0u32;
+            let mut oldest: Option<std::time::SystemTime> = None;
+            for pack_int_id in 0..pack_names.len() as u32 {
+                let mtime = pack_mtime(pack_int_id);
+                if oldest.is_none_or(|current| mtime < current) {
+                    oldest = Some(mtime);
+                    preferred = pack_int_id;
+                }
+            }
+            Some(preferred)
+        }
+        None => None,
+    };
+
+    // Duplicate resolution across packs (upstream midx_oid_compare): keep the
+    // copy from the preferred pack, else the newest pack, else the lowest
+    // pack id.
+    objects.sort_by(|left, right| {
+        left.oid
+            .as_bytes()
+            .cmp(right.oid.as_bytes())
+            .then_with(|| {
+                let left_preferred = Some(left.pack_int_id) == preferred_pack;
+                let right_preferred = Some(right.pack_int_id) == preferred_pack;
+                right_preferred.cmp(&left_preferred)
+            })
+            .then_with(|| pack_mtime(right.pack_int_id).cmp(&pack_mtime(left.pack_int_id)))
+            .then_with(|| left.pack_int_id.cmp(&right.pack_int_id))
+    });
+    objects.dedup_by(|next, kept| next.oid == kept.oid);
+
+    let midx = MultiPackIndex::write_with_reverse_index(
+        format,
+        1,
+        &pack_names,
+        &objects,
+        write_bitmap.then(|| preferred_pack.unwrap_or(0)),
+    )?;
+    let midx_checksum = ObjectId::from_raw(format, &midx[midx.len() - format.raw_len()..])?;
+    fs::write(pack_dir.join("multi-pack-index"), &midx)?;
+
+    // Clear midx bitmap/rev sidecars that don't belong to this write: stale
+    // checksums always; the current checksum's too when no bitmap was asked
+    // for (upstream clear_midx_files_ext keeps only what it just wrote).
+    let bitmap_name = format!("multi-pack-index-{}.bitmap", midx_checksum.to_hex());
+    for entry in fs::read_dir(&pack_dir)? {
+        let path = entry?.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if name.starts_with("multi-pack-index-")
+            && (name.ends_with(".bitmap") || name.ends_with(".rev"))
+            && (!write_bitmap || name != bitmap_name)
+        {
+            let _ = fs::remove_file(&path);
+        }
+    }
+
+    if !write_bitmap {
+        return Ok(());
+    }
+    let preferred_pack = preferred_pack.unwrap_or(0);
+
+    let db = FileObjectDatabase::new(object_dir.clone(), format);
+    let mut tips = repack_preferred_bitmap_tips(&git_dir, &db, format)?;
+    if let Some(snapshot) = &refs_snapshot {
+        // Snapshot lines are "<oid>" (plain tip) or "+<oid>" (preferred tip,
+        // upstream's NEEDS_BITMAP). Only the preferred ones influence
+        // selection here.
+        for line in fs::read_to_string(snapshot)?.lines() {
+            if let Some(hex) = line.strip_prefix('+')
+                && let Ok(oid) = ObjectId::from_hex(format, hex)
+                && let Ok(commit) = sley_rev::peel_to_commit(&db, format, &oid)
+            {
+                tips.insert(commit);
+            }
+        }
+    }
+    if let Some(bitmap) = sley_odb::build_midx_bitmap(
+        &db,
+        format,
+        &objects,
+        &midx_checksum,
+        preferred_pack,
+        &tips,
+    )? {
+        let bitmap_path = pack_dir.join(&bitmap_name);
+        let temp_path = bitmap_path.with_extension("bitmap.tmp");
+        fs::write(&temp_path, &bitmap)?;
+        fs::rename(&temp_path, &bitmap_path)?;
+    }
     Ok(())
 }
 

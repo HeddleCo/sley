@@ -1050,39 +1050,85 @@ fn bitmap_next_commit_index(idx: u32) -> u32 {
 /// Returns `Ok(None)` — mirroring upstream's warn-and-skip — when the pack
 /// lacks full closure (a reachable object is missing from it).
 pub fn build_pack_bitmap(
-    db: &impl ObjectReader,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     index_entries: &[PackIndexEntry],
     pack_checksum: &ObjectId,
     preferred_tips: &HashSet<ObjectId>,
 ) -> Result<Option<Vec<u8>>> {
-    if index_entries.is_empty() || index_entries.len() > u32::MAX as usize {
+    // `index_entries` carries no ordering guarantee (writer provenance is in
+    // pack-write order); bit numbering follows pack (offset) order.
+    let mut by_offset: Vec<usize> = (0..index_entries.len()).collect();
+    by_offset.sort_by_key(|&slot| index_entries[slot].offset);
+    let bit_order: Vec<ObjectId> = by_offset
+        .into_iter()
+        .map(|slot| index_entries[slot].oid)
+        .collect();
+    build_reachability_bitmap(db, format, pack_checksum, &bit_order, preferred_tips)
+}
+
+/// [`build_pack_bitmap`]'s multi-pack sibling: builds the serialised
+/// `multi-pack-index-<checksum>.bitmap` for `midx_entries`, with bits in
+/// pseudo-pack order (preferred pack first, then pack id, then offset — the
+/// same order [`MultiPackIndex::write_with_reverse_index`] records in `RIDX`)
+/// and the midx checksum in the BITM checksum field.
+pub fn build_midx_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    midx_entries: &[sley_pack::MultiPackIndexEntry],
+    midx_checksum: &ObjectId,
+    preferred_pack: u32,
+    preferred_tips: &HashSet<ObjectId>,
+) -> Result<Option<Vec<u8>>> {
+    let mut pseudo: Vec<usize> = (0..midx_entries.len()).collect();
+    pseudo.sort_by_key(|&slot| {
+        let entry = &midx_entries[slot];
+        (
+            entry.pack_int_id != preferred_pack,
+            entry.pack_int_id,
+            entry.offset,
+        )
+    });
+    let bit_order: Vec<ObjectId> = pseudo
+        .into_iter()
+        .map(|slot| midx_entries[slot].oid)
+        .collect();
+    build_reachability_bitmap(db, format, midx_checksum, &bit_order, preferred_tips)
+}
+
+/// Shared write half: `bit_order` lists every covered object's oid in bit
+/// order (pack order for a single pack, pseudo-pack order for a midx);
+/// `checksum` fills the BITM checksum field (pack checksum / midx checksum).
+fn build_reachability_bitmap(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    checksum: &ObjectId,
+    bit_order: &[ObjectId],
+    preferred_tips: &HashSet<ObjectId>,
+) -> Result<Option<Vec<u8>>> {
+    if bit_order.is_empty() || bit_order.len() > u32::MAX as usize {
         return Ok(None);
     }
-    let object_count = index_entries.len();
+    let object_count = bit_order.len();
 
-    // `index_entries` carries no ordering guarantee (writer provenance is in
-    // pack-write order). Derive both spaces explicitly: index position =
-    // oid-sort rank, pack position = offset-sort rank.
-    let mut oid_sorted: Vec<usize> = (0..object_count).collect();
+    // The on-disk entry position space is the oid-sorted lookup order (.idx /
+    // midx OIDL); derive each bit-order slot's rank there.
+    let mut oid_sorted: Vec<u32> = (0..object_count as u32).collect();
     oid_sorted.sort_by(|&left, &right| {
-        index_entries[left]
-            .oid
+        bit_order[left as usize]
             .as_bytes()
-            .cmp(index_entries[right].oid.as_bytes())
+            .cmp(bit_order[right as usize].as_bytes())
     });
     let mut index_position = vec![0u32; object_count];
     for (position, &slot) in oid_sorted.iter().enumerate() {
-        index_position[slot] = position as u32;
+        index_position[slot as usize] = position as u32;
     }
-    let mut by_offset: Vec<usize> = (0..object_count).collect();
-    by_offset.sort_by_key(|&slot| index_entries[slot].offset);
     let mut oid_to_pack = HashMap::with_capacity(object_count);
-    for (pack_pos, &slot) in by_offset.iter().enumerate() {
-        oid_to_pack.insert(index_entries[slot].oid, pack_pos as u32);
+    for (pack_pos, oid) in bit_order.iter().enumerate() {
+        oid_to_pack.insert(*oid, pack_pos as u32);
     }
 
-    // Object types in pack order; commits also collect (date, parent count).
+    // Object types in bit order; commits also collect (date, parent count).
     let mut object_types = Vec::with_capacity(object_count);
     struct IndexedCommit {
         oid: ObjectId,
@@ -1092,16 +1138,21 @@ pub fn build_pack_bitmap(
         parent_count: usize,
     }
     let mut indexed_commits = Vec::new();
-    for (pack_pos, &slot) in by_offset.iter().enumerate() {
-        let oid = index_entries[slot].oid;
-        let object = db.read_object(&oid)?;
-        object_types.push(object.object_type);
-        if object.object_type == ObjectType::Commit {
+    for (pack_pos, oid) in bit_order.iter().enumerate() {
+        // Type via the header fast path: blobs (the bulk of most packs) never
+        // need their bodies inflated here.
+        let object_type = match db.read_object_header(oid)? {
+            Some((object_type, _)) => object_type,
+            None => db.read_object(oid)?.object_type,
+        };
+        object_types.push(object_type);
+        if object_type == ObjectType::Commit {
+            let object = db.read_object(oid)?;
             let commit = Commit::parse_ref(format, &object.body)?;
             indexed_commits.push(IndexedCommit {
-                oid,
+                oid: *oid,
                 pack_pos: pack_pos as u32,
-                index_pos: index_position[slot],
+                index_pos: index_position[pack_pos],
                 date: commit_identity_timestamp(commit.committer),
                 parent_count: commit.parents.len(),
             });
@@ -1175,7 +1226,7 @@ pub fn build_pack_bitmap(
         memo.insert(commit.oid, Arc::new(acc));
     }
 
-    let mut writer = PackBitmapWriter::new(format, *pack_checksum, &object_types)?;
+    let mut writer = PackBitmapWriter::new(format, *checksum, &object_types)?;
     for commit in &selected {
         let words = match memo.get(&commit.oid) {
             Some(words) => words,
@@ -1298,6 +1349,11 @@ pub fn load_pack_bitmap(
     if !pack_dir.exists() {
         return Ok(None);
     }
+    // A multi-pack bitmap wins over single-pack bitmaps, like upstream's
+    // open_bitmap trying the midx first.
+    if let Some(bitmap) = load_midx_bitmap(&pack_dir, format)? {
+        return Ok(Some(bitmap));
+    }
     let mut bitmap_paths = Vec::new();
     for entry in fs::read_dir(&pack_dir)? {
         let path = entry?.path();
@@ -1318,6 +1374,62 @@ pub fn load_pack_bitmap(
         }
     }
     Ok(None)
+}
+
+/// Loads `multi-pack-index-<checksum>.bitmap` when the pack directory has a
+/// multi-pack-index with a `RIDX` chunk (the bit-order permutation) and a
+/// matching bitmap file. Returns `Ok(None)` — never an error — on any missing
+/// or unusable piece, so callers fall through to single-pack bitmaps.
+fn load_midx_bitmap(pack_dir: &Path, format: ObjectFormat) -> Result<Option<LoadedPackBitmap>> {
+    let midx_path = pack_dir.join("multi-pack-index");
+    if !midx_path.exists() {
+        return Ok(None);
+    }
+    let Ok(midx_bytes) = fs::read(&midx_path) else {
+        return Ok(None);
+    };
+    let Ok(midx) = MultiPackIndex::parse(&midx_bytes, format) else {
+        return Ok(None);
+    };
+    let bitmap_path = pack_dir.join(format!("multi-pack-index-{}.bitmap", midx.checksum.to_hex()));
+    if !bitmap_path.exists() {
+        return Ok(None);
+    }
+    let Some(reverse_index) = &midx.reverse_index else {
+        // Without the RIDX permutation the bit numbering is unknown.
+        return Ok(None);
+    };
+    let object_count = midx.objects.len();
+    let Ok(bitmap_bytes) = fs::read(&bitmap_path) else {
+        return Ok(None);
+    };
+    let parsed = match PackBitmapIndex::parse(&bitmap_bytes, format, object_count) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    if parsed.pack_checksum != midx.checksum {
+        return Ok(None);
+    }
+
+    // midx.objects is in lookup (oid-sorted) order; RIDX maps bit positions
+    // to lookup positions.
+    let mut pack_to_oid = Vec::with_capacity(object_count);
+    for &midx_pos in reverse_index {
+        let Some(entry) = midx.objects.get(midx_pos as usize) else {
+            return Ok(None);
+        };
+        pack_to_oid.push(entry.oid);
+    }
+    let mut oid_to_pack = HashMap::with_capacity(object_count);
+    for (pack_pos, oid) in pack_to_oid.iter().enumerate() {
+        oid_to_pack.insert(*oid, pack_pos as u32);
+    }
+    match assemble_loaded_bitmap(parsed, object_count, pack_to_oid, oid_to_pack, |position| {
+        midx.objects.get(position).map(|entry| entry.oid)
+    }) {
+        Ok(loaded) => Ok(Some(loaded)),
+        Err(_) => Ok(None),
+    }
 }
 
 fn load_pack_bitmap_file(
@@ -1346,6 +1458,23 @@ fn load_pack_bitmap_file(
         oid_to_pack.insert(*oid, pack_pos as u32);
     }
 
+    assemble_loaded_bitmap(parsed, object_count, pack_to_oid, oid_to_pack, |position| {
+        index.entries.get(position).map(|entry| entry.oid)
+    })
+    .map(Some)
+}
+
+/// Shared tail of the bitmap loaders: expands the type bitmaps, resolves the
+/// per-commit entries (XOR offsets reference earlier entries in file order),
+/// and maps each entry's lookup-order position back to a commit oid via
+/// `lookup_oid`.
+fn assemble_loaded_bitmap(
+    parsed: PackBitmapIndex,
+    object_count: usize,
+    pack_to_oid: Vec<ObjectId>,
+    oid_to_pack: HashMap<ObjectId, u32>,
+    lookup_oid: impl Fn(usize) -> Option<ObjectId>,
+) -> Result<LoadedPackBitmap> {
     let word_count = object_count.div_ceil(64);
     let expand = |bitmap: &sley_pack::EwahBitmap| -> Result<Vec<u64>> {
         let mut words = bitmap.to_words()?;
@@ -1353,7 +1482,6 @@ fn load_pack_bitmap_file(
         Ok(words)
     };
 
-    // Resolve entries in file order; XOR offsets reference earlier entries.
     let mut resolved: Vec<Arc<Vec<u64>>> = Vec::with_capacity(parsed.entries.len());
     let mut commit_words = HashMap::with_capacity(parsed.entries.len());
     for (entry_index, entry) in parsed.entries.iter().enumerate() {
@@ -1367,11 +1495,13 @@ fn load_pack_bitmap_file(
         }
         let words = Arc::new(words);
         resolved.push(Arc::clone(&words));
-        let commit_oid = index.entries[entry.object_position as usize].oid;
+        let commit_oid = lookup_oid(entry.object_position as usize).ok_or_else(|| {
+            GitError::InvalidFormat("bitmap entry position out of range".into())
+        })?;
         commit_words.insert(commit_oid, words);
     }
 
-    Ok(Some(LoadedPackBitmap {
+    Ok(LoadedPackBitmap {
         object_count: object_count as u32,
         oid_to_pack,
         pack_to_oid,
@@ -1380,7 +1510,7 @@ fn load_pack_bitmap_file(
         trees: expand(&parsed.type_bitmaps.trees)?,
         blobs: expand(&parsed.type_bitmaps.blobs)?,
         tags: expand(&parsed.type_bitmaps.tags)?,
-    }))
+    })
 }
 
 /// Result of a bitmap-assisted reachability walk: pack-position bits for

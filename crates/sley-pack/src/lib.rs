@@ -1527,6 +1527,32 @@ impl MultiPackIndex {
         pack_names: &[String],
         objects: &[MultiPackIndexEntry],
     ) -> Result<Vec<u8>> {
+        Self::write_with_reverse_index(format, version, pack_names, objects, None)
+    }
+
+    /// Like [`MultiPackIndex::write`], but when `preferred_pack` is `Some`,
+    /// additionally emits the `RIDX` chunk: the object order a multi-pack
+    /// `.bitmap` numbers its bits in ("pseudo-pack order" — every object of
+    /// the preferred pack first, then the rest by pack id, each pack's slice
+    /// in offset order), stored as one u32 midx position per object.
+    ///
+    /// `preferred_pack` is the pack-int-id receiving pseudo-pack priority; it
+    /// must be in range.
+    pub fn write_with_reverse_index(
+        format: ObjectFormat,
+        version: u8,
+        pack_names: &[String],
+        objects: &[MultiPackIndexEntry],
+        preferred_pack: Option<u32>,
+    ) -> Result<Vec<u8>> {
+        if let Some(preferred) = preferred_pack
+            && preferred as usize >= pack_names.len()
+        {
+            return Err(GitError::InvalidFormat(format!(
+                "preferred pack {preferred} out of range for {} packs",
+                pack_names.len()
+            )));
+        }
         if version != 1 && version != 2 {
             return Err(GitError::Unsupported(format!(
                 "multi-pack-index version {version}"
@@ -1585,6 +1611,24 @@ impl MultiPackIndex {
         ];
         if !large_offsets.is_empty() {
             chunks.push((*b"LOFF", large_offsets));
+        }
+        if let Some(preferred) = preferred_pack {
+            // `objects` is already in midx (oid-sorted) order here; the chunk
+            // lists each object's midx position in pseudo-pack order.
+            let mut pseudo: Vec<u32> = (0..objects.len() as u32).collect();
+            pseudo.sort_by_key(|&midx_pos| {
+                let object = objects[midx_pos as usize];
+                (
+                    object.pack_int_id != preferred,
+                    object.pack_int_id,
+                    object.offset,
+                )
+            });
+            let mut ridx = Vec::with_capacity(pseudo.len() * 4);
+            for midx_pos in pseudo {
+                ridx.extend_from_slice(&midx_pos.to_be_bytes());
+            }
+            chunks.push((*b"RIDX", ridx));
         }
         write_multi_pack_index_chunks(format, version, pack_names.len() as u32, &chunks)
     }
