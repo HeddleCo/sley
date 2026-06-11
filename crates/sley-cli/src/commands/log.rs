@@ -491,6 +491,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             "-E" | "--basic-regexp" | "--extended-regexp" => {
                 regexp_mode = SimpleLogRegexMode::Basic
             }
+            "-P" | "--perl-regexp" => regexp_mode = SimpleLogRegexMode::Perl,
             "--do-walk" => walk = true,
             "--no-walk" => walk = false,
             "-g" | "--walk-reflogs" => walk_reflogs = true,

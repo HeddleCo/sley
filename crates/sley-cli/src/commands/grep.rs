@@ -22,6 +22,8 @@ enum PatternKind {
     Extended,
     /// Fixed strings (`-F` / `--fixed-strings`).
     Fixed,
+    /// Perl-compatible regular expressions (`-P` / `--perl-regexp`).
+    Perl,
 }
 
 /// Mirror of git's `GREP_PATTERN_TYPE_*`. `Unspecified` means "fall back to
@@ -497,15 +499,10 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             PatternTypeOption::Bre
         };
     }
-    if pattern_type == PatternTypeOption::Pcre {
-        eprintln!(
-            "fatal: cannot use Perl-compatible regexes; sley was not built with PCRE support"
-        );
-        return Err(GitError::Exit(128));
-    }
     opts.kind = match pattern_type {
         PatternTypeOption::Ere => PatternKind::Extended,
         PatternTypeOption::Fixed => PatternKind::Fixed,
+        PatternTypeOption::Pcre => PatternKind::Perl,
         _ => PatternKind::Basic,
     };
     // `grep.*` config sets the default; an explicit CLI flag (tracked by the
@@ -1812,9 +1809,13 @@ impl GrepMatcher {
                     needle: raw.as_bytes().to_vec(),
                     ignore_case: opts.ignore_case,
                 },
-                PatternKind::Basic | PatternKind::Extended => {
-                    let extended = opts.kind == PatternKind::Extended;
-                    let regex = Regex::compile(raw, extended, opts.ignore_case, opts.word)?;
+                PatternKind::Basic | PatternKind::Extended | PatternKind::Perl => {
+                    let mode = match opts.kind {
+                        PatternKind::Basic => RegexMode::Bre,
+                        PatternKind::Extended => RegexMode::Ere,
+                        _ => RegexMode::Pcre,
+                    };
+                    let regex = Regex::compile(raw, mode, opts.ignore_case, opts.word)?;
                     CompiledPattern::Regex(regex)
                 }
             };
@@ -1961,6 +1962,19 @@ fn find_substring(haystack: &[u8], needle: &[u8], ignore_case: bool, from: usize
 
 // --- Regex AST -------------------------------------------------------------
 
+/// Which dialect the pattern text is parsed as. `Pcre` is the in-house
+/// Perl-compatible mode backing `-P` / `--perl-regexp` /
+/// `grep.patternType=perl`: ERE-style syntax plus the PCRE extensions the
+/// upstream test suite exercises (lazy quantifiers, `\x{..}`, `\p{..}`,
+/// escapes inside classes, inline `(?i)`, named groups and backreferences,
+/// and leading `(*VERB)` control verbs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegexMode {
+    Bre,
+    Ere,
+    Pcre,
+}
+
 #[derive(Debug, Clone)]
 enum Node {
     Literal(u8),
@@ -1979,6 +1993,13 @@ enum Node {
         greedy: bool,
     },
     Group(Box<Node>),
+    /// PCRE capturing group `(...)` / `(?P<name>...)`; `usize` is the group
+    /// number (1-based, as in `\1`).
+    Capture(usize, Box<Node>),
+    /// PCRE backreference `\1` / `(?P=name)` to a capturing group.
+    Backref(usize),
+    /// Subtree matched case-insensitively (inline `(?i)`).
+    IgnoreCase(Box<Node>),
     Empty,
 }
 
@@ -1987,6 +2008,29 @@ enum ClassItem {
     Single(u8),
     Range(u8, u8),
     Posix(PosixClass),
+    /// `\p{..}` / `\P{..}` Unicode general-category escape, matched against the
+    /// ASCII range (sley's grep operates bytewise; non-ASCII bytes never match).
+    Category { negate: bool, cat: PerlCategory },
+}
+
+/// ASCII approximation of the Unicode general categories the upstream tests
+/// use with `\p{..}`.
+#[derive(Debug, Clone, Copy)]
+enum PerlCategory {
+    /// `L` — letters (`Lu` and `Ll` are the cased subsets).
+    Letter,
+    UppercaseLetter,
+    LowercaseLetter,
+    /// `N` / `Nd` — (decimal) numbers.
+    Number,
+    /// `P` — punctuation; `Ps` / `Pe` are the open/close subsets.
+    Punctuation,
+    OpenPunctuation,
+    ClosePunctuation,
+    /// `S` — symbols.
+    Symbol,
+    /// `Z` / `Zs` — (space) separators.
+    Separator,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2005,18 +2049,39 @@ enum PosixClass {
     Graph,
 }
 
-struct Regex {
+#[derive(Debug)]
+pub(crate) struct Regex {
     root: Node,
     ignore_case: bool,
+    /// Number of capturing groups (PCRE mode); sizes the backreference slots.
+    num_groups: usize,
 }
 
 impl Regex {
-    fn compile(pattern: &str, extended: bool, ignore_case: bool, word: bool) -> Result<Self> {
-        let bytes = pattern.as_bytes();
+    pub(crate) fn compile(
+        pattern: &str,
+        mode: RegexMode,
+        ignore_case: bool,
+        word: bool,
+    ) -> Result<Self> {
+        let mut bytes = pattern.as_bytes();
+        if mode == RegexMode::Pcre {
+            // PCRE control verbs — `(*NO_JIT)`, `(*UTF)`, ... — are
+            // engine-tuning directives at the start of the pattern; sley's
+            // engine has no JIT to disable, so accept and ignore them.
+            while bytes.starts_with(b"(*") {
+                let Some(end) = bytes.iter().position(|&b| b == b')') else {
+                    break;
+                };
+                bytes = &bytes[end + 1..];
+            }
+        }
         let mut parser = RegexParser {
             bytes,
             pos: 0,
-            extended,
+            mode,
+            num_groups: 0,
+            group_names: Vec::new(),
         };
         let mut root = parser.parse_alternation()?;
         if parser.pos != bytes.len() {
@@ -2031,12 +2096,26 @@ impl Regex {
                 Node::WordBoundary,
             ]);
         }
-        Ok(Self { root, ignore_case })
+        Ok(Self {
+            root,
+            ignore_case,
+            num_groups: parser.num_groups,
+        })
     }
 
     fn find_from(&self, text: &[u8], from: usize) -> Option<(usize, usize)> {
+        self.find_from_with(text, from, self.ignore_case)
+    }
+
+    fn find_from_with(
+        &self,
+        text: &[u8],
+        from: usize,
+        ignore_case: bool,
+    ) -> Option<(usize, usize)> {
         for start in from..=text.len() {
-            if let Some(end) = match_node(&self.root, text, start, self.ignore_case) {
+            let ctx = MatchCtx::new(text, self.num_groups);
+            if let Some(end) = match_node(&self.root, &ctx, start, ignore_case) {
                 return Some((start, end));
             }
         }
@@ -2044,19 +2123,42 @@ impl Regex {
     }
 
     fn matches_whole(&self, text: &[u8]) -> bool {
-        match_anchored_full(&self.root, text, self.ignore_case)
+        let ctx = MatchCtx::new(text, self.num_groups);
+        match_anchored_full(&self.root, &ctx, self.ignore_case)
+    }
+
+    /// Substring match with the caller's case sensitivity (used by the
+    /// `log --grep` family, which resolves `-i` per invocation rather than at
+    /// compile time).
+    pub(crate) fn is_match_with_case(&self, text: &[u8], ignore_case: bool) -> bool {
+        self.find_from_with(text, 0, ignore_case || self.ignore_case)
+            .is_some()
     }
 }
 
 struct RegexParser<'a> {
     bytes: &'a [u8],
     pos: usize,
-    extended: bool,
+    mode: RegexMode,
+    /// Capturing groups assigned so far (PCRE mode).
+    num_groups: usize,
+    /// `(?P<name>...)` name → group number.
+    group_names: Vec<(Vec<u8>, usize)>,
 }
 
 impl RegexParser<'_> {
     fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
+    }
+
+    /// `|`, `()`, `+`, `?`, `{n,m}` are unescaped metacharacters (ERE and PCRE)
+    /// rather than BRE's escaped forms.
+    fn extended(&self) -> bool {
+        self.mode != RegexMode::Bre
+    }
+
+    fn pcre(&self) -> bool {
+        self.mode == RegexMode::Pcre
     }
 
     fn parse_alternation(&mut self) -> Result<Node> {
@@ -2078,14 +2180,14 @@ impl RegexParser<'_> {
 
     fn at_alternation(&self) -> bool {
         match self.peek() {
-            Some(b'|') if self.extended => true,
-            Some(b'\\') if !self.extended => self.bytes.get(self.pos + 1) == Some(&b'|'),
+            Some(b'|') if self.extended() => true,
+            Some(b'\\') if !self.extended() => self.bytes.get(self.pos + 1) == Some(&b'|'),
             _ => false,
         }
     }
 
     fn consume_alternation(&mut self) {
-        if self.extended {
+        if self.extended() {
             self.pos += 1;
         } else {
             self.pos += 2;
@@ -2094,8 +2196,8 @@ impl RegexParser<'_> {
 
     fn at_group_close(&self) -> bool {
         match self.peek() {
-            Some(b')') if self.extended => true,
-            Some(b'\\') if !self.extended => self.bytes.get(self.pos + 1) == Some(&b')'),
+            Some(b')') if self.extended() => true,
+            Some(b'\\') if !self.extended() => self.bytes.get(self.pos + 1) == Some(&b')'),
             _ => false,
         }
     }
@@ -2110,6 +2212,14 @@ impl RegexParser<'_> {
                 self.pos += 1;
                 nodes.push(Node::EndAnchor);
                 continue;
+            }
+            // Inline `(?i)`: the rest of the enclosing group/branch is matched
+            // case-insensitively (PCRE flag-setting group).
+            if self.pcre() && self.bytes[self.pos..].starts_with(b"(?i)") {
+                self.pos += 4;
+                let rest = self.parse_concat()?;
+                nodes.push(Node::IgnoreCase(Box::new(rest)));
+                break;
             }
             let atom = self.parse_atom(nodes.is_empty())?;
             let quantified = self.parse_quantifier(atom)?;
@@ -2129,7 +2239,7 @@ impl RegexParser<'_> {
         if next >= self.bytes.len() {
             return true;
         }
-        if self.extended {
+        if self.extended() {
             matches!(self.bytes.get(next), Some(b'|') | Some(b')'))
         } else {
             self.bytes.get(next) == Some(&b'\\')
@@ -2151,7 +2261,8 @@ impl RegexParser<'_> {
                 Ok(Node::AnyChar)
             }
             b'[' => self.parse_class(),
-            b'(' if self.extended => {
+            b'(' if self.pcre() => self.parse_pcre_group(),
+            b'(' if self.extended() => {
                 self.pos += 1;
                 let inner = self.parse_alternation()?;
                 if self.peek() != Some(b')') {
@@ -2168,12 +2279,103 @@ impl RegexParser<'_> {
         }
     }
 
+    /// `(` in PCRE mode: plain `(...)` captures; `(?:...)` groups without
+    /// capturing; `(?P<name>...)` is a named capture; `(?P=name)` is a
+    /// backreference to one.
+    fn parse_pcre_group(&mut self) -> Result<Node> {
+        debug_assert_eq!(self.peek(), Some(b'('));
+        let rest = &self.bytes[self.pos + 1..];
+        if rest.starts_with(b"?P=") {
+            let name_start = self.pos + 4;
+            let Some(close) = self.bytes[name_start..].iter().position(|&b| b == b')') else {
+                return Err(GitError::Command("unbalanced ( in regex".into()));
+            };
+            let name = &self.bytes[name_start..name_start + close];
+            let Some(&(_, idx)) = self.group_names.iter().find(|(n, _)| n == name) else {
+                return Err(GitError::Command(format!(
+                    "reference to non-existent subpattern: {}",
+                    String::from_utf8_lossy(name)
+                )));
+            };
+            self.pos = name_start + close + 1;
+            return Ok(Node::Backref(idx));
+        }
+        let mut capture_index = None;
+        if rest.starts_with(b"?P<") {
+            let name_start = self.pos + 4;
+            let Some(close) = self.bytes[name_start..].iter().position(|&b| b == b'>') else {
+                return Err(GitError::Command("malformed (?P<name>) group".into()));
+            };
+            let name = self.bytes[name_start..name_start + close].to_vec();
+            self.num_groups += 1;
+            self.group_names.push((name, self.num_groups));
+            capture_index = Some(self.num_groups);
+            self.pos = name_start + close + 1;
+        } else if rest.starts_with(b"?:") {
+            self.pos += 3;
+        } else if rest.starts_with(b"?") {
+            return Err(GitError::Command("unsupported (?...) group in regex".into()));
+        } else {
+            self.pos += 1;
+            self.num_groups += 1;
+            capture_index = Some(self.num_groups);
+        }
+        let inner = self.parse_alternation()?;
+        if self.peek() != Some(b')') {
+            return Err(GitError::Command("unbalanced ( in regex".into()));
+        }
+        self.pos += 1;
+        Ok(match capture_index {
+            Some(idx) => Node::Capture(idx, Box::new(inner)),
+            None => Node::Group(Box::new(inner)),
+        })
+    }
+
     fn parse_escape(&mut self) -> Result<Node> {
         let Some(next) = self.bytes.get(self.pos + 1).copied() else {
             self.pos += 1;
             return Ok(Node::Literal(b'\\'));
         };
-        if !self.extended && next == b'(' {
+        if self.pcre() {
+            match next {
+                b'1'..=b'9' => {
+                    let idx = (next - b'0') as usize;
+                    if idx <= self.num_groups {
+                        self.pos += 2;
+                        return Ok(Node::Backref(idx));
+                    }
+                }
+                b'D' => {
+                    self.pos += 2;
+                    return Ok(Node::Class {
+                        negate: true,
+                        items: vec![ClassItem::Posix(PosixClass::Digit)],
+                    });
+                }
+                b'S' => {
+                    self.pos += 2;
+                    return Ok(Node::Class {
+                        negate: true,
+                        items: vec![ClassItem::Posix(PosixClass::Space)],
+                    });
+                }
+                b'x' => {
+                    self.pos += 2;
+                    let byte = self.parse_hex_escape()?;
+                    return Ok(Node::Literal(byte));
+                }
+                b'p' | b'P' => {
+                    self.pos += 2;
+                    let item = self.parse_category_escape(next == b'P')?;
+                    return Ok(Node::Class {
+                        negate: false,
+                        items: vec![item],
+                    });
+                }
+                _ => {}
+            }
+        }
+        if !self.extended() && next == b'(' {
             self.pos += 2;
             let inner = self.parse_alternation()?;
             if !self.at_group_close() {
@@ -2234,6 +2436,75 @@ impl RegexParser<'_> {
         }
     }
 
+    /// `\x{HH..}` / `\xHH` (cursor already past `\x`). Values above `0xFF` are
+    /// rejected: the engine matches bytes.
+    fn parse_hex_escape(&mut self) -> Result<u8> {
+        let braced = self.peek() == Some(b'{');
+        if braced {
+            self.pos += 1;
+        }
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        while let Some(byte) = self.peek() {
+            let Some(digit) = (byte as char).to_digit(16) else {
+                break;
+            };
+            value = value.saturating_mul(16).saturating_add(digit);
+            digits += 1;
+            self.pos += 1;
+            if !braced && digits == 2 {
+                break;
+            }
+        }
+        if braced {
+            if self.peek() != Some(b'}') {
+                return Err(GitError::Command("malformed \\x{..} in regex".into()));
+            }
+            self.pos += 1;
+        }
+        if digits == 0 || value > 0xFF {
+            return Err(GitError::Command("unsupported \\x escape in regex".into()));
+        }
+        Ok(value as u8)
+    }
+
+    /// `\p{Name}` / `\pL` (cursor already past `\p` / `\P`).
+    fn parse_category_escape(&mut self, negate: bool) -> Result<ClassItem> {
+        let name: Vec<u8> = if self.peek() == Some(b'{') {
+            self.pos += 1;
+            let Some(close) = self.bytes[self.pos..].iter().position(|&b| b == b'}') else {
+                return Err(GitError::Command("malformed \\p{..} in regex".into()));
+            };
+            let name = self.bytes[self.pos..self.pos + close].to_vec();
+            self.pos += close + 1;
+            name
+        } else {
+            let Some(byte) = self.peek() else {
+                return Err(GitError::Command("malformed \\p in regex".into()));
+            };
+            self.pos += 1;
+            vec![byte]
+        };
+        let cat = match name.as_slice() {
+            b"L" => PerlCategory::Letter,
+            b"Lu" => PerlCategory::UppercaseLetter,
+            b"Ll" => PerlCategory::LowercaseLetter,
+            b"N" | b"Nd" => PerlCategory::Number,
+            b"P" => PerlCategory::Punctuation,
+            b"Ps" => PerlCategory::OpenPunctuation,
+            b"Pe" => PerlCategory::ClosePunctuation,
+            b"S" => PerlCategory::Symbol,
+            b"Z" | b"Zs" => PerlCategory::Separator,
+            other => {
+                return Err(GitError::Command(format!(
+                    "unsupported \\p category in regex: {}",
+                    String::from_utf8_lossy(other)
+                )));
+            }
+        };
+        Ok(ClassItem::Category { negate, cat })
+    }
+
     fn parse_class(&mut self) -> Result<Node> {
         let start = self.pos;
         self.pos += 1;
@@ -2258,6 +2529,31 @@ impl RegexParser<'_> {
                 && let Some(class) = self.parse_posix_class()?
             {
                 items.push(ClassItem::Posix(class));
+                continue;
+            }
+            // PCRE: backslash escapes are live inside classes ([\d], [^\d], ...).
+            // POSIX bracket expressions treat `\` as a literal member, so this
+            // is gated on pcre mode.
+            if byte == b'\\'
+                && self.pcre()
+                && let Some(next) = self.bytes.get(self.pos + 1).copied()
+            {
+                self.pos += 2;
+                match next {
+                    b'd' => items.push(ClassItem::Posix(PosixClass::Digit)),
+                    b's' => items.push(ClassItem::Posix(PosixClass::Space)),
+                    b'w' => {
+                        items.push(ClassItem::Posix(PosixClass::Alnum));
+                        items.push(ClassItem::Single(b'_'));
+                    }
+                    b'p' | b'P' => {
+                        items.push(self.parse_category_escape(next == b'P')?);
+                    }
+                    b'x' => items.push(ClassItem::Single(self.parse_hex_escape()?)),
+                    b't' => items.push(ClassItem::Single(b'\t')),
+                    b'n' => items.push(ClassItem::Single(b'\n')),
+                    other => items.push(ClassItem::Single(other)),
+                }
                 continue;
             }
             let lo = byte;
@@ -2306,13 +2602,13 @@ impl RegexParser<'_> {
         };
         let (min, max, consumed) = match byte {
             b'*' => (0, None, 1),
-            b'+' if self.extended => (1, None, 1),
-            b'?' if self.extended => (0, Some(1), 1),
-            b'{' if self.extended => match self.parse_bound(self.pos + 1, false)? {
+            b'+' if self.extended() => (1, None, 1),
+            b'?' if self.extended() => (0, Some(1), 1),
+            b'{' if self.extended() => match self.parse_bound(self.pos + 1, false)? {
                 Some((min, max, end)) => (min, max, end - self.pos),
                 None => return Ok(atom),
             },
-            b'\\' if !self.extended => {
+            b'\\' if !self.extended() => {
                 let next = self.bytes.get(self.pos + 1).copied();
                 match next {
                     Some(b'+') => (1, None, 2),
@@ -2327,11 +2623,18 @@ impl RegexParser<'_> {
             _ => return Ok(atom),
         };
         self.pos += consumed;
+        // PCRE lazy quantifiers: a trailing `?` flips the repeat to shortest-
+        // match-first (`.*?`, `.+?`, `??`, `{n,m}?`).
+        let mut greedy = true;
+        if self.pcre() && self.peek() == Some(b'?') {
+            self.pos += 1;
+            greedy = false;
+        }
         Ok(Node::Repeat {
             node: Box::new(atom),
             min,
             max,
-            greedy: true,
+            greedy,
         })
     }
 
@@ -2399,24 +2702,42 @@ fn parse_usize(digits: &[u8]) -> Result<usize> {
 
 // --- Regex matcher ---------------------------------------------------------
 
-fn match_node(root: &Node, text: &[u8], pos: usize, ignore_case: bool) -> Option<usize> {
-    match_seq(root, text, pos, ignore_case, &|p| Some(p))
+/// Per-match-attempt state: the subject text plus capture-group spans (PCRE
+/// backreferences). Captures mutate during backtracking, hence the `RefCell`
+/// (the continuation-passing matcher only holds `&` references).
+struct MatchCtx<'a> {
+    text: &'a [u8],
+    captures: std::cell::RefCell<Vec<Option<(usize, usize)>>>,
 }
 
-fn match_anchored_full(root: &Node, text: &[u8], ignore_case: bool) -> bool {
-    match_seq(root, text, 0, ignore_case, &|p| {
-        if p == text.len() { Some(p) } else { None }
+impl<'a> MatchCtx<'a> {
+    fn new(text: &'a [u8], num_groups: usize) -> Self {
+        Self {
+            text,
+            captures: std::cell::RefCell::new(vec![None; num_groups + 1]),
+        }
+    }
+}
+
+fn match_node(root: &Node, ctx: &MatchCtx<'_>, pos: usize, ignore_case: bool) -> Option<usize> {
+    match_seq(root, ctx, pos, ignore_case, &|p| Some(p))
+}
+
+fn match_anchored_full(root: &Node, ctx: &MatchCtx<'_>, ignore_case: bool) -> bool {
+    match_seq(root, ctx, 0, ignore_case, &|p| {
+        if p == ctx.text.len() { Some(p) } else { None }
     })
     .is_some()
 }
 
 fn match_seq(
     node: &Node,
-    text: &[u8],
+    ctx: &MatchCtx<'_>,
     pos: usize,
     ignore_case: bool,
     cont: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
+    let text = ctx.text;
     match node {
         Node::Empty => cont(pos),
         Node::Literal(byte) => {
@@ -2470,11 +2791,39 @@ fn match_seq(
                 None
             }
         }
-        Node::Group(inner) => match_seq(inner, text, pos, ignore_case, cont),
-        Node::Concat(nodes) => match_concat(nodes, text, pos, ignore_case, cont),
+        Node::Group(inner) => match_seq(inner, ctx, pos, ignore_case, cont),
+        Node::IgnoreCase(inner) => match_seq(inner, ctx, pos, true, cont),
+        Node::Capture(idx, inner) => {
+            let start = pos;
+            let idx = *idx;
+            match_seq(inner, ctx, pos, ignore_case, &|p| {
+                // Record the span for backreferences; restore on backtrack so a
+                // failed continuation does not leak a stale span.
+                let prev = ctx.captures.borrow()[idx];
+                ctx.captures.borrow_mut()[idx] = Some((start, p));
+                let result = cont(p);
+                if result.is_none() {
+                    ctx.captures.borrow_mut()[idx] = prev;
+                }
+                result
+            })
+        }
+        Node::Backref(idx) => {
+            // PCRE semantics: a backreference to an unset group fails to match.
+            let span = ctx.captures.borrow()[*idx];
+            let (start, end) = span?;
+            let captured_len = end - start;
+            if pos + captured_len > text.len() {
+                return None;
+            }
+            let matches = (0..captured_len)
+                .all(|i| byte_eq(text[pos + i], text[start + i], ignore_case));
+            if matches { cont(pos + captured_len) } else { None }
+        }
+        Node::Concat(nodes) => match_concat(nodes, ctx, pos, ignore_case, cont),
         Node::Alt(branches) => {
             for branch in branches {
-                if let Some(end) = match_seq(branch, text, pos, ignore_case, cont) {
+                if let Some(end) = match_seq(branch, ctx, pos, ignore_case, cont) {
                     return Some(end);
                 }
             }
@@ -2492,7 +2841,8 @@ fn match_seq(
                 max: *max,
                 greedy: *greedy,
             },
-            MatchSubject { text, ignore_case },
+            ctx,
+            ignore_case,
             pos,
             cont,
         ),
@@ -2501,15 +2851,15 @@ fn match_seq(
 
 fn match_concat(
     nodes: &[Node],
-    text: &[u8],
+    ctx: &MatchCtx<'_>,
     pos: usize,
     ignore_case: bool,
     cont: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
     match nodes.split_first() {
         None => cont(pos),
-        Some((head, tail)) => match_seq(head, text, pos, ignore_case, &|p| {
-            match_concat(tail, text, p, ignore_case, cont)
+        Some((head, tail)) => match_seq(head, ctx, pos, ignore_case, &|p| {
+            match_concat(tail, ctx, p, ignore_case, cont)
         }),
     }
 }
@@ -2521,22 +2871,17 @@ struct RepeatPattern<'a> {
     greedy: bool,
 }
 
-#[derive(Clone, Copy)]
-struct MatchSubject<'a> {
-    text: &'a [u8],
-    ignore_case: bool,
-}
-
 fn match_repeat(
     repeat: RepeatPattern<'_>,
-    subject: MatchSubject<'_>,
+    ctx: &MatchCtx<'_>,
+    ignore_case: bool,
     pos: usize,
     cont: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
     fn match_min(
         node: &Node,
         remaining: usize,
-        text: &[u8],
+        ctx: &MatchCtx<'_>,
         pos: usize,
         ignore_case: bool,
         after_min: &dyn Fn(usize) -> Option<usize>,
@@ -2544,18 +2889,20 @@ fn match_repeat(
         if remaining == 0 {
             return after_min(pos);
         }
-        match_seq(node, text, pos, ignore_case, &|p| {
+        match_seq(node, ctx, pos, ignore_case, &|p| {
             if p == pos {
                 return after_min(p);
             }
-            match_min(node, remaining - 1, text, p, ignore_case, after_min)
+            match_min(node, remaining - 1, ctx, p, ignore_case, after_min)
         })
     }
 
+    /// Greedy: longest first — try one more iteration before yielding to the
+    /// continuation.
     fn match_optional(
         node: &Node,
         remaining: Option<usize>,
-        text: &[u8],
+        ctx: &MatchCtx<'_>,
         pos: usize,
         ignore_case: bool,
         cont: &dyn Fn(usize) -> Option<usize>,
@@ -2564,11 +2911,11 @@ fn match_repeat(
             return cont(pos);
         }
         let next_remaining = remaining.map(|r| r - 1);
-        let more = match_seq(node, text, pos, ignore_case, &|p| {
+        let more = match_seq(node, ctx, pos, ignore_case, &|p| {
             if p == pos {
                 None
             } else {
-                match_optional(node, next_remaining, text, p, ignore_case, cont)
+                match_optional(node, next_remaining, ctx, p, ignore_case, cont)
             }
         });
         if more.is_some() {
@@ -2577,25 +2924,40 @@ fn match_repeat(
         cont(pos)
     }
 
+    /// Lazy (`*?` etc.): shortest first — yield to the continuation before
+    /// consuming another iteration.
+    fn match_optional_lazy(
+        node: &Node,
+        remaining: Option<usize>,
+        ctx: &MatchCtx<'_>,
+        pos: usize,
+        ignore_case: bool,
+        cont: &dyn Fn(usize) -> Option<usize>,
+    ) -> Option<usize> {
+        if let Some(end) = cont(pos) {
+            return Some(end);
+        }
+        if remaining == Some(0) {
+            return None;
+        }
+        let next_remaining = remaining.map(|r| r - 1);
+        match_seq(node, ctx, pos, ignore_case, &|p| {
+            if p == pos {
+                None
+            } else {
+                match_optional_lazy(node, next_remaining, ctx, p, ignore_case, cont)
+            }
+        })
+    }
+
     let max_optional = repeat.max.map(|m| m.saturating_sub(repeat.min));
-    let _ = repeat.greedy;
-    match_min(
-        repeat.node,
-        repeat.min,
-        subject.text,
-        pos,
-        subject.ignore_case,
-        &|p| {
-            match_optional(
-                repeat.node,
-                max_optional,
-                subject.text,
-                p,
-                subject.ignore_case,
-                cont,
-            )
-        },
-    )
+    match_min(repeat.node, repeat.min, ctx, pos, ignore_case, &|p| {
+        if repeat.greedy {
+            match_optional(repeat.node, max_optional, ctx, p, ignore_case, cont)
+        } else {
+            match_optional_lazy(repeat.node, max_optional, ctx, p, ignore_case, cont)
+        }
+    })
 }
 
 fn byte_eq(a: u8, b: u8, ignore_case: bool) -> bool {
@@ -2631,9 +2993,30 @@ fn class_matches(items: &[ClassItem], ch: u8, ignore_case: bool) -> bool {
                     return true;
                 }
             }
+            ClassItem::Category { negate, cat } => {
+                if perl_category_matches(*cat, ch) != *negate {
+                    return true;
+                }
+            }
         }
     }
     false
+}
+
+/// ASCII projection of the Unicode general categories (`\p{..}`). The grep
+/// engine is bytewise, so non-ASCII bytes are conservatively "no match".
+fn perl_category_matches(cat: PerlCategory, ch: u8) -> bool {
+    match cat {
+        PerlCategory::Letter => ch.is_ascii_alphabetic(),
+        PerlCategory::UppercaseLetter => ch.is_ascii_uppercase(),
+        PerlCategory::LowercaseLetter => ch.is_ascii_lowercase(),
+        PerlCategory::Number => ch.is_ascii_digit(),
+        PerlCategory::Punctuation => ch.is_ascii_punctuation() && !matches!(ch, b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'),
+        PerlCategory::OpenPunctuation => matches!(ch, b'(' | b'[' | b'{'),
+        PerlCategory::ClosePunctuation => matches!(ch, b')' | b']' | b'}'),
+        PerlCategory::Symbol => matches!(ch, b'$' | b'+' | b'<' | b'=' | b'>' | b'^' | b'`' | b'|' | b'~'),
+        PerlCategory::Separator => ch == b' ',
+    }
 }
 
 fn posix_matches(class: PosixClass, ch: u8) -> bool {
@@ -2673,8 +3056,71 @@ mod tests {
     use super::*;
 
     fn regex_match(pattern: &str, extended: bool, text: &str) -> bool {
-        let re = Regex::compile(pattern, extended, false, false).expect("compile");
+        let mode = if extended {
+            RegexMode::Ere
+        } else {
+            RegexMode::Bre
+        };
+        let re = Regex::compile(pattern, mode, false, false).expect("compile");
         re.find_from(text.as_bytes(), 0).is_some()
+    }
+
+    fn pcre_match(pattern: &str, text: &str) -> bool {
+        let re = Regex::compile(pattern, RegexMode::Pcre, false, false).expect("compile");
+        re.find_from(text.as_bytes(), 0).is_some()
+    }
+
+    fn pcre_find(pattern: &str, text: &str) -> Option<(usize, usize)> {
+        let re = Regex::compile(pattern, RegexMode::Pcre, false, false).expect("compile");
+        re.find_from(text.as_bytes(), 0)
+    }
+
+    #[test]
+    fn pcre_escapes_and_classes() {
+        assert!(pcre_match(r"a\x{2b}b\x{2a}c", "xa+b*cy"));
+        assert!(pcre_match(r"[\d]", "abc5"));
+        assert!(!pcre_match(r"[\d]", "abc"));
+        assert!(pcre_match(r"[\d]\s", "a 5 b"));
+        assert!(pcre_match(r"\d+", "abc123"));
+        assert!(!pcre_match(r"\D", "123"));
+        assert!(pcre_match(r"[^\d]+", "12a3"));
+    }
+
+    #[test]
+    fn pcre_unicode_categories_ascii() {
+        assert!(pcre_match(r"\p{Ps}.*?\p{Pe}", "printf(\"Hello world.\\n\");"));
+        assert!(!pcre_match(r"\p{Ps}\p{Pe}", "no parens here"));
+        assert!(pcre_match(r"(*NO_JIT)\p{Ps}.*?\p{Pe}", "f(x)"));
+        assert!(pcre_match(r"\p{L}+", "word"));
+    }
+
+    #[test]
+    fn pcre_lazy_quantifier_is_shortest_match() {
+        // Greedy spans to the last `)`; lazy stops at the first.
+        assert_eq!(pcre_find(r"\(.*?\)", "(a)(b)"), Some((0, 3)));
+        assert_eq!(pcre_find(r"\(.*\)", "(a)(b)"), Some((0, 6)));
+    }
+
+    #[test]
+    fn pcre_backreferences() {
+        assert!(pcre_match(r"(.)\1", "hello")); // "ll"
+        assert!(!pcre_match(r"(.)\1", "abcd"));
+        assert!(pcre_match(r"(?P<one>.)(?P=one)", "hello"));
+        assert!(!pcre_match(r"(?P<one>.)(?P=one)", "abcd"));
+    }
+
+    #[test]
+    fn pcre_inline_ignore_case_group() {
+        let re = Regex::compile("He((?i)ll)o", RegexMode::Pcre, false, false).expect("compile");
+        assert!(re.find_from(b"Hello", 0).is_some());
+        assert!(re.find_from(b"HeLLo", 0).is_some());
+        assert!(re.find_from(b"hello", 0).is_none()); // leading H stays case-sensitive
+    }
+
+    #[test]
+    fn pcre_non_capturing_group_and_alternation() {
+        assert!(pcre_match(r"(?:foo|bar)baz", "xbarbazy"));
+        assert!(!pcre_match(r"(?:foo|bar)baz", "xbaz"));
     }
 
     #[test]

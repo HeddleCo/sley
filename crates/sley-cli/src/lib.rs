@@ -6342,12 +6342,16 @@ fn commit_author_identity(raw: &[u8]) -> String {
 #[derive(Debug)]
 struct SimpleLogRegex {
     alternatives: Vec<SimpleLogRegexAlternative>,
+    /// `--perl-regexp` patterns compile through the full grep regex engine in
+    /// PCRE mode instead of the simple BRE subset above.
+    perl: Option<commands::grep::Regex>,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum SimpleLogRegexMode {
     Basic,
     Fixed,
+    Perl,
 }
 
 #[derive(Debug)]
@@ -6394,17 +6398,32 @@ enum SimpleLogRegexClassItem {
 
 impl SimpleLogRegex {
     fn parse(pattern: &str, error_context: &'static str, mode: SimpleLogRegexMode) -> Result<Self> {
+        if let SimpleLogRegexMode::Perl = mode {
+            let regex =
+                commands::grep::Regex::compile(pattern, commands::grep::RegexMode::Pcre, false, false)?;
+            return Ok(Self {
+                alternatives: Vec::new(),
+                perl: Some(regex),
+            });
+        }
         let alternatives = match mode {
             SimpleLogRegexMode::Basic => split_log_regex_alternatives(pattern)
                 .into_iter()
                 .map(|alternative| SimpleLogRegexAlternative::parse(alternative, error_context))
                 .collect::<Result<Vec<_>>>()?,
             SimpleLogRegexMode::Fixed => vec![SimpleLogRegexAlternative::parse_fixed(pattern)],
+            SimpleLogRegexMode::Perl => unreachable!("handled above"),
         };
-        Ok(Self { alternatives })
+        Ok(Self {
+            alternatives,
+            perl: None,
+        })
     }
 
     fn is_match(&self, value: &str, ignore_case: bool) -> bool {
+        if let Some(perl) = &self.perl {
+            return perl.is_match_with_case(value.as_bytes(), ignore_case);
+        }
         self.alternatives
             .iter()
             .any(|alternative| alternative.is_match(value, ignore_case))
