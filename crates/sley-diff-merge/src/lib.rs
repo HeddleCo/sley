@@ -3667,7 +3667,7 @@ pub fn is_mergeable_file_mode(mode: u32) -> bool {
 /// the per-command copies it replaced, and additionally resolves renames when
 /// [`MergeTreesOptions::detect_renames`] is set.
 pub fn merge_trees(
-    db: &mut FileObjectDatabase,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     base: Option<&ObjectId>,
     ours: &ObjectId,
@@ -3687,7 +3687,7 @@ pub fn merge_trees(
 /// porcelains often hold the flattened maps already (e.g. cherry-pick builds
 /// `theirs` from a picked commit's tree), so this avoids re-reading them.
 pub fn merge_entry_maps(
-    db: &mut FileObjectDatabase,
+    db: &FileObjectDatabase,
     format: ObjectFormat,
     base_map: &MergeEntryMap,
     ours_map: &MergeEntryMap,
@@ -4036,7 +4036,7 @@ fn merge_file_modes(base: Option<u32>, ours: u32, theirs: u32) -> (u32, bool) {
 
 /// Build a top-level tree object from a flat map of `path -> (mode, oid)`
 /// leaves, writing every (sub)tree object to `db`.
-fn write_merged_tree(db: &mut FileObjectDatabase, leaves: &MergeEntryMap) -> Result<ObjectId> {
+fn write_merged_tree(db: &FileObjectDatabase, leaves: &MergeEntryMap) -> Result<ObjectId> {
     let mut root = MergeTreeNode::default();
     for (path, (mode, oid)) in leaves {
         root.insert(path, *mode, *oid);
@@ -4067,7 +4067,7 @@ impl MergeTreeNode {
         }
     }
 
-    fn write(&self, db: &mut FileObjectDatabase) -> Result<ObjectId> {
+    fn write(&self, db: &FileObjectDatabase) -> Result<ObjectId> {
         let mut entries: Vec<TreeEntry> = Vec::new();
         for (name, (mode, oid)) in &self.blobs {
             entries.push(TreeEntry {

@@ -540,7 +540,7 @@ fn select_commits(
     for (left, right, _not) in &symmetric_ranges {
         let left_oid = resolve_format_patch_commit(repo, left)?;
         let right_oid = resolve_format_patch_commit(repo, right)?;
-        let bases = merge_bases(db, format, &left_oid, &right_oid)?;
+        let bases = merge_bases(repo.git_dir(), db, format, &left_oid, &right_oid)?;
         starts.push(left_oid);
         starts.push(right_oid);
         range_excludes.extend(bases);

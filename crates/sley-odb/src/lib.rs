@@ -23,7 +23,12 @@ pub trait ObjectReader {
 }
 
 pub trait ObjectWriter {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId>;
+    /// Write `object`, returning its id. Takes `&self`: every implementation's
+    /// write state (in-memory map, loose-object cache) is behind interior
+    /// mutability, so a single handle can interleave reads and writes without a
+    /// `&mut` borrow. This lets the merge engine read and write through one `db`
+    /// instead of opening a second read-only handle that re-warms the caches.
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,11 +87,9 @@ impl RawPackInstaller for FileObjectDatabase {
     }
 }
 
-impl RawPackInstaller for std::cell::RefCell<ObjectDatabase> {
+impl RawPackInstaller for ObjectDatabase {
     fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
-        let mut database = self.borrow_mut();
-        let format = database.format;
-        let result = unpack_packfile_objects(pack_bytes, format, &mut *database)?;
+        let result = unpack_packfile_objects(pack_bytes, self.format, self)?;
         Ok(RawPackInstallResult {
             object_ids: result.written_objects,
         })
@@ -160,7 +163,7 @@ where
 pub fn unpack_packfile_objects<W>(
     pack_bytes: &[u8],
     format: ObjectFormat,
-    writer: &mut W,
+    writer: &W,
 ) -> Result<PackUnpackResult>
 where
     W: ObjectWriter,
@@ -169,7 +172,7 @@ where
     write_pack_objects(pack, writer, "pack")
 }
 
-fn write_pack_objects<W>(pack: PackFile, writer: &mut W, source: &str) -> Result<PackUnpackResult>
+fn write_pack_objects<W>(pack: PackFile, writer: &W, source: &str) -> Result<PackUnpackResult>
 where
     W: ObjectWriter,
 {
@@ -926,10 +929,15 @@ where
     Ok(seen)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ObjectDatabase {
     format: ObjectFormat,
-    objects: HashMap<ObjectId, Arc<EncodedObject>>,
+    // Behind a `Mutex` so `write_object` can take `&self` (matching the
+    // `ObjectWriter` trait) and a single handle can interleave reads and writes
+    // without a `&mut` borrow — the same shared-by-`&` shape the file-backed
+    // database uses for its caches. Removes the need for callers to wrap this in
+    // a `RefCell`/`&mut` just to write (see sley-fetch's former `RefCell` dance).
+    objects: Mutex<HashMap<ObjectId, Arc<EncodedObject>>>,
     promisor: bool,
 }
 
@@ -937,7 +945,7 @@ impl ObjectDatabase {
     pub fn new(format: ObjectFormat) -> Self {
         Self {
             format,
-            objects: HashMap::new(),
+            objects: Mutex::new(HashMap::new()),
             promisor: false,
         }
     }
@@ -948,7 +956,10 @@ impl ObjectDatabase {
     }
 
     pub fn contains(&self, oid: &ObjectId) -> bool {
-        self.objects.contains_key(oid)
+        self.objects
+            .lock()
+            .map(|objects| objects.contains_key(oid))
+            .unwrap_or(false)
     }
 
     pub fn validate(&self, oid: &ObjectId) -> Result<()> {
@@ -967,6 +978,8 @@ impl ObjectDatabase {
 impl ObjectReader for ObjectDatabase {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects
+            .lock()
+            .map_err(|_| GitError::object_not_found(*oid))?
             .get(oid)
             .map(Arc::clone)
             .ok_or_else(|| GitError::object_not_found(*oid))
@@ -974,9 +987,13 @@ impl ObjectReader for ObjectDatabase {
 }
 
 impl ObjectWriter for ObjectDatabase {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
-        self.objects.entry(oid).or_insert_with(|| Arc::new(object));
+        self.objects
+            .lock()
+            .map_err(|_| GitError::Io("object cache lock poisoned".into()))?
+            .entry(oid)
+            .or_insert_with(|| Arc::new(object));
         Ok(oid)
     }
 }
@@ -2227,7 +2244,7 @@ impl ObjectReader for FileObjectDatabase {
 }
 
 impl ObjectWriter for FileObjectDatabase {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         // Mirror git's freshen semantics (`write_object_file`:
         // `freshen_packed_object || freshen_loose_object`): an object already
         // present anywhere in the database — loose, packed, or through an
@@ -2676,7 +2693,7 @@ impl ObjectReader for LooseObjectStore {
 }
 
 impl ObjectWriter for LooseObjectStore {
-    fn write_object(&mut self, object: EncodedObject) -> Result<ObjectId> {
+    fn write_object(&self, object: EncodedObject) -> Result<ObjectId> {
         let oid = object.object_id(self.format)?;
         let path = self.object_path(&oid)?;
         if path.exists() {
@@ -3861,7 +3878,7 @@ mod tests {
 
     #[test]
     fn unpack_packfile_objects_writes_sha256_pack_entries() {
-        let mut writer = ObjectDatabase::new(ObjectFormat::Sha256);
+        let writer = ObjectDatabase::new(ObjectFormat::Sha256);
         let object = EncodedObject::new(ObjectType::Blob, b"transport pack object\n".to_vec());
         let oid = object
             .object_id(ObjectFormat::Sha256)
@@ -3869,7 +3886,7 @@ mod tests {
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
             .expect("test operation should succeed");
 
-        let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &mut writer)
+        let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &writer)
             .expect("test operation should succeed");
 
         assert_eq!(result.written_objects, vec![oid]);

@@ -66,6 +66,36 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     reader: &R,
     rev: &str,
 ) -> Result<ObjectId> {
+    resolve_revision_inner(git_dir, format, reader, rev, None)
+}
+
+/// Like [`resolve_revision_with_reader`], but resolves `@{upstream}` / `@{push}`
+/// against a caller-supplied effective config instead of re-reading
+/// `<git_dir>/config` blindly.
+///
+/// Callers that have already resolved the repository config — including
+/// `include`/`includeIf` directives and command-line `-c` / `GIT_CONFIG_*`
+/// overrides — pass it here so upstream resolution honours the same
+/// `branch.<name>.{remote,merge}` the rest of the command sees. When `config`
+/// is `None` (or the upstream path is reached without one), this falls back to an
+/// include-aware read of `<git_dir>/config`.
+pub fn resolve_revision_with_config<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    config: &GitConfig,
+) -> Result<ObjectId> {
+    resolve_revision_inner(git_dir, format, reader, rev, Some(config))
+}
+
+fn resolve_revision_inner<R: ObjectReader>(
+    git_dir: &Path,
+    format: ObjectFormat,
+    reader: &R,
+    rev: &str,
+    config: Option<&GitConfig>,
+) -> Result<ObjectId> {
     // `:/text` and `:[N:]path` are anchored at the start of the spec; handle them
     // before the `^`/`~` suffix machinery so the leading colon is not mistaken
     // for a normal revision name.
@@ -86,7 +116,7 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
     // resolved before the `^`/`~` suffix machinery so that a base like `HEAD@{1}^`
     // first becomes the reflog value and only then has the parent suffix applied
     // (the suffix splitter recurses back into this function on the `@{...}` base).
-    if let Some(oid) = resolve_at_selector(git_dir, format, rev)? {
+    if let Some(oid) = resolve_at_selector(git_dir, format, rev, config)? {
         return Ok(oid);
     }
     if let Some((base, suffix)) = split_revision_suffix(rev)? {
@@ -95,7 +125,7 @@ pub fn resolve_revision_with_reader<R: ObjectReader>(
                 "revision {rev} has empty base"
             )));
         }
-        let base_oid = resolve_revision_with_reader(git_dir, format, reader, base)?;
+        let base_oid = resolve_revision_inner(git_dir, format, reader, base, config)?;
         return apply_revision_suffix(git_dir, reader, format, &base_oid, suffix, rev);
     }
     resolve_revision_name(git_dir, format, rev)
@@ -105,6 +135,7 @@ pub struct RevisionResolver<'a, R> {
     git_dir: &'a Path,
     format: ObjectFormat,
     reader: &'a R,
+    config: Option<&'a GitConfig>,
 }
 
 impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
@@ -113,11 +144,20 @@ impl<'a, R: ObjectReader> RevisionResolver<'a, R> {
             git_dir,
             format,
             reader,
+            config: None,
         }
     }
 
+    /// Attach a caller-resolved effective config so `@{upstream}` / `@{push}`
+    /// honour `include`/`includeIf` and `-c` / `GIT_CONFIG_*` overrides. See
+    /// [`resolve_revision_with_config`].
+    pub fn with_config(mut self, config: &'a GitConfig) -> Self {
+        self.config = Some(config);
+        self
+    }
+
     pub fn resolve(&self, rev: &str) -> Result<ObjectId> {
-        resolve_revision_with_reader(self.git_dir, self.format, self.reader, rev)
+        resolve_revision_inner(self.git_dir, self.format, self.reader, rev, self.config)
     }
 
     pub fn peel_to_blob(&self, rev: &str) -> Result<ObjectId> {
@@ -222,6 +262,7 @@ fn resolve_at_selector(
     git_dir: &Path,
     format: sley_core::ObjectFormat,
     rev: &str,
+    config: Option<&GitConfig>,
 ) -> Result<Option<ObjectId>> {
     // Bare `@` is an alias for HEAD.
     if rev == "@" {
@@ -258,10 +299,14 @@ fn resolve_at_selector(
     }
 
     if inner == "u" || inner == "upstream" {
-        return Ok(Some(resolve_upstream(git_dir, format, base, false, rev)?));
+        return Ok(Some(resolve_upstream(
+            git_dir, format, base, false, rev, config,
+        )?));
     }
     if inner == "push" {
-        return Ok(Some(resolve_upstream(git_dir, format, base, true, rev)?));
+        return Ok(Some(resolve_upstream(
+            git_dir, format, base, true, rev, config,
+        )?));
     }
     if inner.bytes().all(|byte| byte.is_ascii_digit()) {
         let count = parse_at_count(rev, inner)?;
@@ -406,6 +451,7 @@ fn resolve_upstream(
     base: &str,
     push: bool,
     rev: &str,
+    config: Option<&GitConfig>,
 ) -> Result<ObjectId> {
     let refs = FileRefStore::new(git_dir.to_path_buf(), format);
     let branch = if base.is_empty() {
@@ -422,7 +468,17 @@ fn resolve_upstream(
         base.to_string()
     };
 
-    let config = read_repo_config(git_dir)?;
+    // Prefer the caller-resolved effective config (includes + `-c` overrides);
+    // fall back to an include-aware read of `<git_dir>/config` when none was
+    // threaded in.
+    let owned_config;
+    let config = match config {
+        Some(config) => config,
+        None => {
+            owned_config = read_repo_config(git_dir)?;
+            &owned_config
+        }
+    };
     let merge = config
         .get("branch", Some(&branch), "merge")
         .ok_or_else(|| {
@@ -451,18 +507,16 @@ fn resolve_upstream(
     }
 }
 
-/// Read the repository config (`<git_dir>/config`).
+/// Read the repository config (`<git_dir>/config`), resolving `include`/`includeIf`
+/// directives and layering inherited `GIT_CONFIG_*` overrides.
 ///
-/// A missing config file is treated as empty rather than an error, mirroring how
-/// upstream resolution behaves in a freshly created repository with no branch
-/// configuration.
+/// This is the fallback used when a caller did not thread its already-resolved
+/// effective config in via [`resolve_revision_with_config`]; it shares
+/// [`sley_config::read_repo_config`] so a missing file is treated as empty and
+/// includes are honoured. (Command-line `-c` overrides the CLI holds in-process
+/// are only visible when the caller passes the resolved config explicitly.)
 fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
-    let path = git_dir.join("config");
-    match fs::read(&path) {
-        Ok(bytes) => GitConfig::parse(&bytes),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GitConfig::default()),
-        Err(err) => Err(GitError::Io(err.to_string())),
-    }
+    sley_config::read_repo_config(git_dir, None)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

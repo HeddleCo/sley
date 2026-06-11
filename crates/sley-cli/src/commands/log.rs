@@ -1245,7 +1245,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         let left_oid = sley_rev::peel_to_commit(&db, format, &left_oid)?;
         let right_oid = resolve_revision(&git_dir, format, &right)?;
         let right_oid = sley_rev::peel_to_commit(&db, format, &right_oid)?;
-        let merge_bases = merge_bases(&db, format, &left_oid, &right_oid)?;
+        let merge_bases = merge_bases(&git_dir, &db, format, &left_oid, &right_oid)?;
         if not {
             starts.extend(merge_bases);
             symmetric_excludes.push(left_oid);

@@ -315,7 +315,7 @@ fn read_shortlog_from_revisions(
         let left_oid = sley_rev::peel_to_commit(db, format, &left_oid)?;
         let right_oid = repo.resolve_revision(&right)?;
         let right_oid = sley_rev::peel_to_commit(db, format, &right_oid)?;
-        let bases = merge_bases(db, format, &left_oid, &right_oid)?;
+        let bases = merge_bases(repo.git_dir(), db, format, &left_oid, &right_oid)?;
         if not {
             starts.extend(bases);
             symmetric_excludes.push(left_oid);

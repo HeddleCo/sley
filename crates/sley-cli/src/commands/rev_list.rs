@@ -599,7 +599,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 left_right_sides.entry(record.oid).or_insert('>');
             }
         }
-        let merge_bases = merge_bases(&db, format, &left_oid, &right_oid)?;
+        let merge_bases = merge_bases(&git_dir, &db, format, &left_oid, &right_oid)?;
         if not {
             include_commits.extend(merge_bases);
             symmetric_excludes.push(left_oid);

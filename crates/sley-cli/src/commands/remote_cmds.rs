@@ -4112,36 +4112,21 @@ fn remote_pull_branch_configs(config: &GitConfig, remote: &str) -> Vec<(String, 
 }
 
 pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
-    let path = git_dir.join("config");
-    // Resolve `include.path` / `includeIf` directives. With no includes present
-    // this yields the same config as a plain parse, and a missing file yields an
-    // empty config — preserving prior behavior.
-    let git_dir_abs = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
-    let context = sley_config::ConfigIncludeContext::new(
-        Some(git_dir_abs),
-        repo_current_branch_name(git_dir),
-    );
-    let mut config = sley_config::load_config_with_includes(&path, &context)?;
-    // Layer command-line `-c` / `--config-env` / `GIT_CONFIG_*` overrides on top
-    // (highest precedence). git applies these to all config reads, not just
-    // `git config`, so consumers like `git log`'s i18n.* lookups must see them.
-    if let Ok(parameters) = crate::injected_config_parameters() {
-        config
-            .sections
-            .extend(sley_config::injected_config_sections(&parameters));
-    }
-    Ok(config)
+    // Single effective-config reader shared with the library crates: resolves
+    // `include.path` / `includeIf` and layers command-line `-c` / `--config-env`
+    // / `GIT_CONFIG_*` overrides on top (highest precedence). git applies these to
+    // all config reads, not just `git config`, so consumers like `git log`'s
+    // i18n.* lookups must see them. The CLI holds command-line `-c` overrides it
+    // cannot push into the process env, so it reconstructs the effective
+    // `GIT_CONFIG_PARAMETERS` and passes it through.
+    sley_config::read_repo_config(git_dir, crate::effective_config_parameters_env().as_deref())
 }
 
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.
 /// Used for `includeIf "onbranch:<glob>"` resolution; reads HEAD directly so it
 /// needs no object-format or ref-store context.
 pub(crate) fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
-    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let target = head.trim().strip_prefix("ref:")?.trim();
-    target
-        .strip_prefix("refs/heads/")
-        .map(|name| name.to_string())
+    sley_config::repo_current_branch_name(git_dir)
 }
 
 pub(crate) fn write_repo_config(git_dir: &Path, config: &GitConfig) -> Result<()> {
