@@ -3582,7 +3582,7 @@ mod tests {
 
     #[test]
     fn write_and_validate_blob() {
-        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
             .expect("test operation should succeed");
@@ -3597,7 +3597,7 @@ mod tests {
             std::process::id(),
             TEMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
+        let store = LooseObjectStore::new(root.join("objects"), ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec());
         let oid = store
             .write_object(object.clone())
@@ -3648,7 +3648,7 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         // Loose object: the header read inflates only the framing, not the body.
         let loose = EncodedObject::new(ObjectType::Blob, b"loose header object\n".to_vec());
@@ -3724,7 +3724,7 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let loose = EncodedObject::new(ObjectType::Blob, b"loose storage object\n".to_vec());
         let loose_oid = db
@@ -3797,7 +3797,7 @@ mod tests {
         let root = temp_root("sley-file-odb-prefix-loose");
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let object = EncodedObject::new(ObjectType::Blob, b"prefix loose\n".to_vec());
         let oid = db
             .write_object(object)
@@ -3846,7 +3846,7 @@ mod tests {
         let root = temp_root("sley-file-odb-prefix-ambiguous");
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let mut seen = HashMap::new();
         let (prefix, first, second) = (0..10_000)
             .find_map(|idx| {
@@ -4069,7 +4069,7 @@ mod tests {
         fs::create_dir_all(destination_git_dir.join("objects"))
             .expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
+        let source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"reachable payload\n".to_vec());
@@ -4146,7 +4146,7 @@ mod tests {
         let git_dir = root.join("repo.git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"excluded payload\n".to_vec());
         let blob_oid = db
@@ -4203,7 +4203,7 @@ mod tests {
         let git_dir = root.join("repo.git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let object = EncodedObject::new(ObjectType::Blob, b"raw reachable pack\n".to_vec());
         let oid = db
@@ -4236,7 +4236,7 @@ mod tests {
         let git_dir = root.join("repo.git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let blob = EncodedObject::new(ObjectType::Blob, b"tagged payload\n".to_vec());
         let blob_oid = db
@@ -4298,7 +4298,7 @@ mod tests {
         fs::create_dir_all(destination_git_dir.join("objects"))
             .expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
+        let source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
         let object = EncodedObject::new(ObjectType::Blob, b"excluded install\n".to_vec());
         let oid = source
@@ -4329,7 +4329,7 @@ mod tests {
         fs::create_dir_all(destination_git_dir.join("objects"))
             .expect("test operation should succeed");
         let format = ObjectFormat::Sha256;
-        let mut source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
+        let source = FileObjectDatabase::from_git_dir(&source_git_dir, format);
         let destination = FileObjectDatabase::from_git_dir(&destination_git_dir, format);
         let object = EncodedObject::new(ObjectType::Blob, b"sha256 reachable pack\n".to_vec());
         let oid = source
@@ -4375,7 +4375,7 @@ mod tests {
         }
 
         let format = ObjectFormat::Sha1;
-        let mut source = ObjectDatabase::new(format);
+        let source = ObjectDatabase::new(format);
         let object = EncodedObject::new(ObjectType::Blob, b"custom raw installer\n".to_vec());
         let oid = source
             .write_object(object)
@@ -4528,7 +4528,7 @@ mod tests {
         )
         .expect("test operation should succeed");
 
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
         let oid = db
             .write_object(object.clone())
             .expect("test operation should succeed");
@@ -4538,7 +4538,7 @@ mod tests {
 
     #[test]
     fn bundle_prerequisite_verification_reads_existing_objects() {
-        let mut db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let db = ObjectDatabase::new(ObjectFormat::Sha1);
         let oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"base\n".to_vec()))
             .expect("test operation should succeed");
@@ -5058,7 +5058,7 @@ mod tests {
         let git_dir = root.join(".git");
         fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
         let format = ObjectFormat::Sha1;
-        let mut db = FileObjectDatabase::from_git_dir(&git_dir, format);
+        let db = FileObjectDatabase::from_git_dir(&git_dir, format);
 
         let submodule_oid = ObjectId::from_hex(format, "1111111111111111111111111111111111111111")
             .expect("test operation should succeed");
