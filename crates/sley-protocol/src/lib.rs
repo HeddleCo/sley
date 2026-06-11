@@ -1,3 +1,7 @@
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use std::io::{ErrorKind, Read, Write};
 
@@ -587,11 +591,11 @@ pub fn plan_fetch_ref_updates(
     let mut updates = Vec::new();
     for refspec in refspecs.iter().filter(|refspec| !refspec.negative) {
         validate_refspec_shape(refspec)?;
-        if refspec.src.is_none() {
+        let Some(src) = refspec.src.as_deref() else {
             return Err(GitError::InvalidFormat(
                 "fetch refspec is missing a source".into(),
             ));
-        }
+        };
         if refspec.pattern {
             for reference in refs {
                 if refspec_is_excluded(&negative, &reference.name)? {
@@ -608,10 +612,6 @@ pub fn plan_fetch_ref_updates(
             }
             continue;
         }
-        let src = refspec
-            .src
-            .as_deref()
-            .expect("validated positive fetch refspec source");
         if refspec_is_excluded(&negative, src)? {
             continue;
         }
@@ -7664,6 +7664,35 @@ mod tests {
                 false
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn fetch_planner_sourceless_positive_refspec_returns_err_not_panic() {
+        // Regression guard for the sley#7 conversion at the `let Some(src) = ..`
+        // binding: a non-pattern positive refspec with no source must return an
+        // error, never panic. Construct the malformed RefSpec directly so the
+        // test pins the converted guard rather than parse_refspec's behavior.
+        let refs = vec![RefAdvertisement {
+            oid: ObjectId::from_hex(
+                ObjectFormat::Sha1,
+                "1111111111111111111111111111111111111111",
+            )
+            .expect("test operation should succeed"),
+            name: "refs/heads/main".into(),
+            capabilities: Vec::new(),
+        }];
+        let malformed = RefSpec {
+            force: false,
+            negative: false,
+            src: None,
+            dst: Some("refs/heads/main".into()),
+            pattern: false,
+        };
+        let result = plan_fetch_ref_updates(&refs, &[malformed], false);
+        assert!(
+            result.is_err(),
+            "sourceless positive refspec must yield Err, got {result:?}"
         );
     }
 

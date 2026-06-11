@@ -1,3 +1,7 @@
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use sley_core::{GitError, ObjectFormat, Result};
 use sley_protocol::*;
 use std::io::{Read, Write};

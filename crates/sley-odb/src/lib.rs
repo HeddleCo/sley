@@ -1,3 +1,7 @@
+// sley#7: untrusted-input parsing crate — fallible ops propagate errors;
+// the only retained `expect`s would be documented compile-time invariants.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
@@ -2016,9 +2020,14 @@ impl FileObjectDatabase {
             .checked_sub(pack_paths.offset)
             .ok_or_else(|| GitError::InvalidFormat("pack index offsets are not sorted".into()))?;
         let deltabase = match delta_base {
-            Some(PackDeltaBase::Offset(_)) => offset_info
-                .delta_base_oid
-                .expect("scan_pack_index_offsets validates ofs-delta base offsets"),
+            Some(PackDeltaBase::Offset(_)) => offset_info.delta_base_oid.ok_or_else(|| {
+                // scan_pack_index_offsets returns Err when delta_base_offset is
+                // Some but no matching entry is found, so this is unreachable for
+                // valid packs; propagate as an error rather than panic to keep a
+                // malformed pack from taking down the process if that invariant
+                // ever drifts.
+                GitError::InvalidFormat("ofs-delta base oid missing from pack index".into())
+            })?,
             Some(PackDeltaBase::Ref(oid)) => oid,
             None => zero_oid(self.format)?,
         };
