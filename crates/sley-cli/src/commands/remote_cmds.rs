@@ -4113,7 +4113,16 @@ pub(crate) fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
         Some(git_dir_abs),
         repo_current_branch_name(git_dir),
     );
-    sley_config::load_config_with_includes(&path, &context)
+    let mut config = sley_config::load_config_with_includes(&path, &context)?;
+    // Layer command-line `-c` / `--config-env` / `GIT_CONFIG_*` overrides on top
+    // (highest precedence). git applies these to all config reads, not just
+    // `git config`, so consumers like `git log`'s i18n.* lookups must see them.
+    if let Ok(parameters) = crate::injected_config_parameters() {
+        config
+            .sections
+            .extend(sley_config::injected_config_sections(&parameters));
+    }
+    Ok(config)
 }
 
 /// Short branch name from `HEAD` (e.g. "main"), or None when detached/unborn.

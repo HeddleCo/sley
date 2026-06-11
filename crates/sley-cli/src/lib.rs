@@ -565,7 +565,7 @@ fn global_config_value(key: &str) -> Result<Option<String>> {
 /// `GIT_CONFIG_PARAMETERS` = inherited env + command-line `-c`/`--config-env`),
 /// converting any parse failure into git's `error: <msg>\nfatal: unable to parse
 /// command-line config` two-line diagnostic with exit 128.
-fn injected_config_parameters() -> Result<Vec<sley_config::ConfigParameter>> {
+pub(crate) fn injected_config_parameters() -> Result<Vec<sley_config::ConfigParameter>> {
     let params_env = effective_config_parameters_env();
     sley_config::injected_config_parameters(params_env.as_deref())
         .map_err(report_config_parameter_error)
