@@ -25,15 +25,51 @@ enum PatternKind {
     Fixed,
 }
 
+/// Mirror of git's `GREP_PATTERN_TYPE_*`. `Unspecified` means "fall back to
+/// `extended_regexp_option`".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternTypeOption {
+    Unspecified,
+    Bre,
+    Ere,
+    Fixed,
+    Pcre,
+}
+
+/// A token in the boolean grep expression (parsed from the argv stream).
+#[derive(Clone)]
+enum ExprToken {
+    Pattern(usize), // index into `opts.patterns`
+    And,
+    Or,
+    Not,
+    Open,
+    Close,
+}
+
+/// The parsed boolean expression tree (`-e A --and ( -e B --or --not -e C )`).
+#[derive(Clone)]
+enum Expr {
+    /// Leaf: index into the compiled pattern list.
+    Atom(usize),
+    Not(Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+}
+
 /// Parsed command-line options for `git grep`.
 struct GrepOptions {
     patterns: Vec<String>,
+    /// `-f`/`-e`/positional patterns recorded in argv order with boolean glue, so
+    /// the expression tree can be reconstructed.
+    tokens: Vec<ExprToken>,
     kind: PatternKind,
     ignore_case: bool,
     word: bool,
     line_regexp: bool,
     invert: bool,
     line_number: bool,
+    column: bool,
     files_with_matches: bool,
     files_without_match: bool,
     count: bool,
@@ -45,6 +81,12 @@ struct GrepOptions {
     full_name: bool,
     null_data: bool,
     cached: bool,
+    max_depth: Option<i64>,
+    max_count: Option<i64>,
+    before_context: usize,
+    after_context: usize,
+    show_function: bool,
+    function_context: bool,
     revs: Vec<String>,
     pathspecs: Vec<String>,
 }
@@ -53,12 +95,14 @@ impl GrepOptions {
     fn new() -> Self {
         Self {
             patterns: Vec::new(),
+            tokens: Vec::new(),
             kind: PatternKind::Basic,
             ignore_case: false,
             word: false,
             line_regexp: false,
             invert: false,
             line_number: false,
+            column: false,
             files_with_matches: false,
             files_without_match: false,
             count: false,
@@ -70,8 +114,100 @@ impl GrepOptions {
             full_name: false,
             null_data: false,
             cached: false,
+            max_depth: None,
+            max_count: None,
+            before_context: 0,
+            after_context: 0,
+            show_function: false,
+            function_context: false,
             revs: Vec::new(),
             pathspecs: Vec::new(),
+        }
+    }
+
+    fn push_pattern(&mut self, text: String) {
+        let idx = self.patterns.len();
+        self.patterns.push(text);
+        self.tokens.push(ExprToken::Pattern(idx));
+    }
+}
+
+/// Resolve the effective pattern type from config (`grep.patternType`,
+/// `grep.extendedRegexp`) plus the command-line override accumulated during argv
+/// parsing. Config order is file entries first, then `-c` injected parameters;
+/// `grep.patternType=default` resets to unspecified so a later
+/// `grep.extendedRegexp` can take effect. The command-line flags (`-E/-G/-F/-P`)
+/// override config entirely.
+fn resolve_pattern_config(
+    config: &GitConfig,
+) -> Result<(PatternTypeOption, bool, Option<bool>, Option<bool>, Option<bool>)> {
+    let mut pattern_type = PatternTypeOption::Unspecified;
+    let mut extended = false;
+    let mut linenumber: Option<bool> = None;
+    let mut column: Option<bool> = None;
+    let mut fullname: Option<bool> = None;
+
+    let mut apply = |canonical_key: &str, value: Option<&str>| -> Result<()> {
+        match canonical_key {
+            "grep.patterntype" => {
+                let v = value.unwrap_or("");
+                pattern_type = parse_pattern_type_arg(v)?;
+            }
+            "grep.extendedregexp" => {
+                extended = parse_grep_bool(value);
+            }
+            "grep.linenumber" => linenumber = Some(parse_grep_bool(value)),
+            "grep.column" => column = Some(parse_grep_bool(value)),
+            "grep.fullname" => fullname = Some(parse_grep_bool(value)),
+            _ => {}
+        }
+        Ok(())
+    };
+
+    // 1. Config file entries, in file order.
+    for section in &config.sections {
+        if !section.name.eq_ignore_ascii_case("grep") {
+            continue;
+        }
+        for entry in &section.entries {
+            let canonical = format!("grep.{}", entry.key.to_ascii_lowercase());
+            apply(&canonical, entry.value.as_deref())?;
+        }
+    }
+
+    // 2. `-c` / GIT_CONFIG_PARAMETERS injected entries, in order.
+    for param in injected_config_parameters()? {
+        apply(&param.canonical_key.to_ascii_lowercase(), param.value.as_deref())?;
+    }
+
+    Ok((pattern_type, extended, linenumber, column, fullname))
+}
+
+fn parse_pattern_type_arg(arg: &str) -> Result<PatternTypeOption> {
+    Ok(match arg {
+        "default" => PatternTypeOption::Unspecified,
+        "basic" => PatternTypeOption::Bre,
+        "extended" => PatternTypeOption::Ere,
+        "fixed" => PatternTypeOption::Fixed,
+        "perl" => PatternTypeOption::Pcre,
+        other => {
+            eprintln!("fatal: bad grep.patternType argument: {other}");
+            return Err(GitError::Exit(128));
+        }
+    })
+}
+
+/// git's `git_config_bool`: bare key -> true; true/yes/on/non-zero int -> true.
+fn parse_grep_bool(value: Option<&str>) -> bool {
+    match value {
+        None => true,
+        Some(v) => {
+            let lower = v.to_ascii_lowercase();
+            match lower.as_str() {
+                "true" | "yes" | "on" => true,
+                "false" | "no" | "off" | "" => false,
+                other => other.parse::<i64>().map(|n| n != 0).unwrap_or(true),
+            }
         }
     }
 }
@@ -80,7 +216,11 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     let mut opts = GrepOptions::new();
     let mut positionals: Vec<String> = Vec::new();
     let mut saw_double_dash = false;
-    let mut iter = args.iter();
+    // Command-line pattern-type override: `-E/-G/-F/-P` set this (last wins).
+    let mut cli_pattern_type: Option<PatternTypeOption> = None;
+    let mut no_index = false;
+    let mut iter = args.iter().peekable();
+
     while let Some(arg) = iter.next() {
         if saw_double_dash {
             opts.pathspecs.push(arg.clone());
@@ -92,24 +232,35 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 let Some(value) = iter.next() else {
                     return grep_option_requires_value("-e");
                 };
-                opts.patterns.push(value.clone());
+                opts.push_pattern(value.clone());
             }
             value if let Some(value) = value.strip_prefix("-e") => {
-                // `-e<pattern>` glued form.
-                opts.patterns.push(value.to_string());
+                opts.push_pattern(value.to_string());
             }
             value if let Some(value) = value.strip_prefix("--regexp=") => {
-                opts.patterns.push(value.to_string());
+                opts.push_pattern(value.to_string());
             }
-            "-E" | "--extended-regexp" => opts.kind = PatternKind::Extended,
-            "-G" | "--basic-regexp" => opts.kind = PatternKind::Basic,
-            "-F" | "--fixed-strings" => opts.kind = PatternKind::Fixed,
-            "-P" | "--perl-regexp" => {
-                eprintln!(
-                    "fatal: cannot use Perl-compatible regexes; sley was not built with PCRE support"
-                );
-                return Err(GitError::Exit(128));
+            "-f" => {
+                let Some(file) = iter.next() else {
+                    return grep_option_requires_value("-f");
+                };
+                load_pattern_file(file, &mut opts)?;
             }
+            value if let Some(file) = value.strip_prefix("-f") => {
+                load_pattern_file(file, &mut opts)?;
+            }
+            value if let Some(file) = value.strip_prefix("--file=") => {
+                load_pattern_file(file, &mut opts)?;
+            }
+            "--and" => opts.tokens.push(ExprToken::And),
+            "--or" => opts.tokens.push(ExprToken::Or),
+            "--not" => opts.tokens.push(ExprToken::Not),
+            "(" => opts.tokens.push(ExprToken::Open),
+            ")" => opts.tokens.push(ExprToken::Close),
+            "-E" | "--extended-regexp" => cli_pattern_type = Some(PatternTypeOption::Ere),
+            "-G" | "--basic-regexp" => cli_pattern_type = Some(PatternTypeOption::Bre),
+            "-F" | "--fixed-strings" => cli_pattern_type = Some(PatternTypeOption::Fixed),
+            "-P" | "--perl-regexp" => cli_pattern_type = Some(PatternTypeOption::Pcre),
             "-i" | "--ignore-case" => opts.ignore_case = true,
             "--no-ignore-case" => opts.ignore_case = false,
             "-w" | "--word-regexp" => opts.word = true,
@@ -117,6 +268,8 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "-v" | "--invert-match" => opts.invert = true,
             "-n" | "--line-number" => opts.line_number = true,
             "--no-line-number" => opts.line_number = false,
+            "--column" => opts.column = true,
+            "--no-column" => opts.column = false,
             "-l" | "--files-with-matches" | "--name-only" => opts.files_with_matches = true,
             "-L" | "--files-without-match" => opts.files_without_match = true,
             "-c" | "--count" => opts.count = true,
@@ -130,14 +283,76 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "-I" => opts.ignore_binary = true,
             "-z" | "--null" => opts.null_data = true,
             "--cached" => opts.cached = true,
-            "--no-index" => {
-                eprintln!("fatal: --no-index is not supported by sley grep");
-                return Err(GitError::Exit(128));
+            "-p" | "--show-function" => opts.show_function = true,
+            "-W" | "--function-context" => opts.function_context = true,
+            "--no-index" => no_index = true,
+            "-r" | "--recursive" => opts.max_depth = Some(-1),
+            "--no-recursive" => opts.max_depth = Some(0),
+            "--max-depth" => {
+                let Some(value) = iter.next() else {
+                    return grep_option_requires_value("--max-depth");
+                };
+                opts.max_depth = Some(parse_int_arg(value, "--max-depth")?);
+            }
+            value if let Some(v) = value.strip_prefix("--max-depth=") => {
+                opts.max_depth = Some(parse_int_arg(v, "--max-depth")?);
+            }
+            "-m" | "--max-count" => {
+                let Some(value) = iter.next() else {
+                    return grep_option_requires_value("--max-count");
+                };
+                opts.max_count = Some(parse_int_arg(value, "--max-count")?);
+            }
+            value if let Some(v) = value.strip_prefix("--max-count=") => {
+                opts.max_count = Some(parse_int_arg(v, "--max-count")?);
+            }
+            value if let Some(v) = value.strip_prefix("-m") => {
+                opts.max_count = Some(parse_int_arg(v, "--max-count")?);
+            }
+            "-A" | "--after-context" => {
+                let Some(value) = iter.next() else {
+                    return grep_option_requires_value("--after-context");
+                };
+                opts.after_context = parse_context_arg(value)?;
+            }
+            value if let Some(v) = value.strip_prefix("--after-context=") => {
+                opts.after_context = parse_context_arg(v)?;
+            }
+            value if let Some(v) = value.strip_prefix("-A") => {
+                opts.after_context = parse_context_arg(v)?;
+            }
+            "-B" | "--before-context" => {
+                let Some(value) = iter.next() else {
+                    return grep_option_requires_value("--before-context");
+                };
+                opts.before_context = parse_context_arg(value)?;
+            }
+            value if let Some(v) = value.strip_prefix("--before-context=") => {
+                opts.before_context = parse_context_arg(v)?;
+            }
+            value if let Some(v) = value.strip_prefix("-B") => {
+                opts.before_context = parse_context_arg(v)?;
+            }
+            "-C" | "--context" => {
+                let Some(value) = iter.next() else {
+                    return grep_option_requires_value("--context");
+                };
+                let n = parse_context_arg(value)?;
+                opts.before_context = n;
+                opts.after_context = n;
+            }
+            value if let Some(v) = value.strip_prefix("--context=") => {
+                let n = parse_context_arg(v)?;
+                opts.before_context = n;
+                opts.after_context = n;
+            }
+            value if let Some(v) = value.strip_prefix("-C") => {
+                let n = parse_context_arg(v)?;
+                opts.before_context = n;
+                opts.after_context = n;
             }
             "--color"
             | "--no-color"
-            | "--recursive"
-            | "-r"
             | "--recurse-submodules"
             | "--no-recurse-submodules"
             | "--untracked"
@@ -146,22 +361,20 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             | "--heading"
             | "--no-heading"
             | "--break"
-            | "--no-break"
-            | "--column"
-            | "--no-column" => {
+            | "--no-break" => {
                 // Accepted-but-no-op flags whose default behaviour we already match.
             }
-            "--threads" | "--max-depth" | "--context" | "-C" | "-A" | "-B" | "--after-context"
-            | "--before-context" => {
-                // These take a value we currently ignore.
+            "--threads" => {
                 let _ = iter.next();
             }
-            value if value.starts_with("--threads=") || value.starts_with("--max-depth=") => {}
+            value if value.starts_with("--threads=") => {}
             value if value.starts_with("--color=") => {}
-            value if value.starts_with('-') && value.len() > 1 && !value.starts_with("--") => {
-                // A bundle of short flags such as `-in` or `-iw`. Expand and
-                // re-handle each one; `-e`/`-f` consume the remainder as a value.
-                match expand_short_flag_bundle(value, &mut opts)? {
+            value if value.starts_with('-')
+                && value.len() > 1
+                && !value.starts_with("--")
+                && !is_negative_number(value) =>
+            {
+                match expand_short_flag_bundle(value, &mut opts, &mut cli_pattern_type)? {
                     ShortBundle::Handled => {}
                     ShortBundle::Unknown(flag) => {
                         return grep_unknown_option(&flag);
@@ -175,13 +388,18 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         }
     }
 
-    // The very first positional is the pattern unless one was supplied via `-e`.
-    if opts.patterns.is_empty() {
+    // The very first positional is the pattern unless one was supplied via
+    // `-e`/`-f`/boolean tokens.
+    if opts.patterns.is_empty() && opts.tokens.is_empty() {
         if positionals.is_empty() {
             eprintln!("fatal: no pattern given");
             return Err(GitError::Exit(128));
         }
-        opts.patterns.push(positionals.remove(0));
+        opts.push_pattern(positionals.remove(0));
+    }
+
+    if no_index {
+        return Err(GitError::Unsupported("grep --no-index".into()));
     }
 
     let repo = RepositoryContext::discover_current()?;
@@ -190,9 +408,54 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     let format = repo.format();
     let db = repo.objects();
 
-    // Disambiguate remaining positionals into revs and pathspecs: each leading
-    // positional that resolves to an object is a rev; the first one that does
-    // not switches into "path mode", after which everything is a pathspec.
+    // Resolve config-driven pattern type + display defaults, then the CLI
+    // override (`-E/-G/-F/-P` win over config).
+    let (mut pattern_type, extended, cfg_linenumber, cfg_column, cfg_fullname) =
+        resolve_pattern_config(repo.config())?;
+    if let Some(cli) = cli_pattern_type {
+        pattern_type = cli;
+    }
+    if pattern_type == PatternTypeOption::Unspecified {
+        pattern_type = if extended {
+            PatternTypeOption::Ere
+        } else {
+            PatternTypeOption::Bre
+        };
+    }
+    if pattern_type == PatternTypeOption::Pcre {
+        eprintln!(
+            "fatal: cannot use Perl-compatible regexes; sley was not built with PCRE support"
+        );
+        return Err(GitError::Exit(128));
+    }
+    opts.kind = match pattern_type {
+        PatternTypeOption::Ere => PatternKind::Extended,
+        PatternTypeOption::Fixed => PatternKind::Fixed,
+        _ => PatternKind::Basic,
+    };
+    // `grep.*` config defaults apply only when the matching CLI flag was absent.
+    if let Some(v) = cfg_linenumber {
+        // CLI `-n`/`--no-line-number` already toggled opts.line_number; config is
+        // the default, so only apply it if no CLI flag changed it. We approximate
+        // by treating any CLI `-n` as overriding (git: linenum set by config, then
+        // OPT_NEGBIT for -n overrides). Since opts.line_number starts false and CLI
+        // sets it, prefer config only when CLI left it default-false AND config true.
+        if !opts.line_number {
+            opts.line_number = v;
+        }
+    }
+    if let Some(v) = cfg_column {
+        if !opts.column {
+            opts.column = v;
+        }
+    }
+    if let Some(v) = cfg_fullname {
+        if !opts.full_name {
+            opts.full_name = v;
+        }
+    }
+
+    // Disambiguate remaining positionals into revs and pathspecs.
     if !saw_double_dash {
         let mut in_paths = false;
         for value in positionals {
@@ -209,27 +472,26 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             }
         }
     } else {
-        // With an explicit `--`, any positionals seen before it are revs.
         for value in positionals {
             opts.revs.push(value);
         }
     }
 
     let matcher = GrepMatcher::compile(&opts)?;
+    let expr = build_expr(&opts.tokens);
 
-    // The cwd-relative prefix limits and renders results in every mode (working
-    // tree, index, and tree-ish). Searching a tree-ish in a bare repository has
-    // no worktree, so derive it best-effort and fall back to an empty prefix.
     let worktree_root = match worktree_root_for_git_dir(git_dir) {
         Ok(root) if root.is_dir() => Some(root),
         _ => None,
     };
-    let pathspec = GrepPathspec::new(
-        worktree_root.as_deref(),
-        cwd,
-        opts.full_name,
-        &opts.pathspecs,
-    )?;
+    let pathspec = GrepPathspec::new(worktree_root.as_deref(), cwd, opts.full_name, &opts.pathspecs)?;
+
+    let plan = GrepPlan {
+        matcher: &matcher,
+        expr: expr.as_ref(),
+        opts: &opts,
+        pathspec: &pathspec,
+    };
 
     let mut any_match = false;
     let mut out = io::stdout();
@@ -244,9 +506,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                 format,
                 db,
             },
-            &matcher,
-            &opts,
-            &pathspec,
+            &plan,
             &mut out,
         )?;
     } else {
@@ -260,9 +520,7 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
                     tree_oid: &tree_oid,
                     rev,
                 },
-                &matcher,
-                &opts,
-                &pathspec,
+                &plan,
                 &mut out,
             )?;
             any_match = any_match || matched;
@@ -278,6 +536,142 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
     }
 }
 
+/// Bundle of the matcher + expression + options threaded through the source
+/// iterators (keeps function arities small).
+struct GrepPlan<'a> {
+    matcher: &'a GrepMatcher,
+    expr: Option<&'a Expr>,
+    opts: &'a GrepOptions,
+    pathspec: &'a GrepPathspec,
+}
+
+fn is_negative_number(value: &str) -> bool {
+    value.len() > 1 && value.starts_with('-') && value[1..].bytes().all(|b| b.is_ascii_digit())
+}
+
+fn parse_int_arg(value: &str, flag: &str) -> Result<i64> {
+    value.parse::<i64>().map_err(|_| {
+        eprintln!("fatal: invalid number for '{flag}': {value}");
+        GitError::Exit(128)
+    })
+}
+
+fn parse_context_arg(value: &str) -> Result<usize> {
+    let n: i64 = value.parse().map_err(|_| {
+        eprintln!("fatal: invalid context length argument: {value}");
+        GitError::Exit(128)
+    })?;
+    Ok(n.max(0) as usize)
+}
+
+/// Load patterns from a `-f` file (or `-f -` = stdin); each non-empty line is a
+/// separate `-e`-style pattern, joined into the OR-list. Empty lines are dropped.
+fn load_pattern_file(file: &str, opts: &mut GrepOptions) -> Result<()> {
+    let raw = if file == "-" {
+        let mut buf = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        buf
+    } else {
+        // git reads `-f` relative to the cwd.
+        match fs::read(file) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                eprintln!("fatal: cannot open '{file}'");
+                return Err(GitError::Exit(128));
+            }
+        }
+    };
+    for line in raw.split(|&b| b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        opts.push_pattern(String::from_utf8_lossy(line).into_owned());
+    }
+    Ok(())
+}
+
+/// Build the boolean expression tree from the token stream, or `None` when the
+/// patterns are a plain OR-list (no `--and`/`--or`/`--not`/`(`).
+fn build_expr(tokens: &[ExprToken]) -> Option<Expr> {
+    let has_boolean = tokens.iter().any(|t| {
+        matches!(
+            t,
+            ExprToken::And | ExprToken::Or | ExprToken::Not | ExprToken::Open | ExprToken::Close
+        )
+    });
+    if !has_boolean {
+        return None;
+    }
+    let mut parser = ExprParser { tokens, pos: 0 };
+    parser.parse_or()
+}
+
+struct ExprParser<'a> {
+    tokens: &'a [ExprToken],
+    pos: usize,
+}
+
+impl ExprParser<'_> {
+    fn peek(&self) -> Option<&ExprToken> {
+        self.tokens.get(self.pos)
+    }
+
+    fn parse_or(&mut self) -> Option<Expr> {
+        let mut left = self.parse_and()?;
+        while matches!(self.peek(), Some(ExprToken::Or)) {
+            self.pos += 1;
+            let right = self.parse_and()?;
+            left = Expr::Or(Box::new(left), Box::new(right));
+        }
+        Some(left)
+    }
+
+    fn parse_and(&mut self) -> Option<Expr> {
+        let mut left = self.parse_unary()?;
+        loop {
+            match self.peek() {
+                Some(ExprToken::And) => {
+                    self.pos += 1;
+                    let right = self.parse_unary()?;
+                    left = Expr::And(Box::new(left), Box::new(right));
+                }
+                // Implicit AND between adjacent atoms (git treats `-e A -e B` in
+                // expression context as A AND B once any boolean token appears).
+                Some(ExprToken::Pattern(_)) | Some(ExprToken::Not) | Some(ExprToken::Open) => {
+                    let right = self.parse_unary()?;
+                    left = Expr::And(Box::new(left), Box::new(right));
+                }
+                _ => break,
+            }
+        }
+        Some(left)
+    }
+
+    fn parse_unary(&mut self) -> Option<Expr> {
+        match self.peek() {
+            Some(ExprToken::Not) => {
+                self.pos += 1;
+                let inner = self.parse_unary()?;
+                Some(Expr::Not(Box::new(inner)))
+            }
+            Some(ExprToken::Open) => {
+                self.pos += 1;
+                let inner = self.parse_or()?;
+                if matches!(self.peek(), Some(ExprToken::Close)) {
+                    self.pos += 1;
+                }
+                Some(inner)
+            }
+            Some(ExprToken::Pattern(idx)) => {
+                let idx = *idx;
+                self.pos += 1;
+                Some(Expr::Atom(idx))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// Result of expanding a `-abc` short-flag bundle.
 enum ShortBundle {
     Handled,
@@ -285,26 +679,37 @@ enum ShortBundle {
 }
 
 /// Expands a bundle of single-character flags (e.g. `-iwn`). Stops and treats
-/// the remainder as a glued value for value-taking flags (`-e`).
-fn expand_short_flag_bundle(bundle: &str, opts: &mut GrepOptions) -> Result<ShortBundle> {
+/// the remainder as a glued value for value-taking flags (`-e`/`-f`).
+fn expand_short_flag_bundle(
+    bundle: &str,
+    opts: &mut GrepOptions,
+    cli_pattern_type: &mut Option<PatternTypeOption>,
+) -> Result<ShortBundle> {
     let chars: Vec<char> = bundle.chars().collect();
-    // chars[0] is '-'.
     let mut idx = 1;
     while idx < chars.len() {
         let ch = chars[idx];
         match ch {
             'e' => {
-                // The rest of the bundle is the pattern (e.g. `-ehello`).
                 let rest: String = chars[idx + 1..].iter().collect();
                 if rest.is_empty() {
                     grep_option_requires_value("-e")?;
                 }
-                opts.patterns.push(rest);
+                opts.push_pattern(rest);
                 return Ok(ShortBundle::Handled);
             }
-            'E' => opts.kind = PatternKind::Extended,
-            'G' => opts.kind = PatternKind::Basic,
-            'F' => opts.kind = PatternKind::Fixed,
+            'f' => {
+                let rest: String = chars[idx + 1..].iter().collect();
+                if rest.is_empty() {
+                    grep_option_requires_value("-f")?;
+                }
+                load_pattern_file(&rest, opts)?;
+                return Ok(ShortBundle::Handled);
+            }
+            'E' => *cli_pattern_type = Some(PatternTypeOption::Ere),
+            'G' => *cli_pattern_type = Some(PatternTypeOption::Bre),
+            'F' => *cli_pattern_type = Some(PatternTypeOption::Fixed),
+            'P' => *cli_pattern_type = Some(PatternTypeOption::Pcre),
             'i' => opts.ignore_case = true,
             'w' => opts.word = true,
             'x' => opts.line_regexp = true,
@@ -320,6 +725,9 @@ fn expand_short_flag_bundle(bundle: &str, opts: &mut GrepOptions) -> Result<Shor
             'a' => opts.text = true,
             'I' => opts.ignore_binary = true,
             'z' => opts.null_data = true,
+            'p' => opts.show_function = true,
+            'W' => opts.function_context = true,
+            'r' => opts.max_depth = Some(-1),
             other => return Ok(ShortBundle::Unknown(other.to_string())),
         }
         idx += 1;
@@ -355,44 +763,52 @@ struct GrepIndexSource<'a> {
 
 fn grep_index_source(
     source: GrepIndexSource<'_>,
-    matcher: &GrepMatcher,
-    opts: &GrepOptions,
-    pathspec: &GrepPathspec,
+    plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
         return Ok(false);
     };
     let mut any = false;
+    let mut printed_file = false;
     for entry in &index.entries {
-        // Skip the higher merge stages; grep reports each path once.
         if (entry.flags >> 12) & 0x3 != 0 {
             continue;
         }
         if entry.mode == 0o160000 {
-            // Gitlinks (submodules) carry no blob to search here.
             continue;
         }
         let path = &entry.path;
-        if !pathspec.matches(path) {
+        if !plan.pathspec.matches(path) {
             continue;
         }
-        let cached_object = if opts.cached {
-            Some(source.db.read_object(&entry.oid)?)
-        } else {
-            None
-        };
-        let content: Cow<'_, [u8]> = if let Some(object) = &cached_object {
-            Cow::Borrowed(&object.body)
+        if !plan.pathspec.within_max_depth(path, plan.opts.max_depth) {
+            continue;
+        }
+        // CE_VALID (assume-unchanged) and intent-to-add entries: for a working-tree
+        // search git falls back to the worktree file. When the worktree file is
+        // gone but the entry has CE_VALID, git uses the cached blob.
+        let content: Cow<'_, [u8]> = if plan.opts.cached {
+            let object = source.db.read_object(&entry.oid)?;
+            Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(path));
             match fs::read(&absolute) {
                 Ok(bytes) => Cow::Owned(bytes),
-                Err(_) => continue,
+                Err(_) => {
+                    // CE_VALID (assume-unchanged) falls back to the indexed blob
+                    // when the worktree file is gone.
+                    if (entry.flags & 0x8000) != 0 {
+                        let object = source.db.read_object(&entry.oid)?;
+                        Cow::Owned(object.body.to_vec())
+                    } else {
+                        continue;
+                    }
+                }
             }
         };
-        let display = pathspec.display(path);
-        let matched = grep_buffer(&content, &display, None, matcher, opts, out)?;
+        let display = plan.pathspec.display(path);
+        let matched = grep_buffer(&content, &display, None, plan, out, &mut printed_file)?;
         any = any || matched;
     }
     Ok(any)
@@ -408,9 +824,7 @@ struct GrepTreeSource<'a> {
 
 fn grep_tree_source(
     source: GrepTreeSource<'_>,
-    matcher: &GrepMatcher,
-    opts: &GrepOptions,
-    pathspec: &GrepPathspec,
+    plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
     let mut entries: Vec<(Vec<u8>, ObjectId)> = Vec::new();
@@ -422,21 +836,23 @@ fn grep_tree_source(
         &mut entries,
     )?;
     let mut any = false;
+    let mut printed_file = false;
     for (path, oid) in entries {
-        if !pathspec.matches(&path) {
+        if !plan.pathspec.matches(&path) {
             continue;
         }
-        let display = pathspec.display(&path);
+        if !plan.pathspec.within_max_depth(&path, plan.opts.max_depth) {
+            continue;
+        }
+        let display = plan.pathspec.display(&path);
         let object = source.db.read_object(&oid)?;
         let content = &object.body;
-        let matched = grep_buffer(content, &display, Some(source.rev), matcher, opts, out)?;
+        let matched = grep_buffer(content, &display, Some(source.rev), plan, out, &mut printed_file)?;
         any = any || matched;
     }
     Ok(any)
 }
 
-/// Recursively gathers `(full_path, blob_oid)` pairs from a tree, in the same
-/// lexical order Git emits (tree entries are already sorted by name).
 fn collect_tree_blobs(
     db: &FileObjectDatabase,
     format: ObjectFormat,
@@ -474,49 +890,67 @@ fn collect_tree_blobs(
 // Per-file matching and output
 // ---------------------------------------------------------------------------
 
-/// Searches one file's `content`, writing matching output for `display_path`.
-/// `rev` carries the `<rev>:` prefix when searching a tree-ish. Returns whether
-/// the file produced a match.
+/// One matched line plus its column (1-based byte column of the leftmost match,
+/// or 0 when no positive leaf matched — e.g. an inverted/NOT result).
+struct LineHit {
+    line_no: usize,
+    column: usize,
+}
+
 fn grep_buffer(
     content: &[u8],
     display_path: &[u8],
     rev: Option<&str>,
-    matcher: &GrepMatcher,
-    opts: &GrepOptions,
+    plan: &GrepPlan<'_>,
     out: &mut impl Write,
+    printed_file: &mut bool,
 ) -> Result<bool> {
+    let opts = plan.opts;
     let is_binary = !opts.text && buffer_is_binary(content);
     if is_binary && opts.ignore_binary {
         return Ok(false);
     }
 
-    let show_filename = opts.show_filename.unwrap_or(true);
-    // Under `-z`, the *field* separator (after the path / line number) becomes a
-    // NUL, but matched lines are still terminated by `\n`. The `-l`/`-L` file
-    // lists, by contrast, terminate each path with NUL.
-    let field_sep: &[u8] = if opts.null_data { b"\0" } else { b":" };
-    let list_term = if opts.null_data { b'\0' } else { b'\n' };
+    let lines: Vec<&[u8]> = split_lines(content, b'\n').collect();
 
-    // Input is always split into lines on '\n'.
-    let mut match_count = 0usize;
-    let mut matched_lines: Vec<(usize, &[u8])> = Vec::new();
-    for (line_index, line) in split_lines(content, b'\n').enumerate() {
-        if matcher.line_matches(line) != opts.invert {
-            match_count += 1;
-            matched_lines.push((line_index + 1, line));
+    // Evaluate each line: matched? and at what column.
+    let mut hits: Vec<LineHit> = Vec::new();
+    let max = opts.max_count.unwrap_or(-1);
+    for (i, line) in lines.iter().enumerate() {
+        // max_count 0 => never match (and exit non-zero); negative => no limit.
+        if max == 0 {
+            break;
+        }
+        let (matched, column) = eval_line(plan, line);
+        if matched != opts.invert {
+            // Inverted matches always report column 1 (no positive leaf).
+            let column = if opts.invert { 0 } else { column };
+            hits.push(LineHit {
+                line_no: i + 1,
+                column,
+            });
+            if max > 0 && hits.len() as i64 >= max {
+                break;
+            }
         }
     }
-    let any = match_count > 0;
+    let any = !hits.is_empty();
 
     if opts.name_only_quiet {
-        // -q: no output; caller uses the boolean for the exit status.
         return Ok(any);
     }
 
+    let show_filename = opts.show_filename.unwrap_or(true);
+    let field_sep: &[u8] = if opts.null_data { b"\0" } else { b":" };
+    let list_term = if opts.null_data { b'\0' } else { b'\n' };
+
     if opts.count {
         if any {
-            write_line_prefix(out, rev, display_path, show_filename, field_sep)?;
-            out.write_all(match_count.to_string().as_bytes())?;
+            write_path_prefix(out, rev, display_path, show_filename, opts.null_data)?;
+            if show_filename {
+                out.write_all(field_sep)?;
+            }
+            out.write_all(hits.len().to_string().as_bytes())?;
             out.write_all(b"\n")?;
         }
         return Ok(any);
@@ -524,14 +958,14 @@ fn grep_buffer(
 
     if opts.files_with_matches {
         if any {
-            write_path_line(out, rev, display_path, list_term)?;
+            write_path_line(out, rev, display_path, list_term, opts.null_data)?;
         }
         return Ok(any);
     }
 
     if opts.files_without_match {
         if !any {
-            write_path_line(out, rev, display_path, list_term)?;
+            write_path_line(out, rev, display_path, list_term, opts.null_data)?;
         }
         return Ok(any);
     }
@@ -540,7 +974,6 @@ fn grep_buffer(
         return Ok(false);
     }
 
-    // A binary file with matches reports a single summary line (unless -a).
     if is_binary {
         out.write_all(b"Binary file ")?;
         if let Some(rev) = rev {
@@ -552,65 +985,341 @@ fn grep_buffer(
         return Ok(true);
     }
 
-    for (line_no, line) in matched_lines {
-        if opts.only_matching {
-            for span in matcher.match_spans(line) {
-                write_line_prefix(out, rev, display_path, show_filename, field_sep)?;
+    if opts.only_matching {
+        for hit in &hits {
+            let line = lines[hit.line_no - 1];
+            for span in plan.matcher.match_spans_expr(plan.expr, line) {
+                write_match_prefix(out, rev, display_path, show_filename, field_sep)?;
                 if opts.line_number {
-                    out.write_all(line_no.to_string().as_bytes())?;
+                    out.write_all(hit.line_no.to_string().as_bytes())?;
                     out.write_all(field_sep)?;
                 }
                 out.write_all(&line[span.0..span.1])?;
                 out.write_all(b"\n")?;
             }
-            continue;
         }
-        write_line_prefix(out, rev, display_path, show_filename, field_sep)?;
-        if opts.line_number {
-            out.write_all(line_no.to_string().as_bytes())?;
-            out.write_all(field_sep)?;
-        }
-        out.write_all(line)?;
-        out.write_all(b"\n")?;
+        return Ok(true);
     }
+
+    // Determine the set of lines to print, including context and function context.
+    let to_print = compute_output_lines(&lines, &hits, opts);
+    emit_lines(
+        out,
+        &lines,
+        &to_print,
+        &hits,
+        rev,
+        display_path,
+        show_filename,
+        field_sep,
+        opts,
+        printed_file,
+    )?;
     Ok(true)
 }
 
-/// Writes the `<rev>:<path><sep>` (or `<path><sep>`) prefix that precedes a
-/// matched line or count, where `<sep>` is the field separator (`:` normally,
-/// NUL under `-z`). A rev is always joined with `:` (matching Git). With `-h`
-/// and no rev, nothing is written.
-fn write_line_prefix(
+/// Evaluate whether a line matches; return (matched, leftmost-1-based-column).
+fn eval_line(plan: &GrepPlan<'_>, line: &[u8]) -> (bool, usize) {
+    match plan.expr {
+        Some(expr) => {
+            let mut col: Option<usize> = None;
+            let matched = eval_expr(plan.matcher, expr, line, false, &mut col);
+            (matched, col.map(|c| c + 1).unwrap_or(0))
+        }
+        None => {
+            // Plain OR-list: matched if any pattern matches; column = leftmost.
+            let mut col: Option<usize> = None;
+            let mut matched = false;
+            for idx in 0..plan.matcher.patterns.len() {
+                if let Some((s, _)) = plan.matcher.find_idx(idx, line, 0) {
+                    matched = true;
+                    col = Some(col.map_or(s, |c: usize| c.min(s)));
+                    if !plan.opts.column {
+                        break;
+                    }
+                }
+            }
+            (matched, col.map(|c| c + 1).unwrap_or(0))
+        }
+    }
+}
+
+/// Evaluate a boolean expression; track the leftmost positive-leaf match column
+/// in `col`. `negated` flips leaf truth (a NOT toggles it on the way down); a
+/// negated leaf does not contribute to `col` (git swaps col/icol under NOT).
+fn eval_expr(
+    matcher: &GrepMatcher,
+    expr: &Expr,
+    line: &[u8],
+    negated: bool,
+    col: &mut Option<usize>,
+) -> bool {
+    match expr {
+        Expr::Atom(idx) => {
+            let found = matcher.find_idx(*idx, line, 0);
+            let hit = found.is_some();
+            if !negated {
+                if let Some((s, _)) = found {
+                    *col = Some(col.map_or(s, |c| c.min(s)));
+                }
+            }
+            if negated { !hit } else { hit }
+        }
+        Expr::Not(inner) => eval_expr(matcher, inner, line, !negated, col),
+        Expr::And(l, r) => {
+            // git does not short-circuit AND under --column. Evaluate both.
+            let lh = eval_expr(matcher, l, line, negated, col);
+            let rh = eval_expr(matcher, r, line, negated, col);
+            if negated { lh || rh } else { lh && rh }
+        }
+        Expr::Or(l, r) => {
+            let lh = eval_expr(matcher, l, line, negated, col);
+            let rh = eval_expr(matcher, r, line, negated, col);
+            if negated { lh && rh } else { lh || rh }
+        }
+    }
+}
+
+/// Bit flags for which lines to print and how.
+#[derive(Clone, Copy, Default)]
+struct LineFlag {
+    selected: bool, // matched line (prints with `:`)
+    context: bool,  // context line (prints with `-`)
+    function: bool, // function header line (prints with `=`)
+}
+
+/// Compute, for each input line, whether it is selected/context/function.
+fn compute_output_lines(
+    lines: &[&[u8]],
+    hits: &[LineHit],
+    opts: &GrepOptions,
+) -> Vec<LineFlag> {
+    let mut flags = vec![LineFlag::default(); lines.len()];
+    for hit in hits {
+        flags[hit.line_no - 1].selected = true;
+    }
+    // -A/-B/-C context.
+    if opts.before_context > 0 || opts.after_context > 0 {
+        for hit in hits {
+            let center = hit.line_no - 1;
+            let start = center.saturating_sub(opts.before_context);
+            let end = (center + opts.after_context).min(lines.len() - 1);
+            for line in flags.iter_mut().take(end + 1).skip(start) {
+                if !line.selected {
+                    line.context = true;
+                }
+            }
+        }
+    }
+    // -W function context: extend each match to its whole function body and add
+    // the function header line marked with `=`.
+    if opts.function_context {
+        for hit in hits {
+            let center = hit.line_no - 1;
+            let (header, end) = function_bounds(lines, center);
+            for (i, line) in flags.iter_mut().enumerate().take(end + 1) {
+                if i >= header && i <= end && !line.selected {
+                    line.context = true;
+                }
+            }
+            if header < center && !flags[header].selected {
+                flags[header].context = false;
+                flags[header].function = true;
+            }
+        }
+    } else if opts.show_function {
+        // -p: prepend the enclosing function header (a `=` line) per hunk.
+        for hit in hits {
+            let center = hit.line_no - 1;
+            if let Some(header) = enclosing_function(lines, center) {
+                if !flags[header].selected {
+                    flags[header].function = true;
+                }
+            }
+        }
+    }
+    flags
+}
+
+/// A line is a "function" header if it starts at column 0 with a non-space,
+/// non-comment, non-closing-brace character (git's default `match_funcname`).
+fn is_funcline(line: &[u8]) -> bool {
+    match line.first() {
+        None => false,
+        Some(&b) => !(b == b' ' || b == b'\t' || b == b'}' || b == b'\n' || b == b'\r'),
+    }
+}
+
+/// Find the function header line at or above `from`.
+fn enclosing_function(lines: &[&[u8]], from: usize) -> Option<usize> {
+    (0..=from).rev().find(|&i| is_funcline(lines[i]))
+}
+
+/// For -W: return (function_header_line, last_line_of_function) bracketing `from`.
+fn function_bounds(lines: &[&[u8]], from: usize) -> (usize, usize) {
+    let header = enclosing_function(lines, from).unwrap_or(from);
+    // The function ends just before the next function header, trimming trailing
+    // blank lines.
+    let mut end = lines.len() - 1;
+    for i in (header + 1)..lines.len() {
+        if is_funcline(lines[i]) {
+            end = i - 1;
+            break;
+        }
+    }
+    while end > header && lines[end].iter().all(|&b| b == b' ' || b == b'\t') && lines[end].is_empty()
+    {
+        end -= 1;
+    }
+    // Trim trailing empty lines.
+    while end > from && lines[end].is_empty() {
+        end -= 1;
+    }
+    (header, end)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lines(
     out: &mut impl Write,
+    lines: &[&[u8]],
+    flags: &[LineFlag],
+    hits: &[LineHit],
     rev: Option<&str>,
     display_path: &[u8],
     show_filename: bool,
     field_sep: &[u8],
+    opts: &GrepOptions,
+    printed_file: &mut bool,
+) -> Result<()> {
+    // Column lookup per selected line.
+    let col_of = |line_no: usize| -> usize {
+        hits.iter()
+            .find(|h| h.line_no == line_no)
+            .map(|h| h.column)
+            .unwrap_or(0)
+    };
+
+    let has_context = opts.before_context > 0
+        || opts.after_context > 0
+        || opts.function_context;
+
+    let mut last_printed: Option<usize> = None;
+    for (i, flag) in flags.iter().enumerate() {
+        if !(flag.selected || flag.context || flag.function) {
+            continue;
+        }
+        // Hunk separator `--` between non-adjacent printed groups (only with
+        // context, matching git).
+        if has_context {
+            if let Some(prev) = last_printed {
+                if i > prev + 1 {
+                    if *printed_file {
+                        // Between files git also prints `--`; handled by the gap too.
+                    }
+                    out.write_all(b"--\n")?;
+                }
+            } else if *printed_file {
+                out.write_all(b"--\n")?;
+            }
+        }
+        let sep: &[u8] = if flag.selected {
+            field_sep
+        } else if flag.function {
+            b"="
+        } else {
+            b"-"
+        };
+        write_match_prefix_sep(out, rev, display_path, show_filename, sep)?;
+        if opts.line_number {
+            out.write_all((i + 1).to_string().as_bytes())?;
+            out.write_all(sep)?;
+        }
+        if opts.column && flag.selected {
+            let c = col_of(i + 1);
+            out.write_all(c.to_string().as_bytes())?;
+            out.write_all(field_sep)?;
+        }
+        out.write_all(lines[i])?;
+        out.write_all(b"\n")?;
+        last_printed = Some(i);
+    }
+    *printed_file = true;
+    Ok(())
+}
+
+/// Writes the `<rev>:<path>` (quoted) prefix without a trailing field separator.
+fn write_path_prefix(
+    out: &mut impl Write,
+    rev: Option<&str>,
+    display_path: &[u8],
+    show_filename: bool,
+    raw: bool,
 ) -> Result<()> {
     if let Some(rev) = rev {
         out.write_all(rev.as_bytes())?;
         out.write_all(b":")?;
     }
     if show_filename || rev.is_some() {
-        out.write_all(display_path)?;
-        out.write_all(field_sep)?;
+        write_quoted_path(out, display_path, raw)?;
     }
     Ok(())
 }
 
-/// Writes a bare `<rev>:<path>` or `<path>` line (for `-l`/`-L`).
-fn write_path_line(
+/// Writes the `<rev>:<path><sep>` prefix for a matched/context line.
+fn write_match_prefix(
     out: &mut impl Write,
     rev: Option<&str>,
     display_path: &[u8],
-    line_sep: u8,
+    show_filename: bool,
+    field_sep: &[u8],
+) -> Result<()> {
+    write_match_prefix_sep(out, rev, display_path, show_filename, field_sep)
+}
+
+fn write_match_prefix_sep(
+    out: &mut impl Write,
+    rev: Option<&str>,
+    display_path: &[u8],
+    show_filename: bool,
+    sep: &[u8],
 ) -> Result<()> {
     if let Some(rev) = rev {
         out.write_all(rev.as_bytes())?;
         out.write_all(b":")?;
     }
-    out.write_all(display_path)?;
+    if show_filename || rev.is_some() {
+        // The path field is quoted; the `-z` (null) form writes raw bytes.
+        let raw = sep == b"\0";
+        write_quoted_path(out, display_path, raw)?;
+        out.write_all(sep)?;
+    }
+    Ok(())
+}
+
+/// Writes a bare `<rev>:<path>` line (for `-l`/`-L`), quoted unless `-z`.
+fn write_path_line(
+    out: &mut impl Write,
+    rev: Option<&str>,
+    display_path: &[u8],
+    line_sep: u8,
+    raw: bool,
+) -> Result<()> {
+    if let Some(rev) = rev {
+        out.write_all(rev.as_bytes())?;
+        out.write_all(b":")?;
+    }
+    write_quoted_path(out, display_path, raw)?;
     out.write_all(&[line_sep])?;
+    Ok(())
+}
+
+/// Writes a path, C-style quoted (git's `quote_path`) unless `raw` (`-z`).
+fn write_quoted_path(out: &mut impl Write, path: &[u8], raw: bool) -> Result<()> {
+    if raw {
+        out.write_all(path)?;
+    } else {
+        out.write_all(status_quote_path(path, false).as_bytes())?;
+    }
     Ok(())
 }
 
@@ -622,7 +1331,6 @@ fn split_lines(content: &[u8], sep: u8) -> impl Iterator<Item = &[u8]> {
     } else {
         content
     };
-    // For an empty file there are no lines at all.
     SplitLines {
         rest: trimmed,
         sep,
@@ -685,16 +1393,15 @@ fn bytes_to_path(bytes: &[u8]) -> PathBuf {
 // Pathspec limiting (with cwd-relative display)
 // ---------------------------------------------------------------------------
 
-/// A single pathspec entry, holding its normalised (repo-root-relative) form.
 struct GrepPathFilter {
     original: String,
     normalized: Vec<u8>,
+    /// Whether this pathspec is a bare directory-restricting spec (used by
+    /// `--max-depth`, where depth is measured relative to the spec's directory).
+    is_dir_spec: bool,
     matched: Cell<bool>,
 }
 
-/// Pathspec set plus the cwd prefix used to limit and display matches, mirroring
-/// `git grep`'s behaviour of scoping a working-tree/index search to the current
-/// directory and printing paths relative to it (unless `--full-name`).
 struct GrepPathspec {
     prefix: Vec<u8>,
     cwd_depth: usize,
@@ -709,7 +1416,6 @@ impl GrepPathspec {
         full_name: bool,
         pathspecs: &[String],
     ) -> Result<Self> {
-        // The cwd prefix only applies when there is a worktree to be relative to.
         let prefix = if let Some(root) = worktree_root {
             let root = fs::canonicalize(root)?;
             let cwd = fs::canonicalize(cwd)?;
@@ -727,9 +1433,11 @@ impl GrepPathspec {
         let mut filters = Vec::new();
         for spec in pathspecs {
             let normalized = normalize_grep_pathspec(&prefix, spec)?;
+            let is_dir_spec = !spec.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
             filters.push(GrepPathFilter {
                 original: spec.clone(),
                 normalized,
+                is_dir_spec,
                 matched: Cell::new(false),
             });
         }
@@ -741,13 +1449,6 @@ impl GrepPathspec {
         })
     }
 
-    /// Whether `path` (repo-root-relative) is in scope.
-    ///
-    /// With explicit pathspecs the scope is exactly their union (each already
-    /// resolved relative to the cwd, so `../a.txt` reaches outside the cwd).
-    /// Without any pathspec the cwd acts as an implicit one, limiting the search
-    /// to files at or below the current directory — `--full-name` changes only
-    /// the displayed path, never this scope.
     fn matches(&self, path: &[u8]) -> bool {
         if self.filters.is_empty() {
             return self.prefix.is_empty() || path_under_prefix(path, &self.prefix);
@@ -762,8 +1463,54 @@ impl GrepPathspec {
         matched
     }
 
-    /// Renders `path` for output: repo-root-relative under `--full-name`,
-    /// otherwise relative to the current directory.
+    /// `--max-depth N`: limit the search to files at most N directory levels below
+    /// the base of each pathspec (or the cwd prefix when no pathspec). N<0 = no
+    /// limit. A glob pathspec disables the depth limit for the files it matches.
+    fn within_max_depth(&self, path: &[u8], max_depth: Option<i64>) -> bool {
+        let Some(max) = max_depth else { return true };
+        if max < 0 {
+            return true;
+        }
+        let max = max as usize;
+        if self.filters.is_empty() {
+            // Base is the cwd prefix.
+            let rest = if self.prefix.is_empty() {
+                path
+            } else {
+                match strip_dir_prefix(path, &self.prefix) {
+                    Some(r) => r,
+                    None => return true,
+                }
+            };
+            return slash_count(rest) <= max;
+        }
+        // For each matching filter, measure depth relative to that filter's base.
+        for filter in &self.filters {
+            if !grep_pathspec_match(&filter.normalized, path) {
+                continue;
+            }
+            if !filter.is_dir_spec {
+                // Glob pathspec: no depth limit.
+                return true;
+            }
+            let base = &filter.normalized;
+            let rest = if base.is_empty() {
+                path
+            } else if path == base.as_slice() {
+                return true;
+            } else {
+                match strip_dir_prefix(path, base) {
+                    Some(r) => r,
+                    None => continue,
+                }
+            };
+            if slash_count(rest) <= max {
+                return true;
+            }
+        }
+        false
+    }
+
     fn display(&self, path: &[u8]) -> Vec<u8> {
         if self.full_name || self.prefix.is_empty() {
             return path.to_vec();
@@ -798,12 +1545,14 @@ impl GrepPathspec {
     }
 }
 
-/// True if `path` equals `prefix` (a directory) or lives beneath it.
+fn slash_count(path: &[u8]) -> usize {
+    path.iter().filter(|&&b| b == b'/').count()
+}
+
 fn path_under_prefix(path: &[u8], prefix: &[u8]) -> bool {
     strip_dir_prefix(path, prefix).is_some()
 }
 
-/// Strips a leading `prefix/` from `path`, returning the remainder (non-empty).
 fn strip_dir_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if prefix.is_empty() {
         return Some(path);
@@ -813,7 +1562,6 @@ fn strip_dir_prefix<'a>(path: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     if rest.is_empty() { None } else { Some(rest) }
 }
 
-/// Resolves a CLI pathspec against the cwd `prefix`, collapsing `.`/`..`.
 fn normalize_grep_pathspec(prefix: &[u8], arg: &str) -> Result<Vec<u8>> {
     let mut components: Vec<Vec<u8>> = prefix
         .split(|byte| *byte == b'/')
@@ -841,8 +1589,6 @@ fn normalize_grep_pathspec(prefix: &[u8], arg: &str) -> Result<Vec<u8>> {
     Ok(components.join(&b'/'))
 }
 
-/// Git pathspec matching: exact path, directory prefix, or fnmatch glob (where
-/// `*`/`?` may cross `/`, matching Git's wildmatch without `WM_PATHNAME`).
 fn grep_pathspec_match(spec: &[u8], path: &[u8]) -> bool {
     if spec.is_empty() {
         return true;
@@ -850,7 +1596,6 @@ fn grep_pathspec_match(spec: &[u8], path: &[u8]) -> bool {
     if path == spec {
         return true;
     }
-    // Directory prefix: `dir` matches `dir/...`.
     if let Some(rest) = path.strip_prefix(spec)
         && rest.first() == Some(&b'/')
     {
@@ -862,7 +1607,6 @@ fn grep_pathspec_match(spec: &[u8], path: &[u8]) -> bool {
     false
 }
 
-/// fnmatch-style glob where `*` and `?` match any byte including `/`.
 fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
     fn rec(pattern: &[u8], text: &[u8]) -> bool {
         let mut pi = 0;
@@ -870,7 +1614,6 @@ fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
         while pi < pattern.len() {
             match pattern[pi] {
                 b'*' => {
-                    // Collapse consecutive stars.
                     while pi < pattern.len() && pattern[pi] == b'*' {
                         pi += 1;
                     }
@@ -906,7 +1649,6 @@ fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
                         }
                         BracketOutcome::NoMatch => return false,
                         BracketOutcome::Malformed => {
-                            // Treat `[` literally when the class is malformed.
                             if text[ti] != b'[' {
                                 return false;
                             }
@@ -936,19 +1678,12 @@ fn wildmatch(pattern: &[u8], text: &[u8]) -> bool {
     rec(pattern, text)
 }
 
-/// Outcome of matching a glob bracket expression against one byte.
 enum BracketOutcome {
-    /// The byte matched; the class consumed `usize` pattern bytes.
     Match(usize),
-    /// The byte did not match the (well-formed) class.
     NoMatch,
-    /// The `[` opened no valid class; the caller should treat it literally.
     Malformed,
 }
 
-/// Matches `ch` against a bracket expression at the start of `pattern`
-/// (`pattern[0] == '['`), reporting both the outcome and how many pattern bytes
-/// the class spans (through the closing `]`).
 fn match_bracket(pattern: &[u8], ch: u8) -> BracketOutcome {
     let mut i = 1;
     let negate = matches!(pattern.get(i), Some(b'!') | Some(b'^'));
@@ -968,7 +1703,6 @@ fn match_bracket(pattern: &[u8], ch: u8) -> BracketOutcome {
             };
         }
         first = false;
-        // Range `a-b` (but a trailing `-` before `]` is a literal).
         if i + 2 < pattern.len() && pattern[i + 1] == b'-' && pattern[i + 2] != b']' {
             let lo = c;
             let hi = pattern[i + 2];
@@ -990,8 +1724,6 @@ fn match_bracket(pattern: &[u8], ch: u8) -> BracketOutcome {
 // Regular-expression engine (POSIX BRE/ERE subset) + fixed strings
 // ---------------------------------------------------------------------------
 
-/// A compiled set of patterns (OR-combined, as `git grep` does for multiple
-/// `-e`). A line matches if any sub-pattern matches.
 struct GrepMatcher {
     patterns: Vec<CompiledPattern>,
     line_regexp: bool,
@@ -1025,20 +1757,35 @@ impl GrepMatcher {
         })
     }
 
-    fn line_matches(&self, line: &[u8]) -> bool {
-        self.patterns
-            .iter()
-            .any(|p| p.matches_line(line, self.line_regexp))
+    /// Find the leftmost match of pattern `idx` starting at `from`.
+    fn find_idx(&self, idx: usize, line: &[u8], from: usize) -> Option<(usize, usize)> {
+        let pattern = &self.patterns[idx];
+        if self.line_regexp {
+            if pattern.matches_line(line, true) && from == 0 {
+                return Some((0, line.len()));
+            }
+            return None;
+        }
+        pattern.find_from(line, from)
     }
 
-    /// Byte spans of (non-overlapping, left-most) matches on `line`, used by `-o`.
-    fn match_spans(&self, line: &[u8]) -> Vec<(usize, usize)> {
+    /// Byte spans of (non-overlapping, left-most) matches on `line`, for `-o`.
+    /// In expression mode, scans only the positive (atom) patterns.
+    fn match_spans_expr(&self, expr: Option<&Expr>, line: &[u8]) -> Vec<(usize, usize)> {
+        let indices: Vec<usize> = match expr {
+            Some(e) => {
+                let mut v = Vec::new();
+                collect_positive_atoms(e, false, &mut v);
+                v
+            }
+            None => (0..self.patterns.len()).collect(),
+        };
         let mut spans = Vec::new();
         let mut start = 0;
         while start <= line.len() {
             let mut best: Option<(usize, usize)> = None;
-            for pattern in &self.patterns {
-                if let Some((s, e)) = pattern.find_from(line, start) {
+            for &idx in &indices {
+                if let Some((s, e)) = self.find_idx(idx, line, start) {
                     best = match best {
                         Some((bs, _)) if bs <= s => best,
                         _ => Some((s, e)),
@@ -1054,6 +1801,21 @@ impl GrepMatcher {
             }
         }
         spans
+    }
+}
+
+fn collect_positive_atoms(expr: &Expr, negated: bool, out: &mut Vec<usize>) {
+    match expr {
+        Expr::Atom(idx) => {
+            if !negated {
+                out.push(*idx);
+            }
+        }
+        Expr::Not(inner) => collect_positive_atoms(inner, !negated, out),
+        Expr::And(l, r) | Expr::Or(l, r) => {
+            collect_positive_atoms(l, negated, out);
+            collect_positive_atoms(r, negated, out);
+        }
     }
 }
 
@@ -1130,37 +1892,24 @@ fn find_substring(haystack: &[u8], needle: &[u8], ignore_case: bool, from: usize
 
 // --- Regex AST -------------------------------------------------------------
 
-/// A node in the parsed regex tree.
 #[derive(Debug, Clone)]
 enum Node {
-    /// Match a single literal byte.
     Literal(u8),
-    /// `.` — any byte (newlines never occur inside a single line).
     AnyChar,
-    /// A bracket expression `[...]`.
     Class { negate: bool, items: Vec<ClassItem> },
-    /// Start anchor `^`.
     StartAnchor,
-    /// End anchor `$`.
     EndAnchor,
-    /// Word boundary (`\b`).
     WordBoundary,
-    /// Non-word-boundary (`\B`).
     NonWordBoundary,
-    /// Concatenation of nodes.
     Concat(Vec<Node>),
-    /// Alternation of branches.
     Alt(Vec<Node>),
-    /// Repetition with a min and optional max (None = unbounded).
     Repeat {
         node: Box<Node>,
         min: usize,
         max: Option<usize>,
         greedy: bool,
     },
-    /// A grouped sub-expression.
     Group(Box<Node>),
-    /// Matches the empty string.
     Empty,
 }
 
@@ -1187,7 +1936,6 @@ enum PosixClass {
     Graph,
 }
 
-/// A compiled regex: its root node plus matching flags.
 struct Regex {
     root: Node,
     ignore_case: bool,
@@ -1208,7 +1956,6 @@ impl Regex {
             )));
         }
         if word {
-            // Wrap as \b(...)\b.
             root = Node::Concat(vec![
                 Node::WordBoundary,
                 Node::Group(Box::new(root)),
@@ -1228,12 +1975,10 @@ impl Regex {
     }
 
     fn matches_whole(&self, text: &[u8]) -> bool {
-        // -x: the pattern must match the entire line.
         match_anchored_full(&self.root, text, self.ignore_case)
     }
 }
 
-/// Recursive-descent parser for the BRE/ERE subset.
 struct RegexParser<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -1292,7 +2037,6 @@ impl RegexParser<'_> {
             if self.at_alternation() || self.at_group_close() {
                 break;
             }
-            // `$` is an end anchor only at the end of the pattern / branch.
             if byte == b'$' && self.is_end_anchor_position() {
                 self.pos += 1;
                 nodes.push(Node::EndAnchor);
@@ -1311,7 +2055,6 @@ impl RegexParser<'_> {
         }
     }
 
-    /// `$` anchors at end-of-pattern, before `|`, or before a closing group.
     fn is_end_anchor_position(&self) -> bool {
         let next = self.pos + 1;
         if next >= self.bytes.len() {
@@ -1357,23 +2100,18 @@ impl RegexParser<'_> {
     }
 
     fn parse_escape(&mut self) -> Result<Node> {
-        // self.bytes[self.pos] == '\\'
         let Some(next) = self.bytes.get(self.pos + 1).copied() else {
-            // Trailing backslash: treat as literal backslash.
             self.pos += 1;
             return Ok(Node::Literal(b'\\'));
         };
-        if !self.extended {
-            // BRE: `\(`, `\)`, `\|` handled elsewhere; `\{` is a quantifier.
-            if next == b'(' {
-                self.pos += 2;
-                let inner = self.parse_alternation()?;
-                if !self.at_group_close() {
-                    return Err(GitError::Command("unbalanced \\( in regex".into()));
-                }
-                self.pos += 2; // consume `\)`
-                return Ok(Node::Group(Box::new(inner)));
+        if !self.extended && next == b'(' {
+            self.pos += 2;
+            let inner = self.parse_alternation()?;
+            if !self.at_group_close() {
+                return Err(GitError::Command("unbalanced \\( in regex".into()));
             }
+            self.pos += 2;
+            return Ok(Node::Group(Box::new(inner)));
         }
         match next {
             b'b' => {
@@ -1428,7 +2166,6 @@ impl RegexParser<'_> {
     }
 
     fn parse_class(&mut self) -> Result<Node> {
-        // self.bytes[self.pos] == '['
         let start = self.pos;
         self.pos += 1;
         let negate = matches!(self.peek(), Some(b'^'));
@@ -1439,7 +2176,6 @@ impl RegexParser<'_> {
         let mut first = true;
         loop {
             let Some(byte) = self.peek() else {
-                // Unterminated class: rewind and treat `[` as a literal.
                 self.pos = start + 1;
                 return Ok(Node::Literal(b'['));
             };
@@ -1455,7 +2191,6 @@ impl RegexParser<'_> {
                 items.push(ClassItem::Posix(class));
                 continue;
             }
-            // Range?
             let lo = byte;
             if self.bytes.get(self.pos + 1) == Some(&b'-')
                 && self.bytes.get(self.pos + 2).is_some_and(|c| *c != b']')
@@ -1472,7 +2207,6 @@ impl RegexParser<'_> {
     }
 
     fn parse_posix_class(&mut self) -> Result<Option<PosixClass>> {
-        // self.bytes[self.pos..] starts with "[:"
         let rest = &self.bytes[self.pos + 2..];
         let Some(end) = find_seq(rest, b":]") else {
             return Ok(None);
@@ -1498,7 +2232,6 @@ impl RegexParser<'_> {
     }
 
     fn parse_quantifier(&mut self, atom: Node) -> Result<Node> {
-        // Anchors and boundaries cannot be quantified meaningfully; pass through.
         let Some(byte) = self.peek() else {
             return Ok(atom);
         };
@@ -1533,8 +2266,6 @@ impl RegexParser<'_> {
         })
     }
 
-    /// Parses a `{m}`, `{m,}`, or `{m,n}` bound starting at `start`. For BRE the
-    /// terminator is `\}`. Returns `(min, max, end_index_after_close)`.
     fn parse_bound(
         &self,
         start: usize,
@@ -1572,7 +2303,6 @@ impl RegexParser<'_> {
                 Some(parse_usize(&max_digits)?)
             };
         }
-        // Expect the closing brace.
         if bre {
             if self.bytes.get(i) == Some(&b'\\') && self.bytes.get(i + 1) == Some(&b'}') {
                 return Ok(Some((min, max, i + 2)));
@@ -1600,9 +2330,6 @@ fn parse_usize(digits: &[u8]) -> Result<usize> {
 
 // --- Regex matcher ---------------------------------------------------------
 
-/// Attempts to match `node` at `pos` in `text`, returning the end offset of the
-/// shortest/greedy match continuation. This is a backtracking matcher using an
-/// explicit continuation closure for sequencing.
 fn match_node(root: &Node, text: &[u8], pos: usize, ignore_case: bool) -> Option<usize> {
     match_seq(root, text, pos, ignore_case, &|p| Some(p))
 }
@@ -1614,8 +2341,6 @@ fn match_anchored_full(root: &Node, text: &[u8], ignore_case: bool) -> bool {
     .is_some()
 }
 
-/// Matches `node` at `pos`, then calls `cont` with the position after the match.
-/// Returns the first end position for which the whole continuation succeeds.
 fn match_seq(
     node: &Node,
     text: &[u8],
@@ -1739,7 +2464,6 @@ fn match_repeat(
     pos: usize,
     cont: &dyn Fn(usize) -> Option<usize>,
 ) -> Option<usize> {
-    // First satisfy the mandatory `min` repetitions.
     fn match_min(
         node: &Node,
         remaining: usize,
@@ -1752,7 +2476,6 @@ fn match_repeat(
             return after_min(pos);
         }
         match_seq(node, text, pos, ignore_case, &|p| {
-            // Guard against zero-width infinite recursion.
             if p == pos {
                 return after_min(p);
             }
@@ -1760,7 +2483,6 @@ fn match_repeat(
         })
     }
 
-    // Greedy optional tail: try to consume as many as possible, then backtrack.
     fn match_optional(
         node: &Node,
         remaining: Option<usize>,
@@ -1772,11 +2494,9 @@ fn match_repeat(
         if remaining == Some(0) {
             return cont(pos);
         }
-        // Greedy: attempt one more repetition first.
         let next_remaining = remaining.map(|r| r - 1);
         let more = match_seq(node, text, pos, ignore_case, &|p| {
             if p == pos {
-                // Zero-width; avoid looping.
                 None
             } else {
                 match_optional(node, next_remaining, text, p, ignore_case, cont)
@@ -1954,5 +2674,11 @@ mod tests {
         assert!(regex_match(r"a\{2,3\}", false, "aa"));
         assert!(!regex_match(r"a\{2,3\}", false, "a"));
         assert!(regex_match("a{2,3}", true, "aaa"));
+    }
+
+    #[test]
+    fn max_depth_slash_count() {
+        assert_eq!(slash_count(b"a/b/c"), 2);
+        assert_eq!(slash_count(b"v"), 0);
     }
 }
