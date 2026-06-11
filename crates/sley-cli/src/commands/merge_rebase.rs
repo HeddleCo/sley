@@ -251,6 +251,7 @@ fn merge_commit_and_advance(
             author,
             committer: committer.clone(),
             message,
+            encoding: None,
         },
     )?;
     let target_ref = match refs.read_ref("HEAD")? {
@@ -887,6 +888,7 @@ pub(crate) fn conclude_in_progress_merge(
             author,
             committer: committer.clone(),
             message: message.clone(),
+            encoding: None,
         },
     )?;
     update_merge_head_ref(
@@ -1161,6 +1163,7 @@ pub(crate) fn cmd_rebase_continue() -> Result<()> {
             author: stopped_record.commit.author.clone(),
             committer: committer.clone(),
             message: message.clone(),
+            encoding: None,
         },
     )?;
     update_detached_head_at(
@@ -1575,6 +1578,7 @@ pub(crate) fn conclude_rebase_step_via_commit(
             author,
             committer: committer.clone(),
             message: message.clone(),
+            encoding: None,
         },
     )?;
     update_detached_head_at(
@@ -1857,6 +1861,7 @@ fn rebase_replay_commits(
                 author: record.commit.author.clone(),
                 committer: committer.clone(),
                 message: record.commit.message.clone(),
+                encoding: None,
             },
         )?;
         update_detached_head_at(
@@ -2503,6 +2508,7 @@ fn finalize_replay(
                 author: plan.author,
                 committer: plan.committer.clone(),
                 message: plan.message,
+                encoding: None,
             },
         )?;
         let target_ref = match refs.read_ref("HEAD")? {

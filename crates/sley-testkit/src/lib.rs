@@ -862,6 +862,7 @@ pub fn thin_pack_read_parity_for_format(format: ObjectFormat) -> Result<ThinPack
                 committer: identity.clone(),
                 message: b"base\n".to_vec(),
                 reflog_message: b"commit: base".to_vec(),
+                encoding: None,
             },
         )?
         .oid
@@ -881,6 +882,7 @@ pub fn thin_pack_read_parity_for_format(format: ObjectFormat) -> Result<ThinPack
                 committer: identity,
                 message: b"changed\n".to_vec(),
                 reflog_message: b"commit: changed".to_vec(),
+                encoding: None,
             },
         )?
         .oid
@@ -1136,6 +1138,7 @@ pub fn peeled_packed_ref_compaction_interop_parity_for_format(
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
@@ -1289,6 +1292,7 @@ pub fn show_ref_filter_parity_for_format(format: ObjectFormat) -> Result<ShowRef
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -1429,6 +1433,7 @@ pub fn show_ref_verify_parity_for_format(format: ObjectFormat) -> Result<ShowRef
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -2716,6 +2721,7 @@ pub fn cat_file_revision_parity_for_format(format: ObjectFormat) -> Result<CatFi
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
@@ -3337,6 +3343,7 @@ pub fn update_ref_delete_parity_for_format(format: ObjectFormat) -> Result<Updat
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -3415,6 +3422,7 @@ pub fn update_ref_delete_packed_parity_for_format(
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -3485,6 +3493,7 @@ pub fn reflog_expire_parity_for_format(format: ObjectFormat) -> Result<ReflogExp
                 committer: identity_old,
                 message: b"first\n".to_vec(),
                 reflog_message: b"commit: first".to_vec(),
+                encoding: None,
             },
         )?;
 
@@ -3508,6 +3517,7 @@ pub fn reflog_expire_parity_for_format(format: ObjectFormat) -> Result<ReflogExp
                 committer: identity_new,
                 message: b"second\n".to_vec(),
                 reflog_message: b"commit: second".to_vec(),
+                encoding: None,
             },
         )?;
 
@@ -3635,6 +3645,7 @@ pub fn commit_tree_parity_for_format(format: ObjectFormat) -> Result<CommitTreeP
                 author: identity.clone(),
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
+                encoding: None,
             },
         )?
         .to_hex();
@@ -3688,6 +3699,7 @@ pub fn commit_index_parity_for_format(format: ObjectFormat) -> Result<CommitInde
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let head = String::from_utf8_lossy(&run_git(&root, ["rev-parse", "HEAD"], &[])?)
@@ -3873,6 +3885,7 @@ pub fn branch_create_parity_for_format(format: ObjectFormat) -> Result<BranchPar
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -3973,6 +3986,7 @@ pub fn branch_show_current_parity_for_format(
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let upstream = String::from_utf8_lossy(&run_git(&root, ["branch", "--show-current"], &[])?)
@@ -4029,6 +4043,7 @@ pub fn branch_delete_parity_for_format(format: ObjectFormat) -> Result<BranchDel
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -4096,6 +4111,7 @@ pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<Checkou
                 committer: identity.clone(),
                 message: b"feature subject\n".to_vec(),
                 reflog_message: b"commit: feature subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -4121,6 +4137,7 @@ pub fn checkout_branch_parity_for_format(format: ObjectFormat) -> Result<Checkou
                 committer: identity.clone(),
                 message: b"main subject\n".to_vec(),
                 reflog_message: b"commit: main subject".to_vec(),
+                encoding: None,
             },
         )?;
 
@@ -4188,6 +4205,7 @@ pub fn tag_create_parity_for_format(format: ObjectFormat) -> Result<TagParity> {
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -4252,6 +4270,7 @@ pub fn tag_delete_parity_for_format(format: ObjectFormat) -> Result<TagDeletePar
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);
@@ -4309,6 +4328,7 @@ pub fn annotated_tag_create_parity_for_format(format: ObjectFormat) -> Result<An
                 committer: identity.clone(),
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let mut db = FileObjectDatabase::from_git_dir(root.join(".git"), format);
@@ -4403,6 +4423,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
                 committer: identity,
                 message: b"base\n".to_vec(),
                 reflog_message: b"commit: base".to_vec(),
+                encoding: None,
             },
         )?;
 
@@ -4491,6 +4512,7 @@ pub fn diff_name_status_parity_for_format(format: ObjectFormat) -> Result<DiffNa
                 committer: identity,
                 message: b"copy rename base\n".to_vec(),
                 reflog_message: b"commit: copy rename base".to_vec(),
+                encoding: None,
             },
         )?;
         fs::copy(root.join("copy-source.txt"), root.join("copy-dest.txt"))?;
@@ -4601,6 +4623,7 @@ pub fn rev_parse_parity_for_format(format: ObjectFormat) -> Result<RevParseParit
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
                 reflog_message: b"commit: initial subject".to_vec(),
+                encoding: None,
             },
         )?;
         let store = FileRefStore::new(root.join(".git"), format);

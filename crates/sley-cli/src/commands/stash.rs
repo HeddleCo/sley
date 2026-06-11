@@ -1259,6 +1259,7 @@ fn create_stash_commit(
             author: author.clone(),
             committer: committer.clone(),
             message: format!("index on {branch}: {head_name} {head_subject}\n").into_bytes(),
+            encoding: None,
         },
     )?;
     let untracked_commit = if let Some(tree) = untracked_tree {
@@ -1271,6 +1272,7 @@ fn create_stash_commit(
                 committer: committer.clone(),
                 message: format!("untracked files on {branch}: {head_name} {head_subject}\n")
                     .into_bytes(),
+                encoding: None,
             },
         )?)
     } else {
@@ -1297,6 +1299,7 @@ fn create_stash_commit(
             author,
             committer: committer.clone(),
             message: message.as_bytes().to_vec(),
+            encoding: None,
         },
     )?;
     Ok(Some(CreatedStash {

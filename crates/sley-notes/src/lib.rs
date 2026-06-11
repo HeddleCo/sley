@@ -551,6 +551,7 @@ fn commit_notes_update(
             author: identity.author.clone(),
             committer: identity.committer.clone(),
             message: format!("{message}\n").into_bytes(),
+            encoding: None,
         },
     )?;
 
@@ -831,6 +832,7 @@ mod tests {
                 author: identity.author.clone(),
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
+                encoding: None,
             },
         )
         .expect("commit");
@@ -892,6 +894,7 @@ mod tests {
                 author: identity.author.clone(),
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
+                encoding: None,
             },
         )
         .expect("test operation should succeed");
@@ -1015,6 +1018,7 @@ mod tests {
                 author: identity.author.clone(),
                 committer: identity.committer.clone(),
                 message: b"fanout notes\n".to_vec(),
+                encoding: None,
             },
         )
         .expect("commit");
