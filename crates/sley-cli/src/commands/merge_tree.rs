@@ -302,18 +302,27 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     };
 
     let strategy = parse_strategy_favor(&options.strategy_options)?;
-    let outcome = merge_trees(
-        &git_dir,
+    let mut write_db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let merge = sley_diff_merge::merge_trees(
+        &mut write_db,
         format,
-        MergeTreeInputs {
-            base_tree: &base_tree,
-            ours_tree: &ours_tree,
-            theirs_tree: &theirs_tree,
+        base_tree.as_ref(),
+        &ours_tree,
+        &theirs_tree,
+        &sley_diff_merge::MergeTreesOptions {
             ours_label: branch1,
             theirs_label: branch2,
+            ancestor_label: "merged common ancestors",
             favor: strategy,
+            // merge-tree --write-tree is a non-recursive single-base merge; the
+            // historical write-tree path is purely path-keyed, so renames are
+            // off here (stage-a wires rename-awareness through the porcelain
+            // merge path; merge-tree parity is preserved byte-for-byte).
+            detect_renames: false,
+            rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
         },
     )?;
+    let outcome = render_merge_outcome(&merge, branch1, branch2);
 
     if options.quiet {
         return if outcome.clean {
@@ -331,24 +340,16 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
     }
 }
 
-/// Whether to favour one side wholesale for textual conflicts (`-Xours` /
-/// `-Xtheirs`), or to leave conflict markers in place.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StrategyFavor {
-    None,
-    Ours,
-    Theirs,
-}
-
 /// Interpret recognised `-X` strategy options. Only the conflict-resolution
 /// favouring options affect merge-tree output; everything else is ignored, as
 /// upstream tolerates (and largely ignores) most strategy options here.
-fn parse_strategy_favor(options: &[String]) -> Result<StrategyFavor> {
-    let mut favor = StrategyFavor::None;
+fn parse_strategy_favor(options: &[String]) -> Result<sley_diff_merge::MergeFavor> {
+    use sley_diff_merge::MergeFavor;
+    let mut favor = MergeFavor::None;
     for option in options {
         match option.as_str() {
-            "ours" => favor = StrategyFavor::Ours,
-            "theirs" => favor = StrategyFavor::Theirs,
+            "ours" => favor = MergeFavor::Ours,
+            "theirs" => favor = MergeFavor::Theirs,
             // Whitespace / diff-algorithm knobs do not change which bytes win for
             // the cases we model; accept and ignore them.
             "ignore-space-change"
@@ -433,186 +434,73 @@ fn not_something_we_can_merge(rev: &str) -> GitError {
     GitError::Exit(1)
 }
 
-/// Core 3-way tree merge. Reuses [`sley_diff_merge::merge_blobs`] for textual
-/// content merges and the crate-root flattening helper for tree traversal, then
-/// rebuilds a top-level tree from the merged leaves.
-struct MergeTreeInputs<'a> {
-    base_tree: &'a Option<ObjectId>,
-    ours_tree: &'a ObjectId,
-    theirs_tree: &'a ObjectId,
-    ours_label: &'a str,
-    theirs_label: &'a str,
-    favor: StrategyFavor,
-}
-
-fn merge_trees(
-    git_dir: &Path,
-    format: ObjectFormat,
-    inputs: MergeTreeInputs<'_>,
-) -> Result<MergeOutcome> {
-    let read_db = FileObjectDatabase::from_git_dir(git_dir, format);
-    let base_map = match inputs.base_tree {
-        Some(tree) => stash_tree_entry_map(&read_db, format, tree)?,
-        None => MergeTreeMap::new(),
-    };
-    let ours_map = stash_tree_entry_map(&read_db, format, inputs.ours_tree)?;
-    let theirs_map = stash_tree_entry_map(&read_db, format, inputs.theirs_tree)?;
-
-    let mut write_db = FileObjectDatabase::from_git_dir(git_dir, format);
-
-    let mut all_paths = BTreeSet::new();
-    all_paths.extend(base_map.keys().cloned());
-    all_paths.extend(ours_map.keys().cloned());
-    all_paths.extend(theirs_map.keys().cloned());
-
-    // Leaves of the merged tree (path -> (mode, oid)).
-    let mut merged: MergeTreeMap = BTreeMap::new();
+/// Render a [`sley_diff_merge::MergeTreesResult`] into the `merge-tree
+/// --write-tree` [`MergeOutcome`] (tree + sorted conflict stages + ordered
+/// messages). The library computes the merge; this function is purely the
+/// merge-tree-specific *presentation* (message text, message ordering, stage
+/// sorting), kept byte-identical to the historical inline implementation.
+fn render_merge_outcome(
+    merge: &sley_diff_merge::MergeTreesResult,
+    ours_label: &str,
+    theirs_label: &str,
+) -> MergeOutcome {
     let mut conflicted: Vec<ConflictedStage> = Vec::new();
-    // Messages are split so we can emit all "Auto-merging" lines before the
-    // CONFLICT lines, matching upstream ordering.
+    // Upstream emits all "Auto-merging" lines before all "CONFLICT" lines, so
+    // accumulate the two groups separately and concatenate.
     let mut auto_messages: Vec<InfoMessage> = Vec::new();
     let mut conflict_messages: Vec<InfoMessage> = Vec::new();
-    let mut clean = true;
 
-    for path in all_paths {
-        let base = base_map.get(&path).cloned();
-        let ours = ours_map.get(&path).cloned();
-        let theirs = theirs_map.get(&path).cloned();
-
-        // Trivial resolutions.
-        if ours == theirs {
-            if let Some(entry) = ours {
-                merged.insert(path, entry);
-            }
-            continue;
-        }
-        if ours == base {
-            if let Some(entry) = theirs {
-                merged.insert(path, entry);
-            }
-            continue;
-        }
-        if theirs == base {
-            if let Some(entry) = ours {
-                merged.insert(path, entry);
-            }
-            continue;
-        }
-
-        // Both sides diverged from base. Decide how to combine them.
-        let content_mergeable = matches!(&ours, Some((mode, _)) if merge_is_regular_file(*mode))
-            && matches!(&theirs, Some((mode, _)) if merge_is_regular_file(*mode))
-            && match &base {
-                Some((mode, _)) => merge_is_regular_file(*mode),
-                None => true,
-            };
-
-        if let (true, Some((ours_mode, ours_oid)), Some((theirs_mode, theirs_oid))) =
-            (content_mergeable, &ours, &theirs)
-        {
-            // Textual 3-way content merge (also covers add/add: empty base).
-            let add_add = base.is_none();
+    for entry in &merge.paths {
+        let path = &entry.path;
+        if entry.auto_merged {
             auto_messages.push(InfoMessage {
                 paths: vec![path.clone()],
                 stable_type: "Auto-merging".to_string(),
-                message: format!("Auto-merging {}", String::from_utf8_lossy(&path)),
+                message: format!("Auto-merging {}", String::from_utf8_lossy(path)),
             });
-
-            let base_bytes = match &base {
-                Some((_, oid)) => merge_read_blob(&write_db, oid)?,
-                None => Vec::new(),
-            };
-            let ours_bytes = merge_read_blob(&write_db, ours_oid)?;
-            let theirs_bytes = merge_read_blob(&write_db, theirs_oid)?;
-            let result = sley_diff_merge::merge_blobs(
-                &base_bytes,
-                &ours_bytes,
-                &theirs_bytes,
-                &sley_diff_merge::MergeBlobOptions {
-                    ours_label: inputs.ours_label,
-                    theirs_label: inputs.theirs_label,
-                    base_label: "merged common ancestors",
-                    style: sley_diff_merge::ConflictStyle::Merge,
-                },
-            );
-
-            // The file mode is merged 3-way independently of content: whichever
-            // side changed it relative to the base wins; if both changed it to
-            // different non-base modes, that is itself a conflict.
-            let base_mode = base.as_ref().map(|(mode, _)| *mode);
-            let (resolved_mode, mode_conflict) = merge_modes(base_mode, *ours_mode, *theirs_mode);
-
-            if !result.conflicted && !mode_conflict {
-                let oid =
-                    write_db.write_object(EncodedObject::new(ObjectType::Blob, result.content))?;
-                merged.insert(path, (resolved_mode, oid));
-            } else if inputs.favor != StrategyFavor::None && !mode_conflict {
-                // `-Xours` / `-Xtheirs`: take one side's content wholesale.
-                let chosen = if inputs.favor == StrategyFavor::Ours {
-                    ours.clone()
-                } else {
-                    theirs.clone()
-                };
-                if let Some(entry) = chosen {
-                    merged.insert(path, entry);
-                }
-            } else {
-                clean = false;
-                let conflict_kind = if add_add { "add/add" } else { "content" };
+        }
+        let Some(kind) = &entry.conflict else {
+            continue;
+        };
+        match kind {
+            sley_diff_merge::MergeConflictKind::Content { add_add } => {
+                let conflict_kind = if *add_add { "add/add" } else { "content" };
                 conflict_messages.push(InfoMessage {
                     paths: vec![path.clone()],
                     stable_type: "CONFLICT (contents)".to_string(),
                     message: format!(
                         "CONFLICT ({conflict_kind}): Merge conflict in {}",
-                        String::from_utf8_lossy(&path)
+                        String::from_utf8_lossy(path)
                     ),
                 });
-                push_conflicted_stages(&mut conflicted, &path, &base, &ours, &theirs);
-                let oid =
-                    write_db.write_object(EncodedObject::new(ObjectType::Blob, result.content))?;
-                merged.insert(path, (resolved_mode, oid));
             }
-        } else if base.is_some() && (ours.is_none() || theirs.is_none()) {
-            // modify/delete: present on exactly one side, modified relative to base.
-            clean = false;
-            let (deleted_side, modified_side, surviving) = if ours.is_none() {
-                (inputs.ours_label, inputs.theirs_label, theirs.clone())
-            } else {
-                (inputs.theirs_label, inputs.ours_label, ours.clone())
-            };
-            conflict_messages.push(InfoMessage {
-                paths: vec![path.clone()],
-                stable_type: "CONFLICT (modify/delete)".to_string(),
-                message: format!(
-                    "CONFLICT (modify/delete): {path} deleted in {deleted_side} and modified in {modified_side}.  Version {modified_side} of {path} left in tree.",
-                    path = String::from_utf8_lossy(&path),
-                ),
-            });
-            push_conflicted_stages(&mut conflicted, &path, &base, &ours, &theirs);
-            if let Some(entry) = surviving {
-                merged.insert(path, entry);
+            sley_diff_merge::MergeConflictKind::RenameContent { .. } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![path.clone()],
+                    stable_type: "CONFLICT (contents)".to_string(),
+                    message: format!(
+                        "CONFLICT (content): Merge conflict in {}",
+                        String::from_utf8_lossy(path)
+                    ),
+                });
             }
-        } else {
-            // Everything else (add/add of non-files, type changes, etc.): keep the
-            // surviving side's content and record a generic content conflict.
-            clean = false;
-            let add_add = base.is_none();
-            let conflict_kind = if add_add { "add/add" } else { "content" };
-            conflict_messages.push(InfoMessage {
-                paths: vec![path.clone()],
-                stable_type: "CONFLICT (contents)".to_string(),
-                message: format!(
-                    "CONFLICT ({conflict_kind}): Merge conflict in {}",
-                    String::from_utf8_lossy(&path)
-                ),
-            });
-            push_conflicted_stages(&mut conflicted, &path, &base, &ours, &theirs);
-            let surviving = ours.clone().or_else(|| theirs.clone());
-            if let Some(entry) = surviving {
-                merged.insert(path, entry);
+            sley_diff_merge::MergeConflictKind::ModifyDelete {
+                deleted_in,
+                modified_in,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![path.clone()],
+                    stable_type: "CONFLICT (modify/delete)".to_string(),
+                    message: format!(
+                        "CONFLICT (modify/delete): {path} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {path} left in tree.",
+                        path = String::from_utf8_lossy(path),
+                    ),
+                });
             }
         }
+        push_conflicted_stages(&mut conflicted, path, &entry.stages);
     }
+    let _ = (ours_label, theirs_label);
 
     conflicted.sort_by(|left, right| {
         left.path
@@ -620,32 +508,14 @@ fn merge_trees(
             .then_with(|| left.stage.cmp(&right.stage))
     });
 
-    let tree = write_tree_from_leaf_map(&mut write_db, &merged)?;
-
     let mut messages = auto_messages;
     messages.extend(conflict_messages);
 
-    Ok(MergeOutcome {
-        tree,
+    MergeOutcome {
+        tree: merge.tree,
         conflicted,
         messages,
-        clean,
-    })
-}
-
-/// 3-way merge of a file mode. Returns the resolved mode and whether the modes
-/// conflict (both sides changed the mode to different non-base values). When only
-/// one side changed the mode, the changed mode wins; this is independent of the
-/// content merge.
-fn merge_modes(base: Option<u32>, ours: u32, theirs: u32) -> (u32, bool) {
-    if ours == theirs {
-        return (ours, false);
-    }
-    match base {
-        Some(base) if ours == base => (theirs, false),
-        Some(base) if theirs == base => (ours, false),
-        // No base (add/add) or both sides changed the mode differently.
-        _ => (ours, true),
+        clean: merge.clean,
     }
 }
 
@@ -654,11 +524,9 @@ fn merge_modes(base: Option<u32>, ours: u32, theirs: u32) -> (u32, bool) {
 fn push_conflicted_stages(
     out: &mut Vec<ConflictedStage>,
     path: &[u8],
-    base: &Option<(u32, ObjectId)>,
-    ours: &Option<(u32, ObjectId)>,
-    theirs: &Option<(u32, ObjectId)>,
+    stages: &sley_diff_merge::MergeStages,
 ) {
-    for (stage, entry) in [(1u16, base), (2, ours), (3, theirs)] {
+    for (stage, entry) in [(1u16, &stages.base), (2, &stages.ours), (3, &stages.theirs)] {
         if let Some((mode, oid)) = entry {
             out.push(ConflictedStage {
                 mode: *mode,
@@ -769,82 +637,6 @@ fn emit_messages(
         }
     }
     Ok(())
-}
-
-/// Build a top-level tree object from a flat map of `path -> (mode, oid)` leaves,
-/// writing every (sub)tree object to `db`. This never reads or writes the index,
-/// as required by `git merge-tree`.
-fn write_tree_from_leaf_map(
-    db: &mut FileObjectDatabase,
-    leaves: &MergeTreeMap,
-) -> Result<ObjectId> {
-    let mut root = MergeTreeBuilder::default();
-    for (path, (mode, oid)) in leaves {
-        root.insert(path, *mode, *oid);
-    }
-    root.write(db)
-}
-
-/// An in-memory tree node used to assemble the merged tree from flat paths.
-#[derive(Default)]
-struct MergeTreeBuilder {
-    /// Leaf blob/symlink/gitlink entries by name.
-    blobs: BTreeMap<Vec<u8>, (u32, ObjectId)>,
-    /// Sub-directories by name.
-    subtrees: BTreeMap<Vec<u8>, MergeTreeBuilder>,
-}
-
-impl MergeTreeBuilder {
-    /// Insert a leaf at the (possibly nested, `/`-separated) `path`.
-    fn insert(&mut self, path: &[u8], mode: u32, oid: ObjectId) {
-        match path.iter().position(|byte| *byte == b'/') {
-            Some(slash) => {
-                let component = path[..slash].to_vec();
-                let rest = &path[slash + 1..];
-                self.subtrees
-                    .entry(component)
-                    .or_default()
-                    .insert(rest, mode, oid);
-            }
-            None => {
-                self.blobs.insert(path.to_vec(), (mode, oid));
-            }
-        }
-    }
-
-    /// Recursively write this node and its descendants, returning this node's oid.
-    fn write(&self, db: &mut FileObjectDatabase) -> Result<ObjectId> {
-        let mut entries: Vec<TreeEntry> = Vec::new();
-        for (name, (mode, oid)) in &self.blobs {
-            entries.push(TreeEntry {
-                mode: *mode,
-                name: BString::from(name.clone()),
-                oid: *oid,
-            });
-        }
-        for (name, subtree) in &self.subtrees {
-            let oid = subtree.write(db)?;
-            entries.push(TreeEntry {
-                mode: 0o040000,
-                name: BString::from(name.clone()),
-                oid,
-            });
-        }
-        // git sorts tree entries by name, treating directory names as if they had
-        // a trailing '/'.
-        entries.sort_by_key(tree_sort_key);
-        let tree = Tree { entries };
-        db.write_object(EncodedObject::new(ObjectType::Tree, tree.write()))
-    }
-}
-
-/// Tree-entry sort key: directory entries compare as if their name ended in `/`.
-fn tree_sort_key(entry: &TreeEntry) -> Vec<u8> {
-    let mut key = entry.name.as_bytes().to_vec();
-    if entry.mode == 0o040000 {
-        key.push(b'/');
-    }
-    key
 }
 
 // ===========================================================================

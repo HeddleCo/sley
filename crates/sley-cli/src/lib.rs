@@ -89,7 +89,7 @@ pub(crate) use commands::config_cmd::{config_entry_name, has_unescaped_trailing_
 pub(crate) use commands::merge_rebase::{
     MergePathResult, MergeTreeMap, commit_tree_oid, conclude_in_progress_merge,
     conclude_rebase_step_via_commit, head_commit_oid, merge_bases, merge_index_entry,
-    merge_is_regular_file, merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
+    merge_read_blob, merge_remove_worktree_file, merge_write_worktree_file,
     read_merge_message_from_file, rebase_in_progress, three_way_merge_trees,
 };
 pub(crate) use commands::remote_cmds::{

@@ -387,3 +387,112 @@ fn merge_abort_restores_pre_merge_state() {
 
     fs::remove_dir_all(&root).ok();
 }
+
+/// Build a "file renamed on the feature side, modified in place on the default
+/// branch" fixture. Returns the default branch name. The merge should move the
+/// default-branch modification onto the renamed destination (the merge-ort
+/// non-recursive rename case).
+fn setup_rename_merge(dir: &Path, theirs_change: &str, ours_change: &str) -> String {
+    git_ok(
+        dir.parent().unwrap_or(dir),
+        &[
+            "init",
+            "-q",
+            dir.to_str().expect("test operation should succeed"),
+        ],
+    );
+    write_file(dir, "old.txt", "1\n2\n3\n4\n5\n");
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-qm", "base"]);
+    git_ok(dir, &["checkout", "-q", "-b", "feature"]);
+    git_ok(dir, &["mv", "old.txt", "new.txt"]);
+    write_file(dir, "new.txt", theirs_change);
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-qm", "rename+edit"]);
+    let default = default_branch(dir);
+    git_ok(dir, &["checkout", "-q", &default]);
+    write_file(dir, "old.txt", ours_change);
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-qm", "edit-in-place"]);
+    default
+}
+
+#[test]
+fn merge_rename_clean_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-rename-clean");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    // The in-place edit touches a different region than the rename side, so the
+    // 3-way content merge at the destination is clean.
+    setup_rename_merge(&reference, "1\n2\n3\n4\nFIVE\n", "ONE\n2\n3\n4\n5\n");
+    copy_dir_all(&reference, &candidate);
+
+    let ref_out = git(&reference, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+    let rs_out = git_rs(&candidate, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+
+    assert!(ref_out.status.success(), "git rename merge failed");
+    assert!(
+        rs_out.status.success(),
+        "sley rename merge failed: {}",
+        String::from_utf8_lossy(&rs_out.stderr)
+    );
+    // The merge commit (and thus its tree) must be byte-identical to git: the
+    // modification followed the rename, and old.txt is gone from the tree.
+    assert_eq!(
+        head(&candidate),
+        head(&reference),
+        "rename-merge commit oid differs from git"
+    );
+    // Result tree: only new.txt, carrying both edits.
+    assert_eq!(
+        git(&candidate, &["ls-tree", "-r", "--name-only", "HEAD"]).stdout,
+        git(&reference, &["ls-tree", "-r", "--name-only", "HEAD"]).stdout,
+        "rename-merge tree differs from git"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
+
+#[test]
+fn merge_rename_conflict_matches_git() {
+    if !git_available() {
+        return;
+    }
+    let root = unique_temp_dir("merge-rename-conflict");
+    let reference = root.join("reference");
+    let candidate = root.join("candidate");
+    // Both sides edit the same line: a content conflict, but it must be reported
+    // at the renamed destination with all three stages (base/ours/theirs) at
+    // new.txt, exactly like git's merge-ort.
+    setup_rename_merge(&reference, "1\n2\nTHEIRS\n4\n5\n", "1\n2\nOURS\n4\n5\n");
+    copy_dir_all(&reference, &candidate);
+
+    let ref_out = git(&reference, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+    let rs_out = git_rs(&candidate, &["merge", "-m", "Merge branch 'feature'", "feature"]);
+
+    assert_eq!(ref_out.status.code(), Some(1), "git should conflict");
+    assert_eq!(
+        rs_out.status.code(),
+        Some(1),
+        "sley should conflict: {}",
+        String::from_utf8_lossy(&rs_out.stdout)
+    );
+    // The unmerged index stages must match git byte-for-byte: three stages, all
+    // at new.txt (the rename destination), with the same oids.
+    assert_eq!(
+        git(&candidate, &["ls-files", "-u"]).stdout,
+        git(&reference, &["ls-files", "-u"]).stdout,
+        "rename-conflict index stages differ from git"
+    );
+    // The conflicted worktree file lives at the destination with markers.
+    assert_eq!(
+        fs::read(candidate.join("new.txt")).expect("test operation should succeed"),
+        fs::read(reference.join("new.txt")).expect("test operation should succeed"),
+        "rename-conflict worktree content differs from git"
+    );
+
+    fs::remove_dir_all(&root).ok();
+}
