@@ -536,7 +536,7 @@ fn push_split_parameter(key: &str, value: Option<&str>) {
 /// This is what git's process env would hold after folding in `-c`, and is both
 /// parsed for in-process reads and exported to shell-alias subprocesses so they
 /// inherit the parent's overrides.
-fn effective_config_parameters_env() -> Option<String> {
+pub(crate) fn effective_config_parameters_env() -> Option<String> {
     let inherited = env::var("GIT_CONFIG_PARAMETERS").ok().filter(|s| !s.is_empty());
     let fragment = CMDLINE_CONFIG_PARAMETERS
         .lock()

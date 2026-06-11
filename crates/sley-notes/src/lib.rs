@@ -84,6 +84,31 @@ pub enum RemoveNoteOutcome {
 /// Resolve the notes ref using git's precedence: explicit override, then
 /// `GIT_NOTES_REF`, then `core.notesRef`, then [`DEFAULT_NOTES_REF`].
 pub fn resolve_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> Result<NotesRef> {
+    resolve_notes_ref_impl(git_dir, ref_override, None)
+}
+
+/// Like [`resolve_notes_ref`], but resolves `core.notesRef` against a
+/// caller-supplied effective config instead of re-reading `<git_dir>/config`
+/// blindly.
+///
+/// Callers that have already resolved the repository config — `include`/
+/// `includeIf` directives plus command-line `-c` / `GIT_CONFIG_*` overrides —
+/// pass it here so the notes ref honours the same `core.notesRef` the rest of the
+/// command sees. The explicit override and `GIT_NOTES_REF` still take precedence,
+/// matching git.
+pub fn resolve_notes_ref_with_config(
+    git_dir: &Path,
+    ref_override: Option<&str>,
+    config: &GitConfig,
+) -> Result<NotesRef> {
+    resolve_notes_ref_impl(git_dir, ref_override, Some(config))
+}
+
+fn resolve_notes_ref_impl(
+    git_dir: &Path,
+    ref_override: Option<&str>,
+    config: Option<&GitConfig>,
+) -> Result<NotesRef> {
     if let Some(value) = ref_override {
         return Ok(NotesRef::expand(value));
     }
@@ -92,7 +117,20 @@ pub fn resolve_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> Result<N
     {
         return Ok(NotesRef::expand(&value));
     }
-    if let Ok(config) = read_repo_config(git_dir)
+    // Prefer the caller-resolved effective config; fall back to an include-aware
+    // read of `<git_dir>/config` when none was threaded in.
+    let owned_config;
+    let config = match config {
+        Some(config) => Some(config),
+        None => match read_repo_config(git_dir) {
+            Ok(config) => {
+                owned_config = config;
+                Some(&owned_config)
+            }
+            Err(_) => None,
+        },
+    };
+    if let Some(config) = config
         && let Some(value) = config.get("core", None, "notesRef")
         && !value.is_empty()
     {
@@ -506,8 +544,13 @@ fn expand_notes_ref(name: &str) -> String {
     }
 }
 
+/// Include-aware read of `<git_dir>/config` (resolves `include`/`includeIf` and
+/// layers inherited `GIT_CONFIG_*` overrides), shared with the rest of the
+/// library via [`sley_config::read_repo_config`]. Used as the fallback when a
+/// caller did not pass an already-resolved effective config to
+/// [`resolve_notes_ref_with_config`].
 fn read_repo_config(git_dir: &Path) -> Result<GitConfig> {
-    GitConfig::read(git_dir.join("config"))
+    sley_config::read_repo_config(git_dir, None)
 }
 
 fn notes_head_oid(store: &FileRefStore, notes_ref: &NotesRef) -> Result<Option<ObjectId>> {

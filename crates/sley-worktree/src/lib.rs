@@ -219,7 +219,7 @@ pub fn read_repository_index(
 /// [`GitError::InvalidPath`] if a `.git` directory has no parent (a malformed
 /// layout).
 pub fn worktree_root_for_git_dir(git_dir: &Path) -> Result<Option<PathBuf>> {
-    if let Ok(config) = GitConfig::read(git_dir.join("config"))
+    if let Ok(config) = sley_config::read_repo_config(git_dir, None)
         && let Some(worktree) = config.get("core", None, "worktree")
     {
         let worktree = PathBuf::from(worktree);
@@ -2507,7 +2507,7 @@ fn sparse_has_glob_meta(body: &[u8]) -> bool {
 }
 
 fn read_core_excludes_file(root: &Path, patterns: &mut Vec<IgnorePattern>) -> bool {
-    let Ok(config) = GitConfig::read(root.join(".git").join("config")) else {
+    let Ok(config) = sley_config::read_repo_config(&root.join(".git"), None) else {
         return false;
     };
     let Some(value) = config.get("core", None, "excludesFile") else {
@@ -3066,7 +3066,7 @@ impl AttributeMatcher {
     }
 
     fn read_configured_attributes(&mut self, root: &Path) -> bool {
-        let Ok(config) = GitConfig::read(root.join(".git").join("config")) else {
+        let Ok(config) = sley_config::read_repo_config(&root.join(".git"), None) else {
             return false;
         };
         let Some(value) = config.get("core", None, "attributesFile") else {
@@ -5661,7 +5661,7 @@ pub fn remove_index_and_worktree_paths(
         selected.extend(matched);
     }
     if !options.cached && !options.force {
-        let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+        let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
         for path in &selected {
             let Some(index_entry) = index_entries.get(path) else {
                 continue;
@@ -6533,7 +6533,7 @@ fn worktree_entries_with_stat_cache(
     // through the clean filter (core.autocrlf / .gitattributes) first -- exactly
     // as `git add` would store them. With no filter configured this is an exact
     // passthrough, so unfiltered repositories see identical OIDs.
-    let config = GitConfig::read(git_dir.join("config")).unwrap_or_default();
+    let config = sley_config::read_repo_config(git_dir, None).unwrap_or_default();
     // Seed the matcher with the repo-wide sources only; each directory's
     // `.gitattributes` is folded in by `collect_worktree_entries` as it descends,
     // so the worktree is read exactly once (a separate full-tree attribute pass was

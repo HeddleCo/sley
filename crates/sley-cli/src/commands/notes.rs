@@ -4,7 +4,7 @@
 use crate::*;
 use sley_notes::{
     NotesCommitIdentity, NotesRef, list_notes, notes_ref_expected, read_note, remove_note,
-    resolve_notes_ref, upsert_note, write_notes,
+    resolve_notes_ref_with_config, upsert_note, write_notes,
 };
 
 pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
@@ -52,9 +52,17 @@ pub(crate) fn cmd_notes(args: &[String]) -> Result<()> {
 
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let notes_ref = resolve_notes_ref(&git_dir, ref_override.as_deref())?
-        .as_str()
-        .to_string();
+    // Resolve the notes ref against the effective config (includes + `-c` /
+    // `GIT_CONFIG_*` overrides) so `core.notesRef` honours the same config the
+    // rest of the command sees.
+    let effective_config = read_repo_config(&git_dir).unwrap_or_default();
+    let notes_ref = resolve_notes_ref_with_config(
+        &git_dir,
+        ref_override.as_deref(),
+        &effective_config,
+    )?
+    .as_str()
+    .to_string();
 
     // git refuses to write notes outside of refs/notes/. The check uses the
     // *resolved* ref name: `--ref` is expanded (bare names → refs/notes/<name>),

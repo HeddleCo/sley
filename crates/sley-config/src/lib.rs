@@ -351,6 +351,47 @@ pub fn load_config_with_includes(path: &Path, context: &ConfigIncludeContext) ->
     })
 }
 
+/// Read `<git_dir>/config` the way every command does: resolve `include.path` /
+/// `includeIf` directives, then layer command-line `-c` / `--config-env` /
+/// `GIT_CONFIG_*` injections on top (highest precedence).
+///
+/// This is the single effective-config reader the library crates share so that
+/// upstream / notes-ref / worktree lookups inherit includes and overrides, rather
+/// than each crate doing a blind single-file parse. A missing config file yields
+/// an empty (but still override-layered) config, matching git's behaviour in a
+/// freshly initialised repository.
+///
+/// `parameters_env` is the effective `GIT_CONFIG_PARAMETERS` string the caller
+/// reconstructs (inherited env plus any in-process command-line `-c` fragment);
+/// pass `None` to use only the inherited env (`GIT_CONFIG_COUNT` / `GIT_CONFIG_*`
+/// plus whatever `GIT_CONFIG_PARAMETERS` the process already carries). The CLI,
+/// which holds command-line `-c` overrides it cannot push into the process env,
+/// passes its reconstructed string so library reads see the same overrides as
+/// `git config` does.
+pub fn read_repo_config(git_dir: &Path, parameters_env: Option<&str>) -> Result<GitConfig> {
+    let path = git_dir.join("config");
+    // `includeIf "gitdir:"` matches against the absolute git directory; canonicalise
+    // so a relative `git_dir` still resolves includes correctly.
+    let git_dir_abs = fs::canonicalize(git_dir).unwrap_or_else(|_| git_dir.to_path_buf());
+    let context = ConfigIncludeContext::new(Some(git_dir_abs), repo_current_branch_name(git_dir));
+    let mut config = load_config_with_includes(&path, &context)?;
+    if let Ok(parameters) = injected_config_parameters(parameters_env) {
+        config.sections.extend(injected_config_sections(&parameters));
+    }
+    Ok(config)
+}
+
+/// Short branch name from `<git_dir>/HEAD` (e.g. "main"), or `None` when detached
+/// or unborn. Used for `includeIf "onbranch:<glob>"` resolution; reads HEAD
+/// directly so it needs no object-format or ref-store context.
+pub fn repo_current_branch_name(git_dir: &Path) -> Option<String> {
+    let head = fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let target = head.trim().strip_prefix("ref:")?.trim();
+    target
+        .strip_prefix("refs/heads/")
+        .map(|name| name.to_string())
+}
+
 /// Read and parse a single config file, then splice its includes into `out`.
 ///
 /// A non-existent file contributes nothing (git silently ignores it).
