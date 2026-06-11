@@ -1110,13 +1110,25 @@ fn notes_copy_from_stdin(
             let from = resolve_note_object(git_dir, format, from_spec)?;
             let to = resolve_note_object(git_dir, format, to_spec)?;
 
-            let Some(from_blob) = read_note(git_dir, format, &store, &handle, &from)? else {
+            // Read both source and destination notes from the in-progress tree
+            // (the in-memory `notes` set), so multiple lines targeting the same
+            // object accumulate, exactly as git's copy_note mutates the live tree.
+            let from_hex = from.to_hex();
+            let Some(from_blob) = notes
+                .iter()
+                .find(|entry| entry.annotated.to_hex() == from_hex)
+                .map(|entry| entry.blob)
+            else {
                 // No source note: nothing to copy (git's copy_note returns 0).
                 continue;
             };
             let new_bytes = db.read_object(&from_blob)?.body.clone();
 
-            let cur_blob = read_note(git_dir, format, &store, &handle, &to)?;
+            let to_hex = to.to_hex();
+            let cur_blob = notes
+                .iter()
+                .find(|entry| entry.annotated.to_hex() == to_hex)
+                .map(|entry| entry.blob);
             let cur_bytes = match &cur_blob {
                 Some(blob) => Some(db.read_object(blob)?.body.clone()),
                 None => None,

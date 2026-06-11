@@ -200,10 +200,13 @@ fn render_notes_block(
                 .unwrap_or(handle.as_str());
             out.extend_from_slice(format!("\nNotes ({name}):\n").as_bytes());
         }
-        for line in body.split(|b| *b == b'\n') {
-            out.extend_from_slice(b"    ");
-            out.extend_from_slice(line);
-            out.push(b'\n');
+        // An empty note prints just the label (git's loop runs over zero bytes).
+        if !body.is_empty() {
+            for line in body.split(|b| *b == b'\n') {
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            }
         }
     }
     Ok(out)
