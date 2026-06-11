@@ -32,6 +32,11 @@ declare -A FLOOR=(
     [t1401-symbolic-ref.sh]=25
     [t1500-rev-parse.sh]=80
     [t2400-worktree-add.sh]=158
+    [t3070-wildmatch.sh]=1861
+    [t6300-for-each-ref.sh]=334
+    [t7004-tag.sh]=150
+    [t3200-branch.sh]=70
+    [t0027-auto-crlf.sh]=2149
     [t3000-ls-files-others.sh]=15
     [t3103-ls-tree-misc.sh]=10
 )
