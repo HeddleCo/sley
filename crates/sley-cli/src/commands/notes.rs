@@ -108,7 +108,7 @@ fn notes_ref_handle(notes_ref: &str) -> NotesRef {
 /// names gain a `refs/notes/` prefix), but `GIT_NOTES_REF` / `core.notesRef` are
 /// taken verbatim — a fully-qualified non-notes ref from the environment must
 /// be rejected rather than silently re-homed under `refs/notes/`.
-fn raw_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> String {
+pub(crate) fn raw_notes_ref(git_dir: &Path, ref_override: Option<&str>) -> String {
     if let Some(value) = ref_override {
         return NotesRef::expand(value).as_str().to_string();
     }
