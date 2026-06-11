@@ -194,6 +194,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "diff" => commands::diff::cmd_diff(&args[1..]),
         "fetch" => commands::remote_cmds::cmd_fetch(&args[1..]),
         "for-each-ref" => commands::for_each_ref::cmd_for_each_ref(&args[1..]),
+        "refs" => commands::refs::cmd_refs(&args[1..]),
         "fsck" => commands::plumbing::cmd_fsck(&args[1..]),
         "get-tar-commit-id" => commands::utility::cmd_get_tar_commit_id(&args[1..]),
         "ls-remote" => commands::remote_cmds::cmd_ls_remote(&args[1..]),

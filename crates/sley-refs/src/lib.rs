@@ -440,6 +440,42 @@ impl FileRefStore {
         Ok(None)
     }
 
+    /// Raw existence check matching git's `refs_read_raw_ref` (builtin/refs.c
+    /// cmd_refs_exists). A ref "exists" if its loose file is present (regardless
+    /// of contents — dangling symrefs, bad object ids, and refs written with a
+    /// bad name all count) or if it is recorded in packed-refs / the reftable.
+    /// Unlike [`read_ref`], no name validation is performed and the object the
+    /// ref points at is never read. Returns:
+    ///   * `Ok(true)`  — the raw ref exists.
+    ///   * `Ok(false)` — ENOENT or EISDIR (a bare directory where the ref would
+    ///     live and no packed entry); git maps both to exit code 2.
+    pub fn raw_ref_exists(&self, name: &str) -> Result<bool> {
+        if self.uses_reftable()? {
+            return Ok(self.read_reftable_ref(name)?.is_some());
+        }
+        // git routes root-ref-syntax names (HEAD, FETCH_HEAD, MERGE_HEAD, …) to
+        // the per-worktree gitdir and everything else to the common dir; mirror
+        // files_ref_path's REF_WORKTREE_CURRENT vs REF_WORKTREE_SHARED split.
+        let base = if is_root_ref_syntax(name) {
+            &self.git_dir
+        } else {
+            &self.common_dir
+        };
+        let path = base.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                // A directory at the loose path is EISDIR unless packed-refs
+                // still carries the name.
+                Ok(self.read_packed_ref(name)?.is_some())
+            }
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                Ok(self.read_packed_ref(name)?.is_some())
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
     pub fn read_reflog(&self, name: &str) -> Result<Vec<ReflogEntry>> {
         validate_ref_name_for_read(name)?;
         let path = self.reflog_path(name);
@@ -2298,6 +2334,17 @@ fn validate_ref_name_for_update(name: &str) -> Result<()> {
         return Ok(());
     }
     validate_symref_name(name)
+}
+
+/// git's is_root_ref_syntax (refs.c): a ref name made only of uppercase ASCII,
+/// `-`, and `_` (e.g. HEAD, FETCH_HEAD, MERGE_HEAD). Such names live in the
+/// per-worktree gitdir rather than the common refs/ tree. An empty name is not
+/// root-ref syntax.
+fn is_root_ref_syntax(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b == b'-' || b == b'_')
 }
 
 pub fn validate_ref_name(name: &str) -> Result<()> {
