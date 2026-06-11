@@ -614,14 +614,25 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     if shallow_exclude_ignored {
         eprintln!("warning: --shallow-exclude is ignored in local clones; use file:// instead.");
     }
-    if partial_clone_filter.is_some() {
-        let file_transport = parse_remote_url(&repository)
-            .map(|url| url.transport == RemoteTransport::File)
-            .unwrap_or(false);
-        if file_transport {
-            eprintln!("warning: filtering not recognized by server, ignoring");
-        } else {
+    // `--filter` on a true local clone is warned-and-ignored (`is_local` in
+    // builtin/clone.c). A transport clone (`--no-local` / `file://`) honors it
+    // when the source advertises filtering (`uploadpack.allowFilter`),
+    // otherwise warns exactly like a server without the capability.
+    let mut fetch_filter = None::<sley_odb::PackObjectFilter>;
+    if let Some(filter) = partial_clone_filter.as_deref() {
+        if local_mechanism {
             eprintln!("warning: --filter is ignored in local clones; use file:// instead.");
+        } else {
+            let remote_allows_filter = read_repo_config(&remote_common_git_dir)
+                .ok()
+                .and_then(|config| config.get_bool("uploadpack", None, "allowfilter"))
+                .unwrap_or(false);
+            match (remote_allows_filter, filter) {
+                (true, "blob:none") => {
+                    fetch_filter = Some(sley_odb::PackObjectFilter::BlobNone);
+                }
+                _ => eprintln!("warning: filtering not recognized by server, ignoring"),
+            }
         }
     }
     // git prints the trailing "done." only for clones served by `clone_local`
@@ -646,6 +657,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
                 repository: &repository,
                 tag_opt: tag_opt.as_deref(),
                 partial_clone_filter: partial_clone_filter.as_deref(),
+                fetch_filter,
                 head_branch: &checkout_branch,
                 branch_explicit,
                 revision_oid: revision_oid.as_ref(),
@@ -754,6 +766,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         } else {
             detached_remote_head
         },
+        filter: fetch_filter,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -939,6 +952,7 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         depth: options.depth,
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        filter: None,
     };
     let mut progress = StdoutProgress;
     let outcome = sley_remote::clone(
@@ -1056,6 +1070,7 @@ fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         depth: options.depth,
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
+        filter: None,
     };
     let mut credentials = sley_remote::NoCredentials;
     let mut progress = StdoutProgress;
@@ -1243,6 +1258,10 @@ struct CloneLocalOptions<'a> {
     repository: &'a str,
     tag_opt: Option<&'a str>,
     partial_clone_filter: Option<&'a str>,
+    /// The object filter the clone fetch itself applies (only set when the
+    /// in-process local server honors the `--filter`, i.e. a `--no-local` /
+    /// `file://` clone of an `uploadpack.allowFilter` source).
+    fetch_filter: Option<sley_odb::PackObjectFilter>,
     head_branch: &'a str,
     branch_explicit: bool,
     revision_oid: Option<&'a ObjectId>,
@@ -1304,7 +1323,7 @@ fn clone_bare_or_mirror_local_repository(
 
     let previous_cwd = env::current_dir()?;
     env::set_current_dir(destination)?;
-    let refspecs = if options.mirror && options.single_branch {
+    let mut refspecs = if options.mirror && options.single_branch {
         vec![format!(
             "+refs/heads/{}:refs/heads/{}",
             options.head_branch, options.head_branch
@@ -1319,6 +1338,13 @@ fn clone_bare_or_mirror_local_repository(
     } else {
         vec!["+refs/heads/*:refs/heads/*".to_string()]
     };
+    // Clone fetches every tag by default (upstream's `wanted_peer_refs` adds
+    // the `refs/tags/*:refs/tags/*` map whenever `--no-tags` was not given) —
+    // this also picks up tags pointing at non-commits, which tag
+    // auto-following never would.
+    if !options.mirror && options.tag_opt != Some("--no-tags") {
+        refspecs.push("+refs/tags/*:refs/tags/*".to_string());
+    }
     let fetch_result = fetch_local_repository(
         &git_dir,
         options.format,
@@ -1337,6 +1363,7 @@ fn clone_bare_or_mirror_local_repository(
             prune_option_explicit: false,
             depth: None,
             merge_src: None,
+            filter: options.fetch_filter,
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -1807,6 +1834,7 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         prune_option_explicit: false,
         depth: None,
         merge_src: None,
+        filter: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2692,7 +2720,7 @@ pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     let cwd = env::current_dir()?;
     if let Ok(path) = ls_remote_repository_path(repository, &cwd)
         && path.exists()
-        && let Ok(git_dir) = discover_git_dir(path)
+        && let Ok(git_dir) = discover_remote_git_dir(path)
     {
         return Ok(git_dir);
     }
@@ -2702,7 +2730,7 @@ pub(crate) fn ls_remote_git_dir(repository: &str) -> Result<PathBuf> {
     if rewritten != repository
         && let Ok(path) = ls_remote_repository_path(&rewritten, &cwd)
         && path.exists()
-        && let Ok(git_dir) = discover_git_dir(path)
+        && let Ok(git_dir) = discover_remote_git_dir(path)
     {
         return Ok(git_dir);
     }
@@ -3734,7 +3762,7 @@ fn local_remote_git_dir(config: &GitConfig, name: &str, git_dir: &Path) -> Resul
             ));
         }
     };
-    discover_git_dir(remote_path)
+    discover_remote_git_dir(remote_path)
 }
 
 fn repository_relative_path_base(git_dir: &Path) -> Result<PathBuf> {

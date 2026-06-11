@@ -8530,6 +8530,26 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         }
         return Err(GitError::repository_not_found("not a git repository"));
     }
+    discover_git_dir_by_walk(start)
+}
+
+/// Discover the git directory of a *remote* repository named by a local path.
+///
+/// Upstream reaches a local-path remote by spawning `upload-pack` /
+/// `receive-pack` with the local-repository environment cleared
+/// (`local_repo_env` in environment.c), so an explicit `--git-dir` /
+/// `GIT_DIR` or `--bare` from the *local* invocation must never leak into the
+/// remote side's discovery — otherwise `git --git-dir=clone.git fetch origin`
+/// would resolve the remote as `<remote-url>/clone.git` (the local clone
+/// itself) instead of the remote repository.
+pub(crate) fn discover_remote_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
+    discover_git_dir_by_walk(start)
+}
+
+/// The walk-up portion of repository discovery (`setup_git_directory_gently`'s
+/// loop): examine `start` and each ancestor for a `.git` dir, a `.git` gitfile,
+/// or a bare-layout directory, honoring `GIT_CEILING_DIRECTORIES`.
+fn discover_git_dir_by_walk(start: impl AsRef<Path>) -> Result<PathBuf> {
     let ceilings = discovery_ceiling_directories();
     for candidate in start.as_ref().ancestors() {
         // GIT_CEILING_DIRECTORIES: stop the upward walk before *entering* a

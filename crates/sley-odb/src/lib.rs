@@ -337,9 +337,62 @@ where
     R: ObjectReader,
     I: IntoIterator<Item = ObjectId>,
 {
-    let Some(pack) = build_reachable_pack(source, format, starts, excluded)? else {
+    build_and_install_reachable_pack_filtered(
+        source,
+        destination,
+        format,
+        starts,
+        excluded,
+        options,
+        None,
+    )
+}
+
+/// A partial-clone object filter applied while building a transfer pack.
+///
+/// Mirrors the subset of upstream's `list-objects-filter` the in-process local
+/// server supports: directly-wanted tips are always packed; the filter only
+/// prunes objects reached *through* the traversal (upstream's
+/// `filter_blobs_none` runs on traversed blobs, never on wanted tips).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackObjectFilter {
+    /// `blob:none`: omit every blob reached through tree traversal.
+    BlobNone,
+}
+
+/// [`build_and_install_reachable_pack`] with an optional partial-clone
+/// `filter`. With `Some(BlobNone)`, blobs are dropped from the pack unless
+/// they are directly wanted (named in `starts`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_and_install_reachable_pack_filtered<R, I>(
+    source: &R,
+    destination: &FileObjectDatabase,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    options: RawPackInstallOptions,
+    filter: Option<PackObjectFilter>,
+) -> Result<Option<PackInstallResult>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    let starts: Vec<ObjectId> = starts.into_iter().collect();
+    let wanted: HashSet<ObjectId> = starts.iter().copied().collect();
+    let mut objects = collect_reachable_pack_objects(source, format, starts, excluded)?;
+    match filter {
+        Some(PackObjectFilter::BlobNone) => {
+            objects.retain(|entry| {
+                entry.object.object_type != ObjectType::Blob || wanted.contains(&entry.oid)
+            });
+        }
+        None => {}
+    }
+    if objects.is_empty() {
         return Ok(None);
-    };
+    }
+    let inputs = pack_inputs(&objects);
+    let pack = PackFile::write_packed_with_known_ids(&inputs, format)?;
     destination
         .install_generated_pack_unchecked(&pack, options)
         .map(Some)

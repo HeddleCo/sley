@@ -236,7 +236,18 @@ fn verify_pack_one(
     verbose: bool,
     stat_only: bool,
 ) -> Result<()> {
-    let index = PackIndex::parse(&fs::read(index_path)?, format)?;
+    // Upstream verify-pack accepts "foo.pack", "foo.idx" and "foo", and
+    // normalizes them all to the pack/idx pair (builtin/verify-pack.c's
+    // verify_one_pack). Derive the .idx path the same way.
+    let index_path = {
+        let path = index_path.to_string_lossy();
+        let base = path
+            .strip_suffix(".idx")
+            .or_else(|| path.strip_suffix(".pack"))
+            .unwrap_or(&path);
+        PathBuf::from(format!("{base}.idx"))
+    };
+    let index = PackIndex::parse(&fs::read(&index_path)?, format)?;
     let mut entries = index.entries;
     entries.sort_by_key(|entry| entry.offset);
     let mut non_delta = 0usize;

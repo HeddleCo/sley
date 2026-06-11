@@ -88,6 +88,11 @@ pub struct FetchOptions {
     /// When fetching configured remote refspecs, mark the update whose `src`
     /// matches this value as eligible for merge in `FETCH_HEAD` (used by `pull`).
     pub merge_src: Option<String>,
+    /// Partial-clone object filter (`--filter=blob:none`): omit filtered
+    /// objects from the transferred pack. Only honored by the in-process local
+    /// (`file://`/path) server today; directly-wanted tips are always packed,
+    /// mirroring upstream's filter traversal.
+    pub filter: Option<sley_odb::PackObjectFilter>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -392,6 +397,7 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 starts,
                 deepen_plan.as_ref(),
                 promisor_remote,
+                options.filter,
             )?;
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;

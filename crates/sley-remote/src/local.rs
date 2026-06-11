@@ -16,6 +16,7 @@ use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_object::{Commit, ObjectType, Tag};
 use sley_odb::{
     FileObjectDatabase, ObjectReader, RawPackInstallOptions, build_and_install_reachable_pack,
+    build_and_install_reachable_pack_filtered,
     build_reachable_pack, collect_reachable_object_ids,
 };
 use sley_protocol::{
@@ -479,6 +480,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     wants: Vec<ObjectId>,
     deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
+    filter: Option<sley_odb::PackObjectFilter>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
         return Ok(Vec::new());
@@ -552,13 +554,14 @@ pub fn install_fetch_pack_via_local_upload_pack(
         excluded.extend(plan.excluded.iter().copied());
         starts.extend(plan.extra_wants.iter().copied());
     }
-    build_and_install_reachable_pack(
+    build_and_install_reachable_pack_filtered(
         &remote_db,
         &local_db,
         format,
         starts,
         &excluded,
         RawPackInstallOptions { promisor },
+        filter,
     )?;
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
