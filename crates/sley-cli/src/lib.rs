@@ -79,6 +79,7 @@ mod log_format;
 mod remote;
 mod repo_path;
 mod repository;
+mod setup;
 
 pub(crate) use log_format::{CompiledLogFormat, FormatToken, LogFormatDialect, presets};
 
@@ -110,6 +111,14 @@ pub fn run(args: Vec<String>) -> Result<()> {
     set_global_bare(global.bare);
     set_global_replace_objects(global.replace_objects);
     set_global_pathspec_flags(global.pathspec_flags);
+    // Emit git's GIT_TRACE_SETUP output (the env/config/gitfile discovery trace)
+    // before dispatching. This is the CLI-side repository setup that
+    // `sley::Repository::discover` deliberately leaves to this layer.
+    if env::var_os("GIT_TRACE_SETUP").is_some()
+        && let Some(setup_result) = setup::setup_git_directory()
+    {
+        setup::trace_repo_setup(&setup_result);
+    }
     dispatch_with_aliases(global.args, &global.config, 0)
 }
 
@@ -8403,10 +8412,19 @@ fn discover_git_dir(start: impl AsRef<Path>) -> Result<PathBuf> {
         if git_dir.as_os_str().is_empty() {
             return Err(GitError::repository_not_found("not a git repository"));
         }
-        return Ok(resolve_cli_path(
-            start.as_ref(),
-            git_dir.to_string_lossy().as_ref(),
-        ));
+        let resolved = resolve_cli_path(start.as_ref(), git_dir.to_string_lossy().as_ref());
+        // An explicit GIT_DIR / --git-dir that points at a `.git` *file*
+        // ("gitdir: <path>") is resolved to its target, exactly as git's
+        // `setup_explicit_git_dir` does via `read_gitfile`. Without this the
+        // ref store would be pointed at the gitfile itself (a regular file),
+        // so reads of HEAD/refs fail.
+        if resolved.is_file()
+            && let Some(target) = read_gitdir_file(&resolved)?
+            && is_git_dir_candidate(&target)
+        {
+            return fs::canonicalize(target).map_err(|err| GitError::Io(err.to_string()));
+        }
+        return Ok(resolved);
     }
     if global_bare() {
         let cwd = env::current_dir()?;
@@ -8657,6 +8675,15 @@ fn commit_reflog_message(message: &[u8], amend: bool) -> Vec<u8> {
     }
 }
 
+/// Resolve the effective worktree for the *given* git dir.
+///
+/// This resolver is **silent** and operates on its `git_dir` argument (it is
+/// also used as a probe by `is_inside_work_tree`, the ref-storage display path,
+/// and the submodule-superproject walk, which all pass a specific git dir), so
+/// it must neither print nor reinterpret the ambient process environment for an
+/// arbitrary git dir. The user-facing worktree diagnostics — and the full
+/// CLI-side env/config setup resolution — live in [`require_work_tree`], which
+/// the worktree-requiring command entry points call for the ambient repository.
 fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
     // CLI/process-level overrides take precedence over anything recorded in the
     // repository (these are not part of the repository-intrinsic resolution).
@@ -8675,6 +8702,33 @@ fn worktree_root_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
         None => Err(GitError::Unsupported(
             "update-index currently requires a non-bare worktree".into(),
         )),
+    }
+}
+
+/// Resolve the effective worktree for a worktree-requiring command, emitting
+/// git's user-facing diagnostic on failure: the
+/// "core.bare and core.worktree do not make sense" warning + "unable to set up
+/// work tree using invalid config" for the config conflict, or
+/// "this operation must be run in a work tree" for a bare / no-worktree repo.
+fn require_work_tree(git_dir: &Path) -> Result<PathBuf> {
+    if let Some(result) = setup::setup_git_directory() {
+        if result.worktree_config_bogus {
+            eprintln!("warning: core.bare and core.worktree do not make sense");
+            eprintln!("fatal: unable to set up work tree using invalid config");
+            return Err(GitError::Exit(128));
+        }
+        if let Some(worktree) = result.worktree {
+            return Ok(worktree);
+        }
+        eprintln!("fatal: this operation must be run in a work tree");
+        return Err(GitError::Exit(128));
+    }
+    match sley_worktree::worktree_root_for_git_dir(git_dir)? {
+        Some(root) => Ok(root),
+        None => {
+            eprintln!("fatal: this operation must be run in a work tree");
+            Err(GitError::Exit(128))
+        }
     }
 }
 
