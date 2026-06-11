@@ -58,6 +58,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let mut not = false;
     let mut pathspecs: Vec<String> = Vec::new();
     let mut full_history = false;
+    let mut use_bitmap_index = false;
+    let mut test_bitmap = false;
+    let mut unpacked = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if positional_only {
@@ -88,10 +91,12 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--sparse"
             | "--dense"
             | "--remove-empty"
-            | "--unpacked"
             | "--simplify-merges"
             | "--show-pulls"
             | "--exclude-promisor-objects" => {}
+            // No effect on the regular walk yet (pre-existing behaviour); the
+            // bitmap path filters packed objects out of its result.
+            "--unpacked" => unpacked = true,
             "--exclude-hidden" => {
                 let value = iter
                     .next()
@@ -269,6 +274,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 regexp_mode = SimpleLogRegexMode::Basic
             }
             "-z" => nul_terminated = true,
+            "--use-bitmap-index" => use_bitmap_index = true,
+            "--test-bitmap" => test_bitmap = true,
             "--objects" => objects = true,
             "--objects-edge" => {
                 objects = true;
@@ -550,8 +557,43 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let mut include_commits = Vec::new();
     let mut start_tag_objects = Vec::new();
+    // Tips that resolve to non-commit objects (git's pending-object model):
+    // a provided blob is emitted directly in --objects mode (exempt from
+    // filters unless --filter-provided-objects), silently dropped otherwise;
+    // any other non-commit tip is additionally accepted under
+    // --use-bitmap-index, where the bitmap traversal can start from it.
+    let mut provided_objects: Vec<RevListObject> = Vec::new();
+    let mut bitmap_object_tips: Vec<ObjectId> = Vec::new();
     for rev in includes {
-        if let Some(start) = resolve_rev_list_start(&git_dir, &db, format, &rev, ignore_missing)? {
+        let start = match resolve_rev_list_start(&git_dir, &db, format, &rev, ignore_missing) {
+            Ok(start) => start,
+            Err(err) => {
+                let Ok(oid) = resolve_revision(&git_dir, format, &rev) else {
+                    return Err(err);
+                };
+                let Ok(object) = db.read_object(&oid) else {
+                    return Err(err);
+                };
+                match object.object_type {
+                    ObjectType::Blob if objects => {
+                        // git names a pathy tip by its path component.
+                        let name = rev
+                            .split_once(':')
+                            .map(|(_, path)| path.as_bytes().to_vec())
+                            .unwrap_or_default();
+                        provided_objects.push(RevListObject { oid, name });
+                    }
+                    ObjectType::Blob | ObjectType::Tree if !use_bitmap_index => {
+                        // Without --objects, git silently ignores non-commit
+                        // pending objects.
+                    }
+                    _ if use_bitmap_index => bitmap_object_tips.push(oid),
+                    _ => return Err(err),
+                }
+                continue;
+            }
+        };
+        if let Some(start) = start {
             include_commits.push(start.commit);
             if let Some(tag_object) = start.tag_object {
                 start_tag_objects.push(RevListTagObject {
@@ -649,17 +691,124 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         HashSet::new()
     };
-    let mut excluded = HashSet::new();
-    for oid in symmetric_excludes {
-        for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
-            excluded.insert(record.oid);
-        }
-    }
+    let mut exclude_tip_oids: Vec<ObjectId> = symmetric_excludes;
     for rev in excludes {
         let Some(oid) = resolve_rev_list_commit(&git_dir, &db, format, &rev, ignore_missing)?
         else {
             continue;
         };
+        exclude_tip_oids.push(oid);
+    }
+
+    if test_bitmap {
+        return rev_list_test_bitmap(&git_dir, &db, format, &include_commits, &exclude_tip_oids);
+    }
+
+    if use_bitmap_index {
+        // Mirror upstream's want list: tag objects stand in for the commits
+        // they were peeled from (the tag itself is part of the result), plus
+        // any non-commit tips collected above.
+        let mut want_roots = Vec::with_capacity(include_commits.len() + bitmap_object_tips.len());
+        for commit in &include_commits {
+            match start_tag_objects
+                .iter()
+                .find(|tag_object| tag_object.commit == *commit)
+            {
+                Some(tag_object) => want_roots.push(tag_object.object.oid),
+                None => want_roots.push(*commit),
+            }
+        }
+        want_roots.extend(bitmap_object_tips.iter().copied());
+        want_roots.extend(provided_objects.iter().map(|object| object.oid));
+        // Allowlist: anything the bitmap result cannot answer (traversal
+        // order, pathspec pruning, per-commit predicates, output shaping)
+        // falls back to the regular walk, like upstream's try_bitmap_*
+        // helpers returning -1.
+        let bitmap_eligible = walk_mode == RevListWalkMode::Walk
+            && ordering == RevListOrdering::Default
+            && pathspecs.is_empty()
+            && !full_history
+            && !first_parent
+            && !parents
+            && !children
+            && !boundary
+            && !left_right
+            && side_filter.is_none()
+            && !timestamp
+            && !quiet
+            && !nul_terminated
+            && !objects_edge
+            && !header
+            && disk_usage.is_none()
+            && !abbrev_commit
+            && !reverse
+            && pretty == RevListPretty::Default
+            && skip_count == 0
+            && min_parents.is_none()
+            && max_parents.is_none()
+            && max_age.is_none()
+            && min_age.is_none()
+            && author_filters.is_empty()
+            && committer_filters.is_empty()
+            && grep_filters.is_empty()
+            && !ignore_missing
+            && !matches!(object_filter, RevListObjectFilter::TreeDepth(depth) if depth > 0)
+            && if count {
+                // A max-count of reachable *objects* cannot be answered from
+                // a bitmap (no commit/object association); commit counting
+                // clamps instead (upstream try_bitmap_count).
+                !(max_count.is_some() && objects)
+            } else {
+                max_count.is_none()
+            };
+        let query = RevListBitmapQuery {
+            want_roots: &want_roots,
+            exclude_tips: &exclude_tip_oids,
+            objects,
+            count,
+            max_count,
+            object_filter,
+            filter_provided_objects,
+            unpacked,
+        };
+        if bitmap_eligible
+            && !want_roots.is_empty()
+            && rev_list_try_bitmap(&git_dir, &db, format, &query)?
+        {
+            return Ok(());
+        }
+    }
+    if !bitmap_object_tips.is_empty() {
+        // The bitmap path was not usable, and the regular walk cannot start
+        // from a non-commit tip.
+        return Err(GitError::Command(
+            "rev-list cannot start the walk from a non-commit object".into(),
+        ));
+    }
+    if filter_provided_objects && !provided_objects.is_empty() {
+        // With --filter-provided-objects the directly-provided blobs lose
+        // their filter exemption.
+        let mut kept = Vec::with_capacity(provided_objects.len());
+        for object in provided_objects.drain(..) {
+            let keep = match object_filter {
+                RevListObjectFilter::None => true,
+                // tree:0 prunes blobs along with trees; deeper limits keep them.
+                RevListObjectFilter::TreeDepth(depth) => depth > 0,
+                RevListObjectFilter::BlobNone => false,
+                RevListObjectFilter::BlobLimit(limit) => {
+                    db.read_object(&object.oid)?.body.len() < limit
+                }
+                RevListObjectFilter::ObjectType(wanted) => wanted == ObjectType::Blob,
+            };
+            if keep {
+                kept.push(object);
+            }
+        }
+        provided_objects = kept;
+    }
+
+    let mut excluded = HashSet::new();
+    for oid in exclude_tip_oids {
         for record in rev_list_walk_commits(&db, format, [oid], first_parent)? {
             excluded.insert(record.oid);
         }
@@ -891,11 +1040,17 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     } else {
         Vec::new()
     };
-    let selected_objects = if objects {
+    let mut selected_objects = if objects {
         rev_list_objects(&db, format, &selected, &excluded, object_filter)?
     } else {
         Vec::new()
     };
+    if !provided_objects.is_empty() {
+        // A provided object is emitted once, as the provided entry.
+        let provided_oids: HashSet<ObjectId> =
+            provided_objects.iter().map(|object| object.oid).collect();
+        selected_objects.retain(|object| !provided_oids.contains(&object.oid));
+    }
     if let Some(human_readable) = disk_usage {
         let disk_usage = rev_list_disk_usage(
             &git_dir,
@@ -950,6 +1105,7 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                 .count()
                 + boundary_records.len()
                 + selected_tag_objects.len()
+                + provided_objects.len()
                 + selected_objects.len()
         );
         return Ok(());
@@ -1114,6 +1270,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
     }
     for object in selected_tag_objects {
         write_rev_list_object_line(&object, object_names, nul_terminated)?;
+    }
+    for object in &provided_objects {
+        write_rev_list_object_line(object, object_names, nul_terminated)?;
     }
     for object in selected_objects {
         write_rev_list_object_line(&object, object_names, nul_terminated)?;
@@ -1739,4 +1898,276 @@ fn format_rev_list_oid(oid: &ObjectId, abbrev_commit: bool, abbrev_len: Option<u
         return hex[..width.min(hex.len())].to_string();
     }
     hex
+}
+
+// ===== --use-bitmap-index / --test-bitmap =====
+
+/// The slice of a rev-list invocation the bitmap engine can answer; built only
+/// after the eligibility allowlist passed.
+struct RevListBitmapQuery<'a> {
+    want_roots: &'a [ObjectId],
+    exclude_tips: &'a [ObjectId],
+    objects: bool,
+    count: bool,
+    max_count: Option<usize>,
+    object_filter: RevListObjectFilter,
+    filter_provided_objects: bool,
+    unpacked: bool,
+}
+
+/// Sorted set-bit positions of `words & mask`.
+fn rev_list_bitmap_and_positions(words: &[u64], mask: &[u64]) -> Vec<u32> {
+    let mut positions = Vec::new();
+    for (word_index, (word, mask_word)) in words.iter().zip(mask).enumerate() {
+        let mut remaining = word & mask_word;
+        while remaining != 0 {
+            let bit = remaining.trailing_zeros();
+            positions.push(word_index as u32 * 64 + bit);
+            remaining &= remaining - 1;
+        }
+    }
+    positions
+}
+
+fn rev_list_bitmap_and_count(words: &[u64], mask: &[u64]) -> usize {
+    words
+        .iter()
+        .zip(mask)
+        .map(|(word, mask_word)| (word & mask_word).count_ones() as usize)
+        .sum()
+}
+
+/// Attempts to answer the query from the repository's pack bitmap. Returns
+/// `Ok(false)` when no usable bitmap exists (the caller falls back to the
+/// regular walk), `Ok(true)` after printing the result.
+fn rev_list_try_bitmap(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    query: &RevListBitmapQuery<'_>,
+) -> Result<bool> {
+    let objects_dir = sley_odb::repository_objects_dir(git_dir);
+    let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
+        return Ok(false);
+    };
+
+    // Upstream's classic-path guard: with haves, at least one must be in the
+    // bitmapped pack or there is nothing to optimise here.
+    if !query.exclude_tips.is_empty()
+        && !query
+            .exclude_tips
+            .iter()
+            .any(|oid| bitmap.pack_position(oid).is_some())
+    {
+        return Ok(false);
+    }
+
+    let mut result = sley_odb::bitmap_reachable(&bitmap, db, format, query.want_roots, query.objects)?;
+    if !query.exclude_tips.is_empty() {
+        let haves =
+            sley_odb::bitmap_reachable(&bitmap, db, format, query.exclude_tips, query.objects)?;
+        result.subtract(&haves);
+    }
+    rev_list_bitmap_apply_filter(&bitmap, db, &mut result, query)?;
+
+    if query.unpacked {
+        // Upstream filter_packed_objects_from_bitmap: everything in the
+        // bitmapped pack is packed by definition; extended objects are kept
+        // only when no pack (bitmapped or otherwise) holds them.
+        result.words.iter_mut().for_each(|word| *word = 0);
+        let packed = sley_odb::packed_object_ids(&objects_dir, format)?;
+        result.extended.retain(|(oid, _)| !packed.contains(oid));
+    }
+
+    let commit_mask = bitmap.type_words(ObjectType::Commit);
+    if query.count {
+        let mut commit_count = rev_list_bitmap_and_count(&result.words, commit_mask)
+            + result
+                .extended
+                .iter()
+                .filter(|(_, object_type)| *object_type == ObjectType::Commit)
+                .count();
+        if let Some(max_count) = query.max_count {
+            commit_count = commit_count.min(max_count);
+        }
+        let mut total = commit_count;
+        if query.objects {
+            for object_type in [ObjectType::Tree, ObjectType::Blob, ObjectType::Tag] {
+                total += rev_list_bitmap_and_count(&result.words, bitmap.type_words(object_type))
+                    + result
+                        .extended
+                        .iter()
+                        .filter(|(_, extended_type)| *extended_type == object_type)
+                        .count();
+            }
+        }
+        println!("{total}");
+        return Ok(true);
+    }
+
+    // Traversal output: per-type in pack order (commits, then trees, blobs,
+    // tags when --objects), then the extended objects — bare oids throughout,
+    // mirroring upstream's show_object_fast.
+    let mut stdout = io::stdout();
+    for position in rev_list_bitmap_and_positions(&result.words, commit_mask) {
+        if let Some(oid) = bitmap.oid_at(position) {
+            writeln!(stdout, "{oid}")?;
+        }
+    }
+    if query.objects {
+        for object_type in [ObjectType::Tree, ObjectType::Blob, ObjectType::Tag] {
+            for position in
+                rev_list_bitmap_and_positions(&result.words, bitmap.type_words(object_type))
+            {
+                if let Some(oid) = bitmap.oid_at(position) {
+                    writeln!(stdout, "{oid}")?;
+                }
+            }
+        }
+    }
+    for (oid, object_type) in &result.extended {
+        if *object_type != ObjectType::Commit && !query.objects {
+            continue;
+        }
+        writeln!(stdout, "{oid}")?;
+    }
+    stdout.flush()?;
+    Ok(true)
+}
+
+/// Applies the object filter to a bitmap walk result, mirroring upstream's
+/// `filter_bitmap`: bits are cleared per type bitmap, objects the caller named
+/// directly (the want tips) are exempt unless `--filter-provided-objects`, and
+/// the extended (non-pack) objects are filtered individually.
+fn rev_list_bitmap_apply_filter(
+    bitmap: &sley_odb::LoadedPackBitmap,
+    db: &FileObjectDatabase,
+    result: &mut sley_odb::BitmapWalkResult,
+    query: &RevListBitmapQuery<'_>,
+) -> Result<()> {
+    if query.object_filter == RevListObjectFilter::None {
+        return Ok(());
+    }
+
+    // Tip exemptions (upstream find_tip_objects).
+    let word_count = result.words.len();
+    let mut tip_words = vec![0u64; word_count];
+    let mut tip_extended: HashSet<ObjectId> = HashSet::new();
+    if !query.filter_provided_objects {
+        for root in query.want_roots {
+            match bitmap.pack_position(root) {
+                Some(position) => {
+                    let word = (position / 64) as usize;
+                    if word < word_count {
+                        tip_words[word] |= 1u64 << (position % 64);
+                    }
+                }
+                None => {
+                    tip_extended.insert(*root);
+                }
+            }
+        }
+    }
+
+    let mut exclude_type = |result: &mut sley_odb::BitmapWalkResult, object_type: ObjectType| {
+        for (word, (type_word, tip_word)) in result
+            .words
+            .iter_mut()
+            .zip(bitmap.type_words(object_type).iter().zip(&tip_words))
+        {
+            *word &= !(type_word & !tip_word);
+        }
+        result.extended.retain(|(oid, extended_type)| {
+            *extended_type != object_type || tip_extended.contains(oid)
+        });
+    };
+
+    match query.object_filter {
+        RevListObjectFilter::None => {}
+        RevListObjectFilter::BlobNone => exclude_type(result, ObjectType::Blob),
+        RevListObjectFilter::BlobLimit(limit) => {
+            let blob_mask = bitmap.type_words(ObjectType::Blob);
+            for position in rev_list_bitmap_and_positions(&result.words, blob_mask) {
+                let word = (position / 64) as usize;
+                let bit = 1u64 << (position % 64);
+                if tip_words[word] & bit != 0 {
+                    continue;
+                }
+                let Some(oid) = bitmap.oid_at(position) else {
+                    continue;
+                };
+                if db.read_object(oid)?.body.len() >= limit {
+                    result.words[word] &= !bit;
+                }
+            }
+            let mut keep = Vec::with_capacity(result.extended.len());
+            for (oid, extended_type) in result.extended.drain(..) {
+                let keep_object = extended_type != ObjectType::Blob
+                    || tip_extended.contains(&oid)
+                    || db.read_object(&oid)?.body.len() < limit;
+                if keep_object {
+                    keep.push((oid, extended_type));
+                }
+            }
+            result.extended = keep;
+        }
+        RevListObjectFilter::TreeDepth(0) => {
+            exclude_type(result, ObjectType::Tree);
+            exclude_type(result, ObjectType::Blob);
+        }
+        RevListObjectFilter::ObjectType(wanted) => {
+            for object_type in [
+                ObjectType::Commit,
+                ObjectType::Tree,
+                ObjectType::Blob,
+                ObjectType::Tag,
+            ] {
+                if object_type != wanted {
+                    exclude_type(result, object_type);
+                }
+            }
+        }
+        // Excluded by the eligibility allowlist.
+        RevListObjectFilter::TreeDepth(_) => unreachable!("non-zero tree depth falls back"),
+    }
+    Ok(())
+}
+
+/// `git rev-list --test-bitmap <commit>`: verify the stored bitmap for the
+/// commit against a real reachability walk (upstream `test_bitmap_walk`).
+fn rev_list_test_bitmap(
+    git_dir: &Path,
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    include_commits: &[ObjectId],
+    exclude_tips: &[ObjectId],
+) -> Result<()> {
+    let objects_dir = sley_odb::repository_objects_dir(git_dir);
+    let Some(bitmap) = sley_odb::load_pack_bitmap(&objects_dir, format)? else {
+        eprintln!("fatal: failed to load bitmap indexes");
+        return Err(GitError::Exit(128));
+    };
+    if include_commits.len() != 1 || !exclude_tips.is_empty() {
+        eprintln!("fatal: you must specify exactly one commit to test");
+        return Err(GitError::Exit(128));
+    }
+    let tip = include_commits[0];
+    eprintln!(
+        "Bitmap v1 test ({} entries loaded)",
+        bitmap.bitmapped_commits().count()
+    );
+    let Some(stored) = bitmap.bitmap_for_commit(&tip) else {
+        eprintln!("fatal: commit '{tip}' doesn't have an indexed bitmap");
+        return Err(GitError::Exit(128));
+    };
+    let stored = std::sync::Arc::clone(stored);
+    eprintln!("Found bitmap for '{tip}'. {} bits", bitmap.object_count());
+    let walked = sley_odb::bitmap_reachable(&bitmap, db, format, &[tip], true)?;
+    if walked.extended.is_empty() && walked.words == *stored {
+        eprintln!("OK!");
+        Ok(())
+    } else {
+        eprintln!("fatal: mismatch in bitmap results");
+        Err(GitError::Exit(128))
+    }
 }

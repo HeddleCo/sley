@@ -322,18 +322,20 @@ fn repack_preferred_bitmap_tips(
     format: ObjectFormat,
 ) -> Result<HashSet<ObjectId>> {
     let config = read_repo_config(git_dir)?;
-    let prefixes: Vec<String> = config
-        .get_all("pack", None, "preferBitmapTips")
-        .into_iter()
-        .flatten()
-        .map(|prefix| {
-            if prefix.ends_with('/') {
-                prefix.to_string()
-            } else {
-                format!("{prefix}/")
-            }
-        })
-        .collect();
+    let mut prefixes: Vec<String> = Vec::new();
+    for value in config.get_all("pack", None, "preferBitmapTips") {
+        let Some(prefix) = value else {
+            // A bare `[pack] preferBitmapTips` key: git reports the missing
+            // value but continues the repack (string_list config callback).
+            eprintln!("error: missing value for 'pack.preferbitmaptips'");
+            continue;
+        };
+        if prefix.ends_with('/') {
+            prefixes.push(prefix.to_string());
+        } else {
+            prefixes.push(format!("{prefix}/"));
+        }
+    }
     let mut tips = HashSet::new();
     if prefixes.is_empty() {
         return Ok(tips);

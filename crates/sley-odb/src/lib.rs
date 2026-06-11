@@ -520,7 +520,13 @@ pub fn install_repack_result_with_bitmap(
             &result.pack_checksum,
             tips,
         )? {
-            write_pack_component(&pack_dir.join(format!("{pack_name}.bitmap")), &bitmap)?;
+            // Unlike the pack/idx/rev (content-addressed by the pack
+            // checksum), the bitmap depends on selection inputs (e.g.
+            // pack.preferBitmapTips), so an existing file must be replaced —
+            // write_pack_component's exists-skip would keep a stale selection.
+            let bitmap_path = pack_dir.join(format!("{pack_name}.bitmap"));
+            remove_file_if_exists(&bitmap_path)?;
+            write_pack_component(&bitmap_path, &bitmap)?;
         }
     }
 
@@ -2003,6 +2009,19 @@ fn collect_loose_object_ids(
         }
     }
     Ok(())
+}
+
+/// Every object id resolvable through a pack (any `.idx` or the
+/// multi-pack-index) under `objects_dir/pack`. Used by `--unpacked`
+/// filtering: an object is "unpacked" when absent from this set, regardless
+/// of a loose copy also existing.
+pub fn packed_object_ids(
+    objects_dir: impl AsRef<Path>,
+    format: ObjectFormat,
+) -> Result<HashSet<ObjectId>> {
+    let mut oids = HashSet::new();
+    collect_packed_object_ids(&objects_dir.as_ref().join("pack"), format, &mut oids)?;
+    Ok(oids)
 }
 
 fn collect_packed_object_ids(
