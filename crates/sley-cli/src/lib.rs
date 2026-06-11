@@ -8264,7 +8264,7 @@ fn symbolic_ref_cannot_delete(name: &str) -> Result<()> {
     Err(GitError::Exit(128))
 }
 
-fn status_quote_path(path: &[u8], quote_space: bool) -> String {
+pub(crate) fn status_quote_path(path: &[u8], quote_space: bool) -> String {
     let needs_quotes = path.iter().any(|&byte| {
         byte == b'"'
             || byte == b'\\'
