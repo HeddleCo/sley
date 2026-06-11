@@ -69,7 +69,11 @@ struct GrepOptions {
     line_regexp: bool,
     invert: bool,
     line_number: bool,
+    /// Whether `-n`/`--no-line-number` was given explicitly (so config defaults
+    /// are not applied over it).
+    line_number_set: bool,
     column: bool,
+    column_set: bool,
     files_with_matches: bool,
     files_without_match: bool,
     count: bool,
@@ -79,6 +83,7 @@ struct GrepOptions {
     text: bool,
     ignore_binary: bool,
     full_name: bool,
+    full_name_set: bool,
     null_data: bool,
     cached: bool,
     max_depth: Option<i64>,
@@ -102,7 +107,9 @@ impl GrepOptions {
             line_regexp: false,
             invert: false,
             line_number: false,
+            line_number_set: false,
             column: false,
+            column_set: false,
             files_with_matches: false,
             files_without_match: false,
             count: false,
@@ -112,6 +119,7 @@ impl GrepOptions {
             text: false,
             ignore_binary: false,
             full_name: false,
+            full_name_set: false,
             null_data: false,
             cached: false,
             max_depth: None,
@@ -250,7 +258,12 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             continue;
         }
         match arg.as_str() {
-            "--" => saw_double_dash = true,
+            "--" => {
+                // The option terminator is also the rev/path separator; record it
+                // as a positional marker so the later scan can split on it.
+                saw_double_dash = true;
+                positionals.push(DASHDASH.to_string());
+            }
             "-e" => {
                 let Some(value) = iter.next() else {
                     return grep_option_requires_value("-e");
@@ -289,10 +302,22 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "-w" | "--word-regexp" => opts.word = true,
             "-x" | "--line-regexp" => opts.line_regexp = true,
             "-v" | "--invert-match" => opts.invert = true,
-            "-n" | "--line-number" => opts.line_number = true,
-            "--no-line-number" => opts.line_number = false,
-            "--column" => opts.column = true,
-            "--no-column" => opts.column = false,
+            "-n" | "--line-number" => {
+                opts.line_number = true;
+                opts.line_number_set = true;
+            }
+            "--no-line-number" => {
+                opts.line_number = false;
+                opts.line_number_set = true;
+            }
+            "--column" => {
+                opts.column = true;
+                opts.column_set = true;
+            }
+            "--no-column" => {
+                opts.column = false;
+                opts.column_set = true;
+            }
             "-l" | "--files-with-matches" | "--name-only" => opts.files_with_matches = true,
             "-L" | "--files-without-match" => opts.files_without_match = true,
             "-c" | "--count" => opts.count = true,
@@ -300,8 +325,14 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
             "-o" | "--only-matching" => opts.only_matching = true,
             "-H" => opts.show_filename = Some(true),
             "-h" | "--no-filename" => opts.show_filename = Some(false),
-            "--full-name" => opts.full_name = true,
-            "--no-full-name" => opts.full_name = false,
+            "--full-name" => {
+                opts.full_name = true;
+                opts.full_name_set = true;
+            }
+            "--no-full-name" => {
+                opts.full_name = false;
+                opts.full_name_set = true;
+            }
             "-a" | "--text" => opts.text = true,
             "-I" => opts.ignore_binary = true,
             "-z" | "--null" => opts.null_data = true,
@@ -462,24 +493,20 @@ pub(crate) fn cmd_grep(args: &[String]) -> Result<()> {
         PatternTypeOption::Fixed => PatternKind::Fixed,
         _ => PatternKind::Basic,
     };
-    // `grep.*` config defaults apply only when the matching CLI flag was absent.
+    // `grep.*` config sets the default; an explicit CLI flag (tracked by the
+    // `_set` markers) overrides it. git applies config first, then CLI overrides.
     if let Some(v) = cfg_linenumber {
-        // CLI `-n`/`--no-line-number` already toggled opts.line_number; config is
-        // the default, so only apply it if no CLI flag changed it. We approximate
-        // by treating any CLI `-n` as overriding (git: linenum set by config, then
-        // OPT_NEGBIT for -n overrides). Since opts.line_number starts false and CLI
-        // sets it, prefer config only when CLI left it default-false AND config true.
-        if !opts.line_number {
+        if !opts.line_number_set {
             opts.line_number = v;
         }
     }
     if let Some(v) = cfg_column {
-        if !opts.column {
+        if !opts.column_set {
             opts.column = v;
         }
     }
     if let Some(v) = cfg_fullname {
-        if !opts.full_name {
+        if !opts.full_name_set {
             opts.full_name = v;
         }
     }
@@ -750,7 +777,10 @@ fn expand_short_flag_bundle(
             'w' => opts.word = true,
             'x' => opts.line_regexp = true,
             'v' => opts.invert = true,
-            'n' => opts.line_number = true,
+            'n' => {
+                opts.line_number = true;
+                opts.line_number_set = true;
+            }
             'l' => opts.files_with_matches = true,
             'L' => opts.files_without_match = true,
             'c' => opts.count = true,
@@ -805,13 +835,19 @@ fn grep_index_source(
     let Some(index) = sley_worktree::read_repository_index(source.git_dir, source.format)? else {
         return Ok(false);
     };
+    const CE_VALID: u16 = 0x8000;
     let mut any = false;
     let mut printed_file = false;
     for entry in &index.entries {
+        // Skip higher merge stages.
         if (entry.flags >> 12) & 0x3 != 0 {
             continue;
         }
         if entry.mode == 0o160000 {
+            continue;
+        }
+        // Skip skip-worktree entries unless --cached (git: `!cached && skip_worktree`).
+        if !plan.opts.cached && entry.is_skip_worktree() {
             continue;
         }
         let path = &entry.path;
@@ -821,26 +857,21 @@ fn grep_index_source(
         if !plan.pathspec.within_max_depth(path, plan.opts.max_depth) {
             continue;
         }
-        // CE_VALID (assume-unchanged) and intent-to-add entries: for a working-tree
-        // search git falls back to the worktree file. When the worktree file is
-        // gone but the entry has CE_VALID, git uses the cached blob.
-        let content: Cow<'_, [u8]> = if plan.opts.cached {
+        // git: if `cached || CE_VALID`, use the cached blob, but skip stage-N and
+        // intent-to-add entries entirely (they carry no real content to grep).
+        // Otherwise grep the live worktree file.
+        let use_cached = plan.opts.cached || (entry.flags & CE_VALID) != 0;
+        let content: Cow<'_, [u8]> = if use_cached {
+            if entry.is_intent_to_add() {
+                continue;
+            }
             let object = source.db.read_object(&entry.oid)?;
             Cow::Owned(object.body.to_vec())
         } else {
             let absolute = source.worktree_root.join(bytes_to_path(path));
             match fs::read(&absolute) {
                 Ok(bytes) => Cow::Owned(bytes),
-                Err(_) => {
-                    // CE_VALID (assume-unchanged) falls back to the indexed blob
-                    // when the worktree file is gone.
-                    if (entry.flags & 0x8000) != 0 {
-                        let object = source.db.read_object(&entry.oid)?;
-                        Cow::Owned(object.body.to_vec())
-                    } else {
-                        continue;
-                    }
-                }
+                Err(_) => continue,
             }
         };
         let display = plan.pathspec.display(path);
@@ -974,6 +1005,11 @@ fn grep_buffer(
     let any = !hits.is_empty();
 
     if opts.name_only_quiet {
+        // git's `status_only` returns `unmatch_name_only` for files that reached
+        // the end without a hit: with `-L`, a file with no match counts as a hit.
+        if opts.files_without_match {
+            return Ok(!any);
+        }
         return Ok(any);
     }
 
