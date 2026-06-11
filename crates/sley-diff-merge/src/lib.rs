@@ -4121,8 +4121,6 @@ struct MergeRename {
 struct RenameDelete {
     /// The pre-rename source path (deleted on the other side).
     source: Vec<u8>,
-    /// The post-rename destination path (the surviving renamed content).
-    dest: Vec<u8>,
     /// Which side performed the rename (the other side deleted the source).
     side: RenameSide,
 }
@@ -4260,7 +4258,6 @@ fn collect_side_renames(
                     .entry(new.clone())
                     .or_insert(RenameDelete {
                         source: old.clone(),
-                        dest: new.clone(),
                         side,
                     });
             }
