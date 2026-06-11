@@ -379,6 +379,38 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     "checkout currently supports: checkout [-q] <branch> or checkout [-q] -b|-B <branch> [<start>]".into(),
                 ));
             };
+            // A target that is not an existing branch but resolves to a commit-ish
+            // (e.g. `A^0`, a tag, a raw oid) is a *detached HEAD* checkout, not a
+            // branch switch. git detaches HEAD at the resolved commit; treating it
+            // as a branch name would mint a bogus `refs/heads/A^0` symref.
+            let store = FileRefStore::new(&git_dir, format);
+            let is_branch = sley_refs::resolve_ref_peeled(&store, &branch_ref_name(branch)?)
+                .ok()
+                .flatten()
+                .is_some();
+            if !is_branch
+                && let Ok(target_oid) = sley_rev::resolve_revision(&git_dir, format, branch)
+            {
+                let config = read_repo_config(&git_dir)?;
+                let subject = detached_checkout_subject(&git_dir, format, &target_oid);
+                sley_worktree::checkout_detached_filtered(
+                    &worktree_root,
+                    &git_dir,
+                    format,
+                    &target_oid,
+                    commit_identity_from_env("COMMITTER")?,
+                    format!("checkout: moving to {branch}").into_bytes(),
+                    &config,
+                )?;
+                if !quiet {
+                    eprintln!(
+                        "HEAD is now at {} {}",
+                        format_log_abbrev_oid(&target_oid),
+                        subject
+                    );
+                }
+                return Ok(());
+            }
             CheckoutMessage::Existing {
                 branch: branch.clone(),
             }
@@ -1918,6 +1950,28 @@ fn read_head_commit(git_dir: &Path, format: ObjectFormat) -> Result<Option<Commi
         )));
     }
     Commit::parse(format, &object.body).map(Some)
+}
+
+/// First line of the commit message at `oid`, for the `HEAD is now at <oid>
+/// <subject>` line a detached-HEAD checkout prints. Best-effort: an unreadable or
+/// non-commit object yields an empty subject (git still prints the abbreviated
+/// oid).
+fn detached_checkout_subject(git_dir: &Path, format: ObjectFormat, oid: &ObjectId) -> String {
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let Ok(object) = db.read_object(oid) else {
+        return String::new();
+    };
+    if object.object_type != ObjectType::Commit {
+        return String::new();
+    }
+    let Ok(commit) = Commit::parse(format, &object.body) else {
+        return String::new();
+    };
+    String::from_utf8_lossy(&commit.message)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 fn build_reused_commit_author_identity(
