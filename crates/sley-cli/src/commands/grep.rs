@@ -11,7 +11,6 @@
 //! see `commands::stash` for the rationale.
 
 use crate::*;
-use sley_object::TreeEntries;
 use std::borrow::Cow;
 
 /// How the regular expression text is interpreted.
@@ -910,14 +909,16 @@ fn grep_tree_source(
     plan: &GrepPlan<'_>,
     out: &mut impl Write,
 ) -> Result<bool> {
-    let mut entries: Vec<(Vec<u8>, ObjectId)> = Vec::new();
-    collect_tree_blobs(
-        source.db,
-        source.format,
-        source.tree_oid,
-        &mut Vec::new(),
-        &mut entries,
-    )?;
+    // Flatten via the canonical primitive, then keep only the entries the
+    // original tree-blob walk emitted: plain blobs and symlinks, but never
+    // gitlinks (mode 0o160000). `flatten_tree` yields a path-sorted map, which
+    // is the order `git grep <tree-ish>` prints in.
+    let entries: Vec<(Vec<u8>, ObjectId)> =
+        sley_diff_merge::flatten_tree(source.db, source.format, source.tree_oid)?
+            .into_iter()
+            .filter(|(_, (mode, _))| *mode != 0o160000)
+            .map(|(path, (_mode, oid))| (path, oid))
+            .collect();
     let mut any = false;
     let mut printed_file = false;
     for (path, oid) in entries {
@@ -934,39 +935,6 @@ fn grep_tree_source(
         any = any || matched;
     }
     Ok(any)
-}
-
-fn collect_tree_blobs(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    prefix: &mut Vec<u8>,
-    out: &mut Vec<(Vec<u8>, ObjectId)>,
-) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Ok(());
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let object_type = tree_entry_object_type(entry.mode);
-        let base_len = prefix.len();
-        if !prefix.is_empty() {
-            prefix.push(b'/');
-        }
-        prefix.extend_from_slice(entry.name);
-        match object_type {
-            ObjectType::Tree => {
-                collect_tree_blobs(db, format, &entry.oid, prefix, out)?;
-            }
-            ObjectType::Blob if entry.mode != 0o160000 => {
-                out.push((prefix.clone(), entry.oid));
-            }
-            _ => {}
-        }
-        prefix.truncate(base_len);
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

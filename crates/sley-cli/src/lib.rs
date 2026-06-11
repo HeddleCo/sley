@@ -1043,45 +1043,15 @@ fn reflog_reference_name(value: Option<&str>) -> Result<String> {
 
 /// Recursively map a tree's blob entries to `(mode, oid)` keyed by full path.
 /// Shared by the stash and merge/cherry-pick/revert replay machinery.
+///
+/// Thin wrapper over the canonical [`sley_diff_merge::flatten_tree`]; the local
+/// recursive flattener was a byte-identical copy.
 fn stash_tree_entry_map(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     tree_oid: &ObjectId,
 ) -> Result<BTreeMap<Vec<u8>, (u32, ObjectId)>> {
-    let mut entries = BTreeMap::new();
-    collect_stash_tree_entry_map(db, format, tree_oid, Vec::new(), &mut entries)?;
-    Ok(entries)
-}
-
-fn collect_stash_tree_entry_map(
-    db: &FileObjectDatabase,
-    format: ObjectFormat,
-    tree_oid: &ObjectId,
-    prefix: Vec<u8>,
-    entries: &mut BTreeMap<Vec<u8>, (u32, ObjectId)>,
-) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {}, found {}",
-            tree_oid,
-            object.object_type.as_str()
-        )));
-    }
-    for entry in TreeEntries::new(format, &object.body) {
-        let entry = entry?;
-        let mut path = prefix.clone();
-        if !path.is_empty() {
-            path.push(b'/');
-        }
-        path.extend_from_slice(entry.name);
-        if entry.mode == 0o040000 {
-            collect_stash_tree_entry_map(db, format, &entry.oid, path, entries)?;
-        } else {
-            entries.insert(path, (entry.mode, entry.oid));
-        }
-    }
-    Ok(())
+    sley_diff_merge::flatten_tree(db, format, tree_oid)
 }
 
 fn ancestor_depths(
