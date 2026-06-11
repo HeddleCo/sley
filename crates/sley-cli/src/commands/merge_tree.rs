@@ -320,6 +320,7 @@ fn run_real_merge(options: &MergeTreeOptions) -> Result<()> {
             // merge path; merge-tree parity is preserved byte-for-byte).
             detect_renames: false,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            directory_renames: sley_diff_merge::DirectoryRenames::False,
         },
     )?;
     let outcome = render_merge_outcome(&merge, branch1, branch2);
@@ -494,6 +495,21 @@ fn render_merge_outcome(
                     message: format!(
                         "CONFLICT (modify/delete): {path} deleted in {deleted_in} and modified in {modified_in}.  Version {modified_in} of {path} left in tree.",
                         path = String::from_utf8_lossy(path),
+                    ),
+                });
+            }
+            sley_diff_merge::MergeConflictKind::RenameDelete {
+                old_path,
+                renamed_in,
+                deleted_in,
+            } => {
+                conflict_messages.push(InfoMessage {
+                    paths: vec![old_path.clone(), path.clone()],
+                    stable_type: "CONFLICT (rename/delete)".to_string(),
+                    message: format!(
+                        "CONFLICT (rename/delete): {old} renamed to {new} in {renamed_in}, but deleted in {deleted_in}.",
+                        old = String::from_utf8_lossy(old_path),
+                        new = String::from_utf8_lossy(path),
                     ),
                 });
             }

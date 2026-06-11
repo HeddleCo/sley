@@ -64,6 +64,34 @@ pub(crate) fn merge_write_worktree_file(
     Ok(())
 }
 
+/// True when it is safe to delete the worktree file at `path` during a merge:
+/// either the file is already gone, or its on-disk content hashes to the blob
+/// `ours` (HEAD) had at that path. An untracked file (ours = `None`) or a file
+/// whose content diverges from ours' version is preserved, matching git's refusal
+/// to clobber untracked/dirty data (the rename/delete "Gollum's ring" case).
+fn worktree_file_matches_ours(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    ours: Option<&(u32, ObjectId)>,
+) -> Result<bool> {
+    let _ = db;
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let full = worktree_root.join(rel);
+    let Ok(bytes) = fs::read(&full) else {
+        // Missing/unreadable: nothing to clobber, removal is a no-op anyway.
+        return Ok(true);
+    };
+    let Some((_, ours_oid)) = ours else {
+        // The path was not tracked on ours' side; on-disk content is untracked.
+        return Ok(false);
+    };
+    let format = ours_oid.format();
+    let on_disk = sley_core::object_id_for_bytes(format, "blob", &bytes)?;
+    Ok(&on_disk == ours_oid)
+}
+
 pub(crate) fn merge_remove_worktree_file(worktree_root: &Path, path: &[u8]) -> Result<()> {
     let rel = std::str::from_utf8(path)
         .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
@@ -110,6 +138,114 @@ pub(crate) fn three_way_merge_trees(
     ours_label: &str,
     theirs_label: &str,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
+    three_way_merge_trees_with_favor(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        sley_diff_merge::MergeFavor::None,
+    )
+}
+
+/// Build the flattened entry map of the *virtual ancestor* for a 3-way merge,
+/// recursively merging the merge bases together (merge-recursive's "virtual
+/// ancestor" construction for criss-cross histories).
+///
+/// With a single merge base this is exactly that base commit's tree. With more
+/// than one (a criss-cross history) the bases are folded left-to-right: merge
+/// the running virtual ancestor with the next base, using *their* merge bases as
+/// the ancestor of that sub-merge (recursing). Conflicts in the virtual merge are
+/// resolved by writing the conflicted blob content (git keeps the conflicted
+/// state in the virtual tree, which then feeds the outer 3-way merge) — this
+/// matches merge-recursive, which does not stop on virtual-ancestor conflicts.
+fn virtual_ancestor_entry_map(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    bases: &[ObjectId],
+    git_dir: &Path,
+) -> Result<MergeTreeMap> {
+    let first = bases
+        .first()
+        .ok_or_else(|| GitError::Command("virtual ancestor needs at least one base".into()))?;
+    let acc_tree = commit_tree_oid(db, format, first)?;
+    let mut acc_map = stash_tree_entry_map(db, format, &acc_tree)?;
+    // Track the commit(s) the running virtual ancestor stands in for, so the next
+    // pairwise merge uses the correct sub-base.
+    let mut acc_commits = vec![*first];
+
+    let read_db = FileObjectDatabase::from_git_dir(git_dir, format);
+    for base in &bases[1..] {
+        let other_tree = commit_tree_oid(db, format, base)?;
+        let other_map = stash_tree_entry_map(db, format, &other_tree)?;
+
+        // Sub-base: the merge base(s) of the accumulated commits and this base.
+        // Use the first acc commit as a representative (git folds pairwise).
+        let sub_bases = merge_bases(&read_db, format, &acc_commits[0], base)?;
+        let sub_base_map = match sub_bases.first() {
+            Some(sb) => {
+                let sb_tree = commit_tree_oid(db, format, sb)?;
+                stash_tree_entry_map(db, format, &sb_tree)?
+            }
+            None => MergeTreeMap::new(),
+        };
+
+        // Merge the two bases into a new virtual ancestor tree. Conflicts are
+        // folded into the tree (the merged blob with markers is written), never
+        // surfaced — the outer merge owns conflict reporting.
+        let (results, _conflicts) = three_way_merge_trees(
+            db,
+            format,
+            &sub_base_map,
+            &acc_map,
+            &other_map,
+            "Temporary merge branch 1",
+            "Temporary merge branch 2",
+        )?;
+
+        let mut next: MergeTreeMap = BTreeMap::new();
+        for (path, result) in results {
+            match result {
+                MergePathResult::Resolved(Some(entry)) => {
+                    next.insert(path, entry);
+                }
+                MergePathResult::Resolved(None) => {}
+                MergePathResult::Conflict {
+                    worktree, ours, theirs, ..
+                } => {
+                    // Keep the conflicted content in the virtual tree, mirroring
+                    // merge-recursive (it writes the marker blob at stage 0).
+                    if let Some((mode, bytes)) = worktree {
+                        let oid =
+                            db.write_object(EncodedObject::new(ObjectType::Blob, bytes))?;
+                        next.insert(path, (mode, oid));
+                    } else if let Some(entry) = ours.or(theirs) {
+                        next.insert(path, entry);
+                    }
+                }
+            }
+        }
+        acc_map = next;
+        acc_commits = vec![*base];
+    }
+    Ok(acc_map)
+}
+
+/// Like [`three_way_merge_trees`] but with an explicit `-Xours`/`-Xtheirs`
+/// conflict-favouring choice (used by `git merge -X ours|theirs`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_with_favor(
+    db: &mut FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+) -> Result<(MergePathResults, MergeConflictPaths)> {
     let merge = sley_diff_merge::merge_entry_maps(
         db,
         format,
@@ -120,13 +256,16 @@ pub(crate) fn three_way_merge_trees(
             ours_label,
             theirs_label,
             ancestor_label: "merged common ancestors",
-            favor: sley_diff_merge::MergeFavor::None,
-            // Rename-aware non-recursive merge: a file renamed on one side and
-            // modified on the other follows the rename (the merge-ort
-            // single-base rename case). Recursive/criss-cross bases remain a
-            // later stage.
+            favor,
+            // Rename-aware merge: a file renamed on one side and modified on the
+            // other follows the rename (the merge-ort single-base rename case).
             detect_renames: true,
             rename_threshold: sley_diff_merge::DEFAULT_RENAME_THRESHOLD,
+            // Directory-rename detection honours `merge.directoryRenames` (git's
+            // default is `conflict`). When one side renames a directory and the
+            // other adds files under the old directory, those files re-home into
+            // the renamed directory.
+            directory_renames: directory_renames_config(),
         },
     )?;
 
@@ -224,13 +363,67 @@ fn merge_commit_and_advance(
     Ok(oid)
 }
 
-#[derive(Default)]
 struct MergeOptions {
     message: Option<String>,
     no_ff: bool,
     ff_only: bool,
     no_commit: bool,
     quiet: bool,
+    /// `-X ours` / `-X theirs` conflict favouring for textual conflicts.
+    favor: sley_diff_merge::MergeFavor,
+}
+
+impl Default for MergeOptions {
+    fn default() -> Self {
+        Self {
+            message: None,
+            no_ff: false,
+            ff_only: false,
+            no_commit: false,
+            quiet: false,
+            favor: sley_diff_merge::MergeFavor::None,
+        }
+    }
+}
+
+/// Accept a `-s <strategy>` value. sley implements a single 3-way merge engine
+/// equivalent to git's `ort` (the modern default, byte-compatible with the older
+/// `recursive` on the cases we model), so both names are accepted; any other
+/// named strategy is rejected.
+fn accept_merge_strategy(value: &str) -> Result<()> {
+    match value {
+        "recursive" | "ort" => Ok(()),
+        other => Err(GitError::Command(format!(
+            "merge strategy '{other}' is not supported"
+        ))),
+    }
+}
+
+/// Apply a `-X <option>` strategy option, recognising the conflict-favouring
+/// `ours`/`theirs` knobs and tolerating the whitespace/diff-algorithm options
+/// that do not change which bytes win for the cases sley models.
+fn apply_merge_strategy_option(value: &str, options: &mut MergeOptions) -> Result<()> {
+    use sley_diff_merge::MergeFavor;
+    match value {
+        "ours" => options.favor = MergeFavor::Ours,
+        "theirs" => options.favor = MergeFavor::Theirs,
+        "ignore-space-change" | "ignore-all-space" | "ignore-space-at-eol"
+        | "ignore-cr-at-eol" | "renormalize" | "no-renormalize" | "find-renames"
+        | "no-renames" | "diff-algorithm" | "patience" | "histogram" | "subtree" => {}
+        other => {
+            if other.starts_with("find-renames=")
+                || other.starts_with("rename-threshold=")
+                || other.starts_with("diff-algorithm=")
+                || other.starts_with("subtree=")
+            {
+                return Ok(());
+            }
+            return Err(GitError::Command(format!(
+                "merge strategy option '{other}' is not supported"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The short name of the branch HEAD points at (`refs/heads/<name>` → `<name>`),
@@ -242,6 +435,37 @@ fn current_branch_short_name(refs: &FileRefStore) -> Result<Option<String>> {
             Ok(target.strip_prefix("refs/heads/").map(str::to_string))
         }
         _ => Ok(None),
+    }
+}
+
+/// The effective repository config with command-line `-c` / `--config-env` /
+/// `GIT_CONFIG_*` overrides layered on top (highest precedence), mirroring how
+/// git applies `-c` to every config read — not just `git config`. Returns `None`
+/// outside a repository.
+fn effective_config_with_overrides() -> Option<GitConfig> {
+    let mut config = identity_effective_config()?;
+    if let Ok(parameters) = crate::injected_config_parameters() {
+        config
+            .sections
+            .extend(sley_config::injected_config_sections(&parameters));
+    }
+    Some(config)
+}
+
+/// Read `merge.directoryRenames` from the effective config, mapping it to the
+/// library's [`sley_diff_merge::DirectoryRenames`]. git's default (when unset or
+/// unrecognised) is `conflict`: directory renames are detected but each re-homed
+/// path is flagged rather than applied silently.
+fn directory_renames_config() -> sley_diff_merge::DirectoryRenames {
+    use sley_diff_merge::DirectoryRenames;
+    let value = effective_config_with_overrides()
+        .and_then(|config| config.get("merge", None, "directoryRenames").map(str::to_string));
+    match value.as_deref() {
+        Some("false") => DirectoryRenames::False,
+        Some("true") => DirectoryRenames::True,
+        Some("conflict") | None => DirectoryRenames::Conflict,
+        // Unknown values fall back to git's default.
+        Some(_) => DirectoryRenames::Conflict,
     }
 }
 
@@ -386,6 +610,33 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                 options.message = value
                     .strip_prefix("--message=")
                     .map(|value| value.to_string());
+            }
+            "-s" | "--strategy" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("merge -s requires a value".into()))?;
+                accept_merge_strategy(value)?;
+            }
+            value if value.starts_with("--strategy=") => {
+                accept_merge_strategy(value.strip_prefix("--strategy=").unwrap_or(""))?;
+            }
+            value if value.starts_with("-s") && value.len() > 2 => {
+                accept_merge_strategy(&value[2..])?;
+            }
+            "-X" | "--strategy-option" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("merge -X requires a value".into()))?;
+                apply_merge_strategy_option(value, &mut options)?;
+            }
+            value if value.starts_with("--strategy-option=") => {
+                apply_merge_strategy_option(
+                    value.strip_prefix("--strategy-option=").unwrap_or(""),
+                    &mut options,
+                )?;
+            }
+            value if value.starts_with("-X") && value.len() > 2 => {
+                apply_merge_strategy_option(&value[2..], &mut options)?;
             }
             "--" => {
                 positional.extend(iter.by_ref().map(|value| value.to_string()));
@@ -553,28 +804,27 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
     }
 
     // True 3-way merge.
-    let base_oid = bases.first().cloned();
-    if base_oid.is_none() {
+    if bases.is_empty() {
         eprintln!("fatal: refusing to merge unrelated histories");
         return Err(GitError::Exit(128));
     }
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let other_tree = commit_tree_oid(&db, format, &other_oid)?;
-    let base_tree = match &base_oid {
-        Some(oid) => Some(commit_tree_oid(&db, format, oid)?),
-        None => None,
-    };
     let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
     let theirs_map = stash_tree_entry_map(&db, format, &other_tree)?;
-    let base_map = match &base_tree {
-        Some(tree) => stash_tree_entry_map(&db, format, tree)?,
-        None => MergeTreeMap::new(),
-    };
 
     let ours_label = "HEAD".to_string();
     let theirs_label = target.clone();
     let mut write_db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let (results, conflicts) = three_way_merge_trees(
+
+    // Recursive merge of the merge bases into a single virtual ancestor tree
+    // (the merge-recursive "virtual ancestor" — git's behaviour for a
+    // criss-cross history with >1 merge base). With a single base this is just
+    // that base's tree, so the common case is unchanged.
+    let base_map =
+        virtual_ancestor_entry_map(&mut write_db, format, &bases, &common_git_dir)?;
+
+    let (results, conflicts) = three_way_merge_trees_with_favor(
         &mut write_db,
         format,
         &base_map,
@@ -582,6 +832,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
         &theirs_map,
         &ours_label,
         &theirs_label,
+        options.favor,
     )?;
 
     let target_is_branch = match branch_ref_name(&target) {
@@ -712,12 +963,25 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
                     merge_write_worktree_file(&worktree_root, path, &content, *mode)?;
                 }
             }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(&worktree_root, path)?,
+            MergePathResult::Resolved(None) => {
+                // git only removes a worktree file when its content is the tracked
+                // (ours/HEAD) version; an untracked file or one with divergent
+                // content at this path is left alone (the rename/delete "Gollum's
+                // ring" safety case). When the path was not in ours, or the file
+                // on disk differs from ours' blob, preserve it.
+                if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
+                    merge_remove_worktree_file(&worktree_root, path)?;
+                }
+            }
             MergePathResult::Conflict { worktree, .. } => match worktree {
                 Some((mode, content)) => {
                     merge_write_worktree_file(&worktree_root, path, content, *mode)?
                 }
-                None => merge_remove_worktree_file(&worktree_root, path)?,
+                None => {
+                    if worktree_file_matches_ours(&db, &worktree_root, path, ours_map.get(path))? {
+                        merge_remove_worktree_file(&worktree_root, path)?;
+                    }
+                }
             },
         }
     }

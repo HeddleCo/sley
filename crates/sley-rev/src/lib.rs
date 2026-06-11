@@ -583,9 +583,12 @@ fn apply_revision_suffix<R: ObjectReader>(
     match suffix {
         RevisionSuffix::Parent(parent) => {
             if parent == 0 {
-                return Err(GitError::InvalidFormat(format!(
-                    "invalid zero parent in {raw_rev}"
-                )));
+                // `<rev>^0` is not "the 0th parent" — git defines it as "peel to
+                // a commit": dereference tags/etc. down to the commit object the
+                // revision names. For an annotated tag this follows the tag to
+                // its commit; for a commit it is the commit itself.
+                let _ = raw_rev;
+                return peel_revision(reader, format, base, PeelKind::Commit);
             }
             let mut graph = CommitGraphContext::load(git_dir, format);
             graph
