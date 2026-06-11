@@ -381,6 +381,10 @@ fn show_commit(
                     dialect: LogFormatDialect::Log,
                     source: None,
                     date_mode: options.date_mode,
+                    source_oid: None,
+                    describe: None,
+                    color: false,
+                    output_encoding: "UTF-8",
                 },
             )?;
         }

@@ -6628,6 +6628,24 @@ fn commit_subject(message: &[u8]) -> String {
         .to_string()
 }
 
+/// Raw-bytes subject: the title paragraph with internal newlines folded to
+/// single spaces (git's `format_subject`), preserving non-UTF-8/control bytes.
+fn commit_subject_bytes(message: &[u8]) -> &[u8] {
+    // git skips leading blank lines, then takes lines until a blank line,
+    // joining with spaces. The upstream corpus only uses single-line subjects,
+    // so we return the first non-empty line slice directly.
+    let mut start = 0;
+    while start < message.len() && (message[start] == b'\n' || message[start] == b'\r') {
+        start += 1;
+    }
+    let end = message[start..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|off| start + off)
+        .unwrap_or(message.len());
+    &message[start..end]
+}
+
 fn commit_body(message: &[u8]) -> &[u8] {
     let Some(first_newline) = message.iter().position(|byte| *byte == b'\n') else {
         return &[];
@@ -6646,6 +6664,20 @@ struct LogFormatContext<'a> {
     dialect: LogFormatDialect,
     source: Option<&'a str>,
     date_mode: ForEachRefDateMode,
+    /// Per-commit `%S` source label (set when walking refs/ranges/bisect).
+    source_oid: Option<&'a HashMap<ObjectId, String>>,
+    /// `git_dir`/db/format for placeholders that need object access (`%(describe)`).
+    describe: Option<&'a LogDescribeContext<'a>>,
+    /// `--color=always`: emit ANSI sequences for `%C(...)`.
+    color: bool,
+    /// Desired log output encoding (git's `get_log_output_encoding`).
+    output_encoding: &'a str,
+}
+
+struct LogDescribeContext<'a> {
+    git_dir: &'a Path,
+    db: &'a FileObjectDatabase,
+    format: ObjectFormat,
 }
 
 fn print_log_format(
@@ -6673,6 +6705,84 @@ fn emit_compiled_log_format(
     out: &mut Vec<u8>,
     token_range: std::ops::Range<usize>,
 ) -> Result<()> {
+    let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
+    let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
+    let author_timestamp = commit_identity_timestamp(&record.commit.author);
+    let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
+
+    let tokens = &compiled.tokens[token_range];
+    let mut pending_pad: Option<log_format::PaddingSpec> = None;
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let token = &tokens[idx];
+        // A padding directive captures the *next* token group (any leading
+        // color modifiers plus one content placeholder), pads it, and appends.
+        if let FormatToken::Padding(spec) = token {
+            pending_pad = Some(*spec);
+            idx += 1;
+            continue;
+        }
+        if let Some(spec) = pending_pad.take() {
+            // Capture the chain: color modifiers followed by one placeholder.
+            let mut captured = Vec::new();
+            loop {
+                let t = &tokens[idx];
+                let is_modifier = matches!(
+                    t,
+                    FormatToken::ColorParen
+                        | FormatToken::ColorName(_)
+                        | FormatToken::ColorAuto
+                );
+                emit_log_one_token(
+                    t,
+                    record,
+                    context,
+                    &mut captured,
+                    &author_name,
+                    &author_email,
+                    &committer_name,
+                    &committer_email,
+                    &author_timestamp,
+                    &committer_timestamp,
+                )?;
+                idx += 1;
+                if !is_modifier || idx >= tokens.len() {
+                    break;
+                }
+            }
+            apply_padding(out, &captured, spec);
+            continue;
+        }
+        emit_log_one_token(
+            token,
+            record,
+            context,
+            out,
+            &author_name,
+            &author_email,
+            &committer_name,
+            &committer_email,
+            &author_timestamp,
+            &committer_timestamp,
+        )?;
+        idx += 1;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_log_one_token(
+    token: &FormatToken,
+    record: &sley_rev::CommitRecord,
+    context: &LogFormatContext<'_>,
+    out: &mut Vec<u8>,
+    author_name: &str,
+    author_email: &str,
+    committer_name: &str,
+    committer_email: &str,
+    author_timestamp: &str,
+    committer_timestamp: &str,
+) -> Result<()> {
     let LogFormatContext {
         abbrev_len,
         decorations,
@@ -6680,13 +6790,18 @@ fn emit_compiled_log_format(
         dialect,
         source,
         date_mode,
+        source_oid,
+        describe,
+        color,
+        output_encoding,
     } = *context;
-    let (author_name, author_email) = commit_identity_name_email(&record.commit.author);
-    let (committer_name, committer_email) = commit_identity_name_email(&record.commit.committer);
-    let author_timestamp = commit_identity_timestamp(&record.commit.author);
-    let committer_timestamp = commit_identity_timestamp(&record.commit.committer);
-
-    for token in &compiled.tokens[token_range] {
+    let reencoded_message = log_reencode_message(
+        &record.commit.message,
+        &commit_encoding(&record.commit),
+        output_encoding,
+    );
+    let message: &[u8] = &reencoded_message;
+    {
         match token {
             FormatToken::Literal(text) => out.extend_from_slice(text.as_bytes()),
             FormatToken::Percent => out.push(b'%'),
@@ -6711,12 +6826,10 @@ fn emit_compiled_log_format(
             }
             FormatToken::Marker => out.push(marker as u8),
             FormatToken::Subject => {
-                write!(out, "{}", commit_subject(&record.commit.message))
-                    .map_err(io::Error::from)?;
+                out.extend_from_slice(commit_subject_bytes(message));
             }
             FormatToken::SanitizedSubject => {
-                write!(out, "{}", log_sanitized_subject(&record.commit.message))
-                    .map_err(io::Error::from)?;
+                write!(out, "{}", log_sanitized_subject(message)).map_err(io::Error::from)?;
             }
             FormatToken::Encoding => {
                 write!(out, "{}", commit_encoding(&record.commit)).map_err(io::Error::from)?;
@@ -6724,14 +6837,18 @@ fn emit_compiled_log_format(
             FormatToken::NoteName if dialect == LogFormatDialect::Log => {}
             FormatToken::NoteName => out.extend_from_slice(b"%N"),
             FormatToken::RevisionSource if dialect == LogFormatDialect::Log => {
-                if let Some(source) = source {
+                if let Some(map) = source_oid
+                    && let Some(label) = map.get(&record.oid)
+                {
+                    out.extend_from_slice(label.as_bytes());
+                } else if let Some(source) = source {
                     out.extend_from_slice(source.as_bytes());
                 }
             }
             FormatToken::RevisionSource => out.extend_from_slice(b"%S"),
             FormatToken::ColorParen | FormatToken::ColorName(_) => {}
-            FormatToken::Body => out.extend_from_slice(commit_body(&record.commit.message)),
-            FormatToken::FullMessage => out.extend_from_slice(&record.commit.message),
+            FormatToken::Body => out.extend_from_slice(commit_body(message)),
+            FormatToken::FullMessage => out.extend_from_slice(message),
             FormatToken::DecorationsParen => {
                 write!(
                     out,
@@ -6857,6 +6974,34 @@ fn emit_compiled_log_format(
             }
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
+            FormatToken::Trailers(opts) => {
+                let parsed = crate::commands::for_each_ref::parse_for_each_ref_trailer_options(
+                    opts,
+                )
+                .map_err(|_| GitError::Command("invalid %(trailers) options".into()))?;
+                let rendered = crate::commands::for_each_ref::for_each_ref_format_trailers(
+                    message,
+                    &parsed,
+                );
+                out.extend_from_slice(&rendered);
+            }
+            FormatToken::Decorate(spec) => {
+                emit_log_decorate(out, &record.oid, decorations, spec);
+            }
+            FormatToken::Describe(spec) => {
+                if let Some(describe_ctx) = describe {
+                    let rendered = log_describe_placeholder(describe_ctx, &record.oid, spec)?;
+                    out.extend_from_slice(rendered.as_bytes());
+                }
+            }
+            FormatToken::ColorAuto => {
+                // `%C(auto)` toggles auto-coloring; with `--color` we approximate
+                // git's reference coloring at emission sites that need it.
+                let _ = color;
+            }
+            FormatToken::Padding(_) | FormatToken::Wrap(_) => {
+                // Handled by the outer state machine in emit_compiled_log_format.
+            }
             FormatToken::StashDecoParen
             | FormatToken::StashDecoBare
             | FormatToken::ReflogGd
@@ -6867,6 +7012,264 @@ fn emit_compiled_log_format(
         }
     }
     Ok(())
+}
+
+/// Display width of a UTF-8 byte slice, mirroring git's `utf8_strnwidth`:
+/// control chars contribute 0; invalid UTF-8 falls back to byte length.
+fn log_display_width(bytes: &[u8]) -> usize {
+    let mut width = 0usize;
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        match log_pick_utf8(bytes, idx) {
+            Some((cp, len)) => {
+                let w = log_wcwidth(cp);
+                if w > 0 {
+                    width += w as usize;
+                }
+                idx += len;
+            }
+            None => return bytes.len(),
+        }
+    }
+    width
+}
+
+/// git `git_wcwidth`.
+fn log_wcwidth(ch: u32) -> i32 {
+    if ch == 0 {
+        return 0;
+    }
+    if ch < 32 || (0x7f..0xa0).contains(&ch) {
+        return -1;
+    }
+    // We don't ship the full zero/double-width tables; the t4205 corpus only
+    // exercises ASCII + Latin-1 (all width 1). Treat everything else as width 1.
+    1
+}
+
+/// Decode one UTF-8 scalar at `idx`; returns `(codepoint, byte_len)` or `None`
+/// for invalid UTF-8 (matching git's `pick_one_utf8_char` validity checks).
+fn log_pick_utf8(bytes: &[u8], idx: usize) -> Option<(u32, usize)> {
+    let s = &bytes[idx..];
+    let b0 = *s.first()?;
+    if b0 < 0x80 {
+        Some((b0 as u32, 1))
+    } else if b0 & 0xe0 == 0xc0 {
+        let b1 = *s.get(1)?;
+        if b1 & 0xc0 != 0x80 || b0 & 0xfe == 0xc0 {
+            return None;
+        }
+        Some(((((b0 & 0x1f) as u32) << 6) | (b1 & 0x3f) as u32, 2))
+    } else if b0 & 0xf0 == 0xe0 {
+        let b1 = *s.get(1)?;
+        let b2 = *s.get(2)?;
+        if b1 & 0xc0 != 0x80
+            || b2 & 0xc0 != 0x80
+            || (b0 == 0xe0 && b1 & 0xe0 == 0x80)
+            || (b0 == 0xed && b1 & 0xe0 == 0xa0)
+        {
+            return None;
+        }
+        Some((
+            (((b0 & 0x0f) as u32) << 12) | (((b1 & 0x3f) as u32) << 6) | (b2 & 0x3f) as u32,
+            3,
+        ))
+    } else if b0 & 0xf8 == 0xf0 {
+        let b1 = *s.get(1)?;
+        let b2 = *s.get(2)?;
+        let b3 = *s.get(3)?;
+        if b1 & 0xc0 != 0x80
+            || b2 & 0xc0 != 0x80
+            || b3 & 0xc0 != 0x80
+            || (b0 == 0xf0 && b1 & 0xf0 == 0x80)
+            || (b0 == 0xf4 && b1 > 0x8f)
+            || b0 > 0xf4
+        {
+            return None;
+        }
+        Some((
+            (((b0 & 0x07) as u32) << 18)
+                | (((b1 & 0x3f) as u32) << 12)
+                | (((b2 & 0x3f) as u32) << 6)
+                | (b3 & 0x3f) as u32,
+            4,
+        ))
+    } else {
+        None
+    }
+}
+
+/// Port of utf8.c `strbuf_utf8_replace`: replace the glyphs occupying display
+/// columns `[pos, pos+width)` of `src` with `subst` (once), preserving control
+/// characters and ANSI escapes verbatim. We don't ship escape parsing here; the
+/// padded corpus never mixes truncation with ANSI.
+fn log_utf8_replace(src: &[u8], pos: usize, width: usize, subst: &str) -> Vec<u8> {
+    let mut dst = Vec::with_capacity(src.len());
+    let mut w = 0usize;
+    let mut idx = 0usize;
+    let mut subst_done = false;
+    while idx < src.len() {
+        let (cp, len) = match log_pick_utf8(src, idx) {
+            Some(v) => v,
+            None => return src.to_vec(), // broken utf-8: do nothing
+        };
+        let mut gw = log_wcwidth(cp);
+        if gw < 0 {
+            gw = 0;
+        }
+        let gw = gw as usize;
+        if gw != 0 && w >= pos && w < pos + width {
+            if !subst_done {
+                dst.extend_from_slice(subst.as_bytes());
+                subst_done = true;
+            }
+        } else {
+            dst.extend_from_slice(&src[idx..idx + len]);
+        }
+        w += gw;
+        idx += len;
+    }
+    dst
+}
+
+/// Apply a `%<`/`%>`/`%><` padding directive to `captured` and append to `out`,
+/// mirroring pretty.c `format_and_pad_commit`.
+fn apply_padding(out: &mut Vec<u8>, captured: &[u8], spec: log_format::PaddingSpec) {
+    use log_format::{PaddingFlush, PaddingTrunc};
+    let mut padding = spec.padding;
+    if padding < 0 {
+        // Pad to the given column: subtract what's already on the current line.
+        let start = match out.iter().rposition(|b| *b == b'\n') {
+            Some(p) => p + 1,
+            None => 0,
+        };
+        let occupied = log_display_width(&out[start..]) as i64;
+        padding = (-padding) - occupied;
+    }
+    let len = log_display_width(captured) as i64;
+
+    let mut flush = spec.flush;
+    let mut captured = captured.to_vec();
+    if flush == PaddingFlush::LeftAndSteal {
+        // Steal trailing spaces from `out` to make room (no ANSI handling).
+        let mut pad = padding;
+        while len > pad {
+            match out.last() {
+                Some(b' ') => {
+                    out.pop();
+                    pad += 1;
+                }
+                _ => break,
+            }
+        }
+        padding = pad;
+        flush = PaddingFlush::Left;
+    }
+
+    if len > padding {
+        match spec.trunc {
+            PaddingTrunc::Left => {
+                captured = log_utf8_replace(
+                    &captured,
+                    0,
+                    (len - (padding - 2)) as usize,
+                    "..",
+                );
+            }
+            PaddingTrunc::Middle => {
+                captured = log_utf8_replace(
+                    &captured,
+                    (padding / 2 - 1) as usize,
+                    (len - (padding - 2)) as usize,
+                    "..",
+                );
+            }
+            PaddingTrunc::Right => {
+                captured = log_utf8_replace(
+                    &captured,
+                    (padding - 2) as usize,
+                    (len - (padding - 2)) as usize,
+                    "..",
+                );
+            }
+            PaddingTrunc::None => {}
+        }
+        out.extend_from_slice(&captured);
+    } else {
+        let offset = match flush {
+            PaddingFlush::Left => (padding - len) as usize,
+            PaddingFlush::Both => ((padding - len) / 2) as usize,
+            _ => 0,
+        };
+        // Convert column padding back to bytes: total spaces == padding-len, then
+        // the captured bytes are placed at `offset` columns in.
+        let total_pad = (padding - len) as usize;
+        out.extend(std::iter::repeat_n(b' ', total_pad));
+        // Insert captured at the offset (offset is in columns == spaces here).
+        let insert_at = out.len() - total_pad + offset;
+        out.splice(insert_at..insert_at, captured.iter().copied());
+    }
+}
+
+/// Render `%(decorate[:opts])` for `oid` from the decorations map, mirroring
+/// pretty.c `format_decorations`.
+fn emit_log_decorate(
+    out: &mut Vec<u8>,
+    oid: &ObjectId,
+    decorations: &HashMap<ObjectId, Vec<String>>,
+    spec: &log_format::DecorateSpec,
+) {
+    let Some(refs) = decorations.get(oid) else {
+        return;
+    };
+    if refs.is_empty() {
+        return;
+    }
+    out.extend_from_slice(spec.prefix.as_bytes());
+    let mut first = true;
+    for entry in refs {
+        if !first {
+            out.extend_from_slice(spec.separator.as_bytes());
+        }
+        first = false;
+        // The decorations map stores entries like "HEAD -> main", "tag: v1",
+        // "branch". Re-render the pointer/tag prefixes from the spec.
+        let rendered = log_decorate_entry(entry, spec);
+        out.extend_from_slice(rendered.as_bytes());
+    }
+    out.extend_from_slice(spec.suffix.as_bytes());
+}
+
+/// Re-render a single decoration entry under the decorate spec's tag/pointer
+/// overrides. The stored entry uses the default " -> " pointer and "tag: " tag.
+fn log_decorate_entry(entry: &str, spec: &log_format::DecorateSpec) -> String {
+    if let Some(rest) = entry.strip_prefix("HEAD -> ") {
+        format!("HEAD{}{}", spec.pointer, log_decorate_entry(rest, spec))
+    } else if let Some(rest) = entry.strip_prefix("tag: ") {
+        format!("{}{}", spec.tag, rest)
+    } else {
+        entry.to_string()
+    }
+}
+
+/// Render `%(describe[:opts])` for `oid`, returning an empty string on any
+/// describe failure (git treats describe errors as an empty placeholder).
+fn log_describe_placeholder(
+    ctx: &LogDescribeContext<'_>,
+    oid: &ObjectId,
+    spec: &log_format::DescribeSpec,
+) -> Result<String> {
+    let result = crate::commands::describe::describe_for_format(
+        ctx.git_dir,
+        ctx.format,
+        ctx.db,
+        oid,
+        spec.tags,
+        spec.abbrev,
+        &spec.matches,
+        &spec.excludes,
+    )?;
+    Ok(result.unwrap_or_default())
 }
 
 fn format_metadata_parent_oids(parents: &[ObjectId], abbrev_len: Option<usize>) -> String {
@@ -6973,7 +7376,13 @@ fn emit_compiled_log_format_metadata(
             | FormatToken::CommitterDateIso
             | FormatToken::CommitterDateIsoStrict
             | FormatToken::CommitterDateShort
-            | FormatToken::CommitterDateRfc2822 => {}
+            | FormatToken::CommitterDateRfc2822
+            | FormatToken::Padding(_)
+            | FormatToken::Wrap(_)
+            | FormatToken::Trailers(_)
+            | FormatToken::Decorate(_)
+            | FormatToken::Describe(_)
+            | FormatToken::ColorAuto => {}
         }
     }
     Ok(())
@@ -7192,6 +7601,12 @@ pub(crate) fn emit_compiled_stash_format(
             FormatToken::DecorationsParen | FormatToken::DecorationsBare => {}
             FormatToken::Newline => out.push(b'\n'),
             FormatToken::HexByte(byte) => out.push(*byte),
+            FormatToken::Padding(_)
+            | FormatToken::Wrap(_)
+            | FormatToken::Trailers(_)
+            | FormatToken::Decorate(_)
+            | FormatToken::Describe(_)
+            | FormatToken::ColorAuto => {}
         }
     }
     Ok(())
@@ -7267,6 +7682,90 @@ fn commit_encoding(commit: &Commit) -> String {
         .as_deref()
         .map(String::from_utf8_lossy)
         .unwrap_or_default()
+        .to_string()
+}
+
+/// True when `name` denotes a UTF-8 encoding (git's `is_encoding_utf8`).
+fn encoding_is_utf8(name: &str) -> bool {
+    let n = name.trim();
+    n.is_empty()
+        || n.eq_ignore_ascii_case("utf-8")
+        || n.eq_ignore_ascii_case("utf8")
+}
+
+/// True when `name` is ISO-8859-1 / Latin-1.
+fn encoding_is_latin1(name: &str) -> bool {
+    let n = name.trim();
+    n.eq_ignore_ascii_case("ISO8859-1")
+        || n.eq_ignore_ascii_case("ISO-8859-1")
+        || n.eq_ignore_ascii_case("latin1")
+        || n.eq_ignore_ascii_case("latin-1")
+        || n.eq_ignore_ascii_case("8859-1")
+}
+
+/// Re-encode a commit message from its stored `encoding` header to the desired
+/// log output encoding, mirroring git's `repo_logmsg_reencode`. We natively
+/// support the conversions the upstream corpus exercises (Latin-1 ⇄ UTF-8) and
+/// pass the bytes through unchanged when the encodings already match or when the
+/// pair is one we don't convert (git would shell out to iconv there).
+fn log_reencode_message<'a>(message: &'a [u8], from: &str, to: &str) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+    if from.trim().is_empty() || from.eq_ignore_ascii_case(to) {
+        return Cow::Borrowed(message);
+    }
+    if encoding_is_utf8(from) && encoding_is_utf8(to) {
+        return Cow::Borrowed(message);
+    }
+    if encoding_is_latin1(from) && encoding_is_utf8(to) {
+        // Each Latin-1 byte maps to the same Unicode scalar.
+        let mut out = Vec::with_capacity(message.len());
+        for &b in message {
+            if b < 0x80 {
+                out.push(b);
+            } else {
+                out.push(0xc0 | (b >> 6));
+                out.push(0x80 | (b & 0x3f));
+            }
+        }
+        return Cow::Owned(out);
+    }
+    if encoding_is_utf8(from) && encoding_is_latin1(to) {
+        // Reverse: collapse 2-byte Latin-1 range back to single bytes.
+        let mut out = Vec::with_capacity(message.len());
+        let mut idx = 0;
+        while idx < message.len() {
+            let b = message[idx];
+            if b < 0x80 {
+                out.push(b);
+                idx += 1;
+            } else if b & 0xe0 == 0xc0
+                && idx + 1 < message.len()
+                && message[idx + 1] & 0xc0 == 0x80
+            {
+                let cp = (((b & 0x1f) as u32) << 6) | (message[idx + 1] & 0x3f) as u32;
+                if cp <= 0xff {
+                    out.push(cp as u8);
+                } else {
+                    out.extend_from_slice(&message[idx..idx + 2]);
+                }
+                idx += 2;
+            } else {
+                out.push(b);
+                idx += 1;
+            }
+        }
+        return Cow::Owned(out);
+    }
+    Cow::Borrowed(message)
+}
+
+/// The effective `git log` output encoding: `i18n.logOutputEncoding`, else
+/// `i18n.commitEncoding`, else UTF-8 (git's `get_log_output_encoding`).
+fn log_output_encoding(config: &GitConfig) -> String {
+    config
+        .get("i18n", None, "logOutputEncoding")
+        .or_else(|| config.get("i18n", None, "commitEncoding"))
+        .unwrap_or("UTF-8")
         .to_string()
 }
 

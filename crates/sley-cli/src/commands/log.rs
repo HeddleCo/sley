@@ -15,6 +15,11 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut skip = 0usize;
     let mut output = LogOutput::Default;
     let mut preset_oneline: Option<bool> = None;
+    // Raw `--pretty=`/`--format=` spec captured during arg parse and resolved
+    // after config is loaded (aliases live in `pretty.<name>`). The bool is the
+    // "format kind" flag: `--format=`/`tformat:` terminate each entry with a
+    // newline; `--pretty=format:` separates entries instead.
+    let mut pretty_spec: Option<(String, bool)> = None;
     let mut reverse = false;
     let mut ordering = RevListOrdering::Default;
     let mut walk = true;
@@ -744,9 +749,21 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-show-signature=") => {
                 return log_fatal_unrecognized_argument(value);
             }
-            "--oneline" => preset_oneline = Some(false),
-            "--pretty=oneline" | "--format=oneline" => preset_oneline = Some(true),
-            "--pretty=short" | "--format=short" => output = LogOutput::Default,
+            "--oneline" => {
+                preset_oneline = Some(false);
+                pretty_spec = None;
+            }
+            "--pretty" | "--format" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command(format!("{arg} requires a value")))?;
+                pretty_spec = Some((value.to_string(), arg == "--format"));
+                preset_oneline = None;
+            }
+            value if value.starts_with("--pretty=") => {
+                pretty_spec = Some((value["--pretty=".len()..].to_string(), false));
+                preset_oneline = None;
+            }
             "-n" | "--max-count" => {
                 let value = iter
                     .next()
@@ -772,26 +789,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 skip = parse_log_count(value)?;
             }
             value if value.starts_with("--format=") => {
-                output = LogOutput::Compiled {
-                    compiled: CompiledLogFormat::compile(
-                        &value["--format=".len()..],
-                        LogFormatDialect::Log,
-                    )?,
-                    final_newline: true,
-                    show_children: false,
-                    inline_children: false,
-                };
-            }
-            value if value.starts_with("--pretty=format:") => {
-                output = LogOutput::Compiled {
-                    compiled: CompiledLogFormat::compile(
-                        &value["--pretty=format:".len()..],
-                        LogFormatDialect::Log,
-                    )?,
-                    final_newline: false,
-                    show_children: false,
-                    inline_children: false,
-                };
+                pretty_spec = Some((value["--format=".len()..].to_string(), true));
+                preset_oneline = None;
             }
             value if value.starts_with("-n") && value.len() > 2 => {
                 max_count = Some(parse_log_count(&value[2..])?);
@@ -851,6 +850,31 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         eprintln!("fatal: options '--parents' and '--children' cannot be used together");
         return Err(GitError::Exit(128));
     }
+    let git_dir = discover_git_dir(env::current_dir()?)?;
+    let format = repository_object_format(&git_dir)?;
+    let config = read_repo_config(&git_dir)?;
+    let hidden_refs = RevListHiddenRefs::from_config(&config);
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let output_encoding = log_output_encoding(&config);
+    // Resolve the captured `--pretty=`/`--format=` spec now that config (and its
+    // `pretty.<name>` aliases) is available.
+    if let Some((spec, format_kind)) = pretty_spec.take() {
+        match resolve_pretty_spec(&spec, format_kind, &config)? {
+            ResolvedPretty::Oneline => preset_oneline = Some(true),
+            ResolvedPretty::Default => output = LogOutput::Default,
+            ResolvedPretty::Compiled {
+                compiled,
+                final_newline,
+            } => {
+                output = LogOutput::Compiled {
+                    compiled,
+                    final_newline,
+                    show_children: false,
+                    inline_children: false,
+                };
+            }
+        }
+    }
     if let Some(pretty_oneline) = preset_oneline {
         if matches!(output, LogOutput::Default) {
             let use_full_oid = match pretty_oneline {
@@ -878,11 +902,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let author_filters = parse_log_filter_patterns(&author_patterns, regexp_mode)?;
     let committer_filters = parse_log_filter_patterns(&committer_patterns, regexp_mode)?;
     let grep_filters = parse_log_filter_patterns(&grep_patterns, regexp_mode)?;
-    let git_dir = discover_git_dir(env::current_dir()?)?;
-    let format = repository_object_format(&git_dir)?;
-    let config = read_repo_config(&git_dir)?;
-    let hidden_refs = RevListHiddenRefs::from_config(&config);
-    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
     let has_ref_selectors = all_refs
         || branches
         || !branch_patterns.is_empty()
@@ -1078,6 +1097,10 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                     dialect: LogFormatDialect::Log,
                     source: log_format_source.as_deref(),
                     date_mode,
+                    source_oid: None,
+                    describe: None,
+                    color: false,
+                    output_encoding: &output_encoding,
                 },
                 &mut line,
             )?;
@@ -1158,6 +1181,13 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             custom_decoration_mode.unwrap_or(decoration),
         )?
     };
+    // Object access for `%(describe)`.
+    let describe_ctx = LogDescribeContext {
+        git_dir: &git_dir,
+        db: &db,
+        format,
+    };
+    let source_labels: Option<HashMap<ObjectId, String>> = None;
     for (index, record) in selected.iter().enumerate() {
         match output {
             LogOutput::Default => {
@@ -1194,6 +1224,10 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                     dialect: LogFormatDialect::Log,
                     source: log_format_source.as_deref(),
                     date_mode,
+                    source_oid: source_labels.as_ref(),
+                    describe: Some(&describe_ctx),
+                    color: false,
+                    output_encoding: &output_encoding,
                 };
                 if compiled_children && inline_children {
                     print_log_format_with_children(
@@ -1286,6 +1320,79 @@ fn emit_compiled_reflog_walk_format(
         }
     }
     Ok(())
+}
+
+/// The outcome of resolving a `--pretty=`/`--format=` spec.
+enum ResolvedPretty {
+    Oneline,
+    Default,
+    Compiled {
+        compiled: CompiledLogFormat,
+        final_newline: bool,
+    },
+}
+
+/// Resolve a `--pretty=`/`--format=` spec into a compiled format, mirroring
+/// git's `get_commit_format` + `pretty.<name>` alias chain. `format_kind` is the
+/// `--format=`/`tformat:` flag (terminator semantics → `final_newline: true`).
+fn resolve_pretty_spec(
+    spec: &str,
+    format_kind: bool,
+    config: &GitConfig,
+) -> Result<ResolvedPretty> {
+    // Follow `pretty.<name>` aliases (case-insensitive) up to a bounded depth,
+    // matching git's loop guard against alias cycles.
+    let mut current = spec.to_string();
+    // `--format=`/`tformat:` apply terminator semantics. A `--format=X` with no
+    // recognized prefix is treated as a user format `tformat:X`.
+    let mut terminate = format_kind;
+    for _ in 0..32 {
+        if let Some(rest) = current.strip_prefix("format:") {
+            return Ok(ResolvedPretty::Compiled {
+                compiled: CompiledLogFormat::compile(rest, LogFormatDialect::Log)?,
+                final_newline: terminate,
+            });
+        }
+        if let Some(rest) = current.strip_prefix("tformat:") {
+            return Ok(ResolvedPretty::Compiled {
+                compiled: CompiledLogFormat::compile(rest, LogFormatDialect::Log)?,
+                final_newline: true,
+            });
+        }
+        match current.as_str() {
+            "oneline" => return Ok(ResolvedPretty::Oneline),
+            "short" | "medium" => return Ok(ResolvedPretty::Default),
+            "reference" => {
+                return Ok(ResolvedPretty::Compiled {
+                    compiled: CompiledLogFormat::compile(
+                        "%C(auto)%h (%s, %as)",
+                        LogFormatDialect::Log,
+                    )?,
+                    final_newline: true,
+                });
+            }
+            _ => {}
+        }
+        // Try a `pretty.<name>` alias (case-insensitive); aliases may chain.
+        if let Some(value) = config.get("pretty", None, &current) {
+            current = value.to_string();
+            terminate = false;
+            continue;
+        }
+        // No builtin or alias matched. `--format=<raw>` treats the value as a
+        // user format string with terminator semantics; bare `--pretty=<raw>`
+        // does too when it contains a `%` placeholder (git's heuristic).
+        if terminate || current.contains('%') {
+            return Ok(ResolvedPretty::Compiled {
+                compiled: CompiledLogFormat::compile(&current, LogFormatDialect::Log)?,
+                final_newline: true,
+            });
+        }
+        eprintln!("fatal: invalid --pretty format: {spec}");
+        return Err(GitError::Exit(128));
+    }
+    eprintln!("fatal: invalid --pretty format: {spec}");
+    Err(GitError::Exit(128))
 }
 
 fn log_fatal_unrecognized_argument(value: &str) -> Result<()> {

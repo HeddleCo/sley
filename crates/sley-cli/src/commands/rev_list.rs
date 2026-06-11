@@ -760,6 +760,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         dialect: LogFormatDialect::RevList,
                         source: None,
                         date_mode,
+                        source_oid: None,
+                        describe: None,
+                        color: false,
+                        output_encoding: "UTF-8",
                     },
                     &mut line,
                 )?;
@@ -980,6 +984,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         dialect: LogFormatDialect::RevList,
                         source: None,
                         date_mode,
+                        source_oid: None,
+                        describe: None,
+                        color: false,
+                        output_encoding: "UTF-8",
                     };
                     if children {
                         print!(
@@ -1055,6 +1063,10 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
                         dialect: LogFormatDialect::RevList,
                         source: None,
                         date_mode,
+                        source_oid: None,
+                        describe: None,
+                        color: false,
+                        output_encoding: "UTF-8",
                     },
                 )?;
                 println!();
@@ -1265,6 +1277,10 @@ fn write_rev_list_boundary_record(
                         dialect: LogFormatDialect::RevList,
                         source: None,
                         date_mode,
+                        source_oid: None,
+                        describe: None,
+                        color: false,
+                        output_encoding: "UTF-8",
                     },
                 )?;
             } else {
@@ -1311,6 +1327,10 @@ fn write_rev_list_boundary_record(
                     dialect: LogFormatDialect::RevList,
                     source: None,
                     date_mode,
+                    source_oid: None,
+                    describe: None,
+                    color: false,
+                    output_encoding: "UTF-8",
                 },
             )?;
             println!();
