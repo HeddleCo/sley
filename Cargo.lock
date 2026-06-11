@@ -1384,6 +1384,7 @@ version = "0.1.0"
 dependencies = [
  "sley-config",
  "sley-core",
+ "sley-diff-merge",
  "sley-formats",
  "sley-index",
  "sley-object",

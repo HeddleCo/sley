@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 sley-config = { path = "../sley-config" }
 sley-core = { path = "../sley-core" }
+sley-diff-merge = { path = "../sley-diff-merge" }
 sley-formats = { path = "../sley-formats" }
 sley-index = { path = "../sley-index" }
 sley-object = { path = "../sley-object" }
