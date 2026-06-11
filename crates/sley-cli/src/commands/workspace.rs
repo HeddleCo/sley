@@ -2199,7 +2199,13 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let message = tag_message_with_trailers(message, &trailers);
     if in_rebase {
         return conclude_rebase_step_via_commit(
-            &git_dir, format, author, committer, message, quiet,
+            &git_dir,
+            format,
+            author,
+            committer,
+            message,
+            quiet,
+            allow_empty,
         );
     }
     if in_merge {

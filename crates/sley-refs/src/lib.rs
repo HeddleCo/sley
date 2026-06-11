@@ -2330,11 +2330,17 @@ fn validate_ref_name_for_read(name: &str) -> Result<()> {
     if validate_ref_name(name).is_ok() {
         return Ok(());
     }
+    if is_root_ref_syntax(name) {
+        return Ok(());
+    }
     validate_symref_name(name)
 }
 
 fn validate_ref_name_for_update(name: &str) -> Result<()> {
     if validate_ref_name(name).is_ok() {
+        return Ok(());
+    }
+    if is_root_ref_syntax(name) {
         return Ok(());
     }
     validate_symref_name(name)

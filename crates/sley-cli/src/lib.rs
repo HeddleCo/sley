@@ -213,7 +213,7 @@ fn dispatch_command(args: &[String], global_config: &[GlobalConfigOverride]) -> 
         "merge" => commands::merge_rebase::cmd_merge(&args[1..]),
         "merge-base" => commands::merge_rebase::cmd_merge_base(&args[1..]),
         "pull" => commands::merge_rebase::cmd_pull(&args[1..]),
-        "rebase" => commands::merge_rebase::cmd_rebase(&args[1..]),
+        "rebase" => commands::rebase::cmd_rebase(&args[1..]),
         "cherry-pick" => commands::replay::cmd_cherry_pick(&args[1..]),
         "revert" => commands::replay::cmd_revert(&args[1..]),
         "mktree" => commands::index::cmd_mktree(&args[1..]),
