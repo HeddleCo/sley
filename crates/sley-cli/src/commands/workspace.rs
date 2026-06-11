@@ -1467,11 +1467,23 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             );
         }
     }
-    if !pathspec_args.is_empty() {
-        return Err(GitError::Unsupported(
-            "commit pathspecs are not implemented".into(),
-        ));
-    }
+    let partial_paths = if pathspec_args.is_empty() {
+        None
+    } else {
+        if all {
+            eprintln!(
+                "fatal: paths '{} ...' with -a does not make sense",
+                pathspec_args[0]
+            );
+            return Err(GitError::Exit(128));
+        }
+        if amend {
+            return Err(GitError::Unsupported(
+                "commit pathspecs with --amend are not implemented".into(),
+            ));
+        }
+        Some(mem::take(&mut pathspec_args))
+    };
     if unified_context && !interactive && !patch {
         eprintln!("fatal: the option '--unified' requires '--interactive/--patch'");
         return Err(GitError::Exit(128));
@@ -1634,6 +1646,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     if !allow_empty
         && !amend
         && fixup_reword_tree.is_none()
+        && partial_paths.is_none()
         && commit_index_matches_head(&git_dir, format)?
     {
         print_clean_commit_status(&git_dir, format)?;
@@ -1650,6 +1663,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         sley_sequencer::amend_index(&git_dir, format, options)
     } else if let Some(tree) = fixup_reword_tree {
         sley_sequencer::commit_tree_at_head(&git_dir, format, tree, options)
+    } else if let Some(paths) = &partial_paths {
+        commit_partial_paths(&git_dir, format, paths, options, allow_empty)
     } else {
         sley_sequencer::commit_index(&git_dir, format, options)
     }?;
@@ -2051,6 +2066,154 @@ fn commit_stage_tracked_changes(git_dir: &Path, format: ObjectFormat) -> Result<
         &config,
     )?;
     Ok(())
+}
+
+/// Restores the saved index bytes when dropped, so the temporary HEAD-based
+/// index a partial commit materializes can never leak past the commit — even on
+/// an error path.
+struct IndexRestoreGuard {
+    path: PathBuf,
+    saved: Option<Vec<u8>>,
+}
+
+impl Drop for IndexRestoreGuard {
+    fn drop(&mut self) {
+        match &self.saved {
+            Some(bytes) => {
+                let _ = fs::write(&self.path, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+}
+
+/// `git commit <pathspec>...` — the partial-commit dance: the commit's tree is
+/// HEAD's tree with the pathspec-matched worktree changes applied (other staged
+/// changes stay staged and uncommitted), and after the commit object is written
+/// the real index is refreshed for just those paths.
+fn commit_partial_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[String],
+    options: sley_sequencer::CommitIndexOptions,
+    allow_empty: bool,
+) -> Result<sley_sequencer::CommitIndexResult> {
+    let cwd = env::current_dir()?;
+    let worktree_root = worktree_root_for_git_dir(git_dir)?;
+    let config = read_repo_config(git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(git_dir, format);
+    let index_path = sley_worktree::repository_index_path(git_dir);
+    let saved_index = fs::read(&index_path).ok();
+
+    // Paths "known to git": anything tracked in the real index. A pathspec that
+    // only matches untracked files must not commit them (git refuses too).
+    let known_paths: HashSet<PathBuf> = match &saved_index {
+        Some(bytes) => Index::parse(bytes, format)?
+            .entries
+            .iter()
+            .map(|entry| worktree_root.join(String::from_utf8_lossy(&entry.path).as_ref()))
+            .collect(),
+        None => HashSet::new(),
+    };
+
+    let head_tree = read_head_commit(git_dir, format)?.map(|commit| commit.tree);
+
+    // Materialize HEAD's tree as a temporary index in place of the real one so
+    // the regular pathspec resolution computes worktree-vs-HEAD changes.
+    let (tree, action_paths) = {
+        let _restore = IndexRestoreGuard {
+            path: index_path.clone(),
+            saved: saved_index,
+        };
+        match &head_tree {
+            Some(tree) => {
+                let temp_index = sley_worktree::index_from_tree(&db, format, tree)?;
+                fs::write(&index_path, temp_index.write(format)?)?;
+            }
+            None => {
+                let _ = fs::remove_file(&index_path);
+            }
+        }
+        let actions = resolve_add_update_actions(
+            &cwd,
+            &worktree_root,
+            git_dir,
+            format,
+            paths.iter().map(PathBuf::from).collect(),
+            true,
+            false,
+        )?;
+        // Keep only paths known to git: tracked in HEAD (the temp index) or in
+        // the real index (a `git add`ed new file). Untracked matches drop out.
+        let head_paths: HashSet<PathBuf> = match &head_tree {
+            Some(tree) => {
+                let head_index = sley_worktree::index_from_tree(&db, format, tree)?;
+                head_index
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        worktree_root.join(String::from_utf8_lossy(&entry.path).as_ref())
+                    })
+                    .collect()
+            }
+            None => HashSet::new(),
+        };
+        let action_paths: Vec<PathBuf> = actions
+            .iter()
+            .map(AddAction::path)
+            .filter(|path| known_paths.contains(*path) || head_paths.contains(*path))
+            .cloned()
+            .collect();
+        if !action_paths.is_empty() {
+            sley_worktree::update_index_paths_filtered(
+                &worktree_root,
+                git_dir,
+                format,
+                &action_paths,
+                sley_worktree::UpdateIndexOptions {
+                    add: true,
+                    remove: true,
+                    force_remove: false,
+                    chmod: None,
+                    info_only: false,
+                    ignore_skip_worktree_entries: false,
+                },
+                &config,
+            )?;
+        }
+        let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+        (tree, action_paths)
+        // `_restore` drops here, putting the real index back.
+    };
+
+    let baseline = head_tree.unwrap_or_else(|| ObjectId::empty_tree(format));
+    if !allow_empty && tree == baseline {
+        print_clean_commit_status(git_dir, format)?;
+        return Err(GitError::Exit(1));
+    }
+    let result = sley_sequencer::commit_tree_at_head(git_dir, format, tree, options)?;
+    // Refresh the real index for the committed paths so they no longer show as
+    // modified, leaving every other staged change untouched.
+    if !action_paths.is_empty() {
+        sley_worktree::update_index_paths_filtered(
+            &worktree_root,
+            git_dir,
+            format,
+            &action_paths,
+            sley_worktree::UpdateIndexOptions {
+                add: true,
+                remove: true,
+                force_remove: false,
+                chmod: None,
+                info_only: false,
+                ignore_skip_worktree_entries: false,
+            },
+            &config,
+        )?;
+    }
+    Ok(result)
 }
 
 fn commit_index_matches_head(git_dir: &Path, format: ObjectFormat) -> Result<bool> {
