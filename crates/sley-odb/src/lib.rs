@@ -83,11 +83,9 @@ impl RawPackInstaller for FileObjectDatabase {
     }
 }
 
-impl RawPackInstaller for std::cell::RefCell<ObjectDatabase> {
+impl RawPackInstaller for ObjectDatabase {
     fn install_raw_pack(&self, pack_bytes: &[u8]) -> Result<RawPackInstallResult> {
-        let mut database = self.borrow_mut();
-        let format = database.format;
-        let result = unpack_packfile_objects(pack_bytes, format, &mut *database)?;
+        let result = unpack_packfile_objects(pack_bytes, self.format, self)?;
         Ok(RawPackInstallResult {
             object_ids: result.written_objects,
         })
@@ -161,7 +159,7 @@ where
 pub fn unpack_packfile_objects<W>(
     pack_bytes: &[u8],
     format: ObjectFormat,
-    writer: &mut W,
+    writer: &W,
 ) -> Result<PackUnpackResult>
 where
     W: ObjectWriter,
@@ -170,7 +168,7 @@ where
     write_pack_objects(pack, writer, "pack")
 }
 
-fn write_pack_objects<W>(pack: PackFile, writer: &mut W, source: &str) -> Result<PackUnpackResult>
+fn write_pack_objects<W>(pack: PackFile, writer: &W, source: &str) -> Result<PackUnpackResult>
 where
     W: ObjectWriter,
 {
@@ -3871,7 +3869,7 @@ mod tests {
 
     #[test]
     fn unpack_packfile_objects_writes_sha256_pack_entries() {
-        let mut writer = ObjectDatabase::new(ObjectFormat::Sha256);
+        let writer = ObjectDatabase::new(ObjectFormat::Sha256);
         let object = EncodedObject::new(ObjectType::Blob, b"transport pack object\n".to_vec());
         let oid = object
             .object_id(ObjectFormat::Sha256)
@@ -3879,7 +3877,7 @@ mod tests {
         let pack = PackFile::write_undeltified(std::slice::from_ref(&object), ObjectFormat::Sha256)
             .expect("test operation should succeed");
 
-        let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &mut writer)
+        let result = unpack_packfile_objects(&pack.pack, ObjectFormat::Sha256, &writer)
             .expect("test operation should succeed");
 
         assert_eq!(result.written_objects, vec![oid]);

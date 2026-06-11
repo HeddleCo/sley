@@ -269,7 +269,7 @@ mod tests {
             acknowledgments: Vec::new(),
             packfile: pack.pack,
         };
-        let destination = std::cell::RefCell::new(ObjectDatabase::new(format));
+        let destination = ObjectDatabase::new(format);
 
         let result = install_upload_pack_raw_response(&response, &destination)
             .expect("test operation should succeed");
@@ -277,7 +277,6 @@ mod tests {
         assert_eq!(result.object_ids, vec![oid]);
         assert_eq!(
             destination
-                .borrow()
                 .read_object(&oid)
                 .expect("test operation should succeed")
                 .as_ref(),
