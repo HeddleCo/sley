@@ -108,14 +108,16 @@ fn git_with_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
     output.stdout
 }
 
-fn expected_log(cwd: &Path, rev: &str) -> Vec<u8> {
-    expected_log_args(cwd, &[rev])
-}
-
 fn expected_log_args(cwd: &Path, args: &[&str]) -> Vec<u8> {
     let mut git_args = vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
     git_args.extend_from_slice(args);
     git(cwd, &git_args)
+}
+
+/// Oracle for sley's default `git log` (medium) layout: the real `git log`
+/// medium format, including the `Date:` line and the blank line between entries.
+fn expected_log_medium(cwd: &Path, rev: &str) -> Vec<u8> {
+    git(cwd, &["log", rev])
 }
 
 #[test]
@@ -169,7 +171,10 @@ fn log_minimal_format_matches_upstream_git() {
             ],
         );
         for rev in ["HEAD", "refs/tags/v1.0"] {
-            let expected = expected_log(&root, rev);
+            // sley's default `log` renders git's full medium format (commit /
+            // Author / Date / blank / message, with a blank line between
+            // entries), so compare it against real `git log` medium.
+            let expected = expected_log_medium(&root, rev);
             let actual = git_rs(&root, &["log", rev]);
             assert_eq!(actual, expected, "sley log output differed for {rev}");
         }
@@ -399,7 +404,12 @@ fn log_minimal_format_matches_upstream_git() {
             vec!["--pickaxe-regex", "HEAD"],
         ] {
             let expected = expected_log_args(&root, &args);
-            let mut git_rs_args = vec!["log"];
+            // This loop exercises flag *plumbing* (commit selection, decoration,
+            // date modes), not the medium layout — so pin both sides to the same
+            // explicit `--format=` that omits the medium-only `Date:` line and
+            // commit-line coloring, keeping the comparison layout-agnostic.
+            let mut git_rs_args =
+                vec!["log", "--format=commit %H%nAuthor: %an <%ae>%n%n    %s"];
             git_rs_args.extend_from_slice(&args);
             let actual = git_rs(&root, &git_rs_args);
             assert_eq!(actual, expected, "sley log output differed for {args:?}");

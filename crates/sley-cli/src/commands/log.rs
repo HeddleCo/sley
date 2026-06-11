@@ -3,6 +3,222 @@
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
+use sley_notes::{NotesRef, read_note_bytes};
+
+/// Tracks `git log`'s notes-display state (`--notes`, `--show-notes[=ref]`,
+/// `--no-notes`, `--standard-notes`, `--no-standard-notes`), mirroring git's
+/// `display_notes_opt` / `show_notes` resolution.
+#[derive(Default, Clone)]
+struct NotesDisplay {
+    /// Whether any notes flag was given (git's `show_notes_given`).
+    given: bool,
+    /// Whether notes display is currently enabled (git's `show_notes`).
+    enabled: bool,
+    /// Tri-state `use_default_notes`: None = unset (-1), Some(true) = forced on,
+    /// Some(false) = standard refs suppressed.
+    use_default: Option<bool>,
+    /// Extra refs from `--notes=<ref>` / `--show-notes=<ref>`, expanded.
+    extra_refs: Vec<String>,
+}
+
+impl NotesDisplay {
+    /// `--notes` / `--show-notes`: enable display using the standard refs.
+    fn add_default(&mut self) {
+        self.use_default = Some(true);
+        self.enabled = true;
+        self.given = true;
+    }
+    /// `--notes=<ref>`: add a specific ref without forcing the standard refs on
+    /// (only `--show-notes=<ref>` re-enables the defaults).
+    fn add_ref(&mut self, reff: &str) {
+        self.extra_refs
+            .push(NotesRef::expand(reff).as_str().to_string());
+        self.enabled = true;
+        self.given = true;
+    }
+    /// `--show-notes=<ref>`: like `add_ref`, but additionally turns the standard
+    /// refs back on when they were unset (matches git's `--show-notes=` path).
+    fn add_show_ref(&mut self, reff: &str) {
+        if self.use_default.is_none() {
+            self.use_default = Some(true);
+        }
+        self.add_ref(reff);
+    }
+    /// `--no-notes`: clear all display state and turn notes off.
+    fn disable(&mut self) {
+        self.use_default = Some(false);
+        self.extra_refs.clear();
+        self.enabled = false;
+        self.given = true;
+    }
+    /// `--no-standard-notes`: suppress the standard refs but keep any extra refs
+    /// (does not by itself disable display).
+    fn no_standard(&mut self) {
+        self.use_default = Some(false);
+        self.given = true;
+    }
+    /// `--standard-notes`: re-enable the standard refs (keeps extra refs).
+    fn add_standard(&mut self) {
+        self.use_default = Some(true);
+        self.given = true;
+    }
+
+    /// Resolve whether notes display is active. When no flag was given, notes
+    /// show only for the default (no-`--pretty`) format. When a flag was given,
+    /// the explicit `enabled` state wins.
+    fn is_active(&self, default_format: bool) -> bool {
+        if self.given {
+            self.enabled
+        } else {
+            default_format
+        }
+    }
+
+    /// Compute the ordered, de-duplicated list of notes refs to display,
+    /// mirroring git's `load_display_notes`: the standard refs (default notes
+    /// ref + `GIT_NOTES_DISPLAY_REF` env or `notes.displayRef` config, glob
+    /// expanded) come first when `use_default` is set or unset-with-no-extras,
+    /// then the `--notes=<ref>` extras (glob expanded). A `notes.displayRef`
+    /// with no value is a fatal error.
+    fn resolve_refs(&self, git_dir: &Path, store: &FileRefStore) -> Result<Vec<String>> {
+        let mut refs: Vec<String> = Vec::new();
+        let load_standard = matches!(self.use_default, Some(true))
+            || (self.use_default.is_none() && self.extra_refs.is_empty());
+        if load_standard {
+            // git's default_notes_ref takes GIT_NOTES_REF verbatim when set —
+            // even when empty, which yields a no-op (no default note shown).
+            let default_ref = match env::var("GIT_NOTES_REF") {
+                Ok(value) => value,
+                Err(_) => crate::commands::notes::raw_notes_ref(git_dir, None),
+            };
+            if !default_ref.is_empty() {
+                push_unique(&mut refs, default_ref);
+            }
+            // A command-line `-c notes.displayRef` with no value is a parse
+            // error (the key is a string, not a bool). Detect the bool-true
+            // marker the `-c key` form injects and reject it, as git does.
+            if matches!(global_config_value("notes.displayRef"), Ok(Some(v)) if v == "true") {
+                eprintln!("error: missing value for 'notes.displayref'");
+                eprintln!("fatal: unable to parse 'notes.displayref' from command-line config");
+                return Err(GitError::Exit(128));
+            }
+            if let Ok(env_value) = env::var("GIT_NOTES_DISPLAY_REF") {
+                for part in env_value.split(':').filter(|s| !s.is_empty()) {
+                    for expanded in expand_notes_glob(store, part)? {
+                        push_unique(&mut refs, expanded);
+                    }
+                }
+            } else if let Ok(config) = read_repo_config(git_dir) {
+                for value in config
+                    .get_all("notes", None, "displayRef")
+                    .into_iter()
+                    .flatten()
+                {
+                    if value.is_empty() {
+                        eprintln!(
+                            "fatal: unable to parse 'notes.displayref' from command-line config"
+                        );
+                        return Err(GitError::Exit(128));
+                    }
+                    for expanded in expand_notes_glob(store, value)? {
+                        push_unique(&mut refs, expanded);
+                    }
+                }
+            }
+        }
+        for extra in &self.extra_refs {
+            for expanded in expand_notes_glob(store, extra)? {
+                push_unique(&mut refs, expanded);
+            }
+        }
+        Ok(refs)
+    }
+}
+
+/// Push `value` to `refs` only if it is not already present (preserve order).
+fn push_unique(refs: &mut Vec<String>, value: String) {
+    if !refs.contains(&value) {
+        refs.push(value);
+    }
+}
+
+/// Expand a single notes-ref spec: a `*`-containing glob matches existing refs
+/// by prefix (ref-name sorted); an exact ref is returned as-is.
+fn expand_notes_glob(store: &FileRefStore, glob: &str) -> Result<Vec<String>> {
+    if !glob.contains('*') {
+        return Ok(vec![glob.to_string()]);
+    }
+    let prefix = glob.trim_end_matches('*');
+    let mut matched: Vec<String> = store
+        .list_refs()?
+        .into_iter()
+        .map(|entry| entry.name)
+        .filter(|name| name.starts_with(prefix))
+        .collect();
+    matched.sort();
+    Ok(matched)
+}
+
+/// Resolve the standard notes display refs and render the notes block for
+/// `oid`, for callers (e.g. `git show`) that always use the default display set.
+/// Returns the bytes to append after the commit message (empty when none).
+pub(crate) fn render_standard_notes(
+    git_dir: &Path,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let store = FileRefStore::new(git_dir, format);
+    let display = NotesDisplay {
+        use_default: Some(true),
+        ..NotesDisplay::default()
+    };
+    let refs = display.resolve_refs(git_dir, &store)?;
+    render_notes_block(git_dir, format, &store, &refs, oid)
+}
+
+/// Render the `Notes:` / `Notes (<name>):` block(s) for `oid` across the
+/// resolved display refs, matching git's `format_note`: a leading blank line,
+/// the label, then each note line indented by four spaces. Returns the bytes to
+/// append after the commit message (empty when no notes exist).
+fn render_notes_block(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    display_refs: &[String],
+    oid: &ObjectId,
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for reff in display_refs {
+        let handle = NotesRef::expand(reff);
+        let Some(mut body) = read_note_bytes(git_dir, format, store, &handle, oid)? else {
+            continue;
+        };
+        // git drops a single trailing newline before indenting.
+        if body.last() == Some(&b'\n') {
+            body.pop();
+        }
+        // Label: bare `Notes:` only for the literal default ref.
+        if handle.as_str() == sley_notes::DEFAULT_NOTES_REF {
+            out.extend_from_slice(b"\nNotes:\n");
+        } else {
+            let name = handle
+                .as_str()
+                .strip_prefix("refs/")
+                .and_then(|s| s.strip_prefix("notes/"))
+                .unwrap_or(handle.as_str());
+            out.extend_from_slice(format!("\nNotes ({name}):\n").as_bytes());
+        }
+        // An empty note prints just the label (git's loop runs over zero bytes).
+        if !body.is_empty() {
+            for line in body.split(|b| *b == b'\n') {
+                out.extend_from_slice(b"    ");
+                out.extend_from_slice(line);
+                out.push(b'\n');
+            }
+        }
+    }
+    Ok(out)
+}
 
 pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut includes = Vec::new();
@@ -13,7 +229,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     let mut default_revision = None;
     let mut max_count = None;
     let mut skip = 0usize;
-    let mut output = LogOutput::Default;
+    let mut output = LogOutput::Default(LogDefaultKind::Medium);
+    let mut notes_display = NotesDisplay::default();
     let mut preset_oneline: Option<bool> = None;
     // Raw `--pretty=`/`--format=` spec captured during arg parse and resolved
     // after config is loaded (aliases live in `pretty.<name>`). The bool is the
@@ -324,9 +541,6 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             | "--no-use-mailmap"
             | "--mailmap"
             | "--no-mailmap"
-            | "--notes"
-            | "--show-notes"
-            | "--no-notes"
             | "--show-signature"
             | "--no-show-signature"
             | "--no-color"
@@ -747,8 +961,16 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 return log_option_takes_no_value_error("no-mailmap");
             }
             value if value.starts_with("--encoding=") => {}
-            value if value.starts_with("--notes=") => {}
-            value if value.starts_with("--show-notes=") => {}
+            "--notes" | "--show-notes" => notes_display.add_default(),
+            value if value.starts_with("--notes=") => {
+                notes_display.add_ref(&value["--notes=".len()..]);
+            }
+            value if value.starts_with("--show-notes=") => {
+                notes_display.add_show_ref(&value["--show-notes=".len()..]);
+            }
+            "--no-notes" => notes_display.disable(),
+            "--no-standard-notes" => notes_display.no_standard(),
+            "--standard-notes" => notes_display.add_standard(),
             value if value.starts_with("--no-notes=") => {
                 return log_fatal_unrecognized_argument(value);
             }
@@ -869,7 +1091,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     if let Some((spec, format_kind)) = pretty_spec.take() {
         match resolve_pretty_spec(&spec, format_kind, &config)? {
             ResolvedPretty::Oneline => preset_oneline = Some(true),
-            ResolvedPretty::Default => output = LogOutput::Default,
+            ResolvedPretty::Default => output = LogOutput::Default(LogDefaultKind::Medium),
             ResolvedPretty::Reference => {
                 // reference defaults the date to short; an explicit --date wins.
                 if !date_explicit {
@@ -899,7 +1121,7 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         }
     }
     if let Some(pretty_oneline) = preset_oneline {
-        if matches!(output, LogOutput::Default) {
+        if matches!(output, LogOutput::Default(_)) {
             let use_full_oid = match pretty_oneline {
                 true => !abbrev_commit,
                 false => abbrev_len.is_none(),
@@ -1246,9 +1468,23 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     } else {
         None
     };
+    // Resolve the notes-display refs once. Notes show by default only for the
+    // medium (no-`--pretty`) format; an explicit `--notes`/`--no-notes` flag
+    // overrides. The empty list short-circuits all per-commit note lookups.
+    let notes_store = FileRefStore::new(&git_dir, format);
+    let notes_default_format = matches!(output, LogOutput::Default(LogDefaultKind::Medium));
+    let display_notes_refs = if notes_display.is_active(notes_default_format) {
+        notes_display.resolve_refs(&git_dir, &notes_store)?
+    } else {
+        Vec::new()
+    };
+
     for (index, record) in selected.iter().enumerate() {
         match output {
-            LogOutput::Default => {
+            LogOutput::Default(kind) => {
+                if index > 0 {
+                    println!();
+                }
                 print!(
                     "commit {}",
                     format_log_commit_header_oid(&record.oid, abbrev_commit, abbrev_len)
@@ -1261,9 +1497,25 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
                 );
                 println!();
                 println!("Author: {}", commit_author_identity(&record.commit.author));
+                if kind == LogDefaultKind::Medium {
+                    println!(
+                        "Date:   {}",
+                        commit_identity_date(&record.commit.author, date_mode)
+                    );
+                }
                 println!();
                 for line in String::from_utf8_lossy(&record.commit.message).lines() {
                     println!("    {line}");
+                }
+                if !display_notes_refs.is_empty() {
+                    let notes = render_notes_block(
+                        &git_dir,
+                        format,
+                        &notes_store,
+                        &display_notes_refs,
+                        &record.oid,
+                    )?;
+                    io::stdout().write_all(&notes)?;
                 }
             }
             LogOutput::Compiled {
@@ -1345,7 +1597,7 @@ fn log_walk_reflogs(
                     stdout.write_all(b"\n")?;
                 }
             }
-            LogOutput::Default => {
+            LogOutput::Default(_) => {
                 stdout.write_all(&entry.message)?;
                 stdout.write_all(b"\n")?;
             }
@@ -1478,10 +1730,18 @@ fn log_parse_abbrev_width(value: &str) -> usize {
     value.parse::<usize>().unwrap_or(0).max(4)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum LogDefaultKind {
+    /// `medium` (the default): includes the `Date:` line.
+    Medium,
+    /// `--pretty=short`: omits the `Date:` line.
+    Short,
+}
+
 #[derive(Debug, Clone)]
 enum LogOutput {
     /// `short`/`medium` structured layout.
-    Default,
+    Default(LogDefaultKind),
     /// `--oneline`, `--pretty=oneline`, or `--format=` resolved to a compiled stream.
     Compiled {
         compiled: CompiledLogFormat,
