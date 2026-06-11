@@ -6693,7 +6693,10 @@ fn print_log_format(
         &mut line,
         0..compiled.tokens.len(),
     )?;
-    io::stdout().write_all(&line)?;
+    // Re-encode the assembled (UTF-8) line to the log output encoding, mirroring
+    // git's single final `reencode_string_len` pass.
+    let out = log_reencode_message(&line, "UTF-8", context.output_encoding);
+    io::stdout().write_all(&out)?;
     io::stdout().flush()?;
     Ok(())
 }
@@ -6795,11 +6798,13 @@ fn emit_log_one_token(
         color,
         output_encoding,
     } = *context;
-    let reencoded_message = log_reencode_message(
-        &record.commit.message,
-        &commit_encoding(&record.commit),
-        output_encoding,
-    );
+    // git formats in UTF-8 (re-encoding the stored message to UTF-8 up front),
+    // computes alignment/width in UTF-8, and re-encodes the *final* output to the
+    // log output encoding once at the end (handled by the print path). So here we
+    // always normalise the message to UTF-8.
+    let _ = output_encoding;
+    let reencoded_message =
+        log_reencode_message(&record.commit.message, &commit_encoding(&record.commit), "UTF-8");
     let message: &[u8] = &reencoded_message;
     {
         match token {
