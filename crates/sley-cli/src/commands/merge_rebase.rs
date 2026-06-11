@@ -2042,7 +2042,7 @@ fn finish_rebase_update_branch(
     tx.commit()
 }
 
-fn print_commit_shortstat_between_trees(
+pub(crate) fn print_commit_shortstat_between_trees(
     db: &FileObjectDatabase,
     format: ObjectFormat,
     old_tree: &ObjectId,
@@ -2085,10 +2085,11 @@ fn report_unmerged_rebase_continue(unmerged_paths: &[Vec<u8>]) -> Result<()> {
 pub(crate) fn conclude_rebase_step_via_commit(
     git_dir: &Path,
     format: ObjectFormat,
-    author: Vec<u8>,
+    mut author: Vec<u8>,
     committer: Vec<u8>,
     message: Vec<u8>,
     quiet: bool,
+    allow_empty: bool,
 ) -> Result<()> {
     let index = read_worktree_index(git_dir, format)?;
     let unmerged_paths = index_unmerged_paths(&index);
@@ -2100,6 +2101,13 @@ pub(crate) fn conclude_rebase_step_via_commit(
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let parent_tree = read_commit_tree(&db, format, &parent_oid)?;
     let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
+    if !allow_empty && tree == parent_tree {
+        eprintln!("nothing to commit, working tree clean");
+        return Err(GitError::Exit(1));
+    }
+    if let Some(script_author) = read_rebase_author_script_identity(git_dir)? {
+        author = script_author;
+    }
     let mut writer = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit_oid = sley_sequencer::create_commit(
         &mut writer,
@@ -2126,6 +2134,19 @@ pub(crate) fn conclude_rebase_step_via_commit(
         print_commit_shortstat_between_trees(&db, format, &parent_tree, &tree)?;
     }
     Ok(())
+}
+
+fn read_rebase_author_script_identity(git_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let path = rebase_merge_dir(git_dir).join("author-script");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Some((name, email, date)) = sley_sequencer::rebase::parse_author_script(&text) else {
+        return Ok(None);
+    };
+    Ok(Some(sley_sequencer::format_commit_identity(
+        &name, &email, &date,
+    )?))
 }
 
 fn print_rebase_usage() {
@@ -2500,7 +2521,7 @@ fn merge_commit_reflog_message(message: &[u8]) -> Vec<u8> {
     format!("commit (merge): {}", commit_subject(message)).into_bytes()
 }
 
-fn print_branch_commit_summary(
+pub(crate) fn print_branch_commit_summary(
     git_dir: &Path,
     format: ObjectFormat,
     commit_oid: &ObjectId,

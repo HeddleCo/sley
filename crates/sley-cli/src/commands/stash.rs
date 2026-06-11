@@ -3264,3 +3264,129 @@ fn stash_list_age_filters_match(commit: &Commit, options: &StashListOptions) -> 
     Ok(options.max_age.is_none_or(|age| timestamp >= age)
         && options.min_age.is_none_or(|age| timestamp <= age))
 }
+
+// ===== rebase autostash bridge =====
+
+/// `git stash create autostash` for the rebase autostash machinery: returns
+/// the stash commit oid without touching `refs/stash`, `None` when the tree
+/// is clean.
+pub(crate) fn create_stash_for_autostash() -> Result<Option<ObjectId>> {
+    Ok(create_stash_commit(
+        &["autostash".to_string()],
+        false,
+        false,
+        StashCreateMode::Worktree,
+        &[],
+    )?
+    .map(|created| created.oid))
+}
+
+/// `git stash store -m <message> -q <oid>` equivalent.
+pub(crate) fn store_stash_commit(stash_oid: &ObjectId, message: &str) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    validate_stash_like_commit(&db, format, stash_oid)?;
+    let store = FileRefStore::new(&common_git_dir, format);
+    let old_oid = match store.read_ref("refs/stash")? {
+        Some(RefTarget::Direct(oid)) => oid,
+        Some(RefTarget::Symbolic(_)) | None => zero_oid(format)?,
+    };
+    let mut tx = store.transaction();
+    tx.update(RefUpdate {
+        name: "refs/stash".to_string(),
+        expected: None,
+        new: RefTarget::Direct(*stash_oid),
+        reflog: Some(ReflogEntry {
+            old_oid,
+            new_oid: *stash_oid,
+            committer: default_committer(),
+            message: message.as_bytes().to_vec(),
+        }),
+    });
+    tx.commit()
+}
+
+/// `git stash apply <oid>` with all output suppressed; `Ok(false)` when the
+/// stash cannot be applied cleanly (the caller stores it instead).
+pub(crate) fn apply_stash_commit_quietly(stash_oid: &ObjectId) -> Result<bool> {
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let format = repository_object_format(&common_git_dir)?;
+    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
+    let Ok(stash_object) = db.read_object(stash_oid) else {
+        return Ok(false);
+    };
+    if stash_object.object_type != ObjectType::Commit {
+        return Ok(false);
+    }
+    let Ok(stash_commit) = Commit::parse(format, &stash_object.body) else {
+        return Ok(false);
+    };
+    let head_store = FileRefStore::new(&git_dir, format);
+    let Some((head_oid, head_commit)) = stash_head_commit(&head_store, &db, format)? else {
+        return Ok(false);
+    };
+    let Some(base_oid) = stash_commit.parents.first() else {
+        return Ok(false);
+    };
+    let Some(index_oid) = stash_commit.parents.get(1) else {
+        return Ok(false);
+    };
+    let Ok(base_object) = db.read_object(base_oid) else {
+        return Ok(false);
+    };
+    let Ok(base_commit) = Commit::parse(format, &base_object.body) else {
+        return Ok(false);
+    };
+    let Ok(index_object) = db.read_object(index_oid) else {
+        return Ok(false);
+    };
+    let Ok(index_commit) = Commit::parse(format, &index_object.body) else {
+        return Ok(false);
+    };
+    let applied = if base_oid == &head_oid {
+        sley_worktree::reset_index_and_worktree_to_commit(
+            &worktree_root,
+            &git_dir,
+            format,
+            stash_oid,
+        )
+        .and_then(|_| {
+            sley_worktree::reset_index_to_commit(&worktree_root, &git_dir, format, &head_oid)
+        })
+        .is_ok()
+    } else {
+        apply_stash_tracked_paths_to_moved_head(
+            &worktree_root,
+            &git_dir,
+            &db,
+            format,
+            StashMovedHeadApply {
+                base_tree: &base_commit.tree,
+                head_tree: &head_commit.tree,
+                stash_tree: &stash_commit.tree,
+                index_tree: &index_commit.tree,
+                reinstate_index: false,
+            },
+        )
+        .is_ok()
+    };
+    if !applied {
+        return Ok(false);
+    }
+    if let Some(untracked_oid) = stash_commit.parents.get(2) {
+        let Ok(untracked_object) = db.read_object(untracked_oid) else {
+            return Ok(false);
+        };
+        let Ok(untracked_commit) = Commit::parse(format, &untracked_object.body) else {
+            return Ok(false);
+        };
+        restore_stash_tree_to_worktree(&worktree_root, &db, format, &untracked_commit.tree)?;
+    }
+    Ok(true)
+}

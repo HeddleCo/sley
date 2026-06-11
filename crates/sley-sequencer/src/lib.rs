@@ -1,3 +1,4 @@
+pub mod rebase;
 pub mod replay;
 
 use sley_core::{GitError, ObjectId, Result};
