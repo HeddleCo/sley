@@ -891,7 +891,7 @@ fn expand_decorate_value(arg: &str) -> String {
 }
 
 /// git `term_columns()`: respects COLUMNS env, defaults to 80.
-fn term_columns() -> i64 {
+pub(crate) fn term_columns() -> i64 {
     if let Ok(cols) = std::env::var("COLUMNS")
         && let Ok(n) = cols.trim().parse::<i64>()
         && n > 0

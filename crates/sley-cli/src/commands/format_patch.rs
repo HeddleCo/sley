@@ -52,6 +52,13 @@ struct FormatPatchOptions {
     /// Whether to include the diffstat after the `---` line. On by default;
     /// cleared by `--no-stat`.
     stat: bool,
+    /// `--stat=<w>[,<n>[,<c>]]` / `--stat-*-width` knobs. format-patch never
+    /// calls git's `init_diffstat_widths`, so the fields start at 0 (and a
+    /// zero stat-width becomes the 72-column mail wrap at render time); the
+    /// diff.stat*Width config is intentionally ignored.
+    stat_widths: DiffStatWidths,
+    /// `--stat=,,<count>` / `--stat-count=<count>` display truncation.
+    stat_count: Option<usize>,
     /// Custom subject prefix replacing `PATCH` (`--subject-prefix=<p>`).
     subject_prefix: String,
     /// String inserted just before the prefix, e.g. `RFC ` (`--rfc`).
@@ -90,6 +97,8 @@ impl Default for FormatPatchOptions {
             start_number: None,
             signoff: false,
             stat: true,
+            stat_widths: DiffStatWidths::plumbing(),
+            stat_count: None,
             subject_prefix: "PATCH".to_string(),
             reroll_prefix: None,
             keep_subject: false,
@@ -275,7 +284,7 @@ fn render_patch(ctx: RenderContext<'_>) -> Result<Vec<u8>> {
     if !entries.is_empty() {
         if options.stat {
             out.extend_from_slice(b"---\n");
-            write_patch_diffstat(&mut out, &entries, db)?;
+            write_patch_diffstat(&mut out, &entries, db, options)?;
             for entry in &entries {
                 write_patch_summary_entry(&mut out, entry)?;
             }
@@ -1022,165 +1031,40 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
     }
 }
 
-/// The diffstat block (`--stat`) written into `out`: one ` path | count graph`
-/// row per file, then the ` N files changed, ...` summary line, with git's
-/// column alignment and graph scaling.
+/// The diffstat block (`--stat`) written into `out`, via the shared
+/// `show_stats` port. format-patch wraps mails at 72 columns: a zero
+/// stat-width becomes `MAIL_DEFAULT_WRAP` exactly like `cmd_format_patch`,
+/// and the diff.stat*Width config is never consulted.
 fn write_patch_diffstat(
     out: &mut Vec<u8>,
     entries: &[sley_diff_merge::NameStatusEntry],
     db: &FileObjectDatabase,
+    options: &FormatPatchOptions,
 ) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
+    let mut widths = options.stat_widths;
+    if widths.stat_width == 0 {
+        // MAIL_DEFAULT_WRAP
+        widths.stat_width = 72;
     }
-    let mut rows = Vec::with_capacity(entries.len());
-    let mut total_inserted = 0usize;
-    let mut total_deleted = 0usize;
-    for entry in entries {
-        let old_content = entry_old_content(entry, db)?;
-        let new_content = entry_new_content(entry, db)?;
-        let path = diffstat_path(entry);
-        let stats = if old_content.as_deref().is_some_and(|c| c.contains(&0))
-            || new_content.as_deref().is_some_and(|c| c.contains(&0))
-        {
-            DiffstatStats::Binary {
-                old_size: old_content.as_ref().map_or(0, Vec::len),
-                new_size: new_content.as_ref().map_or(0, Vec::len),
-            }
-        } else {
-            let (inserted, deleted) =
-                line_change_counts(old_content.as_deref(), new_content.as_deref());
-            total_inserted += inserted;
-            total_deleted += deleted;
-            DiffstatStats::Text { inserted, deleted }
-        };
-        rows.push(DiffstatRow { path, stats });
-    }
-
-    let name_width = rows
-        .iter()
-        .map(|row| display_width(&row.path))
-        .max()
-        .unwrap_or(0)
-        .min(NAME_CAP);
-    let max_change = rows
-        .iter()
-        .map(|row| match row.stats {
-            DiffstatStats::Text { inserted, deleted } => inserted + deleted,
-            DiffstatStats::Binary { .. } => 0,
-        })
-        .max()
-        .unwrap_or(0);
-    let count_width = decimal_width(max_change);
-    let has_binary = rows
-        .iter()
-        .any(|row| matches!(row.stats, DiffstatStats::Binary { .. }));
-    let count_width = if has_binary {
-        count_width.max(3)
-    } else {
-        count_width
-    };
-    // Available graph columns: git keeps the whole row within a fixed budget;
-    // empirically `name_width + count_width + graph_width == 66` for the
-    // non-tty default of an 80-column terminal.
-    let graph_width = GRAPH_BUDGET.saturating_sub(name_width + count_width);
-
-    for row in &rows {
-        let display = truncate_stat_name(&row.path);
-        match row.stats {
-            DiffstatStats::Binary { old_size, new_size } => {
-                writeln_buf(
-                    out,
-                    &format!(" {display:<name_width$} | Bin {old_size} -> {new_size} bytes"),
-                );
-            }
-            DiffstatStats::Text { inserted, deleted } => {
-                let total = inserted + deleted;
-                if total == 0 {
-                    writeln_buf(
-                        out,
-                        &format!(" {display:<name_width$} | {total:>count_width$}"),
-                    );
-                } else {
-                    let (plus, minus) = scale_graph(inserted, deleted, graph_width, max_change);
-                    let graph: String = std::iter::repeat_n('+', plus)
-                        .chain(std::iter::repeat_n('-', minus))
-                        .collect();
-                    writeln_buf(
-                        out,
-                        &format!(" {display:<name_width$} | {total:>count_width$} {graph}"),
-                    );
-                }
-            }
-        }
-    }
-    write_patch_shortstat(out, entries.len(), total_inserted, total_deleted);
-    Ok(())
+    write_diff_stat_with_widths(
+        out,
+        entries,
+        db,
+        None,
+        false,
+        DiffStatOptions {
+            compact_summary: false,
+            stat_count: options.stat_count,
+            color: false,
+        },
+        widths,
+    )
 }
 
-/// Number of decimal digits needed to print `value` (at least 1).
-fn decimal_width(value: usize) -> usize {
-    value.to_string().len()
-}
 
-/// Scale a row's insertions/deletions to the available graph width, matching
-/// git's behavior: when the row fits, counts are shown 1:1; otherwise the larger
-/// side is scaled with git's `scale_linear` and the smaller side takes the
-/// remainder of the scaled total.
-fn scale_graph(
-    inserted: usize,
-    deleted: usize,
-    graph_width: usize,
-    max_change: usize,
-) -> (usize, usize) {
-    let total = inserted + deleted;
-    if total <= graph_width || max_change <= graph_width {
-        return (inserted, deleted);
-    }
-    let scaled_total = scale_linear(total, graph_width, max_change);
-    if inserted >= deleted {
-        let plus = scale_linear(inserted, graph_width, max_change);
-        let minus = scaled_total.saturating_sub(plus);
-        (plus, minus)
-    } else {
-        let minus = scale_linear(deleted, graph_width, max_change);
-        let plus = scaled_total.saturating_sub(minus);
-        (plus, minus)
-    }
-}
 
-/// git's `scale_linear`: map `it` from `[1, max_change]` onto `[1, width]`.
-fn scale_linear(it: usize, width: usize, max_change: usize) -> usize {
-    if it == 0 || max_change <= 1 || width == 0 {
-        return it.min(width);
-    }
-    1 + (it - 1) * (width - 1) / (max_change - 1)
-}
 
-/// The ` N files changed, X insertions(+), Y deletions(-)` summary line, with
-/// git's pluralization and the quirk that the insertions clause appears when
-/// there were no deletions (and vice versa).
-fn write_patch_shortstat(out: &mut Vec<u8>, files: usize, inserted: usize, deleted: usize) {
-    let mut line = format!(" {files} {} changed", plural_word(files, "file", "files"));
-    if inserted > 0 || deleted == 0 {
-        line.push_str(&format!(
-            ", {inserted} {}(+)",
-            plural_word(inserted, "insertion", "insertions")
-        ));
-    }
-    if deleted > 0 || inserted == 0 {
-        line.push_str(&format!(
-            ", {deleted} {}(-)",
-            plural_word(deleted, "deletion", "deletions")
-        ));
-    }
-    writeln_buf(out, &line);
-}
 
-/// Singular/plural selector.
-fn plural_word<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
-    if count == 1 { singular } else { plural }
-}
 
 /// The ` create mode`/` delete mode`/` rename`/` copy`/` mode change` summary
 /// line for a single entry (the `--summary` lines format-patch always includes
@@ -1251,72 +1135,6 @@ fn write_patch_summary_entry(
     Ok(())
 }
 
-/// Maximum displayed file-name column width in the diffstat before git
-/// truncates with a leading `...`.
-const NAME_CAP: usize = 45;
-/// `name_width + count_width + graph_width` budget for a diffstat row at the
-/// non-tty default 80-column terminal width (derived empirically against git).
-const GRAPH_BUDGET: usize = 66;
-
-/// Per-file diffstat row.
-struct DiffstatRow {
-    path: String,
-    stats: DiffstatStats,
-}
-
-/// Insert/delete counts (text) or sizes (binary) for a diffstat row.
-enum DiffstatStats {
-    Binary { old_size: usize, new_size: usize },
-    Text { inserted: usize, deleted: usize },
-}
-
-/// The displayed path for a diffstat row, using the `old => new` form for
-/// renames/copies.
-fn diffstat_path(entry: &sley_diff_merge::NameStatusEntry) -> String {
-    if let Some(old_path) = &entry.old_path {
-        format!(
-            "{} => {}",
-            status_quote_path(old_path, false),
-            status_quote_path(&entry.path, false)
-        )
-    } else {
-        status_quote_path(&entry.path, false)
-    }
-}
-
-/// Display column width of a path string (byte length; the rest of the CLI
-/// treats quoted paths as ASCII columns).
-fn display_width(path: &str) -> usize {
-    path.len()
-}
-
-/// Truncate an over-long diffstat name to `...` + the trailing characters so the
-/// whole thing is `NAME_CAP` wide, matching git.
-fn truncate_stat_name(path: &str) -> String {
-    if path.len() <= NAME_CAP {
-        return path.to_string();
-    }
-    let tail = &path[path.len() - (NAME_CAP - 3)..];
-    format!("...{tail}")
-}
-
-/// Line insertion/deletion counts between two optional blobs, computed from the
-/// same Myers edit script the unified diff uses so the diffstat agrees with the
-/// emitted hunks line-for-line.
-fn line_change_counts(old: Option<&[u8]>, new: Option<&[u8]>) -> (usize, usize) {
-    let old_lines = sley_diff_merge::split_lines(old.unwrap_or_default());
-    let new_lines = sley_diff_merge::split_lines(new.unwrap_or_default());
-    let mut inserted = 0usize;
-    let mut deleted = 0usize;
-    for op in sley_diff_merge::myers_diff_lines(&old_lines, &new_lines) {
-        match op {
-            sley_diff_merge::DiffOp::Insert(n) => inserted += n,
-            sley_diff_merge::DiffOp::Delete(n) => deleted += n,
-            sley_diff_merge::DiffOp::Equal(_) => {}
-        }
-    }
-    (inserted, deleted)
-}
 
 /// Read the old blob for an entry, if it has one.
 fn entry_old_content(
@@ -1451,6 +1269,19 @@ fn parse_format_patch_args(args: &[String]) -> Result<FormatPatchOptions> {
             "--numbered-files" => options.numbered_files = true,
             "-s" | "--signoff" | "--signed-off-by" => options.signoff = true,
             "--stat" => options.stat = true,
+            value
+                if value.starts_with("--stat=")
+                    || value.starts_with("--stat-width=")
+                    || value.starts_with("--stat-name-width=")
+                    || value.starts_with("--stat-graph-width=")
+                    || value.starts_with("--stat-count=") =>
+            {
+                options.stat = true;
+                diff_stat_parse_width_option(value, &mut options.stat_widths)?;
+                if let Some(count) = diff_stat_count_option(value)? {
+                    options.stat_count = count;
+                }
+            }
             "--no-stat" => options.stat = false,
             // git's `format-patch -p` drops the leading diffstat (like
             // `--no-stat`). The long `--patch` is the diff-machinery flag and,

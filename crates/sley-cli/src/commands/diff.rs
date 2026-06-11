@@ -91,6 +91,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut stat = false;
     let mut compact_summary = false;
     let mut stat_count = None;
+    // `git diff` is porcelain: scale --stat to the terminal and honour the
+    // diff.stat*Width config (resolved after the repository is discovered).
+    let mut stat_widths = DiffStatWidths::terminal();
     let mut numstat = false;
     let mut shortstat = false;
     let mut patch = false;
@@ -570,6 +573,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             {
                 stat = true;
                 no_patch = false;
+                diff_stat_parse_width_option(value, &mut stat_widths)?;
                 if let Some(count) = diff_stat_count_option(value)? {
                     stat_count = count;
                 }
@@ -972,7 +976,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             }
         }
         if show_stat {
-            write_diff_stat(
+            let mut stat_widths = stat_widths;
+            if let Ok(config) = read_repo_config(&git_dir) {
+                stat_widths.resolve_config(&config);
+            } else {
+                stat_widths.resolve_config_defaults();
+            }
+            write_diff_stat_with_widths(
                 &mut stdout,
                 &entries,
                 &db,
@@ -983,6 +993,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     stat_count,
                     color: color_always,
                 },
+                stat_widths,
             )?;
         }
         if show_shortstat {

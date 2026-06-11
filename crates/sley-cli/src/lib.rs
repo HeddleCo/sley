@@ -2301,11 +2301,353 @@ fn write_diff_shortstat(
             }
         }
     }
+    write_diff_stat_summary_line(stdout, entries.len(), inserted, deleted)
+}
+
+fn write_diff_stat(
+    stdout: &mut dyn Write,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    options: DiffStatOptions,
+) -> Result<()> {
+    // Legacy entry point used by porcelain renderers (merge, stash, bisect, ...)
+    // that have not been migrated to pass widths explicitly. git's porcelain
+    // commands scale the stat to the terminal and respect the diff.stat*Width
+    // config, so resolve both here.
+    let mut widths = DiffStatWidths::terminal();
+    if let Ok(cwd) = env::current_dir()
+        && let Ok(git_dir) = discover_git_dir(&cwd)
+        && let Ok(config) = commands::remote_cmds::read_repo_config(&git_dir)
+    {
+        widths.resolve_config(&config);
+    } else {
+        widths.resolve_config_defaults();
+    }
+    write_diff_stat_with_widths(
+        stdout,
+        entries,
+        db,
+        worktree_root,
+        use_worktree_new,
+        options,
+        widths,
+    )
+}
+
+/// The `--stat=<width>[,<name-width>[,<count>]]` / `--stat-*-width` knobs plus
+/// the surrounding layout context, mirroring git's `diff_options` fields.
+///
+/// Sentinels follow git exactly:
+///   * `stat_width`: `-1` = scale to the terminal (minus `line_prefix_width`),
+///     `0` = the fixed 80-column default, `>0` = explicit width.
+///   * `name_width` / `graph_width`: `-1` = take `diff.statNameWidth` /
+///     `diff.statGraphWidth` from config (resolved via `resolve_config`),
+///     `0` = unlimited, `>0` = explicit cap.
+#[derive(Debug, Clone, Copy)]
+struct DiffStatWidths {
+    stat_width: i64,
+    name_width: i64,
+    graph_width: i64,
+    /// Display width of the per-line prefix (e.g. `log --graph` edges),
+    /// subtracted from the terminal width when `stat_width == -1`.
+    line_prefix_width: i64,
+}
+
+impl DiffStatWidths {
+    /// Porcelain default: scale to the terminal, take name/graph caps from config.
+    fn terminal() -> Self {
+        DiffStatWidths {
+            stat_width: -1,
+            name_width: -1,
+            graph_width: -1,
+            line_prefix_width: 0,
+        }
+    }
+
+    /// Plumbing default (`diff-tree` & friends): fixed 80 columns, no caps.
+    /// git's plumbing never calls `init_diffstat_widths`, so the fields stay 0.
+    fn plumbing() -> Self {
+        DiffStatWidths {
+            stat_width: 0,
+            name_width: 0,
+            graph_width: 0,
+            line_prefix_width: 0,
+        }
+    }
+
+    /// Replace `-1` name/graph sentinels with `diff.statNameWidth` /
+    /// `diff.statGraphWidth` (0 when unset), like show_stats' config fallback.
+    fn resolve_config(&mut self, config: &GitConfig) {
+        if self.name_width == -1 {
+            self.name_width = config
+                .get("diff", None, "statnamewidth")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        }
+        if self.graph_width == -1 {
+            self.graph_width = config
+                .get("diff", None, "statgraphwidth")
+                .and_then(|value| value.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        }
+    }
+
+    /// Like `resolve_config` with no config available: sentinels become 0.
+    fn resolve_config_defaults(&mut self) {
+        if self.name_width == -1 {
+            self.name_width = 0;
+        }
+        if self.graph_width == -1 {
+            self.graph_width = 0;
+        }
+    }
+}
+
+/// git `decimal_width()`: columns needed to print `number` in decimal.
+fn diff_stat_decimal_width(number: usize) -> i64 {
+    let mut width = 1i64;
+    let mut number = number / 10;
+    while number > 0 {
+        width += 1;
+        number /= 10;
+    }
+    width
+}
+
+/// git `scale_linear()`: scale `it` into `width` columns of a graph whose
+/// largest row is `max_change`, guaranteeing at least one column for any
+/// nonzero change.
+fn diff_stat_scale_linear(it: i64, width: i64, max_change: i64) -> i64 {
+    if it == 0 {
+        return 0;
+    }
+    1 + (it * (width - 1) / max_change)
+}
+
+/// Display width of a stat row name. git uses `utf8_strwidth`; paths that
+/// need quoting come out of `status_quote_path` as ASCII, so plain char count
+/// matches for everything the t-suite exercises.
+fn diff_stat_display_width(name: &str) -> i64 {
+    name.chars().count() as i64
+}
+
+/// Faithful port of git diff.c `show_stats()`.
+fn write_diff_stat_with_widths(
+    stdout: &mut dyn Write,
+    entries: &[sley_diff_merge::NameStatusEntry],
+    db: &FileObjectDatabase,
+    worktree_root: Option<&Path>,
+    use_worktree_new: bool,
+    options: DiffStatOptions,
+    widths: DiffStatWidths,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let DiffStatOptions {
+        compact_summary,
+        stat_count,
+        color,
+    } = options;
+    let rows = diff_stat_rows(
+        entries,
+        db,
+        worktree_root,
+        use_worktree_new,
+        compact_summary,
+    )?;
+
+    let mut count = stat_count.unwrap_or(rows.len()).min(rows.len());
+
+    // Pass 1: longest name, max change count, binary column width.
+    let mut max_len = 0i64;
+    let mut max_change = 0i64;
+    let mut number_width = 0i64;
+    let mut bin_width = 0i64;
+    for row in rows.iter().take(count) {
+        let len = diff_stat_display_width(&row.path);
+        max_len = max_len.max(len);
+        match row.stats {
+            DiffStatStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
+            } => {
+                // "Bin XXX -> YYY bytes"; an unchanged blob renders plain "Bin"
+                // (sizes treated as 0/0, exactly like git's same-contents case).
+                let (added, deleted) = if unchanged { (0, 0) } else { (new_size, old_size) };
+                let w = 14 + diff_stat_decimal_width(added) + diff_stat_decimal_width(deleted);
+                bin_width = bin_width.max(w);
+                number_width = number_width.max(3);
+            }
+            DiffStatStats::Text { inserted, deleted } => {
+                max_change = max_change.max((inserted + deleted) as i64);
+            }
+        }
+    }
+    count = count.min(rows.len());
+
+    let mut width = if widths.stat_width == -1 {
+        log_format::term_columns() - widths.line_prefix_width
+    } else if widths.stat_width != 0 {
+        widths.stat_width
+    } else {
+        80
+    };
+    number_width = diff_stat_decimal_width(max_change as usize).max(number_width);
+
+    // Guarantee 3/8*16 == 6 for the graph part and 5/8*16 == 10 for the name.
+    if width < 16 + 6 + number_width {
+        width = 16 + 6 + number_width;
+    }
+
+    // First assign sizes that are wanted, ignoring available width.
+    let mut graph_width = if max_change + 4 > bin_width {
+        max_change
+    } else {
+        bin_width - 4
+    };
+    if widths.graph_width > 0 && widths.graph_width < graph_width {
+        graph_width = widths.graph_width;
+    }
+    let mut name_width = if widths.name_width > 0 && widths.name_width < max_len {
+        widths.name_width
+    } else {
+        max_len
+    };
+
+    // Adjust adjustable widths not to exceed maximum width.
+    if name_width + number_width + 6 + graph_width > width {
+        if graph_width > width * 3 / 8 - number_width - 6 {
+            graph_width = width * 3 / 8 - number_width - 6;
+            if graph_width < 6 {
+                graph_width = 6;
+            }
+        }
+        if widths.graph_width > 0 && graph_width > widths.graph_width {
+            graph_width = widths.graph_width;
+        }
+        if name_width > width - number_width - 6 - graph_width {
+            name_width = width - number_width - 6 - graph_width;
+        } else {
+            graph_width = width - number_width - 6 - name_width;
+        }
+    }
+
+    let number_width = number_width.max(0) as usize;
+    for row in rows.iter().take(count) {
+        // "scale" the filename: strip leading characters (then snap to the
+        // next '/') behind a "..." marker when it overflows the name column.
+        let mut len = name_width;
+        let full_name = row.path.as_str();
+        let name_len = diff_stat_display_width(full_name);
+        let mut name = full_name;
+        let mut marker = "";
+        if name_width < name_len {
+            marker = "...";
+            len -= 3;
+            if len < 0 {
+                len = 0;
+            }
+            while diff_stat_display_width(name) > len {
+                let mut chars = name.chars();
+                chars.next();
+                name = chars.as_str();
+            }
+            if let Some(pos) = name.find('/') {
+                name = &name[pos..];
+            }
+        }
+        let padding = (len - diff_stat_display_width(name)).max(0) as usize;
+
+        match row.stats {
+            DiffStatStats::Binary {
+                old_size,
+                new_size,
+                unchanged,
+            } => {
+                write!(
+                    stdout,
+                    " {marker}{name}{:padding$} | {:>number_width$}",
+                    "", "Bin"
+                )?;
+                if unchanged {
+                    writeln!(stdout)?;
+                    continue;
+                }
+                let old_size = color_stat_deleted(&old_size.to_string(), color);
+                let new_size = color_stat_inserted(&new_size.to_string(), color);
+                writeln!(stdout, " {old_size} -> {new_size} bytes")?;
+            }
+            DiffStatStats::Text { inserted, deleted } => {
+                let total_changed = inserted + deleted;
+                let mut add = inserted as i64;
+                let mut del = deleted as i64;
+                if graph_width <= max_change && max_change > 0 {
+                    let mut total = diff_stat_scale_linear(add + del, graph_width, max_change);
+                    if total < 2 && add > 0 && del > 0 {
+                        // width >= 2 due to the sanity check
+                        total = 2;
+                    }
+                    if add < del {
+                        add = diff_stat_scale_linear(add, graph_width, max_change);
+                        del = total - add;
+                    } else {
+                        del = diff_stat_scale_linear(del, graph_width, max_change);
+                        add = total - del;
+                    }
+                }
+                write!(
+                    stdout,
+                    " {marker}{name}{:padding$} | {total_changed:>number_width$}{}",
+                    "",
+                    if total_changed > 0 { " " } else { "" }
+                )?;
+                let mut graph = String::new();
+                if add > 0 {
+                    let pluses = std::iter::repeat_n('+', add as usize).collect::<String>();
+                    graph.push_str(&color_stat_inserted(&pluses, color));
+                }
+                if del > 0 {
+                    let minuses = std::iter::repeat_n('-', del as usize).collect::<String>();
+                    graph.push_str(&color_stat_deleted(&minuses, color));
+                }
+                writeln!(stdout, "{graph}")?;
+            }
+        }
+    }
+    if count < rows.len() {
+        writeln!(stdout, " ...")?;
+    }
+
+    // Totals cover every row (display truncation does not affect them);
+    // binary rows count as changed files but contribute no line counts.
+    let mut adds = 0usize;
+    let mut dels = 0usize;
+    for row in &rows {
+        if let DiffStatStats::Text { inserted, deleted } = row.stats {
+            adds += inserted;
+            dels += deleted;
+        }
+    }
+    write_diff_stat_summary_line(stdout, rows.len(), adds, dels)
+}
+
+/// git `print_stat_summary_inserts_deletes()`: the
+/// " N files changed, A insertions(+), D deletions(-)" trailer.
+fn write_diff_stat_summary_line(
+    stdout: &mut dyn Write,
+    files: usize,
+    inserted: usize,
+    deleted: usize,
+) -> Result<()> {
     write!(
         stdout,
         " {} {} changed",
-        entries.len(),
-        plural(entries.len(), "file", "files")
+        files,
+        plural(files, "file", "files")
     )?;
     if inserted > 0 || deleted == 0 {
         write!(
@@ -2323,101 +2665,6 @@ fn write_diff_shortstat(
     }
     writeln!(stdout)?;
     Ok(())
-}
-
-fn write_diff_stat(
-    stdout: &mut dyn Write,
-    entries: &[sley_diff_merge::NameStatusEntry],
-    db: &FileObjectDatabase,
-    worktree_root: Option<&Path>,
-    use_worktree_new: bool,
-    options: DiffStatOptions,
-) -> Result<()> {
-    if entries.is_empty() {
-        return Ok(());
-    }
-    let DiffStatOptions {
-        compact_summary,
-        stat_count,
-        color,
-    } = options;
-    let rows = diff_stat_rows(
-        entries,
-        db,
-        worktree_root,
-        use_worktree_new,
-        compact_summary,
-    )?;
-    let displayed_rows = if let Some(count) = stat_count {
-        rows.len().min(count)
-    } else {
-        rows.len()
-    };
-    let path_width = rows
-        .iter()
-        .take(displayed_rows)
-        .map(|row| row.path.len())
-        .max()
-        .unwrap_or(0);
-    let has_binary_rows = rows
-        .iter()
-        .take(displayed_rows)
-        .any(|row| matches!(row.stats, DiffStatStats::Binary { .. }));
-    let count_width = rows
-        .iter()
-        .take(displayed_rows)
-        .filter_map(|row| match row.stats {
-            DiffStatStats::Text { inserted, deleted } => Some(inserted + deleted),
-            DiffStatStats::Binary { .. } => None,
-        })
-        .map(|count| count.to_string().len())
-        .max()
-        .unwrap_or(1);
-    let count_width = if has_binary_rows {
-        count_width.max(3)
-    } else {
-        count_width
-    };
-    for row in rows.iter().take(displayed_rows) {
-        match row.stats {
-            DiffStatStats::Binary {
-                old_size,
-                new_size,
-                unchanged,
-            } => {
-                if unchanged {
-                    // git prints just `Bin` (no ` N -> M bytes`) when the binary
-                    // blob is identical on both sides -- e.g. a pure mode change.
-                    writeln!(stdout, " {:path_width$} | Bin", row.path)?;
-                } else {
-                    let old_size = color_stat_deleted(&old_size.to_string(), color);
-                    let new_size = color_stat_inserted(&new_size.to_string(), color);
-                    writeln!(
-                        stdout,
-                        " {:path_width$} | Bin {old_size} -> {new_size} bytes",
-                        row.path
-                    )?;
-                }
-            }
-            DiffStatStats::Text { inserted, deleted } => {
-                let count = inserted + deleted;
-                if count == 0 {
-                    writeln!(stdout, " {:path_width$} | {count:>count_width$}", row.path)?;
-                } else {
-                    let graph = diff_stat_graph(inserted, deleted, color);
-                    writeln!(
-                        stdout,
-                        " {:path_width$} | {count:>count_width$} {graph}",
-                        row.path
-                    )?;
-                }
-            }
-        }
-    }
-    if displayed_rows < rows.len() {
-        writeln!(stdout, " ...")?;
-    }
-    write_diff_shortstat(stdout, entries, db, worktree_root, use_worktree_new)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2475,11 +2722,7 @@ enum DiffStatStats {
 
 fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: bool) -> String {
     let mut path = if let Some(old_path) = &entry.old_path {
-        format!(
-            "{} => {}",
-            status_quote_path(old_path, false),
-            status_quote_path(&entry.path, false)
-        )
+        diff_stat_pprint_rename(old_path, &entry.path)
     } else {
         status_quote_path(&entry.path, false)
     };
@@ -2488,6 +2731,69 @@ fn diff_stat_path(entry: &sley_diff_merge::NameStatusEntry, compact_summary: boo
         path.push_str(summary);
     }
     path
+}
+
+/// git `pprint_rename()`: collapse a rename's common directory prefix and
+/// suffix into braces — `dir/{old => new}/file` — falling back to the plain
+/// `old => new` form when either side needs c-style quoting or when nothing
+/// is shared.
+fn diff_stat_pprint_rename(a: &[u8], b: &[u8]) -> String {
+    let quoted_a = status_quote_path(a, false);
+    let quoted_b = status_quote_path(b, false);
+    if quoted_a.starts_with('"') || quoted_b.starts_with('"') {
+        return format!("{quoted_a} => {quoted_b}");
+    }
+    let len_a = a.len();
+    let len_b = b.len();
+
+    // Find common prefix (must end in a slash to count).
+    let mut pfx_length = 0usize;
+    let mut idx = 0usize;
+    while idx < len_a && idx < len_b && a[idx] == b[idx] {
+        if a[idx] == b'/' {
+            pfx_length = idx + 1;
+        }
+        idx += 1;
+    }
+
+    // Find common suffix, walking back from the (virtual) terminating NUL.
+    // With a common prefix the walk may run one byte into the prefix to see
+    // the same slash; without one it must not underrun the strings.
+    let mut sfx_length = 0usize;
+    let pfx_adjust_for_slash: isize = if pfx_length > 0 { 1 } else { 0 };
+    let mut oi = len_a as isize;
+    let mut ni = len_b as isize;
+    let lower = pfx_length as isize - pfx_adjust_for_slash;
+    while oi >= lower && ni >= lower {
+        let oc = if oi == len_a as isize { 0 } else { a[oi as usize] };
+        let nc = if ni == len_b as isize { 0 } else { b[ni as usize] };
+        if oc != nc {
+            break;
+        }
+        if oc == b'/' {
+            sfx_length = len_a - oi as usize;
+        }
+        oi -= 1;
+        ni -= 1;
+    }
+
+    // pfx{mid-a => mid-b}sfx  |  {pfx-a => pfx-b}sfx  |  pfx{sfx-a => sfx-b}
+    // |  name-a => name-b
+    let a_midlen = len_a.saturating_sub(pfx_length + sfx_length);
+    let b_midlen = len_b.saturating_sub(pfx_length + sfx_length);
+    let mut name = String::new();
+    if pfx_length + sfx_length > 0 {
+        name.push_str(&String::from_utf8_lossy(&a[..pfx_length]));
+        name.push('{');
+    }
+    name.push_str(&String::from_utf8_lossy(&a[pfx_length..pfx_length + a_midlen]));
+    name.push_str(" => ");
+    name.push_str(&String::from_utf8_lossy(&b[pfx_length..pfx_length + b_midlen]));
+    if pfx_length + sfx_length > 0 {
+        name.push('}');
+        name.push_str(&String::from_utf8_lossy(&a[len_a - sfx_length..]));
+    }
+    name
 }
 
 fn diff_compact_summary_label(entry: &sley_diff_merge::NameStatusEntry) -> Option<&'static str> {
@@ -2507,19 +2813,6 @@ fn diff_compact_summary_label(entry: &sley_diff_merge::NameStatusEntry) -> Optio
     }
 }
 
-fn diff_stat_graph(inserted: usize, deleted: usize, color: bool) -> String {
-    let mut graph = String::with_capacity(inserted + deleted);
-    if inserted > 0 {
-        let pluses = std::iter::repeat_n('+', inserted).collect::<String>();
-        graph.push_str(&color_stat_inserted(&pluses, color));
-    }
-    if deleted > 0 {
-        let minuses = std::iter::repeat_n('-', deleted).collect::<String>();
-        graph.push_str(&color_stat_deleted(&minuses, color));
-    }
-    graph
-}
-
 fn color_stat_inserted(value: &str, color: bool) -> String {
     if color {
         format!("\x1b[32m{value}\x1b[m")
@@ -2533,6 +2826,44 @@ fn color_stat_deleted(value: &str, color: bool) -> String {
         format!("\x1b[31m{value}\x1b[m")
     } else {
         value.to_string()
+    }
+}
+
+/// Parse one `--stat*` argument's width components into `widths`, mirroring
+/// git's `diff_opt_stat()`: `--stat=<w>[,<name-w>[,<count>]]` (count handled by
+/// `diff_stat_count_option`), `--stat-width=<w>`, `--stat-name-width=<w>`,
+/// `--stat-graph-width=<w>`. Unknown / non-stat options are left untouched;
+/// returns whether `value` was a stat option at all.
+fn diff_stat_parse_width_option(value: &str, widths: &mut DiffStatWidths) -> Result<bool> {
+    fn parse_number(option: &str, value: &str) -> Result<i64> {
+        value
+            .parse::<i64>()
+            .map_err(|_| GitError::Command(format!("{option} expects a numerical value")))
+    }
+    if let Some(spec) = value.strip_prefix("--stat=") {
+        let mut parts = spec.split(',');
+        if let Some(width) = parts.next()
+            && !width.is_empty()
+        {
+            widths.stat_width = parse_number("--stat", width)?;
+        }
+        if let Some(name_width) = parts.next()
+            && !name_width.is_empty()
+        {
+            widths.name_width = parse_number("--stat", name_width)?;
+        }
+        Ok(true)
+    } else if let Some(width) = value.strip_prefix("--stat-width=") {
+        widths.stat_width = parse_number("--stat-width", width)?;
+        Ok(true)
+    } else if let Some(width) = value.strip_prefix("--stat-name-width=") {
+        widths.name_width = parse_number("--stat-name-width", width)?;
+        Ok(true)
+    } else if let Some(width) = value.strip_prefix("--stat-graph-width=") {
+        widths.graph_width = parse_number("--stat-graph-width", width)?;
+        Ok(true)
+    } else {
+        Ok(value == "--stat" || value.starts_with("--stat-count="))
     }
 }
 
