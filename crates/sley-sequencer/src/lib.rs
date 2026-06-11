@@ -318,6 +318,7 @@ mod tests {
                 author: identity.clone(),
                 committer: identity,
                 message: b"initial subject\n".to_vec(),
+                encoding: None,
             },
         )
         .expect("test operation should succeed");
