@@ -424,6 +424,10 @@ impl CompiledLogFormat {
         self.fields.contains(FormatFields::OID)
     }
 
+    pub(crate) fn uses_source(&self) -> bool {
+        self.fields.contains(FormatFields::REV_SOURCE)
+    }
+
     /// True when the format emits only full oids (`%H`) plus inert literals/newlines.
     #[allow(dead_code)]
     pub(crate) fn is_oid_only(&self) -> bool {

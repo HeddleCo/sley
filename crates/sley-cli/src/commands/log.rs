@@ -967,9 +967,14 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         None
     };
     let mut starts = Vec::new();
+    // `(start_commit_oid, source_label)` pairs in command-line order, used to
+    // build the `%S` per-commit source map (later starts override earlier ones).
+    let mut source_starts: Vec<(ObjectId, String)> = Vec::new();
     for rev in includes {
         let start = resolve_revision(&git_dir, format, &rev)?;
-        starts.push(sley_rev::peel_to_commit(&db, format, &start)?);
+        let commit = sley_rev::peel_to_commit(&db, format, &start)?;
+        source_starts.push((commit, rev.to_string()));
+        starts.push(commit);
     }
     let mut symmetric_excludes = Vec::new();
     for (left, right, not) in linear_ranges {
@@ -996,6 +1001,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             symmetric_excludes.push(left_oid);
             symmetric_excludes.push(right_oid);
         } else {
+            source_starts.push((left_oid, left.to_string()));
+            source_starts.push((right_oid, right.to_string()));
             starts.push(left_oid);
             starts.push(right_oid);
             symmetric_excludes.extend(merge_bases);
@@ -1216,7 +1223,23 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
         db: &db,
         format,
     };
-    let source_labels: Option<HashMap<ObjectId, String>> = None;
+    // `%S` source labels: each commit is tagged with the start ref from which it
+    // is reachable; when several starts reach it, the last one (command-line
+    // order) wins — matching git's `revision.c` source naming.
+    let format_uses_source = matches!(&output, LogOutput::Compiled { compiled, .. } if compiled.uses_source());
+    let source_labels: Option<HashMap<ObjectId, String>> = if format_uses_source
+        && !source_starts.is_empty()
+    {
+        let mut map = HashMap::new();
+        for (start_oid, label) in &source_starts {
+            for record in rev_list_walk_commits(&db, format, [*start_oid], first_parent)? {
+                map.insert(record.oid, label.clone());
+            }
+        }
+        Some(map)
+    } else {
+        None
+    };
     for (index, record) in selected.iter().enumerate() {
         match output {
             LogOutput::Default => {
