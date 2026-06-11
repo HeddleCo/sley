@@ -398,6 +398,134 @@ where
         .map(Some)
 }
 
+/// Assemble a pack stream that reuses an existing pack's object data verbatim
+/// (upstream pack-objects' "pack reuse" fast path, full-pack case) and appends
+/// `appended` as freshly encoded undeltified entries.
+///
+/// The reused pack's entry bytes are copied as-is between our own header and
+/// trailer: a full-pack copy preserves every relative distance, so internal
+/// `OFS_DELTA` bases stay valid. The header object count covers both the
+/// reused and appended entries, and the trailing pack checksum is recomputed
+/// over the assembled stream.
+pub fn assemble_pack_with_verbatim_reuse(
+    format: ObjectFormat,
+    reused_pack_bytes: &[u8],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    assemble_pack_with_verbatim_reuses(format, &[reused_pack_bytes], appended)
+}
+
+/// Like [`assemble_pack_with_verbatim_reuse`], but concatenates multiple whole
+/// packs before appending fresh entries.
+pub fn assemble_pack_with_verbatim_reuses(
+    format: ObjectFormat,
+    reused_packs: &[&[u8]],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    let hash_len = format.raw_len();
+    let mut reused_count = 0u32;
+    let mut capacity = 12 + hash_len + 64 * appended.len();
+    for reused_pack_bytes in reused_packs {
+        if reused_pack_bytes.len() < 12 + hash_len {
+            return Err(GitError::InvalidFormat("reused pack too short".into()));
+        }
+        if &reused_pack_bytes[..4] != b"PACK" {
+            return Err(GitError::InvalidFormat("reused pack has no signature".into()));
+        }
+        let version = u32::from_be_bytes([
+            reused_pack_bytes[4],
+            reused_pack_bytes[5],
+            reused_pack_bytes[6],
+            reused_pack_bytes[7],
+        ]);
+        if version != 2 {
+            return Err(GitError::Unsupported(format!("reused pack version {version}")));
+        }
+        let count = u32::from_be_bytes([
+            reused_pack_bytes[8],
+            reused_pack_bytes[9],
+            reused_pack_bytes[10],
+            reused_pack_bytes[11],
+        ]);
+        reused_count = reused_count
+            .checked_add(count)
+            .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+        capacity = capacity.saturating_add(reused_pack_bytes.len().saturating_sub(12 + hash_len));
+    }
+    let total = reused_count
+        .checked_add(appended.len() as u32)
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    for reused_pack_bytes in reused_packs {
+        out.extend_from_slice(&reused_pack_bytes[12..reused_pack_bytes.len() - hash_len]);
+    }
+    for input in appended {
+        write_undeltified_pack_entry(&mut out, input.object)?;
+    }
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    Ok((out, reused_count))
+}
+
+/// Assemble a pack stream by copying already-encoded pack entries verbatim and
+/// appending freshly encoded undeltified entries.
+pub fn assemble_pack_with_verbatim_entries(
+    format: ObjectFormat,
+    reused_entries: &[&[u8]],
+    appended: &[PackInput<'_>],
+) -> Result<(Vec<u8>, u32)> {
+    let reused_count = u32::try_from(reused_entries.len())
+        .map_err(|_| GitError::InvalidFormat("too many pack objects".into()))?;
+    let total = reused_count
+        .checked_add(appended.len() as u32)
+        .ok_or_else(|| GitError::InvalidFormat("too many pack objects".into()))?;
+
+    let mut capacity = 12 + format.raw_len() + 64 * appended.len();
+    for entry in reused_entries {
+        capacity = capacity.saturating_add(entry.len());
+    }
+    let mut out = Vec::with_capacity(capacity);
+    out.extend_from_slice(b"PACK");
+    out.extend_from_slice(&2u32.to_be_bytes());
+    out.extend_from_slice(&total.to_be_bytes());
+    for entry in reused_entries {
+        out.extend_from_slice(entry);
+    }
+    for input in appended {
+        write_undeltified_pack_entry(&mut out, input.object)?;
+    }
+    let checksum = sley_core::digest_bytes(format, &out)?;
+    out.extend_from_slice(checksum.as_bytes());
+    Ok((out, reused_count))
+}
+
+/// Append one undeltified pack entry (type/size varint header + zlib body).
+fn write_undeltified_pack_entry(out: &mut Vec<u8>, object: &EncodedObject) -> Result<()> {
+    let type_bits: u8 = match object.object_type {
+        ObjectType::Commit => 1,
+        ObjectType::Tree => 2,
+        ObjectType::Blob => 3,
+        ObjectType::Tag => 4,
+    };
+    let mut size = object.body.len() as u64;
+    let mut byte = (type_bits << 4) | (size & 0x0f) as u8;
+    size >>= 4;
+    while size > 0 {
+        out.push(byte | 0x80);
+        byte = (size & 0x7f) as u8;
+        size >>= 7;
+    }
+    out.push(byte);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&object.body)?;
+    out.extend_from_slice(&encoder.finish()?);
+    Ok(())
+}
+
 /// Outcome of consolidating every object in a repository into a single pack.
 ///
 /// This is the engine for `git gc` / `git repack`: [`repack_all_objects`]
@@ -433,6 +561,93 @@ pub struct RepackResult {
 /// [`install_repack_result`].
 ///
 /// Returns `Ok(None)` when the repository contains no objects at all.
+/// `git repack -a`'s gathering rule: pack the reachability closure of `roots`
+/// (ref tips, `HEAD`, reflog entries, indexed objects) instead of everything
+/// on disk. Borrowed objects (alternates) reachable from the roots are packed
+/// into the new local pack like upstream `pack-objects --all` without
+/// `--local`; previously-packed objects that are no longer reachable are NOT
+/// carried forward (that is how `repack -a -d` drops them). Missing objects
+/// are tolerated (stale reflog entries may reference pruned history).
+///
+/// Returns `Ok(None)` when no roots resolve to any object.
+pub fn repack_reachable_objects(
+    git_dir: &Path,
+    format: ObjectFormat,
+    roots: &[ObjectId],
+) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut objects: Vec<ReachablePackObject> = Vec::new();
+    let mut pending: Vec<ObjectId> = roots.to_vec();
+    while let Some(oid) = pending.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = match database.read_object(&oid) {
+            Ok(object) => object,
+            Err(GitError::NotFound(_)) => continue,
+            Err(err) => return Err(err),
+        };
+        match object.object_type {
+            ObjectType::Commit => {
+                let commit = Commit::parse_ref(format, &object.body)?;
+                pending.extend(commit.parents);
+                pending.push(commit.tree);
+            }
+            ObjectType::Tree => {
+                for entry in TreeEntries::new(format, &object.body) {
+                    let entry = entry?;
+                    if !entry.is_gitlink() {
+                        pending.push(entry.oid);
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse_ref(format, &object.body)?;
+                pending.push(tag.object);
+            }
+            ObjectType::Blob => {}
+        }
+        objects.push(ReachablePackObject { oid, object });
+    }
+    if objects.is_empty() {
+        return Ok(None);
+    }
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+
+    // Every pre-existing local pack is superseded under `-a` (their reachable
+    // objects are in the new pack; their unreachable ones are being dropped).
+    let new_pack_file_name = format!("pack-{}.pack", written.checksum.to_hex());
+    let obsolete_packs = existing_pack_files(&objects_dir.join("pack"))?
+        .into_iter()
+        .filter(|path| path.file_name().and_then(|name| name.to_str()) != Some(&new_pack_file_name))
+        .collect();
+
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_object_ids(&objects_dir, format)?
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs,
+        packed_loose,
+        pack_checksum,
+        index_entries,
+    }))
+}
+
 pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
     let objects_dir = repository_objects_dir(git_dir);
     let database = FileObjectDatabase::new(objects_dir.clone(), format);
@@ -488,6 +703,50 @@ pub fn repack_all_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option
         packed_loose,
         pack_checksum: written.checksum,
         index_entries: written.entries,
+    }))
+}
+
+/// Gather only loose objects in `git_dir` and write them into a new pack.
+///
+/// This is the engine for plain `git repack -d` (without `-a`): existing packs
+/// remain in place, and pruning removes only the loose copies that the new pack
+/// now serves.
+pub fn repack_loose_objects(git_dir: &Path, format: ObjectFormat) -> Result<Option<RepackResult>> {
+    let objects_dir = repository_objects_dir(git_dir);
+    let database = FileObjectDatabase::new(objects_dir.clone(), format);
+    let loose_oids = loose_object_ids(&objects_dir, format)?;
+    if loose_oids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut objects = Vec::with_capacity(loose_oids.len());
+    for oid in &loose_oids {
+        objects.push(ReachablePackObject {
+            oid: *oid,
+            object: database.read_object(oid)?,
+        });
+    }
+
+    let inputs = pack_inputs(&objects);
+    let written = PackFile::write_packed_with_known_ids(&inputs, format)?;
+    let object_count = written.entries.len();
+    let packed_oid_set: HashSet<&ObjectId> = written.entries.iter().map(|e| &e.oid).collect();
+    let mut packed_loose: Vec<ObjectId> = loose_oids
+        .into_iter()
+        .filter(|oid| packed_oid_set.contains(oid))
+        .collect();
+    packed_loose.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+
+    let pack_checksum = written.checksum;
+    let index_entries = written.entries.clone();
+    Ok(Some(RepackResult {
+        pack: written.pack,
+        idx: written.index,
+        object_count,
+        obsolete_packs: Vec::new(),
+        packed_loose,
+        pack_checksum,
+        index_entries,
     }))
 }
 

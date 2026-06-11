@@ -125,20 +125,10 @@ fn index_pack_add_pack_file(options: &mut IndexPackOptions, value: &str) -> Resu
 }
 
 fn write_index_pack_output(path: &Path, index: &[u8]) -> Result<()> {
-    let mut file = match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-            eprintln!("fatal: unable to create '{}': File exists", path.display());
-            return Err(GitError::Exit(128));
-        }
-        Err(err) => return Err(GitError::Io(err.to_string())),
-    };
-    file.write_all(index)?;
-    Ok(())
+    // `index-pack -o <path>` is an explicit caller-chosen output. Upstream's
+    // test suite reuses that path across different packs, so replace any prior
+    // file instead of treating it like a content-addressed object component.
+    fs::write(path, index).map_err(|err| GitError::Io(err.to_string()))
 }
 
 fn index_pack_usage<T>() -> Result<T> {
@@ -367,9 +357,69 @@ fn repack_preferred_bitmap_tips(
     Ok(tips)
 }
 
+/// The traversal roots `repack -a` packs from, mirroring upstream's
+/// `pack-objects --all --reflog --indexed-objects` invocation: every direct
+/// ref target, `HEAD`, both sides of every reflog entry, and the blobs in the
+/// index. Unresolvable roots are skipped (the closure walk also tolerates
+/// missing objects — stale reflogs are expected).
+fn repack_traversal_roots(
+    git_dir: &Path,
+    common_git_dir: &Path,
+    format: ObjectFormat,
+) -> Result<Vec<ObjectId>> {
+    let mut roots = Vec::new();
+    let store = FileRefStore::new(git_dir, format);
+    for reference in store.list_refs()? {
+        if let RefTarget::Direct(oid) = reference.target {
+            roots.push(oid);
+        }
+    }
+    if let Ok(head) = resolve_revision(git_dir, format, "HEAD") {
+        roots.push(head);
+    }
+    // Reflogs: parse the leading "<old> <new>" oid pair of each line under
+    // logs/ (both sides — upstream's --reflog marks both).
+    let mut log_dirs = vec![common_git_dir.join("logs"), git_dir.join("logs")];
+    log_dirs.dedup();
+    let zero = "0".repeat(format.hex_len());
+    let mut stack: Vec<PathBuf> = log_dirs.into_iter().filter(|dir| dir.is_dir()).collect();
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(contents) = fs::read_to_string(&path) {
+                for line in contents.lines() {
+                    let mut fields = line.split(' ');
+                    for hex in [fields.next(), fields.next()].into_iter().flatten() {
+                        if hex != zero
+                            && let Ok(oid) = ObjectId::from_hex(format, hex)
+                        {
+                            roots.push(oid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Indexed blobs (upstream --indexed-objects).
+    if let Ok(bytes) = fs::read(git_dir.join("index"))
+        && let Ok(index) = sley_index::Index::parse(&bytes, format)
+    {
+        for entry in &index.entries {
+            roots.push(entry.oid);
+        }
+    }
+    Ok(roots)
+}
+
 pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
     let mut prune = false;
     let mut quiet = false;
+    let mut all = false;
     let mut write_bitmaps: Option<bool> = None;
     for arg in &expand_repack_short_clusters(args) {
         match arg.as_str() {
@@ -377,8 +427,9 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             "-q" | "--quiet" => quiet = true,
             "-b" | "--write-bitmap-index" => write_bitmaps = Some(true),
             "--no-write-bitmap-index" => write_bitmaps = Some(false),
-            // Accepted no-ops: we always rewrite every object into one pack.
-            "-a" | "-A" | "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
+            "-a" | "-A" => all = true,
+            // Accepted no-ops.
+            "-l" | "-f" | "-F" | "--progress" | "--no-progress" => {}
             value if value.starts_with("--window") || value.starts_with("--depth") => {}
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
@@ -401,7 +452,24 @@ pub(crate) fn cmd_repack(args: &[String]) -> Result<()> {
             .get_bool("repack", None, "writeBitmaps")
             .unwrap_or(false),
     };
-    if let Some(result) = sley_odb::repack_all_objects(&common_git_dir, format)? {
+    if write_bitmaps && !all {
+        // Upstream cmd_repack: bitmaps require an all-into-one repack.
+        eprintln!(
+            "fatal: Incremental repacks are incompatible with bitmap indexes.  Use
+--no-write-bitmap-index or disable the pack.writeBitmaps configuration."
+        );
+        return Err(GitError::Exit(128));
+    }
+    // `-a`: pack the reachability closure of refs/HEAD/reflogs/index (borrowed
+    // objects included, unreachable ones dropped). Without `-a`, pack only
+    // loose objects and leave existing packs in place.
+    let result = if all {
+        let roots = repack_traversal_roots(&git_dir, &common_git_dir, format)?;
+        sley_odb::repack_reachable_objects(&common_git_dir, format, &roots)?
+    } else {
+        sley_odb::repack_loose_objects(&common_git_dir, format)?
+    };
+    if let Some(result) = result {
         let bitmap_tips = if write_bitmaps {
             let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
             Some(repack_preferred_bitmap_tips(&common_git_dir, &db, format)?)
