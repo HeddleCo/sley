@@ -3206,10 +3206,20 @@ pub(crate) fn cmd_commit_tree(args: &[String]) -> Result<()> {
     };
     let git_dir = discover_git_dir(env::current_dir()?)?;
     let format = repository_object_format(&git_dir)?;
-    let tree = ObjectId::from_hex(format, &tree)?;
+    // git resolves the tree and each `-p` parent as a revision-ish (so a tag,
+    // branch, `HEAD^`, abbreviated oid, or `<rev>^{tree}` all work), peeling the
+    // tree argument to a tree and each parent to a commit — not a bare 40-hex
+    // oid. Mirror that: resolve, then peel.
+    let db_resolve = FileObjectDatabase::from_git_dir(&git_dir, format);
+    let tree_rev = sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, &tree)?;
+    let tree = sley_rev::peel_to_tree(&db_resolve, format, &tree_rev)?;
     let parents = parents
         .iter()
-        .map(|parent| ObjectId::from_hex(format, parent))
+        .map(|parent| {
+            let oid =
+                sley_rev::resolve_revision_with_reader(&git_dir, format, &db_resolve, parent)?;
+            sley_rev::peel_to_commit(&db_resolve, format, &oid)
+        })
         .collect::<Result<Vec<_>>>()?;
     let message = if message_chunks.is_empty() {
         let mut message = Vec::new();

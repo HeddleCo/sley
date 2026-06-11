@@ -85,7 +85,8 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
             "--count" => count = true,
             "--no-count" => count = false,
             "--topo-order" => ordering = RevListOrdering::Topo,
-            "--date-order" | "--author-date-order" => ordering = RevListOrdering::Date,
+            "--date-order" => ordering = RevListOrdering::Date,
+            "--author-date-order" => ordering = RevListOrdering::AuthorDate,
             "--sparse"
             | "--dense"
             | "--remove-empty"
@@ -833,8 +834,9 @@ pub(crate) fn cmd_rev_list(args: &[String]) -> Result<()> {
         (RevListWalkMode::NoWalkSorted, RevListOrdering::Default) => rev_list_date_order(selected)?,
         (RevListWalkMode::NoWalkUnsorted, RevListOrdering::Default) => selected,
         (RevListWalkMode::Walk, RevListOrdering::Default) => rev_list_date_order(selected)?,
-        (_, RevListOrdering::Topo) => rev_list_topo_order(selected),
+        (_, RevListOrdering::Topo) => rev_list_topo_order(selected)?,
         (_, RevListOrdering::Date) => rev_list_date_order(selected)?,
+        (_, RevListOrdering::AuthorDate) => rev_list_author_date_order(selected)?,
     };
     if skip_count > 0 {
         selected = selected.into_iter().skip(skip_count).collect();

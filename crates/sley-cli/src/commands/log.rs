@@ -288,7 +288,8 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
             }
             "--reverse" => reverse = true,
             "--topo-order" => ordering = RevListOrdering::Topo,
-            "--date-order" | "--author-date-order" => ordering = RevListOrdering::Date,
+            "--date-order" => ordering = RevListOrdering::Date,
+            "--author-date-order" => ordering = RevListOrdering::AuthorDate,
             "--first-parent" => first_parent = true,
             "--parents" => show_parents = true,
             "--children" => show_children = true,
@@ -1426,8 +1427,9 @@ pub(crate) fn cmd_log(args: &[String]) -> Result<()> {
     selected = match ordering {
         RevListOrdering::Default if walk => rev_list_date_order(selected)?,
         RevListOrdering::Default => selected,
-        RevListOrdering::Topo => rev_list_topo_order(selected),
+        RevListOrdering::Topo => rev_list_topo_order(selected)?,
         RevListOrdering::Date => rev_list_date_order(selected)?,
+        RevListOrdering::AuthorDate => rev_list_author_date_order(selected)?,
     };
     if skip > 0 {
         selected = selected.into_iter().skip(skip).collect();

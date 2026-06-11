@@ -647,14 +647,22 @@ fn match_object_header_date(date: &[u8]) -> Option<(i64, i64)> {
 /// git's `parse_date_basic`: the strict-ish absolute parser. Returns the Unix
 /// timestamp on success, `None` on failure.
 fn parse_date_basic(date: &[u8]) -> Option<i64> {
+    parse_date_basic_full(date).map(|(timestamp, _offset)| timestamp)
+}
+
+/// git's `parse_date_basic`, returning both the absolute UTC `timestamp` and the
+/// parsed timezone `offset` in minutes (git's `*offset`). Mirrors git's
+/// `parse_date` shape, which a commit/tag author/committer date needs: the
+/// object line stores `<utc_seconds> <+HHMM>` where the seconds are timezone-
+/// normalised and the offset is carried alongside for display.
+fn parse_date_basic_full(date: &[u8]) -> Option<(i64, i64)> {
     let mut tm = Tm::unset();
     let mut tm_gmt = false;
     let mut offset: i64 = -1;
 
     if date.first() == Some(&b'@') {
         if let Some((stamp, ofs)) = match_object_header_date(&date[1..]) {
-            let _ = ofs;
-            return Some(stamp);
+            return Some((stamp, ofs));
         }
     }
 
@@ -697,7 +705,7 @@ fn parse_date_basic(date: &[u8]) -> Option<i64> {
         timestamp -= offset * 60;
     }
 
-    Some(timestamp)
+    Some((timestamp, offset))
 }
 
 /// git's `update_tm`: fill in unset date fields from `now`, then apply a relative
@@ -962,6 +970,56 @@ fn approxidate_careful(date: &[u8]) -> (i64, bool) {
     let mut error_ret = false;
     let ts = approxidate_str(date, now_unix(), &mut error_ret);
     (ts, error_ret)
+}
+
+/// Parse a commit/tag author or committer date the way git's `parse_date` does
+/// for `GIT_AUTHOR_DATE`/`GIT_COMMITTER_DATE` and `--date=`, returning the
+/// absolute UTC `seconds` and the canonical `+HHMM` timezone string git would
+/// store on the object line.
+///
+/// The fast path is the already-canonical raw form (`<seconds> +HHMM`, optional
+/// leading `@`), which round-trips without going through the civil-date parser;
+/// otherwise git's `parse_date_basic` handles the human/ISO/RFC formats the test
+/// suite (and users) feed in (`2005-04-07T22:13:13`, `Thu, 7 Apr 2005 ...`, etc).
+pub(crate) fn parse_commit_date(date: &str) -> Option<(i64, String)> {
+    let trimmed = date.trim();
+    // Raw form `<seconds> <+HHMM>` (optionally `@`-prefixed) — preserve the tz
+    // string verbatim so a caller-supplied offset survives untouched.
+    if let Some((raw_secs, raw_tz)) = split_raw_seconds_tz(trimmed) {
+        return Some((raw_secs, raw_tz));
+    }
+    let (seconds, offset) = parse_date_basic_full(trimmed.as_bytes())?;
+    Some((seconds, format_tz_offset(offset)))
+}
+
+/// Recognise git's already-canonical `<seconds> <+HHMM>` raw date (with an
+/// optional leading `@`), returning the integer seconds and the tz string as
+/// written. Anything else returns `None` so the full parser runs.
+fn split_raw_seconds_tz(date: &str) -> Option<(i64, String)> {
+    let mut parts = date.split_whitespace();
+    let secs = parts.next()?;
+    let tz = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let secs = secs.strip_prefix('@').unwrap_or(secs);
+    let seconds = secs.parse::<i64>().ok()?;
+    let tz_bytes = tz.as_bytes();
+    if tz_bytes.len() == 5
+        && matches!(tz_bytes[0], b'+' | b'-')
+        && tz_bytes[1..].iter().all(u8::is_ascii_digit)
+    {
+        Some((seconds, tz.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Render a tz offset in minutes as git's `+HHMM`/`-HHMM`.
+fn format_tz_offset(offset_minutes: i64) -> String {
+    let sign = if offset_minutes < 0 { '-' } else { '+' };
+    let abs = offset_minutes.abs();
+    format!("{sign}{:02}{:02}", abs / 60, abs % 60)
 }
 
 /// git's `parse_expiry_date`: the public entry point. Returns `Some(timestamp)`
