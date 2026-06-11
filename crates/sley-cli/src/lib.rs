@@ -1823,7 +1823,7 @@ fn parse_similarity_threshold(spec: &str) -> u8 {
 /// a pathspec, so ordinary file paths keep working without an explicit `--`.
 
 fn write_diff_summary_entry(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
 ) -> Result<()> {
     match entry.status {
@@ -1867,7 +1867,7 @@ fn write_diff_summary_entry(
 }
 
 fn write_diff_raw_entry(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     z: bool,
     zero_worktree_oids: bool,
@@ -1933,7 +1933,7 @@ struct DiffPatchOptions<'a> {
 }
 
 fn write_diff_patch_entry(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
@@ -2018,12 +2018,19 @@ fn write_diff_patch_entry(
             writeln!(stdout, "+++ {header_path}")?;
         }
     }
-    write_diff_full_file_hunk(stdout, old_content.as_deref(), new_content.as_deref())?;
+    // Context-3 hunks with git's section headings (shared with format-patch).
+    let mut hunks = Vec::new();
+    commands::format_patch::write_patch_hunks(
+        &mut hunks,
+        old_content.as_deref(),
+        new_content.as_deref(),
+    );
+    stdout.write_all(&hunks)?;
     Ok(())
 }
 
 fn write_diff_binary_patch_entry(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     old_content: Option<Vec<u8>>,
     new_content: Option<Vec<u8>>,
@@ -2091,7 +2098,7 @@ fn write_diff_binary_patch_entry(
 }
 
 fn write_diff_similarity_headers(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     old_path: &str,
     path: &str,
@@ -2155,83 +2162,12 @@ fn diff_patch_mode_suffix(entry: &sley_diff_merge::NameStatusEntry) -> String {
     }
 }
 
-fn write_diff_full_file_hunk(
-    stdout: &mut io::Stdout,
-    old_content: Option<&[u8]>,
-    new_content: Option<&[u8]>,
-) -> Result<()> {
-    let old_lines = old_content.map(diff_lines).unwrap_or_default();
-    let new_lines = new_content.map(diff_lines).unwrap_or_default();
-    writeln!(
-        stdout,
-        "@@ -{} +{} @@",
-        diff_hunk_range(old_lines.len()),
-        diff_hunk_range(new_lines.len())
-    )?;
-    write_diff_lcs_lines(stdout, &old_lines, &new_lines)?;
-    Ok(())
-}
 
-fn diff_hunk_range(line_count: usize) -> String {
-    match line_count {
-        0 => "0,0".to_string(),
-        1 => "1".to_string(),
-        _ => format!("1,{line_count}"),
-    }
-}
 
-fn write_diff_lcs_lines(
-    stdout: &mut io::Stdout,
-    old_lines: &[&[u8]],
-    new_lines: &[&[u8]],
-) -> Result<()> {
-    let mut lengths = vec![vec![0; new_lines.len() + 1]; old_lines.len() + 1];
-    for old_idx in (0..old_lines.len()).rev() {
-        for new_idx in (0..new_lines.len()).rev() {
-            lengths[old_idx][new_idx] = if old_lines[old_idx] == new_lines[new_idx] {
-                lengths[old_idx + 1][new_idx + 1] + 1
-            } else {
-                lengths[old_idx + 1][new_idx].max(lengths[old_idx][new_idx + 1])
-            };
-        }
-    }
-    let mut old_idx = 0;
-    let mut new_idx = 0;
-    while old_idx < old_lines.len() && new_idx < new_lines.len() {
-        if old_lines[old_idx] == new_lines[new_idx] {
-            write_diff_patch_line(stdout, b' ', old_lines[old_idx])?;
-            old_idx += 1;
-            new_idx += 1;
-        } else if lengths[old_idx + 1][new_idx] >= lengths[old_idx][new_idx + 1] {
-            write_diff_patch_line(stdout, b'-', old_lines[old_idx])?;
-            old_idx += 1;
-        } else {
-            write_diff_patch_line(stdout, b'+', new_lines[new_idx])?;
-            new_idx += 1;
-        }
-    }
-    while old_idx < old_lines.len() {
-        write_diff_patch_line(stdout, b'-', old_lines[old_idx])?;
-        old_idx += 1;
-    }
-    while new_idx < new_lines.len() {
-        write_diff_patch_line(stdout, b'+', new_lines[new_idx])?;
-        new_idx += 1;
-    }
-    Ok(())
-}
 
-fn write_diff_patch_line(stdout: &mut io::Stdout, prefix: u8, line: &[u8]) -> Result<()> {
-    stdout.write_all(&[prefix])?;
-    stdout.write_all(line)?;
-    if !line.ends_with(b"\n") {
-        stdout.write_all(b"\n\\ No newline at end of file\n")?;
-    }
-    Ok(())
-}
 
 fn write_diff_numstat_entry(
-    stdout: &mut io::Stdout,
+    stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     z: bool,
     db: &FileObjectDatabase,
@@ -2267,7 +2203,7 @@ fn write_diff_numstat_entry(
     Ok(())
 }
 
-fn write_diff_numstat_counts(stdout: &mut io::Stdout, stats: DiffLineStats) -> Result<()> {
+fn write_diff_numstat_counts(stdout: &mut dyn Write, stats: DiffLineStats) -> Result<()> {
     match stats {
         DiffLineStats::Binary => write!(stdout, "-\t-\t")?,
         DiffLineStats::Text { inserted, deleted } => write!(stdout, "{inserted}\t{deleted}\t")?,

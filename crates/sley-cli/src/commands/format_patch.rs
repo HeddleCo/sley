@@ -838,7 +838,11 @@ struct TaggedLine<'a> {
 /// Emit the unified-diff hunks for a single file change into `out`, grouping
 /// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
 /// groups), and prefixing each `@@` header with git's default section heading.
-fn write_patch_hunks(out: &mut Vec<u8>, old_content: Option<&[u8]>, new_content: Option<&[u8]>) {
+pub(crate) fn write_patch_hunks(
+    out: &mut Vec<u8>,
+    old_content: Option<&[u8]>,
+    new_content: Option<&[u8]>,
+) {
     let old = sley_diff_merge::split_lines(old_content.unwrap_or_default());
     let new = sley_diff_merge::split_lines(new_content.unwrap_or_default());
     let ops = sley_diff_merge::myers_diff_lines(&old, &new);
