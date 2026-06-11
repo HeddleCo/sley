@@ -150,6 +150,35 @@ pub(crate) fn three_way_merge_trees(
     )
 }
 
+/// Like [`three_way_merge_trees`] with an explicit diff3 ancestor label and
+/// conflict-marker style (cherry-pick / revert pass the parent/commit labels
+/// and honour `merge.conflictStyle`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn three_way_merge_trees_styled(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    style: sley_diff_merge::ConflictStyle,
+) -> Result<(MergePathResults, MergeConflictPaths)> {
+    three_way_merge_trees_inner(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        ancestor_label,
+        sley_diff_merge::MergeFavor::None,
+        style,
+    )
+}
+
 /// Build the flattened entry map of the *virtual ancestor* for a 3-way merge,
 /// recursively merging the merge bases together (merge-recursive's "virtual
 /// ancestor" construction for criss-cross histories).
@@ -248,6 +277,33 @@ pub(crate) fn three_way_merge_trees_with_favor(
     theirs_label: &str,
     favor: sley_diff_merge::MergeFavor,
 ) -> Result<(MergePathResults, MergeConflictPaths)> {
+    three_way_merge_trees_inner(
+        db,
+        format,
+        base,
+        ours,
+        theirs,
+        ours_label,
+        theirs_label,
+        "merged common ancestors",
+        favor,
+        sley_diff_merge::ConflictStyle::Merge,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn three_way_merge_trees_inner(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    base: &MergeTreeMap,
+    ours: &MergeTreeMap,
+    theirs: &MergeTreeMap,
+    ours_label: &str,
+    theirs_label: &str,
+    ancestor_label: &str,
+    favor: sley_diff_merge::MergeFavor,
+    style: sley_diff_merge::ConflictStyle,
+) -> Result<(MergePathResults, MergeConflictPaths)> {
     let merge = sley_diff_merge::merge_entry_maps(
         db,
         format,
@@ -257,7 +313,7 @@ pub(crate) fn three_way_merge_trees_with_favor(
         &sley_diff_merge::MergeTreesOptions {
             ours_label,
             theirs_label,
-            ancestor_label: "merged common ancestors",
+            ancestor_label,
             favor,
             // Rename-aware merge: a file renamed on one side and modified on the
             // other follows the rename (the merge-ort single-base rename case).
@@ -268,6 +324,7 @@ pub(crate) fn three_way_merge_trees_with_favor(
             // other adds files under the old directory, those files re-home into
             // the renamed directory.
             directory_renames: directory_renames_config(),
+            style,
         },
     )?;
 
@@ -2657,358 +2714,6 @@ pub(crate) fn head_commit_oid(refs: &FileRefStore) -> Result<Option<ObjectId>> {
         Some(RefTarget::Direct(oid)) => Ok(Some(oid)),
         None => Ok(None),
     }
-}
-
-struct ReplayPlan {
-    base: MergeTreeMap,
-    theirs: MergeTreeMap,
-    theirs_label: String,
-    new_parents: Vec<ObjectId>,
-    author: Vec<u8>,
-    committer: Vec<u8>,
-    message: Vec<u8>,
-    state_file: &'static str,
-    state_oid: ObjectId,
-    reflog_message: Vec<u8>,
-    conflict_error: String,
-}
-
-/// Replay a single commit's change onto HEAD via 3-way merge (the shared core of
-/// cherry-pick and revert). On a clean result, creates the commit and advances
-/// HEAD; on conflict, writes a staged index + worktree + `<state_file>` and exits 1.
-fn finalize_replay(
-    git_dir: &Path,
-    common_git_dir: &Path,
-    worktree_root: &Path,
-    format: ObjectFormat,
-    refs: &FileRefStore,
-    head_oid: &ObjectId,
-    plan: ReplayPlan,
-) -> Result<()> {
-    let read_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let head_tree = commit_tree_oid(&read_db, format, head_oid)?;
-    let ours_map = stash_tree_entry_map(&read_db, format, &head_tree)?;
-    let mut write_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let (results, conflicts) = three_way_merge_trees(
-        &mut write_db,
-        format,
-        &plan.base,
-        &ours_map,
-        &plan.theirs,
-        "HEAD",
-        &plan.theirs_label,
-    )?;
-
-    if conflicts.is_empty() {
-        let mut entries = Vec::new();
-        for (path, result) in &results {
-            if let MergePathResult::Resolved(Some((mode, oid))) = result {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
-            }
-        }
-        entries.sort_by(|left, right| left.path.cmp(&right.path));
-        let index = Index {
-            version: 2,
-            entries,
-            extensions: Vec::new(),
-            checksum: None,
-        };
-        fs::write(
-            sley_worktree::repository_index_path(git_dir),
-            index.write(format)?,
-        )?;
-        let tree = sley_worktree::write_tree_from_index(git_dir, format)?;
-        let mut commit_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-        let new_oid = sley_sequencer::create_commit(
-            &mut commit_db,
-            sley_sequencer::CommitCreate {
-                tree,
-                parents: plan.new_parents,
-                author: plan.author,
-                committer: plan.committer.clone(),
-                message: plan.message,
-                encoding: None,
-            },
-        )?;
-        let target_ref = match refs.read_ref("HEAD")? {
-            Some(RefTarget::Symbolic(branch)) => branch,
-            _ => "HEAD".to_string(),
-        };
-        let mut tx = refs.transaction();
-        tx.update(RefUpdate {
-            name: target_ref,
-            expected: Some(RefTarget::Direct(*head_oid)),
-            new: RefTarget::Direct(new_oid),
-            reflog: Some(ReflogEntry {
-                old_oid: *head_oid,
-                new_oid,
-                committer: plan.committer,
-                message: plan.reflog_message,
-            }),
-        });
-        tx.commit()?;
-        sley_worktree::reset_index_and_worktree_to_commit(
-            worktree_root,
-            git_dir,
-            format,
-            &new_oid,
-        )?;
-        return Ok(());
-    }
-
-    let mut entries = Vec::new();
-    for (path, result) in &results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                entries.push(merge_index_entry(path, *mode, *oid, 0));
-            }
-            MergePathResult::Resolved(None) => {}
-            MergePathResult::Conflict {
-                base, ours, theirs, ..
-            } => {
-                if let Some((mode, oid)) = base {
-                    entries.push(merge_index_entry(path, *mode, *oid, 1));
-                }
-                if let Some((mode, oid)) = ours {
-                    entries.push(merge_index_entry(path, *mode, *oid, 2));
-                }
-                if let Some((mode, oid)) = theirs {
-                    entries.push(merge_index_entry(path, *mode, *oid, 3));
-                }
-            }
-        }
-    }
-    entries.sort_by(|left, right| {
-        left.path
-            .cmp(&right.path)
-            .then_with(|| (left.flags >> 12).cmp(&(right.flags >> 12)))
-    });
-    let index = Index {
-        version: 2,
-        entries,
-        extensions: Vec::new(),
-        checksum: None,
-    };
-    fs::write(
-        sley_worktree::repository_index_path(git_dir),
-        index.write(format)?,
-    )?;
-    for (path, result) in &results {
-        match result {
-            MergePathResult::Resolved(Some((mode, oid))) => {
-                if ours_map.get(path) != Some(&(*mode, *oid)) {
-                    let content = merge_read_blob(&read_db, oid)?;
-                    merge_write_worktree_file(worktree_root, path, &content, *mode)?;
-                }
-            }
-            MergePathResult::Resolved(None) => merge_remove_worktree_file(worktree_root, path)?,
-            MergePathResult::Conflict { worktree, .. } => match worktree {
-                Some((mode, content)) => {
-                    merge_write_worktree_file(worktree_root, path, content, *mode)?
-                }
-                None => merge_remove_worktree_file(worktree_root, path)?,
-            },
-        }
-    }
-    fs::write(
-        git_dir.join(plan.state_file),
-        format!("{}\n", plan.state_oid),
-    )?;
-    let mut merge_msg = plan.message.clone();
-    merge_msg.extend_from_slice(b"\nConflicts:\n");
-    for path in &conflicts {
-        merge_msg.extend_from_slice(format!("\t{}\n", String::from_utf8_lossy(path)).as_bytes());
-    }
-    fs::write(git_dir.join("MERGE_MSG"), merge_msg)?;
-    fs::write(git_dir.join("ORIG_HEAD"), format!("{head_oid}\n"))?;
-    for path in &conflicts {
-        println!(
-            "CONFLICT (content): Merge conflict in {}",
-            String::from_utf8_lossy(path)
-        );
-    }
-    eprintln!("{}", plan.conflict_error);
-    Err(GitError::Exit(1))
-}
-
-fn sequencer_abort(
-    git_dir: &Path,
-    worktree_root: &Path,
-    format: ObjectFormat,
-    state_file: &str,
-) -> Result<()> {
-    if !git_dir.join(state_file).exists() {
-        return Err(GitError::Command(format!(
-            "no cherry-pick or revert in progress ({state_file} missing)"
-        )));
-    }
-    let head_oid = resolve_revision(git_dir, format, "HEAD")?;
-    sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &head_oid)?;
-    for name in [state_file, "MERGE_MSG", "ORIG_HEAD"] {
-        let path = git_dir.join(name);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn cmd_cherry_pick(args: &[String]) -> Result<()> {
-    let mut abort = false;
-    let mut positional = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--abort" => abort = true,
-            value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported cherry-pick option {value}"
-                )));
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let refs = FileRefStore::new(&git_dir, format);
-    if abort {
-        return sequencer_abort(&git_dir, &worktree_root, format, "CHERRY_PICK_HEAD");
-    }
-    let target = match positional.as_slice() {
-        [target] => target.clone(),
-        [] => return Err(GitError::Command("cherry-pick requires a commit".into())),
-        _ => {
-            return Err(GitError::Unsupported(
-                "cherry-pick of multiple commits is not supported yet".into(),
-            ));
-        }
-    };
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let pick = read_reused_commit(&git_dir, format, &target)?;
-    let pick_oid =
-        sley_rev::peel_to_commit(&db, format, &resolve_revision(&git_dir, format, &target)?)?;
-    let head_oid = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("cherry-pick onto unborn HEAD is not supported".into()))?;
-    let theirs_map = stash_tree_entry_map(&db, format, &pick.tree)?;
-    let base_map = match pick.parents.first() {
-        Some(parent) => {
-            let parent_tree = commit_tree_oid(&db, format, parent)?;
-            stash_tree_entry_map(&db, format, &parent_tree)?
-        }
-        None => MergeTreeMap::new(),
-    };
-    let committer = commit_identity_from_env("COMMITTER")?;
-    let subject = commit_subject(&pick.message);
-    finalize_replay(
-        &git_dir,
-        &common_git_dir,
-        &worktree_root,
-        format,
-        &refs,
-        &head_oid,
-        ReplayPlan {
-            base: base_map,
-            theirs: theirs_map,
-            theirs_label: format!("{} ({subject})", format_log_abbrev_oid(&pick_oid)),
-            new_parents: vec![head_oid],
-            author: pick.author.clone(),
-            committer,
-            message: pick.message.clone(),
-            state_file: "CHERRY_PICK_HEAD",
-            state_oid: pick_oid,
-            reflog_message: format!("cherry-pick: {subject}").into_bytes(),
-            conflict_error: format!(
-                "error: could not apply {}... {subject}",
-                &pick_oid.to_hex()[..7.min(pick_oid.to_hex().len())]
-            ),
-        },
-    )
-}
-
-pub(crate) fn cmd_revert(args: &[String]) -> Result<()> {
-    let mut abort = false;
-    let mut positional = Vec::new();
-    for arg in args {
-        match arg.as_str() {
-            "--abort" => abort = true,
-            "--no-edit" => {}
-            value if value.starts_with('-') => {
-                return Err(GitError::Command(format!(
-                    "unsupported revert option {value}"
-                )));
-            }
-            value => positional.push(value.to_string()),
-        }
-    }
-    let cwd = env::current_dir()?;
-    let git_dir = discover_git_dir(&cwd)?;
-    let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;
-    let format = repository_object_format(&common_git_dir)?;
-    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
-    let refs = FileRefStore::new(&git_dir, format);
-    if abort {
-        return sequencer_abort(&git_dir, &worktree_root, format, "REVERT_HEAD");
-    }
-    let target = match positional.as_slice() {
-        [target] => target.clone(),
-        [] => return Err(GitError::Command("revert requires a commit".into())),
-        _ => {
-            return Err(GitError::Unsupported(
-                "revert of multiple commits is not supported yet".into(),
-            ));
-        }
-    };
-    let db = FileObjectDatabase::from_git_dir(&common_git_dir, format);
-    let revert = read_reused_commit(&git_dir, format, &target)?;
-    let revert_oid =
-        sley_rev::peel_to_commit(&db, format, &resolve_revision(&git_dir, format, &target)?)?;
-    let head_oid = head_commit_oid(&refs)?
-        .ok_or_else(|| GitError::Command("revert onto unborn HEAD is not supported".into()))?;
-    // Reverse application: base is the commit, theirs is its parent.
-    let base_map = stash_tree_entry_map(&db, format, &revert.tree)?;
-    let theirs_map = match revert.parents.first() {
-        Some(parent) => {
-            let parent_tree = commit_tree_oid(&db, format, parent)?;
-            stash_tree_entry_map(&db, format, &parent_tree)?
-        }
-        None => MergeTreeMap::new(),
-    };
-    let identity = commit_identity_from_env("COMMITTER")?;
-    let author = commit_identity_from_env("AUTHOR")?;
-    let subject = commit_subject(&revert.message);
-    let message = format!(
-        "Revert \"{subject}\"\n\nThis reverts commit {}.\n",
-        revert_oid.to_hex()
-    );
-    finalize_replay(
-        &git_dir,
-        &common_git_dir,
-        &worktree_root,
-        format,
-        &refs,
-        &head_oid,
-        ReplayPlan {
-            base: base_map,
-            theirs: theirs_map,
-            theirs_label: format!(
-                "parent of {} ({subject})",
-                format_log_abbrev_oid(&revert_oid)
-            ),
-            new_parents: vec![head_oid],
-            author,
-            committer: identity,
-            message: message.into_bytes(),
-            state_file: "REVERT_HEAD",
-            state_oid: revert_oid,
-            reflog_message: format!("revert: {subject}").into_bytes(),
-            conflict_error: format!(
-                "error: could not revert {}... {subject}",
-                &revert_oid.to_hex()[..7.min(revert_oid.to_hex().len())]
-            ),
-        },
-    )
 }
 
 pub(crate) fn cmd_merge_base(args: &[String]) -> Result<()> {
