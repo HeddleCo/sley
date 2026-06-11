@@ -94,6 +94,14 @@ impl NotesDisplay {
             if !default_ref.is_empty() {
                 push_unique(&mut refs, default_ref);
             }
+            // A command-line `-c notes.displayRef` with no value is a parse
+            // error (the key is a string, not a bool). Detect the bool-true
+            // marker the `-c key` form injects and reject it, as git does.
+            if matches!(global_config_value("notes.displayRef"), Ok(Some(v)) if v == "true") {
+                eprintln!("error: missing value for 'notes.displayref'");
+                eprintln!("fatal: unable to parse 'notes.displayref' from command-line config");
+                return Err(GitError::Exit(128));
+            }
             if let Ok(env_value) = env::var("GIT_NOTES_DISPLAY_REF") {
                 for part in env_value.split(':').filter(|s| !s.is_empty()) {
                     for expanded in expand_notes_glob(store, part)? {

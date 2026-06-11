@@ -811,6 +811,12 @@ fn notes_remove(
             }
         }
     }
+    // git's remove is atomic: it mutates the in-memory tree for every object,
+    // but only commits when none were missing (retval == 0). A missing object
+    // therefore leaves the notes ref untouched.
+    if any_missing {
+        return Err(GitError::Exit(1));
+    }
     if removed_any {
         write_notes(
             git_dir,
@@ -822,9 +828,6 @@ fn notes_remove(
             &notes_commit_identity()?,
             notes_ref_expected(&store, &notes_ref_handle(notes_ref))?,
         )?;
-    }
-    if any_missing {
-        return Err(GitError::Exit(1));
     }
     Ok(())
 }
