@@ -2162,6 +2162,34 @@ impl Regex {
         }
         None
     }
+
+    /// Leftmost match approximating POSIX leftmost-*longest* alternation: at
+    /// the first matching position, every top-level alternative is tried and
+    /// the longest match wins (ties keep the earliest alternative). Userdiff
+    /// word regexes are flat alternations of token shapes where `regexec`'s
+    /// longest-match rule is observable (`0xdead` must tokenize via the hex
+    /// alternative, not as `0` by the earlier decimal one).
+    pub(crate) fn find_longest_alternative(&self, text: &[u8]) -> Option<(usize, usize)> {
+        let branches: Vec<&Node> = match &self.root {
+            Node::Alt(branches) => branches.iter().collect(),
+            other => vec![other],
+        };
+        for start in 0..=text.len() {
+            let mut best: Option<usize> = None;
+            for branch in &branches {
+                let ctx = MatchCtx::new(text, self.num_groups);
+                if let Some(end) = match_node(branch, &ctx, start, self.ignore_case)
+                    && best.is_none_or(|current| end > current)
+                {
+                    best = Some(end);
+                }
+            }
+            if let Some(end) = best {
+                return Some((start, end));
+            }
+        }
+        None
+    }
 }
 
 struct RegexParser<'a> {

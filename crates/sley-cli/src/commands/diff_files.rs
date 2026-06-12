@@ -596,6 +596,9 @@ fn render_diff_files_entries(
                 dst_prefix: &o.dst_prefix,
                 context: 3,
                 userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
             };
             write_diff_patch_entry(&mut stdout, entry, patch_options)?;
         }

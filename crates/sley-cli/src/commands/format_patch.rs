@@ -844,6 +844,10 @@ pub(crate) struct PatchHunkOptions<'a> {
     /// Compiled userdiff funcname patterns for the path; `None` selects the
     /// default `def_ff` heuristic.
     pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+    /// ANSI palette when color output is enabled.
+    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
+    /// Word-diff rendering (replaces the +/- line bodies of each hunk).
+    pub(crate) word_diff: Option<&'a commands::diff_words::WordDiffConfig<'a>>,
 }
 
 impl Default for PatchHunkOptions<'_> {
@@ -852,6 +856,8 @@ impl Default for PatchHunkOptions<'_> {
             context: HUNK_CONTEXT,
             interhunk: 0,
             funcname: None,
+            colors: None,
+            word_diff: None,
         }
     }
 }
@@ -938,9 +944,11 @@ pub(crate) fn write_patch_hunks_with(
     let mut group_start = change_positions[0];
     let mut group_end = change_positions[0];
     for &pos in &change_positions[1..] {
-        // Two change runs merge when at most 2*context (+ interhunk) context
-        // lines separate them (so their context windows touch or overlap).
-        if pos - group_end <= 2 * options.context + options.interhunk {
+        // Two change runs merge when at most 2*context (+ interhunk) equal
+        // lines separate them, mirroring xdl_get_hunk's `distance >
+        // max_common` break (the position gap counts the separating equal
+        // lines plus one, so adjacent delete/insert runs always merge).
+        if pos - group_end <= 2 * options.context + options.interhunk + 1 {
             group_end = pos;
         } else {
             groups.push((group_start, group_end));
@@ -1006,16 +1014,61 @@ fn write_one_hunk(
         slice.first().map(|line| line.old_index),
         options.funcname,
     );
-    out.extend_from_slice(b"@@ -");
-    out.extend_from_slice(format_hunk_range(old_start, old_count).as_bytes());
-    out.extend_from_slice(b" +");
-    out.extend_from_slice(format_hunk_range(new_start, new_count).as_bytes());
-    out.extend_from_slice(b" @@");
-    if let Some(heading) = heading {
-        out.push(b' ');
-        out.extend_from_slice(&heading);
+    let frag = format!(
+        "@@ -{} +{} @@",
+        format_hunk_range(old_start, old_count),
+        format_hunk_range(new_start, new_count)
+    );
+    match options.colors {
+        // Port of emit_hunk_header: the "@@ .. @@" span in the frag color,
+        // the separating blank in the context color, the heading in the func
+        // color (each reset-terminated).
+        Some(colors) => {
+            out.extend_from_slice(colors.frag.as_bytes());
+            out.extend_from_slice(frag.as_bytes());
+            out.extend_from_slice(colors.reset.as_bytes());
+            if let Some(heading) = &heading {
+                out.extend_from_slice(colors.context.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(colors.reset.as_bytes());
+                out.extend_from_slice(colors.func.as_bytes());
+                out.extend_from_slice(heading);
+                out.extend_from_slice(colors.reset.as_bytes());
+            }
+            out.push(b'\n');
+        }
+        None => {
+            out.extend_from_slice(frag.as_bytes());
+            if let Some(heading) = &heading {
+                out.push(b' ');
+                out.extend_from_slice(heading);
+            }
+            out.push(b'\n');
+        }
     }
-    out.push(b'\n');
+
+    if let Some(word_diff) = options.word_diff {
+        // Word-diff rendering: minus/plus runs accumulate and flush at
+        // context lines (fn_out_consume's diff_words branch); the
+        // "\ No newline" markers are eaten.
+        let mut buffers = commands::diff_words::WordDiffBuffers::new();
+        for line in slice {
+            match line.kind {
+                LineKind::Delete => buffers.push_minus(line.content),
+                LineKind::Insert => buffers.push_plus(line.content),
+                LineKind::Context => {
+                    buffers.flush(out, word_diff);
+                    commands::diff_words::WordDiffBuffers::emit_context_line(
+                        out,
+                        word_diff,
+                        line.content,
+                    );
+                }
+            }
+        }
+        buffers.flush(out, word_diff);
+        return;
+    }
 
     for line in slice {
         let prefix = match line.kind {
@@ -1023,7 +1076,10 @@ fn write_one_hunk(
             LineKind::Delete => b'-',
             LineKind::Insert => b'+',
         };
-        write_patch_line(out, prefix, line.content);
+        match options.colors {
+            Some(colors) => write_patch_line_colored(out, prefix, line.content, colors),
+            None => write_patch_line(out, prefix, line.content),
+        }
     }
 }
 
@@ -1069,6 +1125,49 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
     out.extend_from_slice(line);
     if !line.ends_with(b"\n") {
         out.extend_from_slice(b"\n\\ No newline at end of file\n");
+    }
+}
+
+/// [`write_patch_line`] in color. Context/old lines paint the sign and body
+/// in one span; new lines paint the sign and body as separate spans, matching
+/// the default `ws-error-highlight=new` path through `emit_line_ws_markup`
+/// (whitespace-error painting itself is not implemented).
+fn write_patch_line_colored(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    line: &[u8],
+    colors: &commands::diff_words::DiffColors,
+) {
+    let (body, terminated) = match line.split_last() {
+        Some((b'\n', body)) => (body, true),
+        _ => (line, false),
+    };
+    let color = match prefix {
+        b'-' => &colors.old,
+        b'+' => &colors.new,
+        _ => &colors.context,
+    };
+    if prefix == b'+' {
+        out.extend_from_slice(color.as_bytes());
+        out.push(prefix);
+        out.extend_from_slice(colors.reset.as_bytes());
+        if !body.is_empty() {
+            out.extend_from_slice(color.as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(colors.reset.as_bytes());
+        }
+    } else {
+        out.extend_from_slice(color.as_bytes());
+        out.push(prefix);
+        out.extend_from_slice(body);
+        out.extend_from_slice(colors.reset.as_bytes());
+    }
+    out.push(b'\n');
+    if !terminated {
+        out.extend_from_slice(colors.context.as_bytes());
+        out.extend_from_slice(b"\\ No newline at end of file");
+        out.extend_from_slice(colors.reset.as_bytes());
+        out.push(b'\n');
     }
 }
 

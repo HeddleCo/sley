@@ -2414,6 +2414,9 @@ impl LogDiffContext<'_> {
                         dst_prefix: "b/",
                         context: 3,
                         userdiff: None,
+                        colors: None,
+                        word_diff: None,
+                        no_index_contents: None,
                     },
                 )?;
             }

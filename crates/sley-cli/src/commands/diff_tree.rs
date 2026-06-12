@@ -847,6 +847,9 @@ fn run_diff_request(
                 dst_prefix: &context.options.dst_prefix,
                 context: 3,
                 userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }
