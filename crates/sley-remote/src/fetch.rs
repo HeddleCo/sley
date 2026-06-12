@@ -15,7 +15,8 @@
 //! Bundle fetch lives in [`crate::bundle`]; SSH uses the dispatch below. The ref-map
 //! / `FETCH_HEAD` / prune helpers are shared so there is a single implementation.
 
-use std::collections::{BTreeSet, HashSet};
+use crate::local::LocalDeepenPlan;
+use std::collections::{HashMap, BTreeSet, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -93,6 +94,19 @@ pub struct FetchOptions {
     /// (`file://`/path) server today; directly-wanted tips are always packed,
     /// mirroring upstream's filter traversal.
     pub filter: Option<sley_odb::PackObjectFilter>,
+    /// This fetch is a clone (`fetch_pack_args.cloning`): shallow points sent
+    /// by a shallow server are accepted into `$GIT_DIR/shallow` unconditionally.
+    pub cloning: bool,
+    /// `--update-shallow`: accept new shallow points from a shallow server
+    /// (otherwise refs whose history needs them are rejected).
+    pub update_shallow: bool,
+    /// `--deepen=N`: `depth` is relative to the client's current boundary.
+    pub deepen_relative: bool,
+    /// `--shallow-since=<date>`: deepen to commits newer than the date.
+    pub deepen_since: Option<i64>,
+    /// `--shallow-exclude=<ref>`: deepen to commits not reachable from the ref
+    /// (resolved on the remote; a non-ref is an error, like upstream).
+    pub deepen_not: Vec<String>,
 }
 
 /// A remote-tracking ref removed by a prune pass.
@@ -352,33 +366,77 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
             // primary plan is recomputed inside `plan_and_adjust_updates`; the
             // planner is a pure function over the same inputs, so both runs
             // agree. A `None` depth keeps the full-fetch path.
-            let deepen_plan = match options.depth {
-                Some(depth) => {
-                    let primary = plan_fetch_ref_updates(
-                        &advertisements,
-                        &parsed_refspecs,
-                        options.auto_follow_tags,
-                    )?;
-                    let mut seen = HashSet::new();
-                    let mut heads = Vec::new();
-                    for update in &primary {
-                        if seen.insert(update.oid) {
-                            heads.push(update.oid);
-                        }
+            // The remote's own boundary: a shallow server reports its graft
+            // points on ANY fetch (upstream `send_shallow_info` runs an
+            // implicit INFINITE_DEPTH deepen when no deepen was requested).
+            let remote_shallow =
+                crate::shallow::read_shallow(remote_common_git_dir, request.format)?;
+            let explicit_deepen = options.depth.is_some()
+                || options.deepen_since.is_some()
+                || !options.deepen_not.is_empty();
+            let implicit_deepen = !explicit_deepen && !remote_shallow.is_empty();
+            // `--shallow-exclude` values must name refs on the remote
+            // (upstream upload-pack `process_deepen_not`).
+            let mut deepen_not_oids = Vec::new();
+            for name in &options.deepen_not {
+                let resolved = advertisements.iter().find(|advertisement| {
+                    advertisement.name == *name
+                        || advertisement.name == format!("refs/tags/{name}")
+                        || advertisement.name == format!("refs/heads/{name}")
+                        || advertisement.name == format!("refs/{name}")
+                });
+                match resolved {
+                    Some(advertisement) => deepen_not_oids.push(advertisement.oid),
+                    None => {
+                        return Err(GitError::Command(format!(
+                            "git upload-pack: deepen-not is not a ref: {name}"
+                        )));
                     }
-                    // Replay the current boundary, like the HTTP and SSH paths.
-                    let client_shallow =
-                        crate::shallow::read_shallow(request.git_dir, request.format)?;
-                    Some(crate::local::compute_local_deepen(
+                }
+            }
+            let plan_deepen = |heads: &[ObjectId]| -> Result<Option<LocalDeepenPlan>> {
+                if !explicit_deepen && !implicit_deepen {
+                    return Ok(None);
+                }
+                // Replay the current boundary, like the HTTP and SSH paths.
+                let client_shallow =
+                    crate::shallow::read_shallow(request.git_dir, request.format)?;
+                if options.deepen_since.is_some() || !deepen_not_oids.is_empty() {
+                    return Ok(Some(crate::local::compute_local_deepen_by_rev_list(
                         &remote_db,
                         request.format,
-                        &heads,
+                        heads,
                         client_shallow,
-                        depth,
-                    )?)
+                        options.deepen_since,
+                        &deepen_not_oids,
+                    )?));
                 }
-                None => None,
+                let depth = options.depth.unwrap_or(crate::local::INFINITE_DEPTH);
+                Ok(Some(crate::local::compute_local_deepen(
+                    &remote_db,
+                    request.format,
+                    heads,
+                    client_shallow,
+                    depth,
+                    options.deepen_relative,
+                )?))
             };
+            let primary_heads = {
+                let primary = plan_fetch_ref_updates(
+                    &advertisements,
+                    &parsed_refspecs,
+                    options.auto_follow_tags,
+                )?;
+                let mut seen = HashSet::new();
+                let mut heads = Vec::new();
+                for update in &primary {
+                    if seen.insert(update.oid) {
+                        heads.push(update.oid);
+                    }
+                }
+                heads
+            };
+            let mut deepen_plan = plan_deepen(&primary_heads)?;
             let mut updates = plan_and_adjust_updates(FetchPlanInput {
                 advertisements: &advertisements,
                 refspecs: &parsed_refspecs,
@@ -389,16 +447,85 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
                 format: request.format,
                 configured_remote_fetch,
             })?;
-            let starts = updates.iter().map(|update| update.oid).collect();
-            let shallow_info = crate::local::install_fetch_pack_via_local_upload_pack(
-                request.git_dir,
-                remote_git_dir,
-                request.format,
-                starts,
-                deepen_plan.as_ref(),
-                promisor_remote,
-                options.filter,
-            )?;
+            // A shallow server's new boundary points are only written on a
+            // clone, an explicit deepen, or `--update-shallow`; otherwise the
+            // refs whose history would need them are rejected and dropped
+            // (upstream fetch-pack `update_shallow` + REF_STATUS_REJECT_SHALLOW).
+            if implicit_deepen && !options.cloning && !options.update_shallow {
+                let client_shallow: HashSet<ObjectId> =
+                    crate::shallow::read_shallow(request.git_dir, request.format)?
+                        .into_iter()
+                        .collect();
+                let new_points: HashSet<ObjectId> = deepen_plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.shallow_info
+                            .iter()
+                            .filter_map(|entry| match entry {
+                                sley_protocol::ProtocolV2FetchShallowInfo::Shallow(oid)
+                                    if !client_shallow.contains(oid) =>
+                                {
+                                    Some(*oid)
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if !new_points.is_empty() {
+                    let mut dirty_cache: HashMap<ObjectId, bool> = HashMap::new();
+                    let mut dirty = |tip: &ObjectId| -> Result<bool> {
+                        if let Some(&cached) = dirty_cache.get(tip) {
+                            return Ok(cached);
+                        }
+                        let result = tip_reaches_boundary(
+                            &remote_db,
+                            request.format,
+                            tip,
+                            &new_points,
+                        )?;
+                        dirty_cache.insert(*tip, result);
+                        Ok(result)
+                    };
+                    let mut kept = Vec::new();
+                    for update in updates {
+                        if dirty(&update.oid)? {
+                            continue;
+                        }
+                        kept.push(update);
+                    }
+                    updates = kept;
+                    // Re-plan the boundary from the surviving tips so the pack
+                    // walk and the shallow-info reflect only what is sent.
+                    let mut seen = HashSet::new();
+                    let mut heads = Vec::new();
+                    for update in &updates {
+                        if seen.insert(update.oid) {
+                            heads.push(update.oid);
+                        }
+                    }
+                    deepen_plan = if heads.is_empty() {
+                        None
+                    } else {
+                        plan_deepen(&heads)?
+                    };
+                }
+            }
+            let starts: Vec<ObjectId> = updates.iter().map(|update| update.oid).collect();
+            let shallow_info = if starts.is_empty() && deepen_plan.is_none() {
+                Vec::new()
+            } else {
+                crate::local::install_fetch_pack_via_local_upload_pack(
+                    request.git_dir,
+                    remote_git_dir,
+                    request.format,
+                    starts,
+                    deepen_plan.as_ref(),
+                    promisor_remote,
+                    options.filter,
+                    None,
+                )?
+            };
             if !options.dry_run {
                 crate::shallow::apply_shallow_info(request.git_dir, request.format, &shallow_info)?;
             }
@@ -430,6 +557,41 @@ pub fn fetch(request: FetchRequest<'_>, services: FetchServices<'_>) -> Result<F
     }
 
     Ok(outcome)
+}
+
+/// Does the (graft-aware) history of `tip` on the remote touch one of the
+/// server's new shallow boundary points? Mirrors upstream
+/// `assign_shallow_commits_to_refs`'s per-ref reachability test.
+fn tip_reaches_boundary<R: sley_odb::ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    tip: &ObjectId,
+    boundary: &HashSet<ObjectId>,
+) -> Result<bool> {
+    let mut seen: HashSet<ObjectId> = HashSet::new();
+    let mut queue: Vec<ObjectId> = vec![*tip];
+    while let Some(oid) = queue.pop() {
+        if !seen.insert(oid) {
+            continue;
+        }
+        let object = remote_db.read_object(&oid)?;
+        let commit = match object.object_type {
+            sley_object::ObjectType::Commit => {
+                sley_object::Commit::parse_ref(format, &object.body)?
+            }
+            sley_object::ObjectType::Tag => {
+                let tag = sley_object::Tag::parse_ref(format, &object.body)?;
+                queue.push(tag.object);
+                continue;
+            }
+            _ => continue,
+        };
+        if boundary.contains(&oid) {
+            return Ok(true);
+        }
+        queue.extend(sley_odb::grafted_parents(remote_db, &oid, commit.parents));
+    }
+    Ok(false)
 }
 
 /// The shallow boundary to replay in a deepen request: the oids in

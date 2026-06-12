@@ -190,7 +190,7 @@ where
                 oid: commit.tree,
             },
         );
-        for parent in commit.parents {
+        for parent in sley_odb::grafted_parents(self.reader, &oid, commit.parents) {
             self.check_object_link(
                 Some(source.clone()),
                 ObjectLink {
@@ -281,7 +281,7 @@ where
         let Ok(object) = reader.read_object(&oid) else {
             continue;
         };
-        for link in object_links(format, &object) {
+        for link in object_links_grafted(reader, format, &oid, &object) {
             pending.push_back(link.oid);
         }
     }
@@ -306,7 +306,11 @@ where
         let Ok(object) = reader.read_object(oid) else {
             continue;
         };
-        unreachable.push((*oid, object.object_type, object_links(format, &object)));
+        unreachable.push((
+            *oid,
+            object.object_type,
+            object_links_grafted(reader, format, oid, &object),
+        ));
     }
     unreachable
 }
@@ -355,6 +359,21 @@ where
             message: format!("dangling {} {}", object_type.as_str(), oid),
         })
         .collect()
+}
+
+/// [`object_links`] with the graft seam applied: parent links of a shallow
+/// boundary commit are dropped, matching git's graft-aware `parse_commit`.
+fn object_links_grafted<R: ObjectReader>(
+    reader: &R,
+    format: ObjectFormat,
+    oid: &ObjectId,
+    object: &EncodedObject,
+) -> Vec<ObjectLink> {
+    let mut links = object_links(format, object);
+    if object.object_type == ObjectType::Commit && reader.is_shallow_graft(oid) {
+        links.retain(|link| link.object_type != ObjectType::Commit);
+    }
+    links
 }
 
 fn object_links(format: ObjectFormat, object: &EncodedObject) -> Vec<ObjectLink> {

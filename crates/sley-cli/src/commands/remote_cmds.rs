@@ -34,8 +34,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     let mut separate_git_dir = None::<String>;
     let mut depth = None::<u32>;
     let mut local = None::<bool>;
-    let mut shallow_since_ignored = false;
-    let mut shallow_exclude_ignored = false;
+    let mut deepen_since = None::<i64>;
+    let mut deepen_not = Vec::<String>::new();
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -70,31 +70,31 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
             }
             "--no-depth" => depth = None,
             "--shallow-since" => {
-                iter.next().ok_or_else(|| {
+                let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --shallow-since requires a value".into())
                 })?;
-                shallow_since_ignored = true;
+                deepen_since = Some(parse_shallow_since(value)?);
             }
             value if value.starts_with("--shallow-since=") => {
-                let _ = value.strip_prefix("--shallow-since=").ok_or_else(|| {
+                let value = value.strip_prefix("--shallow-since=").ok_or_else(|| {
                     GitError::Command("clone --shallow-since requires a value".into())
                 })?;
-                shallow_since_ignored = true;
+                deepen_since = Some(parse_shallow_since(value)?);
             }
-            "--no-shallow-since" => shallow_since_ignored = false,
+            "--no-shallow-since" => deepen_since = None,
             "--shallow-exclude" => {
-                iter.next().ok_or_else(|| {
+                let value = iter.next().ok_or_else(|| {
                     GitError::Command("clone --shallow-exclude requires a value".into())
                 })?;
-                shallow_exclude_ignored = true;
+                deepen_not.push(value.clone());
             }
             value if value.starts_with("--shallow-exclude=") => {
-                let _ = value.strip_prefix("--shallow-exclude=").ok_or_else(|| {
+                let value = value.strip_prefix("--shallow-exclude=").ok_or_else(|| {
                     GitError::Command("clone --shallow-exclude requires a value".into())
                 })?;
-                shallow_exclude_ignored = true;
+                deepen_not.push(value.to_string());
             }
-            "--no-shallow-exclude" => shallow_exclude_ignored = false,
+            "--no-shallow-exclude" => deepen_not.clear(),
             "--recurse-submodules" | "--recursive" => submodule_active.push(".".to_string()),
             value if value.starts_with("--recurse-submodules=") => {
                 submodule_active.push(
@@ -423,7 +423,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         ));
     }
     let single_branch = explicit_single_branch
-        .unwrap_or(depth.is_some() || shallow_since_ignored || shallow_exclude_ignored);
+        .unwrap_or(depth.is_some() || deepen_since.is_some() || !deepen_not.is_empty());
     if also_filter_submodules && partial_clone_filter.is_none() {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--filter'");
         return Err(GitError::Exit(128));
@@ -432,7 +432,7 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         eprintln!("fatal: the option '--also-filter-submodules' requires '--recurse-submodules'");
         return Err(GitError::Exit(128));
     }
-    if bundle_uri.is_some() && (depth.is_some() || shallow_since_ignored || shallow_exclude_ignored)
+    if bundle_uri.is_some() && (depth.is_some() || deepen_since.is_some() || !deepen_not.is_empty())
     {
         eprintln!(
             "fatal: options '--bundle-uri' and '--depth/--shallow-since/--shallow-exclude' cannot be used together"
@@ -608,12 +608,18 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
     } else {
         depth
     };
-    if shallow_since_ignored {
+    let deepen_since = if deepen_since.is_some() && (local_mechanism || bare || revision.is_some()) {
         eprintln!("warning: --shallow-since is ignored in local clones; use file:// instead.");
-    }
-    if shallow_exclude_ignored {
+        None
+    } else {
+        deepen_since
+    };
+    let deepen_not = if !deepen_not.is_empty() && (local_mechanism || bare || revision.is_some()) {
         eprintln!("warning: --shallow-exclude is ignored in local clones; use file:// instead.");
-    }
+        Vec::new()
+    } else {
+        deepen_not
+    };
     // `--filter` on a true local clone is warned-and-ignored (`is_local` in
     // builtin/clone.c). A transport clone (`--no-local` / `file://`) honors it
     // when the source advertises filtering (`uploadpack.allowFilter`),
@@ -760,6 +766,8 @@ pub(crate) fn cmd_clone(args: &[String]) -> Result<()> {
         // through the in-process transport; a plain local clone had its depth
         // warned-and-ignored above, leaving `None` (a full clone).
         depth,
+        deepen_since,
+        deepen_not,
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: if branch_explicit {
             None
@@ -950,6 +958,8 @@ fn clone_http_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         remote_head_branch: &remote_head_branch,
         single_branch,
         depth: options.depth,
+        deepen_since: None,
+        deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
         filter: None,
@@ -1068,6 +1078,8 @@ fn clone_ssh_repository(options: CloneHttpOptions<'_>) -> Result<()> {
         remote_head_branch: &remote_head_branch,
         single_branch,
         depth: options.depth,
+        deepen_since: None,
+        deepen_not: Vec::new(),
         committer: commit_identity_from_env("COMMITTER")?,
         detached_head: None,
         filter: None,
@@ -1162,7 +1174,7 @@ fn clone_jobs_error() -> &'static str {
 /// numeric value is clamped to `u32::MAX` (git stores depth as a C `int`; the
 /// protocol's `deepen` is unsigned, and any value this large already deepens past
 /// every real history).
-fn parse_clone_depth(value: &str) -> Result<u32> {
+pub(crate) fn parse_clone_depth(value: &str) -> Result<u32> {
     let digits = value.strip_prefix('+').unwrap_or(value);
     if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_digit()) {
         return Err(GitError::Command(format!(
@@ -1364,6 +1376,11 @@ fn clone_bare_or_mirror_local_repository(
             depth: None,
             merge_src: None,
             filter: options.fetch_filter,
+            cloning: false,
+            update_shallow: false,
+            deepen_relative: false,
+            deepen_since: None,
+            deepen_not: Vec::new(),
         },
     );
     env::set_current_dir(previous_cwd)?;
@@ -1835,7 +1852,13 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
         depth: None,
         merge_src: None,
         filter: None,
+        cloning: false,
+        update_shallow: false,
+        deepen_relative: false,
+        deepen_since: None,
+        deepen_not: Vec::new(),
     };
+    let mut unshallow = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1877,6 +1900,42 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
                 options.fetch_all_tags = false;
                 options.tag_option_explicit = true;
             }
+            "--unshallow" => unshallow = true,
+            "--update-shallow" => options.update_shallow = true,
+            "--deepen" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| GitError::Command("fetch --deepen requires a value".into()))?;
+                options.depth = Some(parse_clone_depth(value)?);
+                options.deepen_relative = true;
+            }
+            value if value.starts_with("--deepen=") => {
+                let value = value
+                    .strip_prefix("--deepen=")
+                    .ok_or_else(|| GitError::Command("fetch --deepen requires a value".into()))?;
+                options.depth = Some(parse_clone_depth(value)?);
+                options.deepen_relative = true;
+            }
+            "--shallow-since" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("fetch --shallow-since requires a value".into())
+                })?;
+                options.deepen_since = Some(parse_shallow_since(value)?);
+            }
+            value if value.starts_with("--shallow-since=") => {
+                let value = value.strip_prefix("--shallow-since=").unwrap_or_default();
+                options.deepen_since = Some(parse_shallow_since(value)?);
+            }
+            "--shallow-exclude" => {
+                let value = iter.next().ok_or_else(|| {
+                    GitError::Command("fetch --shallow-exclude requires a value".into())
+                })?;
+                options.deepen_not.push(value.clone());
+            }
+            value if value.starts_with("--shallow-exclude=") => {
+                let value = value.strip_prefix("--shallow-exclude=").unwrap_or_default();
+                options.deepen_not.push(value.to_string());
+            }
             _ if source.is_none() => source = Some(arg.clone()),
             _ => refspecs.push(arg.clone()),
         }
@@ -1885,6 +1944,17 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     let cwd = env::current_dir()?;
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
+    if unshallow {
+        if options.depth.is_some() {
+            eprintln!("fatal: --depth and --unshallow cannot be used together");
+            return Err(GitError::Exit(128));
+        }
+        if !git_dir.join("shallow").exists() {
+            eprintln!("fatal: --unshallow on a complete repository does not make sense");
+            return Err(GitError::Exit(128));
+        }
+        options.depth = Some(sley_remote::INFINITE_DEPTH);
+    }
     if let Ok(input) = fs::read(&source)
         && let Ok(bundle) = Bundle::parse(&input, format)
     {
@@ -1901,14 +1971,16 @@ pub(crate) fn cmd_fetch(args: &[String]) -> Result<()> {
     if fetch_source_is_ssh(&source)? {
         return fetch_ssh_repository(&git_dir, format, &source, &refspecs, options);
     }
-    // Local (`file://`/path) fetches keep the historical warn-and-ignore for
-    // `--depth` (only clone wires the local deepen so far), so the depth is
-    // cleared here and must not leak into the deepen-capable fetch below.
-    if options.depth.is_some() {
-        eprintln!("warning: --depth is ignored in local fetches; use file:// instead.");
-        options.depth = None;
-    }
     fetch_local_repository(&git_dir, format, &source, &refspecs, options)
+}
+
+/// Parse a `--shallow-since` date through the approxidate layer, mirroring
+/// upstream's `parse_timestamp`-or-approxidate handling.
+fn parse_shallow_since(value: &str) -> Result<i64> {
+    crate::commands::approxidate::parse_commit_date(value)
+        .map(|(seconds, _)| seconds)
+        .or_else(|| crate::commands::approxidate::parse_expiry_date(value))
+        .ok_or_else(|| GitError::Command(format!("invalid shallow-since date: {value}")))
 }
 
 pub(crate) fn cmd_receive_pack(args: &[String]) -> Result<()> {

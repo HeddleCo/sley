@@ -785,6 +785,11 @@ impl<'a> CommitGraphContext<'a> {
         reader: &R,
         oid: &ObjectId,
     ) -> Result<Vec<ObjectId>> {
+        // Graft seam: history is cut at shallow boundary commits, so walks
+        // must see them as parentless regardless of graph/object contents.
+        if reader.is_shallow_graft(oid) {
+            return Ok(Vec::new());
+        }
         if let Some(parents) = self.parents(oid) {
             return Ok(parents);
         }
@@ -798,6 +803,9 @@ impl<'a> CommitGraphContext<'a> {
         reader: &R,
         oid: &ObjectId,
     ) -> Result<Option<ObjectId>> {
+        if reader.is_shallow_graft(oid) {
+            return Ok(None);
+        }
         if let Some(parent) = self.first_parent(oid) {
             return Ok(parent);
         }
@@ -924,7 +932,11 @@ fn commit_parents<R: ObjectReader>(
             object.object_type.as_str()
         )));
     }
-    Ok(Commit::parse_ref(format, &object.body)?.parents)
+    Ok(sley_odb::grafted_parents(
+        reader,
+        oid,
+        Commit::parse_ref(format, &object.body)?.parents,
+    ))
 }
 
 fn peel_revision<R: ObjectReader>(
@@ -1428,7 +1440,7 @@ fn commit_metadata_lookup<R: ObjectReader>(
     };
     Ok(CommitMetadata {
         oid: *oid,
-        parents,
+        parents: sley_odb::grafted_parents(reader, oid, parents),
         commit_time,
     })
 }
@@ -1452,7 +1464,7 @@ fn commit_metadata_from_object<R: ObjectReader>(
         .committer_signature()
         .map(|signature| signature.time.seconds)
         .unwrap_or(0);
-    Ok((commit.parents, commit_time))
+    Ok((sley_odb::grafted_parents(reader, oid, commit.parents), commit_time))
 }
 
 pub fn walk_commits<R: ObjectReader>(
@@ -1475,7 +1487,7 @@ pub fn walk_commits<R: ObjectReader>(
             )));
         }
         let commit = Commit::parse(format, &object.body)?;
-        let parents = commit.parents.clone();
+        let parents = sley_odb::grafted_parents(reader, &oid, commit.parents.clone());
         pending.extend(parents.iter().cloned());
         out.push(CommitRecord {
             oid,
@@ -2395,9 +2407,13 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         if commit_message_contains(commit.message, text) {
             return Ok(oid);
         }
-        current = match graph.first_parent(&oid) {
-            Some(parent) => parent,
-            None => commit.parents.into_iter().next(),
+        current = if reader.is_shallow_graft(&oid) {
+            None
+        } else {
+            match graph.first_parent(&oid) {
+                Some(parent) => parent,
+                None => commit.parents.into_iter().next(),
+            }
         };
     }
     Err(GitError::not_found(format!(
@@ -2651,7 +2667,7 @@ impl ResolvedRevisionSelection {
                 Some(metadata) => metadata,
                 None => commit_metadata_from_object(reader, format, &oid)?,
             };
-            pending.extend(parents);
+            pending.extend(sley_odb::grafted_parents(reader, &oid, parents));
             out.push(oid);
         }
         Ok(out)

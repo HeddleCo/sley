@@ -53,7 +53,8 @@ pub use ssh::{
 mod local;
 pub use local::{
     LocalDeepenPlan, attach_receive_pack_capabilities, attach_upload_pack_capabilities,
-    compute_local_deepen, install_fetch_pack_via_local_upload_pack, local_fetch_advertisements,
+    INFINITE_DEPTH, compute_local_deepen, compute_local_deepen_by_rev_list,
+    install_fetch_pack_via_local_upload_pack, local_fetch_advertisements,
     local_have_oids, receive_pack_features, receive_pack_into_local_repository,
     receive_pack_request_uses_push_options, upload_pack_features,
     upload_pack_from_local_repository, upload_pack_request_uses_sideband,
