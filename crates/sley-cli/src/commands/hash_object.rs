@@ -4,7 +4,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use sley_config::GitConfig;
@@ -282,31 +282,43 @@ impl HashObjectInvocation {
         }
         let filter_context =
             HashObjectFilterContext::new(self.object_type, &self.filters, repo_git_dir.as_deref())?;
+        let mut stdout = io::stdout().lock();
 
         if self.read_stdin {
             let mut body = Vec::new();
             io::stdin().read_to_end(&mut body)?;
-            self.hash_one(body, &cwd, None, filter_context.as_ref(), store.as_mut())?;
+            self.hash_one(
+                body,
+                &cwd,
+                None,
+                filter_context.as_ref(),
+                store.as_mut(),
+                &mut stdout,
+            )?;
         }
         if self.read_stdin_paths {
-            let mut body = Vec::new();
-            io::stdin().read_to_end(&mut body)?;
-            for path in body.split(|byte| *byte == b'\n') {
-                if path.is_empty() {
-                    continue;
-                }
-                let path = path.strip_suffix(b"\r").unwrap_or(path);
-                let path = String::from_utf8_lossy(path);
-                let path = Path::new(path.as_ref());
-                let body = read_hash_object_path(path)?;
-                self.hash_one(
-                    body,
-                    &cwd,
-                    Some(path),
-                    filter_context.as_ref(),
-                    store.as_mut(),
-                )?;
-            }
+            crate::commands::stdin_stream::stream_stdin_records(
+                b'\n',
+                &mut stdout,
+                |mut path, stdout| {
+                    if path.is_empty() {
+                        return Ok(());
+                    }
+                    crate::commands::stdin_stream::strip_trailing_cr(&mut path);
+                    let path = String::from_utf8_lossy(&path);
+                    let path = Path::new(path.as_ref());
+                    let body = read_hash_object_path(path)?;
+                    self.hash_one(
+                        body,
+                        &cwd,
+                        Some(path),
+                        filter_context.as_ref(),
+                        store.as_mut(),
+                        stdout,
+                    )?;
+                    Ok(())
+                },
+            )?;
         }
         for path in &self.paths {
             let body = read_hash_object_path(path)?;
@@ -316,6 +328,7 @@ impl HashObjectInvocation {
                 Some(path),
                 filter_context.as_ref(),
                 store.as_mut(),
+                &mut stdout,
             )?;
         }
         Ok(())
@@ -328,9 +341,17 @@ impl HashObjectInvocation {
         source_path: Option<&Path>,
         filter_context: Option<&HashObjectFilterContext>,
         store: Option<&mut LooseObjectStore>,
+        stdout: &mut dyn Write,
     ) -> Result<()> {
         let body = self.filters.apply(body, cwd, source_path, filter_context)?;
-        print_hash_object(self.object_type, self.format, body, self.literally, store)
+        print_hash_object(
+            self.object_type,
+            self.format,
+            body,
+            self.literally,
+            store,
+            stdout,
+        )
     }
 }
 
@@ -522,6 +543,7 @@ fn print_hash_object(
     body: Vec<u8>,
     literally: bool,
     store: Option<&mut LooseObjectStore>,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     if !literally {
         super::hash_object_fsck::check_object(object_type, format, &body)?;
@@ -532,7 +554,7 @@ fn print_hash_object(
     } else {
         object.object_id(format)?
     };
-    println!("{oid}");
+    writeln!(stdout, "{oid}")?;
     Ok(())
 }
 
