@@ -712,6 +712,28 @@ struct GraphCommit {
     commit_time: u64,
 }
 
+#[derive(Debug, Clone)]
+struct GraphBloomCommit {
+    parents: Vec<ObjectId>,
+    filter: Vec<u8>,
+    settings: sley_formats::CommitGraphBloomSettings,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct GraphBloomStats {
+    filter_not_present: usize,
+    maybe: usize,
+    definitely_not: usize,
+    false_positive: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphBloomConsult {
+    DefinitelyNot,
+    Maybe,
+    NotPresent,
+}
+
 /// A walk's view of the commit-graph.
 ///
 /// Construction is cheap and infallible (`load` only records the git dir and
@@ -916,6 +938,57 @@ fn graph_to_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphCommit>> {
                 commit_time: entry.commit_time,
             },
         );
+    }
+    Ok(map)
+}
+
+fn load_commit_graph_bloom_map(
+    objects_dir: &Path,
+    format: sley_core::ObjectFormat,
+) -> HashMap<ObjectId, GraphBloomCommit> {
+    let graph_path = objects_dir.join("info").join("commit-graph");
+    if !graph_path.exists() {
+        return HashMap::new();
+    }
+    fs::read(&graph_path)
+        .map_err(|err| GitError::Io(err.to_string()))
+        .and_then(|bytes| CommitGraph::parse(&bytes, format))
+        .and_then(|graph| graph_to_bloom_map(&graph))
+        .unwrap_or_default()
+}
+
+fn graph_to_bloom_map(graph: &CommitGraph) -> Result<HashMap<ObjectId, GraphBloomCommit>> {
+    let Some(filters) = &graph.bloom_filters else {
+        return Ok(HashMap::new());
+    };
+    let settings = sley_formats::CommitGraphBloomSettings {
+        hash_version: filters.hash_version,
+        hash_count: filters.hash_count,
+        bits_per_entry: filters.bits_per_entry,
+        max_changed_paths: sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
+    };
+    let mut map = HashMap::with_capacity(graph.commits.len());
+    for (idx, entry) in graph.commits.iter().enumerate() {
+        let mut parents = Vec::with_capacity(entry.parents.len());
+        for parent in &entry.parents {
+            let parent = usize::try_from(*parent).map_err(|_| {
+                GitError::InvalidFormat("commit-graph parent index overflow".into())
+            })?;
+            let parent_entry = graph.commits.get(parent).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph parent points past commit table".into())
+            })?;
+            parents.push(parent_entry.oid);
+        }
+        if let Some(filter) = filters.filter_for_commit(idx) {
+            map.insert(
+                entry.oid,
+                GraphBloomCommit {
+                    parents,
+                    filter: filter.to_vec(),
+                    settings,
+                },
+            );
+        }
     }
     Ok(map)
 }
@@ -1612,6 +1685,74 @@ fn tree_same_as_empty_for_pathspec(
     Ok(true)
 }
 
+fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<u8>>> {
+    if pathspec.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for element in pathspec.elements() {
+        let mut pattern = element.pattern();
+        if element.is_exclude()
+            || element.is_icase()
+            || element.is_glob()
+            || !element.attrs().is_empty()
+            || pattern.is_empty()
+            || pattern.iter().any(|byte| matches!(*byte, b'*' | b'?' | b'[' | b'\\'))
+        {
+            return None;
+        }
+        while pattern.ends_with(b"/") {
+            pattern = &pattern[..pattern.len() - 1];
+        }
+        if pattern.is_empty() {
+            return None;
+        }
+        paths.push(pattern.to_vec());
+    }
+    (!paths.is_empty()).then_some(paths)
+}
+
+fn commit_graph_bloom_read_changed_paths_enabled(objects_dir: &Path) -> bool {
+    let Some(git_dir) = objects_dir.parent() else {
+        return true;
+    };
+    sley_config::read_repo_config(git_dir, None)
+        .ok()
+        .and_then(|config| config.get_bool("commitGraph", None, "readChangedPaths"))
+        .unwrap_or(true)
+}
+
+fn commit_graph_bloom_consult(
+    blooms: &HashMap<ObjectId, GraphBloomCommit>,
+    commit: &ObjectId,
+    parent: Option<&ObjectId>,
+    paths: &[Vec<u8>],
+) -> GraphBloomConsult {
+    let Some(bloom) = blooms.get(commit) else {
+        return GraphBloomConsult::NotPresent;
+    };
+    match parent {
+        Some(parent) => {
+            if bloom.parents.first() != Some(parent) {
+                return GraphBloomConsult::NotPresent;
+            }
+        }
+        None => {
+            if !bloom.parents.is_empty() {
+                return GraphBloomConsult::NotPresent;
+            }
+        }
+    }
+    let maybe_changed = paths.iter().any(|path| {
+        sley_formats::commit_graph_bloom_filter_contains(&bloom.filter, path, bloom.settings)
+    });
+    if maybe_changed {
+        GraphBloomConsult::Maybe
+    } else {
+        GraphBloomConsult::DefinitelyNot
+    }
+}
+
 /// Compute the `TREESAME` flag for every commit in `records`, limited by
 /// `pathspec`. `reachable` is the set of oids in `records` so we can tell a
 /// "relevant" (on-graph) parent from a boundary one — git's `relevant_commit`.
@@ -1641,14 +1782,41 @@ fn compute_treesame(
             read_commit_tree(db, format, oid).ok()
         }
     };
+    let bloom_paths = commit_graph_bloom_paths_for_pathspec(pathspec)
+        .filter(|_| commit_graph_bloom_read_changed_paths_enabled(db.objects_dir()));
+    let bloom_map = bloom_paths
+        .as_ref()
+        .map(|_| load_commit_graph_bloom_map(db.objects_dir(), format))
+        .unwrap_or_default();
+    let mut bloom_stats = GraphBloomStats::default();
 
     let mut out = HashMap::with_capacity(records.len());
     for record in records {
         let commit_tree = commit_tree_oid(record);
         let mut simplify = CommitSimplify::default();
         if record.parents.is_empty() {
-            simplify.treesame =
-                tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
+            simplify.treesame = if let Some(paths) = bloom_paths.as_ref() {
+                match commit_graph_bloom_consult(&bloom_map, &record.oid, None, paths) {
+                    GraphBloomConsult::DefinitelyNot => {
+                        bloom_stats.definitely_not += 1;
+                        true
+                    }
+                    GraphBloomConsult::Maybe => {
+                        bloom_stats.maybe += 1;
+                        let same = tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?;
+                        if same {
+                            bloom_stats.false_positive += 1;
+                        }
+                        same
+                    }
+                    GraphBloomConsult::NotPresent => {
+                        bloom_stats.filter_not_present += 1;
+                        tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?
+                    }
+                }
+            } else {
+                tree_same_as_empty_for_pathspec(db, format, &commit_tree, pathspec)?
+            };
             out.insert(record.oid, simplify);
             continue;
         }
@@ -1677,7 +1845,30 @@ fn compute_treesame(
                 }
                 continue;
             };
-            let same = tree_same_for_pathspec(db, format, &pt, &commit_tree, pathspec)?;
+            let same = if nth == 0
+                && let Some(paths) = bloom_paths.as_ref()
+            {
+                match commit_graph_bloom_consult(&bloom_map, &record.oid, Some(parent), paths) {
+                    GraphBloomConsult::DefinitelyNot => {
+                        bloom_stats.definitely_not += 1;
+                        true
+                    }
+                    GraphBloomConsult::Maybe => {
+                        bloom_stats.maybe += 1;
+                        let same = tree_same_for_pathspec(db, format, &pt, &commit_tree, pathspec)?;
+                        if same {
+                            bloom_stats.false_positive += 1;
+                        }
+                        same
+                    }
+                    GraphBloomConsult::NotPresent => {
+                        bloom_stats.filter_not_present += 1;
+                        tree_same_for_pathspec(db, format, &pt, &commit_tree, pathspec)?
+                    }
+                }
+            } else {
+                tree_same_for_pathspec(db, format, &pt, &commit_tree, pathspec)?
+            };
             if same {
                 // try_to_simplify_commit: REV_TREE_SAME. In dense, non-full-
                 // history mode, if this parent is relevant (or we keep
@@ -1709,6 +1900,19 @@ fn compute_treesame(
             };
         }
         out.insert(record.oid, simplify);
+    }
+    if bloom_paths.is_some()
+        && (bloom_stats.filter_not_present > 0
+            || bloom_stats.maybe > 0
+            || bloom_stats.definitely_not > 0
+            || bloom_stats.false_positive > 0)
+    {
+        sley_core::trace2::bloom_statistics(
+            bloom_stats.filter_not_present,
+            bloom_stats.maybe,
+            bloom_stats.definitely_not,
+            bloom_stats.false_positive,
+        );
     }
     Ok(out)
 }
@@ -4250,6 +4454,7 @@ mod tests {
                     parents: commit.parents,
                     generation: generations.get(oid).copied().unwrap_or(1),
                     commit_time,
+                    bloom_filter: None,
                 }
             })
             .collect();
@@ -4591,6 +4796,7 @@ mod tests {
                 parents: parents_map[oid].clone(),
                 generation: generations[oid],
                 commit_time: 0,
+                bloom_filter: None,
             })
             .collect();
         let bytes = CommitGraph::write(format, &entries).expect("test operation should succeed");

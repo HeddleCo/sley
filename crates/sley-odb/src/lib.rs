@@ -2723,6 +2723,11 @@ impl FileObjectDatabase {
         self.format
     }
 
+    /// The repository object directory this database reads from.
+    pub fn objects_dir(&self) -> &Path {
+        &self.objects_dir
+    }
+
     pub fn new(objects_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let objects_dir = objects_dir.into();
         Self {

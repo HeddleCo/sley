@@ -684,6 +684,22 @@ pub struct CommitGraphBloomFilters {
     pub filters: Vec<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitGraphBloomSettings {
+    pub hash_version: u32,
+    pub hash_count: u32,
+    pub bits_per_entry: u32,
+    pub max_changed_paths: usize,
+}
+
+pub const DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS: CommitGraphBloomSettings =
+    CommitGraphBloomSettings {
+        hash_version: 1,
+        hash_count: 7,
+        bits_per_entry: 10,
+        max_changed_paths: 512,
+    };
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitGraphWriteEntry {
     pub oid: ObjectId,
@@ -691,6 +707,7 @@ pub struct CommitGraphWriteEntry {
     pub parents: Vec<ObjectId>,
     pub generation: u32,
     pub commit_time: u64,
+    pub bloom_filter: Option<Vec<u8>>,
 }
 
 impl CommitGraph {
@@ -704,9 +721,19 @@ impl CommitGraph {
             (*b"OIDF", write_commit_graph_fanout(&object_ids)?),
             (*b"OIDL", write_commit_graph_oid_lookup(&object_ids)),
             (*b"CDAT", cdat),
+            (*b"GDA2", write_commit_graph_generation_data(&entries)?),
         ];
+        let gdo2 = write_commit_graph_generation_overflow(&entries)?;
+        if !gdo2.is_empty() {
+            chunks.push((*b"GDO2", gdo2));
+        }
         if !edge.is_empty() {
             chunks.push((*b"EDGE", edge));
+        }
+        let bloom = write_commit_graph_bloom_filters(&entries, DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS);
+        if let Some((bidx, bdat)) = bloom {
+            chunks.push((*b"BIDX", bidx));
+            chunks.push((*b"BDAT", bdat));
         }
         write_commit_graph_chunks(format, 0, &chunks)
     }
@@ -850,6 +877,26 @@ impl CommitGraph {
     }
 }
 
+impl CommitGraphBloomFilters {
+    pub fn filter_for_commit(&self, commit_index: usize) -> Option<&[u8]> {
+        self.filters.get(commit_index).map(Vec::as_slice)
+    }
+
+    pub fn contains_path(&self, commit_index: usize, path: &[u8]) -> Option<bool> {
+        let filter = self.filter_for_commit(commit_index)?;
+        Some(commit_graph_bloom_filter_contains(
+            filter,
+            path,
+            CommitGraphBloomSettings {
+                hash_version: self.hash_version,
+                hash_count: self.hash_count,
+                bits_per_entry: self.bits_per_entry,
+                max_changed_paths: DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths,
+            },
+        ))
+    }
+}
+
 fn validate_commit_graph_write_entries(
     format: ObjectFormat,
     entries: &[CommitGraphWriteEntry],
@@ -958,6 +1005,246 @@ fn write_commit_graph_commit_data(entries: &[CommitGraphWriteEntry]) -> Result<(
     Ok((cdat, edge))
 }
 
+fn write_commit_graph_generation_data(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u8>> {
+    let corrected_dates = corrected_commit_dates(entries)?;
+    let mut overflow_index = 0u32;
+    let mut out = Vec::with_capacity(entries.len() * 4);
+    for (entry, corrected) in entries.iter().zip(corrected_dates) {
+        let offset = corrected.saturating_sub(entry.commit_time);
+        if offset > COMMIT_GRAPH_GENERATION_DATA_MAX {
+            out.extend_from_slice(
+                &(COMMIT_GRAPH_GENERATION_DATA_OVERFLOW | overflow_index).to_be_bytes(),
+            );
+            overflow_index = overflow_index.checked_add(1).ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph GDO2 chunk overflow".into())
+            })?;
+        } else {
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn write_commit_graph_generation_overflow(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u8>> {
+    let corrected_dates = corrected_commit_dates(entries)?;
+    let mut out = Vec::new();
+    for (entry, corrected) in entries.iter().zip(corrected_dates) {
+        let offset = corrected.saturating_sub(entry.commit_time);
+        if offset > COMMIT_GRAPH_GENERATION_DATA_MAX {
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+    }
+    Ok(out)
+}
+
+fn corrected_commit_dates(entries: &[CommitGraphWriteEntry]) -> Result<Vec<u64>> {
+    fn corrected_at(
+        idx: usize,
+        entries: &[CommitGraphWriteEntry],
+        cache: &mut [Option<u64>],
+    ) -> Result<u64> {
+        if let Some(value) = cache[idx] {
+            return Ok(value);
+        }
+        let entry = &entries[idx];
+        let mut corrected = entry.commit_time;
+        for parent in &entry.parents {
+            let parent_idx = entries
+                .binary_search_by(|entry| entry.oid.as_bytes().cmp(parent.as_bytes()))
+                .map_err(|_| {
+                    GitError::InvalidFormat(format!(
+                        "commit-graph parent {parent} is missing from graph"
+                    ))
+                })?;
+            corrected = corrected.max(corrected_at(parent_idx, entries, cache)?.saturating_add(1));
+        }
+        cache[idx] = Some(corrected);
+        Ok(corrected)
+    }
+
+    let mut cache = vec![None; entries.len()];
+    for idx in 0..entries.len() {
+        corrected_at(idx, entries, &mut cache)?;
+    }
+    cache
+        .into_iter()
+        .map(|value| {
+            value.ok_or_else(|| {
+                GitError::InvalidFormat("commit-graph corrected date missing".into())
+            })
+        })
+        .collect()
+}
+
+fn write_commit_graph_bloom_filters(
+    entries: &[CommitGraphWriteEntry],
+    settings: CommitGraphBloomSettings,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    if entries.iter().all(|entry| entry.bloom_filter.is_none()) {
+        return None;
+    }
+    let mut bidx = Vec::with_capacity(entries.len() * 4);
+    let mut bdat = Vec::new();
+    bdat.extend_from_slice(&settings.hash_version.to_be_bytes());
+    bdat.extend_from_slice(&settings.hash_count.to_be_bytes());
+    bdat.extend_from_slice(&settings.bits_per_entry.to_be_bytes());
+    let mut offset = 0u32;
+    for entry in entries {
+        if let Some(filter) = &entry.bloom_filter {
+            offset = offset.checked_add(filter.len() as u32)?;
+            bdat.extend_from_slice(filter);
+        }
+        bidx.extend_from_slice(&offset.to_be_bytes());
+    }
+    Some((bidx, bdat))
+}
+
+pub fn commit_graph_bloom_filter_for_paths<I, P>(
+    paths: I,
+    settings: CommitGraphBloomSettings,
+) -> Vec<u8>
+where
+    I: IntoIterator<Item = P>,
+    P: AsRef<[u8]>,
+{
+    let mut unique = std::collections::BTreeSet::new();
+    for path in paths {
+        let path = path.as_ref();
+        if path.is_empty() {
+            continue;
+        }
+        unique.insert(path.to_vec());
+        for idx in path
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, byte)| (*byte == b'/').then_some(idx))
+        {
+            if idx > 0 {
+                unique.insert(path[..idx].to_vec());
+            }
+        }
+    }
+    if unique.len() > settings.max_changed_paths {
+        return vec![0xff];
+    }
+    let filter_len = ((unique.len() as u64 * u64::from(settings.bits_per_entry)) + 7) / 8;
+    let mut filter = vec![0u8; usize::try_from(filter_len).unwrap_or(usize::MAX).max(1)];
+    for path in unique {
+        add_commit_graph_bloom_key(&mut filter, &path, settings);
+    }
+    filter
+}
+
+pub fn commit_graph_bloom_filter_contains(
+    filter: &[u8],
+    path: &[u8],
+    settings: CommitGraphBloomSettings,
+) -> bool {
+    if filter.is_empty() {
+        return false;
+    }
+    commit_graph_bloom_key_hashes(path, settings).into_iter().all(|hash| {
+        let bit = u64::from(hash) % ((filter.len() as u64) * 8);
+        let byte = (bit / 8) as usize;
+        let mask = 1u8 << (bit & 7);
+        filter.get(byte).is_some_and(|value| value & mask != 0)
+    })
+}
+
+fn add_commit_graph_bloom_key(
+    filter: &mut [u8],
+    path: &[u8],
+    settings: CommitGraphBloomSettings,
+) {
+    if filter.is_empty() {
+        return;
+    }
+    for hash in commit_graph_bloom_key_hashes(path, settings) {
+        let bit = u64::from(hash) % ((filter.len() as u64) * 8);
+        let byte = (bit / 8) as usize;
+        let mask = 1u8 << (bit & 7);
+        if let Some(value) = filter.get_mut(byte) {
+            *value |= mask;
+        }
+    }
+}
+
+fn commit_graph_bloom_key_hashes(path: &[u8], settings: CommitGraphBloomSettings) -> Vec<u32> {
+    let seed0 = 0x293a_e76f;
+    let seed1 = 0x7e64_6e2c;
+    let hash0 = commit_graph_bloom_murmur3_seeded(seed0, path, settings.hash_version);
+    let hash1 = commit_graph_bloom_murmur3_seeded(seed1, path, settings.hash_version);
+    (0..settings.hash_count)
+        .map(|idx| hash0.wrapping_add(idx.wrapping_mul(hash1)))
+        .collect()
+}
+
+fn commit_graph_bloom_murmur3_seeded(seed: u32, data: &[u8], version: u32) -> u32 {
+    let c1 = 0xcc9e_2d51u32;
+    let c2 = 0x1b87_3593u32;
+    let r1 = 15;
+    let r2 = 13;
+    let m = 5u32;
+    let n = 0xe654_6b64u32;
+    let mut seed = seed;
+    for chunk in data.chunks_exact(4) {
+        let mut k = if version == 2 {
+            u32::from(chunk[0])
+                | (u32::from(chunk[1]) << 8)
+                | (u32::from(chunk[2]) << 16)
+                | (u32::from(chunk[3]) << 24)
+        } else {
+            (chunk[0] as i8 as i32 as u32)
+                | ((chunk[1] as i8 as i32 as u32) << 8)
+                | ((chunk[2] as i8 as i32 as u32) << 16)
+                | ((chunk[3] as i8 as i32 as u32) << 24)
+        };
+        k = k.wrapping_mul(c1);
+        k = k.rotate_left(r1);
+        k = k.wrapping_mul(c2);
+        seed ^= k;
+        seed = seed.rotate_left(r2).wrapping_mul(m).wrapping_add(n);
+    }
+
+    let tail = data.chunks_exact(4).remainder();
+    let mut k1 = 0u32;
+    let tail_byte = |idx: usize| -> u32 {
+        if version == 2 {
+            u32::from(tail[idx])
+        } else {
+            tail[idx] as i8 as i32 as u32
+        }
+    };
+    match tail.len() {
+        3 => {
+            k1 ^= tail_byte(2) << 16;
+            k1 ^= tail_byte(1) << 8;
+            k1 ^= tail_byte(0);
+        }
+        2 => {
+            k1 ^= tail_byte(1) << 8;
+            k1 ^= tail_byte(0);
+        }
+        1 => {
+            k1 ^= tail_byte(0);
+        }
+        _ => {}
+    }
+    if !tail.is_empty() {
+        k1 = k1.wrapping_mul(c1);
+        k1 = k1.rotate_left(r1);
+        k1 = k1.wrapping_mul(c2);
+        seed ^= k1;
+    }
+
+    seed ^= data.len() as u32;
+    seed ^= seed >> 16;
+    seed = seed.wrapping_mul(0x85eb_ca6b);
+    seed ^= seed >> 13;
+    seed = seed.wrapping_mul(0xc2b2_ae35);
+    seed ^ (seed >> 16)
+}
+
 fn write_commit_graph_chunks(
     format: ObjectFormat,
     base_graph_count: u8,
@@ -1001,6 +1288,8 @@ fn write_commit_graph_chunks(
 const COMMIT_GRAPH_PARENT_NONE: u32 = 0x7000_0000;
 const COMMIT_GRAPH_EXTRA_EDGE: u32 = 0x8000_0000;
 const COMMIT_GRAPH_EXTRA_EDGE_MASK: u32 = 0x7fff_ffff;
+const COMMIT_GRAPH_GENERATION_DATA_OVERFLOW: u32 = 0x8000_0000;
+const COMMIT_GRAPH_GENERATION_DATA_MAX: u64 = 0x7fff_ffff;
 
 fn parse_commit_graph_fanout(
     bytes: &[u8],
@@ -2627,6 +2916,7 @@ mod tests {
                     parents: vec![main.clone(), side.clone()],
                     generation: 3,
                     commit_time: 30,
+                    bloom_filter: None,
                 },
                 CommitGraphWriteEntry {
                     oid: base,
@@ -2634,6 +2924,7 @@ mod tests {
                     parents: Vec::new(),
                     generation: 1,
                     commit_time: 10,
+                    bloom_filter: None,
                 },
                 CommitGraphWriteEntry {
                     oid: main.clone(),
@@ -2641,6 +2932,7 @@ mod tests {
                     parents: vec![base],
                     generation: 2,
                     commit_time: 20,
+                    bloom_filter: None,
                 },
                 CommitGraphWriteEntry {
                     oid: side.clone(),
@@ -2648,6 +2940,7 @@ mod tests {
                     parents: vec![base],
                     generation: 2,
                     commit_time: 21,
+                    bloom_filter: None,
                 },
             ],
         )
