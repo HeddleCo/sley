@@ -42,7 +42,7 @@ jobs:
     # 53 tracked t-files (round-4a added 5: fetch-pack/shallow + userdiff,
     # incl. the 377-assertion t5500 fetch suite) + oracle-git build on cache
     # miss; 60 min was sized for the 48-file list.
-    timeout-minutes: 80
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@v4
@@ -138,6 +138,9 @@ jobs:
             t4052-stat-output.sh
             t4202-log.sh
             t4205-log-pretty-formats.sh
+            t4216-log-bloom.sh
+            t5318-commit-graph.sh
+            t3432-rebase-fast-forward.sh
             t4214-log-graph-octopus.sh
             t4215-log-skewed-merges.sh
             t5310-pack-bitmaps.sh
