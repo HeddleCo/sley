@@ -357,6 +357,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let mut quiet = false;
     let mut force = false;
     let mut branch_mode = CheckoutBranchMode::Existing;
+    let mut track = None::<crate::commands::branch::BranchTrackMode>;
     let mut positional = Vec::new();
     let mut dashdash_index = None;
     let mut iter = args.iter();
@@ -373,6 +374,15 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
             | "--ignore-other-worktrees"
             | "--no-ignore-other-worktrees"
             | "--no-recurse-submodules" => {}
+            "-t" | "--track" | "--track=direct" => {
+                track = Some(crate::commands::branch::BranchTrackMode::Direct);
+            }
+            "--track=inherit" => {
+                track = Some(crate::commands::branch::BranchTrackMode::Inherit);
+            }
+            "--no-track" => {
+                track = Some(crate::commands::branch::BranchTrackMode::Never);
+            }
             "-b" => {
                 let branch = iter
                     .next()
@@ -417,6 +427,28 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+
+    if matches!(
+        track,
+        Some(
+            crate::commands::branch::BranchTrackMode::Direct
+                | crate::commands::branch::BranchTrackMode::Inherit
+        )
+    ) && matches!(branch_mode, CheckoutBranchMode::Existing)
+    {
+        let [upstream] = positional.as_slice() else {
+            return Err(GitError::Command(
+                "checkout --track requires exactly one start point".into(),
+            ));
+        };
+        let store = FileRefStore::new(&git_dir, format);
+        let branch = checkout_track_branch_name(&store, upstream)?;
+        branch_mode = CheckoutBranchMode::Create {
+            branch,
+            force: false,
+            orphan: false,
+        };
+    }
 
     // Pathspec checkout: `checkout [<tree-ish>] [--] <pathspec>...` restores
     // paths (and, with a tree-ish, index entries) instead of switching HEAD.
@@ -682,6 +714,7 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 ));
             }
             let start = positional.first().map(String::as_str).unwrap_or("HEAD");
+            let store = FileRefStore::new(&git_dir, format);
             let was_reset = checkout_create_or_reset_branch(
                 &git_dir,
                 format,
@@ -689,6 +722,14 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                 start,
                 force,
                 commit_identity_from_env("COMMITTER")?,
+            )?;
+            crate::commands::branch::branch_create_set_tracking(
+                &git_dir,
+                &store,
+                &branch,
+                positional.first(),
+                track,
+                quiet,
             )?;
             if was_reset {
                 CheckoutMessage::Reset { branch }
@@ -724,6 +765,28 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         checkout_message.print();
     }
     Ok(())
+}
+
+fn checkout_track_branch_name(store: &FileRefStore, upstream: &str) -> Result<String> {
+    if let Some(rest) = upstream.strip_prefix("refs/remotes/")
+        && let Some((_, branch)) = rest.split_once('/')
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    if let Some(branch) = upstream.strip_prefix("refs/heads/")
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    let remote_ref = format!("refs/remotes/{upstream}");
+    if store.read_ref(&remote_ref)?.is_some()
+        && let Some((_, branch)) = upstream.split_once('/')
+        && !branch.is_empty()
+    {
+        return Ok(branch.to_string());
+    }
+    Ok(upstream.rsplit('/').next().unwrap_or(upstream).to_string())
 }
 
 pub(crate) fn cmd_switch(args: &[String]) -> Result<()> {
