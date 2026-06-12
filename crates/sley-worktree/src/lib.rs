@@ -6765,6 +6765,11 @@ fn worktree_entries_with_stat_cache(
     .0)
 }
 
+/// Tracked worktree entries keyed by repo path, plus the dirt mask
+/// ([`DIRTY_SUBMODULE_MODIFIED`] / [`DIRTY_SUBMODULE_UNTRACKED`]) for every
+/// tracked gitlink path whose submodule working tree is dirty.
+type WorktreeEntriesWithDirt = (BTreeMap<Vec<u8>, TrackedEntry>, BTreeMap<Vec<u8>, u8>);
+
 /// Like [`worktree_entries_with_stat_cache`], but also reports, for every
 /// tracked gitlink path whose submodule working tree is dirty, the dirt mask
 /// ([`DIRTY_SUBMODULE_MODIFIED`] / [`DIRTY_SUBMODULE_UNTRACKED`]).
@@ -6775,7 +6780,7 @@ fn worktree_entries_with_submodule_dirt(
     stat_cache: Option<&IndexStatCache>,
     tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     ignores: Option<&mut IgnoreMatcher>,
-) -> Result<(BTreeMap<Vec<u8>, TrackedEntry>, BTreeMap<Vec<u8>, u8>)> {
+) -> Result<WorktreeEntriesWithDirt> {
     let mut entries = BTreeMap::new();
     let mut submodule_dirt_map = BTreeMap::new();
     // Worktree blobs are compared to the index by OID, so they must be passed
