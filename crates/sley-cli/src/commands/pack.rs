@@ -622,6 +622,38 @@ fn cmd_maintenance_run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `git unpack-objects` — explode a pack stream from stdin into loose objects
+/// (upstream `builtin/unpack-objects.c`). `-n` parses without writing; the
+/// other upstream flags are accepted and inert for this in-process path.
+pub(crate) fn cmd_unpack_objects(args: &[String]) -> Result<()> {
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "-n" => dry_run = true,
+            "-q" | "-r" | "--strict" => {}
+            value if value.starts_with("--pack_header=") || value.starts_with("--max-input-size=") => {
+            }
+            value => {
+                return Err(GitError::Command(format!(
+                    "unpack-objects: unsupported option {value}"
+                )));
+            }
+        }
+    }
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let mut pack_bytes = Vec::new();
+    io::Read::read_to_end(&mut io::stdin().lock(), &mut pack_bytes)?;
+    if dry_run {
+        sley_pack::PackFile::parse(&pack_bytes, format)?;
+        return Ok(());
+    }
+    let db = FileObjectDatabase::from_git_dir(&git_dir, format);
+    sley_odb::unpack_packfile_objects(&pack_bytes, format, db.loose())?;
+    Ok(())
+}
+
 pub(crate) fn cmd_count_objects(args: &[String]) -> Result<()> {
     let mut verbose = false;
     let mut human_readable = false;
