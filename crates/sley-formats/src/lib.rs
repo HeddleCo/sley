@@ -1127,7 +1127,7 @@ where
     if unique.len() > settings.max_changed_paths {
         return vec![0xff];
     }
-    let filter_len = ((unique.len() as u64 * u64::from(settings.bits_per_entry)) + 7) / 8;
+    let filter_len = (unique.len() as u64 * u64::from(settings.bits_per_entry)).div_ceil(8);
     let mut filter = vec![0u8; usize::try_from(filter_len).unwrap_or(usize::MAX).max(1)];
     for path in unique {
         add_commit_graph_bloom_key(&mut filter, &path, settings);

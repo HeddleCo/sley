@@ -1710,7 +1710,7 @@ fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<
         {
             let slash = pattern[..wildcard].iter().rposition(|byte| *byte == b'/')?;
             &pattern[..slash]
-        } else if pattern.iter().any(|byte| *byte == b'\\') {
+        } else if pattern.contains(&b'\\') {
             return None;
         } else {
             pattern
