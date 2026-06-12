@@ -703,6 +703,7 @@ pub fn compute_local_deepen_by_rev_list<R: ObjectReader>(
 /// line, the pack walk stops at the plan's boundary, and the returned
 /// shallow-info updates must be folded into `$GIT_DIR/shallow` (see
 /// [`crate::apply_shallow_info`]). Empty for a full fetch.
+#[allow(clippy::too_many_arguments)]
 pub fn install_fetch_pack_via_local_upload_pack(
     git_dir: &Path,
     remote_git_dir: &Path,
