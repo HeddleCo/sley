@@ -1111,7 +1111,11 @@ fn checkout_twoway_dirty(
         commands::merge_rebase::merge_write_worktree_file(worktree_root, path, &content, *mode)?;
     }
     for path in &deletions {
-        commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+        if stage0.get(path).is_some_and(|entry| entry.mode == 0o160000) {
+            checkout_remove_gitlink_worktree_dir(worktree_root, path)?;
+        } else {
+            commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)?;
+        }
     }
     let mut entries: Vec<IndexEntry> = Vec::new();
     for (path, (mode, oid)) in &target_map {
@@ -1155,6 +1159,24 @@ fn checkout_twoway_dirty(
         .write(format)?,
     )?;
     Ok(())
+}
+
+fn checkout_remove_gitlink_worktree_dir(worktree_root: &Path, path: &[u8]) -> Result<()> {
+    let rel = std::str::from_utf8(path)
+        .map_err(|_| GitError::InvalidFormat("non-utf8 worktree path".into()))?;
+    let full = worktree_root.join(rel);
+    if !full.exists() {
+        return Ok(());
+    }
+    if full.is_dir() {
+        match fs::remove_dir(&full) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+    commands::merge_rebase::merge_remove_worktree_file(worktree_root, path)
 }
 
 fn checkout_is_dirty_tree_error(err: &GitError) -> bool {

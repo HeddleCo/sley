@@ -179,3 +179,49 @@ fn rebase_already_up_to_date_matches_upstream_git() {
     );
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn checkout_can_leave_gitlink_branch_with_dirty_populated_submodule() {
+    let root = unique_temp_dir("rebase-autostash-gitlink-checkout");
+    let child = root.join("child");
+    let superproject = root.join("super");
+    fs::create_dir_all(&child).expect("create child repo");
+    fs::create_dir_all(&superproject).expect("create superproject repo");
+
+    git(&child, &["init", "-q", "-b", "main"]);
+    prepare_identity(&child);
+    fs::write(child.join("file0"), b"child\n").expect("write child file");
+    git(&child, &["add", "file0"]);
+    git_with_identity(&child, &["commit", "-m", "child", "-q"]);
+
+    git(&superproject, &["init", "-q", "-b", "main"]);
+    prepare_identity(&superproject);
+    fs::write(superproject.join("file0"), b"base\n").expect("write base file");
+    git(&superproject, &["add", "file0"]);
+    git_with_identity(&superproject, &["commit", "-m", "base", "-q"]);
+    git(&superproject, &["checkout", "-b", "with-submodule", "-q"]);
+    let child_arg = child.to_str().expect("child path utf8");
+    git(
+        &superproject,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            child_arg,
+            "sub",
+        ],
+    );
+    git(&superproject, &["add", ".gitmodules", "sub"]);
+    git_with_identity(&superproject, &["commit", "-m", "add submodule", "-q"]);
+
+    fs::write(superproject.join("sub/file0"), b"changed\n").expect("dirty submodule");
+    run_success(env!("CARGO_BIN_EXE_sley"), &superproject, &["reset", "--hard"]);
+    run_success(env!("CARGO_BIN_EXE_sley"), &superproject, &["checkout", "main"]);
+    assert_eq!(
+        run_output(env!("CARGO_BIN_EXE_sley"), &superproject, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout,
+        b"main\n",
+        "checkout should leave the gitlink branch"
+    );
+    let _ = fs::remove_dir_all(&root);
+}
