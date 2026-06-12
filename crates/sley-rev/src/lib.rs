@@ -1694,10 +1694,7 @@ fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<
         let mut pattern = element.pattern();
         if element.is_exclude()
             || element.is_icase()
-            || element.is_glob()
-            || !element.attrs().is_empty()
             || pattern.is_empty()
-            || pattern.iter().any(|byte| matches!(*byte, b'*' | b'?' | b'[' | b'\\'))
         {
             return None;
         }
@@ -1707,7 +1704,21 @@ fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<
         if pattern.is_empty() {
             return None;
         }
-        paths.push(pattern.to_vec());
+        let bloom_path = if let Some(wildcard) = pattern
+            .iter()
+            .position(|byte| matches!(*byte, b'*' | b'?' | b'['))
+        {
+            let slash = pattern[..wildcard].iter().rposition(|byte| *byte == b'/')?;
+            &pattern[..slash]
+        } else if pattern.iter().any(|byte| *byte == b'\\') {
+            return None;
+        } else {
+            pattern
+        };
+        if bloom_path.is_empty() {
+            return None;
+        }
+        paths.push(bloom_path.to_vec());
     }
     (!paths.is_empty()).then_some(paths)
 }
