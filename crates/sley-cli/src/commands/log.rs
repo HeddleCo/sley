@@ -2412,6 +2412,7 @@ impl LogDiffContext<'_> {
                         abbrev: self.patch_abbrev,
                         src_prefix: "a/",
                         dst_prefix: "b/",
+                        dirty_submodules: None,
                     },
                 )?;
             }

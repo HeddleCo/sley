@@ -845,6 +845,7 @@ fn run_diff_request(
                 abbrev: context.patch_abbrev,
                 src_prefix: &context.options.src_prefix,
                 dst_prefix: &context.options.dst_prefix,
+                dirty_submodules: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

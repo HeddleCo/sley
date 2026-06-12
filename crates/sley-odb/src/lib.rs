@@ -2624,6 +2624,11 @@ fn collect_packed_object_ids(
 }
 
 impl FileObjectDatabase {
+    /// The object-id format (hash algorithm) this database was opened with.
+    pub fn object_format(&self) -> ObjectFormat {
+        self.format
+    }
+
     pub fn new(objects_dir: impl Into<PathBuf>, format: ObjectFormat) -> Self {
         let objects_dir = objects_dir.into();
         Self {

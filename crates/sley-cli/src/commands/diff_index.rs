@@ -485,6 +485,7 @@ fn render(
                 abbrev: ctx.patch_abbrev,
                 src_prefix: ctx.src_prefix,
                 dst_prefix: ctx.dst_prefix,
+                dirty_submodules: None,
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

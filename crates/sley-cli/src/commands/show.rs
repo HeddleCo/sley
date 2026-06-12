@@ -732,6 +732,7 @@ fn write_commit_diff_patch(
                 abbrev: patch_abbrev,
                 src_prefix: "a/",
                 dst_prefix: "b/",
+                dirty_submodules: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

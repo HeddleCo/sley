@@ -2610,7 +2610,23 @@ fn worktree_entries(
     format: ObjectFormat,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
     let mut entries = BTreeMap::new();
-    collect_worktree_entries(worktree_root, git_dir, worktree_root, format, &mut entries)?;
+    // Tracked gitlink paths are opaque to the walk: it never descends into
+    // them, and reports the embedded repository's checked-out HEAD as the
+    // worktree-side oid (falling back to the staged oid for an unpopulated
+    // directory, which upstream treats as always unchanged).
+    let index_gitlinks: BTreeMap<Vec<u8>, ObjectId> = read_index_entries(git_dir, format)?
+        .into_iter()
+        .filter(|(_, entry)| entry.mode == 0o160000)
+        .map(|(path, entry)| (path, entry.oid))
+        .collect();
+    collect_worktree_entries(
+        worktree_root,
+        git_dir,
+        worktree_root,
+        format,
+        &index_gitlinks,
+        &mut entries,
+    )?;
     Ok(entries)
 }
 
@@ -2619,6 +2635,7 @@ fn collect_worktree_entries(
     git_dir: &Path,
     dir: &Path,
     format: ObjectFormat,
+    index_gitlinks: &BTreeMap<Vec<u8>, ObjectId>,
     entries: &mut BTreeMap<Vec<u8>, TrackedEntry>,
 ) -> Result<()> {
     if dir == git_dir {
@@ -2630,9 +2647,28 @@ fn collect_worktree_entries(
         if path == git_dir {
             continue;
         }
+        // Never treat a `.git` entry (the repository's own, or an embedded
+        // repository's) as worktree content.
+        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
-            collect_worktree_entries(root, git_dir, &path, format, entries)?;
+            let relative = path.strip_prefix(root).map_err(|_| {
+                GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
+            })?;
+            let git_path = git_path_bytes(relative)?;
+            if let Some(staged_oid) = index_gitlinks.get(&git_path) {
+                let oid = gitlink_head_oid(&path, format).unwrap_or(*staged_oid);
+                entries.insert(git_path, TrackedEntry { mode: 0o160000, oid });
+                continue;
+            }
+            // An untracked embedded repository is a boundary too: its files
+            // are not the superproject's worktree content.
+            if gitlink_git_dir(&path).is_some() {
+                continue;
+            }
+            collect_worktree_entries(root, git_dir, &path, format, index_gitlinks, entries)?;
         } else if metadata.is_file() {
             let relative = path.strip_prefix(root).map_err(|_| {
                 GitError::InvalidPath(format!("path {} is outside worktree", path.display()))
@@ -2685,8 +2721,15 @@ fn collect_worktree_blob_cache(
         if path == git_dir {
             continue;
         }
+        // `.git` entries and embedded repositories are not superproject blobs.
+        if path.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            continue;
+        }
         let metadata = entry.metadata()?;
         if metadata.is_dir() {
+            if gitlink_git_dir(&path).is_some() {
+                continue;
+            }
             collect_worktree_blob_cache(git_dir, &path, format, cache)?;
         } else if metadata.is_file() {
             let body = fs::read(&path)?;
