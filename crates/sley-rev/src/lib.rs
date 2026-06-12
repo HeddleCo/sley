@@ -1701,7 +1701,7 @@ fn commit_graph_bloom_paths_for_pathspec(pathspec: &Pathspec) -> Option<Vec<Vec<
         while pattern.ends_with(b"/") {
             pattern = &pattern[..pattern.len() - 1];
         }
-        if pattern.is_empty() {
+        if pattern.is_empty() || pattern == b"." {
             return None;
         }
         let bloom_path = if let Some(wildcard) = pattern
