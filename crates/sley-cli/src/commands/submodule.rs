@@ -366,7 +366,8 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
             eprintln!("Maybe you want to use 'update --init'?");
             continue;
         };
-        if submodule_head(&path).is_err() {
+        let just_populated = submodule_head(&path).is_err();
+        if just_populated {
             // Populate the worktree: reconnect to a retained
             // .git/modules/<path> git dir when one exists (upstream
             // clone_submodule does the same after the worktree was removed),
@@ -405,9 +406,11 @@ fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
         // Check out the gitlink oid recorded in the superproject index,
         // detached — upstream `submodule update --checkout` runs
         // `git checkout -q <oid>` inside the submodule and reports it. A
-        // submodule already at the recorded oid is left alone (and silent).
+        // submodule already at the recorded oid is left alone (and silent) —
+        // unless its worktree was just (re)populated: a reconnected git dir
+        // can already have HEAD at the target while the worktree is empty.
         let (sub_git_dir, head_oid) = submodule_head(&path)?;
-        if head_oid != target_oid {
+        if just_populated || head_oid != target_oid {
             let sub_format = repository_object_format(&sub_git_dir)?;
             sley_worktree::reset_index_and_worktree_to_commit(
                 &path,
