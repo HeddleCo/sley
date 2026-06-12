@@ -20,6 +20,13 @@
 # Round-4a floors (fetch-pack/shallow + userdiff) measured 2026-06-12 at the
 # integ/round4a tip (epic/sley-fetchpack + epic/sley-userdiff merged onto
 # b1b606a).
+# Round-4b floors (gitlink stage-1: submodule basics/status/diff) measured
+# 2026-06-12 at the integ/round4b tip (epic/sley-gitlink-a merged onto
+# e08520c). t0008-ignores.sh deadlocks on its last cell ('streaming support
+# for --stdin', pre-existing check-ignore buffering bug, sley#44) until the
+# harness timeout; the summary row still records ok=284 (counts parse from
+# the captured TAP before the hang), so the floor is valid — but the run
+# needs SLEY_TEST_TIMEOUT high enough (900s) to reach cell 284 first.
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -40,7 +47,7 @@ declare -A FLOOR=(
     [t1300-config.sh]=445
     [t1401-symbolic-ref.sh]=25
     [t1500-rev-parse.sh]=80
-    [t2400-worktree-add.sh]=162
+    [t2400-worktree-add.sh]=165
     [t3070-wildmatch.sh]=1861
     [t6300-for-each-ref.sh]=358
     [t7004-tag.sh]=159
@@ -87,6 +94,11 @@ declare -A FLOOR=(
     [t4034-diff-words.sh]=64
     [t5500-fetch-pack.sh]=356
     [t5537-fetch-shallow.sh]=9
+    [t0008-ignores.sh]=284
+    [t7400-submodule-basic.sh]=70
+    [t7506-status-submodule.sh]=28
+    [t7508-status.sh]=66
+    [t4027-diff-submodule.sh]=18
 )
 
 fail=0

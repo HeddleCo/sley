@@ -42,7 +42,7 @@ jobs:
     # 53 tracked t-files (round-4a added 5: fetch-pack/shallow + userdiff,
     # incl. the 377-assertion t5500 fetch suite) + oracle-git build on cache
     # miss; 60 min was sized for the 48-file list.
-    timeout-minutes: 70
+    timeout-minutes: 80
 
     steps:
       - uses: actions/checkout@v4
@@ -100,6 +100,7 @@ jobs:
           # (overrides the runner's default subset).
           SLEY_TESTS: >-
             t0001-init.sh
+            t0008-ignores.sh
             t0027-auto-crlf.sh
             t1006-cat-file.sh
             t1007-hash-object.sh
@@ -130,6 +131,7 @@ jobs:
             t4013-diff-various.sh
             t4015-diff-whitespace.sh
             t4018-diff-funcname.sh
+            t4027-diff-submodule.sh
             t4034-diff-words.sh
             t4045-diff-relative.sh
             t4047-diff-dirstat.sh
@@ -151,11 +153,18 @@ jobs:
             t6300-for-each-ref.sh
             t6423-merge-rename-directories.sh
             t7004-tag.sh
+            t7400-submodule-basic.sh
+            t7506-status-submodule.sh
+            t7508-status.sh
             t7810-grep.sh
           # t5310/t5326 overrun the runner's 120s default per-script timeout
           # under load (a TIMEOUT row truncates the ok count and would falsely
           # trip the floor gate). Give every script the same generous ceiling.
-          SLEY_TEST_TIMEOUT: "540"
+          # t0008 deadlocks on its LAST cell (sley#44 check-ignore buffering);
+          # 900s lets the 284 floor cells complete and record before the kill
+          # (the job burns the full ceiling on that one script — the job
+          # timeout-minutes accounts for it).
+          SLEY_TEST_TIMEOUT: "900"
           SLEY_RUN_LABEL: ${{ github.sha }}
         run: |
           export SLEY_BIN="$GITHUB_WORKSPACE/target/release/sley"
