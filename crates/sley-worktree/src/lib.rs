@@ -132,6 +132,76 @@ pub struct ShortStatusEntry {
     pub worktree_mode: Option<u32>,
     pub head_oid: Option<ObjectId>,
     pub index_oid: Option<ObjectId>,
+    /// For a tracked gitlink (submodule) path: how the submodule's working
+    /// state differs from the staged gitlink. `None` for ordinary paths.
+    pub submodule: Option<SubmoduleStatus>,
+}
+
+/// Submodule-specific change detail for a status entry, mirroring upstream's
+/// `wt_status_change_data` trio: `new_submodule_commits` plus the
+/// `DIRTY_SUBMODULE_MODIFIED`/`DIRTY_SUBMODULE_UNTRACKED` dirty bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SubmoduleStatus {
+    /// The submodule's checked-out HEAD differs from the staged gitlink oid.
+    pub new_commits: bool,
+    /// The submodule has staged or unstaged changes to tracked files.
+    pub modified_content: bool,
+    /// The submodule has untracked files.
+    pub untracked_content: bool,
+}
+
+impl SubmoduleStatus {
+    pub fn any(&self) -> bool {
+        self.new_commits || self.modified_content || self.untracked_content
+    }
+}
+
+/// Bit set in a submodule dirt mask when the submodule has staged or unstaged
+/// changes to tracked files (upstream `DIRTY_SUBMODULE_MODIFIED`).
+pub const DIRTY_SUBMODULE_MODIFIED: u8 = 1;
+/// Bit set in a submodule dirt mask when the submodule has untracked files
+/// (upstream `DIRTY_SUBMODULE_UNTRACKED`).
+pub const DIRTY_SUBMODULE_UNTRACKED: u8 = 2;
+
+/// Inspect the working state of the submodule whose worktree is at `sub_root`
+/// and report its dirt mask: [`DIRTY_SUBMODULE_MODIFIED`] for staged/unstaged
+/// changes to tracked files, [`DIRTY_SUBMODULE_UNTRACKED`] for untracked
+/// files. Returns 0 for a clean submodule — and for a directory that is not a
+/// populated repository at all (upstream treats an unpopulated gitlink as
+/// always unchanged). The native equivalent of upstream's
+/// `is_submodule_modified()` (which runs `git status --porcelain=2` inside the
+/// submodule and classifies `?` lines as untracked, everything else as
+/// modified).
+pub fn submodule_dirt(sub_root: &Path) -> u8 {
+    let Some(git_dir) = sley_diff_merge::gitlink_git_dir(sub_root) else {
+        return 0;
+    };
+    let Ok(config) = sley_config::read_repo_config(&git_dir, None) else {
+        return 0;
+    };
+    let Ok(format) = config.repository_object_format() else {
+        return 0;
+    };
+    let Ok(entries) = short_status_with_options(
+        sub_root,
+        &git_dir,
+        format,
+        ShortStatusOptions {
+            include_ignored: false,
+            untracked_mode: StatusUntrackedMode::Normal,
+        },
+    ) else {
+        return 0;
+    };
+    let mut dirt = 0;
+    for entry in entries {
+        if entry.index == b'?' && entry.worktree == b'?' {
+            dirt |= DIRTY_SUBMODULE_UNTRACKED;
+        } else {
+            dirt |= DIRTY_SUBMODULE_MODIFIED;
+        }
+    }
+    dirt
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -527,6 +597,40 @@ fn update_index_paths_impl(
                 "cannot add to the index - missing --add option?",
             );
             return Err(GitError::Exit(128));
+        }
+        if metadata.is_dir() {
+            // A directory is stageable only as a gitlink: when it is an
+            // embedded repository with a commit checked out, git records a
+            // mode-160000 entry whose oid is that commit (no object is
+            // written). Otherwise it errors — with upstream's exact messages
+            // for the embedded-repo-without-commit and plain-directory cases
+            // (object-file.c index_path / builtin/update-index.c
+            // process_directory).
+            let display = String::from_utf8_lossy(&git_path).into_owned();
+            let has_dot_git = absolute.join(".git").exists();
+            let Some(head_oid) = sley_diff_merge::gitlink_head_oid(&absolute, format) else {
+                if has_dot_git {
+                    eprintln!("error: '{display}' does not have a commit checked out");
+                } else {
+                    eprintln!("error: {display}: is a directory - add files inside instead");
+                }
+                eprintln!("fatal: Unable to process path {display}");
+                return Err(GitError::Exit(128));
+            };
+            if path_chmod.is_some() {
+                eprintln!(
+                    "fatal: git update-index: cannot chmod {}x '{display}'",
+                    if path_chmod == Some(true) { '+' } else { '-' },
+                );
+                return Err(GitError::Exit(128));
+            }
+            let mut entry = index_entry_from_metadata(git_path.clone(), head_oid, &metadata);
+            entry.mode = 0o160000;
+            reports.push(format!("add '{display}'"));
+            index.entries.retain(|existing| existing.path != git_path);
+            index.entries.push(entry);
+            updated.push(head_oid);
+            continue;
         }
         let is_symlink = metadata.file_type().is_symlink();
         let body = if is_symlink {
@@ -1260,6 +1364,12 @@ pub fn write_tree_from_index_with_options(
     if !options.missing_ok {
         let mut missing = false;
         for entry in &entries {
+            // A gitlink's oid names a commit in the *submodule's* repository;
+            // it is never expected to exist in this odb (upstream
+            // update_one_entry: REF_OBJ check skips S_IFGITLINK entries).
+            if entry.mode == 0o160000 {
+                continue;
+            }
             if !odb.contains(&entry.oid)? {
                 eprintln!(
                     "error: invalid object {:o} {} for '{}'",
@@ -1361,7 +1471,7 @@ pub fn short_status_with_options(
         None
     };
     let mut ignores = IgnoreMatcher::from_worktree_base(worktree_root)?;
-    let worktree = worktree_entries_with_stat_cache(
+    let (worktree, submodule_dirt_map) = worktree_entries_with_submodule_dirt(
         worktree_root,
         git_dir,
         format,
@@ -1391,6 +1501,22 @@ pub fn short_status_with_options(
         {
             continue;
         }
+        // Submodule detail for a tracked gitlink whose worktree directory is
+        // populated: new commits when the checked-out HEAD moved off the staged
+        // oid, plus the dirt mask the walk collected.
+        let submodule = match (index_entry, worktree_entry) {
+            (Some(index), Some(worktree))
+                if index.mode == 0o160000 && worktree.mode == 0o160000 =>
+            {
+                let dirt = submodule_dirt_map.get(&path).copied().unwrap_or(0);
+                Some(SubmoduleStatus {
+                    new_commits: index.oid != worktree.oid,
+                    modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
+                    untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
+                })
+            }
+            _ => None,
+        };
         let (index_code, worktree_code) =
             if head_entry.is_none() && index_entry.is_none() && worktree_entry.is_some() {
                 (b'?', b'?')
@@ -1405,6 +1531,9 @@ pub fn short_status_with_options(
                     (None, Some(_)) => b'?',
                     (Some(_), None) => b'D',
                     (Some(left), Some(right)) if left != right => b'M',
+                    // A submodule whose HEAD still matches the staged gitlink
+                    // but whose own tree is dirty is a worktree modification.
+                    _ if submodule.is_some_and(|sub| sub.any()) => b'M',
                     _ => b' ',
                 };
                 (index_code, worktree_code)
@@ -1419,6 +1548,7 @@ pub fn short_status_with_options(
                 worktree_mode: worktree_entry.map(|entry| entry.mode),
                 head_oid: head_entry.map(|entry| entry.oid),
                 index_oid: index_entry.map(|entry| entry.oid),
+                submodule: submodule.filter(|sub| sub.any()),
             });
         }
     }
@@ -1433,6 +1563,7 @@ pub fn short_status_with_options(
                 worktree_mode: None,
                 head_oid: None,
                 index_oid: None,
+                submodule: None,
             });
         }
     }
@@ -1457,6 +1588,7 @@ pub fn short_status_with_options(
             worktree_mode: None,
             head_oid: None,
             index_oid: None,
+            submodule: None,
         });
     }
     entries.sort_by(|left, right| {
@@ -6350,6 +6482,13 @@ impl IndexStatCache {
             oid: entry.oid,
         })
     }
+
+    /// The stage-0 gitlink (mode 160000) index entry at `git_path`, if any.
+    fn gitlink_entry(&self, git_path: &[u8]) -> Option<&IndexEntry> {
+        self.entries
+            .get(git_path)
+            .filter(|entry| entry.mode == 0o160000)
+    }
 }
 
 fn read_index_entries(
@@ -6568,7 +6707,30 @@ fn worktree_entries_with_stat_cache(
     tracked_paths: Option<&BTreeSet<Vec<u8>>>,
     ignores: Option<&mut IgnoreMatcher>,
 ) -> Result<BTreeMap<Vec<u8>, TrackedEntry>> {
+    Ok(worktree_entries_with_submodule_dirt(
+        worktree_root,
+        git_dir,
+        format,
+        stat_cache,
+        tracked_paths,
+        ignores,
+    )?
+    .0)
+}
+
+/// Like [`worktree_entries_with_stat_cache`], but also reports, for every
+/// tracked gitlink path whose submodule working tree is dirty, the dirt mask
+/// ([`DIRTY_SUBMODULE_MODIFIED`] / [`DIRTY_SUBMODULE_UNTRACKED`]).
+fn worktree_entries_with_submodule_dirt(
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    stat_cache: Option<&IndexStatCache>,
+    tracked_paths: Option<&BTreeSet<Vec<u8>>>,
+    ignores: Option<&mut IgnoreMatcher>,
+) -> Result<(BTreeMap<Vec<u8>, TrackedEntry>, BTreeMap<Vec<u8>, u8>)> {
     let mut entries = BTreeMap::new();
+    let mut submodule_dirt_map = BTreeMap::new();
     // Worktree blobs are compared to the index by OID, so they must be passed
     // through the clean filter (core.autocrlf / .gitattributes) first -- exactly
     // as `git add` would store them. With no filter configured this is an exact
@@ -6591,9 +6753,10 @@ fn worktree_entries_with_stat_cache(
         tracked_paths,
         ignores,
         entries: &mut entries,
+        submodule_dirt: &mut submodule_dirt_map,
     };
     collect_worktree_entries(&mut context, worktree_root)?;
-    Ok(entries)
+    Ok((entries, submodule_dirt_map))
 }
 
 struct WorktreeEntriesWalk<'a> {
@@ -6607,6 +6770,8 @@ struct WorktreeEntriesWalk<'a> {
     tracked_paths: Option<&'a BTreeSet<Vec<u8>>>,
     ignores: Option<&'a mut IgnoreMatcher>,
     entries: &'a mut BTreeMap<Vec<u8>, TrackedEntry>,
+    /// Dirt masks for tracked gitlink paths whose submodule worktree is dirty.
+    submodule_dirt: &'a mut BTreeMap<Vec<u8>, u8>,
 }
 
 fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -> Result<()> {
@@ -6652,6 +6817,32 @@ fn collect_worktree_entries(context: &mut WorktreeEntriesWalk<'_>, dir: &Path) -
             continue;
         }
         if metadata.is_dir() {
+            // A directory staged as a gitlink (mode 160000) is opaque: the walk
+            // never descends into it. Its worktree "content" is the commit the
+            // embedded repository has checked out (upstream ce_compare_gitlink):
+            // a populated submodule reports its HEAD (plus a dirt mask when its
+            // own tree has modified/untracked content); an unpopulated
+            // directory — no repository, or no commit checked out — always
+            // matches the staged oid.
+            if let Some(index_entry) = context
+                .stat_cache
+                .and_then(|cache| cache.gitlink_entry(&git_path))
+            {
+                let oid = sley_diff_merge::gitlink_head_oid(&path, context.format)
+                    .unwrap_or(index_entry.oid);
+                let dirt = submodule_dirt(&path);
+                if dirt != 0 {
+                    context.submodule_dirt.insert(git_path.clone(), dirt);
+                }
+                context.entries.insert(
+                    git_path,
+                    TrackedEntry {
+                        mode: 0o160000,
+                        oid,
+                    },
+                );
+                continue;
+            }
             if is_nested_repository_boundary(&path) {
                 if let Some(tracked_paths) = context.tracked_paths
                     && !tracked_paths_may_contain(tracked_paths, &git_path)
@@ -6763,12 +6954,16 @@ fn is_dot_git_entry(path: &Path) -> bool {
 }
 
 /// Whether `path` is a directory containing an embedded repository's `.git`
-/// *directory*. Git only treats a nested `.git` directory as a repository
-/// boundary (listing the directory as `dir/`); a plain `.git` *file* (an invalid
-/// or non-submodule gitlink) is not a boundary — Git descends into the directory
-/// and lists its other untracked contents normally.
+/// *directory*, or a `.git` file whose `gitdir:` pointer resolves to an
+/// existing directory (a submodule worktree). Git treats both as a repository
+/// boundary (listing the directory as `dir/`); an *invalid* `.git` file (no
+/// resolvable `gitdir:` target) is not a boundary — Git descends into the
+/// directory and lists its other untracked contents normally.
 fn is_nested_repository_boundary(path: &Path) -> bool {
-    path.join(".git").is_dir()
+    if path.join(".git").is_dir() {
+        return true;
+    }
+    sley_diff_merge::gitlink_git_dir(path).is_some()
 }
 
 /// Whether `path` is an embedded repository's `.git` directory or a path inside it.

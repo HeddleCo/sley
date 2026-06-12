@@ -7,7 +7,66 @@ use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
 use sley_refs::{FileRefStore, RefTarget};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+// ===========================================================================
+// Gitlink (submodule) resolution helpers.
+//
+// A gitlink is a mode-160000 tree/index entry whose oid names the commit an
+// embedded repository has checked out. These helpers resolve, for a directory
+// in the working tree, (a) the embedded repository's git directory — either a
+// `.git` directory or a `.git` *file* carrying a `gitdir: <path>` pointer (the
+// layout `git submodule add`/`update` creates, pointing into the
+// superproject's `.git/modules/<name>`) — and (b) the commit its HEAD names.
+// They are the native equivalent of upstream's `resolve_gitlink_ref()`.
+// ===========================================================================
+
+/// Resolve the git directory of an embedded repository whose working tree is
+/// at `sub_root`. A `.git` directory is returned as-is; a `.git` file is
+/// followed through its `gitdir: <path>` pointer (a relative pointer resolves
+/// against `sub_root`). Returns `None` when there is no `.git` entry or the
+/// pointer does not name an existing directory.
+pub fn gitlink_git_dir(sub_root: &Path) -> Option<PathBuf> {
+    let dot_git = sub_root.join(".git");
+    let metadata = fs::symlink_metadata(&dot_git).ok()?;
+    if metadata.is_dir() {
+        return Some(dot_git);
+    }
+    if !metadata.is_file() {
+        return None;
+    }
+    let contents = fs::read_to_string(&dot_git).ok()?;
+    let target = contents.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = PathBuf::from(target);
+    let git_dir = if target.is_absolute() {
+        target
+    } else {
+        sub_root.join(target)
+    };
+    if git_dir.is_dir() { Some(git_dir) } else { None }
+}
+
+/// Resolve the commit checked out in the embedded repository at `sub_root`
+/// (the value a gitlink entry for that path records): its git directory's
+/// HEAD, followed through symbolic refs. `None` when `sub_root` is not a
+/// repository or its HEAD does not resolve to a commit (e.g. an unborn
+/// branch) — upstream's `resolve_gitlink_ref() < 0` case.
+pub fn gitlink_head_oid(sub_root: &Path, format: ObjectFormat) -> Option<ObjectId> {
+    let git_dir = gitlink_git_dir(sub_root)?;
+    let store = FileRefStore::new(&git_dir, format);
+    let mut target = store.read_ref("HEAD").ok()??;
+    // Follow symbolic-ref chains defensively (git caps the depth too).
+    for _ in 0..10 {
+        match target {
+            RefTarget::Direct(oid) => return Some(oid),
+            RefTarget::Symbolic(name) => target = store.read_ref(&name).ok()??,
+        }
+    }
+    None
+}
 
 // ===========================================================================
 // Line-level diff (Myers O(ND)) and 3-way blob merge (diff3).

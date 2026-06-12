@@ -941,9 +941,22 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         .collect::<Vec<_>>();
     if !action_paths.is_empty() {
         let config = read_repo_config(&git_dir)?;
+        // Snapshot the tracked paths before staging: the embedded-repo warning
+        // fires only for *newly added* gitlinks (upstream only checks paths
+        // that came from the untracked-file listing).
+        let previously_tracked: BTreeSet<Vec<u8>> =
+            sley_worktree::read_repository_index(&git_dir, format)?
+                .map(|index| {
+                    index
+                        .entries
+                        .into_iter()
+                        .map(|entry| entry.path.into_bytes())
+                        .collect()
+                })
+                .unwrap_or_default();
         sley_worktree::update_index_paths_filtered(
             &worktree_root,
-            git_dir,
+            git_dir.clone(),
             format,
             &action_paths,
             sley_worktree::UpdateIndexOptions {
@@ -956,9 +969,66 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             },
             &config,
         )?;
+        warn_on_embedded_repos(&git_dir, &worktree_root, &actions, &previously_tracked)?;
     }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
+    }
+    Ok(())
+}
+
+/// Upstream builtin/add.c check_embedded_repo(): after staging, warn (per
+/// path) about each embedded git repository that was just added as a gitlink,
+/// and print the `advice.addEmbeddedRepo` hint once.
+fn warn_on_embedded_repos(
+    git_dir: &Path,
+    worktree_root: &Path,
+    actions: &[AddAction],
+    previously_tracked: &BTreeSet<Vec<u8>>,
+) -> Result<()> {
+    let mut adviced = false;
+    for action in actions {
+        let AddAction::Add(path) = action else {
+            continue;
+        };
+        if !path.is_dir() || sley_diff_merge::gitlink_git_dir(path).is_none() {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(worktree_root) else {
+            continue;
+        };
+        let name = relative.to_string_lossy().replace('\\', "/");
+        if previously_tracked.contains(name.as_bytes()) {
+            continue;
+        }
+        eprintln!("warning: adding embedded git repository: {name}");
+        if adviced {
+            continue;
+        }
+        adviced = true;
+        let advice_enabled = read_repo_config(git_dir)
+            .ok()
+            .and_then(|config| config.get_bool("advice", None, "addembeddedrepo"))
+            .unwrap_or(true);
+        if !advice_enabled {
+            continue;
+        }
+        eprintln!("hint: You've added another git repository inside your current repository.");
+        eprintln!("hint: Clones of the outer repository will not contain the contents of");
+        eprintln!("hint: the embedded repository and will not know how to obtain it.");
+        eprintln!("hint: If you meant to add a submodule, use:");
+        eprintln!("hint:");
+        eprintln!("hint: \tgit submodule add <url> {name}");
+        eprintln!("hint:");
+        eprintln!("hint: If you added this path by mistake, you can remove it from the");
+        eprintln!("hint: index with:");
+        eprintln!("hint:");
+        eprintln!("hint: \tgit rm --cached {name}");
+        eprintln!("hint:");
+        eprintln!("hint: See \"git help submodule\" for more information.");
+        eprintln!(
+            "hint: Disable this message with \"git config set advice.addEmbeddedRepo false\""
+        );
     }
     Ok(())
 }
