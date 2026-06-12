@@ -231,6 +231,23 @@ where
     walk_reachable_objects(reader, format, starts, &HashSet::new(), |_, _| {})
 }
 
+/// [`collect_reachable_object_ids`] with a cut set: commits in `cut` are
+/// collected, but the walk does not continue to their parents — the view a
+/// shallow repository has of its own refs (`$GIT_DIR/shallow` of the *other*
+/// side, threaded explicitly because `reader` belongs to this side).
+pub fn collect_reachable_object_ids_with_cut<R, I>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    cut: &HashSet<ObjectId>,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+{
+    walk_reachable_objects_with_cut(reader, format, starts, &HashSet::new(), cut, |_, _| {})
+}
+
 /// [`collect_reachable_object_ids`] with a stop set: objects in `excluded` are
 /// not visited and not expanded, so the walk never sees anything reachable only
 /// through them (used to truncate history at a shallow boundary).
@@ -371,6 +388,7 @@ where
         excluded,
         options,
         None,
+        None,
     )
 }
 
@@ -398,6 +416,7 @@ pub fn build_and_install_reachable_pack_filtered<R, I>(
     excluded: &HashSet<ObjectId>,
     options: RawPackInstallOptions,
     filter: Option<PackObjectFilter>,
+    unpack_limit: Option<usize>,
 ) -> Result<Option<PackInstallResult>>
 where
     R: ObjectReader,
@@ -415,6 +434,17 @@ where
         None => {}
     }
     if objects.is_empty() {
+        return Ok(None);
+    }
+    // Mirror fetch-pack's unpack-limit: small transfers are exploded into
+    // loose objects instead of landing as a pack (upstream `get_pack` picks
+    // unpack-objects when the header count is below fetch/transfer.unpackLimit).
+    if let Some(limit) = unpack_limit
+        && objects.len() < limit
+    {
+        for entry in &objects {
+            destination.loose().write_object((*entry.object).clone())?;
+        }
         return Ok(None);
     }
     let inputs = pack_inputs(&objects);
@@ -1248,6 +1278,25 @@ fn walk_reachable_objects<R, I, F>(
     format: ObjectFormat,
     starts: I,
     excluded: &HashSet<ObjectId>,
+    visit: F,
+) -> Result<HashSet<ObjectId>>
+where
+    R: ObjectReader,
+    I: IntoIterator<Item = ObjectId>,
+    F: FnMut(&ObjectId, &Arc<EncodedObject>),
+{
+    walk_reachable_objects_with_cut(reader, format, starts, excluded, &HashSet::new(), visit)
+}
+
+/// [`walk_reachable_objects`] with an additional `cut` set: commits in `cut`
+/// are visited (their trees and blobs too) but their parents are not followed,
+/// mirroring a shallow client's view of its own history during negotiation.
+fn walk_reachable_objects_with_cut<R, I, F>(
+    reader: &R,
+    format: ObjectFormat,
+    starts: I,
+    excluded: &HashSet<ObjectId>,
+    cut: &HashSet<ObjectId>,
     mut visit: F,
 ) -> Result<HashSet<ObjectId>>
 where
@@ -1274,8 +1323,10 @@ where
                         (commit.tree, commit.parents)
                     };
                     visit(&oid, &object);
-                    for parent in grafted_parents(reader, &oid, parents).into_iter().rev() {
-                        pending.push(parent);
+                    if !cut.contains(&oid) {
+                        for parent in grafted_parents(reader, &oid, parents).into_iter().rev() {
+                            pending.push(parent);
+                        }
                     }
                     pending.push(tree);
                 }

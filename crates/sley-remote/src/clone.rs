@@ -91,6 +91,11 @@ pub struct CloneOptions<'a> {
     /// warned-and-ignored upstream of `clone` by the caller, matching git's
     /// `is_local` behavior.
     pub depth: Option<u32>,
+    /// `--shallow-since=<date>` (parsed to an epoch): deepen to commits newer
+    /// than the date. Local in-process transport only.
+    pub deepen_since: Option<i64>,
+    /// `--shallow-exclude=<ref>` values, resolved against the remote.
+    pub deepen_not: Vec<String>,
     /// The committer identity for the branch-creation and checkout reflog entries.
     pub committer: Vec<u8>,
     /// The remote `HEAD` is detached at this commit (no default branch). After
@@ -190,7 +195,12 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
             common_git_dir: remote_common_git_dir.clone(),
         },
     };
-    let fetch_options = clone_fetch_options(request.options.depth, request.options.filter);
+    let fetch_options = clone_fetch_options(
+        request.options.depth,
+        request.options.deepen_since,
+        request.options.deepen_not.clone(),
+        request.options.filter,
+    );
     fetch(
         crate::fetch::FetchRequest {
             git_dir: &git_dir,
@@ -293,6 +303,8 @@ pub fn clone(request: CloneRequest<'_>, services: CloneServices<'_>) -> Result<C
 /// paths passed.
 fn clone_fetch_options(
     depth: Option<u32>,
+    deepen_since: Option<i64>,
+    deepen_not: Vec<String>,
     filter: Option<sley_odb::PackObjectFilter>,
 ) -> FetchOptions {
     FetchOptions {
@@ -308,5 +320,10 @@ fn clone_fetch_options(
         depth,
         merge_src: None,
         filter,
+        cloning: true,
+        update_shallow: false,
+        deepen_relative: false,
+        deepen_since,
+        deepen_not,
     }
 }

@@ -243,6 +243,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
                 &wants,
                 client_shallow,
                 depth,
+                false,
             )?)
         }
         _ => None,
@@ -255,6 +256,7 @@ pub(crate) fn cmd_fetch_pack(args: &[String]) -> Result<()> {
             wants,
             deepen_plan.as_ref(),
             false,
+            None,
             None,
         )?;
         apply_shallow_info(&git_dir, format, &shallow_info)?;

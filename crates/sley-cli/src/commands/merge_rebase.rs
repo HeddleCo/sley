@@ -2840,7 +2840,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
     let mut rebase_flag = None::<bool>;
     let mut remote = None::<String>;
     let mut branch = None::<String>;
+    let mut depth = None::<u32>;
+    let mut expect_depth_value = false;
     for arg in args {
+        if expect_depth_value {
+            expect_depth_value = false;
+            depth = Some(crate::commands::remote_cmds::parse_clone_depth(arg)?);
+            continue;
+        }
         match arg.as_str() {
             "--no-ff" => no_ff = true,
             "--ff-only" => ff_only = true,
@@ -2848,6 +2855,12 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
             "--no-rebase" => rebase_flag = Some(false),
             "-q" | "--quiet" => quiet = true,
             "--no-quiet" => quiet = false,
+            "--depth" => expect_depth_value = true,
+            value if value.starts_with("--depth=") => {
+                depth = Some(crate::commands::remote_cmds::parse_clone_depth(
+                    value.strip_prefix("--depth=").unwrap_or_default(),
+                )?);
+            }
             value if value.starts_with('-') => {
                 return Err(GitError::Command(format!(
                     "pull currently supports --ff-only, --no-ff, --rebase, --no-rebase, --quiet, and remote/branch arguments; unsupported option {value}"
@@ -2896,9 +2909,14 @@ pub(crate) fn cmd_pull(args: &[String]) -> Result<()> {
         write_fetch_head: true,
         tag_option_explicit: false,
         prune_option_explicit: false,
-        depth: None,
+        depth,
         merge_src,
         filter: None,
+        cloning: false,
+        update_shallow: false,
+        deepen_relative: false,
+        deepen_since: None,
+        deepen_not: Vec::new(),
     };
     pull_fetch(&git_dir, format, &remote, &refspecs, fetch_options)?;
     let common_git_dir = common_git_dir_for_git_dir(&git_dir)?;

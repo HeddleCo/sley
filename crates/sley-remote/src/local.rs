@@ -337,8 +337,14 @@ pub fn local_have_oids(git_dir: &Path, format: ObjectFormat) -> Result<Vec<Objec
 /// Mirrors upstream `upload-pack.c::deepen` + `shallow.c::get_shallow_commits`.
 #[derive(Debug, Clone)]
 pub struct LocalDeepenPlan {
-    /// The requested deepen depth (`--depth N`, always >= 1).
+    /// The requested deepen depth (`--depth N`; [`INFINITE_DEPTH`] for
+    /// `--unshallow` and for the implicit deepen a shallow server runs on a
+    /// plain fetch; `0` for the deepen-since/deepen-not rev-list modes).
     pub depth: u32,
+    /// The request carried `deepen-since` (trace2 `fetch-info` parity).
+    pub deepen_since: bool,
+    /// Number of `deepen-not` entries in the request (trace2 parity).
+    pub deepen_not: usize,
     /// The client's existing shallow boundary (`$GIT_DIR/shallow`), replayed as
     /// `shallow` lines in the upload-pack request.
     pub client_shallow: Vec<ObjectId>,
@@ -393,7 +399,20 @@ pub fn compute_local_deepen<R: ObjectReader>(
     heads: &[ObjectId],
     client_shallow: Vec<ObjectId>,
     depth: u32,
+    deepen_relative: bool,
 ) -> Result<LocalDeepenPlan> {
+    // `--deepen=N`: the boundary moves N commits past the client's current
+    // boundary (upstream `get_shallows_depth` + `depth +=`).
+    let depth = if deepen_relative && depth < INFINITE_DEPTH {
+        depth.saturating_add(client_shallow_min_depth(
+            remote_db,
+            format,
+            heads,
+            &client_shallow,
+        )?)
+    } else {
+        depth
+    };
     let mut min_depth: HashMap<ObjectId, u32> = HashMap::new();
     let mut queue: VecDeque<ObjectId> = VecDeque::new();
     for head in heads {
@@ -414,8 +433,17 @@ pub fn compute_local_deepen<R: ObjectReader>(
     while let Some(oid) = queue.pop_front() {
         let commit_depth = min_depth[&oid];
         let object = remote_db.read_object(&oid)?;
-        let parents = Commit::parse_ref(format, &object.body)?.parents;
-        if commit_depth + 1 >= depth {
+        let parents = sley_odb::grafted_parents(
+            remote_db,
+            &oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        );
+        // A commit is boundary when the requested depth cuts at it, or when
+        // the server's own history is cut at it (a shallow server reports its
+        // graft points to the client — upstream `get_shallows_or_depth`).
+        if (depth != INFINITE_DEPTH && commit_depth + 1 >= depth)
+            || remote_db.is_shallow_graft(&oid)
+        {
             boundary.push(oid);
             boundary_parents.extend(parents);
             continue;
@@ -436,6 +464,7 @@ pub fn compute_local_deepen<R: ObjectReader>(
         .collect::<HashSet<_>>();
 
     let client: HashSet<ObjectId> = client_shallow.iter().copied().collect();
+    let boundary_set: HashSet<ObjectId> = boundary.iter().copied().collect();
     let mut shallow_info = Vec::new();
     for oid in &boundary {
         if !client.contains(oid) {
@@ -444,16 +473,217 @@ pub fn compute_local_deepen<R: ObjectReader>(
     }
     let mut extra_wants = Vec::new();
     for oid in &client_shallow {
-        let unshallowed = min_depth.get(oid).is_some_and(|d| d + 1 < depth);
+        // A client-shallow commit is unshallowed when the walk reached it as
+        // a non-boundary commit (upstream `send_unshallow`: NOT_SHALLOW set).
+        let unshallowed = min_depth.contains_key(oid) && !boundary_set.contains(oid);
         if !unshallowed {
             continue;
         }
         shallow_info.push(ProtocolV2FetchShallowInfo::Unshallow(*oid));
         let object = remote_db.read_object(oid)?;
-        extra_wants.extend(Commit::parse_ref(format, &object.body)?.parents);
+        extra_wants.extend(sley_odb::grafted_parents(
+            remote_db,
+            oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        ));
     }
     Ok(LocalDeepenPlan {
         depth,
+        deepen_since: false,
+        deepen_not: 0,
+        client_shallow,
+        shallow_info,
+        excluded,
+        extra_wants,
+    })
+}
+
+/// Upstream `INFINITE_DEPTH`: `--unshallow`, and the implicit deepen a shallow
+/// server runs for a plain fetch so its graft points reach the client.
+pub const INFINITE_DEPTH: u32 = 0x7fff_ffff;
+
+/// Upstream `get_shallows_depth`: the minimum depth (head = 1) at which the
+/// walk from `heads` meets one of the client's shallow points, or 0 when it
+/// never does. Used to make `--deepen=N` relative to the current boundary.
+fn client_shallow_min_depth<R: ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    heads: &[ObjectId],
+    client_shallow: &[ObjectId],
+) -> Result<u32> {
+    if client_shallow.is_empty() {
+        return Ok(0);
+    }
+    let client: HashSet<ObjectId> = client_shallow.iter().copied().collect();
+    let mut min_depth: HashMap<ObjectId, u32> = HashMap::new();
+    let mut queue: VecDeque<ObjectId> = VecDeque::new();
+    for head in heads {
+        let Some(commit) = peel_to_commit(remote_db, format, head)? else {
+            continue;
+        };
+        if let std::collections::hash_map::Entry::Vacant(entry) = min_depth.entry(commit) {
+            entry.insert(1);
+            queue.push_back(commit);
+        }
+    }
+    let mut best: u32 = 0;
+    while let Some(oid) = queue.pop_front() {
+        let commit_depth = min_depth[&oid];
+        if client.contains(&oid) && (best == 0 || commit_depth < best) {
+            best = commit_depth;
+        }
+        let object = remote_db.read_object(&oid)?;
+        let parents = sley_odb::grafted_parents(
+            remote_db,
+            &oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        );
+        for parent in parents {
+            if let std::collections::hash_map::Entry::Vacant(entry) = min_depth.entry(parent) {
+                entry.insert(commit_depth + 1);
+                queue.push_back(parent);
+            }
+        }
+    }
+    Ok(best)
+}
+
+/// Deepen plan for the rev-list modes (`--shallow-since`, `--shallow-exclude`),
+/// mirroring upstream `get_shallow_commits_by_rev_list`: the kept set is every
+/// commit reachable from `heads` that is newer than `since` (when given) and
+/// not reachable from a `deepen_not` tip; the boundary is every kept commit
+/// with at least one parent outside the kept set.
+pub fn compute_local_deepen_by_rev_list<R: ObjectReader>(
+    remote_db: &R,
+    format: ObjectFormat,
+    heads: &[ObjectId],
+    client_shallow: Vec<ObjectId>,
+    since: Option<i64>,
+    deepen_not: &[ObjectId],
+) -> Result<LocalDeepenPlan> {
+    // Closure of the deepen-not tips (commits to subtract from the kept set).
+    let mut excluded_not: HashSet<ObjectId> = HashSet::new();
+    let mut queue: VecDeque<ObjectId> = VecDeque::new();
+    for tip in deepen_not {
+        if let Some(commit) = peel_to_commit(remote_db, format, tip)?
+            && excluded_not.insert(commit)
+        {
+            queue.push_back(commit);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        let object = remote_db.read_object(&oid)?;
+        for parent in sley_odb::grafted_parents(
+            remote_db,
+            &oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        ) {
+            if excluded_not.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+
+    let commit_time = |oid: &ObjectId| -> Result<i64> {
+        let object = remote_db.read_object(oid)?;
+        Ok(Commit::parse_ref(format, &object.body)?
+            .committer_signature()
+            .map(|signature| signature.time.seconds)
+            .unwrap_or(0))
+    };
+    let keeps = |oid: &ObjectId| -> Result<bool> {
+        if excluded_not.contains(oid) {
+            return Ok(false);
+        }
+        match since {
+            Some(since) => Ok(commit_time(oid)? >= since),
+            None => Ok(true),
+        }
+    };
+
+    // Kept-set walk: only kept commits are expanded, so the walk never reads
+    // objects past the cut (and stops at server graft points via the seam).
+    let mut kept: HashSet<ObjectId> = HashSet::new();
+    let mut kept_order: Vec<ObjectId> = Vec::new();
+    let mut queue: VecDeque<ObjectId> = VecDeque::new();
+    for head in heads {
+        let Some(commit) = peel_to_commit(remote_db, format, head)? else {
+            continue;
+        };
+        if keeps(&commit)? && kept.insert(commit) {
+            kept_order.push(commit);
+            queue.push_back(commit);
+        }
+    }
+    while let Some(oid) = queue.pop_front() {
+        let object = remote_db.read_object(&oid)?;
+        for parent in sley_odb::grafted_parents(
+            remote_db,
+            &oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        ) {
+            if !kept.contains(&parent) && keeps(&parent)? {
+                kept.insert(parent);
+                kept_order.push(parent);
+                queue.push_back(parent);
+            }
+        }
+    }
+    if kept.is_empty() {
+        // Upstream `get_shallow_commits_by_rev_list` dies here.
+        return Err(GitError::Command(
+            "no commits selected for shallow requests".into(),
+        ));
+    }
+
+    // Boundary: kept commits with a parent outside the kept set.
+    let mut boundary = Vec::new();
+    let mut boundary_set: HashSet<ObjectId> = HashSet::new();
+    let mut excluded: HashSet<ObjectId> = HashSet::new();
+    for oid in &kept_order {
+        let object = remote_db.read_object(oid)?;
+        let parents = sley_odb::grafted_parents(
+            remote_db,
+            oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        );
+        let mut is_boundary = false;
+        for parent in parents {
+            if !kept.contains(&parent) {
+                is_boundary = true;
+                excluded.insert(parent);
+            }
+        }
+        if is_boundary && boundary_set.insert(*oid) {
+            boundary.push(*oid);
+        }
+    }
+
+    let client: HashSet<ObjectId> = client_shallow.iter().copied().collect();
+    let mut shallow_info = Vec::new();
+    for oid in &boundary {
+        if !client.contains(oid) {
+            shallow_info.push(ProtocolV2FetchShallowInfo::Shallow(*oid));
+        }
+    }
+    let mut extra_wants = Vec::new();
+    for oid in &client_shallow {
+        let unshallowed = kept.contains(oid) && !boundary_set.contains(oid);
+        if !unshallowed {
+            continue;
+        }
+        shallow_info.push(ProtocolV2FetchShallowInfo::Unshallow(*oid));
+        let object = remote_db.read_object(oid)?;
+        extra_wants.extend(sley_odb::grafted_parents(
+            remote_db,
+            oid,
+            Commit::parse_ref(format, &object.body)?.parents,
+        ));
+    }
+    Ok(LocalDeepenPlan {
+        depth: 0,
+        deepen_since: since.is_some(),
+        deepen_not: deepen_not.len(),
         client_shallow,
         shallow_info,
         excluded,
@@ -481,6 +711,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
     deepen: Option<&LocalDeepenPlan>,
     promisor: bool,
     filter: Option<sley_odb::PackObjectFilter>,
+    unpack_limit: Option<usize>,
 ) -> Result<Vec<ProtocolV2FetchShallowInfo>> {
     if wants.is_empty() {
         return Ok(Vec::new());
@@ -514,7 +745,7 @@ pub fn install_fetch_pack_via_local_upload_pack(
         shallow: deepen
             .map(|plan| plan.client_shallow.clone())
             .unwrap_or_default(),
-        deepen: deepen.map(|plan| plan.depth),
+        deepen: deepen.and_then(|plan| (plan.depth > 0).then_some(plan.depth)),
         ..UploadPackRequest::default()
     };
     let mut encoded_request = Vec::new();
@@ -546,7 +777,29 @@ pub fn install_fetch_pack_via_local_upload_pack(
             Err(err) => Some(Err(err)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let mut excluded = collect_reachable_object_ids(&remote_db, format, known_haves)?;
+    // Trace2 `fetch-info` parity: upstream upload-pack emits a data_json
+    // event the shallow tests grep for; the in-process server inherits the
+    // client's GIT_TRACE2_EVENT just like a spawned upload-pack would.
+    trace2_fetch_info(
+        known_haves.len(),
+        decoded_request.wants.len(),
+        deepen.map(|plan| plan.depth).unwrap_or(0),
+        deepen.map(|plan| plan.client_shallow.len()).unwrap_or(0),
+        deepen.is_some_and(|plan| plan.deepen_since),
+        deepen.map(|plan| plan.deepen_not).unwrap_or(0),
+        filter,
+    );
+    // With a deepen plan the haves walk is cut at the client's existing
+    // boundary: having a commit inside the old shallow window must not imply
+    // having the history below it (upstream runs pack-objects with the
+    // client's shallow file for exactly this reason).
+    let mut excluded = match deepen {
+        Some(plan) => {
+            let cut: HashSet<ObjectId> = plan.client_shallow.iter().copied().collect();
+            sley_odb::collect_reachable_object_ids_with_cut(&remote_db, format, known_haves, &cut)?
+        }
+        None => collect_reachable_object_ids(&remote_db, format, known_haves)?,
+    };
     let mut starts = decoded_request.wants;
     if let Some(plan) = deepen {
         // Stop the pack walk at the shallow boundary and pack the history a
@@ -562,8 +815,44 @@ pub fn install_fetch_pack_via_local_upload_pack(
         &excluded,
         RawPackInstallOptions { promisor },
         filter,
+        unpack_limit,
     )?;
     Ok(deepen
         .map(|plan| plan.shallow_info.clone())
         .unwrap_or_default())
+}
+
+/// Append upstream upload-pack's `fetch-info` data_json event to the file
+/// named by `GIT_TRACE2_EVENT` (`trace2_fetch_info` in `upload-pack.c`). The
+/// subset of fields the test suite greps is emitted with upstream spellings.
+fn trace2_fetch_info(
+    haves: usize,
+    wants: usize,
+    depth: u32,
+    shallows: usize,
+    deepen_since: bool,
+    deepen_not: usize,
+    filter: Option<sley_odb::PackObjectFilter>,
+) {
+    let Some(path) = std::env::var_os("GIT_TRACE2_EVENT") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let filter_json = match filter {
+        Some(sley_odb::PackObjectFilter::BlobNone) => "\"blob:none\"".to_string(),
+        None => "null".to_string(),
+    };
+    let line = format!(
+        "{{\"event\":\"data_json\",\"thread\":\"main\",\"category\":\"upload-pack\",\"key\":\"fetch-info\",\"value\":{{\"haves\":{haves},\"wants\":{wants},\"want-refs\":0,\"depth\":{depth},\"shallows\":{shallows},\"deepen-since\":{deepen_since},\"deepen-not\":{deepen_not},\"deepen-relative\":false,\"filter\":{filter_json}}}}}\n"
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        use std::io::Write as _;
+        let _ = file.write_all(line.as_bytes());
+    }
 }
