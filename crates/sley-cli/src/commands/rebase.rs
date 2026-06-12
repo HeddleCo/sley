@@ -56,6 +56,7 @@ struct RebaseArgs {
     force: bool,
     exec: Vec<String>,
     signoff: bool,
+    no_verify: bool,
     reschedule_failed_exec: Option<bool>,
     root: bool,
     fork_point: Option<bool>,
@@ -90,6 +91,7 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
         force: false,
         exec: Vec::new(),
         signoff: false,
+        no_verify: false,
         reschedule_failed_exec: None,
         root: false,
         fork_point: None,
@@ -198,7 +200,8 @@ fn parse_rebase_args(args: &[String]) -> Result<RebaseArgs> {
             _ if arg.starts_with("-X") && arg.len() > 2 => {
                 out.strategy_opts.push(arg[2..].to_string());
             }
-            "--no-verify" | "--verify" => {}
+            "--no-verify" => out.no_verify = true,
+            "--verify" => out.no_verify = false,
             "--rerere-autoupdate" | "--no-rerere-autoupdate" => {}
             "--allow-empty-message" => {}
             "--committer-date-is-author-date" | "--reset-author-date" | "--ignore-date" => {
@@ -725,6 +728,14 @@ fn start_rebase(ctx: &Ctx, args: RebaseArgs) -> Result<()> {
             }
         }
     };
+
+    if !args.no_verify {
+        let mut hook_args = vec![upstream_name.as_str()];
+        if args.positional.get(1).is_some() {
+            hook_args.push(branch_name.as_str());
+        }
+        commands::hooks::run_hook_l("pre-rebase", &hook_args)?;
+    }
 
     // Onto.
     let onto_name = match &args.onto_name {

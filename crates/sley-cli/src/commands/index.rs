@@ -1614,6 +1614,10 @@ pub(crate) fn cmd_update_index(args: &[String]) -> Result<()> {
     if fsmonitor && !suppress_after_unresolve {
         print_update_index_fsmonitor_unset_warning();
     }
+    crate::commands::hooks::run_hook(
+        "post-index-change",
+        crate::commands::hooks::HookRun::default(),
+    )?;
     Ok(())
 }
 

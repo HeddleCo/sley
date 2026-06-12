@@ -18,6 +18,38 @@ pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
+    let mut suffix = None::<String>;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "-s" | "--suffix" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Exit(129));
+                };
+                suffix = Some(value.clone());
+            }
+            value if value.starts_with("--suffix=") => {
+                suffix = Some(value["--suffix=".len()..].to_string());
+            }
+            "-h" | "--help" => {
+                println!("usage: git bugreport [-s <suffix>]");
+                return Ok(());
+            }
+            value if value.starts_with('-') => return Err(GitError::Exit(129)),
+            _ => {}
+        }
+        index += 1;
+    }
+    let file_name = match suffix {
+        Some(suffix) => format!("git-bugreport-{suffix}.txt"),
+        None => "git-bugreport.txt".to_string(),
+    };
+    fs::write(file_name, "Sley bugreport\n")?;
+    Ok(())
+}
+
 fn print_version_build_options() {
     println!("cpu: {}", std::env::consts::ARCH);
     println!("sizeof-long: {}", std::mem::size_of::<std::ffi::c_long>());

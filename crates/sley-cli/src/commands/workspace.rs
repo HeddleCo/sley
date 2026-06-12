@@ -427,6 +427,8 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
     let format = repository_object_format(&git_dir)?;
+    let checkout_old_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
+        .unwrap_or_else(|| ObjectId::null(format));
 
     if matches!(
         track,
@@ -635,6 +637,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                     subject
                 );
             }
+            run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
+            commands::hooks::run_hook(
+                "reference-transaction",
+                commands::hooks::HookRun::default(),
+            )?;
             return Ok(());
         }
         CheckoutBranchMode::Existing => {
@@ -684,6 +691,11 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
                         subject
                     );
                 }
+                run_post_checkout_hook(&checkout_old_head, &target_oid, true)?;
+                commands::hooks::run_hook(
+                    "reference-transaction",
+                    commands::hooks::HookRun::default(),
+                )?;
                 return Ok(());
             }
             CheckoutMessage::Existing {
@@ -761,9 +773,30 @@ pub(crate) fn cmd_checkout(args: &[String]) -> Result<()> {
         Err(err) => return Err(err),
     }
     sley_sequencer::replay::remove_branch_state(&git_dir);
+    let checkout_new_head = resolve_ref_peeled(&FileRefStore::new(&git_dir, format), "HEAD")?
+        .unwrap_or(checkout_old_head);
+    run_post_checkout_hook(&checkout_old_head, &checkout_new_head, true)?;
+    commands::hooks::run_hook(
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
     if !quiet {
         checkout_message.print();
     }
+    Ok(())
+}
+
+fn run_post_checkout_hook(
+    old_head: &ObjectId,
+    new_head: &ObjectId,
+    branch_checkout: bool,
+) -> Result<()> {
+    let old = old_head.to_hex();
+    let new = new_head.to_hex();
+    commands::hooks::run_hook_l(
+        "post-checkout",
+        &[old.as_str(), new.as_str(), if branch_checkout { "1" } else { "0" }],
+    )?;
     Ok(())
 }
 
@@ -1461,6 +1494,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let mut status_null = false;
     let mut null_implied_status = false;
     let mut dry_run = false;
+    let mut no_verify = false;
+    let mut no_post_rewrite = false;
     let mut interactive = false;
     let mut patch = false;
     let mut gpg_sign = false;
@@ -1701,7 +1736,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--no-date=") => {
                 return commit_option_takes_no_value_error("no-date");
             }
-            "-n" | "--no-verify" | "--verify" => {}
+            "-n" | "--no-verify" => no_verify = true,
+            "--verify" => no_verify = false,
             value if value.starts_with("--no-verify=") => {
                 return commit_option_takes_no_value_error("no-verify");
             }
@@ -1719,7 +1755,8 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
             value if value.starts_with("--no-gpg-sign=") => {
                 return commit_option_takes_no_value_error("no-gpg-sign");
             }
-            "--post-rewrite" | "--no-post-rewrite" => {}
+            "--post-rewrite" => no_post_rewrite = false,
+            "--no-post-rewrite" => no_post_rewrite = true,
             value if value.starts_with("--post-rewrite=") => {
                 return commit_option_takes_no_value_error("no-no-post-rewrite");
             }
@@ -2136,6 +2173,11 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         .filter(|enc| !encoding_is_utf8(enc))
         .map(String::into_bytes);
     let committer = commit_identity_from_env("COMMITTER")?;
+    let amended_old_oid = if amend {
+        commands::merge_rebase::head_commit_oid(&FileRefStore::new(&git_dir, format))?
+    } else {
+        None
+    };
     let amended_commit = amend
         .then(|| read_amended_commit(&git_dir, format))
         .transpose()?;
@@ -2280,8 +2322,29 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
         eprintln!("Aborting commit due to empty commit message.");
         return Err(GitError::Exit(1));
     }
-    let message = message;
-    let message = tag_message_with_trailers(message, &trailers);
+    let mut message = tag_message_with_trailers(message, &trailers);
+    if !no_verify {
+        commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())?;
+    }
+    let editmsg = git_dir.join("COMMIT_EDITMSG");
+    fs::write(&editmsg, &message)?;
+    let source = if amend {
+        "commit"
+    } else if had_message_source {
+        "message"
+    } else {
+        "template"
+    };
+    let editmsg_arg = editmsg.to_string_lossy().into_owned();
+    let mut prepare_args = vec![editmsg_arg.as_str(), source];
+    if amend {
+        prepare_args.push("HEAD");
+    }
+    commands::hooks::run_hook_l("prepare-commit-msg", &prepare_args)?;
+    if !no_verify {
+        commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
+    }
+    message = fs::read(&editmsg)?;
     if in_rebase {
         return conclude_rebase_step_via_commit(
             &git_dir,
@@ -2351,6 +2414,23 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     }?;
     if !quiet {
         println!("{}", result.oid);
+    }
+    commands::hooks::run_hook(
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
+    if amend && !no_post_rewrite
+        && let Some(old_oid) = amended_old_oid
+    {
+        commands::hooks::run_hook(
+            "post-rewrite",
+            commands::hooks::HookRun {
+                args: vec!["amend".to_string()],
+                stdin: Some(format!("{} {}\n", old_oid, result.oid).into_bytes()),
+                ..commands::hooks::HookRun::default()
+            },
+        )?;
     }
     Ok(())
 }
@@ -2464,6 +2544,7 @@ fn conclude_replay_via_commit(
     if !quiet {
         println!("{new_oid}");
     }
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
@@ -2639,6 +2720,7 @@ fn commit_partial_paths(
     if !quiet {
         println!("{new_oid}");
     }
+    commands::hooks::run_hook("post-commit", commands::hooks::HookRun::default())?;
     Ok(())
 }
 

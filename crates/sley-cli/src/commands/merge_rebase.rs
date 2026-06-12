@@ -388,6 +388,7 @@ fn merge_commit_and_advance(
     tree: ObjectId,
     message: Vec<u8>,
 ) -> Result<ObjectId> {
+    commands::hooks::run_hook("pre-merge-commit", commands::hooks::HookRun::default())?;
     let author = commit_identity_from_env("AUTHOR")?;
     let committer = commit_identity_from_env("COMMITTER")?;
     let mut db = FileObjectDatabase::from_git_dir(git_dir, format);
@@ -419,6 +420,10 @@ fn merge_commit_and_advance(
         }),
     });
     tx.commit()?;
+    commands::hooks::run_hook(
+        "reference-transaction",
+        commands::hooks::HookRun::default(),
+    )?;
     Ok(oid)
 }
 
@@ -1228,6 +1233,7 @@ pub(crate) fn cmd_merge(args: &[String]) -> Result<()> {
             format,
             &merged_oid,
         )?;
+        commands::hooks::run_hook_l("post-merge", &["0"])?;
         return Ok(());
     }
 

@@ -1044,7 +1044,7 @@ fn stage_and_commit(
     actions: &[ApplyFileAction],
     signoff: bool,
 ) -> Result<()> {
-    let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let mut index = read_repository_index(git_dir, format)?.unwrap_or(Index {
         version: 2,
         entries: Vec::new(),
@@ -1116,11 +1116,20 @@ fn create_am_commit(
 
     let author = am_author_identity(patch)?;
     let committer = commit_identity_from_env("COMMITTER")?;
-    let message = if signoff {
-        commit_message_with_signoff(patch.message.clone(), &commit_signoff_from_env()?)
+    let message_path = git_dir.join("rebase-apply").join("final-commit");
+    let message_path = if message_path.exists() {
+        message_path
     } else {
-        patch.message.clone()
+        git_dir.join("COMMIT_EDITMSG")
     };
+    fs::write(&message_path, &patch.message)?;
+    let message_arg = message_path.to_string_lossy().into_owned();
+    commands::hooks::run_hook_l("applypatch-msg", &[message_arg.as_str()])?;
+    let mut message = fs::read(&message_path)?;
+    if signoff {
+        message = commit_message_with_signoff(message, &commit_signoff_from_env()?);
+    }
+    commands::hooks::run_hook("pre-applypatch", commands::hooks::HookRun::default())?;
 
     let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let new_oid = sley_sequencer::create_commit(
@@ -1153,6 +1162,7 @@ fn create_am_commit(
     });
     tx.commit()?;
     sley_worktree::reset_index_and_worktree_to_commit(worktree_root, git_dir, format, &new_oid)?;
+    commands::hooks::run_hook("post-applypatch", commands::hooks::HookRun::default())?;
     Ok(())
 }
 
@@ -1181,7 +1191,7 @@ fn apply_three_way(
     let refs = FileRefStore::new(git_dir, format);
     let head_oid = head_commit_oid(&refs)?
         .ok_or_else(|| GitError::Command("am: HEAD disappeared mid-series".into()))?;
-    let mut db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    let db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     let head_tree = commit_tree_oid(&db, format, &head_oid)?;
     let ours_map = stash_tree_entry_map(&db, format, &head_tree)?;
 
@@ -1257,7 +1267,7 @@ fn apply_three_way(
 
     println!("Falling back to patching base and 3-way merge...");
     let (results, conflicts) = three_way_merge_trees(
-        &mut db,
+        &db,
         format,
         &base_map,
         &ours_map,

@@ -27,6 +27,7 @@ pub(crate) mod fetch_pack;
 pub(crate) mod for_each_ref;
 pub(crate) mod format_patch;
 pub(crate) mod grep;
+pub(crate) mod hooks;
 pub(crate) mod hash_object;
 pub(crate) mod hash_object_fsck;
 pub(crate) mod index;

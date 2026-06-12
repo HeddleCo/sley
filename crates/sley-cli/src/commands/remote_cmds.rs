@@ -2103,6 +2103,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
     let mut set_upstream = false;
     let mut delete = false;
     let mut force = false;
+    let mut no_verify = false;
     let mut positional = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -2111,6 +2112,8 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
             "--no-quiet" => quiet = false,
             "-f" | "--force" => force = true,
             "--no-force" => force = false,
+            "--no-verify" => no_verify = true,
+            "--verify" => no_verify = false,
             "-u" | "--set-upstream" => set_upstream = true,
             "--no-set-upstream" => set_upstream = false,
             "-d" | "--delete" => delete = true,
@@ -2160,6 +2163,7 @@ pub(crate) fn cmd_push(args: &[String]) -> Result<()> {
         quiet,
         set_upstream,
         force,
+        no_verify,
     };
     // All transports delegate the git work to `sley_remote::push`, picked purely
     // by the resolved `PushDestination`; this command keeps owning URL/repo
@@ -2195,6 +2199,7 @@ struct PushOptions {
     quiet: bool,
     set_upstream: bool,
     force: bool,
+    no_verify: bool,
 }
 
 /// Drive [`sley_remote::push`] for an already-resolved `destination` (HTTP or
@@ -2239,6 +2244,10 @@ fn run_push(
     if outcome.commands.is_empty() {
         return Ok(());
     }
+    if !options.no_verify {
+        run_pre_push_hook(git_dir, remote, refspecs, &outcome.commands)?;
+    }
+    run_local_receive_hooks(destination, &outcome.commands)?;
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
     }
@@ -2249,6 +2258,154 @@ fn run_push(
         }
     }
     Ok(())
+}
+
+fn run_local_receive_hooks(
+    destination: &sley_remote::PushDestination,
+    push_commands: &[ReceivePackCommand],
+) -> Result<()> {
+    let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        ..
+    } = destination
+    else {
+        return Ok(());
+    };
+    let stdin = push_commands
+        .iter()
+        .map(|command| format!("{} {} {}\n", command.old_id, command.new_id, command.name))
+        .collect::<String>()
+        .into_bytes();
+    let _ = commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "pre-receive",
+        commands::hooks::HookRun {
+            stdin: Some(stdin.clone()),
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
+    for command in push_commands {
+        let _ = commands::hooks::run_traditional_hook_at(
+            remote_git_dir,
+            "update",
+            commands::hooks::HookRun {
+                args: vec![
+                    command.name.clone(),
+                    command.old_id.to_string(),
+                    command.new_id.to_string(),
+                ],
+                ..commands::hooks::HookRun::default()
+            },
+        )?;
+    }
+    let _ = commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "post-receive",
+        commands::hooks::HookRun {
+            stdin: Some(stdin),
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
+    let _ = commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "post-update",
+        commands::hooks::HookRun {
+            args: push_commands
+                .iter()
+                .map(|command| command.name.clone())
+                .collect(),
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
+    let _ = commands::hooks::run_traditional_hook_at(
+        remote_git_dir,
+        "push-to-checkout",
+        commands::hooks::HookRun::default(),
+    )?;
+    Ok(())
+}
+
+fn run_pre_push_hook(
+    git_dir: &Path,
+    remote: &str,
+    refspecs: &[String],
+    push_commands: &[ReceivePackCommand],
+) -> Result<()> {
+    let url = push_resolved_url(remote).unwrap_or_else(|_| remote.to_string());
+    let stdin = pre_push_stdin(git_dir, refspecs, push_commands)?;
+    commands::hooks::run_hook(
+        "pre-push",
+        commands::hooks::HookRun {
+            args: vec![remote.to_string(), url],
+            stdin: Some(stdin.into_bytes()),
+            stdout_to_stderr: false,
+            ..commands::hooks::HookRun::default()
+        },
+    )?;
+    Ok(())
+}
+
+fn pre_push_stdin(
+    git_dir: &Path,
+    refspecs: &[String],
+    commands: &[ReceivePackCommand],
+) -> Result<String> {
+    let format = repository_object_format(git_dir)?;
+    let refs = FileRefStore::new(git_dir, format);
+    let current_branch = refs.current_branch().ok().flatten();
+    let mut out = String::new();
+    for (idx, command) in commands.iter().enumerate() {
+        let local_ref = refspecs
+            .get(idx)
+            .and_then(|refspec| pre_push_local_ref(&refs, refspec, current_branch.as_deref()))
+            .unwrap_or_else(|| command.name.clone());
+        let local_ref = if command.new_id.is_null() {
+            "(delete)".to_string()
+        } else {
+            local_ref
+        };
+        let remote_ref = if command.name == "HEAD" {
+            current_branch
+                .as_deref()
+                .map(|branch| format!("refs/heads/{branch}"))
+                .unwrap_or_else(|| command.name.clone())
+        } else {
+            command.name.clone()
+        };
+        out.push_str(&format!(
+            "{} {} {} {}\n",
+            local_ref, command.new_id, remote_ref, command.old_id
+        ));
+    }
+    Ok(out)
+}
+
+fn pre_push_local_ref(
+    refs: &FileRefStore,
+    refspec: &str,
+    current_branch: Option<&str>,
+) -> Option<String> {
+    let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+    let (src, _) = refspec.split_once(':').unwrap_or((refspec, ""));
+    if src.is_empty() {
+        return Some("(delete)".to_string());
+    }
+    if src == "HEAD" || src.contains('~') || src.contains('^') {
+        return Some(src.to_string());
+    }
+    if src.starts_with("refs/") {
+        return Some(src.to_string());
+    }
+    if Some(src) == current_branch {
+        return Some(format!("refs/heads/{src}"));
+    }
+    if let Ok(Some(_)) = refs.read_ref(&format!("refs/tags/{src}")) {
+        return Some(format!("refs/tags/{src}"));
+    }
+    if let Ok(Some(_)) = refs.read_ref(&format!("refs/heads/{src}")) {
+        return Some(format!("refs/heads/{src}"));
+    }
+    Some(src.to_string())
 }
 
 fn push_remote_is_ssh(remote: &str) -> Result<bool> {
