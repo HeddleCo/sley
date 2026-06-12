@@ -1940,6 +1940,11 @@ struct DiffPatchOptions<'a> {
     abbrev: usize,
     src_prefix: &'a str,
     dst_prefix: &'a str,
+    /// Lines of hunk context (`-U<n>`); the porcelain default is 3.
+    context: usize,
+    /// Userdiff driver resolution (`diff=<driver>` attributes + config);
+    /// `None` keeps the default funcname heuristic.
+    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
 }
 
 fn write_diff_patch_entry(
@@ -2028,12 +2033,42 @@ fn write_diff_patch_entry(
             writeln!(stdout, "+++ {header_path}")?;
         }
     }
-    // Context-3 hunks with git's section headings (shared with format-patch).
+    // Hunks with git's section headings (shared with format-patch). The
+    // funcname pattern comes from the old side's driver, then the new side's,
+    // mirroring diff_funcname_pattern(one) ?: diff_funcname_pattern(two).
+    let driver = match options.userdiff {
+        Some(resolver) => {
+            let old_side = resolver.driver_for_path(old_path)?;
+            if old_side
+                .as_ref()
+                .is_some_and(|driver| driver.funcname.is_some())
+            {
+                old_side
+            } else {
+                let new_side = resolver.driver_for_path(&entry.path)?;
+                if new_side
+                    .as_ref()
+                    .is_some_and(|driver| driver.funcname.is_some())
+                {
+                    new_side
+                } else {
+                    old_side
+                }
+            }
+        }
+        None => None,
+    };
+    let hunk_options = commands::format_patch::PatchHunkOptions {
+        context: options.context,
+        funcname: driver.as_ref().and_then(|driver| driver.funcname.as_ref()),
+        ..Default::default()
+    };
     let mut hunks = Vec::new();
-    commands::format_patch::write_patch_hunks(
+    commands::format_patch::write_patch_hunks_with(
         &mut hunks,
         old_content.as_deref(),
         new_content.as_deref(),
+        &hunk_options,
     );
     stdout.write_all(&hunks)?;
     Ok(())

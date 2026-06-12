@@ -845,6 +845,8 @@ fn run_diff_request(
                 abbrev: context.patch_abbrev,
                 src_prefix: &context.options.src_prefix,
                 dst_prefix: &context.options.dst_prefix,
+                context: 3,
+                userdiff: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

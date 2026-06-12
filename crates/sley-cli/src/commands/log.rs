@@ -2412,6 +2412,8 @@ impl LogDiffContext<'_> {
                         abbrev: self.patch_abbrev,
                         src_prefix: "a/",
                         dst_prefix: "b/",
+                        context: 3,
+                        userdiff: None,
                     },
                 )?;
             }

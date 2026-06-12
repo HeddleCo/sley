@@ -56,6 +56,7 @@ pub(crate) mod stash;
 pub(crate) mod submodule;
 pub(crate) mod tag;
 pub(crate) mod trees;
+pub(crate) mod userdiff;
 pub(crate) mod utility;
 pub(crate) mod verify_commit;
 pub(crate) mod verify_tag;

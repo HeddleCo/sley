@@ -102,6 +102,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut dirstat_cli_params: Vec<String> = Vec::new();
     let mut patch = false;
     let mut no_patch = false;
+    // `-U<n>` / `--unified=<n>` hunk context; None keeps the default of 3.
+    let mut context: Option<usize> = None;
     let mut reverse = false;
     let mut pickaxe = None;
     let mut pickaxe_all = false;
@@ -239,6 +241,29 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = false;
             }
             "-p" | "-u" | "--patch" => {
+                patch = true;
+                no_patch = false;
+            }
+            "-U" | "--unified" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("unified"))?;
+                commit_validate_unified_context(value, arg == "-U")?;
+                context = Some(parse_unified_count(value));
+                patch = true;
+                no_patch = false;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value
+                if let Some(value) = value
+                    .strip_prefix("--unified=")
+                    .or_else(|| value.strip_prefix("-U")) =>
+            {
+                commit_validate_unified_context(value, !arg.starts_with("--"))?;
+                context = Some(parse_unified_count(value));
                 patch = true;
                 no_patch = false;
             }
@@ -1058,6 +1083,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .collect()
     };
     let has_differences = !entries.is_empty();
+    // Userdiff driver resolution (`diff=<driver>` attributes + `diff.<name>.*`
+    // config) for hunk headings. Attributes always come from the real
+    // worktree, even when the content comparison is `--cached`.
+    let userdiff = commands::userdiff::UserdiffResolver::new(
+        worktree_root_for_git_dir(&git_dir).ok(),
+        read_repo_config(&git_dir).ok(),
+    );
     if !quiet && !no_patch {
         let mut stdout = io::stdout();
         let show_raw = raw && !name_only && !name_status;
@@ -1175,6 +1207,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     abbrev: patch_abbrev,
                     src_prefix: &src_prefix,
                     dst_prefix: &dst_prefix,
+                    context: context.unwrap_or(3),
+                    userdiff: Some(&userdiff),
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1470,6 +1504,26 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
     // the prefix happens to end on a path-component boundary.
     path.strip_prefix(prefix)
         .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
+}
+
+/// Parse a validated `-U` / `--unified` count: digits with an optional
+/// k/m/g (1024-based) suffix, clamped at zero for negative values.
+fn parse_unified_count(value: &str) -> usize {
+    let (number, multiplier) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    if let Some(digits) = number.strip_prefix('-') {
+        let _ = digits;
+        return 0;
+    }
+    let digits = number.strip_prefix('+').unwrap_or(number);
+    digits
+        .parse::<usize>()
+        .unwrap_or(0)
+        .saturating_mul(multiplier)
 }
 
 fn log_validate_word_diff(value: &str) -> Result<()> {

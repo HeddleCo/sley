@@ -835,6 +835,27 @@ struct TaggedLine<'a> {
     new_index: usize,
 }
 
+/// Options for [`write_patch_hunks_with`]: hunk shaping and heading lookup.
+pub(crate) struct PatchHunkOptions<'a> {
+    /// Lines of context around each change (`-U<n>`, default 3).
+    pub(crate) context: usize,
+    /// Extra inter-hunk merging distance (`--inter-hunk-context`).
+    pub(crate) interhunk: usize,
+    /// Compiled userdiff funcname patterns for the path; `None` selects the
+    /// default `def_ff` heuristic.
+    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+}
+
+impl Default for PatchHunkOptions<'_> {
+    fn default() -> Self {
+        Self {
+            context: HUNK_CONTEXT,
+            interhunk: 0,
+            funcname: None,
+        }
+    }
+}
+
 /// Emit the unified-diff hunks for a single file change into `out`, grouping
 /// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
 /// groups), and prefixing each `@@` header with git's default section heading.
@@ -842,6 +863,16 @@ pub(crate) fn write_patch_hunks(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
+) {
+    write_patch_hunks_with(out, old_content, new_content, &PatchHunkOptions::default());
+}
+
+/// [`write_patch_hunks`] with explicit hunk shaping options.
+pub(crate) fn write_patch_hunks_with(
+    out: &mut Vec<u8>,
+    old_content: Option<&[u8]>,
+    new_content: Option<&[u8]>,
+    options: &PatchHunkOptions<'_>,
 ) {
     let old = sley_diff_merge::split_lines(old_content.unwrap_or_default());
     let new = sley_diff_merge::split_lines(new_content.unwrap_or_default());
@@ -907,9 +938,9 @@ pub(crate) fn write_patch_hunks(
     let mut group_start = change_positions[0];
     let mut group_end = change_positions[0];
     for &pos in &change_positions[1..] {
-        // Two change runs merge when at most 2*HUNK_CONTEXT context lines
-        // separate them (so their context windows touch or overlap).
-        if pos - group_end <= 2 * HUNK_CONTEXT {
+        // Two change runs merge when at most 2*context (+ interhunk) context
+        // lines separate them (so their context windows touch or overlap).
+        if pos - group_end <= 2 * options.context + options.interhunk {
             group_end = pos;
         } else {
             groups.push((group_start, group_end));
@@ -920,9 +951,9 @@ pub(crate) fn write_patch_hunks(
     groups.push((group_start, group_end));
 
     for (first_change, last_change) in groups {
-        let hunk_start = first_change.saturating_sub(HUNK_CONTEXT);
-        let hunk_end = (last_change + HUNK_CONTEXT + 1).min(tagged.len());
-        write_one_hunk(out, &tagged, &old, hunk_start, hunk_end);
+        let hunk_start = first_change.saturating_sub(options.context);
+        let hunk_end = (last_change + options.context + 1).min(tagged.len());
+        write_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
     }
 }
 
@@ -935,6 +966,7 @@ fn write_one_hunk(
     old_lines: &[sley_diff_merge::DiffLine<'_>],
     start: usize,
     end: usize,
+    options: &PatchHunkOptions<'_>,
 ) {
     let slice = &tagged[start..end];
     let mut old_count = 0usize;
@@ -969,7 +1001,11 @@ fn write_one_hunk(
             .unwrap_or(1)
     };
 
-    let heading = hunk_section_heading(old_lines, slice.first().map(|line| line.old_index));
+    let heading = hunk_section_heading(
+        old_lines,
+        slice.first().map(|line| line.old_index),
+        options.funcname,
+    );
     out.extend_from_slice(b"@@ -");
     out.extend_from_slice(format_hunk_range(old_start, old_count).as_bytes());
     out.extend_from_slice(b" +");
@@ -977,7 +1013,7 @@ fn write_one_hunk(
     out.extend_from_slice(b" @@");
     if let Some(heading) = heading {
         out.push(b' ');
-        out.extend_from_slice(heading);
+        out.extend_from_slice(&heading);
     }
     out.push(b'\n');
 
@@ -1001,28 +1037,29 @@ fn format_hunk_range(start: usize, count: usize) -> String {
     }
 }
 
-/// git's default section heading for a hunk: the nearest line *before* the
-/// hunk's first line whose first byte looks like the start of a function (an
-/// ASCII letter, `_`, or `$`), returned without its trailing newline. Returns
-/// `None` when no such line precedes the hunk.
-fn hunk_section_heading<'a>(
-    old_lines: &[sley_diff_merge::DiffLine<'a>],
+/// git's section heading for a hunk: the nearest line *before* the hunk's
+/// first line accepted by the path's funcname patterns (or, without a driver,
+/// the default `def_ff` heuristic: first byte is an ASCII letter, `_`, or
+/// `$`). Headings are capped at the 80-byte upstream header buffer with
+/// trailing whitespace trimmed. Returns `None` when no such line precedes the
+/// hunk.
+fn hunk_section_heading(
+    old_lines: &[sley_diff_merge::DiffLine<'_>],
     first_old_index: Option<usize>,
-) -> Option<&'a [u8]> {
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
+) -> Option<Vec<u8>> {
     let first = first_old_index?;
     // Scan upward from the line just above the hunk.
     for idx in (0..first).rev() {
-        let line = old_lines[idx].bytes_without_newline();
-        if line.first().is_some_and(is_funcname_start) {
-            return Some(line);
+        let heading = match funcname {
+            Some(funcname) => funcname.match_line(old_lines[idx].content),
+            None => commands::userdiff::default_funcname_heading(old_lines[idx].content),
+        };
+        if heading.is_some() {
+            return heading;
         }
     }
     None
-}
-
-/// Whether `byte` can begin a git default-funcname section heading line.
-fn is_funcname_start(byte: &u8) -> bool {
-    byte.is_ascii_alphabetic() || *byte == b'_' || *byte == b'$'
 }
 
 /// Write a single diff line with its `prefix` marker, appending the
