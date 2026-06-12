@@ -24,15 +24,16 @@ use std::collections::HashMap;
 use std::env;
 use std::io::Read;
 use std::path::Path;
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
 
 use sley_core::{Capability, GitError, ObjectFormat, ObjectId, Result};
 use sley_fetch::{install_upload_pack_raw_promisor_response, install_upload_pack_raw_response};
 use sley_odb::{FileObjectDatabase, build_reachable_pack, collect_reachable_object_ids};
 use sley_protocol::{
-    GitService, ProtocolV2FetchShallowInfo, ReceivePackPushRequestOptions, RefAdvertisement,
-    UploadPackFeatures, UploadPackNegotiationRequest, UploadPackRawPackfileResponse,
-    UploadPackRequest, build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
+    GitService, ProtocolV2FetchShallowInfo, ReceivePackCommand, ReceivePackFeatures,
+    ReceivePackPushRequestOptions, RefAdvertisement, UploadPackFeatures,
+    UploadPackNegotiationRequest, UploadPackRawPackfileResponse, UploadPackRequest,
+    build_receive_pack_push_request, parse_receive_pack_features, parse_refspec,
     parse_upload_pack_features, plan_push_commands, read_receive_pack_report_status,
     read_ref_advertisement_set, read_upload_pack_raw_packfile_response,
     read_upload_pack_shallow_info_and_raw_packfile_response, write_receive_pack_push_request,
@@ -41,7 +42,7 @@ use sley_protocol::{
 use sley_refs::FileRefStore;
 use sley_transport::{RemoteTransport, RemoteUrl, SshCommandVariant, ssh_process_command};
 
-use crate::PushOutcome;
+use crate::{PushOutcome, PushRequest};
 
 /// The `ssh` program to spawn for SSH transport: the `GIT_SSH` environment
 /// variable when set, otherwise `ssh`. This mirrors git's basic `GIT_SSH`
@@ -67,18 +68,26 @@ pub(crate) struct SshPushRequest<'a> {
     pub format: ObjectFormat,
     pub remote: &'a RemoteUrl,
     pub refspecs: &'a [String],
-    pub quiet: bool,
     pub force: bool,
 }
 
-pub(crate) fn push_ssh(request: SshPushRequest<'_>) -> Result<PushOutcome> {
+pub(crate) struct SshPushPlan {
+    pub(crate) commands: Vec<ReceivePackCommand>,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    stdout: ChildStdout,
+    features: ReceivePackFeatures,
+    advertisements: Vec<RefAdvertisement>,
+    remote: RemoteUrl,
+}
+
+pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> {
     let SshPushRequest {
         git_dir,
         common_git_dir,
         format,
         remote,
         refspecs,
-        quiet,
         force,
     } = request;
     if remote.transport != RemoteTransport::Ssh {
@@ -102,7 +111,7 @@ pub(crate) fn push_ssh(request: SshPushRequest<'_>) -> Result<PushOutcome> {
         .stdout
         .take()
         .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
@@ -152,53 +161,86 @@ pub(crate) fn push_ssh(request: SshPushRequest<'_>) -> Result<PushOutcome> {
         .collect::<Vec<_>>();
     if commands.is_empty() {
         drop(stdin);
-        let _ = child.wait_with_output()?;
-        return Ok(PushOutcome::default());
+        return Ok(SshPushPlan {
+            commands,
+            child,
+            stdin: None,
+            stdout,
+            features,
+            advertisements: advertisement_set.refs,
+            remote: remote.clone(),
+        });
     }
 
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    Ok(SshPushPlan {
+        commands,
+        child,
+        stdin: Some(stdin),
+        stdout,
+        features,
+        advertisements: advertisement_set.refs,
+        remote: remote.clone(),
+    })
+}
+
+pub(crate) fn execute_push_ssh_plan(
+    request: PushRequest<'_>,
+    mut plan: SshPushPlan,
+) -> Result<PushOutcome> {
+    if plan.commands.is_empty() {
+        return Ok(PushOutcome::default());
+    }
+    let mut stdin = plan
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not available".into()))?;
+    let commands = plan.commands.clone();
+    let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let remote_excluded_tips =
-        crate::remote_advertisement_tips_known_to_local(&local_db, &advertisement_set.refs)?;
-    let remote_excluded = collect_reachable_object_ids(&local_db, format, remote_excluded_tips)?;
+        crate::remote_advertisement_tips_known_to_local(&local_db, &plan.advertisements)?;
+    let remote_excluded =
+        collect_reachable_object_ids(&local_db, request.format, remote_excluded_tips)?;
     let starts = commands
         .iter()
         .filter(|command| !command.new_id.is_null())
         .map(|command| command.new_id.clone());
-    let packfile = build_reachable_pack(&local_db, format, starts, &remote_excluded)?
+    let packfile = build_reachable_pack(&local_db, request.format, starts, &remote_excluded)?
         .map(|pack| pack.pack)
         .unwrap_or_default();
     let request = build_receive_pack_push_request(
-        &features,
+        &plan.features,
         commands.clone(),
         packfile,
         ReceivePackPushRequestOptions {
-            report_status: features.report_status,
-            ofs_delta: features.ofs_delta,
-            quiet: quiet && features.quiet,
-            object_format: features
+            report_status: plan.features.report_status,
+            ofs_delta: plan.features.ofs_delta,
+            quiet: request.options.quiet && plan.features.quiet,
+            object_format: plan
+                .features
                 .object_format
-                .filter(|_| format != ObjectFormat::Sha1),
+                .filter(|_| request.format != ObjectFormat::Sha1),
             ..ReceivePackPushRequestOptions::default()
         },
     )?;
     write_receive_pack_push_request(&mut stdin, &request)?;
     drop(stdin);
 
-    let report = if features.report_status {
-        let report = read_receive_pack_report_status(&mut stdout)?;
+    let report = if plan.features.report_status {
+        let report = read_receive_pack_report_status(&mut plan.stdout)?;
         crate::push::validate_receive_pack_report(&report)?;
         Some(report)
     } else {
         let mut sink = Vec::new();
-        stdout.read_to_end(&mut sink)?;
+        plan.stdout.read_to_end(&mut sink)?;
         None
     };
-    let output = child.wait_with_output()?;
+    let output = plan.child.wait_with_output()?;
     if !output.status.success() {
         return Err(GitError::Command(format!(
             "ssh receive-pack failed for {}: {}",
-            ssh_remote_display(remote),
+            ssh_remote_display(&plan.remote),
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }

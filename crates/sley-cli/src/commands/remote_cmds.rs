@@ -2225,29 +2225,30 @@ fn run_push(
         quiet: options.quiet,
         force: options.force,
     };
-    let outcome = sley_remote::push(
-        sley_remote::PushRequest {
-            git_dir,
-            common_git_dir,
-            format,
-            config: &config,
-            remote,
-            destination,
-            refspecs,
-            options: &remote_options,
-        },
-        sley_remote::PushServices {
-            credentials: &mut credentials,
-            progress: &mut progress,
-        },
-    )?;
-    if outcome.commands.is_empty() {
+    let request = sley_remote::PushRequest {
+        git_dir,
+        common_git_dir,
+        format,
+        config: &config,
+        remote,
+        destination,
+        refspecs,
+        options: &remote_options,
+    };
+    let mut services = sley_remote::PushServices {
+        credentials: &mut credentials,
+        progress: &mut progress,
+    };
+    let plan = sley_remote::plan_push(request, &mut services)?;
+    if plan.commands.is_empty() {
         return Ok(());
     }
     if !options.no_verify {
-        run_pre_push_hook(git_dir, remote, refspecs, &outcome.commands)?;
+        run_pre_push_hook(git_dir, remote, refspecs, &plan.commands)?;
     }
-    run_local_receive_hooks(destination, &outcome.commands)?;
+    run_local_receive_pre_hooks(destination, &plan.commands)?;
+    let outcome = sley_remote::execute_push_plan(request, &mut services, plan)?;
+    run_local_receive_post_hooks(destination, &outcome.commands)?;
     if options.set_upstream {
         configure_push_upstreams(git_dir, remote, &outcome.commands)?;
     }
@@ -2260,7 +2261,7 @@ fn run_push(
     Ok(())
 }
 
-fn run_local_receive_hooks(
+fn run_local_receive_pre_hooks(
     destination: &sley_remote::PushDestination,
     push_commands: &[ReceivePackCommand],
 ) -> Result<()> {
@@ -2271,16 +2272,12 @@ fn run_local_receive_hooks(
     else {
         return Ok(());
     };
-    let stdin = push_commands
-        .iter()
-        .map(|command| format!("{} {} {}\n", command.old_id, command.new_id, command.name))
-        .collect::<String>()
-        .into_bytes();
+    let stdin = receive_hook_stdin(push_commands);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "pre-receive",
         commands::hooks::HookRun {
-            stdin: Some(stdin.clone()),
+            stdin: Some(stdin),
             ..commands::hooks::HookRun::default()
         },
     )?;
@@ -2298,6 +2295,21 @@ fn run_local_receive_hooks(
             },
         )?;
     }
+    Ok(())
+}
+
+fn run_local_receive_post_hooks(
+    destination: &sley_remote::PushDestination,
+    push_commands: &[ReceivePackCommand],
+) -> Result<()> {
+    let sley_remote::PushDestination::Local {
+        git_dir: remote_git_dir,
+        ..
+    } = destination
+    else {
+        return Ok(());
+    };
+    let stdin = receive_hook_stdin(push_commands);
     let _ = commands::hooks::run_traditional_hook_at(
         remote_git_dir,
         "post-receive",
@@ -2323,6 +2335,14 @@ fn run_local_receive_hooks(
         commands::hooks::HookRun::default(),
     )?;
     Ok(())
+}
+
+fn receive_hook_stdin(push_commands: &[ReceivePackCommand]) -> Vec<u8> {
+    push_commands
+        .iter()
+        .map(|command| format!("{} {} {}\n", command.old_id, command.new_id, command.name))
+        .collect::<String>()
+        .into_bytes()
 }
 
 fn run_pre_push_hook(

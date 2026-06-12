@@ -178,6 +178,16 @@ fn fake_ssh_script(root: &Path) -> PathBuf {
     script
 }
 
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("stat executable").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod executable");
+    }
+}
+
 fn loose_object_path(git_dir: &Path, oid: &str) -> PathBuf {
     git_dir.join("objects").join(&oid[..2]).join(&oid[2..])
 }
@@ -813,6 +823,91 @@ fn push_local_branch_to_bare_repo_matches_upstream_ref_and_objects() {
         &["cat-file", "-e", "refs/heads/main^{tree}"],
     );
     assert_remote_stored_pushed_objects_in_pack(&remote);
+}
+
+#[test]
+fn failing_pre_push_hook_leaves_remote_ref_unchanged_and_runs_at_worktree_root() {
+    let root = unique_temp_dir("push-pre-push-fails-before-ref-update");
+    fs::create_dir_all(&root).expect("create temp root");
+    let work = root.join("work");
+    let remote = root.join("remote.git");
+    fs::create_dir_all(&work).expect("create work");
+    fs::create_dir_all(&remote).expect("create remote");
+    create_work_repo(&work, None);
+    create_bare_repo(&remote, None);
+
+    let remote_arg = remote.to_string_lossy();
+    run_success(env!("CARGO_BIN_EXE_sley"), &work, &["push", "-q", &remote_arg, "main"]);
+    let old_remote_head = run_success(
+        sley_testkit::oracle_git(),
+        &remote,
+        &["rev-parse", "refs/heads/main"],
+    );
+
+    fs::write(work.join("payload.txt"), b"blocked by pre-push\n").expect("write update");
+    run_success(sley_testkit::oracle_git(), &work, &["add", "payload.txt"]);
+    run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &[
+            "-c",
+            "user.name=Example User",
+            "-c",
+            "user.email=example@example.invalid",
+            "commit",
+            "-m",
+            "blocked update",
+            "-q",
+        ],
+    );
+    let local_head = run_success(
+        sley_testkit::oracle_git(),
+        &work,
+        &["rev-parse", "refs/heads/main"],
+    );
+    assert_ne!(local_head, old_remote_head);
+
+    let hooks_dir = work.join(".git").join("hooks");
+    fs::create_dir_all(&hooks_dir).expect("create hooks dir");
+    let hook = hooks_dir.join("pre-push");
+    fs::write(&hook, b"#!/bin/sh\npwd >hook.cwd\nexit 12\n").expect("write pre-push");
+    make_executable(&hook);
+
+    let subdir = work.join("subdir");
+    fs::create_dir_all(&subdir).expect("create subdir");
+    let output = run(
+        env!("CARGO_BIN_EXE_sley"),
+        &subdir,
+        &["push", "-q", &remote_arg, "main"],
+    );
+    assert!(
+        !output.status.success(),
+        "failing pre-push should abort push\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "hook failures should be normalized to exit 1"
+    );
+    assert_eq!(
+        run_success(
+            sley_testkit::oracle_git(),
+            &remote,
+            &["rev-parse", "refs/heads/main"]
+        ),
+        old_remote_head,
+        "remote ref must be unchanged when pre-push fails"
+    );
+    let hook_cwd = fs::read_to_string(work.join("hook.cwd")).expect("read hook cwd");
+    assert_eq!(
+        fs::canonicalize(hook_cwd.trim()).expect("canonical hook cwd"),
+        fs::canonicalize(&work).expect("canonical worktree root"),
+        "pre-push should run from the worktree root"
+    );
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

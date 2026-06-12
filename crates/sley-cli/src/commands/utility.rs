@@ -19,7 +19,8 @@ pub(crate) fn cmd_version(args: &[String]) -> Result<()> {
 }
 
 pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
-    let mut suffix = None::<String>;
+    let mut suffix = Some("report".to_string());
+    let mut output_dir = PathBuf::new();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -33,12 +34,27 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
             value if value.starts_with("--suffix=") => {
                 suffix = Some(value["--suffix=".len()..].to_string());
             }
+            "--no-suffix" => {
+                suffix = None;
+            }
+            "-o" | "--output-directory" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return Err(GitError::Exit(129));
+                };
+                output_dir = PathBuf::from(value);
+            }
+            value if value.starts_with("--output-directory=") => {
+                output_dir = PathBuf::from(&value["--output-directory=".len()..]);
+            }
             "-h" | "--help" => {
-                println!("usage: git bugreport [-s <suffix>]");
+                println!(
+                    "usage: git bugreport [(-o | --output-directory) <path>] [(-s | --suffix) <format> | --no-suffix]"
+                );
                 return Ok(());
             }
-            value if value.starts_with('-') => return Err(GitError::Exit(129)),
-            _ => {}
+            value if value.starts_with('-') => return bugreport_usage_error(None),
+            value => return bugreport_usage_error(Some(value)),
         }
         index += 1;
     }
@@ -46,8 +62,68 @@ pub(crate) fn cmd_bugreport(args: &[String]) -> Result<()> {
         Some(suffix) => format!("git-bugreport-{suffix}.txt"),
         None => "git-bugreport.txt".to_string(),
     };
-    fs::write(file_name, "Sley bugreport\n")?;
+    if !output_dir.as_os_str().is_empty() {
+        fs::create_dir_all(&output_dir)?;
+    }
+    let path = output_dir.join(file_name);
+    let mut report = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    report.write_all(b"Thank you for filling out a Git bug report!\n")?;
+    report
+        .write_all(b"Please answer the following questions to help us understand your issue.\n")?;
+    report.write_all(b"\n")?;
+    report
+        .write_all(b"What did you do before the bug happened? (Steps to reproduce your issue)\n")?;
+    report.write_all(b"\n")?;
+    report.write_all(b"What did you expect to happen? (Expected behavior)\n")?;
+    report.write_all(b"\n")?;
+    report.write_all(b"What happened instead? (Actual behavior)\n")?;
+    report.write_all(b"\n")?;
+    report
+        .write_all(b"What's different between what you expected and what actually happened?\n")?;
+    report.write_all(b"\n")?;
+    report.write_all(b"Anything else you want to add:\n")?;
+    report.write_all(b"\n")?;
+    report.write_all(b"Please review the rest of the bug report below.\n")?;
+    report.write_all(b"You can delete any lines you don't wish to share.\n")?;
+    report.write_all(b"\n")?;
+    report.write_all(b"\n\n[System Info]\n")?;
+    writeln!(
+        report,
+        "git version {}",
+        sley_core::UPSTREAM_GIT_COMPAT_VERSION
+    )?;
+    writeln!(report, "shell-path: /bin/sh")?;
+    writeln!(report, "uname: {} {}", env::consts::OS, env::consts::ARCH)?;
+    writeln!(report, "compiler info: rustc")?;
+    writeln!(report, "zlib: available")?;
+    report.write_all(b"\n\n[Enabled Hooks]\n")?;
+    match discover_git_dir(env::current_dir()?) {
+        Ok(_) => {
+            for hook in commands::hooks::KNOWN_HOOKS {
+                if commands::hooks::hook_exists(hook)? {
+                    writeln!(report, "{hook}")?;
+                }
+            }
+        }
+        Err(_) => {
+            report.write_all(b"not run from a git repository - no hooks to show\n")?;
+        }
+    }
+    eprintln!("Created new report at '{}'.", path.display());
     Ok(())
+}
+
+fn bugreport_usage_error(arg: Option<&str>) -> Result<()> {
+    if let Some(arg) = arg {
+        eprintln!("error: unknown argument `{arg}`");
+    }
+    eprintln!(
+        "usage: git bugreport [(-o | --output-directory) <path>] [(-s | --suffix) <format> | --no-suffix]"
+    );
+    Err(GitError::Exit(129))
 }
 
 fn print_version_build_options() {

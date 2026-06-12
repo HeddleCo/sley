@@ -22,6 +22,8 @@ pub(crate) struct HookRun {
     pub(crate) stdin: Option<Vec<u8>>,
     pub(crate) stdout_to_stderr: bool,
     pub(crate) error_if_missing: bool,
+    pub(crate) cwd: Option<PathBuf>,
+    pub(crate) normalize_failure: bool,
 }
 
 impl Default for HookRun {
@@ -31,11 +33,13 @@ impl Default for HookRun {
             stdin: None,
             stdout_to_stderr: true,
             error_if_missing: false,
+            cwd: None,
+            normalize_failure: true,
         }
     }
 }
 
-const KNOWN_HOOKS: &[&str] = &[
+pub(crate) const KNOWN_HOOKS: &[&str] = &[
     "applypatch-msg",
     "commit-msg",
     "fsmonitor-watchman",
@@ -88,7 +92,7 @@ pub(crate) fn run_hook(hook_name: &str, options: HookRun) -> Result<bool> {
     for hook in runnable {
         let status = spawn_hook(&hook, &options)?;
         if !status.success() {
-            return Err(GitError::Exit(status.code().unwrap_or(1)));
+            return Err(GitError::Exit(hook_failure_code(status.code(), &options)));
         }
     }
     Ok(true)
@@ -104,6 +108,12 @@ pub(crate) fn run_hook_l(hook_name: &str, args: &[&str]) -> Result<bool> {
     )
 }
 
+pub(crate) fn hook_exists(hook_name: &str) -> Result<bool> {
+    Ok(list_hook_commands(hook_name)?
+        .into_iter()
+        .any(|hook| !matches!(hook, HookCommand::Configured { disabled: true, .. })))
+}
+
 pub(crate) fn run_traditional_hook_at(
     git_dir: &Path,
     hook_name: &str,
@@ -114,9 +124,13 @@ pub(crate) fn run_traditional_hook_at(
     if !is_executable_file(&path) {
         return Ok(false);
     }
+    let mut options = options;
+    if options.cwd.is_none() {
+        options.cwd = Some(hook_cwd_for_git_dir(git_dir)?);
+    }
     let status = spawn_hook(&HookCommand::Traditional(path), &options)?;
     if !status.success() {
-        return Err(GitError::Exit(status.code().unwrap_or(1)));
+        return Err(GitError::Exit(hook_failure_code(status.code(), &options)));
     }
     Ok(true)
 }
@@ -250,6 +264,8 @@ fn cmd_hook_run(args: &[String]) -> Result<()> {
             stdin,
             stdout_to_stderr: true,
             error_if_missing: !ignore_missing,
+            cwd: None,
+            normalize_failure: false,
         },
     )?;
     Ok(())
@@ -268,9 +284,10 @@ fn list_hook_commands(hook_name: &str) -> Result<Vec<HookCommand>> {
 }
 
 fn hook_config() -> Vec<ScopedSection> {
-    let common_git_dir = discover_git_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .ok()
-        .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir).ok());
+    let common_git_dir =
+        discover_git_dir(env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+            .ok()
+            .and_then(|git_dir| common_git_dir_for_git_dir(&git_dir).ok());
     let context = sley_config::ConfigIncludeContext::new(common_git_dir.clone(), None);
     let mut out = Vec::new();
     if let Ok(config) = sley_config::load_pre_dispatch_config(None, &context) {
@@ -353,7 +370,11 @@ fn configured_hooks(config: &[ScopedSection], hook_name: &str) -> Result<Vec<Hoo
             } else if entry.key.eq_ignore_ascii_case("enabled") {
                 let pos = state_for(&mut states, name);
                 let state = &mut states[pos].1;
-                match entry.value.as_deref().and_then(sley_config::parse_config_bool) {
+                match entry
+                    .value
+                    .as_deref()
+                    .and_then(sley_config::parse_config_bool)
+                {
                     Some(false) => state.disabled = true,
                     Some(true) => state.disabled = false,
                     None => {}
@@ -410,6 +431,9 @@ fn find_hook(config: &[ScopedSection], hook_name: &str) -> Result<Option<PathBuf
     let path = hook_dir.join(hook_name);
     if is_executable_file(&path) {
         Ok(Some(path))
+    } else if path.is_file() {
+        advise_ignored_hook(&path, config);
+        Ok(None)
     } else {
         Ok(None)
     }
@@ -451,6 +475,40 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+fn hook_failure_code(code: Option<i32>, options: &HookRun) -> i32 {
+    if options.normalize_failure {
+        1
+    } else {
+        code.unwrap_or(1)
+    }
+}
+
+fn advise_ignored_hook(path: &Path, config: &[ScopedSection]) {
+    let advice_enabled = scoped_config_get(config, "advice", None, "ignoredHook")
+        .and_then(|value| sley_config::parse_config_bool(&value))
+        .unwrap_or(true);
+    if !advice_enabled {
+        return;
+    }
+    eprintln!(
+        "hint: The '{}' hook was ignored because it's not set as executable.",
+        path.display()
+    );
+    eprintln!("hint: You can disable this warning with `git config advice.ignoredHook false`.");
+}
+
+fn default_hook_cwd() -> Option<PathBuf> {
+    let git_dir = discover_git_dir(env::current_dir().ok()?).ok()?;
+    hook_cwd_for_git_dir(&git_dir).ok()
+}
+
+fn hook_cwd_for_git_dir(git_dir: &Path) -> Result<PathBuf> {
+    match worktree_root_for_git_dir(git_dir) {
+        Ok(root) => Ok(root),
+        Err(_) => Ok(git_dir.to_path_buf()),
+    }
+}
+
 fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::ExitStatus> {
     let mut command = match hook {
         HookCommand::Traditional(path) => Command::new(path),
@@ -460,6 +518,9 @@ fn spawn_hook(hook: &HookCommand, options: &HookRun) -> Result<std::process::Exi
             cmd
         }
     };
+    if let Some(cwd) = options.cwd.clone().or_else(default_hook_cwd) {
+        command.current_dir(cwd);
+    }
     command.args(&options.args);
     if options.stdin.is_some() {
         command.stdin(Stdio::piped());
@@ -500,12 +561,16 @@ impl HookCommand {
 }
 
 fn hook_usage() {
-    eprintln!("usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]");
+    eprintln!(
+        "usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]"
+    );
     eprintln!("   or: git hook list [--allow-unknown-hook-name] [-z] [--show-scope] <hook-name>");
 }
 
 fn hook_run_usage() {
-    eprintln!("usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]");
+    eprintln!(
+        "usage: git hook run [--allow-unknown-hook-name] [--ignore-missing] [--to-stdin=<path>] <hook-name> [-- <hook-args>]"
+    );
 }
 
 fn hook_list_usage() {

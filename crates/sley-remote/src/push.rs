@@ -104,6 +104,7 @@ pub struct PushOutcome {
 }
 
 /// Fully resolved inputs for a [`push`] run.
+#[derive(Clone, Copy)]
 pub struct PushRequest<'a> {
     /// Local repository `$GIT_DIR`.
     pub git_dir: &'a Path,
@@ -131,6 +132,32 @@ pub struct PushServices<'a> {
     pub progress: &'a mut dyn ProgressSink,
 }
 
+/// A push after ref negotiation and command planning, but before any ref update
+/// is sent or applied.
+pub struct PushPlan {
+    /// The receive-pack commands that will be executed if the caller proceeds.
+    pub commands: Vec<ReceivePackCommand>,
+    execution: PushExecution,
+}
+
+enum PushExecution {
+    Noop,
+    #[cfg(feature = "http")]
+    Http {
+        remote_url: RemoteUrl,
+        features: ReceivePackFeatures,
+        advertisements: Vec<RefAdvertisement>,
+        command_forces: Vec<(ReceivePackCommand, bool)>,
+    },
+    Ssh(crate::ssh::SshPushPlan),
+    Local {
+        remote_git_dir: PathBuf,
+        remote_common_git_dir: PathBuf,
+        remote_refs: Vec<RefAdvertisement>,
+        command_forces: Vec<(ReceivePackCommand, bool)>,
+    },
+}
+
 /// Push `refspecs` to a resolved `destination` from the repository at `git_dir`.
 ///
 /// Performs the work the CLI's `push_http_repository`/`push_local_repository`
@@ -145,15 +172,23 @@ pub struct PushServices<'a> {
 /// `GitError::Exit`. A still-`None` report in the outcome means the remote did
 /// not advertise `report-status`. Set-upstream config and the "To <remote>"
 /// summary are the caller's job, driven from [`PushOutcome::commands`].
-pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<PushOutcome> {
+pub fn push(request: PushRequest<'_>, mut services: PushServices<'_>) -> Result<PushOutcome> {
+    let plan = plan_push(request, &mut services)?;
+    execute_push_plan(request, &mut services, plan)
+}
+
+/// Negotiate with the remote and compute the receive-pack command list without
+/// sending a pack or applying a ref update.
+pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> Result<PushPlan> {
     // `config` and `progress` are part of the seam (mirroring `fetch`) but the
     // current push flow drives credentials from the caller-built provider and
     // returns its summary in `PushOutcome` rather than streaming progress, so
     // neither is consumed yet. Kept named for the public API and future use.
-    let _ = (request.config, services.progress);
+    let _ = request.config;
+    let _ = &mut services.progress;
     match request.destination {
         #[cfg(feature = "http")]
-        PushDestination::Http(remote_url) => push_http(PushHttpRequest {
+        PushDestination::Http(remote_url) => plan_push_http(PushHttpRequest {
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
             format: request.format,
@@ -166,19 +201,30 @@ pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<Push
         PushDestination::Http(_) => Err(GitError::Unsupported(
             "HTTP transport is not enabled in this build".into(),
         )),
-        PushDestination::Ssh(remote_url) => crate::ssh::push_ssh(crate::ssh::SshPushRequest {
-            git_dir: request.git_dir,
-            common_git_dir: request.common_git_dir,
-            format: request.format,
-            remote: remote_url,
-            refspecs: request.refspecs,
-            quiet: request.options.quiet,
-            force: request.options.force,
-        }),
+        PushDestination::Ssh(remote_url) => {
+            let plan = crate::ssh::plan_push_ssh(crate::ssh::SshPushRequest {
+                git_dir: request.git_dir,
+                common_git_dir: request.common_git_dir,
+                format: request.format,
+                remote: remote_url,
+                refspecs: request.refspecs,
+                force: request.options.force,
+            })?;
+            let commands = plan.commands.clone();
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Ssh(plan)
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
         PushDestination::Local {
             git_dir: remote_git_dir,
             common_git_dir: remote_common_git_dir,
-        } => push_local(PushLocalRequest {
+        } => plan_push_local(PushLocalRequest {
             git_dir: request.git_dir,
             common_git_dir: request.common_git_dir,
             format: request.format,
@@ -188,6 +234,51 @@ pub fn push(request: PushRequest<'_>, services: PushServices<'_>) -> Result<Push
             refspecs: request.refspecs,
             options: request.options,
         }),
+    }
+}
+
+/// Execute a previously planned push.
+pub fn execute_push_plan(
+    request: PushRequest<'_>,
+    services: &mut PushServices<'_>,
+    plan: PushPlan,
+) -> Result<PushOutcome> {
+    let _ = (request.config, request.remote);
+    let _ = &mut services.progress;
+    if plan.commands.is_empty() {
+        return Ok(PushOutcome::default());
+    }
+    match plan.execution {
+        PushExecution::Noop => Ok(PushOutcome::default()),
+        #[cfg(feature = "http")]
+        PushExecution::Http {
+            remote_url,
+            features,
+            advertisements,
+            command_forces,
+        } => execute_push_http(
+            request,
+            services.credentials,
+            plan.commands,
+            remote_url,
+            features,
+            advertisements,
+            command_forces,
+        ),
+        PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan),
+        PushExecution::Local {
+            remote_git_dir,
+            remote_common_git_dir,
+            remote_refs,
+            command_forces,
+        } => execute_push_local(
+            request,
+            plan.commands,
+            remote_git_dir,
+            remote_common_git_dir,
+            remote_refs,
+            command_forces,
+        ),
     }
 }
 
@@ -205,7 +296,7 @@ struct PushHttpRequest<'a> {
 }
 
 #[cfg(feature = "http")]
-fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
+fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     let PushHttpRequest {
         git_dir,
         common_git_dir,
@@ -236,25 +327,49 @@ fn push_http(request: PushHttpRequest<'_>) -> Result<PushOutcome> {
         refspecs,
         options.force,
     )?;
-    let commands = commands_from_forces(&command_forces);
-    if commands.is_empty() {
-        return Ok(PushOutcome::default());
-    }
-
     let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
     reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    let commands = commands_from_forces(&command_forces);
+    let execution = if commands.is_empty() {
+        PushExecution::Noop
+    } else {
+        PushExecution::Http {
+            remote_url: remote_url.clone(),
+            features,
+            advertisements: advertisement_set.refs,
+            command_forces,
+        }
+    };
+    Ok(PushPlan {
+        commands,
+        execution,
+    })
+}
+
+#[cfg(feature = "http")]
+fn execute_push_http(
+    request: PushRequest<'_>,
+    credentials: &mut dyn CredentialProvider,
+    commands: Vec<ReceivePackCommand>,
+    remote_url: RemoteUrl,
+    features: ReceivePackFeatures,
+    advertisements: Vec<RefAdvertisement>,
+    _command_forces: Vec<(ReceivePackCommand, bool)>,
+) -> Result<PushOutcome> {
+    let client = crate::http::new_http_client();
+    let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let body = build_receive_pack_body(&PushPackRequest {
         local_db: &local_db,
-        format,
+        format: request.format,
         commands: &commands,
-        remote_advertisements: &advertisement_set.refs,
+        remote_advertisements: &advertisements,
         features: &features,
-        options: receive_pack_push_options(&features, format, options.quiet),
+        options: receive_pack_push_options(&features, request.format, request.options.quiet),
         thin: false,
     })?;
-    let url = http_smart_rpc_url(remote_url, GitService::ReceivePack)?;
+    let url = http_smart_rpc_url(&remote_url, GitService::ReceivePack)?;
     let content_type = smart_http_rpc_request_content_type(GitService::ReceivePack)?;
-    let mut response = crate::http::http_send_with_auth(remote_url, credentials, |auth| {
+    let mut response = crate::http::http_send_with_auth(&remote_url, credentials, |auth| {
         client.post(
             &url,
             &content_type,
@@ -294,7 +409,7 @@ struct PushLocalRequest<'a> {
     options: &'a PushOptions,
 }
 
-fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
+fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     let PushLocalRequest {
         git_dir,
         common_git_dir,
@@ -320,11 +435,33 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
     let command_forces =
         plan_push_command_forces(format, &local_refs, &remote_refs, refspecs, options.force)?;
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     let commands = commands_from_forces(&command_forces);
-    if commands.is_empty() {
-        return Ok(PushOutcome::default());
-    }
+    let execution = if commands.is_empty() {
+        PushExecution::Noop
+    } else {
+        PushExecution::Local {
+            remote_git_dir: remote_git_dir.to_path_buf(),
+            remote_common_git_dir: remote_common_git_dir.to_path_buf(),
+            remote_refs,
+            command_forces,
+        }
+    };
+    Ok(PushPlan {
+        commands,
+        execution,
+    })
+}
 
+fn execute_push_local(
+    request: PushRequest<'_>,
+    commands: Vec<ReceivePackCommand>,
+    remote_git_dir: PathBuf,
+    remote_common_git_dir: PathBuf,
+    remote_refs: Vec<RefAdvertisement>,
+    _command_forces: Vec<(ReceivePackCommand, bool)>,
+) -> Result<PushOutcome> {
     let remote_excluded_tips = remote_refs
         .iter()
         .map(|reference| reference.oid)
@@ -334,16 +471,16 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
         .filter(|command| !command.new_id.is_null())
         .map(|command| command.new_id.clone())
         .collect::<Vec<_>>();
-    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
-    let remote_db = FileObjectDatabase::from_git_dir(remote_common_git_dir, format);
-    reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
-    let remote_excluded = collect_reachable_object_ids(&remote_db, format, remote_excluded_tips)?;
+    let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
+    let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
+    let remote_excluded =
+        collect_reachable_object_ids(&remote_db, request.format, remote_excluded_tips)?;
     let packfile = if starts.is_empty() {
         Vec::new()
     } else {
         b"PACK".to_vec()
     };
-    let request = ReceivePackPushRequest {
+    let receive_request = ReceivePackPushRequest {
         commands: ReceivePackRequest {
             shallow: Vec::new(),
             commands: commands.clone(),
@@ -353,9 +490,9 @@ fn push_local(request: PushLocalRequest<'_>) -> Result<PushOutcome> {
         packfile,
     };
     crate::local::receive_pack_reachable_pack_into_local_repository(
-        remote_git_dir,
-        format,
-        &request,
+        &remote_git_dir,
+        request.format,
+        &receive_request,
         &local_db,
         starts,
         remote_excluded,

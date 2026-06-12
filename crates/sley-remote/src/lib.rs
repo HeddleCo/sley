@@ -52,10 +52,10 @@ pub use ssh::{
 
 mod local;
 pub use local::{
-    LocalDeepenPlan, attach_receive_pack_capabilities, attach_upload_pack_capabilities,
-    INFINITE_DEPTH, compute_local_deepen, compute_local_deepen_by_rev_list,
-    install_fetch_pack_via_local_upload_pack, local_fetch_advertisements,
-    local_have_oids, receive_pack_features, receive_pack_into_local_repository,
+    INFINITE_DEPTH, LocalDeepenPlan, attach_receive_pack_capabilities,
+    attach_upload_pack_capabilities, compute_local_deepen, compute_local_deepen_by_rev_list,
+    install_fetch_pack_via_local_upload_pack, local_fetch_advertisements, local_have_oids,
+    receive_pack_features, receive_pack_into_local_repository,
     receive_pack_request_uses_push_options, upload_pack_features,
     upload_pack_from_local_repository, upload_pack_request_uses_sideband,
     upload_pack_sideband_response,
@@ -80,9 +80,9 @@ pub use pack::{
 
 mod push;
 pub use push::{
-    PushDestination, PushOptions, PushOutcome, PushRequest, PushServices, local_push_source_refs,
-    normalize_push_refname, normalize_push_refspec, push, reject_non_fast_forward_pushes,
-    validate_receive_pack_report,
+    PushDestination, PushOptions, PushOutcome, PushPlan, PushRequest, PushServices,
+    execute_push_plan, local_push_source_refs, normalize_push_refname, normalize_push_refspec,
+    plan_push, push, reject_non_fast_forward_pushes, validate_receive_pack_report,
 };
 
 mod ls_remote;
