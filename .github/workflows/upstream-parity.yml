@@ -110,7 +110,8 @@ jobs:
             t1462-refs-exists.sh
             t1500-rev-parse.sh
             t1510-repo-setup.sh
-            t2020-checkout-detach.sh
+            t1800-hook.sh
+          t2020-checkout-detach.sh
             t2107-update-index-basic.sh
             t2400-worktree-add.sh
             t3000-ls-files-others.sh
@@ -147,8 +148,10 @@ jobs:
             t5326-multi-pack-bitmaps.sh
             t5327-multi-pack-bitmaps-rev.sh
             t5332-multi-pack-reuse.sh
-            t5500-fetch-pack.sh
-            t5537-fetch-shallow.sh
+            t5407-post-rewrite-hook.sh
+          t5500-fetch-pack.sh
+            t5571-pre-push-hook.sh
+          t5537-fetch-shallow.sh
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
