@@ -952,7 +952,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             ));
         }
         let expected_oid = if let Some(old) = positional.get(1) {
-            Some(parse_update_ref_expected(format, old)?)
+            Some(parse_update_ref_expected(&git_dir, format, &store, old)?)
         } else {
             None
         };
@@ -968,7 +968,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
     let name = update_ref_effective_name(&store, &requested_name, deref)?;
     let new_oid = parse_update_ref_new_oid(&git_dir, format, &store, &positional[1])?;
     let expected_oid = if let Some(old) = positional.get(2) {
-        Some(parse_update_ref_expected(format, old)?)
+        Some(parse_update_ref_expected(&git_dir, format, &store, old)?)
     } else {
         None
     };
@@ -1079,9 +1079,15 @@ fn update_ref_stdin_line(
                 return update_ref_stdin_bad_command(command);
             }
             let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let new_oid = ObjectId::from_hex(context.format, parts[2])?;
+            let new_oid =
+                parse_update_ref_new_oid(context.git_dir, context.format, context.store, parts[2])?;
             let expected = if let Some(old) = parts.get(3) {
-                Some(parse_update_ref_expected(context.format, old)?)
+                Some(parse_update_ref_expected(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    old,
+                )?)
             } else {
                 None
             };
@@ -1112,7 +1118,8 @@ fn update_ref_stdin_line(
                 return update_ref_stdin_bad_command(command);
             }
             let name = update_ref_effective_name(context.store, parts[1], *deref)?;
-            let new_oid = ObjectId::from_hex(context.format, parts[2])?;
+            let new_oid =
+                parse_update_ref_new_oid(context.git_dir, context.format, context.store, parts[2])?;
             if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(parts[1]);
             }
@@ -1145,7 +1152,12 @@ fn update_ref_stdin_line(
             }
             let name = update_ref_effective_name(context.store, parts[1], *deref)?;
             let expected = if let Some(old) = parts.get(2) {
-                Some(parse_update_ref_expected(context.format, old)?)
+                Some(parse_update_ref_expected(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    old,
+                )?)
             } else {
                 None
             };
@@ -1168,7 +1180,7 @@ fn update_ref_stdin_line(
             }
             let name = update_ref_effective_name(context.store, parts[1], *deref)?;
             let expected = if let Some(old) = parts.get(2) {
-                parse_update_ref_expected(context.format, old)?
+                parse_update_ref_expected(context.git_dir, context.format, context.store, old)?
             } else {
                 zero_oid(context.format)?
             };
@@ -1208,7 +1220,12 @@ fn update_ref_stdin_line(
                 None => None,
                 Some("ref") => Some(UpdateRefStdinSymrefExpected::Target(parts[4].to_string())),
                 Some("oid") => Some(UpdateRefStdinSymrefExpected::Oid(
-                    parse_update_ref_expected(context.format, parts[4])?,
+                    parse_update_ref_expected(
+                        context.git_dir,
+                        context.format,
+                        context.store,
+                        parts[4],
+                    )?,
                 )),
                 Some(kind) => {
                     return update_ref_stdin_symref_update_invalid_old_kind(parts[1], kind);
@@ -1305,11 +1322,17 @@ fn update_ref_stdin_z_command(
             let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
             let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
-            let new_oid = ObjectId::from_hex(context.format, &new)?;
+            let new_oid =
+                parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
             let expected = if old.is_empty() {
                 None
             } else {
-                Some(parse_update_ref_expected(context.format, &old)?)
+                Some(parse_update_ref_expected(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    &old,
+                )?)
             };
             if context.batch_updates {
                 return update_ref_stdin_write_batch(
@@ -1339,7 +1362,8 @@ fn update_ref_stdin_z_command(
             };
             let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
-            let new_oid = ObjectId::from_hex(context.format, &new)?;
+            let new_oid =
+                parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
             if new_oid == zero_oid(context.format)? {
                 return update_ref_stdin_create_zero(&name);
             }
@@ -1375,7 +1399,12 @@ fn update_ref_stdin_z_command(
             let expected = if old.is_empty() {
                 None
             } else {
-                Some(parse_update_ref_expected(context.format, &old)?)
+                Some(parse_update_ref_expected(
+                    context.git_dir,
+                    context.format,
+                    context.store,
+                    &old,
+                )?)
             };
             if context.batch_updates {
                 return update_ref_delete_stdin_batch(
@@ -1399,7 +1428,7 @@ fn update_ref_stdin_z_command(
             let expected = if old.is_empty() {
                 zero_oid(context.format)?
             } else {
-                parse_update_ref_expected(context.format, &old)?
+                parse_update_ref_expected(context.git_dir, context.format, context.store, &old)?
             };
             let current = context.store.read_ref(&name)?;
             if context.batch_updates {
@@ -1438,9 +1467,12 @@ fn update_ref_stdin_z_command(
                 Some("oid") => {
                     let _ = update_ref_stdin_z_next(input, cursor, command, "")?;
                     let old_oid = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
-                    Some(UpdateRefStdinSymrefExpected::Oid(
-                        parse_update_ref_expected(context.format, &old_oid)?,
-                    ))
+                    Some(UpdateRefStdinSymrefExpected::Oid(parse_update_ref_expected(
+                        context.git_dir,
+                        context.format,
+                        context.store,
+                        &old_oid,
+                    )?))
                 }
                 _ => None,
             };
@@ -2206,19 +2238,7 @@ fn parse_update_ref_new_oid(
     store: &FileRefStore,
     value: &str,
 ) -> Result<ObjectId> {
-    if let Ok(oid) = ObjectId::from_hex(format, value) {
-        return Ok(oid);
-    }
-    if let Ok(Some(oid)) = resolve_ref_peeled(store, value) {
-        return Ok(oid);
-    }
-    // git's update-ref resolves <newvalue> as a revision, so revision syntax like
-    // `HEAD~1` or `<branch>^0` works (e.g. t1500's bisect setup, driven by
-    // test_commit_bulk). Fall through to the full revision parser, storing
-    // whatever object it resolves to (git does not peel here). `resolve_revision`
-    // also covers the plain-ref case (a bare `refs/...` or `HEAD`), so a
-    // validation error from `resolve_ref_peeled` above is not fatal on its own.
-    if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, value) {
+    if let Some(oid) = parse_update_ref_oidish(git_dir, format, store, value) {
         return Ok(oid);
     }
     eprintln!(
@@ -2230,8 +2250,43 @@ fn parse_update_ref_new_oid(
     Err(GitError::Exit(128))
 }
 
-fn parse_update_ref_expected(format: ObjectFormat, value: &str) -> Result<ObjectId> {
-    ObjectId::from_hex(format, value)
+fn parse_update_ref_oidish(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    value: &str,
+) -> Option<ObjectId> {
+    if let Ok(oid) = ObjectId::from_hex(format, value) {
+        return Some(oid);
+    }
+    if let Ok(Some(oid)) = resolve_ref_peeled(store, value) {
+        return Some(oid);
+    }
+    // git's update-ref resolves <newvalue> as a revision, so revision syntax like
+    // `HEAD~1` or `<branch>^0` works (e.g. t1500's bisect setup, driven by
+    // test_commit_bulk). Fall through to the full revision parser, storing
+    // whatever object it resolves to (git does not peel here). `resolve_revision`
+    // also covers the plain-ref case (a bare `refs/...` or `HEAD`), so a
+    // validation error from `resolve_ref_peeled` above is not fatal on its own.
+    if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, value) {
+        return Some(oid);
+    }
+    None
+}
+
+fn parse_update_ref_expected(
+    git_dir: &Path,
+    format: ObjectFormat,
+    store: &FileRefStore,
+    value: &str,
+) -> Result<ObjectId> {
+    parse_update_ref_oidish(git_dir, format, store, value)
+        .ok_or_else(|| GitError::InvalidObjectId(format!(
+            "expected {} hex digits for {}, got {}",
+            format.hex_len(),
+            format.name(),
+            value.len()
+        )))
 }
 
 fn check_update_ref_expected(

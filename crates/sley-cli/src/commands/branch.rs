@@ -5958,7 +5958,7 @@ struct BranchCreateOptions {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum BranchTrackMode {
+pub(crate) enum BranchTrackMode {
     Direct,
     Inherit,
     Never,
@@ -6870,7 +6870,7 @@ fn config_bool_value(value: &str) -> bool {
     }
 }
 
-fn branch_create_set_tracking(
+pub(crate) fn branch_create_set_tracking(
     git_dir: &Path,
     store: &FileRefStore,
     branch: &str,
