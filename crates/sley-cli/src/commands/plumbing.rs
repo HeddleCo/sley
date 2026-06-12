@@ -748,6 +748,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let mut verbose = false;
     let mut update = false;
     let mut all = false;
+    let mut force = false;
     let mut ignore_removal = false;
     let mut ignore_missing = false;
     let mut chmod = None;
@@ -774,6 +775,8 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
             "--no-verbose" => verbose = false,
             "-u" | "--update" => update = true,
             "--no-update" => update = false,
+            "-f" | "--force" => force = true,
+            "--no-force" => force = false,
             "-A" | "--all" | "--no-ignore-removal" => {
                 all = true;
                 ignore_removal = false;
@@ -830,7 +833,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                     && value.len() > 2
                     && value[1..]
                         .bytes()
-                        .all(|option| matches!(option, b'A' | b'n' | b'u' | b'v')) =>
+                        .all(|option| matches!(option, b'A' | b'n' | b'u' | b'v' | b'f')) =>
             {
                 for option in value[1..].bytes() {
                     match option {
@@ -838,6 +841,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
                         b'n' => dry_run = true,
                         b'u' => update = true,
                         b'v' => verbose = true,
+                        b'f' => force = true,
                         _ => unreachable!("add short-option group was filtered"),
                     }
                 }
@@ -876,6 +880,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    die_on_pathspec_inside_submodule(&cwd, &worktree_root, &git_dir, format, &paths)?;
     if update || all {
         let actions = resolve_add_update_actions(
             &cwd,
@@ -926,6 +931,7 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
         paths,
         AddRegularOptions {
             chmod,
+            force,
             ignore_removal,
             ignore_missing,
         },
@@ -973,6 +979,66 @@ pub(crate) fn cmd_add(args: &[String]) -> Result<()> {
     }
     if verbose {
         print_add_actions(&worktree_root, &actions)?;
+    }
+    Ok(())
+}
+
+/// Upstream pathspec.c `die_path_inside_submodule()`: a pathspec that names a
+/// path *inside* a tracked gitlink is fatal — the file belongs to the
+/// submodule's repository, not this one.
+fn die_on_pathspec_inside_submodule(
+    cwd: &Path,
+    worktree_root: &Path,
+    git_dir: &Path,
+    format: ObjectFormat,
+    paths: &[PathBuf],
+) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(());
+    };
+    let gitlinks: Vec<Vec<u8>> = index
+        .entries
+        .iter()
+        .filter(|entry| entry.mode == 0o160000)
+        .map(|entry| entry.path.as_bytes().to_vec())
+        .collect();
+    if gitlinks.is_empty() {
+        return Ok(());
+    }
+    for path in paths {
+        let absolute = if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        };
+        let Ok(relative) = absolute.strip_prefix(worktree_root) else {
+            continue;
+        };
+        let git_path = relative
+            .components()
+            .filter_map(|component| match component {
+                std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let git_path = git_path.as_bytes();
+        for link in &gitlinks {
+            if git_path.len() > link.len()
+                && git_path.starts_with(link)
+                && git_path[link.len()] == b'/'
+            {
+                eprintln!(
+                    "fatal: Pathspec '{}' is in submodule '{}'",
+                    path.to_string_lossy(),
+                    String::from_utf8_lossy(link)
+                );
+                return Err(GitError::Exit(128));
+            }
+        }
     }
     Ok(())
 }
@@ -1047,6 +1113,7 @@ fn parse_add_chmod(value: &str) -> Result<bool> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AddRegularOptions {
     chmod: Option<bool>,
+    force: bool,
     ignore_removal: bool,
     ignore_missing: bool,
 }
@@ -1110,9 +1177,17 @@ fn resolve_add_regular_actions(
             actions.push(action);
         }
     }
-    if options.chmod.is_some() {
-        for (_, pathspec, _) in &pathspecs {
+    if options.chmod.is_some() || options.force {
+        // `--force` stages paths the status walk never reports (gitignored
+        // files; gitignored embedded repositories as gitlinks), so resolve the
+        // pathspecs straight off the filesystem. The same walk feeds `--chmod`,
+        // which must touch every matching file whether or not it changed.
+        for (idx, (_, pathspec, _)) in pathspecs.iter().enumerate() {
             for path in resolve_add_paths(cwd, worktree_root, vec![pathspec.clone()])? {
+                if fs::symlink_metadata(&path).is_err() {
+                    continue;
+                }
+                matched[idx] = true;
                 if seen.insert(path.clone()) {
                     actions.push(AddAction::Add(path));
                 }
@@ -1157,6 +1232,18 @@ fn collect_add_files(
     directory: &Path,
     out: &mut BTreeSet<PathBuf>,
 ) -> Result<()> {
+    // An embedded repository below the worktree root is opaque to `add`: it is
+    // staged as a single gitlink path, never descended into. Canonicalize both
+    // sides so a pathspec like `.` (root + a CurDir component) is still
+    // recognized as the root itself, not an embedded repository.
+    let is_root = match (fs::canonicalize(directory), fs::canonicalize(worktree_root)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => directory == worktree_root,
+    };
+    if !is_root && sley_diff_merge::gitlink_git_dir(directory).is_some() {
+        out.insert(directory.to_path_buf());
+        return Ok(());
+    }
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();

@@ -114,12 +114,16 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     for display_path in path_args {
         let path_arg = String::from_utf8_lossy(&display_path);
         let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
-        if tracked_paths.contains(&git_path) {
-            continue;
-        }
         let absolute = resolve_cli_path(cwd, &path_arg);
-        let ignore_match =
-            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?;
+        // Tracked paths are never ignored (upstream check-ignore consults the
+        // index via find_pathspecs_matching_against_index and skips matching
+        // entries): report them as non-matching rather than skipping output,
+        // so `-v -n` still prints the `::` line for them.
+        let ignore_match = if tracked_paths.contains(&git_path) {
+            None
+        } else {
+            sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
+        };
         if let Some(ignore_match) = ignore_match {
             if verbose || ignore_match.ignored {
                 matched_any = true;

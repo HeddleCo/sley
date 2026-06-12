@@ -1512,7 +1512,11 @@ pub fn short_status_with_options(
                 Some(SubmoduleStatus {
                     new_commits: index.oid != worktree.oid,
                     modified_content: dirt & DIRTY_SUBMODULE_MODIFIED != 0,
-                    untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0,
+                    // With untracked files disabled (`status -uno`), upstream
+                    // sets ignore_untracked_in_submodules: untracked content
+                    // alone does not make a submodule dirty.
+                    untracked_content: dirt & DIRTY_SUBMODULE_UNTRACKED != 0
+                        && !matches!(options.untracked_mode, StatusUntrackedMode::None),
                 })
             }
             _ => None,
@@ -4691,6 +4695,12 @@ fn checkout_commit_to_index_and_worktree_filtered(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
+        // Gitlinks go through the shared materialization step (mkdir + zeroed
+        // stat); smudge filters never apply to a submodule directory.
+        if entry.mode == 0o160000 {
+            index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
+            continue;
+        }
         let object = db.read_object(&entry.oid)?;
         if object.object_type != ObjectType::Blob {
             return Err(GitError::InvalidObject(format!(
@@ -4771,21 +4781,46 @@ fn checkout_commit_to_index_and_worktree_sparse(
     sparse: Option<(&SparseCheckout, SparseCheckoutMode)>,
 ) -> Result<usize> {
     let previously_skipped = skip_worktree_paths(git_dir, format)?;
-    // Honor skip-worktree: a path whose worktree file is intentionally absent
-    // must not be treated as a dirty (deleted) change blocking the checkout.
-    let status = short_status(worktree_root, git_dir, format)?;
-    if status
-        .iter()
-        .any(|entry| !previously_skipped.contains(entry.path.as_slice()))
-    {
-        return Err(GitError::Transaction(
-            "checkout requires a clean working tree".into(),
-        ));
-    }
     let db = FileObjectDatabase::from_git_dir(git_dir, format);
     let commit = read_commit(&db, format, target)?;
     let mut target_entries = BTreeMap::new();
     collect_tree_entries(&db, format, &commit.tree, &mut target_entries)?;
+
+    // Honor skip-worktree: a path whose worktree file is intentionally absent
+    // must not be treated as a dirty (deleted) change blocking the checkout.
+    let status = short_status(worktree_root, git_dir, format)?;
+    if status.iter().any(|entry| {
+        if previously_skipped.contains(entry.path.as_slice()) {
+            return false;
+        }
+        // Submodule state never blocks a checkout: upstream unpack-trees
+        // treats gitlinks as always up-to-date (ie_match_stat refuses to pay
+        // for a submodule dirtiness probe), so new commits / dirty content in
+        // a submodule must not fail the branch switch.
+        if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) {
+            return false;
+        }
+        // An untracked embedded repository where the target tree records a
+        // gitlink is reused as-is (upstream entry.c write_entry: mkdir with
+        // EEXIST is success), so it does not block the checkout either.
+        if entry.index == b'?' && entry.worktree == b'?' {
+            let path = entry
+                .path
+                .strip_suffix(b"/")
+                .unwrap_or(entry.path.as_slice());
+            if target_entries
+                .get(path)
+                .is_some_and(|target| target.mode == 0o160000)
+            {
+                return false;
+            }
+        }
+        true
+    }) {
+        return Err(GitError::Transaction(
+            "checkout requires a clean working tree".into(),
+        ));
+    }
 
     let matcher = sparse.map(|(spec, mode)| SparseMatcher::new(spec, mode));
 
@@ -4808,25 +4843,9 @@ fn checkout_commit_to_index_and_worktree_sparse(
             matcher.includes_file(path)
         });
         let index_entry = if in_cone {
-            let object = db.read_object(&entry.oid)?;
-            if object.object_type != ObjectType::Blob {
-                return Err(GitError::InvalidObject(format!(
-                    "expected blob {}, found {}",
-                    entry.oid,
-                    object.object_type.as_str()
-                )));
-            }
-            let file_path = worktree_path(worktree_root, path)?;
-            if let Some(parent) = file_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&file_path, &object.body)?;
-            let metadata = fs::metadata(&file_path)?;
-            let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
-            index_entry.mode = entry.mode;
-            // `index_entry_from_metadata` leaves flags_extended at 0, so the
+            // `materialize_tree_entry` leaves flags_extended at 0, so the
             // skip-worktree bit is already clear for in-cone paths.
-            index_entry
+            materialize_tree_entry(&db, worktree_root, path, entry)?
         } else {
             // Out of cone: ensure no stale worktree file remains and synthesize
             // an index entry straight from the tree (no worktree metadata),
@@ -5250,23 +5269,7 @@ pub fn reset_index_and_worktree_to_commit(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        let object = db.read_object(&entry.oid)?;
-        if object.object_type != ObjectType::Blob {
-            return Err(GitError::InvalidObject(format!(
-                "expected blob {}, found {}",
-                entry.oid,
-                object.object_type.as_str()
-            )));
-        }
-        let file_path = worktree_path(worktree_root, path)?;
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&file_path, &object.body)?;
-        let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
-        index_entry.mode = entry.mode;
-        index_entries.push(index_entry);
+        index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     fs::write(
@@ -5282,6 +5285,60 @@ pub fn reset_index_and_worktree_to_commit(
     Ok(RestoreResult {
         restored: target_entries.len(),
     })
+}
+
+/// Write one target tree entry into the worktree and return its index entry —
+/// the shared materialization step for every checkout/reset worktree rebuild.
+///
+/// Gitlinks (mode 160000) never touch the object database: their oid names a
+/// commit in the *submodule's* repository, not an object here. Upstream
+/// (entry.c `write_entry` S_IFGITLINK) just mkdirs the path — an
+/// already-populated submodule is left untouched (EEXIST is success) — and
+/// records the oid in the index with a zeroed stat so status re-evaluates the
+/// gitlink against the embedded repository's HEAD.
+fn materialize_tree_entry(
+    db: &FileObjectDatabase,
+    worktree_root: &Path,
+    path: &[u8],
+    entry: &TrackedEntry,
+) -> Result<IndexEntry> {
+    if entry.mode == 0o160000 {
+        let dir_path = worktree_path(worktree_root, path)?;
+        fs::create_dir_all(&dir_path)?;
+        return Ok(IndexEntry {
+            ctime_seconds: 0,
+            ctime_nanoseconds: 0,
+            mtime_seconds: 0,
+            mtime_nanoseconds: 0,
+            dev: 0,
+            ino: 0,
+            mode: entry.mode,
+            uid: 0,
+            gid: 0,
+            size: 0,
+            oid: entry.oid,
+            flags: path.len().min(0x0fff) as u16,
+            flags_extended: 0,
+            path: BString::from(path),
+        });
+    }
+    let object = db.read_object(&entry.oid)?;
+    if object.object_type != ObjectType::Blob {
+        return Err(GitError::InvalidObject(format!(
+            "expected blob {}, found {}",
+            entry.oid,
+            object.object_type.as_str()
+        )));
+    }
+    let file_path = worktree_path(worktree_root, path)?;
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&file_path, &object.body)?;
+    let metadata = fs::metadata(&file_path)?;
+    let mut index_entry = index_entry_from_metadata(path.to_vec(), entry.oid, &metadata);
+    index_entry.mode = entry.mode;
+    Ok(index_entry)
 }
 
 /// Materialize a tree object into the index and worktree.
@@ -5305,23 +5362,7 @@ pub fn checkout_tree_to_index_and_worktree(
 
     let mut index_entries = Vec::new();
     for (path, entry) in &target_entries {
-        let object = db.read_object(&entry.oid)?;
-        if object.object_type != ObjectType::Blob {
-            return Err(GitError::InvalidObject(format!(
-                "expected blob {}, found {}",
-                entry.oid,
-                object.object_type.as_str()
-            )));
-        }
-        let file_path = worktree_path(worktree_root, path)?;
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&file_path, &object.body)?;
-        let metadata = fs::metadata(&file_path)?;
-        let mut index_entry = index_entry_from_metadata(path.clone(), entry.oid, &metadata);
-        index_entry.mode = entry.mode;
-        index_entries.push(index_entry);
+        index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
     }
     index_entries.sort_by(|left, right| left.path.cmp(&right.path));
     fs::write(
@@ -6239,18 +6280,24 @@ fn restored_head_index_entry(
     // invariant that the status stat-cache relies on. Leave the stat zeroed so
     // status always re-hashes this path and detects any modification -- exactly
     // git's behavior for tree-sourced entries until a later refresh validates them.
-    let size = match fs::metadata(&file_path) {
-        Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
-        Err(_) => {
-            let object = db.read_object(&entry.oid)?;
-            if object.object_type != ObjectType::Blob {
-                return Err(GitError::InvalidObject(format!(
-                    "expected blob {}, found {}",
-                    entry.oid,
-                    object.object_type.as_str()
-                )));
+    let size = if entry.mode == 0o160000 {
+        // A gitlink's oid names a commit in the submodule's repository — it is
+        // not readable here, and a tree-sourced gitlink entry carries size 0.
+        0
+    } else {
+        match fs::metadata(&file_path) {
+            Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
+            Err(_) => {
+                let object = db.read_object(&entry.oid)?;
+                if object.object_type != ObjectType::Blob {
+                    return Err(GitError::InvalidObject(format!(
+                        "expected blob {}, found {}",
+                        entry.oid,
+                        object.object_type.as_str()
+                    )));
+                }
+                object.body.len().min(u32::MAX as usize) as u32
             }
-            object.body.len().min(u32::MAX as usize) as u32
         }
     };
     Ok(IndexEntry {
@@ -7014,10 +7061,23 @@ fn worktree_path(root: &Path, path: &[u8]) -> Result<PathBuf> {
 
 fn remove_worktree_file(root: &Path, path: &[u8]) -> Result<()> {
     let file = worktree_path(root, path)?;
-    if file.exists() {
-        fs::remove_file(&file)?;
-        prune_empty_parents(root, file.parent())?;
+    if !file.exists() {
+        return Ok(());
     }
+    if file.is_dir() {
+        // A tracked path that is a directory on disk is a gitlink: upstream
+        // checkout/reset never recurses into a submodule's working tree. It
+        // rmdirs the path when empty (remove_scheduled_dirs) and leaves a
+        // populated submodule in place.
+        match fs::remove_dir(&file) {
+            Ok(()) => prune_empty_parents(root, file.parent())?,
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(err) => return Err(err.into()),
+        }
+        return Ok(());
+    }
+    fs::remove_file(&file)?;
+    prune_empty_parents(root, file.parent())?;
     Ok(())
 }
 
