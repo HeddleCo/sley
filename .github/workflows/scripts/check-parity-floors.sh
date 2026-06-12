@@ -17,6 +17,9 @@
 # Round-3 floors (rebase-i/bitmaps-b/diff-formats) measured 2026-06-11 at the
 # integ/round3 tip (epic/sley-rebase-i + epic/sley-bitmaps-b +
 # epic/sley-diff-formats merged onto 04f10f8).
+# Round-4a floors (fetch-pack/shallow + userdiff) measured 2026-06-12 at the
+# integ/round4a tip (epic/sley-fetchpack + epic/sley-userdiff merged onto
+# b1b606a).
 # Raise a floor only after a real, sustained gain lands; never lower one.
 
 set -euo pipefail
@@ -75,10 +78,15 @@ declare -A FLOOR=(
     [t3420-rebase-autostash.sh]=28
     [t5327-multi-pack-bitmaps-rev.sh]=308
     [t5332-multi-pack-reuse.sh]=9
-    [t4013-diff-various.sh]=124
+    [t4013-diff-various.sh]=125
     [t4052-stat-output.sh]=71
     [t4045-diff-relative.sh]=29
     [t4047-diff-dirstat.sh]=41
+    [t4015-diff-whitespace.sh]=55
+    [t4018-diff-funcname.sh]=287
+    [t4034-diff-words.sh]=64
+    [t5500-fetch-pack.sh]=356
+    [t5537-fetch-shallow.sh]=9
 )
 
 fail=0

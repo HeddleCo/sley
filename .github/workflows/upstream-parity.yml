@@ -39,10 +39,10 @@ jobs:
   upstream-parity:
     name: Upstream parity (floor-gated subset)
     runs-on: ubuntu-latest
-    # 48 tracked t-files (round-3 added 11: rebase-i, bitmaps-b, diff-formats,
-    # incl. the slow t5327 multi-pack rev suite) + oracle-git build on cache
-    # miss; 45 min was sized for the 37-file list.
-    timeout-minutes: 60
+    # 53 tracked t-files (round-4a added 5: fetch-pack/shallow + userdiff,
+    # incl. the 377-assertion t5500 fetch suite) + oracle-git build on cache
+    # miss; 60 min was sized for the 48-file list.
+    timeout-minutes: 70
 
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +128,9 @@ jobs:
             t3507-cherry-pick-conflict.sh
             t3510-cherry-pick-sequence.sh
             t4013-diff-various.sh
+            t4015-diff-whitespace.sh
+            t4018-diff-funcname.sh
+            t4034-diff-words.sh
             t4045-diff-relative.sh
             t4047-diff-dirstat.sh
             t4052-stat-output.sh
@@ -139,6 +142,8 @@ jobs:
             t5326-multi-pack-bitmaps.sh
             t5327-multi-pack-bitmaps-rev.sh
             t5332-multi-pack-reuse.sh
+            t5500-fetch-pack.sh
+            t5537-fetch-shallow.sh
             t6003-rev-list-topo-order.sh
             t6012-rev-list-simplify.sh
             t6030-bisect-porcelain.sh
