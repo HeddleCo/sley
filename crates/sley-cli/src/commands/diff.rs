@@ -102,6 +102,8 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut dirstat_cli_params: Vec<String> = Vec::new();
     let mut patch = false;
     let mut no_patch = false;
+    // `-U<n>` / `--unified=<n>` hunk context; None keeps the default of 3.
+    let mut context: Option<usize> = None;
     let mut reverse = false;
     let mut pickaxe = None;
     let mut pickaxe_all = false;
@@ -120,7 +122,9 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut diff_patch_output_control = false;
     let mut diff_rewrite_control = false;
     let mut diff_submodule_output_control = false;
-    let mut diff_word_control = false;
+    let mut word_diff_mode: Option<commands::diff_words::WordDiffMode> = None;
+    let mut word_diff_regex: Option<String> = None;
+    let mut no_index = false;
     let mut diff_relative = DiffRelativeMode::Off;
     // Whether --relative/--no-relative appeared on the command line (an
     // explicit flag wins over the diff.relative config).
@@ -242,6 +246,29 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 patch = true;
                 no_patch = false;
             }
+            "-U" | "--unified" => {
+                idx += 1;
+                let value = args
+                    .get(idx)
+                    .ok_or_else(|| log_option_requires_value_error("unified"))?;
+                commit_validate_unified_context(value, arg == "-U")?;
+                context = Some(parse_unified_count(value));
+                patch = true;
+                no_patch = false;
+            }
+            "--unified=" => {
+                return commit_unified_expects_numerical_value_error(false);
+            }
+            value
+                if let Some(value) = value
+                    .strip_prefix("--unified=")
+                    .or_else(|| value.strip_prefix("-U")) =>
+            {
+                commit_validate_unified_context(value, !arg.starts_with("--"))?;
+                context = Some(parse_unified_count(value));
+                patch = true;
+                no_patch = false;
+            }
             "--patch-with-raw" => {
                 raw = true;
                 patch = true;
@@ -265,6 +292,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 no_patch = true;
             }
             "-a" | "--text" | "--no-ext-diff" | "--no-textconv" => {}
+            "--no-index" => no_index = true,
             "-R" => reverse = true,
             "-S" => {
                 idx += 1;
@@ -378,20 +406,50 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                 log_validate_submodule_format(value)?;
                 diff_submodule_output_control = true;
             }
-            "--word-diff" => diff_word_control = true,
+            "--word-diff" => {
+                // Keeps an already-selected mode (git only upgrades NONE to
+                // plain).
+                if word_diff_mode.is_none() {
+                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+            }
             value if let Some(value) = value.strip_prefix("--word-diff=") => {
                 log_validate_word_diff(value)?;
-                diff_word_control = true;
+                word_diff_mode = match value {
+                    "plain" => Some(commands::diff_words::WordDiffMode::Plain),
+                    "porcelain" => Some(commands::diff_words::WordDiffMode::Porcelain),
+                    "color" => {
+                        color_always = true;
+                        Some(commands::diff_words::WordDiffMode::Color)
+                    }
+                    _ => None,
+                };
             }
             "--word-diff-regex" => {
                 idx += 1;
-                args.get(idx)
+                let value = args
+                    .get(idx)
                     .ok_or_else(|| log_option_requires_value_error("word-diff-regex"))?;
-                diff_word_control = true;
+                word_diff_regex = Some(value.clone());
+                if word_diff_mode.is_none() {
+                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
             }
-            value if value.starts_with("--word-diff-regex=") => diff_word_control = true,
-            "--color-words" => diff_word_control = true,
-            value if value.starts_with("--color-words=") => diff_word_control = true,
+            value if let Some(value) = value.strip_prefix("--word-diff-regex=") => {
+                word_diff_regex = Some(value.to_string());
+                if word_diff_mode.is_none() {
+                    word_diff_mode = Some(commands::diff_words::WordDiffMode::Plain);
+                }
+            }
+            "--color-words" => {
+                color_always = true;
+                word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+            }
+            value if let Some(value) = value.strip_prefix("--color-words=") => {
+                color_always = true;
+                word_diff_mode = Some(commands::diff_words::WordDiffMode::Color);
+                word_diff_regex = Some(value.to_string());
+            }
             "--output-indicator-new" => {
                 idx += 1;
                 let value = args
@@ -687,11 +745,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff currently supports: diff [--cached] [-z] [-M|-C] [--diff-filter=<filter>] [--exit-code|--quiet] [--abbrev[=<n>]|--no-abbrev] [--src-prefix=<prefix>|--dst-prefix=<prefix>|--no-prefix|--default-prefix] [--raw|--stat|--compact-summary|--numstat|--shortstat|--summary|--name-status|--name-only|-p|-u|--patch|--patch-with-raw|--patch-with-stat|-s|--no-patch] [HEAD] [-- <path>...] and diff [--cached] [-z] --quiet [HEAD]".into(),
         ));
     }
-    if color_always && !name_status && !name_only && !stat && !compact_summary && !shortstat {
-        return Err(GitError::Unsupported(
-            "diff colored output is not supported for this output mode".into(),
-        ));
-    }
     if diff_algorithm_control && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff algorithm controls are not supported for this output mode".into(),
@@ -737,11 +790,6 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             "diff submodule output controls are not supported for this output mode".into(),
         ));
     }
-    if diff_word_control && !name_status && !name_only {
-        return Err(GitError::Unsupported(
-            "diff word controls are not supported for this output mode".into(),
-        ));
-    }
     if reverse && !name_status && !name_only {
         return Err(GitError::Unsupported(
             "diff reverse output is not supported for this output mode".into(),
@@ -766,6 +814,26 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
         ));
     }
     let cwd = env::current_dir()?;
+    if no_index {
+        let mut paths = path_args;
+        if head {
+            paths.insert(0, "HEAD".to_string());
+        }
+        paths.extend(explicit_paths);
+        return cmd_diff_no_index(
+            &cwd,
+            &paths,
+            DiffNoIndexParams {
+                context: context.unwrap_or(3),
+                color: color_always,
+                word_diff_mode,
+                word_diff_regex: word_diff_regex.as_deref(),
+                src_prefix: &src_prefix,
+                dst_prefix: &dst_prefix,
+                quiet,
+            },
+        );
+    }
     let git_dir = discover_git_dir(&cwd)?;
     let format = repository_object_format(&git_dir)?;
     let db = FileObjectDatabase::from_git_dir(&git_dir, format);
@@ -1058,6 +1126,13 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             .collect()
     };
     let has_differences = !entries.is_empty();
+    // Userdiff driver resolution (`diff=<driver>` attributes + `diff.<name>.*`
+    // config) for hunk headings. Attributes always come from the real
+    // worktree, even when the content comparison is `--cached`.
+    let userdiff = commands::userdiff::UserdiffResolver::new(
+        worktree_root_for_git_dir(&git_dir).ok(),
+        read_repo_config(&git_dir).ok(),
+    );
     if !quiet && !no_patch {
         let mut stdout = io::stdout();
         let show_raw = raw && !name_only && !name_status;
@@ -1166,6 +1241,12 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             if show_raw || show_numstat || show_stat || show_shortstat || show_summary {
                 writeln!(stdout)?;
             }
+            let colors = color_always
+                .then(|| commands::diff_words::DiffColors::enabled(read_repo_config(&git_dir).ok().as_ref()));
+            let word_request = word_diff_mode.map(|mode| WordDiffRequest {
+                mode,
+                cli_regex: word_diff_regex.as_deref(),
+            });
             for entry in &entries {
                 let options = DiffPatchOptions {
                     db: &db,
@@ -1175,6 +1256,11 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     abbrev: patch_abbrev,
                     src_prefix: &src_prefix,
                     dst_prefix: &dst_prefix,
+                    context: context.unwrap_or(3),
+                    userdiff: Some(&userdiff),
+                    colors: colors.as_ref(),
+                    word_diff: word_request.as_ref(),
+                    no_index_contents: None,
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1472,6 +1558,26 @@ fn diff_relative_display_path(path: &[u8], prefix: &[u8]) -> Option<Vec<u8>> {
         .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest).to_vec())
 }
 
+/// Parse a validated `-U` / `--unified` count: digits with an optional
+/// k/m/g (1024-based) suffix, clamped at zero for negative values.
+fn parse_unified_count(value: &str) -> usize {
+    let (number, multiplier) = match value.as_bytes().last() {
+        Some(b'k' | b'K') => (&value[..value.len() - 1], 1024usize),
+        Some(b'm' | b'M') => (&value[..value.len() - 1], 1024 * 1024),
+        Some(b'g' | b'G') => (&value[..value.len() - 1], 1024 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    if let Some(digits) = number.strip_prefix('-') {
+        let _ = digits;
+        return 0;
+    }
+    let digits = number.strip_prefix('+').unwrap_or(number);
+    digits
+        .parse::<usize>()
+        .unwrap_or(0)
+        .saturating_mul(multiplier)
+}
+
 fn log_validate_word_diff(value: &str) -> Result<()> {
     match value {
         "plain" | "color" | "porcelain" | "none" => Ok(()),
@@ -1480,4 +1586,106 @@ fn log_validate_word_diff(value: &str) -> Result<()> {
             Err(GitError::Exit(129))
         }
     }
+}
+
+/// Parameters for `git diff --no-index`.
+struct DiffNoIndexParams<'a> {
+    context: usize,
+    color: bool,
+    word_diff_mode: Option<commands::diff_words::WordDiffMode>,
+    word_diff_regex: Option<&'a str>,
+    src_prefix: &'a str,
+    dst_prefix: &'a str,
+    quiet: bool,
+}
+
+/// `git diff --no-index <path> <path>`: compare two files outside (or beside)
+/// the object database. Attributes and `diff.*` config still apply when the
+/// command runs inside a repository. Exits 1 when the files differ.
+fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>) -> Result<()> {
+    if paths.len() != 2 {
+        eprintln!("usage: git diff --no-index [<options>] <path> <path>");
+        return Err(GitError::Exit(129));
+    }
+    let read_side = |spec: &str| -> Result<(Vec<u8>, u32)> {
+        let path = Path::new(spec);
+        let content = fs::read(path).map_err(|_| {
+            eprintln!("error: Could not access '{spec}'");
+            GitError::Exit(1)
+        })?;
+        let mode = {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let permissions = fs::metadata(path).map(|meta| meta.permissions().mode());
+                if permissions.is_ok_and(|bits| bits & 0o111 != 0) {
+                    0o100755
+                } else {
+                    0o100644
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                0o100644
+            }
+        };
+        Ok((content, mode))
+    };
+    let (old_content, old_mode) = read_side(&paths[0])?;
+    let (new_content, new_mode) = read_side(&paths[1])?;
+    if old_content == new_content && old_mode == new_mode {
+        return Ok(());
+    }
+    // Repository context is optional: when present, .gitattributes drivers,
+    // diff.<name>.* config, and color overrides all apply.
+    let git_dir = discover_git_dir(cwd).ok();
+    let config = git_dir.as_deref().and_then(|dir| read_repo_config(dir).ok());
+    let worktree_root = git_dir
+        .as_deref()
+        .and_then(|dir| worktree_root_for_git_dir(dir).ok());
+    let userdiff = commands::userdiff::UserdiffResolver::new(
+        worktree_root,
+        git_dir
+            .as_deref()
+            .and_then(|dir| read_repo_config(dir).ok()),
+    );
+    let colors = params
+        .color
+        .then(|| commands::diff_words::DiffColors::enabled(config.as_ref()));
+    let word_request = params.word_diff_mode.map(|mode| WordDiffRequest {
+        mode,
+        cli_regex: params.word_diff_regex,
+    });
+    let entry = sley_diff_merge::NameStatusEntry {
+        status: sley_diff_merge::NameStatus::Modified,
+        path: BString::from(paths[1].as_bytes()),
+        old_path: Some(BString::from(paths[0].as_bytes())),
+        old_mode: Some(old_mode),
+        new_mode: Some(new_mode),
+        old_oid: None,
+        new_oid: None,
+    };
+    // A throwaway object database handle: content reads are overridden, so it
+    // is never consulted.
+    let scratch_git_dir = git_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
+    let db = FileObjectDatabase::from_git_dir(&scratch_git_dir, ObjectFormat::Sha1);
+    if !params.quiet {
+        let mut stdout = io::stdout();
+        let options = DiffPatchOptions {
+            db: &db,
+            worktree_root: None,
+            use_worktree_new: false,
+            format: ObjectFormat::Sha1,
+            abbrev: 7,
+            src_prefix: params.src_prefix,
+            dst_prefix: params.dst_prefix,
+            context: params.context,
+            userdiff: Some(&userdiff),
+            colors: colors.as_ref(),
+            word_diff: word_request.as_ref(),
+            no_index_contents: Some((Some(&old_content), Some(&new_content))),
+        };
+        write_diff_patch_entry(&mut stdout, &entry, options)?;
+    }
+    Err(GitError::Exit(1))
 }

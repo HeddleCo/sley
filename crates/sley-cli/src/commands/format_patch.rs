@@ -835,6 +835,33 @@ struct TaggedLine<'a> {
     new_index: usize,
 }
 
+/// Options for [`write_patch_hunks_with`]: hunk shaping and heading lookup.
+pub(crate) struct PatchHunkOptions<'a> {
+    /// Lines of context around each change (`-U<n>`, default 3).
+    pub(crate) context: usize,
+    /// Extra inter-hunk merging distance (`--inter-hunk-context`).
+    pub(crate) interhunk: usize,
+    /// Compiled userdiff funcname patterns for the path; `None` selects the
+    /// default `def_ff` heuristic.
+    pub(crate) funcname: Option<&'a commands::userdiff::CompiledFuncname>,
+    /// ANSI palette when color output is enabled.
+    pub(crate) colors: Option<&'a commands::diff_words::DiffColors>,
+    /// Word-diff rendering (replaces the +/- line bodies of each hunk).
+    pub(crate) word_diff: Option<&'a commands::diff_words::WordDiffConfig<'a>>,
+}
+
+impl Default for PatchHunkOptions<'_> {
+    fn default() -> Self {
+        Self {
+            context: HUNK_CONTEXT,
+            interhunk: 0,
+            funcname: None,
+            colors: None,
+            word_diff: None,
+        }
+    }
+}
+
 /// Emit the unified-diff hunks for a single file change into `out`, grouping
 /// changes with [`HUNK_CONTEXT`] lines of surrounding context (merging nearby
 /// groups), and prefixing each `@@` header with git's default section heading.
@@ -842,6 +869,16 @@ pub(crate) fn write_patch_hunks(
     out: &mut Vec<u8>,
     old_content: Option<&[u8]>,
     new_content: Option<&[u8]>,
+) {
+    write_patch_hunks_with(out, old_content, new_content, &PatchHunkOptions::default());
+}
+
+/// [`write_patch_hunks`] with explicit hunk shaping options.
+pub(crate) fn write_patch_hunks_with(
+    out: &mut Vec<u8>,
+    old_content: Option<&[u8]>,
+    new_content: Option<&[u8]>,
+    options: &PatchHunkOptions<'_>,
 ) {
     let old = sley_diff_merge::split_lines(old_content.unwrap_or_default());
     let new = sley_diff_merge::split_lines(new_content.unwrap_or_default());
@@ -907,9 +944,11 @@ pub(crate) fn write_patch_hunks(
     let mut group_start = change_positions[0];
     let mut group_end = change_positions[0];
     for &pos in &change_positions[1..] {
-        // Two change runs merge when at most 2*HUNK_CONTEXT context lines
-        // separate them (so their context windows touch or overlap).
-        if pos - group_end <= 2 * HUNK_CONTEXT {
+        // Two change runs merge when at most 2*context (+ interhunk) equal
+        // lines separate them, mirroring xdl_get_hunk's `distance >
+        // max_common` break (the position gap counts the separating equal
+        // lines plus one, so adjacent delete/insert runs always merge).
+        if pos - group_end <= 2 * options.context + options.interhunk + 1 {
             group_end = pos;
         } else {
             groups.push((group_start, group_end));
@@ -920,9 +959,9 @@ pub(crate) fn write_patch_hunks(
     groups.push((group_start, group_end));
 
     for (first_change, last_change) in groups {
-        let hunk_start = first_change.saturating_sub(HUNK_CONTEXT);
-        let hunk_end = (last_change + HUNK_CONTEXT + 1).min(tagged.len());
-        write_one_hunk(out, &tagged, &old, hunk_start, hunk_end);
+        let hunk_start = first_change.saturating_sub(options.context);
+        let hunk_end = (last_change + options.context + 1).min(tagged.len());
+        write_one_hunk(out, &tagged, &old, hunk_start, hunk_end, options);
     }
 }
 
@@ -935,6 +974,7 @@ fn write_one_hunk(
     old_lines: &[sley_diff_merge::DiffLine<'_>],
     start: usize,
     end: usize,
+    options: &PatchHunkOptions<'_>,
 ) {
     let slice = &tagged[start..end];
     let mut old_count = 0usize;
@@ -969,17 +1009,66 @@ fn write_one_hunk(
             .unwrap_or(1)
     };
 
-    let heading = hunk_section_heading(old_lines, slice.first().map(|line| line.old_index));
-    out.extend_from_slice(b"@@ -");
-    out.extend_from_slice(format_hunk_range(old_start, old_count).as_bytes());
-    out.extend_from_slice(b" +");
-    out.extend_from_slice(format_hunk_range(new_start, new_count).as_bytes());
-    out.extend_from_slice(b" @@");
-    if let Some(heading) = heading {
-        out.push(b' ');
-        out.extend_from_slice(heading);
+    let heading = hunk_section_heading(
+        old_lines,
+        slice.first().map(|line| line.old_index),
+        options.funcname,
+    );
+    let frag = format!(
+        "@@ -{} +{} @@",
+        format_hunk_range(old_start, old_count),
+        format_hunk_range(new_start, new_count)
+    );
+    match options.colors {
+        // Port of emit_hunk_header: the "@@ .. @@" span in the frag color,
+        // the separating blank in the context color, the heading in the func
+        // color (each reset-terminated).
+        Some(colors) => {
+            out.extend_from_slice(colors.frag.as_bytes());
+            out.extend_from_slice(frag.as_bytes());
+            out.extend_from_slice(colors.reset.as_bytes());
+            if let Some(heading) = &heading {
+                out.extend_from_slice(colors.context.as_bytes());
+                out.push(b' ');
+                out.extend_from_slice(colors.reset.as_bytes());
+                out.extend_from_slice(colors.func.as_bytes());
+                out.extend_from_slice(heading);
+                out.extend_from_slice(colors.reset.as_bytes());
+            }
+            out.push(b'\n');
+        }
+        None => {
+            out.extend_from_slice(frag.as_bytes());
+            if let Some(heading) = &heading {
+                out.push(b' ');
+                out.extend_from_slice(heading);
+            }
+            out.push(b'\n');
+        }
     }
-    out.push(b'\n');
+
+    if let Some(word_diff) = options.word_diff {
+        // Word-diff rendering: minus/plus runs accumulate and flush at
+        // context lines (fn_out_consume's diff_words branch); the
+        // "\ No newline" markers are eaten.
+        let mut buffers = commands::diff_words::WordDiffBuffers::new();
+        for line in slice {
+            match line.kind {
+                LineKind::Delete => buffers.push_minus(line.content),
+                LineKind::Insert => buffers.push_plus(line.content),
+                LineKind::Context => {
+                    buffers.flush(out, word_diff);
+                    commands::diff_words::WordDiffBuffers::emit_context_line(
+                        out,
+                        word_diff,
+                        line.content,
+                    );
+                }
+            }
+        }
+        buffers.flush(out, word_diff);
+        return;
+    }
 
     for line in slice {
         let prefix = match line.kind {
@@ -987,7 +1076,10 @@ fn write_one_hunk(
             LineKind::Delete => b'-',
             LineKind::Insert => b'+',
         };
-        write_patch_line(out, prefix, line.content);
+        match options.colors {
+            Some(colors) => write_patch_line_colored(out, prefix, line.content, colors),
+            None => write_patch_line(out, prefix, line.content),
+        }
     }
 }
 
@@ -1001,28 +1093,29 @@ fn format_hunk_range(start: usize, count: usize) -> String {
     }
 }
 
-/// git's default section heading for a hunk: the nearest line *before* the
-/// hunk's first line whose first byte looks like the start of a function (an
-/// ASCII letter, `_`, or `$`), returned without its trailing newline. Returns
-/// `None` when no such line precedes the hunk.
-fn hunk_section_heading<'a>(
-    old_lines: &[sley_diff_merge::DiffLine<'a>],
+/// git's section heading for a hunk: the nearest line *before* the hunk's
+/// first line accepted by the path's funcname patterns (or, without a driver,
+/// the default `def_ff` heuristic: first byte is an ASCII letter, `_`, or
+/// `$`). Headings are capped at the 80-byte upstream header buffer with
+/// trailing whitespace trimmed. Returns `None` when no such line precedes the
+/// hunk.
+fn hunk_section_heading(
+    old_lines: &[sley_diff_merge::DiffLine<'_>],
     first_old_index: Option<usize>,
-) -> Option<&'a [u8]> {
+    funcname: Option<&commands::userdiff::CompiledFuncname>,
+) -> Option<Vec<u8>> {
     let first = first_old_index?;
     // Scan upward from the line just above the hunk.
     for idx in (0..first).rev() {
-        let line = old_lines[idx].bytes_without_newline();
-        if line.first().is_some_and(is_funcname_start) {
-            return Some(line);
+        let heading = match funcname {
+            Some(funcname) => funcname.match_line(old_lines[idx].content),
+            None => commands::userdiff::default_funcname_heading(old_lines[idx].content),
+        };
+        if heading.is_some() {
+            return heading;
         }
     }
     None
-}
-
-/// Whether `byte` can begin a git default-funcname section heading line.
-fn is_funcname_start(byte: &u8) -> bool {
-    byte.is_ascii_alphabetic() || *byte == b'_' || *byte == b'$'
 }
 
 /// Write a single diff line with its `prefix` marker, appending the
@@ -1032,6 +1125,49 @@ fn write_patch_line(out: &mut Vec<u8>, prefix: u8, line: &[u8]) {
     out.extend_from_slice(line);
     if !line.ends_with(b"\n") {
         out.extend_from_slice(b"\n\\ No newline at end of file\n");
+    }
+}
+
+/// [`write_patch_line`] in color. Context/old lines paint the sign and body
+/// in one span; new lines paint the sign and body as separate spans, matching
+/// the default `ws-error-highlight=new` path through `emit_line_ws_markup`
+/// (whitespace-error painting itself is not implemented).
+fn write_patch_line_colored(
+    out: &mut Vec<u8>,
+    prefix: u8,
+    line: &[u8],
+    colors: &commands::diff_words::DiffColors,
+) {
+    let (body, terminated) = match line.split_last() {
+        Some((b'\n', body)) => (body, true),
+        _ => (line, false),
+    };
+    let color = match prefix {
+        b'-' => &colors.old,
+        b'+' => &colors.new,
+        _ => &colors.context,
+    };
+    if prefix == b'+' {
+        out.extend_from_slice(color.as_bytes());
+        out.push(prefix);
+        out.extend_from_slice(colors.reset.as_bytes());
+        if !body.is_empty() {
+            out.extend_from_slice(color.as_bytes());
+            out.extend_from_slice(body);
+            out.extend_from_slice(colors.reset.as_bytes());
+        }
+    } else {
+        out.extend_from_slice(color.as_bytes());
+        out.push(prefix);
+        out.extend_from_slice(body);
+        out.extend_from_slice(colors.reset.as_bytes());
+    }
+    out.push(b'\n');
+    if !terminated {
+        out.extend_from_slice(colors.context.as_bytes());
+        out.extend_from_slice(b"\\ No newline at end of file");
+        out.extend_from_slice(colors.reset.as_bytes());
+        out.push(b'\n');
     }
 }
 

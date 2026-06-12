@@ -485,6 +485,11 @@ fn render(
                 abbrev: ctx.patch_abbrev,
                 src_prefix: ctx.src_prefix,
                 dst_prefix: ctx.dst_prefix,
+                context: 3,
+                userdiff: None,
+                colors: None,
+                word_diff: None,
+                no_index_contents: None,
             };
             write_diff_patch_entry(&mut stdout, entry, options)?;
         }

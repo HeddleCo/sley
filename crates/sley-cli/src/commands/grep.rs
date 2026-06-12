@@ -2064,7 +2064,19 @@ impl Regex {
         ignore_case: bool,
         word: bool,
     ) -> Result<Self> {
-        let mut bytes = pattern.as_bytes();
+        Self::compile_bytes(pattern.as_bytes(), mode, ignore_case, word)
+    }
+
+    /// Compile a pattern given as raw bytes. Userdiff word regexes embed
+    /// non-UTF-8 byte ranges (`[\xc0-\xff][\x80-\xbf]+`), so the byte form is
+    /// the primitive; [`Regex::compile`] delegates here.
+    pub(crate) fn compile_bytes(
+        pattern: &[u8],
+        mode: RegexMode,
+        ignore_case: bool,
+        word: bool,
+    ) -> Result<Self> {
+        let mut bytes = pattern;
         if mode == RegexMode::Pcre {
             // PCRE control verbs — `(*NO_JIT)`, `(*UTF)`, ... — are
             // engine-tuning directives at the start of the pattern; sley's
@@ -2086,7 +2098,8 @@ impl Regex {
         let mut root = parser.parse_alternation()?;
         if parser.pos != bytes.len() {
             return Err(GitError::Command(format!(
-                "invalid regular expression: {pattern}"
+                "invalid regular expression: {}",
+                String::from_utf8_lossy(pattern)
             )));
         }
         if word {
@@ -2133,6 +2146,49 @@ impl Regex {
     pub(crate) fn is_match_with_case(&self, text: &[u8], ignore_case: bool) -> bool {
         self.find_from_with(text, 0, ignore_case || self.ignore_case)
             .is_some()
+    }
+
+    /// Leftmost match with capture-group spans, like POSIX `regexec` filling
+    /// `pmatch`. Index 0 is the whole match; index `n` is group `n`'s span or
+    /// `None` when the group did not participate in the match.
+    pub(crate) fn find_captures(&self, text: &[u8]) -> Option<Vec<Option<(usize, usize)>>> {
+        for start in 0..=text.len() {
+            let ctx = MatchCtx::new(text, self.num_groups);
+            if let Some(end) = match_node(&self.root, &ctx, start, self.ignore_case) {
+                let mut spans = ctx.captures.into_inner();
+                spans[0] = Some((start, end));
+                return Some(spans);
+            }
+        }
+        None
+    }
+
+    /// Leftmost match approximating POSIX leftmost-*longest* alternation: at
+    /// the first matching position, every top-level alternative is tried and
+    /// the longest match wins (ties keep the earliest alternative). Userdiff
+    /// word regexes are flat alternations of token shapes where `regexec`'s
+    /// longest-match rule is observable (`0xdead` must tokenize via the hex
+    /// alternative, not as `0` by the earlier decimal one).
+    pub(crate) fn find_longest_alternative(&self, text: &[u8]) -> Option<(usize, usize)> {
+        let branches: Vec<&Node> = match &self.root {
+            Node::Alt(branches) => branches.iter().collect(),
+            other => vec![other],
+        };
+        for start in 0..=text.len() {
+            let mut best: Option<usize> = None;
+            for branch in &branches {
+                let ctx = MatchCtx::new(text, self.num_groups);
+                if let Some(end) = match_node(branch, &ctx, start, self.ignore_case)
+                    && best.is_none_or(|current| end > current)
+                {
+                    best = Some(end);
+                }
+            }
+            if let Some(end) = best {
+                return Some((start, end));
+            }
+        }
+        None
     }
 }
 
@@ -2263,13 +2319,17 @@ impl RegexParser<'_> {
             b'[' => self.parse_class(),
             b'(' if self.pcre() => self.parse_pcre_group(),
             b'(' if self.extended() => {
+                // POSIX ERE groups are capturing (regexec fills pmatch);
+                // userdiff funcname headings use group 1 when it participated.
                 self.pos += 1;
+                self.num_groups += 1;
+                let idx = self.num_groups;
                 let inner = self.parse_alternation()?;
                 if self.peek() != Some(b')') {
                     return Err(GitError::Command("unbalanced ( in regex".into()));
                 }
                 self.pos += 1;
-                Ok(Node::Group(Box::new(inner)))
+                Ok(Node::Capture(idx, Box::new(inner)))
             }
             b'\\' => self.parse_escape(),
             other => {
@@ -2376,13 +2436,16 @@ impl RegexParser<'_> {
             }
         }
         if !self.extended() && next == b'(' {
+            // POSIX BRE groups are capturing, like ERE `(...)` above.
             self.pos += 2;
+            self.num_groups += 1;
+            let idx = self.num_groups;
             let inner = self.parse_alternation()?;
             if !self.at_group_close() {
                 return Err(GitError::Command("unbalanced \\( in regex".into()));
             }
             self.pos += 2;
-            return Ok(Node::Group(Box::new(inner)));
+            return Ok(Node::Capture(idx, Box::new(inner)));
         }
         match next {
             b'b' => {

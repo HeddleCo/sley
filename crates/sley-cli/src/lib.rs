@@ -1942,6 +1942,40 @@ struct DiffPatchOptions<'a> {
     abbrev: usize,
     src_prefix: &'a str,
     dst_prefix: &'a str,
+    /// Lines of hunk context (`-U<n>`); the porcelain default is 3.
+    context: usize,
+    /// Userdiff driver resolution (`diff=<driver>` attributes + config);
+    /// `None` keeps the default funcname heuristic.
+    userdiff: Option<&'a commands::userdiff::UserdiffResolver>,
+    /// ANSI palette when color output is enabled.
+    colors: Option<&'a commands::diff_words::DiffColors>,
+    /// Word-diff rendering request (mode + the command-line regex override).
+    word_diff: Option<&'a WordDiffRequest<'a>>,
+    /// Preloaded file contents for `diff --no-index` (old, new), bypassing
+    /// the object database / worktree reads.
+    no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
+}
+
+/// A `--word-diff` request before per-file word-regex resolution.
+struct WordDiffRequest<'a> {
+    mode: commands::diff_words::WordDiffMode,
+    /// `--word-diff-regex` / `--color-words=<re>` override.
+    cli_regex: Option<&'a str>,
+}
+
+/// Write one metainfo header line, wrapped in the meta color when enabled.
+fn write_diff_meta_line(
+    stdout: &mut dyn Write,
+    colors: Option<&commands::diff_words::DiffColors>,
+    line: &str,
+) -> Result<()> {
+    match colors {
+        Some(colors) if !colors.meta.is_empty() => {
+            writeln!(stdout, "{}{}{}", colors.meta, line, colors.reset)?;
+        }
+        _ => writeln!(stdout, "{line}")?,
+    }
+    Ok(())
 }
 
 fn write_diff_patch_entry(
@@ -1949,13 +1983,18 @@ fn write_diff_patch_entry(
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
-    let old_content = diff_entry_old_content(entry, options.db)?;
-    let new_content = diff_entry_new_content(
-        entry,
-        options.db,
-        options.worktree_root,
-        options.use_worktree_new,
-    )?;
+    let (old_content, new_content) = match options.no_index_contents {
+        Some((old, new)) => (old.map(<[u8]>::to_vec), new.map(<[u8]>::to_vec)),
+        None => (
+            diff_entry_old_content(entry, options.db)?,
+            diff_entry_new_content(
+                entry,
+                options.db,
+                options.worktree_root,
+                options.use_worktree_new,
+            )?,
+        ),
+    };
     let content_changed = old_content.as_deref() != new_content.as_deref();
     if old_content.as_deref().is_some_and(is_binary_content)
         || new_content.as_deref().is_some_and(is_binary_content)
@@ -1970,16 +2009,21 @@ fn write_diff_patch_entry(
     let header_path = diff_patch_file_header_path(options.dst_prefix, &entry.path);
     let old_similarity_path = status_quote_path(old_path, false);
     let similarity_path = status_quote_path(&entry.path, false);
-    writeln!(stdout, "diff --git {diff_old_path} {diff_path}",)?;
+    let colors = options.colors;
+    write_diff_meta_line(
+        stdout,
+        colors,
+        &format!("diff --git {diff_old_path} {diff_path}"),
+    )?;
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
             if let Some(mode) = entry.new_mode {
-                writeln!(stdout, "new file mode {mode:06o}")?;
+                write_diff_meta_line(stdout, colors, &format!("new file mode {mode:06o}"))?;
             }
         }
         sley_diff_merge::NameStatus::Deleted => {
             if let Some(mode) = entry.old_mode {
-                writeln!(stdout, "deleted file mode {mode:06o}")?;
+                write_diff_meta_line(stdout, colors, &format!("deleted file mode {mode:06o}"))?;
             }
         }
         sley_diff_merge::NameStatus::Modified
@@ -1988,8 +2032,8 @@ fn write_diff_patch_entry(
             if let (Some(old_mode), Some(new_mode)) = (entry.old_mode, entry.new_mode)
                 && old_mode != new_mode
             {
-                writeln!(stdout, "old mode {old_mode:06o}")?;
-                writeln!(stdout, "new mode {new_mode:06o}")?;
+                write_diff_meta_line(stdout, colors, &format!("old mode {old_mode:06o}"))?;
+                write_diff_meta_line(stdout, colors, &format!("new mode {new_mode:06o}"))?;
             }
         }
     }
@@ -1997,45 +2041,122 @@ fn write_diff_patch_entry(
     if !content_changed {
         return Ok(());
     }
-    writeln!(
+    write_diff_meta_line(
         stdout,
-        "index {}..{}{}",
-        diff_patch_oid(
-            entry.old_oid.as_ref(),
-            old_content.as_deref(),
-            options.format,
-            options.abbrev,
+        colors,
+        &format!(
+            "index {}..{}{}",
+            diff_patch_oid(
+                entry.old_oid.as_ref(),
+                old_content.as_deref(),
+                options.format,
+                options.abbrev,
+            ),
+            diff_patch_oid(
+                entry.new_oid.as_ref(),
+                new_content.as_deref(),
+                options.format,
+                options.abbrev,
+            ),
+            diff_patch_mode_suffix(entry)
         ),
-        diff_patch_oid(
-            entry.new_oid.as_ref(),
-            new_content.as_deref(),
-            options.format,
-            options.abbrev,
-        ),
-        diff_patch_mode_suffix(entry)
     )?;
     match entry.status {
         sley_diff_merge::NameStatus::Added => {
-            writeln!(stdout, "--- /dev/null")?;
+            write_diff_meta_line(stdout, colors, "--- /dev/null")?;
         }
         _ => {
-            writeln!(stdout, "--- {old_header_path}")?;
+            write_diff_meta_line(stdout, colors, &format!("--- {old_header_path}"))?;
         }
     }
     match entry.status {
         sley_diff_merge::NameStatus::Deleted => {
-            writeln!(stdout, "+++ /dev/null")?;
+            write_diff_meta_line(stdout, colors, "+++ /dev/null")?;
         }
         _ => {
-            writeln!(stdout, "+++ {header_path}")?;
+            write_diff_meta_line(stdout, colors, &format!("+++ {header_path}"))?;
         }
     }
-    // Context-3 hunks with git's section headings (shared with format-patch).
+    // Hunks with git's section headings (shared with format-patch). The
+    // funcname pattern comes from the old side's driver, then the new side's,
+    // mirroring diff_funcname_pattern(one) ?: diff_funcname_pattern(two);
+    // the word regex resolves CLI > old driver > new driver > diff.wordRegex.
+    let (old_driver, new_driver) = match options.userdiff {
+        Some(resolver) => (
+            resolver.driver_for_path(old_path)?,
+            resolver.driver_for_path(&entry.path)?,
+        ),
+        None => (None, None),
+    };
+    let funcname = old_driver
+        .as_ref()
+        .and_then(|driver| driver.funcname.as_ref())
+        .or_else(|| {
+            new_driver
+                .as_ref()
+                .and_then(|driver| driver.funcname.as_ref())
+        });
+    let default_colors;
+    let word_regex;
+    let word_diff = match options.word_diff {
+        Some(request) => {
+            let spec: Option<Vec<u8>> = request
+                .cli_regex
+                .map(|regex| regex.as_bytes().to_vec())
+                .or_else(|| {
+                    old_driver
+                        .as_ref()
+                        .and_then(|driver| driver.word_regex.clone())
+                })
+                .or_else(|| {
+                    new_driver
+                        .as_ref()
+                        .and_then(|driver| driver.word_regex.clone())
+                })
+                .or_else(|| {
+                    options
+                        .userdiff
+                        .and_then(commands::userdiff::UserdiffResolver::config_word_regex)
+                });
+            word_regex = spec
+                .map(|spec| {
+                    commands::grep::Regex::compile_bytes(
+                        &spec,
+                        commands::grep::RegexMode::Ere,
+                        false,
+                        false,
+                    )
+                    .map_err(|_| {
+                        eprintln!(
+                            "fatal: invalid regular expression: {}",
+                            String::from_utf8_lossy(&spec)
+                        );
+                        GitError::Exit(128)
+                    })
+                })
+                .transpose()?;
+            default_colors = commands::diff_words::DiffColors::default();
+            Some(commands::diff_words::WordDiffConfig {
+                mode: request.mode,
+                regex: word_regex.as_ref(),
+                colors: colors.unwrap_or(&default_colors),
+            })
+        }
+        None => None,
+    };
+    let hunk_options = commands::format_patch::PatchHunkOptions {
+        context: options.context,
+        funcname,
+        colors,
+        word_diff: word_diff.as_ref(),
+        ..Default::default()
+    };
     let mut hunks = Vec::new();
-    commands::format_patch::write_patch_hunks(
+    commands::format_patch::write_patch_hunks_with(
         &mut hunks,
         old_content.as_deref(),
         new_content.as_deref(),
+        &hunk_options,
     );
     stdout.write_all(&hunks)?;
     Ok(())
