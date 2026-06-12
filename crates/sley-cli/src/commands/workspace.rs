@@ -2282,6 +2282,7 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     } else {
         message
     };
+    message = tag_message_with_trailers(message, &trailers);
     // Editor flow: a commit without an explicit message source launches the
     // editor over COMMIT_EDITMSG (the in-merge / rebase conclude paths keep
     // their historical no-editor behavior).
@@ -2294,57 +2295,54 @@ pub(crate) fn cmd_commit(raw_args: &[String]) -> Result<()> {
     let use_editor = !in_rebase
         && !in_merge
         && (edit_flag == Some(true) || (edit_flag != Some(false) && !had_message_source));
-    if use_editor {
-        let editmsg = git_dir.join("COMMIT_EDITMSG");
-        fs::write(&editmsg, &message)?;
-        if let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg) {
-            eprintln!("error: {err}");
-            eprintln!("Please supply the message using either -m or -F option.");
-            return Err(GitError::Exit(1));
-        }
-        message = fs::read(&editmsg)?;
-        if cleanup_mode.is_none() {
-            message = commands::replay::strip_comment_lines(
-                &message,
-                commands::replay::comment_char(&git_dir),
-            );
-        }
-    }
-    if let Some(cleanup_mode) = cleanup_mode {
-        message = commit_cleanup_message(message, cleanup_mode);
-    }
-    let message_with_trailers =
-        commands::tag::tag_message_with_trailers(message.clone(), &trailers);
-    if (in_cherry_pick || in_revert)
-        && !allow_empty_message
-        && commit_message_is_empty(&message_with_trailers)
-    {
-        eprintln!("Aborting commit due to empty commit message.");
-        return Err(GitError::Exit(1));
-    }
-    let mut message = tag_message_with_trailers(message, &trailers);
     if !no_verify {
         commands::hooks::run_hook("pre-commit", commands::hooks::HookRun::default())?;
     }
     let editmsg = git_dir.join("COMMIT_EDITMSG");
     fs::write(&editmsg, &message)?;
-    let source = if amend {
-        "commit"
-    } else if had_message_source {
-        "message"
-    } else {
-        "template"
-    };
     let editmsg_arg = editmsg.to_string_lossy().into_owned();
-    let mut prepare_args = vec![editmsg_arg.as_str(), source];
+    let mut prepare_args = vec![editmsg_arg.as_str()];
     if amend {
+        prepare_args.push("commit");
         prepare_args.push("HEAD");
+    } else if in_merge || ((in_cherry_pick || in_revert) && git_dir.join("MERGE_MSG").is_file()) {
+        prepare_args.push("merge");
+    } else if let Some(rev) = reuse_message.as_deref() {
+        prepare_args.push("commit");
+        prepare_args.push(rev);
+    } else if had_message_source {
+        prepare_args.push("message");
+    } else {
+        prepare_args.push("template");
     }
     commands::hooks::run_hook_l("prepare-commit-msg", &prepare_args)?;
+    if use_editor
+        && let Err(err) = commands::replay::launch_editor(&git_dir, &editmsg)
+    {
+        eprintln!("error: {err}");
+        eprintln!("Please supply the message using either -m or -F option.");
+        return Err(GitError::Exit(1));
+    }
     if !no_verify {
         commands::hooks::run_hook_l("commit-msg", &[editmsg_arg.as_str()])?;
     }
     message = fs::read(&editmsg)?;
+    if use_editor && cleanup_mode.is_none() {
+        message = commands::replay::strip_comment_lines(
+            &message,
+            commands::replay::comment_char(&git_dir),
+        );
+    }
+    if let Some(cleanup_mode) = cleanup_mode {
+        message = commit_cleanup_message(message, cleanup_mode);
+    }
+    if (in_cherry_pick || in_revert)
+        && !allow_empty_message
+        && commit_message_is_empty(&message)
+    {
+        eprintln!("Aborting commit due to empty commit message.");
+        return Err(GitError::Exit(1));
+    }
     if in_rebase {
         return conclude_rebase_step_via_commit(
             &git_dir,
