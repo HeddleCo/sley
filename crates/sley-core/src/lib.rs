@@ -64,6 +64,33 @@ pub mod trace2 {
             let _ = file.write_all(line.as_bytes());
         }
     }
+
+    /// Emit the trace2 perf payload used by Git's changed-path Bloom filter
+    /// tests. This intentionally writes only the grep-stable statistics string.
+    pub fn bloom_statistics(
+        filter_not_present: usize,
+        maybe: usize,
+        definitely_not: usize,
+        false_positive: usize,
+    ) {
+        let Some(target) = std::env::var_os("GIT_TRACE2_PERF") else {
+            return;
+        };
+        let target = target.to_string_lossy().into_owned();
+        if !target.starts_with('/') {
+            return;
+        }
+        let line = format!(
+            "statistics:{{\"filter_not_present\":{filter_not_present},\"maybe\":{maybe},\"definitely_not\":{definitely_not},\"false_positive\":{false_positive}}}\n"
+        );
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+        {
+            let _ = file.write_all(line.as_bytes());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

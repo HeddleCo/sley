@@ -2790,10 +2790,13 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
     let format = repository_object_format(&git_dir)?;
     let mut object_dir: Option<PathBuf> = None;
     let mut reachable = false;
+    let mut changed_paths: Option<bool> = None;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--reachable" => reachable = true,
+            "--changed-paths" => changed_paths = Some(true),
+            "--no-changed-paths" => changed_paths = Some(false),
             "--object-dir" => {
                 let value = iter
                     .next()
@@ -2818,7 +2821,13 @@ fn cmd_commit_graph_write(args: &[String]) -> Result<()> {
         return Ok(());
     }
     let object_dir = object_dir.unwrap_or_else(|| repository_objects_dir(&git_dir));
-    let graph = commit_graph_for_reachable_refs(&git_dir, &object_dir, format)?;
+    let changed_paths = changed_paths.unwrap_or_else(|| {
+        sley_config::read_repo_config(&git_dir, None)
+            .ok()
+            .and_then(|config| config.get_bool("commitGraph", None, "changedPaths"))
+            .unwrap_or(false)
+    });
+    let graph = commit_graph_for_reachable_refs(&git_dir, &object_dir, format, changed_paths)?;
     let graph_dir = object_dir.join("info");
     fs::create_dir_all(&graph_dir)?;
     fs::write(graph_dir.join("commit-graph"), graph)?;
@@ -2924,6 +2933,7 @@ fn commit_graph_for_reachable_refs(
     git_dir: &Path,
     object_dir: &Path,
     format: ObjectFormat,
+    changed_paths: bool,
 ) -> Result<Vec<u8>> {
     let db = FileObjectDatabase::new(object_dir, format);
     let store = FileRefStore::new(git_dir, format);
@@ -2953,15 +2963,87 @@ fn commit_graph_for_reachable_refs(
     let mut generation_cache = HashMap::new();
     let mut entries = Vec::with_capacity(records.len());
     for record in &records {
+        let bloom_filter = if changed_paths {
+            Some(commit_graph_bloom_filter_for_record(
+                &db,
+                format,
+                record,
+                &record_map,
+            )?)
+        } else {
+            None
+        };
         entries.push(CommitGraphWriteEntry {
             oid: record.oid,
             tree: record.commit.tree,
             parents: record.parents.clone(),
             generation: commit_graph_generation(&record.oid, &record_map, &mut generation_cache)?,
             commit_time: commit_graph_commit_time(&record.commit)?,
+            bloom_filter,
         });
     }
     CommitGraph::write(format, &entries)
+}
+
+fn commit_graph_bloom_filter_for_record(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    record: &sley_rev::CommitRecord,
+    records: &HashMap<ObjectId, &sley_rev::CommitRecord>,
+) -> Result<Vec<u8>> {
+    let options = sley_diff_merge::DiffNameStatusOptions {
+        detect_renames: false,
+        detect_copies: false,
+        find_copies_harder: false,
+        rename_empty: false,
+    };
+    let changes = if let Some(parent) = record.parents.first() {
+        let parent_tree = if let Some(parent_record) = records.get(parent) {
+            parent_record.commit.tree
+        } else {
+            read_commit_tree_for_graph(db, format, parent)?
+        };
+        if parent_tree == record.commit.tree {
+            Vec::new()
+        } else {
+            sley_diff_merge::diff_name_status_trees_with_options(
+                db,
+                format,
+                &parent_tree,
+                &record.commit.tree,
+                options,
+            )?
+        }
+    } else {
+        sley_diff_merge::diff_name_status_empty_tree_with_options(
+            db,
+            format,
+            &record.commit.tree,
+            options,
+        )?
+    };
+    if changes.len() > sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS.max_changed_paths {
+        return Ok(vec![0xff]);
+    }
+    Ok(sley_formats::commit_graph_bloom_filter_for_paths(
+        changes.iter().map(|entry| entry.path.as_bytes()),
+        sley_formats::DEFAULT_COMMIT_GRAPH_BLOOM_SETTINGS,
+    ))
+}
+
+fn read_commit_tree_for_graph(
+    db: &FileObjectDatabase,
+    format: ObjectFormat,
+    oid: &ObjectId,
+) -> Result<ObjectId> {
+    let object = db.read_object(oid)?;
+    if object.object_type != ObjectType::Commit {
+        return Err(GitError::InvalidObject(format!(
+            "expected commit {oid}, found {}",
+            object.object_type.as_str()
+        )));
+    }
+    Ok(Commit::parse_ref(format, &object.body)?.tree)
 }
 
 fn commit_graph_generation(

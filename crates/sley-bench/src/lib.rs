@@ -180,6 +180,7 @@ pub fn create_commit_fixture() -> Result<CommitBenchFixture> {
             parents: parent.iter().cloned().collect(),
             generation: (index + 1) as u32,
             commit_time,
+            bloom_filter: None,
         });
         parent = Some(oid.clone());
         commit_oids.push(oid);

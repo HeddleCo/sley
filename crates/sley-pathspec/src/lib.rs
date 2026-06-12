@@ -137,6 +137,16 @@ impl PathspecElement {
         &self.attrs
     }
 
+    /// Whether this element carries case-insensitive matching.
+    pub fn is_icase(&self) -> bool {
+        self.icase
+    }
+
+    /// Whether this element carries glob magic.
+    pub fn is_glob(&self) -> bool {
+        self.glob
+    }
+
     /// The bare match pattern (magic prefix stripped).
     pub fn pattern(&self) -> &[u8] {
         &self.pattern
