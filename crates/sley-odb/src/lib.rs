@@ -23,6 +23,32 @@ static TEMPFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub trait ObjectReader {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>>;
+
+    /// Graft-points seam (shallow clones today, replace refs/grafts later):
+    /// `true` when history is cut at `oid`, so every walk must treat the
+    /// commit as parentless even though its raw body still names parents.
+    ///
+    /// [`FileObjectDatabase`] answers from `$GIT_DIR/shallow`; readers that
+    /// are not backed by a repository (in-memory stores, pack overlays)
+    /// keep the default "no grafts".
+    fn is_shallow_graft(&self, _oid: &ObjectId) -> bool {
+        false
+    }
+}
+
+/// Parents of a parsed commit with the graft seam applied: empty when the
+/// reader cuts history at `oid` (shallow boundary), the raw parsed parents
+/// otherwise.
+pub fn grafted_parents<R: ObjectReader + ?Sized>(
+    reader: &R,
+    oid: &ObjectId,
+    parents: Vec<ObjectId>,
+) -> Vec<ObjectId> {
+    if reader.is_shallow_graft(oid) {
+        Vec::new()
+    } else {
+        parents
+    }
 }
 
 pub trait ObjectWriter {
@@ -593,7 +619,7 @@ pub fn repack_reachable_objects(
         match object.object_type {
             ObjectType::Commit => {
                 let commit = Commit::parse_ref(format, &object.body)?;
-                pending.extend(commit.parents);
+                pending.extend(grafted_parents(&database, &oid, commit.parents));
                 pending.push(commit.tree);
             }
             ObjectType::Tree => {
@@ -1248,7 +1274,7 @@ where
                         (commit.tree, commit.parents)
                     };
                     visit(&oid, &object);
-                    for parent in parents.into_iter().rev() {
+                    for parent in grafted_parents(reader, &oid, parents).into_iter().rev() {
                         pending.push(parent);
                     }
                     pending.push(tree);
@@ -1429,7 +1455,7 @@ fn bitmap_num_maximal_commits(
         }
         let object = db.read_object(&oid)?;
         let commit = Commit::parse_ref(format, &object.body)?;
-        let parent = commit.parents.first().copied();
+        let parent = grafted_parents(db, &oid, commit.parents).first().copied();
         first_parent.insert(oid, parent);
         if let Some(parent) = parent {
             stack.push(parent);
@@ -1566,7 +1592,7 @@ fn build_reachability_bitmap(
                 pack_pos: pack_pos as u32,
                 index_pos: index_position[pack_pos],
                 date: commit_identity_timestamp(commit.committer),
-                parent_count: commit.parents.len(),
+                parent_count: grafted_parents(db, oid, commit.parents).len(),
             });
         }
     }
@@ -1639,7 +1665,7 @@ fn build_reachability_bitmap(
             let object = db.read_object(&oid)?;
             let tree = {
                 let parsed = Commit::parse_ref(format, &object.body)?;
-                pending.extend(parsed.parents);
+                pending.extend(grafted_parents(db, &oid, parsed.parents));
                 parsed.tree
             };
             if !bitmap_mark_tree(db, format, &tree, &oid_to_pack, &mut acc)? {
@@ -2048,7 +2074,7 @@ pub fn bitmap_reachable(
         }
         let object = db.read_object(&oid)?;
         let commit = Commit::parse_ref(format, &object.body)?;
-        commit_stack.extend(commit.parents);
+        commit_stack.extend(grafted_parents(db, &oid, commit.parents));
         if include_objects {
             walk.mark_tree_closure(db, format, &commit.tree)?;
         }
@@ -2501,6 +2527,23 @@ pub struct FileObjectDatabase {
     decoded: DecodedObjectCache,
     pack_deltas: PackDeltaCaches,
     pack_header_types: PackHeaderTypeCaches,
+    /// Graft points (`$GIT_DIR/shallow`), loaded lazily on the first
+    /// [`ObjectReader::is_shallow_graft`] query. `$GIT_DIR` is taken to be
+    /// the parent of `objects_dir`, matching the standard layout.
+    shallow_grafts: Arc<std::sync::OnceLock<HashSet<ObjectId>>>,
+}
+
+/// Parse `$GIT_DIR/shallow`: one hex object id per line. A missing file is an
+/// empty set (the repository is not shallow); unparsable lines are ignored so
+/// a torn write never poisons walks.
+fn read_shallow_grafts(shallow_file: &Path, format: ObjectFormat) -> HashSet<ObjectId> {
+    let Ok(contents) = std::fs::read_to_string(shallow_file) else {
+        return HashSet::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| ObjectId::from_hex(format, line.trim()).ok())
+        .collect()
 }
 
 pub fn repository_objects_dir(git_dir: impl AsRef<Path>) -> PathBuf {
@@ -2638,6 +2681,7 @@ impl FileObjectDatabase {
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
+            shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -2655,6 +2699,7 @@ impl FileObjectDatabase {
             decoded: Arc::new(Mutex::new(LruObjectCache::new(object_cache_budget()))),
             pack_deltas: Arc::new(Mutex::new(HashMap::new())),
             pack_header_types: Arc::new(Mutex::new(HashMap::new())),
+            shallow_grafts: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -3406,6 +3451,21 @@ fn alternate_object_dirs(objects_dir: &Path) -> Vec<PathBuf> {
 }
 
 impl ObjectReader for FileObjectDatabase {
+    fn is_shallow_graft(&self, oid: &ObjectId) -> bool {
+        self.shallow_grafts
+            .get_or_init(|| {
+                let shallow_file = self
+                    .objects_dir
+                    .parent()
+                    .map(|git_dir| git_dir.join("shallow"));
+                match shallow_file {
+                    Some(path) => read_shallow_grafts(&path, self.format),
+                    None => HashSet::new(),
+                }
+            })
+            .contains(oid)
+    }
+
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         match self.loose.read_object(oid) {
             Ok(object) => return Ok(object),
