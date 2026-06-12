@@ -319,7 +319,8 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
     verify_remote_object_format(&features, format)?;
 
     let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = local_push_source_refs(&local_store, format)?;
+    let mut local_refs = local_push_source_refs(&local_store, format)?;
+    add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
     let command_forces = plan_push_command_forces(
         format,
         &local_refs,
@@ -431,7 +432,8 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
     }
 
     let local_store = FileRefStore::new(git_dir, format);
-    let local_refs = local_push_source_refs(&local_store, format)?;
+    let mut local_refs = local_push_source_refs(&local_store, format)?;
+    add_revision_push_sources(git_dir, format, refspecs, &mut local_refs);
     let remote_refs = crate::local::local_fetch_advertisements(remote_git_dir, format)?;
     let command_forces =
         plan_push_command_forces(format, &local_refs, &remote_refs, refspecs, options.force)?;
@@ -571,7 +573,7 @@ fn plan_push_command_forces(
 ) -> Result<Vec<(ReceivePackCommand, bool)>> {
     let parsed_refspecs = refspecs
         .iter()
-        .map(|refspec| parse_refspec(&normalize_push_refspec(refspec)))
+        .map(|refspec| parse_refspec(&normalize_push_refspec_for_sources(refspec, local_refs)))
         .collect::<Result<Vec<_>>>()?;
     let mut command_forces = Vec::new();
     for refspec in &parsed_refspecs {
@@ -585,6 +587,94 @@ fn plan_push_command_forces(
         }
     }
     Ok(command_forces)
+}
+
+fn add_revision_push_sources(
+    git_dir: &Path,
+    format: ObjectFormat,
+    refspecs: &[String],
+    local_refs: &mut Vec<PushSourceRef>,
+) {
+    for refspec in refspecs {
+        let refspec = refspec.strip_prefix('+').unwrap_or(refspec);
+        let src = refspec.split_once(':').map_or(refspec, |(src, _)| src);
+        if src.is_empty() || src == "HEAD" || src.starts_with("refs/") {
+            continue;
+        }
+        if local_refs.iter().any(|reference| {
+            reference.name == src
+                || reference.name == format!("refs/heads/{src}")
+                || reference.name == format!("refs/tags/{src}")
+        }) {
+            continue;
+        }
+        if let Ok(oid) = sley_rev::resolve_revision(git_dir, format, src)
+            && !local_refs.iter().any(|reference| reference.name == src)
+        {
+            local_refs.push(PushSourceRef {
+                name: src.to_string(),
+                oid,
+            });
+        }
+    }
+}
+
+fn normalize_push_refspec_for_sources(refspec: &str, local_refs: &[PushSourceRef]) -> String {
+    let (force, refspec) = refspec
+        .strip_prefix('+')
+        .map_or((false, refspec), |refspec| (true, refspec));
+    let normalized = if let Some((src, dst)) = refspec.split_once(':') {
+        let (src, src_kind) = normalize_push_source_refname(src, local_refs);
+        let dst = normalize_push_destination_refname(dst, src_kind);
+        format!("{src}:{dst}")
+    } else {
+        let (name, _) = normalize_push_source_refname(refspec, local_refs);
+        format!("{name}:{name}")
+    };
+    if force {
+        format!("+{normalized}")
+    } else {
+        normalized
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PushSourceKind {
+    Branch,
+    Tag,
+    Other,
+}
+
+fn normalize_push_source_refname(
+    name: &str,
+    local_refs: &[PushSourceRef],
+) -> (String, PushSourceKind) {
+    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+        return (name.to_string(), PushSourceKind::Other);
+    }
+    let branch = format!("refs/heads/{name}");
+    let tag = format!("refs/tags/{name}");
+    let has_branch = local_refs.iter().any(|reference| reference.name == branch);
+    let has_tag = local_refs.iter().any(|reference| reference.name == tag);
+    if has_tag && !has_branch {
+        (tag, PushSourceKind::Tag)
+    } else if has_branch {
+        (branch, PushSourceKind::Branch)
+    } else if local_refs.iter().any(|reference| reference.name == name) {
+        (name.to_string(), PushSourceKind::Other)
+    } else {
+        (branch, PushSourceKind::Branch)
+    }
+}
+
+fn normalize_push_destination_refname(name: &str, src_kind: PushSourceKind) -> String {
+    if name.is_empty() || name == "HEAD" || name.starts_with("refs/") {
+        return name.to_string();
+    }
+    match src_kind {
+        PushSourceKind::Tag => format!("refs/tags/{name}"),
+        PushSourceKind::Branch | PushSourceKind::Other => format!("refs/heads/{name}"),
+    }
 }
 
 /// The planned commands, dropping the per-command force flags.
