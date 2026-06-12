@@ -2417,6 +2417,7 @@ impl LogDiffContext<'_> {
                         colors: None,
                         word_diff: None,
                         no_index_contents: None,
+                        dirty_submodules: None,
                     },
                 )?;
             }

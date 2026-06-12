@@ -146,6 +146,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
     let mut rename_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut copy_threshold = sley_diff_merge::DEFAULT_RENAME_THRESHOLD;
     let mut diff_filter = DiffFilter::default();
+    let mut ignore_submodules_cli: Option<SubmoduleIgnoreMode> = None;
     let mut path_args = Vec::new();
     // Arguments after `--` are always pathspecs, never revisions; keep them apart
     // so the revision splitter only ever reinterprets the pre-`--` positionals.
@@ -560,11 +561,16 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             value if value.starts_with("--no-color-moved-ws=") => {
                 return log_option_takes_no_value_error("no-color-moved-ws");
             }
-            "--ignore-submodules"
-            | "--ignore-submodules=none"
-            | "--ignore-submodules=untracked"
-            | "--ignore-submodules=dirty"
-            | "--ignore-submodules=all" => {}
+            // `--ignore-submodules` without a value means "all" (upstream
+            // diff_opt_ignore_submodules with no arg).
+            "--ignore-submodules" => ignore_submodules_cli = Some(SubmoduleIgnoreMode::All),
+            value if let Some(value) = value.strip_prefix("--ignore-submodules=") => {
+                let Some(mode) = parse_submodule_ignore_mode(value) else {
+                    eprintln!("fatal: bad --ignore-submodules argument: {value}");
+                    return Err(GitError::Exit(128));
+                };
+                ignore_submodules_cli = Some(mode);
+            }
             "--abbrev" => {
                 raw_abbrev = Some(Some(7));
                 patch_abbrev = Some(7);
@@ -1073,6 +1079,22 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
             )?
         }
     };
+    // Submodule-ignore handling: drop `all`-ignored gitlink entries, then for
+    // worktree-involved diffs collect each staged submodule's dirt (for the
+    // `-dirty` patch suffix) and append dirty-but-same-commit pairs the map
+    // comparison alone cannot see.
+    let submodule_config = submodule_diff_config(
+        &git_dir,
+        worktree_root.as_deref(),
+        ignore_submodules_cli,
+    );
+    let mut entries = apply_submodule_ignore_filter(entries, &submodule_config);
+    let dirty_submodules = match (use_worktree_new, worktree_root.as_deref()) {
+        (true, Some(root)) => {
+            collect_dirty_submodules(&mut entries, &git_dir, format, root, &submodule_config)?
+        }
+        _ => HashSet::new(),
+    };
     let entries = apply_diff_pathspec(entries, &pathspec);
     let entries = if let Some(needle) = pickaxe.as_deref() {
         apply_diff_pickaxe(
@@ -1261,6 +1283,7 @@ pub(crate) fn cmd_diff(args: &[String]) -> Result<()> {
                     colors: colors.as_ref(),
                     word_diff: word_request.as_ref(),
                     no_index_contents: None,
+                    dirty_submodules: Some(&dirty_submodules),
                 };
                 write_diff_patch_entry(&mut stdout, entry, options)?;
             }
@@ -1684,6 +1707,7 @@ fn cmd_diff_no_index(cwd: &Path, paths: &[String], params: DiffNoIndexParams<'_>
             colors: colors.as_ref(),
             word_diff: word_request.as_ref(),
             no_index_contents: Some((Some(&old_content), Some(&new_content))),
+            dirty_submodules: None,
         };
         write_diff_patch_entry(&mut stdout, &entry, options)?;
     }

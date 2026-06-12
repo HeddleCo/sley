@@ -737,6 +737,7 @@ fn write_commit_diff_patch(
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
+                dirty_submodules: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

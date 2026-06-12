@@ -2242,6 +2242,7 @@ fn cmd_stash_show(args: &[String]) -> Result<()> {
                         colors: None,
                         word_diff: None,
                         no_index_contents: None,
+                        dirty_submodules: None,
                     };
                     write_diff_patch_entry(&mut stdout, entry, options)?;
                 }

@@ -850,6 +850,7 @@ fn run_diff_request(
                 colors: None,
                 word_diff: None,
                 no_index_contents: None,
+                dirty_submodules: None,
             };
             write_diff_patch_entry(stdout, entry, patch_options)?;
         }

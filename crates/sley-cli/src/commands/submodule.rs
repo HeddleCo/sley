@@ -7,13 +7,45 @@ use crate::*;
 pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
     let mut index = 0;
     let mut quiet = false;
-    while matches!(args.get(index).map(String::as_str), Some("--quiet" | "-q")) {
-        quiet = true;
-        index += 1;
+    let mut leading = Vec::new();
+    loop {
+        match args.get(index).map(String::as_str) {
+            Some("--quiet" | "-q") => {
+                quiet = true;
+                index += 1;
+            }
+            // `--cached` may precede the subcommand (`git submodule --cached
+            // status`); remember it for the status default.
+            Some("--cached") => {
+                leading.push("--cached".to_string());
+                index += 1;
+            }
+            Some("-h") => {
+                // `git submodule -h` prints the usage to stdout and succeeds.
+                println!("{}", submodule_usage_text());
+                return Ok(());
+            }
+            // A bare `--` / `--end-of-options` (or any other unknown leading
+            // option) is a usage error.
+            Some("--" | "--end-of-options") if args.len() == index + 1 => {
+                return submodule_usage();
+            }
+            _ => break,
+        }
     }
     if matches!(args.get(index).map(String::as_str), Some("status")) {
         index += 1;
-        return cmd_submodule_status(&args[index..], quiet);
+        let mut rest = leading.clone();
+        rest.extend_from_slice(&args[index..]);
+        return cmd_submodule_status(&rest, quiet);
+    }
+    if matches!(args.get(index).map(String::as_str), Some("add")) {
+        index += 1;
+        return cmd_submodule_add(&args[index..], quiet);
+    }
+    if matches!(args.get(index).map(String::as_str), Some("update")) {
+        index += 1;
+        return cmd_submodule_update(&args[index..], quiet);
     }
     if matches!(args.get(index).map(String::as_str), Some("init")) {
         index += 1;
@@ -47,7 +79,9 @@ pub(crate) fn cmd_submodule(args: &[String]) -> Result<()> {
         index += 1;
         return cmd_submodule_set_url(&args[index..], quiet);
     }
-    cmd_submodule_status(&args[index..], quiet)
+    let mut rest = leading;
+    rest.extend_from_slice(&args[index..]);
+    cmd_submodule_status(&rest, quiet)
 }
 
 #[derive(Debug)]
@@ -70,6 +104,21 @@ struct SubmoduleConfigEntry {
 struct SubmoduleStatusEntry {
     path: String,
     display_path: String,
+}
+
+struct SubmoduleAddOptions {
+    repository: String,
+    path: Option<String>,
+    branch: Option<String>,
+    name: Option<String>,
+    force: bool,
+    quiet: bool,
+}
+
+struct SubmoduleUpdateOptions<'a> {
+    init: bool,
+    quiet: bool,
+    paths: Vec<&'a str>,
 }
 
 fn cmd_submodule_status(args: &[String], quiet: bool) -> Result<()> {
@@ -128,11 +177,428 @@ fn parse_submodule_status_options(args: &[String]) -> Result<SubmoduleStatusOpti
     })
 }
 
+fn cmd_submodule_add(args: &[String], quiet: bool) -> Result<()> {
+    let options = parse_submodule_add_options(args, quiet)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    let path = options
+        .path
+        .clone()
+        .unwrap_or_else(|| default_submodule_path(&options.repository));
+    let normalized_path = normalize_submodule_add_path(&cwd, &worktree_root, &path)?;
+    let destination = worktree_root.join(&normalized_path);
+
+    let existing_repo =
+        destination.is_dir() && sley_diff_merge::gitlink_git_dir(&destination).is_some();
+    if existing_repo && submodule_head(&destination).is_err() {
+        eprintln!("fatal: '{normalized_path}' does not have a commit checked out");
+        return Err(GitError::Exit(128));
+    }
+    if !options.force
+        && let Some(index) = read_repository_index(&git_dir, format)?
+        && index
+            .entries
+            .iter()
+            .any(|entry| path_matches_or_is_beneath(&entry.path, normalized_path.as_bytes()))
+    {
+        eprintln!("fatal: '{normalized_path}' already exists in the index");
+        return Err(GitError::Exit(128));
+    }
+    // Upstream add_submodule(): an existing directory must be a populated
+    // (non-bare) repository — anything else, even an empty directory, is fatal.
+    if destination.is_dir() && !existing_repo {
+        eprintln!("fatal: '{normalized_path}' already exists and is not a valid git repo");
+        return Err(GitError::Exit(128));
+    }
+
+    if existing_repo {
+        println!("Adding existing repo at '{normalized_path}' to the index");
+    } else {
+        let modules_git_dir = git_dir.join("modules").join(&normalized_path);
+        let mut clone_args = Vec::new();
+        if options.quiet {
+            clone_args.push("-q".to_string());
+        }
+        if let Some(branch) = &options.branch {
+            clone_args.push("-b".to_string());
+            clone_args.push(branch.clone());
+        }
+        clone_args.push("--separate-git-dir".to_string());
+        clone_args.push(modules_git_dir.display().to_string());
+        clone_args.push(options.repository.clone());
+        clone_args.push(destination.display().to_string());
+        super::remote_cmds::cmd_clone(&clone_args)?;
+
+        rewrite_submodule_gitdir_file(&destination, &modules_git_dir)?;
+        set_submodule_core_worktree(&destination, &modules_git_dir)?;
+    }
+
+    let (submodule_git_dir, head_oid) = submodule_head(&destination)?;
+    let submodule_format = repository_object_format(&submodule_git_dir)?;
+    if submodule_format != format {
+        eprintln!("fatal: cannot add a submodule of a different hash algorithm");
+        return Err(GitError::Exit(128));
+    }
+
+    write_submodule_mapping(
+        &git_dir,
+        &worktree_root,
+        &normalized_path,
+        &options.repository,
+        options.branch.as_deref(),
+        options.name.as_deref(),
+    )?;
+    stage_submodule_paths(&git_dir, format, &worktree_root, &normalized_path, head_oid)?;
+    Ok(())
+}
+
+fn parse_submodule_add_options(args: &[String], mut quiet: bool) -> Result<SubmoduleAddOptions> {
+    let mut branch = None;
+    let mut name = None;
+    let mut force = false;
+    let mut values = Vec::new();
+    let mut positional_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if positional_only {
+            values.push(arg.clone());
+            index += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--quiet" | "-q" => quiet = true,
+            "--force" | "-f" => force = true,
+            "--progress" | "--no-progress" => {}
+            "--name" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                name = Some(value.clone());
+            }
+            // Reference repositories are an object-sharing optimization sley
+            // does not implement yet; refuse loudly instead of cloning without
+            // the requested borrowing.
+            "--reference" | "--reference-if-able" => {
+                eprintln!("fatal: sley submodule add does not support --reference yet");
+                return Err(GitError::Exit(128));
+            }
+            "--branch" | "-b" => {
+                index += 1;
+                let Some(value) = args.get(index) else {
+                    return submodule_usage();
+                };
+                branch = Some(value.clone());
+            }
+            value if let Some(value) = value.strip_prefix("--branch=") => {
+                branch = Some(value.to_string());
+            }
+            value if let Some(value) = value.strip_prefix("--name=") => {
+                name = Some(value.to_string());
+            }
+            value if value.starts_with("--reference=") || value.starts_with("--reference-if-able=") => {
+                eprintln!("fatal: sley submodule add does not support --reference yet");
+                return Err(GitError::Exit(128));
+            }
+            value if value.starts_with('-') => return submodule_usage(),
+            value => values.push(value.to_string()),
+        }
+        index += 1;
+    }
+    match values.as_slice() {
+        [repository] => Ok(SubmoduleAddOptions {
+            repository: repository.clone(),
+            path: None,
+            branch,
+            name,
+            force,
+            quiet,
+        }),
+        [repository, path] => Ok(SubmoduleAddOptions {
+            repository: repository.clone(),
+            path: Some(path.clone()),
+            branch,
+            name,
+            force,
+            quiet,
+        }),
+        _ => submodule_usage(),
+    }
+}
+
+fn cmd_submodule_update(args: &[String], quiet: bool) -> Result<()> {
+    let options = parse_submodule_update_options(args, quiet)?;
+    let cwd = env::current_dir()?;
+    let git_dir = discover_git_dir(&cwd)?;
+    let format = repository_object_format(&git_dir)?;
+    let worktree_root = worktree_root_for_git_dir(&git_dir)?;
+    if options.init {
+        cmd_submodule_init(
+            &options
+                .paths
+                .iter()
+                .map(|path| (*path).to_string())
+                .collect::<Vec<_>>(),
+            options.quiet,
+        )?;
+    }
+    let submodules = read_submodule_configs(&worktree_root)?;
+    let selected = filter_submodule_configs(&cwd, &worktree_root, &submodules, &options.paths)?;
+    let index = read_repository_index(&git_dir, format)?;
+    let config = read_repo_config(&git_dir)?;
+    for submodule in selected {
+        let Some(target_oid) = submodule_index_oid(&index, &submodule.path) else {
+            continue;
+        };
+        let path = worktree_root.join(&submodule.path);
+        // `update` (without --init) only touches *initialized* submodules:
+        // ones whose url was copied into .git/config. A .gitmodules-only
+        // entry gets upstream's two-line stderr nudge and is skipped.
+        let Some(url) = config
+            .get("submodule", Some(&submodule.name), "url")
+            .map(str::to_string)
+        else {
+            eprintln!("Submodule path '{}' not initialized", submodule.path);
+            eprintln!("Maybe you want to use 'update --init'?");
+            continue;
+        };
+        let just_populated = submodule_head(&path).is_err();
+        if just_populated {
+            // Populate the worktree: reconnect to a retained
+            // .git/modules/<path> git dir when one exists (upstream
+            // clone_submodule does the same after the worktree was removed),
+            // otherwise clone fresh. NOTE: `-N/--no-fetch` only skips the
+            // *fetch* step of an update; the native implementation has no
+            // separate fetch today, so the flag is accepted as a no-op.
+            let modules_git_dir = git_dir.join("modules").join(&submodule.path);
+            if modules_git_dir.join("HEAD").is_file() {
+                if path.exists() {
+                    if !path.is_dir() || fs::read_dir(&path)?.next().is_some() {
+                        eprintln!(
+                            "fatal: destination path '{}' already exists and is not an empty directory",
+                            submodule.path
+                        );
+                        return Err(GitError::Exit(128));
+                    }
+                } else {
+                    fs::create_dir_all(&path)?;
+                }
+                rewrite_submodule_gitdir_file(&path, &modules_git_dir)?;
+                set_submodule_core_worktree(&path, &modules_git_dir)?;
+            } else {
+                let mut clone_args = Vec::new();
+                if options.quiet {
+                    clone_args.push("-q".to_string());
+                }
+                clone_args.push("--separate-git-dir".to_string());
+                clone_args.push(modules_git_dir.display().to_string());
+                clone_args.push(url);
+                clone_args.push(path.display().to_string());
+                super::remote_cmds::cmd_clone(&clone_args)?;
+                rewrite_submodule_gitdir_file(&path, &modules_git_dir)?;
+                set_submodule_core_worktree(&path, &modules_git_dir)?;
+            }
+        }
+        // Check out the gitlink oid recorded in the superproject index,
+        // detached — upstream `submodule update --checkout` runs
+        // `git checkout -q <oid>` inside the submodule and reports it. A
+        // submodule already at the recorded oid is left alone (and silent) —
+        // unless its worktree was just (re)populated: a reconnected git dir
+        // can already have HEAD at the target while the worktree is empty.
+        let (sub_git_dir, head_oid) = submodule_head(&path)?;
+        if just_populated || head_oid != target_oid {
+            let sub_format = repository_object_format(&sub_git_dir)?;
+            sley_worktree::reset_index_and_worktree_to_commit(
+                &path,
+                &sub_git_dir,
+                sub_format,
+                &target_oid,
+            )?;
+            fs::write(sub_git_dir.join("HEAD"), format!("{target_oid}\n"))?;
+            if !options.quiet {
+                println!(
+                    "Submodule path '{}': checked out '{target_oid}'",
+                    submodule.path
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_submodule_update_options(
+    args: &[String],
+    mut quiet: bool,
+) -> Result<SubmoduleUpdateOptions<'_>> {
+    let mut init = false;
+    let mut paths = Vec::new();
+    let mut positional_only = false;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if positional_only {
+            paths.push(arg.as_str());
+            index += 1;
+            continue;
+        }
+        match arg.as_str() {
+            "--" => positional_only = true,
+            "--quiet" | "-q" => quiet = true,
+            "--init" => init = true,
+            // `-N/--no-fetch` skips the fetch step of an update; the native
+            // implementation performs no separate fetch, so it is a no-op
+            // (NOT "skip checkout" — the checkout below still happens).
+            "--no-fetch" | "-N" => {}
+            "--checkout"
+            | "--merge"
+            | "--rebase"
+            | "--recursive"
+            | "--recommend-shallow"
+            | "--no-recommend-shallow"
+            | "--single-branch"
+            | "--no-single-branch" => {}
+            "--filter" => {
+                index += 1;
+                if args.get(index).is_none() {
+                    return submodule_usage();
+                }
+            }
+            // See parse_submodule_add_options: refuse --reference rather than
+            // silently cloning without the requested object borrowing.
+            "--reference" => {
+                eprintln!("fatal: sley submodule update does not support --reference yet");
+                return Err(GitError::Exit(128));
+            }
+            value if value.starts_with("--reference=") => {
+                eprintln!("fatal: sley submodule update does not support --reference yet");
+                return Err(GitError::Exit(128));
+            }
+            value if value.starts_with("--filter=") => {}
+            value if value.starts_with('-') => return submodule_usage(),
+            value => paths.push(value),
+        }
+        index += 1;
+    }
+    Ok(SubmoduleUpdateOptions { init, quiet, paths })
+}
+
+fn submodule_usage_text() -> &'static str {
+    "usage: git submodule [--quiet] [--cached]\n   or: git submodule [--quiet] add [-b <branch>] [-f|--force] [--name <name>] [--reference <repository>] [--] <repository> [<path>]\n   or: git submodule [--quiet] status [--cached] [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] init [--] [<path>...]\n   or: git submodule [--quiet] deinit [-f|--force] (--all| [--] <path>...)\n   or: git submodule [--quiet] update [--init [--filter=<filter-spec>]] [--remote] [-N|--no-fetch] [-f|--force] [--checkout|--merge|--rebase] [--[no-]recommend-shallow] [--reference <repository>] [--recursive] [--[no-]single-branch] [--] [<path>...]\n   or: git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>\n   or: git submodule [--quiet] set-url [--] <path> <newurl>\n   or: git submodule [--quiet] summary [--cached|--files] [--summary-limit <n>] [commit] [--] [<path>...]\n   or: git submodule [--quiet] foreach [--recursive] <command>\n   or: git submodule [--quiet] sync [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] absorbgitdirs [--] [<path>...]"
+}
+
 fn submodule_usage<T>() -> Result<T> {
-    eprintln!(
-        "usage: git submodule [--quiet] [--cached]\n   or: git submodule [--quiet] add [-b <branch>] [-f|--force] [--name <name>] [--reference <repository>] [--] <repository> [<path>]\n   or: git submodule [--quiet] status [--cached] [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] init [--] [<path>...]\n   or: git submodule [--quiet] deinit [-f|--force] (--all| [--] <path>...)\n   or: git submodule [--quiet] update [--init [--filter=<filter-spec>]] [--remote] [-N|--no-fetch] [-f|--force] [--checkout|--merge|--rebase] [--[no-]recommend-shallow] [--reference <repository>] [--recursive] [--[no-]single-branch] [--] [<path>...]\n   or: git submodule [--quiet] set-branch (--default|--branch <branch>) [--] <path>\n   or: git submodule [--quiet] set-url [--] <path> <newurl>\n   or: git submodule [--quiet] summary [--cached|--files] [--summary-limit <n>] [commit] [--] [<path>...]\n   or: git submodule [--quiet] foreach [--recursive] <command>\n   or: git submodule [--quiet] sync [--recursive] [--] [<path>...]\n   or: git submodule [--quiet] absorbgitdirs [--] [<path>...]"
-    );
+    eprintln!("{}", submodule_usage_text());
     Err(GitError::Exit(1))
+}
+
+fn default_submodule_path(repository: &str) -> String {
+    let trimmed = repository.trim_end_matches('/');
+    let name = Path::new(trimmed)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| trimmed.to_string());
+    name.strip_suffix(".git").unwrap_or(&name).to_string()
+}
+
+fn normalize_submodule_add_path(cwd: &Path, worktree_root: &Path, path: &str) -> Result<String> {
+    let input = Path::new(path.trim_end_matches('/'));
+    let absolute = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        cwd.join(input)
+    };
+    let normalized = normalize_lexical_path(&absolute);
+    let relative = normalized.strip_prefix(worktree_root).map_err(|_| {
+        eprintln!("fatal: submodule path '{}' is outside repository", path);
+        GitError::Exit(128)
+    })?;
+    let path = relative
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if path.is_empty() {
+        return submodule_usage();
+    }
+    Ok(path)
+}
+
+fn path_matches_or_is_beneath(index_path: &BString, path: &[u8]) -> bool {
+    index_path.as_bytes() == path
+        || index_path
+            .as_bytes()
+            .strip_prefix(path)
+            .is_some_and(|rest| rest.starts_with(b"/"))
+}
+
+fn rewrite_submodule_gitdir_file(submodule_root: &Path, modules_git_dir: &Path) -> Result<()> {
+    let link = relative_path_from_absolute_components(submodule_root, modules_git_dir)?;
+    fs::write(submodule_root.join(".git"), format!("gitdir: {link}\n"))?;
+    Ok(())
+}
+
+fn set_submodule_core_worktree(submodule_root: &Path, modules_git_dir: &Path) -> Result<()> {
+    let mut config = read_repo_config(modules_git_dir)?;
+    let worktree = relative_path_from_absolute_components(modules_git_dir, submodule_root)?;
+    set_config_value(&mut config, "core", None, "worktree", &worktree);
+    write_repo_config(modules_git_dir, &config)
+}
+
+fn write_submodule_mapping(
+    git_dir: &Path,
+    worktree_root: &Path,
+    path: &str,
+    url: &str,
+    branch: Option<&str>,
+    name_override: Option<&str>,
+) -> Result<()> {
+    let gitmodules_path = worktree_root.join(".gitmodules");
+    let mut gitmodules = GitConfig::read(&gitmodules_path).unwrap_or_default();
+    let name = name_override.map(str::to_string).unwrap_or_else(|| {
+        submodule_name_for_exact_path(&gitmodules, path).unwrap_or_else(|| path.to_string())
+    });
+    set_submodule_config_value(&mut gitmodules, &name, "path", path);
+    set_submodule_config_value(&mut gitmodules, &name, "url", url);
+    if let Some(branch) = branch {
+        set_submodule_config_value(&mut gitmodules, &name, "branch", branch);
+    }
+    fs::write(&gitmodules_path, gitmodules.to_canonical_bytes())?;
+
+    let mut config = read_repo_config(git_dir)?;
+    set_submodule_config_value(&mut config, &name, "url", url);
+    set_submodule_config_value(&mut config, &name, "active", "true");
+    write_repo_config(git_dir, &config)?;
+    Ok(())
+}
+
+fn stage_submodule_paths(
+    git_dir: &Path,
+    format: ObjectFormat,
+    worktree_root: &Path,
+    path: &str,
+    oid: ObjectId,
+) -> Result<()> {
+    super::plumbing::cmd_add(&[worktree_root.join(".gitmodules").display().to_string()])?;
+    sley_worktree::update_index_cacheinfo(
+        git_dir,
+        format,
+        &[sley_worktree::CacheInfoEntry {
+            mode: 0o160000,
+            oid,
+            path: path.as_bytes().to_vec(),
+            stage: 0,
+        }],
+        true,
+        false,
+    )?;
+    Ok(())
 }
 
 fn cmd_submodule_init(args: &[String], quiet: bool) -> Result<()> {

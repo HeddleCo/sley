@@ -1954,6 +1954,10 @@ struct DiffPatchOptions<'a> {
     /// Preloaded file contents for `diff --no-index` (old, new), bypassing
     /// the object database / worktree reads.
     no_index_contents: Option<(Option<&'a [u8]>, Option<&'a [u8]>)>,
+    /// Gitlink paths whose worktree-side synthesized content carries the
+    /// `-dirty` suffix (the submodule's own tree has modified/untracked
+    /// content the effective ignore mode does not suppress).
+    dirty_submodules: Option<&'a HashSet<Vec<u8>>>,
 }
 
 /// A `--word-diff` request before per-file word-regex resolution.
@@ -1978,12 +1982,180 @@ fn write_diff_meta_line(
     Ok(())
 }
 
+/// The `--ignore-submodules` modes (upstream handle_ignore_submodules_arg).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubmoduleIgnoreMode {
+    /// Nothing is ignored: untracked content alone marks a submodule dirty.
+    None,
+    /// Untracked content in submodules is ignored (the implicit default for
+    /// porcelain diff: repo_diff_setup sets ignore_untracked_in_submodules).
+    Untracked,
+    /// All working-tree dirt is ignored; only commit changes show.
+    Dirty,
+    /// Submodules are ignored entirely.
+    All,
+}
+
+fn parse_submodule_ignore_mode(value: &str) -> Option<SubmoduleIgnoreMode> {
+    match value {
+        "none" => Some(SubmoduleIgnoreMode::None),
+        "untracked" => Some(SubmoduleIgnoreMode::Untracked),
+        "dirty" => Some(SubmoduleIgnoreMode::Dirty),
+        "all" => Some(SubmoduleIgnoreMode::All),
+        _ => None,
+    }
+}
+
+/// The resolved submodule-ignore configuration for a diff invocation.
+/// Precedence per path (upstream run_diff_files / set_diffopt_flags_from_
+/// submodule_config): an explicit `--ignore-submodules` wins over everything;
+/// otherwise `submodule.<name>.ignore` in the repo config, then in
+/// `.gitmodules`; otherwise `diff.ignoreSubmodules`; otherwise the implicit
+/// untracked-ignoring default.
+struct SubmoduleDiffConfig {
+    cli: Option<SubmoduleIgnoreMode>,
+    base: SubmoduleIgnoreMode,
+    per_path: HashMap<Vec<u8>, SubmoduleIgnoreMode>,
+}
+
+impl SubmoduleDiffConfig {
+    fn effective(&self, path: &[u8]) -> SubmoduleIgnoreMode {
+        if let Some(mode) = self.cli {
+            return mode;
+        }
+        if let Some(mode) = self.per_path.get(path) {
+            return *mode;
+        }
+        self.base
+    }
+}
+
+fn submodule_diff_config(
+    git_dir: &Path,
+    worktree_root: Option<&Path>,
+    cli: Option<SubmoduleIgnoreMode>,
+) -> SubmoduleDiffConfig {
+    let repo_config = read_repo_config(git_dir).ok();
+    let base = repo_config
+        .as_ref()
+        .and_then(|config| config.get("diff", None, "ignoresubmodules"))
+        .and_then(parse_submodule_ignore_mode)
+        .unwrap_or(SubmoduleIgnoreMode::Untracked);
+    let mut per_path = HashMap::new();
+    if let Some(root) = worktree_root
+        && let Ok(gitmodules) = GitConfig::read(root.join(".gitmodules"))
+    {
+        for section in &gitmodules.sections {
+            if section.name != "submodule" {
+                continue;
+            }
+            let Some(name) = section.subsection.as_deref() else {
+                continue;
+            };
+            let value_of = |key: &str| {
+                section
+                    .entries
+                    .iter()
+                    .rev()
+                    .find(|entry| entry.key.eq_ignore_ascii_case(key))
+                    .and_then(|entry| entry.value.as_deref())
+            };
+            let Some(path) = value_of("path") else {
+                continue;
+            };
+            let ignore = repo_config
+                .as_ref()
+                .and_then(|config| config.get("submodule", Some(name), "ignore"))
+                .or_else(|| value_of("ignore"));
+            if let Some(mode) = ignore.and_then(parse_submodule_ignore_mode) {
+                per_path.insert(path.as_bytes().to_vec(), mode);
+            }
+        }
+    }
+    SubmoduleDiffConfig {
+        cli,
+        base,
+        per_path,
+    }
+}
+
+/// Drop gitlink entries whose effective ignore mode is `all`.
+fn apply_submodule_ignore_filter(
+    entries: Vec<sley_diff_merge::NameStatusEntry>,
+    config: &SubmoduleDiffConfig,
+) -> Vec<sley_diff_merge::NameStatusEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let gitlink =
+                entry.old_mode == Some(0o160000) || entry.new_mode == Some(0o160000);
+            !(gitlink && config.effective(&entry.path) == SubmoduleIgnoreMode::All)
+        })
+        .collect()
+}
+
+/// For a worktree-involved diff: find every staged gitlink whose submodule
+/// tree is dirty under its effective ignore mode (the `-dirty` suffix set),
+/// and append a Modified pair for dirty submodules whose checked-out commit
+/// still matches the staged oid (which the map comparison alone would skip).
+fn collect_dirty_submodules(
+    entries: &mut Vec<sley_diff_merge::NameStatusEntry>,
+    git_dir: &Path,
+    format: ObjectFormat,
+    worktree_root: &Path,
+    config: &SubmoduleDiffConfig,
+) -> Result<HashSet<Vec<u8>>> {
+    let mut dirty = HashSet::new();
+    let Some(index) = sley_worktree::read_repository_index(git_dir, format)? else {
+        return Ok(dirty);
+    };
+    let mut injected = false;
+    for entry in &index.entries {
+        if entry.mode != 0o160000 {
+            continue;
+        }
+        let path = entry.path.as_bytes();
+        let mode = config.effective(path);
+        if matches!(
+            mode,
+            SubmoduleIgnoreMode::All | SubmoduleIgnoreMode::Dirty
+        ) {
+            continue;
+        }
+        let sub_root = worktree_root.join(repo_path_to_path(path));
+        let dirt = sley_worktree::submodule_dirt(&sub_root);
+        let counts = dirt & sley_worktree::DIRTY_SUBMODULE_MODIFIED != 0
+            || (mode == SubmoduleIgnoreMode::None
+                && dirt & sley_worktree::DIRTY_SUBMODULE_UNTRACKED != 0);
+        if !counts {
+            continue;
+        }
+        dirty.insert(path.to_vec());
+        if !entries.iter().any(|existing| existing.path[..] == *path) {
+            entries.push(sley_diff_merge::NameStatusEntry {
+                status: sley_diff_merge::NameStatus::Modified,
+                path: path.to_vec().into(),
+                old_path: None,
+                old_mode: Some(0o160000),
+                new_mode: Some(0o160000),
+                old_oid: Some(entry.oid),
+                new_oid: Some(entry.oid),
+            });
+            injected = true;
+        }
+    }
+    if injected {
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+    }
+    Ok(dirty)
+}
+
 fn write_diff_patch_entry(
     stdout: &mut dyn Write,
     entry: &sley_diff_merge::NameStatusEntry,
     options: DiffPatchOptions<'_>,
 ) -> Result<()> {
-    let (old_content, new_content) = match options.no_index_contents {
+    let (old_content, mut new_content) = match options.no_index_contents {
         Some((old, new)) => (old.map(<[u8]>::to_vec), new.map(<[u8]>::to_vec)),
         None => (
             diff_entry_old_content(entry, options.db)?,
@@ -1995,6 +2167,20 @@ fn write_diff_patch_entry(
             )?,
         ),
     };
+    // A dirty submodule's worktree side carries the `-dirty` suffix in the
+    // synthesized "Subproject commit <oid>" content (diff.c
+    // diff_populate_filespec with dirty_submodule set).
+    if entry.new_mode == Some(0o160000)
+        && options.use_worktree_new
+        && options
+            .dirty_submodules
+            .is_some_and(|dirty| dirty.contains(&entry.path[..]))
+        && let Some(content) = new_content.as_mut()
+        && content.ends_with(b"\n")
+    {
+        content.truncate(content.len() - 1);
+        content.extend_from_slice(b"-dirty\n");
+    }
     let content_changed = old_content.as_deref() != new_content.as_deref();
     if old_content.as_deref().is_some_and(is_binary_content)
         || new_content.as_deref().is_some_and(is_binary_content)
@@ -3160,10 +3346,24 @@ fn plural<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
+/// The synthetic blob content git diffs a gitlink as: `Subproject commit
+/// <oid>\n` (diff.c diff_populate_filespec), with an optional `-dirty` suffix
+/// for a worktree-side submodule whose own tree has changes.
+fn gitlink_diff_content(oid: &ObjectId, dirty: bool) -> Vec<u8> {
+    let suffix = if dirty { "-dirty" } else { "" };
+    format!("Subproject commit {oid}{suffix}\n").into_bytes()
+}
+
 fn diff_entry_old_content(
     entry: &sley_diff_merge::NameStatusEntry,
     db: &FileObjectDatabase,
 ) -> Result<Option<Vec<u8>>> {
+    if entry.old_mode == Some(0o160000) {
+        return Ok(entry
+            .old_oid
+            .as_ref()
+            .map(|oid| gitlink_diff_content(oid, false)));
+    }
     entry
         .old_oid
         .as_ref()
@@ -3179,6 +3379,24 @@ fn diff_entry_new_content(
 ) -> Result<Option<Vec<u8>>> {
     if entry.new_mode.is_none() {
         return Ok(None);
+    }
+    if entry.new_mode == Some(0o160000) {
+        // A gitlink's content never comes from reading the path (it's a
+        // directory): it is the recorded commit — the entry's oid, or for a
+        // worktree comparison (where changed-path oids are unresolved) the
+        // submodule's live HEAD, falling back to the old side's oid.
+        let oid = match entry.new_oid {
+            Some(oid) => Some(oid),
+            None => match (use_worktree, worktree_root) {
+                (true, Some(root)) => {
+                    let sub_root = root.join(repo_path_to_path(&entry.path));
+                    sley_diff_merge::gitlink_head_oid(&sub_root, db.object_format())
+                        .or(entry.old_oid)
+                }
+                _ => entry.old_oid,
+            },
+        };
+        return Ok(oid.map(|oid| gitlink_diff_content(&oid, false)));
     }
     if use_worktree {
         let root = worktree_root.ok_or_else(|| {

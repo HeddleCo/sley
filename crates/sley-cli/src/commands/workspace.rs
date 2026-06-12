@@ -3304,10 +3304,18 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
             println!("{}", status_branch_header(&git_dir, format, ahead_behind)?);
         }
         for entry in entries {
+            // `--short` (but not --porcelain) refines a submodule's worktree
+            // column per upstream short_submodule_status(): 'M' new commits,
+            // 'm' modified content, '?' untracked content.
+            let worktree_code = if porcelain_v1 {
+                entry.worktree
+            } else {
+                status_short_submodule_code(&entry)
+            };
             println!(
                 "{}{} {}",
                 entry.index as char,
-                entry.worktree as char,
+                worktree_code as char,
                 status_quote_path(&entry.path, true)
             );
         }
@@ -3315,6 +3323,24 @@ pub(crate) fn cmd_status(args: &[String]) -> Result<()> {
         print_status_long(&git_dir, format, entries, false, show_stash, ahead_behind)?;
     }
     Ok(())
+}
+
+/// Upstream wt-status.c short_submodule_status(): in `--short` output a
+/// changed submodule's worktree column shows 'M' for new commits, 'm' for
+/// modified content, '?' for untracked content (priority in that order).
+fn status_short_submodule_code(entry: &sley_worktree::ShortStatusEntry) -> u8 {
+    let Some(submodule) = entry.submodule else {
+        return entry.worktree;
+    };
+    if submodule.new_commits {
+        b'M'
+    } else if submodule.modified_content {
+        b'm'
+    } else if submodule.untracked_content {
+        b'?'
+    } else {
+        entry.worktree
+    }
 }
 
 fn status_option_takes_no_value_error(option: &str) -> Result<()> {
@@ -3454,9 +3480,24 @@ fn print_status_porcelain_v2(
         }
         let index = status_porcelain_v2_code(entry.index);
         let worktree = status_porcelain_v2_code(entry.worktree);
+        // Porcelain v2 submodule field (wt-status.c wt_porcelain_v2_*):
+        // "N..." for an ordinary path; "S<C><M><U>" for a submodule, with C
+        // for new commits, M for modified content, U for untracked content.
+        let sub = match entry.submodule {
+            Some(submodule) => format!(
+                "S{}{}{}",
+                if submodule.new_commits { 'C' } else { '.' },
+                if submodule.modified_content { 'M' } else { '.' },
+                if submodule.untracked_content { 'U' } else { '.' },
+            ),
+            None if entry.index_mode == Some(0o160000) || entry.worktree_mode == Some(0o160000) => {
+                "S...".to_string()
+            }
+            None => "N...".to_string(),
+        };
         write!(
             stdout,
-            "1 {index}{worktree} N... {:06o} {:06o} {:06o} {} {} ",
+            "1 {index}{worktree} {sub} {:06o} {:06o} {:06o} {} {} ",
             entry.head_mode.unwrap_or(0),
             entry.index_mode.unwrap_or(0),
             entry.worktree_mode.unwrap_or(0),
@@ -3509,7 +3550,31 @@ fn print_status_long(
             staged.push((label, entry.path.clone()));
         }
         if let Some(label) = status_long_change_label(entry.worktree) {
-            unstaged.push((label, entry.path));
+            // Submodule change detail (wt-status.c): " (new commits, modified
+            // content, untracked content)" — whichever apply, in that order.
+            let mut extras = Vec::new();
+            if let Some(submodule) = entry.submodule {
+                if submodule.new_commits {
+                    extras.push("new commits");
+                }
+                if submodule.modified_content {
+                    extras.push("modified content");
+                }
+                if submodule.untracked_content {
+                    extras.push("untracked content");
+                }
+            }
+            let suffix = if extras.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", extras.join(", "))
+            };
+            // The "(commit or discard ...)" hint keys on dirty *content* only,
+            // not on new commits (wt_status_check_worktree_changes).
+            let dirty_submodule = entry
+                .submodule
+                .is_some_and(|sub| sub.modified_content || sub.untracked_content);
+            unstaged.push((label, entry.path, suffix, dirty_submodule));
         }
     }
 
@@ -3538,14 +3603,17 @@ fn print_status_long(
             println!();
         }
         println!("Changes not staged for commit:");
-        if unstaged.iter().any(|(label, _)| *label == "deleted:") {
+        if unstaged.iter().any(|(label, _, _, _)| *label == "deleted:") {
             println!("  (use \"git add/rm <file>...\" to update what will be committed)");
         } else {
             println!("  (use \"git add <file>...\" to update what will be committed)");
         }
         println!("  (use \"git restore <file>...\" to discard changes in working directory)");
-        for (label, path) in unstaged {
-            println!("\t{label:<12}{}", status_quote_path(&path, false));
+        if unstaged.iter().any(|(_, _, _, dirty)| *dirty) {
+            println!("  (commit or discard the untracked or modified content in submodules)");
+        }
+        for (label, path, suffix, _) in unstaged {
+            println!("\t{label:<12}{}{suffix}", status_quote_path(&path, false));
         }
     }
 
