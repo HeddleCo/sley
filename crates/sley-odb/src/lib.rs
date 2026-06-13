@@ -5,7 +5,7 @@
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 use sley_formats::{Bundle, BundleReference};
 use sley_object::{Commit, EncodedObject, ObjectType, Tag, TreeEntries, parse_framed_object};
 use sley_pack::{
@@ -39,6 +39,20 @@ pub trait ObjectReader {
 fn implied_empty_tree_object(format: ObjectFormat, oid: &ObjectId) -> Option<Arc<EncodedObject>> {
     (*oid == ObjectId::empty_tree(format))
         .then(|| Arc::new(EncodedObject::new(ObjectType::Tree, Vec::new())))
+}
+
+fn with_missing_object_context(
+    err: GitError,
+    oid: ObjectId,
+    context: MissingObjectContext,
+) -> GitError {
+    let kind = err
+        .not_found_kind()
+        .and_then(sley_core::NotFoundKind::missing_object_kind);
+    match kind {
+        Some(kind) => GitError::object_kind_not_found_in(oid, kind, context),
+        None => err,
+    }
 }
 
 /// Parents of a parsed commit with the graft seam applied: empty when the
@@ -150,14 +164,10 @@ pub fn verify_bundle_prerequisites<R: ObjectReader>(bundle: &Bundle, reader: &R)
     if missing.is_empty() {
         return Ok(());
     }
-    let missing = missing
-        .iter()
-        .map(ObjectId::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(GitError::not_found(format!(
-        "bundle prerequisites missing: {missing}"
-    )))
+    Err(GitError::object_not_found_in(
+        missing[0],
+        MissingObjectContext::PackInstall,
+    ))
 }
 
 pub fn unbundle_objects<R, W>(
@@ -1324,7 +1334,9 @@ where
             if !seen.insert(oid) {
                 continue;
             }
-            let object = reader.read_object(&oid)?;
+            let object = reader.read_object(&oid).map_err(|err| {
+                with_missing_object_context(err, oid, MissingObjectContext::Traversal)
+            })?;
             match object.object_type {
                 ObjectType::Commit => {
                     let (tree, parents) = {
@@ -2253,11 +2265,11 @@ impl ObjectReader for ObjectDatabase {
     fn read_object(&self, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
         self.objects
             .lock()
-            .map_err(|_| GitError::object_not_found(*oid))?
+            .map_err(|_| GitError::object_not_found_in(*oid, MissingObjectContext::Read))?
             .get(oid)
             .map(Arc::clone)
             .or_else(|| implied_empty_tree_object(self.format, oid))
-            .ok_or_else(|| GitError::object_not_found(*oid))
+            .ok_or_else(|| GitError::object_not_found_in(*oid, MissingObjectContext::Read))
     }
 }
 
@@ -3577,7 +3589,10 @@ impl ObjectReader for FileObjectDatabase {
             Err(GitError::NotFound(_)) => {}
             Err(err) => return Err(err),
         }
-        Err(GitError::object_not_found(*oid))
+        Err(GitError::object_not_found_in(
+            *oid,
+            MissingObjectContext::Read,
+        ))
     }
 }
 
@@ -3975,12 +3990,18 @@ impl ObjectReader for LooseObjectStore {
         // Skip the `open()` (and its ENOENT) for ids the loose cache knows are
         // not on disk — the dominant wasted syscall when reading packed objects.
         if !self.loose_oid_present(oid) {
-            return Err(GitError::object_not_found(*oid));
+            return Err(GitError::object_not_found_in(
+                *oid,
+                MissingObjectContext::Read,
+            ));
         }
         let compressed = match fs::read(&path) {
             Ok(compressed) => compressed,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(GitError::object_not_found(*oid));
+                return Err(GitError::object_not_found_in(
+                    *oid,
+                    MissingObjectContext::Read,
+                ));
             }
             Err(err) => return Err(GitError::Io(err.to_string())),
         };
@@ -4846,10 +4867,14 @@ mod tests {
 
         let missing = ObjectId::from_hex(format, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("test operation should succeed");
-        assert!(matches!(
-            collect_reachable_object_ids(&db, format, std::iter::once(missing)),
-            Err(GitError::NotFound(_))
-        ));
+        let err = collect_reachable_object_ids(&db, format, std::iter::once(missing))
+            .expect_err("missing traversal root should error");
+        let kind = err.not_found_kind().expect("typed not found");
+        assert_eq!(kind.object_id(), Some(missing));
+        assert_eq!(
+            kind.missing_object_context(),
+            Some(MissingObjectContext::Traversal)
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

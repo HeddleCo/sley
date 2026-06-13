@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use sley_config::raw_edit::{
     ConfigFileWriteError, ConfigFileWriteOptions, RawConfigEditor, RawEditOutcome,
-    write_config_file_locked,
+    SectionEditOutcome, rename_or_remove_section, write_config_file_locked,
 };
 use sley_config::{ConfigOriginKind, ConfigScope, ConfigStack};
 
@@ -45,6 +45,72 @@ impl ConfigSnapshot {
             .filter(|value| value.key == key.full)
             .collect())
     }
+}
+
+/// Source-attributed remote configuration, lowest precedence first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteConfigSnapshot {
+    pub remotes: Vec<RemoteConfig>,
+}
+
+impl RemoteConfigSnapshot {
+    pub fn get(&self, name: &str) -> Option<&RemoteConfig> {
+        self.remotes.iter().find(|remote| remote.name == name)
+    }
+}
+
+/// One logical `[remote "<name>"]` assembled from the effective config stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfig {
+    pub name: String,
+    pub values: Vec<RemoteConfigValue>,
+    pub sources: Vec<RemoteConfigSource>,
+}
+
+impl RemoteConfig {
+    pub fn urls(&self) -> Vec<&str> {
+        self.values_for("url")
+    }
+
+    pub fn push_urls(&self) -> Vec<&str> {
+        self.values_for("pushurl")
+    }
+
+    pub fn fetch_refspecs(&self) -> Vec<&str> {
+        self.values_for("fetch")
+    }
+
+    pub fn values_for(&self, name: &str) -> Vec<&str> {
+        self.values
+            .iter()
+            .filter(|value| value.name.eq_ignore_ascii_case(name))
+            .filter_map(|value| value.value.as_deref())
+            .collect()
+    }
+}
+
+/// One key/value inside a remote section with its physical source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfigValue {
+    pub name: String,
+    pub value: Option<String>,
+    pub source: ConfigSource,
+}
+
+/// A physical source contributing to a remote, plus editability metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfigSource {
+    pub source: ConfigSource,
+    pub editable: bool,
+    pub target_path: Option<PathBuf>,
+    pub refusal: Option<RemoteConfigRefusal>,
+}
+
+/// Why a remote source cannot be edited by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteConfigRefusal {
+    ExternalInclude { path: PathBuf },
+    SyntheticSource,
 }
 
 /// The physical or synthetic origin of a config value.
@@ -119,6 +185,29 @@ impl ConfigEditPlan {
     }
 }
 
+/// One key/value written into a config section operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSectionEntry {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+impl ConfigSectionEntry {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: Some(value.into()),
+        }
+    }
+
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: None,
+        }
+    }
+}
+
 /// One edit within a [`ConfigEditPlan`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigEdit {
@@ -132,6 +221,15 @@ pub enum ConfigEdit {
         section: String,
         subsection: Option<String>,
         name: String,
+    },
+    ReplaceSection {
+        section: String,
+        subsection: Option<String>,
+        entries: Vec<ConfigSectionEntry>,
+    },
+    RemoveSection {
+        section: String,
+        subsection: Option<String>,
     },
 }
 
@@ -154,6 +252,70 @@ impl ConfigEdit {
             name: key.name,
         })
     }
+
+    pub fn replace_section(
+        section: impl Into<String>,
+        subsection: Option<String>,
+        entries: Vec<ConfigSectionEntry>,
+    ) -> Self {
+        Self::ReplaceSection {
+            section: section.into(),
+            subsection,
+            entries,
+        }
+    }
+
+    pub fn remove_section(section: impl Into<String>, subsection: Option<String>) -> Self {
+        Self::RemoveSection {
+            section: section.into(),
+            subsection,
+        }
+    }
+}
+
+/// A whole-section replacement for `[remote "<name>"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfigSet {
+    pub name: String,
+    pub entries: Vec<ConfigSectionEntry>,
+}
+
+impl RemoteConfigSet {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn with_entry(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.entries.push(ConfigSectionEntry::new(name, value));
+        self
+    }
+
+    pub fn with_url(self, url: impl Into<String>) -> Self {
+        self.with_entry("url", url)
+    }
+
+    pub fn with_push_url(self, url: impl Into<String>) -> Self {
+        self.with_entry("pushurl", url)
+    }
+
+    pub fn with_fetch_refspec(self, refspec: impl Into<String>) -> Self {
+        self.with_entry("fetch", refspec)
+    }
+}
+
+/// A whole-section removal for `[remote "<name>"]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfigRemove {
+    pub name: String,
+}
+
+impl RemoteConfigRemove {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
 }
 
 /// Source-aware config planning/apply errors.
@@ -161,10 +323,18 @@ impl ConfigEdit {
 pub enum ConfigEditError {
     NoEditableSource,
     AmbiguousSource(Vec<ConfigSource>),
-    RefusesExternalInclude { path: PathBuf },
+    RefusesExternalInclude {
+        path: PathBuf,
+    },
     IncludeIfNotSatisfied,
+    SectionNotFound {
+        section: String,
+        subsection: Option<String>,
+    },
     Parse(String),
-    Locked { path: PathBuf },
+    Locked {
+        path: PathBuf,
+    },
     Io(std::io::Error),
 }
 
@@ -183,6 +353,15 @@ impl fmt::Display for ConfigEditError {
                 )
             }
             Self::IncludeIfNotSatisfied => f.write_str("includeIf condition is not satisfied"),
+            Self::SectionNotFound {
+                section,
+                subsection,
+            } => match subsection {
+                Some(subsection) => {
+                    write!(f, "config section not found: {section}.{subsection}")
+                }
+                None => write!(f, "config section not found: {section}"),
+            },
             Self::Parse(message) => write!(f, "config parse error: {message}"),
             Self::Locked { path } => write!(f, "config lock already exists: {}", path.display()),
             Self::Io(err) => write!(f, "io error: {err}"),
@@ -214,6 +393,44 @@ impl Repository {
             })
             .collect();
         Ok(ConfigSnapshot { values })
+    }
+
+    /// Return configured remotes with physical source and editability metadata.
+    pub fn remote_config_with_sources(&self) -> Result<RemoteConfigSnapshot, ConfigEditError> {
+        let stack = self.config_stack_with_sources()?;
+        let bases = ConfigSourceBases::for_repository(self);
+        let mut remotes: Vec<RemoteConfig> = Vec::new();
+        for entry in stack.entries {
+            if !entry.section.eq_ignore_ascii_case("remote") {
+                continue;
+            }
+            let Some(remote_name) = entry.subsection else {
+                continue;
+            };
+            let source = bases.source_for(entry.scope, &entry.origin, entry.included_from.as_ref());
+            let value = RemoteConfigValue {
+                name: entry.key,
+                value: entry.value,
+                source: source.clone(),
+            };
+            let idx = match remotes.iter().position(|remote| remote.name == remote_name) {
+                Some(idx) => idx,
+                None => {
+                    remotes.push(RemoteConfig {
+                        name: remote_name.clone(),
+                        values: Vec::new(),
+                        sources: Vec::new(),
+                    });
+                    remotes.len() - 1
+                }
+            };
+            let remote = &mut remotes[idx];
+            if !remote.sources.iter().any(|item| item.source == source) {
+                remote.sources.push(self.remote_source_metadata(source));
+            }
+            remote.values.push(value);
+        }
+        Ok(RemoteConfigSnapshot { remotes })
     }
 
     /// Plan the physical config file that should be edited for `key` and `scope`.
@@ -253,6 +470,39 @@ impl Repository {
             .with_operation(ConfigEdit::unset(key)?))
     }
 
+    /// Plan a whole-section replacement for `[remote "<name>"]`.
+    ///
+    /// The applied edit removes every matching remote section from the selected
+    /// physical config file and appends one canonical replacement section.
+    pub fn plan_remote_set(
+        &self,
+        set: RemoteConfigSet,
+        scope: ConfigEditScope,
+    ) -> Result<ConfigEditPlan, ConfigEditError> {
+        validate_remote_name(&set.name)?;
+        validate_section_entries("remote", Some(&set.name), &set.entries)?;
+        let target_path = self.remote_config_edit_target_path(&set.name, scope)?;
+        Ok(
+            ConfigEditPlan::new(target_path).with_operation(ConfigEdit::replace_section(
+                "remote",
+                Some(set.name),
+                set.entries,
+            )),
+        )
+    }
+
+    /// Plan removal of all `[remote "<name>"]` sections in the selected file.
+    pub fn plan_remote_remove(
+        &self,
+        remove: RemoteConfigRemove,
+        scope: ConfigEditScope,
+    ) -> Result<ConfigEditPlan, ConfigEditError> {
+        validate_remote_name(&remove.name)?;
+        let target_path = self.remote_config_edit_target_path(&remove.name, scope)?;
+        Ok(ConfigEditPlan::new(target_path)
+            .with_operation(ConfigEdit::remove_section("remote", Some(remove.name))))
+    }
+
     /// Apply a config edit plan through `<target>.lock` and atomic rename.
     pub fn apply_config_edit_plan(&self, plan: ConfigEditPlan) -> Result<(), ConfigEditError> {
         if plan.operations.is_empty() {
@@ -276,6 +526,22 @@ impl Repository {
                     subsection,
                     name,
                 } => (section, subsection, name, None),
+                ConfigEdit::ReplaceSection {
+                    section,
+                    subsection,
+                    entries,
+                } => {
+                    contents =
+                        replace_section(contents, &section, subsection.as_deref(), &entries)?;
+                    continue;
+                }
+                ConfigEdit::RemoveSection {
+                    section,
+                    subsection,
+                } => {
+                    contents = remove_section(contents, &section, subsection.as_deref())?;
+                    continue;
+                }
             };
             let mut editor = RawConfigEditor::new(contents, &section, subsection.as_deref(), &name);
             match editor.set_multivar(value.as_deref(), None, None, true) {
@@ -356,6 +622,38 @@ impl Repository {
         }
     }
 
+    fn remote_config_edit_target_path(
+        &self,
+        name: &str,
+        scope: ConfigEditScope,
+    ) -> Result<PathBuf, ConfigEditError> {
+        match scope {
+            ConfigEditScope::ExistingValue {
+                allow_external_includes,
+            } => {
+                let stack = self.config_stack_with_sources()?;
+                let bases = ConfigSourceBases::for_repository(self);
+                for entry in stack.entries.iter().rev() {
+                    if entry.section.eq_ignore_ascii_case("remote")
+                        && entry.subsection.as_deref() == Some(name)
+                    {
+                        let source = bases.source_for(
+                            entry.scope,
+                            &entry.origin,
+                            entry.included_from.as_ref(),
+                        );
+                        return self.edit_path_for_source(&source, allow_external_includes);
+                    }
+                }
+                Err(ConfigEditError::NoEditableSource)
+            }
+            other => {
+                let key = ParsedConfigKey::parse(&format!("remote.{name}.url"))?;
+                self.config_edit_target_path(&key, other)
+            }
+        }
+    }
+
     fn edit_path_for_source(
         &self,
         source: &ConfigSource,
@@ -386,6 +684,29 @@ impl Repository {
             .into_iter()
             .chain(std::iter::once(self.common_dir().to_path_buf()));
         roots.any(|root| path_starts_with(path, &root))
+    }
+
+    fn remote_source_metadata(&self, source: ConfigSource) -> RemoteConfigSource {
+        match self.edit_path_for_source(&source, false) {
+            Ok(path) => RemoteConfigSource {
+                source,
+                editable: true,
+                target_path: Some(path),
+                refusal: None,
+            },
+            Err(ConfigEditError::RefusesExternalInclude { path }) => RemoteConfigSource {
+                source,
+                editable: false,
+                target_path: None,
+                refusal: Some(RemoteConfigRefusal::ExternalInclude { path }),
+            },
+            Err(_) => RemoteConfigSource {
+                source,
+                editable: false,
+                target_path: None,
+                refusal: Some(RemoteConfigRefusal::SyntheticSource),
+            },
+        }
     }
 }
 
@@ -502,6 +823,155 @@ fn config_entry_key(section: &str, subsection: Option<&str>, name: &str) -> Stri
     match subsection {
         Some(subsection) => format!("{section}.{subsection}.{name}"),
         None => format!("{section}.{name}"),
+    }
+}
+
+fn validate_remote_name(name: &str) -> Result<(), ConfigEditError> {
+    if name.is_empty() {
+        return Err(ConfigEditError::Parse(
+            "remote name must not be empty".into(),
+        ));
+    }
+    ParsedConfigKey::parse(&format!("remote.{name}.url")).map(|_| ())
+}
+
+fn validate_section_entries(
+    section: &str,
+    subsection: Option<&str>,
+    entries: &[ConfigSectionEntry],
+) -> Result<(), ConfigEditError> {
+    for entry in entries {
+        if entry.name.is_empty() {
+            return Err(ConfigEditError::Parse(
+                "config entry name must not be empty".into(),
+            ));
+        }
+        let key = match subsection {
+            Some(subsection) => format!("{section}.{subsection}.{}", entry.name),
+            None => format!("{section}.{}", entry.name),
+        };
+        ParsedConfigKey::parse(&key)?;
+    }
+    Ok(())
+}
+
+fn replace_section(
+    contents: Vec<u8>,
+    section: &str,
+    subsection: Option<&str>,
+    entries: &[ConfigSectionEntry],
+) -> Result<Vec<u8>, ConfigEditError> {
+    let contents = match remove_section_if_present(&contents, section, subsection)? {
+        Some(contents) => contents,
+        None => contents,
+    };
+    Ok(append_section(contents, section, subsection, entries))
+}
+
+fn remove_section(
+    contents: Vec<u8>,
+    section: &str,
+    subsection: Option<&str>,
+) -> Result<Vec<u8>, ConfigEditError> {
+    match remove_section_if_present(&contents, section, subsection)? {
+        Some(contents) => Ok(contents),
+        None => Err(ConfigEditError::SectionNotFound {
+            section: section.to_string(),
+            subsection: subsection.map(str::to_string),
+        }),
+    }
+}
+
+fn remove_section_if_present(
+    contents: &[u8],
+    section: &str,
+    subsection: Option<&str>,
+) -> Result<Option<Vec<u8>>, ConfigEditError> {
+    let name = normalised_section_name(section, subsection);
+    match rename_or_remove_section(contents, &name, None) {
+        SectionEditOutcome::Changed(contents) => Ok(Some(contents)),
+        SectionEditOutcome::NotFound => Ok(None),
+        SectionEditOutcome::LineTooLong(line) => Err(ConfigEditError::Parse(format!(
+            "config line {line} exceeds maximum line length"
+        ))),
+    }
+}
+
+fn append_section(
+    mut contents: Vec<u8>,
+    section: &str,
+    subsection: Option<&str>,
+    entries: &[ConfigSectionEntry],
+) -> Vec<u8> {
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        contents.push(b'\n');
+    }
+    render_section(&mut contents, section, subsection, entries);
+    contents
+}
+
+fn render_section(
+    out: &mut Vec<u8>,
+    section: &str,
+    subsection: Option<&str>,
+    entries: &[ConfigSectionEntry],
+) {
+    out.push(b'[');
+    out.extend_from_slice(section.as_bytes());
+    if let Some(subsection) = subsection {
+        out.extend_from_slice(b" \"");
+        for ch in subsection.chars() {
+            if ch == '"' || ch == '\\' {
+                out.push(b'\\');
+            }
+            let mut buf = [0; 4];
+            out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+        }
+        out.push(b'"');
+    }
+    out.extend_from_slice(b"]\n");
+    for entry in entries {
+        out.push(b'\t');
+        out.extend_from_slice(entry.name.as_bytes());
+        match &entry.value {
+            Some(value) => {
+                out.extend_from_slice(b" = ");
+                out.extend_from_slice(quote_config_value(value).as_bytes());
+            }
+            None => {}
+        }
+        out.push(b'\n');
+    }
+}
+
+fn quote_config_value(value: &str) -> String {
+    let needs_quotes = value.starts_with(' ')
+        || value.ends_with(' ')
+        || value.contains('\r')
+        || value.bytes().any(|byte| matches!(byte, b'#' | b';'));
+    let mut out = String::new();
+    if needs_quotes {
+        out.push('"');
+    }
+    for ch in value.chars() {
+        match ch {
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            other => out.push(other),
+        }
+    }
+    if needs_quotes {
+        out.push('"');
+    }
+    out
+}
+
+fn normalised_section_name(section: &str, subsection: Option<&str>) -> String {
+    match subsection {
+        Some(subsection) => format!("{}.{subsection}", section.to_ascii_lowercase()),
+        None => section.to_ascii_lowercase(),
     }
 }
 

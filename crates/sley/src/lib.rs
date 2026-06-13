@@ -91,8 +91,8 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{
-    BString, FullName, GitError, GitTime, MissingObjectKind, NotFoundKind, ObjectFormat, ObjectId,
-    Result, Signature,
+    BString, FullName, GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind,
+    ObjectFormat, ObjectId, Result, Signature,
 };
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
@@ -106,17 +106,23 @@ pub use sley_refs::{
 };
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
-    IndexStatProbe, ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
+    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, ShortStatusEntry,
+    ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState, write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;
 pub use config_edit::{
-    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigSnapshot, ConfigSource,
-    ConfigValue,
+    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigSectionEntry,
+    ConfigSnapshot, ConfigSource, ConfigValue, RemoteConfig, RemoteConfigRefusal,
+    RemoteConfigRemove, RemoteConfigSet, RemoteConfigSnapshot, RemoteConfigSource,
+    RemoteConfigValue,
 };
 pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use objects::LoadedObject;
-pub use refs::{DeleteRef, RefChange, RefChangeResult, RefConflict, ReflogMessage};
+pub use refs::{
+    DeleteRef, RefBatchChange, RefChange, RefChangeResult, RefConflict, RefDeleteExpected,
+    ReflogMessage,
+};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -543,9 +549,14 @@ impl Repository {
     /// Read a commit object, parsing it into a [`Commit`]. Returns an error if
     /// `oid` does not name a commit.
     pub fn read_commit(&self, oid: &ObjectId) -> Result<Commit> {
-        let object = self
-            .read_object(oid)
-            .map_err(|err| expect_missing_object_kind(err, *oid, MissingObjectKind::Commit))?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Commit,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a commit",
@@ -558,9 +569,14 @@ impl Repository {
     /// Read a tree object, parsing it into a [`Tree`]. Returns an error if `oid`
     /// does not name a tree.
     pub fn read_tree(&self, oid: &ObjectId) -> Result<Tree> {
-        let object = self
-            .read_object(oid)
-            .map_err(|err| expect_missing_object_kind(err, *oid, MissingObjectKind::Tree))?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Tree,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Tree {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a tree",
@@ -573,9 +589,14 @@ impl Repository {
     /// Read an annotated tag object, parsing it into a [`Tag`]. Returns an error
     /// if `oid` does not name a tag.
     pub fn read_tag(&self, oid: &ObjectId) -> Result<Tag> {
-        let object = self
-            .read_object(oid)
-            .map_err(|err| expect_missing_object_kind(err, *oid, MissingObjectKind::Tag))?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Tag,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Tag {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a tag",
@@ -688,9 +709,12 @@ fn expect_missing_object_kind(
     err: GitError,
     oid: ObjectId,
     expected: MissingObjectKind,
+    context: MissingObjectContext,
 ) -> GitError {
     match err.not_found_kind() {
-        Some(NotFoundKind::Object { .. }) => GitError::object_kind_not_found(oid, expected),
+        Some(NotFoundKind::Object { .. }) => {
+            GitError::object_kind_not_found_in(oid, expected, context)
+        }
         _ => err,
     }
 }
@@ -984,6 +1008,10 @@ mod tests {
             raw_kind.missing_object_kind(),
             Some(MissingObjectKind::Object)
         );
+        assert_eq!(
+            raw_kind.missing_object_context(),
+            Some(MissingObjectContext::Read)
+        );
 
         let commit_err = repo
             .read_commit(&missing)
@@ -993,6 +1021,10 @@ mod tests {
         assert_eq!(
             commit_kind.missing_object_kind(),
             Some(MissingObjectKind::Commit)
+        );
+        assert_eq!(
+            commit_kind.missing_object_context(),
+            Some(MissingObjectContext::Read)
         );
     }
 

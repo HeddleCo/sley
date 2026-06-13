@@ -2,7 +2,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sley::{ConfigEditError, ConfigEditScope, ConfigSource, Repository};
+use sley::{
+    ConfigEditError, ConfigEditScope, ConfigSource, RemoteConfigRefusal, RemoteConfigRemove,
+    RemoteConfigSet, Repository,
+};
 
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -207,4 +210,137 @@ fn repository_plan_existing_external_include_can_be_opted_in() {
         fs::read_to_string(&outside).expect("read include"),
         "[remote \"origin\"]\n\turl = new-url\n"
     );
+}
+
+#[test]
+fn repository_remote_config_with_sources_reports_external_include_refusal() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let outside = temp.path.join("remotes.cfg");
+    let repo = Repository::init(&repo_dir).expect("init");
+    fs::write(
+        &outside,
+        b"[remote \"origin\"]\n\turl = old-url\n\tpushurl = push-url\n",
+    )
+    .expect("write include");
+    fs::write(
+        repo.common_dir().join("config"),
+        format!("[include]\n\tpath = {}\n", outside.display()),
+    )
+    .expect("write config");
+
+    let snapshot = repo.remote_config_with_sources().expect("remote snapshot");
+    let origin = snapshot.get("origin").expect("origin remote");
+
+    assert_eq!(origin.urls(), vec!["old-url"]);
+    assert_eq!(origin.push_urls(), vec!["push-url"]);
+    assert_eq!(origin.sources.len(), 1);
+    assert!(!origin.sources[0].editable);
+    assert_eq!(
+        origin.sources[0].refusal,
+        Some(RemoteConfigRefusal::ExternalInclude {
+            path: outside.clone()
+        })
+    );
+}
+
+#[test]
+fn repository_plan_remote_set_collapses_duplicate_sections_and_preserves_other_bytes() {
+    let temp = TempDir::new();
+    let repo = Repository::init(&temp.path).expect("init");
+    let config_path = repo.common_dir().join("config");
+    fs::write(
+        &config_path,
+        b"# keep\n[remote.origin] ; dotted\n\turl = old-one\n[remote \"origin\"] # quoted\n\turl = old-two\n\tfetch = old-fetch\n[core]\n\trepositoryformatversion = 0\n",
+    )
+    .expect("write config");
+
+    let set = RemoteConfigSet::new("origin")
+        .with_url("new-url")
+        .with_push_url("push-url")
+        .with_fetch_refspec("+refs/heads/*:refs/remotes/origin/*")
+        .with_fetch_refspec("+refs/tags/*:refs/tags/*");
+    let plan = repo
+        .plan_remote_set(set, ConfigEditScope::Local)
+        .expect("plan remote set");
+    repo.apply_config_edit_plan(plan).expect("apply remote set");
+
+    let updated = fs::read_to_string(&config_path).expect("read config");
+    assert!(updated.contains("# keep\n"));
+    assert!(updated.contains("[core]\n\trepositoryformatversion = 0\n"));
+    assert!(!updated.contains("old-one"));
+    assert!(!updated.contains("old-two"));
+    assert!(!updated.contains("old-fetch"));
+    assert_eq!(updated.matches("[remote \"origin\"]").count(), 1);
+    assert!(updated.contains("\turl = new-url\n"));
+    assert!(updated.contains("\tpushurl = push-url\n"));
+    assert!(updated.contains("\tfetch = +refs/heads/*:refs/remotes/origin/*\n"));
+    assert!(updated.contains("\tfetch = +refs/tags/*:refs/tags/*\n"));
+}
+
+#[test]
+fn repository_plan_remote_remove_edits_included_file_inside_repo() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let repo = Repository::init(&repo_dir).expect("init");
+    let included = repo_dir.join("remotes.cfg");
+    fs::write(
+        &included,
+        b"[remote \"origin\"]\n\turl = old-one\n[remote.origin]\n\tfetch = old-fetch\n[remote \"backup\"]\n\turl = backup-url\n",
+    )
+    .expect("write include");
+    fs::write(
+        repo.common_dir().join("config"),
+        format!("[include]\n\tpath = {}\n", included.display()),
+    )
+    .expect("write config");
+
+    let plan = repo
+        .plan_remote_remove(
+            RemoteConfigRemove::new("origin"),
+            ConfigEditScope::ExistingValue {
+                allow_external_includes: false,
+            },
+        )
+        .expect("included remote is editable");
+
+    assert_eq!(plan.target_path, included);
+    repo.apply_config_edit_plan(plan).expect("apply remove");
+
+    assert_eq!(
+        fs::read_to_string(repo.common_dir().join("config")).expect("read main"),
+        format!("[include]\n\tpath = {}\n", included.display())
+    );
+    let updated = fs::read_to_string(&included).expect("read include");
+    assert!(!updated.contains("origin"));
+    assert!(!updated.contains("old-fetch"));
+    assert!(updated.contains("[remote \"backup\"]\n\turl = backup-url\n"));
+}
+
+#[test]
+fn repository_plan_remote_set_refuses_external_include_by_default() {
+    let temp = TempDir::new();
+    let repo_dir = temp.path.join("repo");
+    let outside = temp.path.join("outside.cfg");
+    let repo = Repository::init(&repo_dir).expect("init");
+    fs::write(&outside, b"[remote \"origin\"]\n\turl = old-url\n").expect("write include");
+    fs::write(
+        repo.common_dir().join("config"),
+        format!("[include]\n\tpath = {}\n", outside.display()),
+    )
+    .expect("write config");
+
+    let err = repo
+        .plan_remote_set(
+            RemoteConfigSet::new("origin").with_url("new-url"),
+            ConfigEditScope::ExistingValue {
+                allow_external_includes: false,
+            },
+        )
+        .expect_err("external include is refused");
+
+    assert!(matches!(
+        err,
+        ConfigEditError::RefusesExternalInclude { path } if path == outside
+    ));
 }

@@ -1,5 +1,6 @@
 //! Ref-transaction helpers on top of [`sley_refs::FileRefTransaction`].
 
+use std::collections::HashSet;
 use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,8 +17,27 @@ pub struct DeleteRef {
     pub name: FullName,
     /// When set, the ref must currently point at this exact object id.
     pub expected_old: Option<ObjectId>,
+    /// Optional richer delete precondition. When present, this takes precedence
+    /// over [`DeleteRef::expected_old`].
+    pub expected: Option<RefDeleteExpected>,
     /// Optional reflog message appended on successful deletion.
     pub reflog: Option<ReflogMessage>,
+    /// Optional reflog committer ident. When omitted, sley builds one from repo
+    /// config, matching the older facade behavior.
+    pub reflog_committer: Option<Vec<u8>>,
+}
+
+/// Compare-and-delete preconditions for [`DeleteRef`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefDeleteExpected {
+    /// Any existing direct or symbolic ref may be deleted.
+    Any,
+    /// The ref's immediate on-disk target must match.
+    Immediate(RefTarget),
+    /// The ref must immediately point at this object id.
+    Direct(ObjectId),
+    /// The ref may be symbolic, but its peeled direct target must match.
+    Peeled(ObjectId),
 }
 
 /// Reflog message for a ref delete.
@@ -45,6 +65,25 @@ pub struct RefChange {
     pub expected: Option<RefTarget>,
     /// Optional reflog entry appended on success.
     pub reflog: Option<ReflogEntry>,
+}
+
+/// One create/update/delete in a mixed ref batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefBatchChange {
+    Update(RefChange),
+    Delete(DeleteRef),
+}
+
+impl From<RefChange> for RefBatchChange {
+    fn from(value: RefChange) -> Self {
+        Self::Update(value)
+    }
+}
+
+impl From<DeleteRef> for RefBatchChange {
+    fn from(value: DeleteRef) -> Self {
+        Self::Delete(value)
+    }
 }
 
 impl RefChange {
@@ -104,6 +143,20 @@ impl RefConflict {
             },
         }
     }
+
+    fn new(ref_name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            ref_name: ref_name.into(),
+            message: message.into(),
+        }
+    }
+
+    fn from_delete_error(ref_name: String, err: RefDeleteError) -> Self {
+        Self {
+            ref_name,
+            message: err.to_string(),
+        }
+    }
 }
 
 fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
@@ -124,17 +177,50 @@ impl Repository {
     /// leave the ref untouched, and packed refs are rewritten through
     /// `packed-refs.lock`.
     pub fn delete_ref(&self, delete: DeleteRef) -> std::result::Result<(), RefDeleteError> {
+        let current = if delete.expected.is_some() {
+            let name = delete.name.as_str().to_string();
+            let current = self
+                .references()
+                .read_ref(&name)
+                .map_err(ref_delete_error_from_git)?;
+            self.verify_delete_expected(&name, current.as_ref(), delete.expected.as_ref())?;
+            current
+        } else {
+            None
+        };
+        let committer = match delete.reflog_committer {
+            Some(committer) => committer,
+            None => self.delete_ref_committer()?,
+        };
         let reflog = match delete.reflog {
             Some(message) => Some(DeleteRefReflog {
-                committer: self.delete_ref_committer()?,
+                committer,
                 message: message.message,
             }),
             None => None,
         };
+        if let Some(RefTarget::Symbolic(_)) = current {
+            return self
+                .references()
+                .delete_symbolic_ref(delete.name.as_str())
+                .map_err(ref_delete_error_from_git)
+                .and_then(|deleted| {
+                    if deleted {
+                        Ok(())
+                    } else {
+                        Err(RefDeleteError::NotFound)
+                    }
+                });
+        }
+        let expected_old = match (&delete.expected, current.as_ref()) {
+            (Some(RefDeleteExpected::Any), _) => delete.expected_old,
+            (Some(_), Some(RefTarget::Direct(oid))) => Some(*oid),
+            _ => delete.expected_old,
+        };
         self.references()
             .delete_ref_checked(StoreDeleteRef {
                 name: delete.name.into(),
-                expected_old: delete.expected_old,
+                expected_old,
                 reflog,
             })
             .map(|_| ())
@@ -154,6 +240,90 @@ impl Repository {
         tx.commit().map_err(RefConflict::from_git_error)
     }
 
+    /// Apply a mixed create/update/delete batch after validating every lease.
+    ///
+    /// The public API is stable for callers that need exact ref plans. The
+    /// current file backend implementation preflights every change before
+    /// writing, uses the existing atomic update transaction for writes, then
+    /// applies checked deletes. Stale leases or duplicate names reject the
+    /// entire batch before any mutation.
+    pub fn apply_ref_batch(
+        &self,
+        changes: &[RefBatchChange],
+    ) -> std::result::Result<(), RefConflict> {
+        let refs = self.references();
+        let mut names = HashSet::new();
+        let mut updates = Vec::new();
+        let mut deletes = Vec::new();
+        for change in changes {
+            let name = match change {
+                RefBatchChange::Update(change) => change.name.as_str(),
+                RefBatchChange::Delete(delete) => delete.name.as_str(),
+            };
+            if !names.insert(name.to_string()) {
+                return Err(RefConflict::new(name, "duplicate ref in batch"));
+            }
+            match change {
+                RefBatchChange::Update(change) => {
+                    if let Some(expected) = &change.expected {
+                        let current = refs
+                            .read_ref(change.name.as_str())
+                            .map_err(RefConflict::from_git_error)?;
+                        if current.as_ref() != Some(expected) {
+                            return Err(RefConflict::new(
+                                change.name.as_str(),
+                                "expected ref to match",
+                            ));
+                        }
+                    }
+                    updates.push(change.clone());
+                }
+                RefBatchChange::Delete(delete) => {
+                    let current = refs
+                        .read_ref(delete.name.as_str())
+                        .map_err(RefConflict::from_git_error)?;
+                    if current.is_none() {
+                        return Err(RefConflict::new(delete.name.as_str(), "ref not found"));
+                    }
+                    if delete.expected.is_none() && matches!(current, Some(RefTarget::Symbolic(_)))
+                    {
+                        return Err(RefConflict::new(
+                            delete.name.as_str(),
+                            "symbolic ref delete requires an explicit checked expectation",
+                        ));
+                    }
+                    self.verify_delete_expected(
+                        delete.name.as_str(),
+                        current.as_ref(),
+                        delete.expected.as_ref(),
+                    )
+                    .map_err(|err| {
+                        RefConflict::from_delete_error(delete.name.as_str().to_string(), err)
+                    })?;
+                    if delete.expected.is_none()
+                        && let Some(expected) = delete.expected_old
+                        && current.as_ref() != Some(&RefTarget::Direct(expected))
+                    {
+                        return Err(RefConflict::new(
+                            delete.name.as_str(),
+                            "expected ref to match",
+                        ));
+                    }
+                    deletes.push(delete.clone());
+                }
+            }
+        }
+        if !updates.is_empty() {
+            self.apply_ref_changes(&updates)?;
+        }
+        for delete in deletes {
+            let name = delete.name.as_str().to_string();
+            self.delete_ref(delete)
+                .map_err(|err| RefConflict::from_delete_error(name, err))?;
+        }
+        Ok(())
+    }
+
     fn delete_ref_committer(&self) -> std::result::Result<Vec<u8>, RefDeleteError> {
         let name = self
             .config_string("user", "name")
@@ -169,6 +339,47 @@ impl Repository {
             .unwrap_or(0);
         Ok(format!("{name} <{email}> {seconds} +0000").into_bytes())
     }
+
+    fn verify_delete_expected(
+        &self,
+        _name: &str,
+        current: Option<&RefTarget>,
+        expected: Option<&RefDeleteExpected>,
+    ) -> std::result::Result<(), RefDeleteError> {
+        let Some(expected) = expected else {
+            return Ok(());
+        };
+        let Some(current) = current else {
+            return Err(RefDeleteError::NotFound);
+        };
+        match expected {
+            RefDeleteExpected::Any => Ok(()),
+            RefDeleteExpected::Immediate(target) if current == target => Ok(()),
+            RefDeleteExpected::Direct(oid) if current == &RefTarget::Direct(*oid) => Ok(()),
+            RefDeleteExpected::Peeled(oid) => {
+                let actual = match current {
+                    RefTarget::Direct(current) => Some(*current),
+                    RefTarget::Symbolic(target) => self
+                        .resolve_symbolic(target)
+                        .map_err(ref_delete_error_from_git)?,
+                };
+                if actual == Some(*oid) {
+                    Ok(())
+                } else {
+                    Err(RefDeleteError::ExpectedMismatch {
+                        expected: Some(*oid),
+                        actual,
+                    })
+                }
+            }
+            RefDeleteExpected::Immediate(_) | RefDeleteExpected::Direct(_) => {
+                Err(RefDeleteError::ExpectedMismatch {
+                    expected: expected.expected_oid(),
+                    actual: current.direct_oid(),
+                })
+            }
+        }
+    }
 }
 
 /// Facade-level ref transaction result type.
@@ -176,6 +387,29 @@ pub type RefChangeResult<T> = std::result::Result<T, RefConflict>;
 
 fn ref_delete_error_from_git(err: GitError) -> RefDeleteError {
     RefDeleteError::Io(std::io::Error::other(err.to_string()))
+}
+
+impl RefDeleteExpected {
+    fn expected_oid(&self) -> Option<ObjectId> {
+        match self {
+            Self::Direct(oid) | Self::Peeled(oid) => Some(*oid),
+            Self::Immediate(RefTarget::Direct(oid)) => Some(*oid),
+            Self::Any | Self::Immediate(RefTarget::Symbolic(_)) => None,
+        }
+    }
+}
+
+trait RefTargetExt {
+    fn direct_oid(&self) -> Option<ObjectId>;
+}
+
+impl RefTargetExt for RefTarget {
+    fn direct_oid(&self) -> Option<ObjectId> {
+        match self {
+            RefTarget::Direct(oid) => Some(*oid),
+            RefTarget::Symbolic(_) => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -297,7 +531,9 @@ mod tests {
         repo.delete_ref(DeleteRef {
             name: FullName::new("refs/heads/main").expect("valid ref name"),
             expected_old: Some(oid),
+            expected: None,
             reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
+            reflog_committer: None,
         })
         .expect("delete ref");
 
@@ -317,5 +553,172 @@ mod tests {
             sley_core::ObjectId::null(repo.object_format())
         );
         assert_eq!(log[0].message, b"delete main");
+    }
+
+    #[test]
+    fn repository_apply_ref_batch_mixes_update_and_delete() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let a = write_commit(&repo, None);
+        let b = write_commit(&repo, Some(&a));
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(a)).expect("valid ref name")
+        ])
+        .expect("seed main");
+
+        repo.apply_ref_batch(&[
+            RefBatchChange::Update(
+                RefChange::new("refs/heads/feature", RefTarget::Direct(b)).expect("valid ref name"),
+            ),
+            RefBatchChange::Delete(DeleteRef {
+                name: FullName::new("refs/heads/main").expect("valid ref name"),
+                expected_old: Some(a),
+                expected: None,
+                reflog: None,
+                reflog_committer: None,
+            }),
+        ])
+        .expect("mixed batch");
+
+        assert!(
+            repo.find_reference("refs/heads/main")
+                .expect("lookup main")
+                .is_none()
+        );
+        assert_eq!(
+            repo.find_reference("refs/heads/feature")
+                .expect("lookup feature")
+                .expect("feature")
+                .target,
+            RefTarget::Direct(b)
+        );
+    }
+
+    #[test]
+    fn repository_apply_ref_batch_stale_delete_leaves_updates_untouched() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let a = write_commit(&repo, None);
+        let b = write_commit(&repo, Some(&a));
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(a)).expect("valid ref name"),
+            RefChange::new("refs/heads/feature", RefTarget::Direct(a)).expect("valid ref name"),
+        ])
+        .expect("seed refs");
+
+        let err = repo
+            .apply_ref_batch(&[
+                RefBatchChange::Update(
+                    RefChange::new("refs/heads/feature", RefTarget::Direct(b))
+                        .expect("valid ref name"),
+                ),
+                RefBatchChange::Delete(DeleteRef {
+                    name: FullName::new("refs/heads/main").expect("valid ref name"),
+                    expected_old: Some(b),
+                    expected: None,
+                    reflog: None,
+                    reflog_committer: None,
+                }),
+            ])
+            .expect_err("stale delete");
+
+        assert_eq!(err.ref_name, "refs/heads/main");
+        assert_eq!(
+            repo.find_reference("refs/heads/feature")
+                .expect("lookup feature")
+                .expect("feature")
+                .target,
+            RefTarget::Direct(a)
+        );
+        assert_eq!(
+            repo.find_reference("refs/heads/main")
+                .expect("lookup main")
+                .expect("main")
+                .target,
+            RefTarget::Direct(a)
+        );
+    }
+
+    #[test]
+    fn repository_apply_ref_batch_rejects_duplicate_names() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let a = write_commit(&repo, None);
+        let b = write_commit(&repo, Some(&a));
+
+        let err = repo
+            .apply_ref_batch(&[
+                RefBatchChange::Update(
+                    RefChange::new("refs/heads/main", RefTarget::Direct(a))
+                        .expect("valid ref name"),
+                ),
+                RefBatchChange::Update(
+                    RefChange::new("refs/heads/main", RefTarget::Direct(b))
+                        .expect("valid ref name"),
+                ),
+            ])
+            .expect_err("duplicate");
+
+        assert_eq!(err.ref_name, "refs/heads/main");
+    }
+
+    #[test]
+    fn repository_delete_ref_uses_explicit_reflog_committer() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let oid = write_commit(&repo, None);
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name")
+        ])
+        .expect("seed main");
+        let committer = b"Heddle <actor@example.invalid> 7 +0000".to_vec();
+
+        repo.delete_ref(DeleteRef {
+            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            expected_old: Some(oid),
+            expected: None,
+            reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
+            reflog_committer: Some(committer.clone()),
+        })
+        .expect("delete ref");
+
+        let log = repo
+            .references()
+            .read_reflog("refs/heads/main")
+            .expect("read reflog");
+        assert_eq!(log[0].committer, committer);
+    }
+
+    #[test]
+    fn repository_delete_ref_checks_symbolic_immediate_target() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let oid = write_commit(&repo, None);
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name"),
+            RefChange::new(
+                "refs/alias/main",
+                RefTarget::Symbolic("refs/heads/main".into()),
+            )
+            .expect("valid ref name"),
+        ])
+        .expect("seed refs");
+
+        repo.delete_ref(DeleteRef {
+            name: FullName::new("refs/alias/main").expect("valid ref name"),
+            expected_old: None,
+            expected: Some(RefDeleteExpected::Immediate(RefTarget::Symbolic(
+                "refs/heads/main".into(),
+            ))),
+            reflog: None,
+            reflog_committer: None,
+        })
+        .expect("delete symbolic ref");
+
+        assert!(
+            repo.find_reference("refs/alias/main")
+                .expect("lookup alias")
+                .is_none()
+        );
     }
 }

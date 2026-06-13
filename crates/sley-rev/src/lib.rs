@@ -1,7 +1,7 @@
 pub mod graph;
 
 use sley_config::GitConfig;
-use sley_core::{GitError, ObjectFormat, ObjectId, Result};
+use sley_core::{GitError, MissingObjectContext, ObjectFormat, ObjectId, Result};
 
 pub use sley_core::BString;
 use sley_formats::CommitGraph;
@@ -13,6 +13,26 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+fn read_revision_object<R: ObjectReader>(reader: &R, oid: &ObjectId) -> Result<Arc<EncodedObject>> {
+    reader
+        .read_object(oid)
+        .map_err(|err| with_missing_object_context(err, *oid, MissingObjectContext::RevisionWalk))
+}
+
+fn with_missing_object_context(
+    err: GitError,
+    oid: ObjectId,
+    context: MissingObjectContext,
+) -> GitError {
+    let kind = err
+        .not_found_kind()
+        .and_then(sley_core::NotFoundKind::missing_object_kind);
+    match kind {
+        Some(kind) => GitError::object_kind_not_found_in(oid, kind, context),
+        None => err,
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RevisionSpec {
@@ -1120,7 +1140,7 @@ fn commit_parents<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<Vec<ObjectId>> {
-    let object = reader.read_object(oid)?;
+    let object = read_revision_object(reader, oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
             "expected commit {oid}, found {}",
@@ -1143,13 +1163,13 @@ fn peel_revision<R: ObjectReader>(
     match kind {
         PeelKind::AnyNonTag => peel_tags(reader, format, oid),
         PeelKind::Object => {
-            reader.read_object(oid)?;
+            read_revision_object(reader, oid)?;
             Ok(*oid)
         }
         PeelKind::Commit => peel_to_commit(reader, format, oid),
         PeelKind::Tree => peel_to_tree(reader, format, oid),
         PeelKind::Tag => {
-            let object = reader.read_object(oid)?;
+            let object = read_revision_object(reader, oid)?;
             if object.object_type == ObjectType::Tag {
                 Ok(*oid)
             } else {
@@ -1167,7 +1187,7 @@ pub fn peel_tags<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let object = reader.read_object(oid)?;
+    let object = read_revision_object(reader, oid)?;
     if object.object_type != ObjectType::Tag {
         return Ok(*oid);
     }
@@ -1180,7 +1200,7 @@ pub fn peel_to_tree<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let object = reader.read_object(oid)?;
+    let object = read_revision_object(reader, oid)?;
     match object.object_type {
         ObjectType::Tree => Ok(*oid),
         ObjectType::Commit => Ok(Commit::parse_ref(format, &object.body)?.tree),
@@ -1200,7 +1220,7 @@ pub fn peel_to_commit<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<ObjectId> {
-    let object = reader.read_object(oid)?;
+    let object = read_revision_object(reader, oid)?;
     match object.object_type {
         ObjectType::Commit => Ok(*oid),
         ObjectType::Tag => {
@@ -1647,7 +1667,7 @@ fn commit_metadata_from_object<R: ObjectReader>(
     format: sley_core::ObjectFormat,
     oid: &ObjectId,
 ) -> Result<(Vec<ObjectId>, i64)> {
-    let object = reader.read_object(oid)?;
+    let object = read_revision_object(reader, oid)?;
     if object.object_type != ObjectType::Commit {
         return Err(GitError::InvalidObject(format!(
             "expected commit {oid}, found {}",
@@ -1677,7 +1697,7 @@ pub fn walk_commits<R: ObjectReader>(
         if !seen.insert(oid) {
             continue;
         }
-        let object = reader.read_object(&oid)?;
+        let object = read_revision_object(reader, &oid)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
                 "expected commit {oid}, found {}",
@@ -2707,7 +2727,7 @@ fn search_commit_message_all<R: ObjectReader>(
         if !seen.insert(oid) {
             continue;
         }
-        let object = reader.read_object(&oid)?;
+        let object = read_revision_object(reader, &oid)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
                 "expected commit {oid}, found {}",
@@ -2753,7 +2773,7 @@ fn search_commit_message_first_parent<R: ObjectReader>(
         if !seen.insert(oid) {
             break;
         }
-        let object = reader.read_object(&oid)?;
+        let object = read_revision_object(reader, &oid)?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
                 "expected commit {oid}, found {}",
@@ -3294,6 +3314,25 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn walk_commits_missing_start_reports_revision_walk_context() {
+        let db = ObjectDatabase::new(ObjectFormat::Sha1);
+        let missing = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("test operation should succeed");
+
+        let err = walk_commits(&db, ObjectFormat::Sha1, [missing])
+            .expect_err("missing commit should error");
+        let kind = err.not_found_kind().expect("typed not found");
+        assert_eq!(kind.object_id(), Some(missing));
+        assert_eq!(
+            kind.missing_object_context(),
+            Some(MissingObjectContext::RevisionWalk)
+        );
+    }
 
     #[test]
     fn resolve_revision_reads_symbolic_head_and_tags() {

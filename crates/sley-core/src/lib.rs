@@ -1136,6 +1136,35 @@ impl fmt::Display for MissingObjectKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MissingObjectContext {
+    Read,
+    Traversal,
+    PackInstall,
+    RevisionWalk,
+    WorktreeMaterialize,
+    RemoteBoundary,
+}
+
+impl MissingObjectContext {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Traversal => "traversal",
+            Self::PackInstall => "pack-install",
+            Self::RevisionWalk => "revision-walk",
+            Self::WorktreeMaterialize => "worktree-materialize",
+            Self::RemoteBoundary => "remote-boundary",
+        }
+    }
+}
+
+impl fmt::Display for MissingObjectContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotFoundKind {
     Message(String),
@@ -1145,6 +1174,7 @@ pub enum NotFoundKind {
     Object {
         oid: ObjectId,
         kind: MissingObjectKind,
+        context: Option<MissingObjectContext>,
     },
     Reference {
         name: String,
@@ -1162,8 +1192,9 @@ impl fmt::Display for NotFoundKind {
             Self::Object {
                 oid,
                 kind: MissingObjectKind::Object,
+                ..
             } => write!(f, "object {oid}"),
-            Self::Object { oid, kind } => write!(f, "{kind} object {oid}"),
+            Self::Object { oid, kind, .. } => write!(f, "{kind} object {oid}"),
             Self::Reference { name } => write!(f, "{name}"),
             Self::Repository { path } => write!(f, "{path}"),
         }
@@ -1181,6 +1212,13 @@ impl NotFoundKind {
     pub fn missing_object_kind(&self) -> Option<MissingObjectKind> {
         match self {
             Self::Object { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
+    pub fn missing_object_context(&self) -> Option<MissingObjectContext> {
+        match self {
+            Self::Object { context, .. } => *context,
             _ => None,
         }
     }
@@ -1279,7 +1317,27 @@ impl GitError {
     }
 
     pub fn object_kind_not_found(oid: ObjectId, kind: MissingObjectKind) -> Self {
-        Self::NotFound(NotFoundKind::Object { oid, kind })
+        Self::NotFound(NotFoundKind::Object {
+            oid,
+            kind,
+            context: None,
+        })
+    }
+
+    pub fn object_not_found_in(oid: ObjectId, context: MissingObjectContext) -> Self {
+        Self::object_kind_not_found_in(oid, MissingObjectKind::Object, context)
+    }
+
+    pub fn object_kind_not_found_in(
+        oid: ObjectId,
+        kind: MissingObjectKind,
+        context: MissingObjectContext,
+    ) -> Self {
+        Self::NotFound(NotFoundKind::Object {
+            oid,
+            kind,
+            context: Some(context),
+        })
     }
 
     pub fn reference_not_found(name: impl Into<String>) -> Self {

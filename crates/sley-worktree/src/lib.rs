@@ -1,5 +1,8 @@
 use sley_config::GitConfig;
-use sley_core::{BString, GitError, MissingObjectKind, ObjectFormat, ObjectId, RepoPath, Result};
+use sley_core::{
+    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,
+    Result,
+};
 use sley_index::{CacheTree, Index, IndexEntry, Stage};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -229,6 +232,19 @@ pub enum WorktreeEntryState {
     Modified,
     /// The path, or one of its parents, is missing from the worktree.
     Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AtomicMetadataWriteOptions {
+    pub fsync_file: bool,
+    pub fsync_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicMetadataWriteResult {
+    pub path: PathBuf,
+    pub len: u64,
+    pub mtime: Option<(u64, u64)>,
 }
 
 /// Stage-0 index stat data that can prove a worktree path clean without
@@ -5747,6 +5763,76 @@ fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
     Some((duration.as_secs(), u64::from(duration.subsec_nanos())))
 }
 
+/// Write a git metadata file through a sibling `.lock` file and atomic rename.
+///
+/// This helper is intended for small repository/worktree metadata files such as
+/// `HEAD`, `config.worktree`, or state files under `.git/`. It deliberately does
+/// not try to replace object or pack writers, which have their own durability
+/// and naming rules.
+pub fn write_metadata_file_atomic(
+    path: impl AsRef<Path>,
+    bytes: &[u8],
+    options: AtomicMetadataWriteOptions,
+) -> Result<AtomicMetadataWriteResult> {
+    let path = path.as_ref();
+    let parent = path.parent().ok_or_else(|| {
+        GitError::InvalidPath(format!("metadata path has no parent: {}", path.display()))
+    })?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = metadata_lock_path(path)?;
+    let mut lock = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(GitError::Transaction(format!(
+                "metadata lock already exists: {}",
+                lock_path.display()
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if let Err(err) = lock.write_all(bytes) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    if options.fsync_file
+        && let Err(err) = lock.sync_all()
+    {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    drop(lock);
+    if let Err(err) = fs::rename(&lock_path, path) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    if options.fsync_dir
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        dir.sync_all()?;
+    }
+    let metadata = fs::metadata(path)?;
+    Ok(AtomicMetadataWriteResult {
+        path: path.to_path_buf(),
+        len: metadata.len(),
+        mtime: file_mtime_parts(&metadata),
+    })
+}
+
+fn metadata_lock_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        GitError::InvalidPath(format!("metadata path has no filename: {}", path.display()))
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
 /// Checks out `target` like [`checkout_detached`], but materializes the
 /// worktree through the supplied [`SparseCheckout`]: out-of-cone paths are not
 /// written, get their skip-worktree bit set, and have any stale worktree file
@@ -6554,9 +6640,11 @@ fn expect_missing_object_kind(
     expected: MissingObjectKind,
 ) -> GitError {
     match err.not_found_kind() {
-        Some(sley_core::NotFoundKind::Object { .. }) => {
-            GitError::object_kind_not_found(oid, expected)
-        }
+        Some(sley_core::NotFoundKind::Object { .. }) => GitError::object_kind_not_found_in(
+            oid,
+            expected,
+            MissingObjectContext::WorktreeMaterialize,
+        ),
         _ => err,
     }
 }
@@ -7507,6 +7595,55 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn atomic_metadata_writer_writes_and_reports_stat() {
+        let root = temp_root();
+        let path = root.join(".git").join("HEAD");
+
+        let result = write_metadata_file_atomic(
+            &path,
+            b"ref: refs/heads/main\n",
+            AtomicMetadataWriteOptions::default(),
+        )
+        .expect("write metadata");
+
+        assert_eq!(
+            fs::read(&path).expect("read metadata"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(result.path, path);
+        assert_eq!(result.len, b"ref: refs/heads/main\n".len() as u64);
+        assert!(result.mtime.is_some());
+        assert!(!path.with_file_name("HEAD.lock").exists());
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn atomic_metadata_writer_existing_lock_preserves_original() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("create git dir");
+        let path = git_dir.join("HEAD");
+        let lock = git_dir.join("HEAD.lock");
+        fs::write(&path, b"ref: refs/heads/main\n").expect("write original");
+        fs::write(&lock, b"held\n").expect("write lock");
+
+        let err = write_metadata_file_atomic(
+            &path,
+            b"ref: refs/heads/other\n",
+            AtomicMetadataWriteOptions::default(),
+        )
+        .expect_err("held lock must fail");
+
+        assert!(matches!(err, GitError::Transaction(_)));
+        assert_eq!(
+            fs::read(&path).expect("read original"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(fs::read(&lock).expect("read lock"), b"held\n");
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
     // --- `ls-files --eol` stat/attr helpers (mirror convert.c) ---------------
 
     #[test]
@@ -7738,6 +7875,10 @@ mod tests {
         let kind = err.not_found_kind().expect("typed not found");
         assert_eq!(kind.object_id(), Some(missing));
         assert_eq!(kind.missing_object_kind(), Some(MissingObjectKind::Blob));
+        assert_eq!(
+            kind.missing_object_context(),
+            Some(MissingObjectContext::WorktreeMaterialize)
+        );
         fs::remove_dir_all(root).expect("test operation should succeed");
     }
 

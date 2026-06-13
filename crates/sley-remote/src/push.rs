@@ -176,6 +176,26 @@ impl PushActionPlan {
             options,
         }
     }
+
+    pub fn from_commands_and_infer_pack_roots(
+        commands: Vec<PushCommand>,
+        options: PushOptions,
+    ) -> Self {
+        let mut pack_objects = Vec::new();
+        for command in &commands {
+            let Some(src) = command.src.as_ref() else {
+                continue;
+            };
+            if !pack_objects.contains(src) {
+                pack_objects.push(*src);
+            }
+        }
+        Self {
+            commands,
+            pack_objects,
+            options,
+        }
+    }
 }
 
 /// The structured result of a [`push`].
@@ -1280,6 +1300,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn push_action_plan_infers_pack_roots_from_non_delete_commands() {
+        let repo = temp_repo("action-plan-infer-roots");
+        let first = write_commit(&repo, Vec::new(), "first");
+        let second = write_commit(&repo, vec![first], "second");
+
+        let plan = PushActionPlan::from_commands_and_infer_pack_roots(
+            vec![
+                PushCommand {
+                    src: Some(first),
+                    dst: "refs/heads/main".into(),
+                    expected_old: None,
+                    force: false,
+                },
+                PushCommand {
+                    src: Some(second),
+                    dst: "refs/heads/topic".into(),
+                    expected_old: Some(first),
+                    force: true,
+                },
+            ],
+            default_options(),
+        );
+
+        assert_eq!(plan.pack_objects, vec![first, second]);
+        assert!(!plan.commands[0].force);
+        assert!(plan.commands[1].force);
+    }
+
+    #[test]
+    fn push_action_plan_inferred_pack_roots_exclude_deletes() {
+        let repo = temp_repo("action-plan-delete-roots");
+        let old = write_commit(&repo, Vec::new(), "old");
+        let new = write_commit(&repo, vec![old], "new");
+
+        let plan = PushActionPlan::from_commands_and_infer_pack_roots(
+            vec![
+                PushCommand {
+                    src: None,
+                    dst: "refs/heads/remove".into(),
+                    expected_old: Some(old),
+                    force: false,
+                },
+                PushCommand {
+                    src: Some(new),
+                    dst: "refs/heads/keep".into(),
+                    expected_old: Some(old),
+                    force: false,
+                },
+            ],
+            default_options(),
+        );
+
+        assert_eq!(plan.pack_objects, vec![new]);
+    }
+
+    #[test]
+    fn push_action_plan_inferred_pack_roots_dedupe_first_seen_order() {
+        let repo = temp_repo("action-plan-dedupe-roots");
+        let first = write_commit(&repo, Vec::new(), "first");
+        let second = write_commit(&repo, Vec::new(), "second");
+
+        let plan = PushActionPlan::from_commands_and_infer_pack_roots(
+            vec![
+                PushCommand {
+                    src: Some(second),
+                    dst: "refs/heads/second".into(),
+                    expected_old: None,
+                    force: false,
+                },
+                PushCommand {
+                    src: Some(first),
+                    dst: "refs/heads/first".into(),
+                    expected_old: None,
+                    force: false,
+                },
+                PushCommand {
+                    src: Some(second),
+                    dst: "refs/tags/second".into(),
+                    expected_old: None,
+                    force: false,
+                },
+                PushCommand {
+                    src: Some(first),
+                    dst: "refs/tags/first".into(),
+                    expected_old: None,
+                    force: false,
+                },
+            ],
+            default_options(),
+        );
+
+        assert_eq!(plan.pack_objects, vec![second, first]);
+    }
+
     fn push_local_actions(
         local: &Path,
         remote: &Path,
@@ -1438,6 +1553,54 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(unrelated))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_command_force_is_precise_for_non_ff_validation() {
+        let local = temp_repo("actions-command-force-precise-local");
+        let remote = temp_repo("actions-command-force-precise-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let forced_unrelated = write_commit(&local, Vec::new(), "forced unrelated");
+        let unforced_unrelated = write_commit(&local, Vec::new(), "unforced unrelated");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        set_ref(&remote, "refs/heads/topic", RefTarget::Direct(base));
+        let plan = PushActionPlan::from_commands_and_infer_pack_roots(
+            vec![
+                PushCommand {
+                    src: Some(forced_unrelated),
+                    dst: "refs/heads/main".into(),
+                    expected_old: Some(base),
+                    force: true,
+                },
+                PushCommand {
+                    src: Some(unforced_unrelated),
+                    dst: "refs/heads/topic".into(),
+                    expected_old: Some(base),
+                    force: false,
+                },
+            ],
+            default_options(),
+        );
+
+        let err = push_local_actions(&local, &remote, &plan)
+            .expect_err("only the forced command should bypass non-fast-forward validation");
+
+        assert!(err.to_string().contains("non-fast-forward update to topic"));
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(base))
+        );
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/topic")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(base))
         );
     }
 
