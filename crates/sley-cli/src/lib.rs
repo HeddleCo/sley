@@ -6344,10 +6344,7 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    // `git log` accepts the empty `--output-indicator-*=`, even though the diff
-    // plumbing command rejects it. Keep the shared diff/stash validator strict
-    // and relax only log's option passthrough.
-    if value.is_empty() {
+    if option == "output-indicator-context" && value.is_empty() {
         Ok(())
     } else {
         log_validate_output_indicator(option, value)
@@ -7587,8 +7584,19 @@ fn log_regex_unterminated_class_error(
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    let _ = class_bytes;
-    let message = "brackets ([ ]) not balanced";
+    // `class_bytes` is everything after the opening `[`. git (via POSIX regerror)
+    // distinguishes two cases: an opening bracket with no class content at all -
+    // `[` or `[^` at end of pattern - reports a generic "Invalid regular
+    // expression"; an unterminated class that does have content (e.g. `[a`, `[]`,
+    // `[[:alpha:]`) reports the bracket-specific "Unmatched" diagnostic. In POSIX
+    // BRE a `]` immediately following `[`/`[^` is a literal member, so it counts as
+    // content. Match that split exactly for git 2.54 parity.
+    let after_caret = class_bytes.strip_prefix(b"^").unwrap_or(class_bytes);
+    let message = if after_caret.is_empty() {
+        "Invalid regular expression"
+    } else {
+        "Unmatched [, [^, [:, [., or [="
+    };
     eprintln!("fatal: {error_context}, '{pattern}': {message}");
     Err(GitError::Exit(128))
 }
