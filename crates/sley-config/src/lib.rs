@@ -804,6 +804,7 @@ pub struct ConfigStackEntry {
     pub value: Option<String>,
     pub scope: ConfigScope,
     pub origin: ConfigOrigin,
+    pub included_from: Option<ConfigOrigin>,
 }
 
 impl ConfigStackEntry {
@@ -849,6 +850,7 @@ impl ConfigStack {
             0,
             false,
             respect_includes,
+            None,
             &mut self.entries,
         )
     }
@@ -871,6 +873,7 @@ impl ConfigStack {
             0,
             false,
             respect_includes,
+            None,
             &mut self.entries,
         )
     }
@@ -888,6 +891,7 @@ impl ConfigStack {
                 value: param.value.clone(),
                 scope: ConfigScope::Command,
                 origin: ConfigOrigin::command_line(),
+                included_from: None,
             });
         }
     }
@@ -956,6 +960,7 @@ fn emit_config_file(
     depth: usize,
     forbid_remote_url: bool,
     respect_includes: bool,
+    included_from: Option<ConfigOrigin>,
     out: &mut Vec<ConfigStackEntry>,
 ) -> Result<()> {
     let bytes = match fs::read(path) {
@@ -973,6 +978,7 @@ fn emit_config_file(
         depth,
         forbid_remote_url,
         respect_includes,
+        included_from,
         out,
     )
 }
@@ -991,6 +997,7 @@ fn emit_parsed_config(
     depth: usize,
     forbid_remote_url: bool,
     respect_includes: bool,
+    included_from: Option<ConfigOrigin>,
     out: &mut Vec<ConfigStackEntry>,
 ) -> Result<()> {
     if depth >= CONFIG_MAX_INCLUDE_DEPTH {
@@ -1025,6 +1032,7 @@ fn emit_parsed_config(
                 value: entry.value.clone(),
                 scope,
                 origin: origin.clone(),
+                included_from: included_from.clone(),
             });
             let Some(kind) = &include_kind else { continue };
             if !eq_ignore_ascii_case(&entry.key, "path") {
@@ -1046,6 +1054,7 @@ fn emit_parsed_config(
                         depth + 1,
                         forbid_remote_url,
                         true,
+                        Some(origin.clone()),
                         out,
                     )?;
                 }
@@ -1064,6 +1073,7 @@ fn emit_parsed_config(
                         depth + 1,
                         true,
                         true,
+                        Some(origin.clone()),
                         &mut included,
                     )?;
                     if stack_include_condition_matches(
@@ -1091,6 +1101,7 @@ fn emit_parsed_config(
                             depth + 1,
                             forbid_remote_url,
                             true,
+                            Some(origin.clone()),
                             out,
                         )?;
                     }

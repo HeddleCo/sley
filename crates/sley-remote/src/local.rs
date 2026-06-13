@@ -28,7 +28,7 @@ use sley_protocol::{
     read_upload_pack_negotiation_request, read_upload_pack_request,
     write_upload_pack_negotiation_request, write_upload_pack_request,
 };
-use sley_refs::{FileRefStore, Ref, RefTarget, RefUpdate};
+use sley_refs::{DeleteRef, FileRefStore, Ref, RefPrecondition, RefTarget};
 
 /// The all-zero object id for `format`, used for the synthetic
 /// `capabilities^{}` advertisement when a repository has no refs.
@@ -211,17 +211,30 @@ pub fn receive_pack_into_local_repository(
         |commands| {
             let mut tx = remote_store.transaction();
             for command in commands {
-                tx.update(RefUpdate {
-                    name: command.name.clone(),
-                    expected: (!command.old_id.is_null())
-                        .then(|| RefTarget::Direct(command.old_id.clone())),
-                    new: RefTarget::Direct(command.new_id.clone()),
-                    reflog: None,
-                });
+                let precondition = if command.old_id.is_null() {
+                    RefPrecondition::MustNotExist
+                } else {
+                    RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
+                };
+                tx.update_to(
+                    command.name.clone(),
+                    RefTarget::Direct(command.new_id),
+                    precondition,
+                    None,
+                );
             }
             tx.commit()
         },
-        |name| remote_store.delete_ref(name).map(|_| ()),
+        |command| {
+            remote_store
+                .delete_ref_checked(DeleteRef {
+                    name: command.name.clone(),
+                    expected_old: (!command.old_id.is_null()).then_some(command.old_id),
+                    reflog: None,
+                })
+                .map(|_| ())
+                .map_err(|err| GitError::Transaction(err.to_string()))
+        },
     )
 }
 
@@ -267,17 +280,30 @@ pub fn receive_pack_reachable_pack_into_local_repository(
         |commands| {
             let mut tx = remote_store.transaction();
             for command in commands {
-                tx.update(RefUpdate {
-                    name: command.name.clone(),
-                    expected: (!command.old_id.is_null())
-                        .then(|| RefTarget::Direct(command.old_id.clone())),
-                    new: RefTarget::Direct(command.new_id.clone()),
-                    reflog: None,
-                });
+                let precondition = if command.old_id.is_null() {
+                    RefPrecondition::MustNotExist
+                } else {
+                    RefPrecondition::MustExistAndMatch(RefTarget::Direct(command.old_id))
+                };
+                tx.update_to(
+                    command.name.clone(),
+                    RefTarget::Direct(command.new_id),
+                    precondition,
+                    None,
+                );
             }
             tx.commit()
         },
-        |name| remote_store.delete_ref(name).map(|_| ()),
+        |command| {
+            remote_store
+                .delete_ref_checked(DeleteRef {
+                    name: command.name.clone(),
+                    expected_old: (!command.old_id.is_null()).then_some(command.old_id),
+                    reflog: None,
+                })
+                .map(|_| ())
+                .map_err(|err| GitError::Transaction(err.to_string()))
+        },
     )
 }
 

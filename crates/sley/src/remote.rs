@@ -155,6 +155,33 @@ impl Repository {
         )
     }
 
+    /// Push a caller-authored exact old/new/delete plan to `remote`.
+    pub fn push_actions(
+        &self,
+        remote: impl Into<String>,
+        plan: PushActionPlan,
+        credentials: &mut dyn CredentialProvider,
+        progress: &mut dyn ProgressSink,
+    ) -> Result<PushOutcome> {
+        let ctx = self.remote(remote)?;
+        let destination = ctx.push_destination(self)?;
+        push_actions(
+            PushActionRequest {
+                git_dir: self.git_dir(),
+                common_git_dir: self.common_dir(),
+                format: self.object_format(),
+                config: ctx.config(),
+                remote: ctx.name(),
+                destination: &destination,
+                plan: &plan,
+            },
+            PushServices {
+                credentials,
+                progress,
+            },
+        )
+    }
+
     /// List refs advertised by `remote` (name or URL).
     pub fn ls_remote(
         &self,

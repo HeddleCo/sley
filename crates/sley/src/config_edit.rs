@@ -1,0 +1,545 @@
+//! Source-aware config snapshots and byte-preserving edit plans.
+
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use sley_config::raw_edit::{
+    ConfigFileWriteError, ConfigFileWriteOptions, RawConfigEditor, RawEditOutcome,
+    write_config_file_locked,
+};
+use sley_config::{ConfigOriginKind, ConfigScope, ConfigStack};
+
+use crate::{GitError, Repository};
+
+/// One config value with the physical source it was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigValue {
+    /// Canonical `section[.subsection].name`.
+    pub key: String,
+    /// Parsed value. `None` represents a bare boolean-true key.
+    pub value: Option<String>,
+    /// Scope/source metadata suitable for deciding whether the value can be edited.
+    pub source: ConfigSource,
+}
+
+/// A flattened effective config stream, lowest precedence first.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ConfigSnapshot {
+    pub values: Vec<ConfigValue>,
+}
+
+impl ConfigSnapshot {
+    /// Highest-precedence value for `key`.
+    pub fn get(&self, key: &str) -> Result<Option<&ConfigValue>, ConfigEditError> {
+        let key = ParsedConfigKey::parse(key)?;
+        Ok(self.values.iter().rev().find(|value| value.key == key.full))
+    }
+
+    /// All values for `key`, in precedence order.
+    pub fn get_all(&self, key: &str) -> Result<Vec<&ConfigValue>, ConfigEditError> {
+        let key = ParsedConfigKey::parse(key)?;
+        Ok(self
+            .values
+            .iter()
+            .filter(|value| value.key == key.full)
+            .collect())
+    }
+}
+
+/// The physical or synthetic origin of a config value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigSource {
+    Local {
+        path: PathBuf,
+    },
+    Worktree {
+        path: PathBuf,
+    },
+    Global {
+        path: PathBuf,
+    },
+    System {
+        path: PathBuf,
+    },
+    Included {
+        path: PathBuf,
+        included_from: Option<PathBuf>,
+    },
+    Env,
+    CommandLine,
+    Blob {
+        spec: String,
+    },
+    Stdin,
+}
+
+/// Scope/target selection for planning a config edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigEditScope {
+    /// Edit `<common_git_dir>/config`.
+    Local,
+    /// Edit `<git_dir>/config.worktree`.
+    Worktree,
+    /// Edit the highest-precedence global config file discovered for this process.
+    Global,
+    /// Edit the system config file discovered for this process.
+    System,
+    /// Edit the highest-precedence existing value's physical source.
+    ExistingValue { allow_external_includes: bool },
+    /// Edit an explicit physical path.
+    Path(PathBuf),
+}
+
+/// A byte-preserving edit plan for one physical config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEditPlan {
+    pub target_path: PathBuf,
+    pub operations: Vec<ConfigEdit>,
+    pub fsync: bool,
+}
+
+impl ConfigEditPlan {
+    pub fn new(target_path: impl Into<PathBuf>) -> Self {
+        Self {
+            target_path: target_path.into(),
+            operations: Vec::new(),
+            fsync: false,
+        }
+    }
+
+    pub fn with_operation(mut self, operation: ConfigEdit) -> Self {
+        self.operations.push(operation);
+        self
+    }
+
+    pub fn with_fsync(mut self, fsync: bool) -> Self {
+        self.fsync = fsync;
+        self
+    }
+}
+
+/// One edit within a [`ConfigEditPlan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigEdit {
+    Set {
+        section: String,
+        subsection: Option<String>,
+        name: String,
+        value: String,
+    },
+    Unset {
+        section: String,
+        subsection: Option<String>,
+        name: String,
+    },
+}
+
+impl ConfigEdit {
+    pub fn set(key: &str, value: impl Into<String>) -> Result<Self, ConfigEditError> {
+        let key = ParsedConfigKey::parse(key)?;
+        Ok(Self::Set {
+            section: key.section,
+            subsection: key.subsection,
+            name: key.name,
+            value: value.into(),
+        })
+    }
+
+    pub fn unset(key: &str) -> Result<Self, ConfigEditError> {
+        let key = ParsedConfigKey::parse(key)?;
+        Ok(Self::Unset {
+            section: key.section,
+            subsection: key.subsection,
+            name: key.name,
+        })
+    }
+}
+
+/// Source-aware config planning/apply errors.
+#[derive(Debug)]
+pub enum ConfigEditError {
+    NoEditableSource,
+    AmbiguousSource(Vec<ConfigSource>),
+    RefusesExternalInclude { path: PathBuf },
+    IncludeIfNotSatisfied,
+    Parse(String),
+    Locked { path: PathBuf },
+    Io(std::io::Error),
+}
+
+impl fmt::Display for ConfigEditError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoEditableSource => f.write_str("no editable config source"),
+            Self::AmbiguousSource(sources) => {
+                write!(f, "ambiguous config source among {} sources", sources.len())
+            }
+            Self::RefusesExternalInclude { path } => {
+                write!(
+                    f,
+                    "refusing to edit external included config {}",
+                    path.display()
+                )
+            }
+            Self::IncludeIfNotSatisfied => f.write_str("includeIf condition is not satisfied"),
+            Self::Parse(message) => write!(f, "config parse error: {message}"),
+            Self::Locked { path } => write!(f, "config lock already exists: {}", path.display()),
+            Self::Io(err) => write!(f, "io error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for ConfigEditError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            _ => None,
+        }
+    }
+}
+
+impl Repository {
+    /// Return the effective config as a source-attributed flat stream.
+    pub fn config_with_sources(&self) -> Result<ConfigSnapshot, ConfigEditError> {
+        let stack = self.config_stack_with_sources()?;
+        let bases = ConfigSourceBases::for_repository(self);
+        let values = stack
+            .entries
+            .into_iter()
+            .map(|entry| ConfigValue {
+                key: config_entry_key(&entry.section, entry.subsection.as_deref(), &entry.key),
+                value: entry.value,
+                source: bases.source_for(entry.scope, &entry.origin, entry.included_from.as_ref()),
+            })
+            .collect();
+        Ok(ConfigSnapshot { values })
+    }
+
+    /// Plan the physical config file that should be edited for `key` and `scope`.
+    ///
+    /// The returned plan has no operations; callers may add operations directly
+    /// or use [`Repository::plan_config_set`] / [`Repository::plan_config_unset`].
+    pub fn plan_config_edit(
+        &self,
+        key: &str,
+        scope: ConfigEditScope,
+    ) -> Result<ConfigEditPlan, ConfigEditError> {
+        let key = ParsedConfigKey::parse(key)?;
+        let target_path = self.config_edit_target_path(&key, scope)?;
+        Ok(ConfigEditPlan::new(target_path))
+    }
+
+    /// Plan a `set` operation for `key`.
+    pub fn plan_config_set(
+        &self,
+        key: &str,
+        value: impl Into<String>,
+        scope: ConfigEditScope,
+    ) -> Result<ConfigEditPlan, ConfigEditError> {
+        Ok(self
+            .plan_config_edit(key, scope)?
+            .with_operation(ConfigEdit::set(key, value)?))
+    }
+
+    /// Plan an `unset` operation for `key`.
+    pub fn plan_config_unset(
+        &self,
+        key: &str,
+        scope: ConfigEditScope,
+    ) -> Result<ConfigEditPlan, ConfigEditError> {
+        Ok(self
+            .plan_config_edit(key, scope)?
+            .with_operation(ConfigEdit::unset(key)?))
+    }
+
+    /// Apply a config edit plan through `<target>.lock` and atomic rename.
+    pub fn apply_config_edit_plan(&self, plan: ConfigEditPlan) -> Result<(), ConfigEditError> {
+        if plan.operations.is_empty() {
+            return Ok(());
+        }
+        let mut contents = match fs::read(&plan.target_path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(ConfigEditError::Io(err)),
+        };
+        for operation in plan.operations {
+            let (section, subsection, name, value) = match operation {
+                ConfigEdit::Set {
+                    section,
+                    subsection,
+                    name,
+                    value,
+                } => (section, subsection, name, Some(value)),
+                ConfigEdit::Unset {
+                    section,
+                    subsection,
+                    name,
+                } => (section, subsection, name, None),
+            };
+            let mut editor = RawConfigEditor::new(contents, &section, subsection.as_deref(), &name);
+            match editor.set_multivar(value.as_deref(), None, None, true) {
+                RawEditOutcome::Changed => contents = editor.into_bytes(),
+                RawEditOutcome::NothingSet => return Err(ConfigEditError::NoEditableSource),
+            }
+        }
+        write_config_file_locked(
+            &plan.target_path,
+            &contents,
+            ConfigFileWriteOptions { fsync: plan.fsync },
+        )
+        .map_err(ConfigEditError::from_config_write)
+    }
+
+    fn config_stack_with_sources(&self) -> Result<ConfigStack, ConfigEditError> {
+        let context = sley_config::ConfigIncludeContext::new(
+            Some(self.config_include_git_dir()),
+            self.config_include_branch(),
+        );
+        let mut stack = ConfigStack::new();
+        for (path, scope) in sley_config::default_config_layer_paths() {
+            stack
+                .push_file(&path, scope, true, &context)
+                .map_err(ConfigEditError::from_git_error)?;
+        }
+        stack
+            .push_file(
+                &self.common_dir().join("config"),
+                ConfigScope::Local,
+                true,
+                &context,
+            )
+            .map_err(ConfigEditError::from_git_error)?;
+        stack
+            .push_file(
+                &self.git_dir().join("config.worktree"),
+                ConfigScope::Worktree,
+                true,
+                &context,
+            )
+            .map_err(ConfigEditError::from_git_error)?;
+        Ok(stack)
+    }
+
+    fn config_edit_target_path(
+        &self,
+        key: &ParsedConfigKey,
+        scope: ConfigEditScope,
+    ) -> Result<PathBuf, ConfigEditError> {
+        match scope {
+            ConfigEditScope::Local => Ok(self.common_dir().join("config")),
+            ConfigEditScope::Worktree => Ok(self.git_dir().join("config.worktree")),
+            ConfigEditScope::Global => sley_config::default_config_layer_paths()
+                .into_iter()
+                .filter_map(|(path, scope)| (scope == ConfigScope::Global).then_some(path))
+                .last()
+                .ok_or(ConfigEditError::NoEditableSource),
+            ConfigEditScope::System => sley_config::default_config_layer_paths()
+                .into_iter()
+                .find_map(|(path, scope)| (scope == ConfigScope::System).then_some(path))
+                .ok_or(ConfigEditError::NoEditableSource),
+            ConfigEditScope::Path(path) => Ok(path),
+            ConfigEditScope::ExistingValue {
+                allow_external_includes,
+            } => {
+                let snapshot = self.config_with_sources()?;
+                let Some(value) = snapshot
+                    .values
+                    .iter()
+                    .rev()
+                    .find(|value| value.key == key.full)
+                else {
+                    return Err(ConfigEditError::NoEditableSource);
+                };
+                self.edit_path_for_source(&value.source, allow_external_includes)
+            }
+        }
+    }
+
+    fn edit_path_for_source(
+        &self,
+        source: &ConfigSource,
+        allow_external_includes: bool,
+    ) -> Result<PathBuf, ConfigEditError> {
+        match source {
+            ConfigSource::Local { path }
+            | ConfigSource::Worktree { path }
+            | ConfigSource::Global { path }
+            | ConfigSource::System { path } => Ok(path.clone()),
+            ConfigSource::Included { path, .. } => {
+                if allow_external_includes || self.config_path_is_inside_repository(path) {
+                    Ok(path.clone())
+                } else {
+                    Err(ConfigEditError::RefusesExternalInclude { path: path.clone() })
+                }
+            }
+            ConfigSource::Env
+            | ConfigSource::CommandLine
+            | ConfigSource::Blob { .. }
+            | ConfigSource::Stdin => Err(ConfigEditError::NoEditableSource),
+        }
+    }
+
+    fn config_path_is_inside_repository(&self, path: &Path) -> bool {
+        let mut roots = self
+            .workdir()
+            .into_iter()
+            .chain(std::iter::once(self.common_dir().to_path_buf()));
+        roots.any(|root| path_starts_with(path, &root))
+    }
+}
+
+struct ConfigSourceBases {
+    local: PathBuf,
+    worktree: PathBuf,
+    globals: Vec<PathBuf>,
+    system: Option<PathBuf>,
+}
+
+impl ConfigSourceBases {
+    fn for_repository(repo: &Repository) -> Self {
+        let mut globals = Vec::new();
+        let mut system = None;
+        for (path, scope) in sley_config::default_config_layer_paths() {
+            match scope {
+                ConfigScope::System => system = Some(path),
+                ConfigScope::Global => globals.push(path),
+                _ => {}
+            }
+        }
+        Self {
+            local: repo.common_dir().join("config"),
+            worktree: repo.git_dir().join("config.worktree"),
+            globals,
+            system,
+        }
+    }
+
+    fn source_for(
+        &self,
+        scope: ConfigScope,
+        origin: &sley_config::ConfigOrigin,
+        included_from: Option<&sley_config::ConfigOrigin>,
+    ) -> ConfigSource {
+        match origin.kind {
+            ConfigOriginKind::File => {
+                let path = PathBuf::from(&origin.name);
+                match scope {
+                    ConfigScope::Local if paths_equivalent(&path, &self.local) => {
+                        ConfigSource::Local { path }
+                    }
+                    ConfigScope::Worktree if paths_equivalent(&path, &self.worktree) => {
+                        ConfigSource::Worktree { path }
+                    }
+                    ConfigScope::Global
+                        if self
+                            .globals
+                            .iter()
+                            .any(|base| paths_equivalent(&path, base)) =>
+                    {
+                        ConfigSource::Global { path }
+                    }
+                    ConfigScope::System
+                        if self
+                            .system
+                            .as_ref()
+                            .is_some_and(|base| paths_equivalent(&path, base)) =>
+                    {
+                        ConfigSource::System { path }
+                    }
+                    _ => ConfigSource::Included {
+                        path,
+                        included_from: included_from.and_then(file_origin_path),
+                    },
+                }
+            }
+            ConfigOriginKind::Blob => ConfigSource::Blob {
+                spec: origin.name.clone(),
+            },
+            ConfigOriginKind::Stdin => ConfigSource::Stdin,
+            ConfigOriginKind::CommandLine => ConfigSource::CommandLine,
+        }
+    }
+}
+
+fn file_origin_path(origin: &sley_config::ConfigOrigin) -> Option<PathBuf> {
+    (origin.kind == ConfigOriginKind::File).then(|| PathBuf::from(&origin.name))
+}
+
+#[derive(Debug, Clone)]
+struct ParsedConfigKey {
+    full: String,
+    section: String,
+    subsection: Option<String>,
+    name: String,
+}
+
+impl ParsedConfigKey {
+    fn parse(key: &str) -> Result<Self, ConfigEditError> {
+        let full = sley_config::canonicalize_config_key(key)
+            .map_err(|err| ConfigEditError::Parse(err.message()))?;
+        let first_dot = full
+            .find('.')
+            .ok_or_else(|| ConfigEditError::Parse(format!("invalid config key: {key}")))?;
+        let last_dot = full
+            .rfind('.')
+            .ok_or_else(|| ConfigEditError::Parse(format!("invalid config key: {key}")))?;
+        let section = full[..first_dot].to_string();
+        let name = full[last_dot + 1..].to_string();
+        let subsection = (first_dot != last_dot).then(|| full[first_dot + 1..last_dot].to_string());
+        Ok(Self {
+            full,
+            section,
+            subsection,
+            name,
+        })
+    }
+}
+
+fn config_entry_key(section: &str, subsection: Option<&str>, name: &str) -> String {
+    let section = section.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    match subsection {
+        Some(subsection) => format!("{section}.{subsection}.{name}"),
+        None => format!("{section}.{name}"),
+    }
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    left == right
+        || match (fs::canonicalize(left), fs::canonicalize(right)) {
+            (Ok(left), Ok(right)) => left == right,
+            _ => false,
+        }
+}
+
+fn path_starts_with(path: &Path, root: &Path) -> bool {
+    if path.starts_with(root) {
+        return true;
+    }
+    match (fs::canonicalize(path), fs::canonicalize(root)) {
+        (Ok(path), Ok(root)) => path.starts_with(root),
+        _ => false,
+    }
+}
+
+impl ConfigEditError {
+    fn from_git_error(err: GitError) -> Self {
+        match err {
+            GitError::Io(message) => Self::Io(std::io::Error::other(message)),
+            GitError::InvalidFormat(message)
+            | GitError::InvalidPath(message)
+            | GitError::InvalidObject(message)
+            | GitError::InvalidObjectId(message)
+            | GitError::Unsupported(message) => Self::Parse(message),
+            other => Self::Parse(other.to_string()),
+        }
+    }
+
+    fn from_config_write(err: ConfigFileWriteError) -> Self {
+        match err {
+            ConfigFileWriteError::ExistingLock(path) => Self::Locked { path },
+            ConfigFileWriteError::Io { source, .. } => Self::Io(source),
+        }
+    }
+}

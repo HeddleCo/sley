@@ -39,6 +39,7 @@ use sley_protocol::{
     parse_refspec, plan_push_commands,
 };
 
+use crate::pack::push_pack_roots;
 #[cfg(feature = "http")]
 use crate::pack::{PushPackRequest, build_receive_pack_body};
 use sley_refs::{FileRefStore, Ref, RefTarget};
@@ -88,6 +89,78 @@ pub struct PushOptions {
     pub force: bool,
 }
 
+/// One caller-authored receive-pack command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushCommand {
+    /// The object id to install at `dst`, or `None` for a delete.
+    pub src: Option<ObjectId>,
+    /// Full destination ref name.
+    pub dst: String,
+    /// The expected remote old object id. `None` lowers to the zero oid, which
+    /// receive-pack treats as create-only for updates and unconditional for
+    /// deletes.
+    pub expected_old: Option<ObjectId>,
+}
+
+/// A typed push action that preserves the caller's exact old/new/delete intent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushAction {
+    Create {
+        dst: String,
+        new: ObjectId,
+    },
+    Update {
+        dst: String,
+        old: ObjectId,
+        new: ObjectId,
+    },
+    Delete {
+        dst: String,
+        old: Option<ObjectId>,
+    },
+}
+
+impl From<PushAction> for PushCommand {
+    fn from(value: PushAction) -> Self {
+        match value {
+            PushAction::Create { dst, new } => Self {
+                src: Some(new),
+                dst,
+                expected_old: None,
+            },
+            PushAction::Update { dst, old, new } => Self {
+                src: Some(new),
+                dst,
+                expected_old: Some(old),
+            },
+            PushAction::Delete { dst, old } => Self {
+                src: None,
+                dst,
+                expected_old: old,
+            },
+        }
+    }
+}
+
+/// A caller-authored push plan. This is distinct from [`PushPlan`], which is a
+/// negotiated, executable transport token returned by [`plan_push`].
+#[derive(Debug, Clone)]
+pub struct PushActionPlan {
+    pub commands: Vec<PushCommand>,
+    pub pack_objects: Vec<ObjectId>,
+    pub options: PushOptions,
+}
+
+impl PushActionPlan {
+    pub fn from_actions(actions: Vec<PushAction>, options: PushOptions) -> Self {
+        Self {
+            commands: actions.into_iter().map(PushCommand::from).collect(),
+            pack_objects: Vec::new(),
+            options,
+        }
+    }
+}
+
 /// The structured result of a [`push`].
 #[derive(Debug, Clone, Default)]
 pub struct PushOutcome {
@@ -124,6 +197,25 @@ pub struct PushRequest<'a> {
     pub options: &'a PushOptions,
 }
 
+/// Fully resolved inputs for a caller-authored exact push plan.
+#[derive(Clone, Copy)]
+pub struct PushActionRequest<'a> {
+    /// Local repository `$GIT_DIR`.
+    pub git_dir: &'a Path,
+    /// Local repository common `$GIT_DIR`, used for object access.
+    pub common_git_dir: &'a Path,
+    /// Local repository object format.
+    pub format: ObjectFormat,
+    /// Local repository config snapshot.
+    pub config: &'a GitConfig,
+    /// Remote name or source string, used for diagnostics.
+    pub remote: &'a str,
+    /// Already-resolved push destination.
+    pub destination: &'a PushDestination,
+    /// Caller-authored exact push plan.
+    pub plan: &'a PushActionPlan,
+}
+
 /// Mutable seams used while pushing.
 pub struct PushServices<'a> {
     /// Credential source for authenticated transports.
@@ -148,6 +240,7 @@ enum PushExecution {
         features: ReceivePackFeatures,
         advertisements: Vec<RefAdvertisement>,
         command_forces: Vec<(ReceivePackCommand, bool)>,
+        pack_objects: Vec<ObjectId>,
     },
     Ssh(crate::ssh::SshPushPlan),
     Local {
@@ -155,6 +248,7 @@ enum PushExecution {
         remote_common_git_dir: PathBuf,
         remote_refs: Vec<RefAdvertisement>,
         command_forces: Vec<(ReceivePackCommand, bool)>,
+        pack_objects: Vec<ObjectId>,
     },
 }
 
@@ -175,6 +269,15 @@ enum PushExecution {
 pub fn push(request: PushRequest<'_>, mut services: PushServices<'_>) -> Result<PushOutcome> {
     let plan = plan_push(request, &mut services)?;
     execute_push_plan(request, &mut services, plan)
+}
+
+/// Push a caller-authored exact plan, preserving its old/new/delete command ids.
+pub fn push_actions(
+    request: PushActionRequest<'_>,
+    mut services: PushServices<'_>,
+) -> Result<PushOutcome> {
+    let plan = plan_push_actions(request, &mut services)?;
+    execute_push_action_plan(request, &mut services, plan)
 }
 
 /// Negotiate with the remote and compute the receive-pack command list without
@@ -237,6 +340,111 @@ pub fn plan_push(request: PushRequest<'_>, services: &mut PushServices<'_>) -> R
     }
 }
 
+/// Negotiate with the remote and bind a caller-authored exact push plan to a
+/// transport execution token.
+pub fn plan_push_actions(
+    request: PushActionRequest<'_>,
+    services: &mut PushServices<'_>,
+) -> Result<PushPlan> {
+    let _ = request.config;
+    let _ = &mut services.progress;
+    let commands = receive_pack_commands_from_action_plan(request.format, request.plan)?;
+    let command_forces = commands
+        .iter()
+        .cloned()
+        .map(|command| (command, request.plan.options.force))
+        .collect::<Vec<_>>();
+    match request.destination {
+        #[cfg(feature = "http")]
+        PushDestination::Http(remote_url) => {
+            let client = crate::http::new_http_client();
+            let discovered = crate::http::http_service_advertisements(
+                &client,
+                remote_url,
+                request.format,
+                GitService::ReceivePack,
+                services.credentials,
+            )?;
+            let advertisement_set = discovered.set;
+            let features = advertised_receive_pack_features(&advertisement_set.refs)?;
+            verify_remote_object_format(&features, request.format)?;
+            let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
+            reject_non_fast_forward_pushes(&local_db, request.format, &command_forces)?;
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Http {
+                    remote_url: remote_url.clone(),
+                    features,
+                    advertisements: advertisement_set.refs,
+                    command_forces,
+                    pack_objects: request.plan.pack_objects.clone(),
+                }
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
+        #[cfg(not(feature = "http"))]
+        PushDestination::Http(_) => Err(GitError::Unsupported(
+            "HTTP transport is not enabled in this build".into(),
+        )),
+        PushDestination::Ssh(remote_url) => {
+            let plan = crate::ssh::plan_push_ssh_commands(crate::ssh::SshPushCommandsRequest {
+                common_git_dir: request.common_git_dir,
+                format: request.format,
+                remote: remote_url,
+                commands: commands.clone(),
+                pack_objects: request.plan.pack_objects.clone(),
+                force: request.plan.options.force,
+            })?;
+            let commands = plan.commands.clone();
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Ssh(plan)
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
+        PushDestination::Local {
+            git_dir: remote_git_dir,
+            common_git_dir: remote_common_git_dir,
+        } => {
+            let remote_format = crate::object_format_for_git_dir(remote_common_git_dir)?;
+            if remote_format != request.format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "remote repository uses {}, local repository uses {}",
+                    remote_format.name(),
+                    request.format.name()
+                )));
+            }
+            let remote_refs =
+                crate::local::local_fetch_advertisements(remote_git_dir, request.format)?;
+            let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
+            reject_non_fast_forward_pushes(&local_db, request.format, &command_forces)?;
+            let execution = if commands.is_empty() {
+                PushExecution::Noop
+            } else {
+                PushExecution::Local {
+                    remote_git_dir: remote_git_dir.to_path_buf(),
+                    remote_common_git_dir: remote_common_git_dir.to_path_buf(),
+                    remote_refs,
+                    command_forces,
+                    pack_objects: request.plan.pack_objects.clone(),
+                }
+            };
+            Ok(PushPlan {
+                commands,
+                execution,
+            })
+        }
+    }
+}
+
 /// Execute a previously planned push.
 pub fn execute_push_plan(
     request: PushRequest<'_>,
@@ -256,6 +464,7 @@ pub fn execute_push_plan(
             features,
             advertisements,
             command_forces,
+            pack_objects,
         } => execute_push_http(
             request,
             services.credentials,
@@ -264,6 +473,7 @@ pub fn execute_push_plan(
             features,
             advertisements,
             command_forces,
+            pack_objects,
         ),
         PushExecution::Ssh(plan) => crate::ssh::execute_push_ssh_plan(request, plan),
         PushExecution::Local {
@@ -271,6 +481,7 @@ pub fn execute_push_plan(
             remote_common_git_dir,
             remote_refs,
             command_forces,
+            pack_objects,
         } => execute_push_local(
             request,
             plan.commands,
@@ -278,8 +489,32 @@ pub fn execute_push_plan(
             remote_common_git_dir,
             remote_refs,
             command_forces,
+            pack_objects,
         ),
     }
+}
+
+/// Execute a previously negotiated exact push plan.
+pub fn execute_push_action_plan(
+    request: PushActionRequest<'_>,
+    services: &mut PushServices<'_>,
+    plan: PushPlan,
+) -> Result<PushOutcome> {
+    let refspecs: &[String] = &[];
+    execute_push_plan(
+        PushRequest {
+            git_dir: request.git_dir,
+            common_git_dir: request.common_git_dir,
+            format: request.format,
+            config: request.config,
+            remote: request.remote,
+            destination: request.destination,
+            refspecs,
+            options: &request.plan.options,
+        },
+        services,
+        plan,
+    )
 }
 
 /// Push to a smart-HTTP(S) remote: advertise via receive-pack info/refs, plan,
@@ -339,6 +574,7 @@ fn plan_push_http(request: PushHttpRequest<'_>) -> Result<PushPlan> {
             features,
             advertisements: advertisement_set.refs,
             command_forces,
+            pack_objects: Vec::new(),
         }
     };
     Ok(PushPlan {
@@ -356,6 +592,7 @@ fn execute_push_http(
     features: ReceivePackFeatures,
     advertisements: Vec<RefAdvertisement>,
     _command_forces: Vec<(ReceivePackCommand, bool)>,
+    pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
     let client = crate::http::new_http_client();
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
@@ -363,6 +600,7 @@ fn execute_push_http(
         local_db: &local_db,
         format: request.format,
         commands: &commands,
+        pack_objects: &pack_objects,
         remote_advertisements: &advertisements,
         features: &features,
         options: receive_pack_push_options(&features, request.format, request.options.quiet),
@@ -448,6 +686,7 @@ fn plan_push_local(request: PushLocalRequest<'_>) -> Result<PushPlan> {
             remote_common_git_dir: remote_common_git_dir.to_path_buf(),
             remote_refs,
             command_forces,
+            pack_objects: Vec::new(),
         }
     };
     Ok(PushPlan {
@@ -463,16 +702,13 @@ fn execute_push_local(
     remote_common_git_dir: PathBuf,
     remote_refs: Vec<RefAdvertisement>,
     _command_forces: Vec<(ReceivePackCommand, bool)>,
+    pack_objects: Vec<ObjectId>,
 ) -> Result<PushOutcome> {
     let remote_excluded_tips = remote_refs
         .iter()
         .map(|reference| reference.oid)
         .collect::<Vec<_>>();
-    let starts = commands
-        .iter()
-        .filter(|command| !command.new_id.is_null())
-        .map(|command| command.new_id.clone())
-        .collect::<Vec<_>>();
+    let starts = push_pack_roots(&commands, &pack_objects);
     let local_db = FileObjectDatabase::from_git_dir(request.common_git_dir, request.format);
     let remote_db = FileObjectDatabase::from_git_dir(&remote_common_git_dir, request.format);
     let remote_excluded =
@@ -683,6 +919,50 @@ fn commands_from_forces(command_forces: &[(ReceivePackCommand, bool)]) -> Vec<Re
     command_forces
         .iter()
         .map(|(command, _)| command.clone())
+        .collect()
+}
+
+fn receive_pack_commands_from_action_plan(
+    format: ObjectFormat,
+    plan: &PushActionPlan,
+) -> Result<Vec<ReceivePackCommand>> {
+    let zero = ObjectId::null(format);
+    for oid in &plan.pack_objects {
+        if oid.format() != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "push pack object {oid} has {} object id for {} repository",
+                oid.format().name(),
+                format.name()
+            )));
+        }
+    }
+    plan.commands
+        .iter()
+        .map(|command| {
+            let old_id = command.expected_old.unwrap_or(zero);
+            let new_id = command.src.unwrap_or(zero);
+            if old_id.format() != format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "push command {} expected old has {} object id for {} repository",
+                    command.dst,
+                    old_id.format().name(),
+                    format.name()
+                )));
+            }
+            if new_id.format() != format {
+                return Err(GitError::InvalidObjectId(format!(
+                    "push command {} new id has {} object id for {} repository",
+                    command.dst,
+                    new_id.format().name(),
+                    format.name()
+                )));
+            }
+            Ok(ReceivePackCommand {
+                old_id,
+                new_id,
+                name: command.dst.clone(),
+            })
+        })
         .collect()
 }
 
@@ -942,6 +1222,35 @@ mod tests {
         }
     }
 
+    fn push_local_actions(
+        local: &Path,
+        remote: &Path,
+        plan: &PushActionPlan,
+    ) -> Result<PushOutcome> {
+        let destination = PushDestination::Local {
+            git_dir: remote.to_path_buf(),
+            common_git_dir: remote.to_path_buf(),
+        };
+        let config = GitConfig::default();
+        let mut credentials = NoCredentials;
+        let mut progress = SilentProgress;
+        push_actions(
+            PushActionRequest {
+                git_dir: local,
+                common_git_dir: local,
+                format: ObjectFormat::Sha1,
+                config: &config,
+                remote: "origin",
+                destination: &destination,
+                plan,
+            },
+            PushServices {
+                credentials: &mut credentials,
+                progress: &mut progress,
+            },
+        )
+    }
+
     #[test]
     fn local_push_returns_success_report_status_and_updates_ref() {
         let local = temp_repo("local-success");
@@ -995,6 +1304,130 @@ mod tests {
                 .read_ref("refs/heads/main")
                 .expect("remote ref should read"),
             Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_preserves_exact_old_new_update() {
+        let local = temp_repo("actions-update-local");
+        let remote = temp_repo("actions-update-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let tip = write_commit(&local, vec![base], "tip");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Update {
+                dst: "refs/heads/main".into(),
+                old: base,
+                new: tip,
+            }],
+            default_options(),
+        );
+
+        let outcome = push_local_actions(&local, &remote, &plan).expect("push actions");
+
+        assert_eq!(outcome.commands.len(), 1);
+        assert_eq!(outcome.commands[0].old_id, base);
+        assert_eq!(outcome.commands[0].new_id, tip);
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(tip))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_stale_update_old_rejects_without_mutating() {
+        let local = temp_repo("actions-stale-local");
+        let remote = temp_repo("actions-stale-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let tip = write_commit(&local, vec![base], "tip");
+        let concurrent = write_commit(&remote, vec![base], "concurrent");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(concurrent));
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Update {
+                dst: "refs/heads/main".into(),
+                old: base,
+                new: tip,
+            }],
+            default_options(),
+        );
+
+        let err = push_local_actions(&local, &remote, &plan).expect_err("stale old rejects");
+
+        assert!(err.to_string().contains("expected ref refs/heads/main"));
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(concurrent))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_stale_delete_old_rejects_without_mutating() {
+        let local = temp_repo("actions-delete-local");
+        let remote = temp_repo("actions-delete-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let concurrent = write_commit(&remote, vec![base], "concurrent");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(concurrent));
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Delete {
+                dst: "refs/heads/main".into(),
+                old: Some(base),
+            }],
+            default_options(),
+        );
+
+        let err = push_local_actions(&local, &remote, &plan).expect_err("stale delete rejects");
+
+        assert!(err.to_string().contains("expected ref refs/heads/main"));
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(concurrent))
+        );
+    }
+
+    #[test]
+    fn local_push_actions_create_rejects_existing_ref() {
+        let local = temp_repo("actions-create-local");
+        let remote = temp_repo("actions-create-remote");
+        let base = write_commit(&local, Vec::new(), "base");
+        let remote_base = write_commit(&remote, Vec::new(), "base");
+        assert_eq!(remote_base, base);
+        let tip = write_commit(&local, vec![base], "tip");
+        set_ref(&remote, "refs/heads/main", RefTarget::Direct(base));
+        let plan = PushActionPlan::from_actions(
+            vec![PushAction::Create {
+                dst: "refs/heads/main".into(),
+                new: tip,
+            }],
+            default_options(),
+        );
+
+        let err = push_local_actions(&local, &remote, &plan).expect_err("create must be absent");
+
+        assert!(
+            err.to_string()
+                .contains("expected ref refs/heads/main to not already exist")
+        );
+        let remote_refs = FileRefStore::new(&remote, ObjectFormat::Sha1);
+        assert_eq!(
+            remote_refs
+                .read_ref("refs/heads/main")
+                .expect("remote ref should read"),
+            Some(RefTarget::Direct(base))
         );
     }
 

@@ -41,7 +41,9 @@
 //! ```
 
 mod capabilities;
+mod config_edit;
 mod diff;
+mod index_io;
 mod notes_repo;
 mod objects;
 mod refs;
@@ -98,15 +100,22 @@ pub use sley_object::{
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
-pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
+pub use sley_refs::{
+    FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
+};
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
     IndexStatProbe, ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
 };
 
 pub use capabilities::RepositoryCapabilities;
+pub use config_edit::{
+    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigSnapshot, ConfigSource,
+    ConfigValue,
+};
+pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions};
 pub use objects::LoadedObject;
-pub use refs::{RefChange, RefChangeResult, RefConflict};
+pub use refs::{DeleteRef, RefChange, RefChangeResult, RefConflict, ReflogMessage};
 
 /// A resolved reference: its full name plus the target it points at.
 ///

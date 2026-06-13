@@ -71,8 +71,18 @@ pub(crate) struct SshPushRequest<'a> {
     pub force: bool,
 }
 
+pub(crate) struct SshPushCommandsRequest<'a> {
+    pub common_git_dir: &'a Path,
+    pub format: ObjectFormat,
+    pub remote: &'a RemoteUrl,
+    pub commands: Vec<ReceivePackCommand>,
+    pub pack_objects: Vec<ObjectId>,
+    pub force: bool,
+}
+
 pub(crate) struct SshPushPlan {
     pub(crate) commands: Vec<ReceivePackCommand>,
+    pub(crate) pack_objects: Vec<ObjectId>,
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: ChildStdout,
@@ -163,6 +173,7 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
         drop(stdin);
         return Ok(SshPushPlan {
             commands,
+            pack_objects: Vec::new(),
             child,
             stdin: None,
             stdout,
@@ -176,6 +187,97 @@ pub(crate) fn plan_push_ssh(request: SshPushRequest<'_>) -> Result<SshPushPlan> 
     crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
     Ok(SshPushPlan {
         commands,
+        pack_objects: Vec::new(),
+        child,
+        stdin: Some(stdin),
+        stdout,
+        features,
+        advertisements: advertisement_set.refs,
+        remote: remote.clone(),
+    })
+}
+
+pub(crate) fn plan_push_ssh_commands(request: SshPushCommandsRequest<'_>) -> Result<SshPushPlan> {
+    let SshPushCommandsRequest {
+        common_git_dir,
+        format,
+        remote,
+        commands,
+        pack_objects,
+        force,
+    } = request;
+    if remote.transport != RemoteTransport::Ssh {
+        return Err(GitError::InvalidFormat(
+            "SSH receive-pack requires an SSH remote".into(),
+        ));
+    }
+    let ssh = ssh_process_command(
+        remote,
+        GitService::ReceivePack,
+        ssh_program(),
+        SshCommandVariant::OpenSsh,
+    )?;
+    let mut child = ProcessCommand::new(&ssh.program)
+        .args(&ssh.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| GitError::Command("ssh receive-pack stdout was not piped".into()))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| GitError::Command("ssh receive-pack stdin was not piped".into()))?;
+
+    let advertisement_set = read_ref_advertisement_set(format, &mut stdout)?;
+    let features = advertisement_set
+        .refs
+        .first()
+        .map(|advertisement| parse_receive_pack_features(&advertisement.capabilities))
+        .transpose()?
+        .unwrap_or_default();
+    if let Some(remote_format) = features.object_format {
+        if remote_format != format {
+            return Err(GitError::InvalidObjectId(format!(
+                "remote repository uses {}, local repository uses {}",
+                remote_format.name(),
+                format.name()
+            )));
+        }
+    } else if format != ObjectFormat::Sha1 {
+        return Err(GitError::InvalidObjectId(format!(
+            "remote repository did not advertise object-format for {} push",
+            format.name()
+        )));
+    }
+
+    if commands.is_empty() {
+        drop(stdin);
+        return Ok(SshPushPlan {
+            commands,
+            pack_objects,
+            child,
+            stdin: None,
+            stdout,
+            features,
+            advertisements: advertisement_set.refs,
+            remote: remote.clone(),
+        });
+    }
+
+    let command_forces = commands
+        .iter()
+        .cloned()
+        .map(|command| (command, force))
+        .collect::<Vec<_>>();
+    let local_db = FileObjectDatabase::from_git_dir(common_git_dir, format);
+    crate::push::reject_non_fast_forward_pushes(&local_db, format, &command_forces)?;
+    Ok(SshPushPlan {
+        commands,
+        pack_objects,
         child,
         stdin: Some(stdin),
         stdout,
@@ -202,10 +304,7 @@ pub(crate) fn execute_push_ssh_plan(
         crate::remote_advertisement_tips_known_to_local(&local_db, &plan.advertisements)?;
     let remote_excluded =
         collect_reachable_object_ids(&local_db, request.format, remote_excluded_tips)?;
-    let starts = commands
-        .iter()
-        .filter(|command| !command.new_id.is_null())
-        .map(|command| command.new_id.clone());
+    let starts = crate::pack::push_pack_roots(&commands, &plan.pack_objects);
     let packfile = build_reachable_pack(&local_db, request.format, starts, &remote_excluded)?
         .map(|pack| pack.pack)
         .unwrap_or_default();

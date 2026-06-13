@@ -1,10 +1,38 @@
 //! Ref-transaction helpers on top of [`sley_refs::FileRefTransaction`].
 
 use std::fmt;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use sley_refs::{RefTarget, RefUpdate, ReflogEntry};
+use sley_refs::{
+    DeleteRef as StoreDeleteRef, DeleteRefReflog, RefDeleteError, RefTarget, RefUpdate, ReflogEntry,
+};
 
-use crate::{FullName, GitError, Repository, Result};
+use crate::{FullName, GitError, ObjectId, Repository, Result};
+
+/// One ref delete to apply atomically via [`Repository::delete_ref`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRef {
+    /// Full ref name (e.g. `refs/heads/main`).
+    pub name: FullName,
+    /// When set, the ref must currently point at this exact object id.
+    pub expected_old: Option<ObjectId>,
+    /// Optional reflog message appended on successful deletion.
+    pub reflog: Option<ReflogMessage>,
+}
+
+/// Reflog message for a ref delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReflogMessage {
+    pub message: Vec<u8>,
+}
+
+impl ReflogMessage {
+    pub fn new(message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
 
 /// One ref update to apply atomically via [`Repository::apply_ref_changes`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +118,28 @@ fn extract_ref_name_from_transaction(message: &str) -> Option<String> {
 }
 
 impl Repository {
+    /// Delete a direct ref only if the optional old-oid precondition still holds.
+    ///
+    /// The ref is locked before its current value is read, stale expected values
+    /// leave the ref untouched, and packed refs are rewritten through
+    /// `packed-refs.lock`.
+    pub fn delete_ref(&self, delete: DeleteRef) -> std::result::Result<(), RefDeleteError> {
+        let reflog = match delete.reflog {
+            Some(message) => Some(DeleteRefReflog {
+                committer: self.delete_ref_committer()?,
+                message: message.message,
+            }),
+            None => None,
+        };
+        self.references()
+            .delete_ref_checked(StoreDeleteRef {
+                name: delete.name.into(),
+                expected_old: delete.expected_old,
+                reflog,
+            })
+            .map(|_| ())
+    }
+
     /// Apply `changes` atomically via the on-disk ref transaction backend.
     ///
     /// All updates succeed together or none take effect. A failed
@@ -103,10 +153,30 @@ impl Repository {
         }
         tx.commit().map_err(RefConflict::from_git_error)
     }
+
+    fn delete_ref_committer(&self) -> std::result::Result<Vec<u8>, RefDeleteError> {
+        let name = self
+            .config_string("user", "name")
+            .map_err(ref_delete_error_from_git)?
+            .unwrap_or_else(|| "sley".to_string());
+        let email = self
+            .config_string("user", "email")
+            .map_err(ref_delete_error_from_git)?
+            .unwrap_or_else(|| "sley@example.invalid".to_string());
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or(0);
+        Ok(format!("{name} <{email}> {seconds} +0000").into_bytes())
+    }
 }
 
 /// Facade-level ref transaction result type.
 pub type RefChangeResult<T> = std::result::Result<T, RefConflict>;
+
+fn ref_delete_error_from_git(err: GitError) -> RefDeleteError {
+    RefDeleteError::Io(std::io::Error::other(err.to_string()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -145,7 +215,7 @@ mod tests {
         repo: &Repository,
         parent: Option<&sley_core::ObjectId>,
     ) -> sley_core::ObjectId {
-        let mut db = repo.objects_mut();
+        let db = repo.objects_mut();
         let blob_oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"x\n".to_vec()))
             .expect("blob");
@@ -212,5 +282,40 @@ mod tests {
             }])
             .expect_err("stale expected");
         assert_eq!(err.ref_name, "refs/heads/main");
+    }
+
+    #[test]
+    fn repository_delete_ref_enforces_expected_and_appends_reflog() {
+        let temp = TempDir::new();
+        let repo = Repository::init(&temp.path).expect("init");
+        let oid = write_commit(&repo, None);
+        repo.apply_ref_changes(&[
+            RefChange::new("refs/heads/main", RefTarget::Direct(oid)).expect("valid ref name")
+        ])
+        .expect("create ref");
+
+        repo.delete_ref(DeleteRef {
+            name: FullName::new("refs/heads/main").expect("valid ref name"),
+            expected_old: Some(oid),
+            reflog: Some(ReflogMessage::new(b"delete main".to_vec())),
+        })
+        .expect("delete ref");
+
+        assert!(
+            repo.find_reference("refs/heads/main")
+                .expect("lookup")
+                .is_none()
+        );
+        let log = repo
+            .references()
+            .read_reflog("refs/heads/main")
+            .expect("read reflog");
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].old_oid, oid);
+        assert_eq!(
+            log[0].new_oid,
+            sley_core::ObjectId::null(repo.object_format())
+        );
+        assert_eq!(log[0].message, b"delete main");
     }
 }
