@@ -1529,15 +1529,19 @@ fn config_raw_edit(
     match editor.set_multivar(value, comment, value_matches, multi_replace) {
         sley_config::raw_edit::RawEditOutcome::NothingSet => Ok(false),
         sley_config::raw_edit::RawEditOutcome::Changed => {
-            if let Some(parent) = path.parent()
-                && !parent.as_os_str().is_empty()
-            {
-                fs::create_dir_all(parent).ok();
-            }
-            fs::write(&path, editor.into_bytes())?;
+            write_raw_config_file(&path, editor.into_bytes())?;
             Ok(true)
         }
     }
+}
+
+fn write_raw_config_file(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
+    sley_config::raw_edit::write_config_file_locked(
+        path,
+        &bytes,
+        sley_config::raw_edit::ConfigFileWriteOptions::default(),
+    )
+    .map_err(|err| GitError::Io(err.to_string()))
 }
 
 /// git's `section_name_is_ok`: a new section name must be non-empty, and the
@@ -1617,7 +1621,7 @@ fn config_rename_or_remove_section(
         new_name.as_deref(),
     ) {
         sley_config::raw_edit::SectionEditOutcome::Changed(out) => {
-            fs::write(&path, out)?;
+            write_raw_config_file(&path, out)?;
             Ok(())
         }
         sley_config::raw_edit::SectionEditOutcome::NotFound => {

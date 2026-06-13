@@ -113,6 +113,7 @@ pub fn create_annotated_tag(writer: &mut impl ObjectWriter, tag: TagCreate) -> R
         name: tag.name,
         tagger: Some(tag.tagger),
         message: tag.message,
+        raw_body: None,
     };
     writer.write_object(EncodedObject::new(ObjectType::Tag, tag.write()))
 }

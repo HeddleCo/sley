@@ -5528,7 +5528,7 @@ where
     I: FnMut(&[u8]) -> Result<()>,
     C: FnMut(&ObjectId) -> Result<bool>,
     U: FnMut(&[ReceivePackCommand]) -> Result<()>,
-    D: FnMut(&str) -> Result<()>,
+    D: FnMut(&ReceivePackCommand) -> Result<()>,
 {
     validate_receive_pack_push_request_features(features, request)?;
 
@@ -5572,7 +5572,7 @@ where
         .iter()
         .filter(|command| is_receive_pack_delete_command(command))
     {
-        delete_ref(&command.name)?;
+        delete_ref(command)?;
     }
 
     Ok(ReceivePackReportStatus {
@@ -11764,8 +11764,8 @@ mod tests {
             },
             |_| Ok(false),
             |_| unreachable!("delete-only request should not apply updates"),
-            |name| {
-                deleted.borrow_mut().push(name.to_string());
+            |command| {
+                deleted.borrow_mut().push(command.name.clone());
                 Ok(())
             },
         )

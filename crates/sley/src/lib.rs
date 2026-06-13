@@ -41,7 +41,9 @@
 //! ```
 
 mod capabilities;
+mod config_edit;
 mod diff;
+mod index_io;
 mod notes_repo;
 mod objects;
 mod refs;
@@ -89,7 +91,8 @@ pub mod plumbing {
 // so the common path (`use sley::{Repository, ObjectId, ...}`) stays short.
 pub use sley_config::GitConfig;
 pub use sley_core::{
-    BString, FullName, GitError, GitTime, NotFoundKind, ObjectFormat, ObjectId, Result, Signature,
+    BString, FullName, GitError, GitTime, MissingObjectContext, MissingObjectKind, NotFoundKind,
+    ObjectFormat, ObjectId, Result, Signature,
 };
 pub use sley_diff_merge::{DiffNameStatusOptions, NameStatusEntry};
 pub use sley_index::{Index, IndexEntry, Stage as IndexStage};
@@ -98,15 +101,28 @@ pub use sley_object::{
 };
 pub use sley_object::{EntryKind, TreeBuilder as TreeEditor};
 pub use sley_odb::FileObjectDatabase as ObjectDatabase;
-pub use sley_refs::{FileRefStore as RefStore, RefPrecondition, RefTarget as ReferenceTarget};
+pub use sley_refs::{
+    FileRefStore as RefStore, RefDeleteError, RefPrecondition, RefTarget as ReferenceTarget,
+};
 pub use sley_sequencer::TagCreate;
 pub use sley_worktree::{
-    IndexStatProbe, ShortStatusEntry, ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState,
+    AtomicMetadataWriteOptions, AtomicMetadataWriteResult, IndexStatProbe, ShortStatusEntry,
+    ShortStatusOptions, StatusUntrackedMode, WorktreeEntryState, write_metadata_file_atomic,
 };
 
 pub use capabilities::RepositoryCapabilities;
+pub use config_edit::{
+    ConfigEdit, ConfigEditError, ConfigEditPlan, ConfigEditScope, ConfigSectionEntry,
+    ConfigSnapshot, ConfigSource, ConfigValue, RemoteConfig, RemoteConfigRefusal,
+    RemoteConfigRemove, RemoteConfigSet, RemoteConfigSnapshot, RemoteConfigSource,
+    RemoteConfigValue,
+};
+pub use index_io::{IndexError, IndexWriteError, IndexWriteOptions, IndexWriteResult};
 pub use objects::LoadedObject;
-pub use refs::{RefChange, RefChangeResult, RefConflict};
+pub use refs::{
+    DeleteRef, RefBatchChange, RefChange, RefChangeResult, RefConflict, RefDeleteExpected,
+    ReflogMessage,
+};
 
 /// A resolved reference: its full name plus the target it points at.
 ///
@@ -533,7 +549,14 @@ impl Repository {
     /// Read a commit object, parsing it into a [`Commit`]. Returns an error if
     /// `oid` does not name a commit.
     pub fn read_commit(&self, oid: &ObjectId) -> Result<Commit> {
-        let object = self.read_object(oid)?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Commit,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Commit {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a commit",
@@ -546,7 +569,14 @@ impl Repository {
     /// Read a tree object, parsing it into a [`Tree`]. Returns an error if `oid`
     /// does not name a tree.
     pub fn read_tree(&self, oid: &ObjectId) -> Result<Tree> {
-        let object = self.read_object(oid)?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Tree,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Tree {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a tree",
@@ -559,7 +589,14 @@ impl Repository {
     /// Read an annotated tag object, parsing it into a [`Tag`]. Returns an error
     /// if `oid` does not name a tag.
     pub fn read_tag(&self, oid: &ObjectId) -> Result<Tag> {
-        let object = self.read_object(oid)?;
+        let object = self.read_object(oid).map_err(|err| {
+            expect_missing_object_kind(
+                err,
+                *oid,
+                MissingObjectKind::Tag,
+                MissingObjectContext::Read,
+            )
+        })?;
         if object.object_type != ObjectType::Tag {
             return Err(GitError::InvalidObject(format!(
                 "object {oid} is a {}, not a tag",
@@ -665,6 +702,20 @@ impl Repository {
         Err(GitError::InvalidFormat(format!(
             "symbolic reference chain too deep starting at {name}"
         )))
+    }
+}
+
+fn expect_missing_object_kind(
+    err: GitError,
+    oid: ObjectId,
+    expected: MissingObjectKind,
+    context: MissingObjectContext,
+) -> GitError {
+    match err.not_found_kind() {
+        Some(NotFoundKind::Object { .. }) => {
+            GitError::object_kind_not_found_in(oid, expected, context)
+        }
+        _ => err,
     }
 }
 
@@ -787,7 +838,7 @@ mod tests {
     /// Write a blob, a tree referencing it, and a commit pointing at the tree,
     /// then point `refs/heads/main` at the commit. Returns the commit oid.
     fn seed_commit(repo: &Repository) -> ObjectId {
-        let mut db = repo.objects_mut();
+        let db = repo.objects_mut();
 
         let blob_oid = db
             .write_object(EncodedObject::new(ObjectType::Blob, b"hello\n".to_vec()))
@@ -826,6 +877,20 @@ mod tests {
         .expect("create main branch");
 
         commit_oid
+    }
+
+    fn seed_empty_tree_commit(repo: &Repository) -> ObjectId {
+        let db = repo.objects_mut();
+        let commit = Commit {
+            tree: ObjectId::empty_tree(repo.object_format()),
+            parents: Vec::new(),
+            author: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
+            committer: b"Tester <test@example.com> 1700000000 +0000".to_vec(),
+            encoding: None,
+            message: b"empty tree\n".to_vec(),
+        };
+        db.write_object(EncodedObject::new(ObjectType::Commit, commit.write()))
+            .expect("write empty tree commit")
     }
 
     #[test]
@@ -910,6 +975,78 @@ mod tests {
         let blob = repo.read_object(&tree.entries[0].oid).expect("read blob");
         assert_eq!(blob.object_type, ObjectType::Blob);
         assert_eq!(blob.body, b"hello\n");
+    }
+
+    #[test]
+    fn read_tree_accepts_implied_empty_tree_without_stored_object() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let empty = ObjectId::empty_tree(repo.object_format());
+
+        let object = repo.read_object(&empty).expect("read implied empty tree");
+        assert_eq!(object.object_type, ObjectType::Tree);
+        assert!(object.body.is_empty());
+
+        let tree = repo.read_tree(&empty).expect("parse implied empty tree");
+        assert!(tree.entries.is_empty());
+    }
+
+    #[test]
+    fn missing_object_errors_expose_oid_and_expected_kind() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let missing = ObjectId::from_hex(
+            repo.object_format(),
+            "1111111111111111111111111111111111111111",
+        )
+        .expect("valid oid");
+
+        let raw_err = repo.read_object(&missing).expect_err("raw missing object");
+        let raw_kind = raw_err.not_found_kind().expect("typed not found");
+        assert_eq!(raw_kind.object_id(), Some(missing));
+        assert_eq!(
+            raw_kind.missing_object_kind(),
+            Some(MissingObjectKind::Object)
+        );
+        assert_eq!(
+            raw_kind.missing_object_context(),
+            Some(MissingObjectContext::Read)
+        );
+
+        let commit_err = repo
+            .read_commit(&missing)
+            .expect_err("typed missing commit");
+        let commit_kind = commit_err.not_found_kind().expect("typed not found");
+        assert_eq!(commit_kind.object_id(), Some(missing));
+        assert_eq!(
+            commit_kind.missing_object_kind(),
+            Some(MissingObjectKind::Commit)
+        );
+        assert_eq!(
+            commit_kind.missing_object_context(),
+            Some(MissingObjectContext::Read)
+        );
+    }
+
+    #[test]
+    fn read_commit_accepts_encoded_non_utf8_commit() {
+        let temp = TempDir::new();
+        let repo = Repository::init(temp.path()).expect("init");
+        let tree = ObjectId::empty_tree(repo.object_format());
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        body.extend_from_slice(b"author J\xF6rg <j@example.invalid> 0 +0000\n");
+        body.extend_from_slice(b"committer M\xFCller <m@example.invalid> 1 +0000\n");
+        body.extend_from_slice(b"encoding ISO-8859-1\n\ncaf\xE9\n");
+        let oid = repo
+            .write_raw_object(ObjectType::Commit, body)
+            .expect("write raw commit");
+
+        let commit = repo.read_commit(&oid).expect("read non-utf8 commit");
+        assert_eq!(commit.author, b"J\xF6rg <j@example.invalid> 0 +0000");
+        assert_eq!(commit.committer, b"M\xFCller <m@example.invalid> 1 +0000");
+        assert_eq!(commit.encoding.as_deref(), Some(&b"ISO-8859-1"[..]));
+        assert_eq!(commit.message, b"caf\xE9\n");
     }
 
     #[test]
@@ -1247,6 +1384,27 @@ mod tests {
         let original = source.read_commit(&commit_oid).expect("read source commit");
         assert_eq!(copied.tree, original.tree);
         assert_eq!(copied.message, original.message);
+    }
+
+    #[test]
+    fn copy_reachable_from_accepts_implied_empty_tree() {
+        let source_dir = TempDir::new();
+        let dest_dir = TempDir::new();
+        let source = Repository::init(source_dir.path()).expect("source");
+        let dest = Repository::init(dest_dir.path()).expect("dest");
+        let commit_oid = seed_empty_tree_commit(&source);
+
+        dest.copy_reachable_from(&source, std::slice::from_ref(&commit_oid))
+            .expect("copy empty-tree commit");
+
+        let copied = dest.read_commit(&commit_oid).expect("read copied commit");
+        assert_eq!(copied.tree, ObjectId::empty_tree(dest.object_format()));
+        assert!(
+            dest.read_tree(&copied.tree)
+                .expect("read tree")
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

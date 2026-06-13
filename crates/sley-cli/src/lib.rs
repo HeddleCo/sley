@@ -6325,11 +6325,14 @@ fn log_validate_output_indicator(option: &str, value: &str) -> Result<()> {
 }
 
 fn log_validate_output_indicator_for_log(option: &str, value: &str) -> Result<()> {
-    if option == "output-indicator-context" && value.is_empty() {
-        Ok(())
-    } else {
-        log_validate_output_indicator(option, value)
+    // git accepts an empty value only for `--output-indicator-context` (it falls
+    // back to the default ' ' marker); empty `--output-indicator-{new,old}=` is
+    // rejected with exit 129, exactly like a single-byte check failing. Defer to
+    // the shared validator so the empty case errors byte-identically to git.
+    if value.is_empty() && option == "output-indicator-context" {
+        return Ok(());
     }
+    log_validate_output_indicator(option, value)
 }
 
 fn log_validate_submodule_format(value: &str) -> Result<()> {
@@ -7561,23 +7564,19 @@ fn parse_simple_log_regex_class(
 }
 
 fn log_regex_unterminated_class_error(
-    class_bytes: &[u8],
+    _class_bytes: &[u8],
     pattern: &str,
     error_context: &str,
 ) -> Result<(SimpleLogRegexClass, usize)> {
-    // `class_bytes` is everything after the opening `[`. git (via POSIX regerror)
-    // distinguishes two cases: an opening bracket with no class content at all -
-    // `[` or `[^` at end of pattern - reports a generic "Invalid regular
-    // expression"; an unterminated class that does have content (e.g. `[a`, `[]`,
-    // `[[:alpha:]`) reports the bracket-specific "Unmatched" diagnostic. In POSIX
-    // BRE a `]` immediately following `[`/`[^` is a literal member, so it counts as
-    // content. Match that split exactly for git 2.54 parity.
-    let after_caret = class_bytes.strip_prefix(b"^").unwrap_or(class_bytes);
-    let message = if after_caret.is_empty() {
-        "Invalid regular expression"
-    } else {
-        "Unmatched [, [^, [:, [., or [="
-    };
+    // Default output must be byte-identical to git: glibc's `regcomp` reports an
+    // unbalanced bracket class via `regerror`, which git surfaces verbatim as
+    // "Invalid regular expression". The friendlier "brackets ([ ]) not balanced"
+    // diagnostic is a strict improvement, but only acceptable behind a verbose
+    // mode — sley-cli has no global `-v`/verbosity seam reaching the log
+    // regex-parse path yet (only per-subcommand verbose flags in worktree/etc.).
+    // TODO(verbose): surface detailed regex diagnostics ("brackets ([ ]) not
+    // balanced") under -v once a global verbosity level is plumbed into log.
+    let message = "Invalid regular expression";
     eprintln!("fatal: {error_context}, '{pattern}': {message}");
     Err(GitError::Exit(128))
 }

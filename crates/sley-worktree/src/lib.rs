@@ -1,5 +1,8 @@
 use sley_config::GitConfig;
-use sley_core::{BString, GitError, ObjectFormat, ObjectId, RepoPath, Result};
+use sley_core::{
+    BString, GitError, MissingObjectContext, MissingObjectKind, ObjectFormat, ObjectId, RepoPath,
+    Result,
+};
 use sley_index::{CacheTree, Index, IndexEntry, Stage};
 use sley_object::{Commit, EncodedObject, ObjectType, Tree, TreeEntry, tree_entry_object_type};
 use sley_odb::{FileObjectDatabase, ObjectReader, ObjectWriter};
@@ -229,6 +232,19 @@ pub enum WorktreeEntryState {
     Modified,
     /// The path, or one of its parents, is missing from the worktree.
     Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AtomicMetadataWriteOptions {
+    pub fsync_file: bool,
+    pub fsync_dir: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AtomicMetadataWriteResult {
+    pub path: PathBuf,
+    pub len: u64,
+    pub mtime: Option<(u64, u64)>,
 }
 
 /// Stage-0 index stat data that can prove a worktree path clean without
@@ -3491,19 +3507,15 @@ fn collect_attribute_patterns_from_tree(
     base: Vec<u8>,
     matcher: &mut AttributeMatcher,
 ) -> Result<()> {
-    let object = db.read_object(tree_oid)?;
-    if object.object_type != ObjectType::Tree {
-        return Err(GitError::InvalidObject(format!(
-            "expected tree {tree_oid}, found {}",
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, tree_oid, ObjectType::Tree)?;
     let mut entries = Tree::parse(format, &object.body)?.entries;
     entries.sort_by(|left, right| left.name.cmp(&right.name));
     for entry in &entries {
         if entry.name == b".gitattributes" && tree_entry_object_type(entry.mode) == ObjectType::Blob
         {
-            let object = db.read_object(&entry.oid)?;
+            let object = db.read_object(&entry.oid).map_err(|err| {
+                expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob)
+            })?;
             if object.object_type == ObjectType::Blob {
                 read_attribute_patterns_from_bytes(&object.body, matcher, &base);
             }
@@ -3549,7 +3561,9 @@ fn collect_attribute_patterns_from_index(
             Some(parent) => parent.strip_suffix(b"/").unwrap_or(parent).to_vec(),
             None => continue,
         };
-        let object = db.read_object(&entry.oid)?;
+        let object = db
+            .read_object(&entry.oid)
+            .map_err(|err| expect_missing_object_kind(err, entry.oid, MissingObjectKind::Blob))?;
         if object.object_type == ObjectType::Blob {
             read_attribute_patterns_from_bytes(&object.body, matcher, &base);
         }
@@ -4871,14 +4885,7 @@ fn checkout_commit_to_index_and_worktree_filtered(
             index_entries.push(materialize_tree_entry(&db, worktree_root, path, entry)?);
             continue;
         }
-        let object = db.read_object(&entry.oid)?;
-        if object.object_type != ObjectType::Blob {
-            return Err(GitError::InvalidObject(format!(
-                "expected blob {}, found {}",
-                entry.oid,
-                object.object_type.as_str()
-            )));
-        }
+        let object = read_expected_object(&db, &entry.oid, ObjectType::Blob)?;
         let body: Cow<'_, [u8]> = match (smudge_config, &attributes) {
             (Some(config), Some(matcher)) => {
                 let checks = matcher.attributes_for_path(path, &filter_attribute_names(), false);
@@ -5498,14 +5505,7 @@ fn materialize_tree_entry(
             path: BString::from(path),
         });
     }
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -5763,6 +5763,76 @@ fn file_mtime_parts(metadata: &fs::Metadata) -> Option<(u64, u64)> {
     Some((duration.as_secs(), u64::from(duration.subsec_nanos())))
 }
 
+/// Write a git metadata file through a sibling `.lock` file and atomic rename.
+///
+/// This helper is intended for small repository/worktree metadata files such as
+/// `HEAD`, `config.worktree`, or state files under `.git/`. It deliberately does
+/// not try to replace object or pack writers, which have their own durability
+/// and naming rules.
+pub fn write_metadata_file_atomic(
+    path: impl AsRef<Path>,
+    bytes: &[u8],
+    options: AtomicMetadataWriteOptions,
+) -> Result<AtomicMetadataWriteResult> {
+    let path = path.as_ref();
+    let parent = path.parent().ok_or_else(|| {
+        GitError::InvalidPath(format!("metadata path has no parent: {}", path.display()))
+    })?;
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = metadata_lock_path(path)?;
+    let mut lock = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(GitError::Transaction(format!(
+                "metadata lock already exists: {}",
+                lock_path.display()
+            )));
+        }
+        Err(err) => return Err(err.into()),
+    };
+    if let Err(err) = lock.write_all(bytes) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    if options.fsync_file
+        && let Err(err) = lock.sync_all()
+    {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    drop(lock);
+    if let Err(err) = fs::rename(&lock_path, path) {
+        let _ = fs::remove_file(&lock_path);
+        return Err(err.into());
+    }
+    if options.fsync_dir
+        && let Ok(dir) = fs::File::open(parent)
+    {
+        dir.sync_all()?;
+    }
+    let metadata = fs::metadata(path)?;
+    Ok(AtomicMetadataWriteResult {
+        path: path.to_path_buf(),
+        len: metadata.len(),
+        mtime: file_mtime_parts(&metadata),
+    })
+}
+
+fn metadata_lock_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        GitError::InvalidPath(format!("metadata path has no filename: {}", path.display()))
+    })?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
+}
+
 /// Checks out `target` like [`checkout_detached`], but materializes the
 /// worktree through the supplied [`SparseCheckout`]: out-of-cone paths are not
 /// written, get their skip-worktree bit set, and have any stale worktree file
@@ -5817,14 +5887,7 @@ fn materialize_index_entry_file(
     file_path: &Path,
     entry: &IndexEntry,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -6065,14 +6128,7 @@ pub fn remove_index_and_worktree_paths(
             }
             let worktree_file = worktree_path(worktree_root, path)?;
             if worktree_file.exists() {
-                let object = db.read_object(&index_entry.oid)?;
-                if object.object_type != ObjectType::Blob {
-                    return Err(GitError::InvalidObject(format!(
-                        "expected blob {}, found {}",
-                        index_entry.oid,
-                        object.object_type.as_str()
-                    )));
-                }
+                let object = read_expected_object(&db, &index_entry.oid, ObjectType::Blob)?;
                 let worktree_bytes = apply_clean_filter(
                     worktree_root,
                     git_dir,
@@ -6408,14 +6464,7 @@ fn restore_index_entry(
     entry: &IndexEntry,
     smudge_config: Option<&GitConfig>,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let body: Cow<'_, [u8]> = match smudge_config {
         Some(config) => {
             let checks = smudge_attribute_checks_from_index(
@@ -6464,14 +6513,7 @@ fn restored_head_index_entry(
         match fs::metadata(&file_path) {
             Ok(metadata) => metadata.len().min(u32::MAX as u64) as u32,
             Err(_) => {
-                let object = db.read_object(&entry.oid)?;
-                if object.object_type != ObjectType::Blob {
-                    return Err(GitError::InvalidObject(format!(
-                        "expected blob {}, found {}",
-                        entry.oid,
-                        object.object_type.as_str()
-                    )));
-                }
+                let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
                 object.body.len().min(u32::MAX as usize) as u32
             }
         }
@@ -6500,14 +6542,7 @@ fn restore_head_entry_to_worktree(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<()> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -6522,14 +6557,7 @@ fn restore_head_entry_to_worktree_and_index(
     path: &[u8],
     entry: &TrackedEntry,
 ) -> Result<IndexEntry> {
-    let object = db.read_object(&entry.oid)?;
-    if object.object_type != ObjectType::Blob {
-        return Err(GitError::InvalidObject(format!(
-            "expected blob {}, found {}",
-            entry.oid,
-            object.object_type.as_str()
-        )));
-    }
+    let object = read_expected_object(db, &entry.oid, ObjectType::Blob)?;
     let file_path = worktree_path(worktree_root, path)?;
     if let Some(parent) = file_path.parent() {
         fs::create_dir_all(parent)?;
@@ -6587,14 +6615,51 @@ fn index_entry_from_metadata(
     }
 }
 
-fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
-    let object = db.read_object(oid)?;
-    if object.object_type != ObjectType::Commit {
+fn read_expected_object(
+    db: &FileObjectDatabase,
+    oid: &ObjectId,
+    expected: ObjectType,
+) -> Result<std::sync::Arc<EncodedObject>> {
+    let object = db
+        .read_object(oid)
+        .map_err(|err| expect_missing_object_kind(err, *oid, missing_kind_for_type(expected)))?;
+    if object.object_type != expected {
         return Err(GitError::InvalidObject(format!(
-            "expected commit {oid}, found {}",
+            "expected {} {}, found {}",
+            expected.as_str(),
+            oid,
             object.object_type.as_str()
         )));
     }
+    Ok(object)
+}
+
+fn expect_missing_object_kind(
+    err: GitError,
+    oid: ObjectId,
+    expected: MissingObjectKind,
+) -> GitError {
+    match err.not_found_kind() {
+        Some(sley_core::NotFoundKind::Object { .. }) => GitError::object_kind_not_found_in(
+            oid,
+            expected,
+            MissingObjectContext::WorktreeMaterialize,
+        ),
+        _ => err,
+    }
+}
+
+fn missing_kind_for_type(object_type: ObjectType) -> MissingObjectKind {
+    match object_type {
+        ObjectType::Blob => MissingObjectKind::Blob,
+        ObjectType::Tree => MissingObjectKind::Tree,
+        ObjectType::Commit => MissingObjectKind::Commit,
+        ObjectType::Tag => MissingObjectKind::Tag,
+    }
+}
+
+fn read_commit(db: &FileObjectDatabase, format: ObjectFormat, oid: &ObjectId) -> Result<Commit> {
+    let object = read_expected_object(db, oid, ObjectType::Commit)?;
     Commit::parse(format, &object.body)
 }
 
@@ -6730,12 +6795,7 @@ fn resolve_head_tree_oid(
     let Some(commit_oid) = resolve_head_commit_oid(git_dir, format)? else {
         return Ok(None);
     };
-    let object = db.read_object(&commit_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "HEAD {commit_oid} is not a commit"
-        )));
-    }
+    let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     Ok(Some(commit.tree))
 }
@@ -6877,12 +6937,7 @@ fn head_tree_entries(
     let Some(commit_oid) = commit_oid else {
         return Ok(BTreeMap::new());
     };
-    let object = db.read_object(&commit_oid)?;
-    if object.object_type != ObjectType::Commit {
-        return Err(GitError::InvalidObject(format!(
-            "HEAD {commit_oid} is not a commit"
-        )));
-    }
+    let object = read_expected_object(db, &commit_oid, ObjectType::Commit)?;
     let commit = Commit::parse_ref(format, &object.body)?;
     let mut entries = BTreeMap::new();
     collect_tree_entries(db, format, &commit.tree, &mut entries)?;
@@ -7540,6 +7595,55 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn atomic_metadata_writer_writes_and_reports_stat() {
+        let root = temp_root();
+        let path = root.join(".git").join("HEAD");
+
+        let result = write_metadata_file_atomic(
+            &path,
+            b"ref: refs/heads/main\n",
+            AtomicMetadataWriteOptions::default(),
+        )
+        .expect("write metadata");
+
+        assert_eq!(
+            fs::read(&path).expect("read metadata"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(result.path, path);
+        assert_eq!(result.len, b"ref: refs/heads/main\n".len() as u64);
+        assert!(result.mtime.is_some());
+        assert!(!path.with_file_name("HEAD.lock").exists());
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn atomic_metadata_writer_existing_lock_preserves_original() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).expect("create git dir");
+        let path = git_dir.join("HEAD");
+        let lock = git_dir.join("HEAD.lock");
+        fs::write(&path, b"ref: refs/heads/main\n").expect("write original");
+        fs::write(&lock, b"held\n").expect("write lock");
+
+        let err = write_metadata_file_atomic(
+            &path,
+            b"ref: refs/heads/other\n",
+            AtomicMetadataWriteOptions::default(),
+        )
+        .expect_err("held lock must fail");
+
+        assert!(matches!(err, GitError::Transaction(_)));
+        assert_eq!(
+            fs::read(&path).expect("read original"),
+            b"ref: refs/heads/main\n"
+        );
+        assert_eq!(fs::read(&lock).expect("read lock"), b"held\n");
+        fs::remove_dir_all(root).expect("test operation should succeed");
+    }
+
     // --- `ls-files --eol` stat/attr helpers (mirror convert.c) ---------------
 
     #[test]
@@ -7756,6 +7860,26 @@ mod tests {
         let matcher = ignore_matcher(&[b"*.log", b"!keep.log"]);
         assert!(matcher.is_ignored(b"a/x.log", false));
         assert!(!matcher.is_ignored(b"a/keep.log", false));
+    }
+
+    #[test]
+    fn read_expected_object_missing_blob_exposes_oid_and_kind() {
+        let root = temp_root();
+        let git_dir = root.join(".git");
+        fs::create_dir_all(git_dir.join("objects")).expect("test operation should succeed");
+        let db = FileObjectDatabase::from_git_dir(&git_dir, ObjectFormat::Sha1);
+        let missing = ObjectId::empty_blob(ObjectFormat::Sha1);
+
+        let err = read_expected_object(&db, &missing, ObjectType::Blob)
+            .expect_err("missing blob should error");
+        let kind = err.not_found_kind().expect("typed not found");
+        assert_eq!(kind.object_id(), Some(missing));
+        assert_eq!(kind.missing_object_kind(), Some(MissingObjectKind::Blob));
+        assert_eq!(
+            kind.missing_object_context(),
+            Some(MissingObjectContext::WorktreeMaterialize)
+        );
+        fs::remove_dir_all(root).expect("test operation should succeed");
     }
 
     #[test]

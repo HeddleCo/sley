@@ -804,6 +804,7 @@ pub struct ConfigStackEntry {
     pub value: Option<String>,
     pub scope: ConfigScope,
     pub origin: ConfigOrigin,
+    pub included_from: Option<ConfigOrigin>,
 }
 
 impl ConfigStackEntry {
@@ -844,11 +845,14 @@ impl ConfigStack {
     ) -> Result<()> {
         emit_config_file(
             path,
-            scope,
-            context,
-            0,
-            false,
-            respect_includes,
+            &EmitConfigOptions {
+                scope,
+                context,
+                depth: 0,
+                forbid_remote_url: false,
+                respect_includes,
+                included_from: None,
+            },
             &mut self.entries,
         )
     }
@@ -866,11 +870,14 @@ impl ConfigStack {
         emit_parsed_config(
             parsed,
             &origin,
-            scope,
-            context,
-            0,
-            false,
-            respect_includes,
+            &EmitConfigOptions {
+                scope,
+                context,
+                depth: 0,
+                forbid_remote_url: false,
+                respect_includes,
+                included_from: None,
+            },
             &mut self.entries,
         )
     }
@@ -888,6 +895,7 @@ impl ConfigStack {
                 value: param.value.clone(),
                 scope: ConfigScope::Command,
                 origin: ConfigOrigin::command_line(),
+                included_from: None,
             });
         }
     }
@@ -947,15 +955,25 @@ pub fn default_config_layer_paths() -> Vec<(PathBuf, ConfigScope)> {
     layers
 }
 
+/// The shared walk options threaded through [`emit_config_file`] /
+/// [`emit_parsed_config`] and their recursive include calls. Bundling them keeps
+/// the two emitters under clippy's argument limit and makes the per-include
+/// adjustments (`depth + 1`, switching `included_from`) read as field updates.
+#[derive(Clone)]
+struct EmitConfigOptions<'a> {
+    scope: ConfigScope,
+    context: &'a ConfigIncludeContext,
+    depth: usize,
+    forbid_remote_url: bool,
+    respect_includes: bool,
+    included_from: Option<ConfigOrigin>,
+}
+
 /// Read + parse a file and emit its entries (resolving includes when asked).
 /// A missing file contributes nothing, matching git.
 fn emit_config_file(
     path: &Path,
-    scope: ConfigScope,
-    context: &ConfigIncludeContext,
-    depth: usize,
-    forbid_remote_url: bool,
-    respect_includes: bool,
+    options: &EmitConfigOptions<'_>,
     out: &mut Vec<ConfigStackEntry>,
 ) -> Result<()> {
     let bytes = match fs::read(path) {
@@ -965,16 +983,7 @@ fn emit_config_file(
     };
     let parsed = GitConfig::parse(&bytes)?;
     let origin = ConfigOrigin::file(path.to_string_lossy().into_owned());
-    emit_parsed_config(
-        &parsed,
-        &origin,
-        scope,
-        context,
-        depth,
-        forbid_remote_url,
-        respect_includes,
-        out,
-    )
+    emit_parsed_config(&parsed, &origin, options, out)
 }
 
 /// Walk a parsed config in order, emitting one [`ConfigStackEntry`] per entry.
@@ -982,17 +991,25 @@ fn emit_config_file(
 /// `git_config_include` calls the callback before splicing) and then, when the
 /// directive applies, the referenced file's entries follow with the *included*
 /// file as their origin and the including layer's scope.
-#[allow(clippy::too_many_arguments)]
 fn emit_parsed_config(
     parsed: &GitConfig,
     origin: &ConfigOrigin,
-    scope: ConfigScope,
-    context: &ConfigIncludeContext,
-    depth: usize,
-    forbid_remote_url: bool,
-    respect_includes: bool,
+    options: &EmitConfigOptions<'_>,
     out: &mut Vec<ConfigStackEntry>,
 ) -> Result<()> {
+    let EmitConfigOptions {
+        scope,
+        context,
+        depth,
+        forbid_remote_url,
+        respect_includes,
+        included_from,
+    } = options;
+    let scope = *scope;
+    let context = *context;
+    let depth = *depth;
+    let forbid_remote_url = *forbid_remote_url;
+    let respect_includes = *respect_includes;
     if depth >= CONFIG_MAX_INCLUDE_DEPTH {
         return Err(GitError::InvalidFormat(format!(
             "exceeded maximum config include depth of {CONFIG_MAX_INCLUDE_DEPTH}"
@@ -1025,6 +1042,7 @@ fn emit_parsed_config(
                 value: entry.value.clone(),
                 scope,
                 origin: origin.clone(),
+                included_from: included_from.clone(),
             });
             let Some(kind) = &include_kind else { continue };
             if !eq_ignore_ascii_case(&entry.key, "path") {
@@ -1041,11 +1059,14 @@ fn emit_parsed_config(
                 IncludeKind::Unconditional => {
                     emit_config_file(
                         &resolved,
-                        scope,
-                        context,
-                        depth + 1,
-                        forbid_remote_url,
-                        true,
+                        &EmitConfigOptions {
+                            scope,
+                            context,
+                            depth: depth + 1,
+                            forbid_remote_url,
+                            respect_includes: true,
+                            included_from: Some(origin.clone()),
+                        },
                         out,
                     )?;
                 }
@@ -1059,11 +1080,14 @@ fn emit_parsed_config(
                     let mut included = Vec::new();
                     emit_config_file(
                         &resolved,
-                        scope,
-                        context,
-                        depth + 1,
-                        true,
-                        true,
+                        &EmitConfigOptions {
+                            scope,
+                            context,
+                            depth: depth + 1,
+                            forbid_remote_url: true,
+                            respect_includes: true,
+                            included_from: Some(origin.clone()),
+                        },
                         &mut included,
                     )?;
                     if stack_include_condition_matches(
@@ -1086,11 +1110,14 @@ fn emit_parsed_config(
                     ) {
                         emit_config_file(
                             &resolved,
-                            scope,
-                            context,
-                            depth + 1,
-                            forbid_remote_url,
-                            true,
+                            &EmitConfigOptions {
+                                scope,
+                                context,
+                                depth: depth + 1,
+                                forbid_remote_url,
+                                respect_includes: true,
+                                included_from: Some(origin.clone()),
+                            },
                             out,
                         )?;
                     }

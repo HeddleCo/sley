@@ -32,6 +32,57 @@ pub struct RefDelete {
     pub oid: ObjectId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRef {
+    pub name: String,
+    pub expected_old: Option<ObjectId>,
+    pub reflog: Option<DeleteRefReflog>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRefReflog {
+    pub committer: Vec<u8>,
+    pub message: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub enum RefDeleteError {
+    NotFound,
+    ExpectedMismatch {
+        expected: Option<ObjectId>,
+        actual: Option<ObjectId>,
+    },
+    Locked,
+    InvalidName,
+    Io(std::io::Error),
+}
+
+impl fmt::Display for RefDeleteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("ref not found"),
+            Self::ExpectedMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "ref expected old oid mismatch: expected {:?}, actual {:?}",
+                    expected, actual
+                )
+            }
+            Self::Locked => f.write_str("ref is locked"),
+            Self::InvalidName => f.write_str("invalid ref name"),
+            Self::Io(err) => write!(f, "io error: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for RefDeleteError {}
+
+impl From<std::io::Error> for RefDeleteError {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
 pub fn parse_loose_ref(format: ObjectFormat, name: impl Into<String>, bytes: &[u8]) -> Result<Ref> {
     let name = name.into();
     let value = std::str::from_utf8(bytes)
@@ -658,7 +709,7 @@ impl FileRefStore {
     pub fn transaction(&self) -> FileRefTransaction<'_> {
         FileRefTransaction {
             store: self,
-            updates: Vec::new(),
+            changes: Vec::new(),
         }
     }
 
@@ -901,6 +952,17 @@ impl FileRefStore {
         })
     }
 
+    pub fn delete_ref_checked(
+        &self,
+        delete: DeleteRef,
+    ) -> std::result::Result<RefDelete, RefDeleteError> {
+        validate_ref_name(&delete.name).map_err(|_| RefDeleteError::InvalidName)?;
+        if self.uses_reftable().map_err(ref_delete_error_from_git)? {
+            return self.delete_reftable_ref_checked(delete);
+        }
+        self.delete_files_ref_checked(delete)
+    }
+
     pub fn delete_symbolic_ref(&self, name: &str) -> Result<bool> {
         validate_ref_name_for_read(name)?;
         if self.uses_reftable()? {
@@ -987,6 +1049,111 @@ impl FileRefStore {
         };
         self.write_packed_refs(&refs)?;
         Ok(oid)
+    }
+
+    fn delete_reftable_ref_checked(
+        &self,
+        delete: DeleteRef,
+    ) -> std::result::Result<RefDelete, RefDeleteError> {
+        let target = self
+            .read_ref(&delete.name)
+            .map_err(ref_delete_error_from_git)?;
+        let oid = checked_delete_oid(delete.expected_old, target)?;
+        self.append_reftable_records(vec![ReftableRefRecord {
+            name: delete.name.clone(),
+            update_index: 0,
+            value: ReftableRefValue::Deletion,
+        }])
+        .map_err(ref_delete_error_from_git)?;
+        // Git unlinks logs/refs/<name> on delete (pruning now-empty dirs); it
+        // does not keep a deletion entry. Mirror delete_ref / delete_branch.
+        self.remove_reflog_file(&delete.name);
+        Ok(RefDelete {
+            name: delete.name,
+            oid,
+        })
+    }
+
+    fn delete_files_ref_checked(
+        &self,
+        delete: DeleteRef,
+    ) -> std::result::Result<RefDelete, RefDeleteError> {
+        let name = delete.name;
+        let path = self.ref_path(&name);
+        let parent = path.parent().ok_or(RefDeleteError::InvalidName)?;
+        fs::create_dir_all(parent).map_err(RefDeleteError::from)?;
+
+        let loose_lock_path = lock_path_for(&path).map_err(|_| RefDeleteError::InvalidName)?;
+        let _prune_guard = RefDirPruneGuard {
+            store: self,
+            name: name.clone(),
+        };
+        let loose_lock = DeleteLock::acquire(loose_lock_path)?;
+
+        let packed_path = self.common_dir.join("packed-refs");
+        let packed_lock_path =
+            lock_path_for(&packed_path).map_err(|_| RefDeleteError::InvalidName)?;
+        let mut packed_lock = DeleteLock::acquire(packed_lock_path)?;
+
+        let loose_ref = self
+            .read_loose_ref(&name)
+            .map_err(ref_delete_error_from_git)?;
+        let packed_original = match fs::read(&packed_path) {
+            Ok(bytes) => Some(bytes),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(RefDeleteError::Io(err)),
+        };
+        let mut packed_refs = match &packed_original {
+            Some(bytes) => {
+                parse_packed_refs(self.format, bytes).map_err(ref_delete_error_from_git)?
+            }
+            None => Vec::new(),
+        };
+        let packed_index = packed_refs
+            .iter()
+            .position(|reference| reference.reference.name == name);
+
+        let current = if let Some(reference) = loose_ref.as_ref() {
+            Some(reference.target.clone())
+        } else {
+            packed_index.map(|index| packed_refs[index].reference.target.clone())
+        };
+        let oid = checked_delete_oid(delete.expected_old, current)?;
+
+        let packed_changed = if let Some(index) = packed_index {
+            packed_refs.remove(index);
+            true
+        } else {
+            false
+        };
+
+        if packed_changed {
+            let packed_bytes =
+                write_packed_refs(&packed_refs).map_err(ref_delete_error_from_git)?;
+            packed_lock.write_all(&packed_bytes)?;
+            let lock_path = packed_lock.close();
+            if let Err(err) = fs::rename(&lock_path, &packed_path) {
+                let _ = fs::remove_file(&lock_path);
+                return Err(RefDeleteError::Io(err));
+            }
+        } else {
+            packed_lock.remove();
+        }
+
+        if loose_ref.is_some()
+            && let Err(err) = fs::remove_file(&path)
+        {
+            if packed_changed && let Some(bytes) = packed_original.as_ref() {
+                let _ = restore_file_atomically(&packed_path, bytes);
+            }
+            return Err(RefDeleteError::Io(err));
+        }
+        loose_lock.remove();
+
+        // Git unlinks logs/refs/<name> on delete (pruning now-empty dirs); it
+        // does not keep a deletion entry. Mirror delete_ref / delete_branch.
+        self.remove_reflog_file(&name);
+        Ok(RefDelete { name, oid })
     }
 
     fn read_loose_ref(&self, name: &str) -> Result<Option<Ref>> {
@@ -1319,10 +1486,10 @@ fn repository_common_dir(git_dir: &Path) -> PathBuf {
 
 pub struct FileRefTransaction<'a> {
     store: &'a FileRefStore,
-    updates: Vec<QueuedUpdate>,
+    changes: Vec<QueuedRefChange>,
 }
 
-/// One queued change inside a [`FileRefTransaction`], carrying the
+/// One queued update inside a [`FileRefTransaction`], carrying the
 /// compare-and-swap precondition to enforce under lock.
 struct QueuedUpdate {
     name: String,
@@ -1331,18 +1498,41 @@ struct QueuedUpdate {
     reflog: Option<ReflogEntry>,
 }
 
+struct QueuedDelete {
+    name: String,
+    precondition: RefDeletePrecondition,
+}
+
+enum QueuedRefChange {
+    Update(QueuedUpdate),
+    Delete(QueuedDelete),
+}
+
+/// The compare-and-delete precondition checked for a queued ref delete.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefDeletePrecondition {
+    /// Any existing direct or symbolic ref may be deleted.
+    Any,
+    /// The ref's immediate target must match exactly.
+    Immediate(RefTarget),
+    /// The ref must be direct. When an object id is supplied, it must match.
+    Direct(Option<ObjectId>),
+    /// The ref may be symbolic, but its peeled direct target must match.
+    Peeled(ObjectId),
+}
+
 impl<'a> FileRefTransaction<'a> {
     /// Queue a ref update whose precondition comes from [`RefUpdate::expected`]
     /// (`None` = no check; `Some(target)` = the ref must currently match
     /// `target`). For create-only or match-or-create semantics use
     /// [`update_to`](FileRefTransaction::update_to).
     pub fn update(&mut self, update: RefUpdate) {
-        self.updates.push(QueuedUpdate {
+        self.changes.push(QueuedRefChange::Update(QueuedUpdate {
             name: update.name,
             precondition: RefPrecondition::from_expected(update.expected),
             new: update.new,
             reflog: update.reflog,
-        });
+        }));
     }
 
     /// Queue a ref update with an explicit compare-and-swap [`RefPrecondition`]
@@ -1357,82 +1547,148 @@ impl<'a> FileRefTransaction<'a> {
         precondition: RefPrecondition,
         reflog: Option<ReflogEntry>,
     ) {
-        self.updates.push(QueuedUpdate {
+        self.changes.push(QueuedRefChange::Update(QueuedUpdate {
             name: name.into(),
             precondition,
             new,
             reflog,
-        });
+        }));
     }
 
-    /// Commit all queued updates atomically and durably.
+    /// Queue a direct ref delete using the historical checked-delete shape.
     ///
-    /// All updates succeed together or none take effect. For the loose-ref
+    /// `expected_old = None` means "delete any direct ref"; `Some(oid)` means
+    /// the direct ref must currently point at that object id.
+    pub fn delete(&mut self, delete: DeleteRef) {
+        self.delete_with_precondition(
+            delete.name,
+            RefDeletePrecondition::Direct(delete.expected_old),
+            delete.reflog,
+        );
+    }
+
+    /// Queue a ref delete with an explicit direct/symbolic precondition.
+    ///
+    /// `_reflog` is accepted for API compatibility but ignored: git unlinks the
+    /// reflog on delete rather than writing a deletion entry, so a
+    /// caller-supplied deletion message has no on-disk effect.
+    pub fn delete_with_precondition(
+        &mut self,
+        name: impl Into<String>,
+        precondition: RefDeletePrecondition,
+        _reflog: Option<DeleteRefReflog>,
+    ) {
+        self.changes.push(QueuedRefChange::Delete(QueuedDelete {
+            name: name.into(),
+            precondition,
+        }));
+    }
+
+    /// Commit all queued updates and deletes atomically and durably.
+    ///
+    /// All ref changes succeed together or none take effect. For the loose-ref
     /// backend the sequence is:
     ///
-    /// 1. Coalesce updates that target the same ref so each ref is touched once
-    ///    (the final `new` value wins, reflog entries accumulate in order, and
-    ///    the precondition from the first queued update is enforced).
-    /// 2. Take an exclusive `<ref>.lock` file for every ref up front. Acquiring a
-    ///    lock fails if another writer already holds it, guaranteeing isolation.
+    /// 1. Preserve the historical update-only coalescing behavior. Mixed
+    ///    transactions reject duplicate ref names so a delete and write cannot
+    ///    target the same ref ambiguously.
+    /// 2. Take an exclusive `<ref>.lock` file for every ref up front, and lock
+    ///    `packed-refs` before checked deletes can inspect or rewrite it.
     /// 3. Re-verify every precondition *while holding the locks*, closing
     ///    the check-then-write race that a pre-lock verification would leave open.
-    /// 4. Write each new value into its lock file and `fsync` it.
-    /// 5. Atomically `rename` each lock file over the real ref.
+    /// 4. Stage every write, delete marker, and packed-refs rewrite.
+    /// 5. Rename/remove staged paths, rolling back already-applied paths if a
+    ///    later step fails.
     ///
-    /// If any step fails, every ref already renamed in this commit is restored to
-    /// the exact bytes it held beforehand (or removed if it did not exist), and
-    /// all outstanding lock files are deleted, so the repository is left exactly
-    /// as it was. Reflog entries are appended only after every ref update has
-    /// landed.
+    /// If any step fails, every path already changed in this commit is restored
+    /// to the exact bytes it held beforehand (or removed if it did not exist),
+    /// and all outstanding lock files are deleted. Reflog entries are appended
+    /// only after every ref change has landed.
     pub fn commit(self) -> Result<()> {
-        let FileRefTransaction { store, updates } = self;
-        let updates = coalesce_ref_updates(updates)?;
-        for update in &updates {
-            if !matches!(update.precondition, RefPrecondition::Any) {
-                let current = store.read_ref(&update.name)?;
-                if !update.precondition.is_satisfied_by(current.as_ref()) {
-                    return Err(GitError::Transaction(
-                        update.precondition.describe(&update.name),
-                    ));
-                }
-            }
-        }
+        let FileRefTransaction { store, changes } = self;
+        let changes = coalesce_ref_changes(changes)?;
         if store.uses_reftable()? {
-            let mut records = Vec::with_capacity(updates.len());
-            let mut reflogs = Vec::new();
-            for update in updates {
-                records.push(ReftableRefRecord {
-                    name: update.name.clone(),
-                    update_index: 0,
-                    value: reftable_value_from_ref_target(&update.new),
-                });
-                for entry in update.reflog {
-                    reflogs.push((update.name.clone(), entry));
-                }
-            }
-            store.append_reftable_records(records)?;
-            for (name, entry) in reflogs {
-                store.append_reflog(&name, &entry)?;
-            }
-            return Ok(());
+            return store.commit_reftable(changes);
         }
-        store.commit_loose(updates)
+        store.commit_loose(changes)
     }
 }
 
 impl FileRefStore {
+    fn commit_reftable(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        let mut records = Vec::with_capacity(changes.len());
+        let mut reflogs = Vec::new();
+        let mut delete_names = Vec::new();
+        for change in changes {
+            match change {
+                CoalescedRefChange::Update(update) => {
+                    if !matches!(update.precondition, RefPrecondition::Any) {
+                        let current = self.read_ref(&update.name)?;
+                        if !update.precondition.is_satisfied_by(current.as_ref()) {
+                            return Err(GitError::Transaction(
+                                update.precondition.describe(&update.name),
+                            ));
+                        }
+                    }
+                    records.push(ReftableRefRecord {
+                        name: update.name.clone(),
+                        update_index: 0,
+                        value: reftable_value_from_ref_target(&update.new),
+                    });
+                    for entry in update.reflog {
+                        reflogs.push((update.name.clone(), entry));
+                    }
+                }
+                CoalescedRefChange::Delete(delete) => {
+                    let current = self.read_ref(&delete.name)?;
+                    // Enforce the precondition; git unlinks logs/refs/<name> on
+                    // delete rather than appending a deletion reflog entry, so the
+                    // returned OID is unused.
+                    verify_delete_precondition(
+                        self,
+                        &delete.name,
+                        current.as_ref(),
+                        &delete.precondition,
+                    )?;
+                    records.push(ReftableRefRecord {
+                        name: delete.name.clone(),
+                        update_index: 0,
+                        value: ReftableRefValue::Deletion,
+                    });
+                    delete_names.push(delete.name.clone());
+                }
+            }
+        }
+        self.append_reftable_records(records)?;
+        // Git unlinks logs/refs/<name> (pruning now-empty dirs) on delete; do
+        // this before appending update reflogs so a delete+recreate does not race
+        // the new ref's reflog file.
+        for name in &delete_names {
+            self.remove_reflog_file(name);
+        }
+        for (name, entry) in reflogs {
+            self.append_reflog(&name, &entry)?;
+        }
+        Ok(())
+    }
+
     /// Atomic, all-or-nothing commit for the loose-ref backend. See
     /// [`FileRefTransaction::commit`] for the full ordering and rollback rules.
-    fn commit_loose(&self, updates: Vec<CoalescedRefUpdate>) -> Result<()> {
-        let mut pending = Vec::with_capacity(updates.len());
+    fn commit_loose(&self, changes: Vec<CoalescedRefChange>) -> Result<()> {
+        let has_delete = changes
+            .iter()
+            .any(|change| matches!(change, CoalescedRefChange::Delete(_)));
+        let mut pending = Vec::with_capacity(changes.len() + usize::from(has_delete));
         // Acquire every lock first; bail (releasing what we hold) on any failure.
-        for update in &updates {
-            if let Err(err) = self.check_ref_directory_conflict(&update.name) {
+        for change in &changes {
+            let name = change.name();
+            if matches!(change, CoalescedRefChange::Update(_))
+                && let Err(err) = self.check_ref_directory_conflict(name)
+            {
                 release_pending_locks(&pending);
                 return Err(err);
             }
-            let path = self.ref_path(&update.name);
+            let path = self.ref_path(name);
             let parent = path
                 .parent()
                 .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
@@ -1440,8 +1696,8 @@ impl FileRefStore {
                 release_pending_locks(&pending);
                 if err.kind() == std::io::ErrorKind::NotADirectory {
                     return Err(ref_directory_conflict_error(
-                        &update.name,
-                        &parent_to_ref_name(self.ref_base_dir(&update.name), parent),
+                        name,
+                        &parent_to_ref_name(self.ref_base_dir(name), parent),
                     ));
                 }
                 return Err(GitError::Io(err.to_string()));
@@ -1459,75 +1715,258 @@ impl FileRefStore {
                 .open(&lock_path)
             {
                 release_pending_locks(&pending);
-                return Err(GitError::Io(format!(
-                    "could not lock ref {}: {err}",
-                    update.name
-                )));
+                return Err(GitError::Io(format!("could not lock ref {name}: {err}")));
             }
-            pending.push(PendingRefWrite {
+            let action = match change {
+                CoalescedRefChange::Update(update) => PendingPathAction::Write {
+                    contents: write_loose_ref(&Ref {
+                        name: update.name.clone(),
+                        target: update.new.clone(),
+                    }),
+                },
+                CoalescedRefChange::Delete(_) => PendingPathAction::Delete,
+            };
+            pending.push(PendingPathChange {
+                name: name.to_string(),
                 path,
                 lock_path,
-                contents: write_loose_ref(&Ref {
-                    name: update.name.clone(),
-                    target: update.new.clone(),
-                }),
+                original: None,
+                action,
             });
         }
 
-        // Verify expectations under lock, then capture prior on-disk state for
-        // rollback. read_ref consults loose then packed refs, matching the
-        // pre-lock check, so a concurrent change is caught here.
-        let mut originals = Vec::with_capacity(updates.len());
-        for (update, write) in updates.iter().zip(&pending) {
-            if !matches!(update.precondition, RefPrecondition::Any) {
-                match self.read_ref(&update.name) {
-                    Ok(current) if update.precondition.is_satisfied_by(current.as_ref()) => {}
-                    Ok(_) => {
-                        release_pending_locks(&pending);
-                        return Err(GitError::Transaction(
-                            update.precondition.describe(&update.name),
-                        ));
-                    }
-                    Err(err) => {
-                        release_pending_locks(&pending);
-                        return Err(err);
-                    }
-                }
-            }
-            match read_optional_file(&write.path) {
-                Ok(original) => originals.push(original),
+        let packed_path = self.common_dir.join("packed-refs");
+        let mut packed_refs = Vec::new();
+        if has_delete {
+            let packed_lock_path = match lock_path_for(&packed_path) {
+                Ok(lock_path) => lock_path,
                 Err(err) => {
                     release_pending_locks(&pending);
                     return Err(err);
                 }
+            };
+            if let Err(err) = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&packed_lock_path)
+            {
+                release_pending_locks(&pending);
+                return Err(GitError::Io(format!("could not lock packed-refs: {err}")));
+            }
+            let packed_original = match fs::read(&packed_path) {
+                Ok(bytes) => Some(bytes),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    release_pending_locks(&pending);
+                    let _ = fs::remove_file(&packed_lock_path);
+                    return Err(GitError::Io(err.to_string()));
+                }
+            };
+            packed_refs = match &packed_original {
+                Some(bytes) => match parse_packed_refs(self.format, bytes) {
+                    Ok(refs) => refs,
+                    Err(err) => {
+                        release_pending_locks(&pending);
+                        let _ = fs::remove_file(&packed_lock_path);
+                        return Err(err);
+                    }
+                },
+                None => Vec::new(),
+            };
+            pending.push(PendingPathChange {
+                name: "packed-refs".into(),
+                path: packed_path.clone(),
+                lock_path: packed_lock_path,
+                original: packed_original,
+                action: PendingPathAction::ReleaseLock,
+            });
+        }
+
+        // Verify expectations under lock, then capture prior on-disk state for
+        // rollback. Mixed transactions read packed refs from the snapshot held
+        // behind packed-refs.lock so deletes cannot race a packed rewrite.
+        let mut reflogs = Vec::new();
+        let mut delete_names = BTreeSet::new();
+        for index in 0..changes.len() {
+            match &changes[index] {
+                CoalescedRefChange::Update(update) => {
+                    if !matches!(update.precondition, RefPrecondition::Any) {
+                        let current = if has_delete {
+                            match self.read_ref_from_locked_packed(&update.name, &packed_refs) {
+                                Ok(current) => current,
+                                Err(err) => {
+                                    release_pending_locks(&pending);
+                                    return Err(err);
+                                }
+                            }
+                        } else {
+                            match self.read_ref(&update.name) {
+                                Ok(current) => current,
+                                Err(err) => {
+                                    release_pending_locks(&pending);
+                                    return Err(err);
+                                }
+                            }
+                        };
+                        if !update.precondition.is_satisfied_by(current.as_ref()) {
+                            release_pending_locks(&pending);
+                            return Err(GitError::Transaction(
+                                update.precondition.describe(&update.name),
+                            ));
+                        }
+                    }
+                    pending[index].original = match read_optional_file(&pending[index].path) {
+                        Ok(original) => original,
+                        Err(err) => {
+                            release_pending_locks(&pending);
+                            return Err(err);
+                        }
+                    };
+                    for entry in &update.reflog {
+                        reflogs.push((update.name.clone(), entry.clone()));
+                    }
+                }
+                CoalescedRefChange::Delete(delete) => {
+                    let state = match self.read_locked_ref_state(&delete.name, &packed_refs) {
+                        Ok(state) => state,
+                        Err(err) => {
+                            release_pending_locks(&pending);
+                            return Err(err);
+                        }
+                    };
+                    // Enforce the delete precondition under lock; the returned
+                    // OID is unused because git unlinks logs/refs/<name> on
+                    // delete rather than appending a deletion reflog entry.
+                    if let Err(err) = verify_delete_precondition(
+                        self,
+                        &delete.name,
+                        state.current.as_ref(),
+                        &delete.precondition,
+                    ) {
+                        release_pending_locks(&pending);
+                        return Err(err);
+                    }
+                    pending[index].original = if state.has_loose {
+                        match read_optional_file(&pending[index].path) {
+                            Ok(original) => original,
+                            Err(err) => {
+                                release_pending_locks(&pending);
+                                return Err(err);
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    delete_names.insert(delete.name.clone());
+                }
             }
         }
 
-        // Stage every new value into its lock file. Nothing has been renamed
-        // yet, so on failure we only need to drop the lock files.
-        for write in &pending {
-            if let Err(err) = stage_lock_file(&write.lock_path, &write.contents) {
+        if has_delete {
+            let old_len = packed_refs.len();
+            packed_refs.retain(|reference| !delete_names.contains(&reference.reference.name));
+            if packed_refs.len() != old_len {
+                let packed_bytes = match write_packed_refs(&packed_refs) {
+                    Ok(bytes) => bytes,
+                    Err(err) => {
+                        release_pending_locks(&pending);
+                        return Err(err);
+                    }
+                };
+                if let Some(packed) = pending.last_mut() {
+                    packed.action = PendingPathAction::Write {
+                        contents: packed_bytes,
+                    };
+                }
+            }
+        }
+
+        // Stage every new value or delete marker into its lock file. Nothing has
+        // been renamed or removed yet, so on failure we only drop lock files.
+        for change in &pending {
+            if let Err(err) = stage_pending_change(change) {
                 release_pending_locks(&pending);
                 return Err(err);
             }
         }
 
-        // Atomically swap each lock file into place; on failure restore the refs
-        // already renamed and drop the remaining locks.
+        // Apply each staged path change; on failure restore paths already
+        // changed and drop the remaining lock files.
         for index in 0..pending.len() {
-            if let Err(err) = fs::rename(&pending[index].lock_path, &pending[index].path) {
-                rollback_after_rename(&pending, &originals, index);
-                return Err(GitError::Io(err.to_string()));
+            if let Err(err) = maybe_fail_loose_commit_action(index) {
+                rollback_after_apply(&pending, index);
+                return Err(err);
+            }
+            if let Err(err) = apply_pending_change(&pending[index]) {
+                rollback_after_apply(&pending, index + 1);
+                return Err(err);
             }
         }
 
-        // All refs are durable; append reflogs last, matching git's ordering.
-        for update in updates {
-            for entry in update.reflog {
-                self.append_reflog(&update.name, &entry)?;
+        for change in &pending {
+            if matches!(change.action, PendingPathAction::Delete) && change.original.is_some() {
+                self.prune_empty_ref_dirs(&change.name);
             }
         }
+        // Git unlinks logs/refs/<name> (and prunes now-empty log dirs) on delete;
+        // do this before appending update reflogs so a delete+recreate in the
+        // same direction does not race the new ref's reflog file.
+        for name in &delete_names {
+            self.remove_reflog_file(name);
+        }
+        // All refs are durable; append reflogs last, matching git's ordering.
+        for (name, entry) in reflogs {
+            self.append_reflog(&name, &entry)?;
+        }
         Ok(())
+    }
+
+    fn read_ref_from_locked_packed(
+        &self,
+        name: &str,
+        packed_refs: &[PackedRef],
+    ) -> Result<Option<RefTarget>> {
+        let state = self.read_locked_ref_state(name, packed_refs)?;
+        Ok(state.current)
+    }
+
+    fn read_locked_ref_state(
+        &self,
+        name: &str,
+        packed_refs: &[PackedRef],
+    ) -> Result<LockedRefState> {
+        let loose = self.read_loose_ref(name)?;
+        let packed_index = packed_refs
+            .iter()
+            .position(|reference| reference.reference.name == name);
+        let current = if let Some(reference) = loose.as_ref() {
+            Some(reference.target.clone())
+        } else {
+            packed_index.map(|index| packed_refs[index].reference.target.clone())
+        };
+        Ok(LockedRefState {
+            current,
+            has_loose: loose.is_some(),
+        })
+    }
+}
+
+struct LockedRefState {
+    current: Option<RefTarget>,
+    has_loose: bool,
+}
+
+enum CoalescedRefChange {
+    Update(CoalescedRefUpdate),
+    Delete(CoalescedRefDelete),
+}
+
+impl CoalescedRefChange {
+    fn name(&self) -> &str {
+        match self {
+            Self::Update(update) => &update.name,
+            Self::Delete(delete) => &delete.name,
+        }
     }
 }
 
@@ -1537,6 +1976,60 @@ struct CoalescedRefUpdate {
     precondition: RefPrecondition,
     new: RefTarget,
     reflog: Vec<ReflogEntry>,
+}
+
+struct CoalescedRefDelete {
+    name: String,
+    precondition: RefDeletePrecondition,
+}
+
+fn coalesce_ref_changes(changes: Vec<QueuedRefChange>) -> Result<Vec<CoalescedRefChange>> {
+    let has_delete = changes
+        .iter()
+        .any(|change| matches!(change, QueuedRefChange::Delete(_)));
+    if !has_delete {
+        let updates = changes
+            .into_iter()
+            .map(|change| match change {
+                QueuedRefChange::Update(update) => update,
+                QueuedRefChange::Delete(_) => unreachable!("has_delete was false"),
+            })
+            .collect::<Vec<_>>();
+        return coalesce_ref_updates(updates).map(|updates| {
+            updates
+                .into_iter()
+                .map(CoalescedRefChange::Update)
+                .collect()
+        });
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut coalesced = Vec::with_capacity(changes.len());
+    for change in changes {
+        let name = match &change {
+            QueuedRefChange::Update(update) => &update.name,
+            QueuedRefChange::Delete(delete) => &delete.name,
+        };
+        validate_ref_name_for_update(name)?;
+        if !seen.insert(name.clone()) {
+            return Err(GitError::Transaction(format!(
+                "ref {name} appears more than once in transaction"
+            )));
+        }
+        coalesced.push(match change {
+            QueuedRefChange::Update(update) => CoalescedRefChange::Update(CoalescedRefUpdate {
+                name: update.name,
+                precondition: update.precondition,
+                new: update.new,
+                reflog: update.reflog.into_iter().collect(),
+            }),
+            QueuedRefChange::Delete(delete) => CoalescedRefChange::Delete(CoalescedRefDelete {
+                name: delete.name,
+                precondition: delete.precondition,
+            }),
+        });
+    }
+    Ok(coalesced)
 }
 
 /// Fold repeated updates to the same ref into one, preserving first-seen order.
@@ -1578,12 +2071,184 @@ fn coalesce_ref_updates(updates: Vec<QueuedUpdate>) -> Result<Vec<CoalescedRefUp
     Ok(coalesced)
 }
 
-/// A staged loose-ref write: the target ref path, its lock file, and the bytes
-/// to install.
-struct PendingRefWrite {
+/// A staged path change: the target path, its lock file, and original bytes for
+/// rollback.
+struct PendingPathChange {
+    name: String,
     path: PathBuf,
     lock_path: PathBuf,
-    contents: Vec<u8>,
+    original: Option<Vec<u8>>,
+    action: PendingPathAction,
+}
+
+enum PendingPathAction {
+    Write { contents: Vec<u8> },
+    Delete,
+    ReleaseLock,
+}
+
+struct RefDirPruneGuard<'a> {
+    store: &'a FileRefStore,
+    name: String,
+}
+
+impl Drop for RefDirPruneGuard<'_> {
+    fn drop(&mut self) {
+        self.store.prune_empty_ref_dirs(&self.name);
+    }
+}
+
+struct DeleteLock {
+    path: PathBuf,
+    file: Option<fs::File>,
+    active: bool,
+}
+
+impl DeleteLock {
+    fn acquire(path: PathBuf) -> std::result::Result<Self, RefDeleteError> {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => Ok(Self {
+                path,
+                file: Some(file),
+                active: true,
+            }),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(RefDeleteError::Locked)
+            }
+            Err(err) => Err(RefDeleteError::Io(err)),
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> std::result::Result<(), RefDeleteError> {
+        let Some(file) = self.file.as_mut() else {
+            return Err(RefDeleteError::Io(std::io::Error::other(
+                "lock file is already closed",
+            )));
+        };
+        file.set_len(0)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn close(mut self) -> PathBuf {
+        self.active = false;
+        let _ = self.file.take();
+        self.path.clone()
+    }
+
+    fn remove(mut self) {
+        self.active = false;
+        let _ = self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for DeleteLock {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.file.take();
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn checked_delete_oid(
+    expected: Option<ObjectId>,
+    current: Option<RefTarget>,
+) -> std::result::Result<ObjectId, RefDeleteError> {
+    let Some(current) = current else {
+        return Err(RefDeleteError::NotFound);
+    };
+    let RefTarget::Direct(actual) = current else {
+        return Err(RefDeleteError::ExpectedMismatch {
+            expected,
+            actual: None,
+        });
+    };
+    if let Some(expected_oid) = expected
+        && expected_oid != actual
+    {
+        return Err(RefDeleteError::ExpectedMismatch {
+            expected: Some(expected_oid),
+            actual: Some(actual),
+        });
+    }
+    Ok(actual)
+}
+
+/// Verify a queued/checked delete may proceed, dying on a precondition
+/// mismatch. Git unlinks the reflog on delete (it never writes a deletion
+/// entry), so this validates only — the peeled OID is no longer plumbed out.
+/// `peeled_oid_for_delete` is still invoked where the precondition requires the
+/// peeled value, so a broken/unpeelable ref is still reported.
+fn verify_delete_precondition(
+    store: &FileRefStore,
+    name: &str,
+    current: Option<&RefTarget>,
+    precondition: &RefDeletePrecondition,
+) -> Result<()> {
+    let Some(current) = current else {
+        return Err(GitError::Transaction(format!("ref {name} not found")));
+    };
+    match precondition {
+        RefDeletePrecondition::Any => {
+            peeled_oid_for_delete(store, current)?;
+            Ok(())
+        }
+        RefDeletePrecondition::Immediate(expected) if current == expected => {
+            peeled_oid_for_delete(store, current)?;
+            Ok(())
+        }
+        RefDeletePrecondition::Immediate(_) => Err(delete_precondition_mismatch(name)),
+        RefDeletePrecondition::Direct(expected) => {
+            let RefTarget::Direct(actual) = current else {
+                return Err(delete_precondition_mismatch(name));
+            };
+            if let Some(expected) = expected
+                && expected != actual
+            {
+                return Err(delete_precondition_mismatch(name));
+            }
+            Ok(())
+        }
+        RefDeletePrecondition::Peeled(expected) => {
+            let actual = peeled_oid_for_delete(store, current)?;
+            if actual == Some(*expected) {
+                Ok(())
+            } else {
+                Err(delete_precondition_mismatch(name))
+            }
+        }
+    }
+}
+
+fn peeled_oid_for_delete(store: &FileRefStore, target: &RefTarget) -> Result<Option<ObjectId>> {
+    match target {
+        RefTarget::Direct(oid) => Ok(Some(*oid)),
+        RefTarget::Symbolic(name) => resolve_ref_peeled(store, name),
+    }
+}
+
+fn delete_precondition_mismatch(name: &str) -> GitError {
+    GitError::Transaction(format!("expected ref {name} to match"))
+}
+
+fn ref_delete_error_from_git(err: GitError) -> RefDeleteError {
+    match err {
+        GitError::InvalidPath(_) => RefDeleteError::InvalidName,
+        GitError::NotFound(_) => RefDeleteError::NotFound,
+        GitError::Io(message) if message.contains("File exists") => RefDeleteError::Locked,
+        GitError::Io(message) if message.contains("could not lock") => RefDeleteError::Locked,
+        GitError::Transaction(message) if message.contains("could not lock") => {
+            RefDeleteError::Locked
+        }
+        other => RefDeleteError::Io(std::io::Error::other(other.to_string())),
+    }
 }
 
 fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -1604,35 +2269,89 @@ fn stage_lock_file(lock_path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Delete every still-held lock file. Used when a transaction aborts before any
-/// rename, so nothing on disk has changed yet.
-fn release_pending_locks(pending: &[PendingRefWrite]) {
-    for write in pending {
-        let _ = fs::remove_file(&write.lock_path);
+fn stage_pending_change(change: &PendingPathChange) -> Result<()> {
+    match &change.action {
+        PendingPathAction::Write { contents } => stage_lock_file(&change.lock_path, contents),
+        PendingPathAction::Delete => stage_lock_file(&change.lock_path, b"delete\n"),
+        PendingPathAction::ReleaseLock => Ok(()),
     }
 }
 
-/// Roll back after `renamed` refs have already been swapped into place: restore
-/// each to its captured bytes (or remove it if it did not previously exist),
-/// then drop the lock files that have not yet been renamed.
-fn rollback_after_rename(
-    pending: &[PendingRefWrite],
-    originals: &[Option<Vec<u8>>],
-    renamed: usize,
-) {
-    for index in 0..renamed {
-        match &originals[index] {
-            Some(bytes) => {
-                let _ = restore_file_atomically(&pending[index].path, bytes);
+fn apply_pending_change(change: &PendingPathChange) -> Result<()> {
+    match &change.action {
+        PendingPathAction::Write { .. } => {
+            fs::rename(&change.lock_path, &change.path).map_err(|err| GitError::Io(err.to_string()))
+        }
+        PendingPathAction::Delete => {
+            if change.original.is_some() {
+                fs::remove_file(&change.path).map_err(|err| GitError::Io(err.to_string()))?;
             }
-            None => {
-                let _ = fs::remove_file(&pending[index].path);
-            }
+            fs::remove_file(&change.lock_path).map_err(|err| GitError::Io(err.to_string()))
+        }
+        PendingPathAction::ReleaseLock => {
+            fs::remove_file(&change.lock_path).map_err(|err| GitError::Io(err.to_string()))
         }
     }
-    for write in pending.iter().skip(renamed) {
-        let _ = fs::remove_file(&write.lock_path);
+}
+
+/// Delete every still-held lock file. Used when a transaction aborts before any
+/// path change, so nothing on disk has changed yet.
+fn release_pending_locks(pending: &[PendingPathChange]) {
+    for change in pending {
+        let _ = fs::remove_file(&change.lock_path);
     }
+}
+
+/// Roll back after `applied` path changes have already landed: restore each to
+/// its captured bytes (or remove it if it did not previously exist), then drop
+/// the lock files that have not yet been applied.
+fn rollback_after_apply(pending: &[PendingPathChange], applied: usize) {
+    for change in pending.iter().take(applied) {
+        if matches!(change.action, PendingPathAction::ReleaseLock) {
+            let _ = fs::remove_file(&change.lock_path);
+            continue;
+        }
+        match &change.original {
+            Some(bytes) => {
+                let _ = restore_file_atomically(&change.path, bytes);
+            }
+            None => {
+                let _ = fs::remove_file(&change.path);
+            }
+        }
+        let _ = fs::remove_file(&change.lock_path);
+    }
+    for change in pending.iter().skip(applied) {
+        let _ = fs::remove_file(&change.lock_path);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_LOOSE_COMMIT_ACTION: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_fail_loose_commit_action_for_test(index: Option<usize>) {
+    FAIL_LOOSE_COMMIT_ACTION.with(|cell| cell.set(index));
+}
+
+#[cfg(test)]
+fn maybe_fail_loose_commit_action(index: usize) -> Result<()> {
+    let should_fail = FAIL_LOOSE_COMMIT_ACTION.with(|cell| cell.get() == Some(index));
+    if should_fail {
+        FAIL_LOOSE_COMMIT_ACTION.with(|cell| cell.set(None));
+        return Err(GitError::Io(format!(
+            "injected loose ref transaction failure at action {index}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn maybe_fail_loose_commit_action(_index: usize) -> Result<()> {
+    Ok(())
 }
 
 /// Best-effort atomic restore of `path` to `bytes` during rollback, reusing the
@@ -3158,6 +3877,277 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
     }
 
     #[test]
+    fn file_ref_store_delete_ref_checked_removes_reflog() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        // Create the ref *with* a reflog entry so logs/refs/heads/main exists on
+        // disk; git unlinks that file on delete rather than appending a deletion
+        // entry, so the checked delete must remove it (mirroring delete_ref).
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: Some(ReflogEntry {
+                old_oid: zero_oid(ObjectFormat::Sha1).expect("test operation should succeed"),
+                new_oid: oid,
+                committer: b"Git Rs <sley@example.invalid> 0 +0000".to_vec(),
+                message: b"create main".to_vec(),
+            }),
+        });
+        tx.commit().expect("test operation should succeed");
+        assert!(
+            git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .exists(),
+            "reflog file should exist before the checked delete"
+        );
+
+        let deleted = store
+            .delete_ref_checked(DeleteRef {
+                name: "refs/heads/main".into(),
+                expected_old: Some(oid),
+                reflog: Some(DeleteRefReflog {
+                    committer: b"Git Rs <sley@example.invalid> 123 +0000".to_vec(),
+                    message: b"delete main".to_vec(),
+                }),
+            })
+            .expect("test operation should succeed");
+
+        assert_eq!(deleted.name, "refs/heads/main");
+        assert_eq!(deleted.oid, oid);
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        // Git unlinks the reflog on delete: the file is gone and there is no
+        // lingering deletion entry to read back.
+        assert!(
+            !git_dir
+                .join("logs")
+                .join("refs")
+                .join("heads")
+                .join("main")
+                .exists(),
+            "reflog file should be removed by the checked delete"
+        );
+        assert!(
+            store
+                .read_reflog("refs/heads/main")
+                .expect("test operation should succeed")
+                .is_empty()
+        );
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_delete_ref_checked_stale_expected_leaves_ref_untouched() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let actual = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let expected = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(actual),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+
+        let err = store
+            .delete_ref_checked(DeleteRef {
+                name: "refs/heads/main".into(),
+                expected_old: Some(expected),
+                reflog: None,
+            })
+            .expect_err("stale expected must fail");
+
+        assert!(matches!(
+            err,
+            RefDeleteError::ExpectedMismatch {
+                expected: Some(got_expected),
+                actual: Some(got_actual),
+            } if got_expected == expected && got_actual == actual
+        ));
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(actual))
+        );
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_delete_ref_checked_missing_returns_not_found() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+
+        let err = store
+            .delete_ref_checked(DeleteRef {
+                name: "refs/heads/missing".into(),
+                expected_old: None,
+                reflog: None,
+            })
+            .expect_err("missing ref must fail");
+
+        assert!(matches!(err, RefDeleteError::NotFound));
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("missing.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_delete_ref_checked_removes_packed_ref() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let other = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        store
+            .write_packed_refs(&[
+                PackedRef {
+                    reference: Ref {
+                        name: "refs/heads/main".into(),
+                        target: RefTarget::Direct(oid),
+                    },
+                    peeled: None,
+                },
+                PackedRef {
+                    reference: Ref {
+                        name: "refs/heads/other".into(),
+                        target: RefTarget::Direct(other),
+                    },
+                    peeled: None,
+                },
+            ])
+            .expect("test operation should succeed");
+
+        store
+            .delete_ref_checked(DeleteRef {
+                name: "refs/heads/main".into(),
+                expected_old: Some(oid),
+                reflog: None,
+            })
+            .expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/other")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(other))
+        );
+        let packed =
+            fs::read_to_string(git_dir.join("packed-refs")).expect("test operation should succeed");
+        assert!(!packed.contains("refs/heads/main"));
+        assert!(packed.contains("refs/heads/other"));
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
+        assert!(!git_dir.join("packed-refs.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_store_delete_ref_checked_lock_conflict_returns_locked() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.commit().expect("test operation should succeed");
+        fs::write(
+            git_dir.join("refs").join("heads").join("main.lock"),
+            b"held\n",
+        )
+        .expect("test operation should succeed");
+
+        let err = store
+            .delete_ref_checked(DeleteRef {
+                name: "refs/heads/main".into(),
+                expected_old: Some(oid),
+                reflog: None,
+            })
+            .expect_err("held lock must fail");
+
+        assert!(matches!(err, RefDeleteError::Locked));
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(oid))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
     fn file_ref_store_reports_current_branch() {
         let git_dir = temp_git_dir();
         fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n")
@@ -4191,6 +5181,262 @@ ce013625030ba8dba906f756967f9e9ca394464a refs/tags/v1\n\
                 .exists()
         );
         assert!(!git_dir.join("refs").join("tags").join("v1.0.lock").exists());
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_mixes_update_and_delete() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let old_main = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let new_topic = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut seed = store.transaction();
+        seed.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(old_main),
+            reflog: None,
+        });
+        seed.commit().expect("test operation should succeed");
+
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(new_topic),
+            reflog: None,
+        });
+        tx.delete_with_precondition(
+            "refs/heads/main",
+            RefDeletePrecondition::Direct(Some(old_main)),
+            None,
+        );
+        tx.commit().expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(new_topic))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_stale_delete_rolls_back_update() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let old_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let new_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut seed = store.transaction();
+        for name in ["refs/heads/main", "refs/heads/topic"] {
+            seed.update(RefUpdate {
+                name: name.into(),
+                expected: None,
+                new: RefTarget::Direct(old_oid),
+                reflog: None,
+            });
+        }
+        seed.commit().expect("test operation should succeed");
+
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(new_oid),
+            reflog: None,
+        });
+        tx.delete_with_precondition(
+            "refs/heads/main",
+            RefDeletePrecondition::Direct(Some(new_oid)),
+            None,
+        );
+        let err = tx.commit().expect_err("stale delete must abort");
+        assert!(err.to_string().contains("expected ref refs/heads/main"));
+
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(old_oid))
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(old_oid))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_rejects_duplicate_mixed_ref() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut tx = store.transaction();
+        tx.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        tx.delete_with_precondition("refs/heads/main", RefDeletePrecondition::Any, None);
+
+        let err = tx.commit().expect_err("duplicate ref must fail");
+        assert!(err.to_string().contains("refs/heads/main"));
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_deletes_symbolic_ref_with_immediate_expectation() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let mut seed = store.transaction();
+        seed.update(RefUpdate {
+            name: "refs/heads/main".into(),
+            expected: None,
+            new: RefTarget::Direct(oid),
+            reflog: None,
+        });
+        seed.update(RefUpdate {
+            name: "refs/aliases/main".into(),
+            expected: None,
+            new: RefTarget::Symbolic("refs/heads/main".into()),
+            reflog: None,
+        });
+        seed.commit().expect("test operation should succeed");
+
+        let mut tx = store.transaction();
+        tx.delete_with_precondition(
+            "refs/aliases/main",
+            RefDeletePrecondition::Immediate(RefTarget::Symbolic("refs/heads/main".into())),
+            None,
+        );
+        tx.commit().expect("test operation should succeed");
+
+        assert_eq!(
+            store
+                .read_ref("refs/aliases/main")
+                .expect("test operation should succeed"),
+            None
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(oid))
+        );
+        fs::remove_dir_all(git_dir).expect("test operation should succeed");
+    }
+
+    #[test]
+    fn file_ref_transaction_rolls_back_delete_after_late_write_failure() {
+        let git_dir = temp_git_dir();
+        let store = FileRefStore::new(&git_dir, ObjectFormat::Sha1);
+        let old_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "ce013625030ba8dba906f756967f9e9ca394464a",
+        )
+        .expect("test operation should succeed");
+        let new_oid = ObjectId::from_hex(
+            ObjectFormat::Sha1,
+            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        )
+        .expect("test operation should succeed");
+        let mut seed = store.transaction();
+        for name in ["refs/heads/main", "refs/heads/topic"] {
+            seed.update(RefUpdate {
+                name: name.into(),
+                expected: None,
+                new: RefTarget::Direct(old_oid),
+                reflog: None,
+            });
+        }
+        seed.commit().expect("test operation should succeed");
+
+        set_fail_loose_commit_action_for_test(Some(1));
+        let mut tx = store.transaction();
+        tx.delete_with_precondition(
+            "refs/heads/main",
+            RefDeletePrecondition::Direct(Some(old_oid)),
+            None,
+        );
+        tx.update(RefUpdate {
+            name: "refs/heads/topic".into(),
+            expected: None,
+            new: RefTarget::Direct(new_oid),
+            reflog: None,
+        });
+        let err = tx.commit().expect_err("injected failure must abort");
+        assert!(
+            err.to_string()
+                .contains("injected loose ref transaction failure")
+        );
+
+        assert_eq!(
+            store
+                .read_ref("refs/heads/main")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(old_oid))
+        );
+        assert_eq!(
+            store
+                .read_ref("refs/heads/topic")
+                .expect("test operation should succeed"),
+            Some(RefTarget::Direct(old_oid))
+        );
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("main.lock")
+                .exists()
+        );
+        assert!(
+            !git_dir
+                .join("refs")
+                .join("heads")
+                .join("topic.lock")
+                .exists()
+        );
         fs::remove_dir_all(git_dir).expect("test operation should succeed");
     }
 
