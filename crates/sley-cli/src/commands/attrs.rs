@@ -1,7 +1,7 @@
 //! Attribute and ignore inspection commands (`check-attr`, `check-ignore`).
 
 use std::collections::BTreeSet;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use sley_core::{GitError, Result};
 
@@ -80,18 +80,7 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         eprintln!("fatal: --non-matching is only valid with --verbose");
         return Err(GitError::Exit(128));
     }
-    if read_stdin {
-        let mut input = Vec::new();
-        io::stdin().read_to_end(&mut input)?;
-        let separator = if z { b'\0' } else { b'\n' };
-        path_args.extend(
-            input
-                .split(|byte| *byte == separator)
-                .filter(|path| !path.is_empty())
-                .map(|path| path.strip_suffix(b"\r").unwrap_or(path).to_vec()),
-        );
-    }
-    if path_args.is_empty() {
+    if !read_stdin && path_args.is_empty() {
         return Err(GitError::Command(
             "check-ignore requires path arguments or --stdin".into(),
         ));
@@ -111,7 +100,9 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let terminator = if z { b'\0' } else { b'\n' };
     let mut matched_any = false;
-    for display_path in path_args {
+    let process_path = |display_path: Vec<u8>,
+                        stdout: &mut std::io::StdoutLock<'_>|
+     -> Result<bool> {
         let path_arg = String::from_utf8_lossy(&display_path);
         let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
         let absolute = resolve_cli_path(cwd, &path_arg);
@@ -124,10 +115,10 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
         } else {
             sley_worktree::standard_ignore_match(worktree_root, &git_path, absolute.is_dir())?
         };
+        let path_matched = ignore_match
+            .as_ref()
+            .is_some_and(|ignore_match| verbose || ignore_match.ignored);
         if let Some(ignore_match) = ignore_match {
-            if verbose || ignore_match.ignored {
-                matched_any = true;
-            }
             if !quiet && verbose {
                 if z {
                     stdout.write_all(&ignore_match.source)?;
@@ -159,6 +150,31 @@ pub(crate) fn cmd_check_ignore(args: &[String]) -> Result<()> {
                 stdout.write_all(b"::\t")?;
                 stdout.write_all(&display_path)?;
                 stdout.write_all(&[terminator])?;
+            }
+        }
+        Ok(path_matched)
+    };
+    if read_stdin {
+        crate::commands::stdin_stream::stream_stdin_records(
+            terminator,
+            &mut stdout,
+            |mut display_path, stdout| {
+                if display_path.is_empty() {
+                    return Ok(());
+                }
+                if !z {
+                    crate::commands::stdin_stream::strip_trailing_cr(&mut display_path);
+                }
+                if process_path(display_path, stdout)? {
+                    matched_any = true;
+                }
+                Ok(())
+            },
+        )?;
+    } else {
+        for display_path in path_args {
+            if process_path(display_path, &mut stdout)? {
+                matched_any = true;
             }
         }
     }
@@ -250,18 +266,7 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
             "check-attr --stdin cannot be combined with path arguments".into(),
         ));
     }
-    if read_stdin {
-        let mut input = Vec::new();
-        io::stdin().read_to_end(&mut input)?;
-        let separator = if z { b'\0' } else { b'\n' };
-        path_args.extend(
-            input
-                .split(|byte| *byte == separator)
-                .filter(|path| !path.is_empty())
-                .map(|path| path.strip_suffix(b"\r").unwrap_or(path).to_vec()),
-        );
-    }
-    if path_args.is_empty() {
+    if !read_stdin && path_args.is_empty() {
         return Err(GitError::Command(
             "check-attr requires path arguments or --stdin".into(),
         ));
@@ -280,7 +285,10 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
         None
     };
     let mut stdout = io::stdout().lock();
-    for display_path in path_args {
+    let terminator = if z { b'\0' } else { b'\n' };
+    let process_path = |display_path: Vec<u8>,
+                        mut stdout: &mut std::io::StdoutLock<'_>|
+     -> Result<()> {
         let path_arg = String::from_utf8_lossy(&display_path);
         let git_path = normalize_ls_files_pathspec(prefix.as_bytes(), &path_arg)?;
         let checks = if cached {
@@ -321,6 +329,26 @@ pub(crate) fn cmd_check_attr(args: &[String]) -> Result<()> {
                 write_check_attr_state(&mut stdout, check.state.as_ref())?;
                 stdout.write_all(b"\n")?;
             }
+        }
+        Ok(())
+    };
+    if read_stdin {
+        crate::commands::stdin_stream::stream_stdin_records(
+            terminator,
+            &mut stdout,
+            |mut display_path, stdout| {
+                if display_path.is_empty() {
+                    return Ok(());
+                }
+                if !z {
+                    crate::commands::stdin_stream::strip_trailing_cr(&mut display_path);
+                }
+                process_path(display_path, stdout)
+            },
+        )?;
+    } else {
+        for display_path in path_args {
+            process_path(display_path, &mut stdout)?;
         }
     }
     stdout.flush()?;

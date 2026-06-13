@@ -56,6 +56,7 @@ pub(crate) mod show;
 pub(crate) mod show_branch;
 pub(crate) mod sparse_checkout;
 pub(crate) mod stash;
+pub(crate) mod stdin_stream;
 pub(crate) mod submodule;
 pub(crate) mod tag;
 pub(crate) mod trees;

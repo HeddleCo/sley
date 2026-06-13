@@ -1,5 +1,9 @@
 //! Extracted from the crate root (sley#8 phase 1) — code motion only.
 
+use std::fs;
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+
 // A glob of the crate root brings every shared helper/type into scope via
 // descendant-privacy; see commands::stash for the rationale.
 use crate::*;
@@ -168,6 +172,23 @@ fn collect_repository_reflog_names(git_dir: &Path, names: &mut BTreeSet<String>)
 
 fn reflog_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(reflog_logs_dir_for_ref(git_dir, name)?.join(name))
+}
+
+fn loose_ref_path_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
+    if name == "HEAD" {
+        Ok(git_dir.join(name))
+    } else {
+        Ok(common_git_dir_for_git_dir(git_dir)?.join(name))
+    }
+}
+
+fn lock_path_for_loose_ref_path(path: &Path) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| GitError::InvalidPath("ref path has no file name".into()))?;
+    let mut lock_name = file_name.to_os_string();
+    lock_name.push(".lock");
+    Ok(path.with_file_name(lock_name))
 }
 
 fn reflog_logs_dir_for_ref(git_dir: &Path, name: &str) -> Result<PathBuf> {
@@ -996,6 +1017,7 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
             committer: default_committer(),
             message,
         });
+    let tx_name = name.clone();
     let mut tx = store.transaction();
     tx.update(RefUpdate {
         name,
@@ -1003,7 +1025,16 @@ pub(crate) fn cmd_update_ref(args: &[String]) -> Result<()> {
         new: RefTarget::Direct(new_oid),
         reflog,
     });
-    tx.commit()
+    match tx.commit() {
+        Ok(()) => Ok(()),
+        Err(GitError::Io(message))
+            if message.starts_with(&format!("could not lock ref {tx_name}: ")) =>
+        {
+            let prefix = format!("could not lock ref {tx_name}: ");
+            update_ref_lock_failure(&tx_name, message.trim_start_matches(&prefix))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 fn update_ref_usage() -> Result<()> {
@@ -1032,20 +1063,23 @@ fn update_ref_stdin(context: UpdateRefStdinContext<'_>, deref: bool, nul: bool) 
     if nul {
         return update_ref_stdin_z(&context, deref);
     }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
     let mut deref = deref;
     let mut transaction = UpdateRefStdinTransaction::default();
-    for line in input.lines() {
+    let mut stdout = io::stdout().lock();
+    crate::commands::stdin_stream::stream_stdin_records(b'\n', &mut stdout, |mut line, stdout| {
+        crate::commands::stdin_stream::strip_trailing_cr(&mut line);
+        let line = String::from_utf8_lossy(&line);
         if line.is_empty() {
-            continue;
+            return Ok(());
         }
-        let result = update_ref_stdin_line(&context, &mut deref, &mut transaction, line);
-        if let Err(err) = result {
-            transaction.restore(context.store)?;
+        if let Err(err) =
+            update_ref_stdin_line(&context, &mut deref, &mut transaction, stdout, &line)
+        {
+            let _ = transaction.restore(context.store);
             return Err(err);
         }
-    }
+        Ok(())
+    })?;
     transaction.finish_implicit(context.store)
 }
 
@@ -1053,6 +1087,7 @@ fn update_ref_stdin_line(
     context: &UpdateRefStdinContext<'_>,
     deref: &mut bool,
     transaction: &mut UpdateRefStdinTransaction,
+    stdout: &mut dyn Write,
     line: &str,
 ) -> Result<()> {
     let parts = line.split_whitespace().collect::<Vec<_>>();
@@ -1099,6 +1134,7 @@ fn update_ref_stdin_line(
                         new_oid,
                         expected_oid: expected.as_ref(),
                     },
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1132,6 +1168,7 @@ fn update_ref_stdin_line(
                         new_oid,
                         expected_oid: Some(&zero),
                     },
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1167,6 +1204,7 @@ fn update_ref_stdin_line(
                     context.format,
                     &name,
                     expected.as_ref(),
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1191,6 +1229,7 @@ fn update_ref_stdin_line(
                     &name,
                     current.as_ref(),
                     &expected,
+                    stdout,
                 );
             }
             check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
@@ -1257,48 +1296,49 @@ fn update_ref_stdin_line(
             }
             update_ref_stdin_symref_delete(context.store, parts[1], parts.get(2).copied())
         }
-        "start" => transaction.start(),
-        "prepare" => transaction.prepare(context.store),
-        "commit" => transaction.commit(context.store),
-        "abort" => transaction.abort(context.store),
+        "start" => transaction.start(stdout),
+        "prepare" => transaction.prepare(context.git_dir, context.store, stdout),
+        "commit" => transaction.commit(context.store, stdout),
+        "abort" => transaction.abort(context.store, stdout),
         _ => update_ref_stdin_bad_command(command),
     }
 }
 
 fn update_ref_stdin_z(context: &UpdateRefStdinContext<'_>, deref: bool) -> Result<()> {
-    let mut input = Vec::new();
-    io::stdin().read_to_end(&mut input)?;
-    let mut cursor = 0usize;
+    let stdin = io::stdin();
+    let mut reader = crate::commands::stdin_stream::StdinRecordReader::new(stdin.lock(), b'\0');
+    let mut stdout = io::stdout().lock();
     let mut deref = deref;
     let mut transaction = UpdateRefStdinTransaction::default();
-    while cursor < input.len() {
-        let command = update_ref_stdin_z_next(&input, &mut cursor, "", "")?;
+    while let Some(command) = reader.read_record()? {
+        let command = String::from_utf8_lossy(&command).into_owned();
         if command.is_empty() {
             continue;
         }
         let result = update_ref_stdin_z_command(
             context,
             &mut deref,
-            &input,
-            &mut cursor,
+            &mut reader,
             &command,
             &mut transaction,
+            &mut stdout,
         );
         if let Err(err) = result {
             transaction.restore(context.store)?;
             return Err(err);
         }
+        stdout.flush()?;
     }
     transaction.finish_implicit(context.store)
 }
 
-fn update_ref_stdin_z_command(
+fn update_ref_stdin_z_command<R: BufRead>(
     context: &UpdateRefStdinContext<'_>,
     deref: &mut bool,
-    input: &[u8],
-    cursor: &mut usize,
+    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
     command: &str,
     transaction: &mut UpdateRefStdinTransaction,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     let (verb, name) = update_ref_stdin_z_verb_and_name(command);
     if transaction.is_closed() && verb != "start" {
@@ -1319,8 +1359,8 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
-            let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
+            let new = update_ref_stdin_z_next(reader, command, "<new-oid>")?;
+            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
             let new_oid =
                 parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
@@ -1342,6 +1382,7 @@ fn update_ref_stdin_z_command(
                         new_oid,
                         expected_oid: expected.as_ref(),
                     },
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1360,7 +1401,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let new = update_ref_stdin_z_next(input, cursor, command, "<new-oid>")?;
+            let new = update_ref_stdin_z_next(reader, command, "<new-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
             let new_oid =
                 parse_update_ref_new_oid(context.git_dir, context.format, context.store, &new)?;
@@ -1376,6 +1417,7 @@ fn update_ref_stdin_z_command(
                         new_oid,
                         expected_oid: Some(&zero),
                     },
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1394,7 +1436,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
+            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
             let expected = if old.is_empty() {
                 None
@@ -1412,6 +1454,7 @@ fn update_ref_stdin_z_command(
                     context.format,
                     &name,
                     expected.as_ref(),
+                    stdout,
                 );
             }
             if transaction.capture(context.store, &name)? {
@@ -1423,7 +1466,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let old = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
+            let old = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
             let expected = if old.is_empty() {
                 zero_oid(context.format)?
@@ -1437,6 +1480,7 @@ fn update_ref_stdin_z_command(
                     &name,
                     current.as_ref(),
                     &expected,
+                    stdout,
                 );
             }
             check_update_ref_stdin_expected(context.format, &name, current.as_ref(), &expected)
@@ -1445,7 +1489,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let target = update_ref_stdin_z_next(input, cursor, command, "<new-target>")?;
+            let target = update_ref_stdin_z_next(reader, command, "<new-target>")?;
             let name = update_ref_effective_name(context.store, name, *deref)?;
             if transaction.capture(context.store, &name)? {
                 return Ok(());
@@ -1456,17 +1500,16 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let target = update_ref_stdin_z_next(input, cursor, command, "<new-target>")?;
-            let expected = match update_ref_stdin_z_peek(input, *cursor).as_deref() {
+            let target = update_ref_stdin_z_next(reader, command, "<new-target>")?;
+            let expected = match update_ref_stdin_z_peek(reader)?.as_deref() {
                 Some("ref") => {
-                    let _ = update_ref_stdin_z_next(input, cursor, command, "")?;
-                    let old_target =
-                        update_ref_stdin_z_next(input, cursor, command, "<old-target>")?;
+                    let _ = update_ref_stdin_z_next(reader, command, "")?;
+                    let old_target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
                     Some(UpdateRefStdinSymrefExpected::Target(old_target))
                 }
                 Some("oid") => {
-                    let _ = update_ref_stdin_z_next(input, cursor, command, "")?;
-                    let old_oid = update_ref_stdin_z_next(input, cursor, command, "<old-oid>")?;
+                    let _ = update_ref_stdin_z_next(reader, command, "")?;
+                    let old_oid = update_ref_stdin_z_next(reader, command, "<old-oid>")?;
                     Some(UpdateRefStdinSymrefExpected::Oid(parse_update_ref_expected(
                         context.git_dir,
                         context.format,
@@ -1489,7 +1532,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let target = update_ref_stdin_z_next(input, cursor, command, "<old-target>")?;
+            let target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
             let expected = (!target.is_empty()).then_some(target.as_str());
             update_ref_stdin_symref_verify(context.store, name, expected)
         }
@@ -1500,7 +1543,7 @@ fn update_ref_stdin_z_command(
             let Some(name) = name else {
                 return update_ref_stdin_bad_command(verb);
             };
-            let target = update_ref_stdin_z_next(input, cursor, command, "<old-target>")?;
+            let target = update_ref_stdin_z_next(reader, command, "<old-target>")?;
             let expected = (!target.is_empty()).then_some(target.as_str());
             if transaction.capture(context.store, name)? {
                 return Ok(());
@@ -1512,10 +1555,10 @@ fn update_ref_stdin_z_command(
                 return update_ref_stdin_bad_command(verb);
             }
             match verb {
-                "start" => transaction.start(),
-                "prepare" => transaction.prepare(context.store),
-                "commit" => transaction.commit(context.store),
-                "abort" => transaction.abort(context.store),
+                "start" => transaction.start(stdout),
+                "prepare" => transaction.prepare(context.git_dir, context.store, stdout),
+                "commit" => transaction.commit(context.store, stdout),
+                "abort" => transaction.abort(context.store, stdout),
                 _ => unreachable!(),
             }
         }
@@ -1530,6 +1573,7 @@ struct UpdateRefStdinTransaction {
     closed: bool,
     originals: BTreeMap<String, Option<RefTarget>>,
     duplicate: Option<String>,
+    locks: Vec<PathBuf>,
 }
 
 impl Default for UpdateRefStdinTransaction {
@@ -1541,6 +1585,7 @@ impl Default for UpdateRefStdinTransaction {
             closed: false,
             originals: BTreeMap::new(),
             duplicate: None,
+            locks: Vec::new(),
         }
     }
 }
@@ -1569,7 +1614,7 @@ impl UpdateRefStdinTransaction {
         self.closed
     }
 
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self, stdout: &mut dyn Write) -> Result<()> {
         if self.explicit {
             return update_ref_stdin_restart_transaction();
         }
@@ -1577,22 +1622,28 @@ impl UpdateRefStdinTransaction {
         self.explicit = true;
         self.prepared = false;
         self.closed = false;
-        println!("start: ok");
+        writeln!(stdout, "start: ok")?;
         Ok(())
     }
 
-    fn prepare(&mut self, store: &FileRefStore) -> Result<()> {
+    fn prepare(
+        &mut self,
+        git_dir: &Path,
+        store: &FileRefStore,
+        stdout: &mut dyn Write,
+    ) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
             self.restore(store)?;
             eprintln!("fatal: prepare: multiple updates for ref '{name}' not allowed");
             return Err(GitError::Exit(128));
         }
+        self.acquire_locks(git_dir)?;
         self.prepared = true;
-        println!("prepare: ok");
+        writeln!(stdout, "prepare: ok")?;
         Ok(())
     }
 
-    fn commit(&mut self, store: &FileRefStore) -> Result<()> {
+    fn commit(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
         if let Some(name) = self.duplicate.clone() {
             self.restore(store)?;
             eprintln!("fatal: commit: multiple updates for ref '{name}' not allowed");
@@ -1602,9 +1653,10 @@ impl UpdateRefStdinTransaction {
         self.explicit = false;
         self.prepared = false;
         self.closed = true;
+        self.release_locks();
         self.originals.clear();
         self.duplicate = None;
-        println!("commit: ok");
+        writeln!(stdout, "commit: ok")?;
         Ok(())
     }
 
@@ -1624,13 +1676,14 @@ impl UpdateRefStdinTransaction {
         Ok(())
     }
 
-    fn abort(&mut self, store: &FileRefStore) -> Result<()> {
+    fn abort(&mut self, store: &FileRefStore, stdout: &mut dyn Write) -> Result<()> {
         self.restore(store)?;
-        println!("abort: ok");
+        writeln!(stdout, "abort: ok")?;
         Ok(())
     }
 
     fn restore(&mut self, store: &FileRefStore) -> Result<()> {
+        self.release_locks();
         if self.active {
             for (name, original) in mem::take(&mut self.originals) {
                 update_ref_stdin_restore_ref(store, &name, original)?;
@@ -1642,6 +1695,40 @@ impl UpdateRefStdinTransaction {
         self.closed = true;
         self.duplicate = None;
         Ok(())
+    }
+
+    fn acquire_locks(&mut self, git_dir: &Path) -> Result<()> {
+        if !self.locks.is_empty() {
+            return Ok(());
+        }
+        let names = self.originals.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let path = loose_ref_path_for_ref(git_dir, &name)?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| GitError::InvalidPath("ref path has no parent".into()))?;
+            fs::create_dir_all(parent)?;
+            let lock_path = lock_path_for_loose_ref_path(&path)?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(_) => self.locks.push(lock_path),
+                Err(err) => {
+                    self.release_locks();
+                    eprintln!("fatal: prepare: cannot lock ref '{name}': {err}");
+                    return Err(GitError::Exit(128));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn release_locks(&mut self) {
+        for lock in mem::take(&mut self.locks) {
+            let _ = fs::remove_file(lock);
+        }
     }
 }
 
@@ -1698,31 +1785,24 @@ fn update_ref_stdin_z_verb_and_name(command: &str) -> (&str, Option<&str>) {
         .map_or((command, None), |(verb, name)| (verb, Some(name)))
 }
 
-fn update_ref_stdin_z_next(
-    input: &[u8],
-    cursor: &mut usize,
+fn update_ref_stdin_z_next<R: BufRead>(
+    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
     command: &str,
     field: &str,
 ) -> Result<String> {
-    if *cursor >= input.len() {
-        eprintln!("fatal: {command}: unexpected end of input when reading {field}");
-        return Err(GitError::Exit(128));
-    }
-    let Some(end) = input[*cursor..].iter().position(|byte| *byte == b'\0') else {
+    let Some(field_value) = reader.read_record()? else {
         eprintln!("fatal: {command}: unexpected end of input when reading {field}");
         return Err(GitError::Exit(128));
     };
-    let field = String::from_utf8_lossy(&input[*cursor..*cursor + end]).into_owned();
-    *cursor += end + 1;
-    Ok(field)
+    Ok(String::from_utf8_lossy(&field_value).into_owned())
 }
 
-fn update_ref_stdin_z_peek(input: &[u8], cursor: usize) -> Option<String> {
-    if cursor >= input.len() {
-        return None;
-    }
-    let end = input[cursor..].iter().position(|byte| *byte == b'\0')?;
-    Some(String::from_utf8_lossy(&input[cursor..cursor + end]).into_owned())
+fn update_ref_stdin_z_peek<R: BufRead>(
+    reader: &mut crate::commands::stdin_stream::StdinRecordReader<R>,
+) -> Result<Option<String>> {
+    Ok(reader
+        .peek_record()?
+        .map(|record| String::from_utf8_lossy(record).into_owned()))
 }
 
 fn update_ref_stdin_bad_command(command: &str) -> Result<()> {
@@ -1899,15 +1979,20 @@ struct UpdateRefStdinRejection {
     stderr_reason: String,
 }
 
-fn print_update_ref_stdin_rejection(rejection: UpdateRefStdinRejection) {
-    println!(
+fn print_update_ref_stdin_rejection(
+    rejection: UpdateRefStdinRejection,
+    stdout: &mut dyn Write,
+) -> Result<()> {
+    writeln!(
+        stdout,
         "rejected {} {} {} {}",
         rejection.name, rejection.new_value, rejection.old_value, rejection.stdout_reason
-    );
+    )?;
     eprintln!(
         "error: cannot lock ref '{}': {}",
         rejection.name, rejection.stderr_reason
     );
+    Ok(())
 }
 
 fn update_ref_stdin_expected_rejection(
@@ -1981,6 +2066,7 @@ fn update_ref_requires_commit(name: &str) -> bool {
 fn update_ref_stdin_write_batch(
     context: &UpdateRefStdinContext<'_>,
     request: UpdateRefStdinWriteRequest<'_>,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     let current = context.store.read_ref(&request.name)?;
     if let Some(expected_oid) = request.expected_oid
@@ -1992,7 +2078,7 @@ fn update_ref_stdin_write_batch(
             request.new_oid.to_string(),
         )?
     {
-        print_update_ref_stdin_rejection(rejection);
+        print_update_ref_stdin_rejection(rejection, stdout)?;
         return Ok(());
     }
     if request.new_oid == zero_oid(context.format)? {
@@ -2004,7 +2090,8 @@ fn update_ref_stdin_write_batch(
         &request.name,
         &request.new_oid,
     ) {
-        println!(
+        writeln!(
+            stdout,
             "rejected {} {} {} invalid new value provided",
             request.name,
             request.new_oid,
@@ -2012,7 +2099,7 @@ fn update_ref_stdin_write_batch(
                 .expected_oid
                 .map(ObjectId::to_string)
                 .unwrap_or_else(|| "(null)".to_string())
-        );
+        )?;
         eprintln!("error: cannot update ref '{}': {reason}", request.name);
         return Ok(());
     }
@@ -2030,6 +2117,7 @@ fn update_ref_delete_stdin_batch(
     format: ObjectFormat,
     name: &str,
     expected: Option<&ObjectId>,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     let current = store.read_ref(name)?;
     if let Some(expected) = expected
@@ -2041,7 +2129,7 @@ fn update_ref_delete_stdin_batch(
             zero_oid(format)?.to_string(),
         )?
     {
-        print_update_ref_stdin_rejection(rejection);
+        print_update_ref_stdin_rejection(rejection, stdout)?;
         return Ok(());
     }
     update_ref_delete_stdin(store, format, name, None)
@@ -2052,11 +2140,12 @@ fn verify_update_ref_stdin_batch(
     name: &str,
     current: Option<&RefTarget>,
     expected: &ObjectId,
+    stdout: &mut dyn Write,
 ) -> Result<()> {
     if let Some(rejection) =
         update_ref_stdin_expected_rejection(format, name, current, expected, "(null)".to_string())?
     {
-        print_update_ref_stdin_rejection(rejection);
+        print_update_ref_stdin_rejection(rejection, stdout)?;
     }
     Ok(())
 }
